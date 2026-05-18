@@ -60,9 +60,9 @@ Change License: Apache License 2.0).
 ### Clients
 
 - Python bindings (`pip install namidb`), abi3 wheels for Linux
-  (x86_64 + aarch64), macOS (x86_64 + arm64) and Windows (x86_64).
-  Sync + async (`acypher`). Arrow / pandas / polars output. `s3://`
-  and `memory://` URIs.
+  (x86_64 + aarch64), macOS (arm64) and Windows (x86_64). Intel macOS
+  installs via sdist. Sync + async (`acypher`). Arrow / pandas /
+  polars output. `s3://` and `memory://` URIs.
 - CLI: `namidb parse`, `namidb explain --verbose`, `namidb run`.
 
 ### Project
