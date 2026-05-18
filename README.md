@@ -73,7 +73,7 @@ Same engine across all three. No rewrites when you graduate from a notebook to a
 - **Columnar storage on object storage** — Parquet node SSTs, custom edge-SST format with CSR adjacency (RFC-002), zstd compression, bloom filters, fence-pointer indices.
 - **Coordination-free correctness** — single-writer-per-namespace with epoch fencing via manifest CAS. Conditional writes (`If-Match`, `If-None-Match`) replace external consensus.
 - **Tiered caches** — process-wide `AdjacencyCache` (CSR), `NodeViewCache`, and `SstCache` (decoded body + edge property streams + reader). Cross-snapshot reuse with `Arc`-shared, byte-budgeted memory.
-- **Python bindings** — `pip install namidb`, abi3 wheels for Linux (x86_64 + aarch64), macOS (x86_64 + arm64) and Windows (x86_64). Sync + async (`acypher`). Arrow / pandas / polars output. `s3://` and `memory://` URIs.
+- **Python bindings** — `pip install namidb`, abi3 wheels for Linux (x86_64 + aarch64), macOS (arm64) and Windows (x86_64), with sdist fallback for other targets. Sync + async (`acypher`). Arrow / pandas / polars output. `s3://` and `memory://` URIs.
 - **CLI** — `namidb parse`, `namidb explain --verbose`, `namidb run` for ad-hoc query work.
 - **Bench harness** — synthetic, deterministic LDBC SNB Interactive harness with a paired Kùzu runner under [`bench/`](./bench/).
 

@@ -12,9 +12,10 @@ pip install 'namidb[pandas]'    # + DataFrame interop
 pip install 'namidb[polars]'    # + polars interop
 ```
 
-Wheels are published for Linux (x86_64, aarch64), macOS (x86_64,
-arm64), and Windows (x86_64) via the `python-wheels.yml` workflow on
-every `py-v*` tag — `pyarrow >= 14` is a hard transitive dependency.
+Wheels are published for Linux (x86_64, aarch64), macOS (arm64), and
+Windows (x86_64) via the `python-wheels.yml` workflow on every `py-v*`
+tag — `pyarrow >= 14` is a hard transitive dependency. Intel macOS
+users fall back to the sdist (slower install, same runtime behaviour).
 
 ## Build from source
 
@@ -296,10 +297,10 @@ export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
    git tag py-v0.1.0
    git push origin py-v0.1.0
    ```
-4. `python-wheels.yml` builds 5 wheels (Linux x86_64/aarch64, macOS
-   x86_64/arm64, Windows x86_64) + sdist, smoke-tests one wheel on
-   Python 3.9 and 3.13, then publishes to PyPI via OIDC trusted
-   publishing (configured once per account at
+4. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
+   arm64, Windows x86_64) + sdist, smoke-tests one wheel on Python
+   3.9 and 3.13, then publishes to PyPI via OIDC trusted publishing
+   (configured once per account at
    https://pypi.org/manage/account/publishing/).
 
 `py-v*` tag prefix keeps Python releases separate from any future
