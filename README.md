@@ -268,7 +268,7 @@ NamiDB is licensed under the [**Business Source License 1.1**](LICENSE).
 - A separate commercial license is available for teams that need to
   embed or redistribute NamiDB outside the bounds of BSL — including
   offering it as a hosted database service. Contact
-  [`licensing@namidb.com`](mailto:licensing@namidb.com).
+  [`info@namidb.com`](mailto:info@namidb.com).
 
 <br />
 
