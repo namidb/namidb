@@ -1,0 +1,68 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - rust
+    groups:
+      arrow-stack:
+        patterns:
+          - "arrow*"
+          - "parquet"
+      tokio-stack:
+        patterns:
+          - "tokio*"
+          - "tower*"
+          - "axum"
+          - "hyper*"
+      object-store:
+        patterns:
+          - "object_store"
+      tracing:
+        patterns:
+          - "tracing*"
+          - "opentelemetry*"
+      tests:
+        patterns:
+          - "proptest"
+          - "tokio-test"
+          - "tempfile"
+          - "criterion"
+        dependency-type: "development"
+
+  - package-ecosystem: pip
+    directory: /crates/namidb-py
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps-py)"
+    labels:
+      - dependencies
+      - python
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - github-actions

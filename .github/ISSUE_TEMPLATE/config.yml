@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & discussion
+    url: https://github.com/namidb/namidb/discussions
+    about: Ask a question, share what you're building, or propose an idea. Use issues for actionable bug reports and feature requests.
+  - name: Documentation
+    url: https://docs.namidb.com
+    about: Reference docs, guides, and getting-started material.
+  - name: Security
+    url: https://github.com/namidb/namidb/security/policy
+    about: Report a vulnerability privately. Do NOT open a public issue.
