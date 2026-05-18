@@ -85,7 +85,7 @@ jobs:
           args: --release --out dist --manifest-path crates/namidb-py/Cargo.toml
           manylinux: ${{ matrix.target.manylinux }}
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: dist/*.whl
@@ -106,7 +106,7 @@ jobs:
         with:
           command: sdist
           args: --out dist --manifest-path crates/namidb-py/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
