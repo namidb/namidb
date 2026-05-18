@@ -1,0 +1,58 @@
+# Self-hosted NamiDB on MinIO.
+#
+# Usage:
+#   docker build -t namidb-server:0.1 -f crates/namidb-server/Dockerfile .
+#   export NAMIDB_AUTH_TOKEN=$(openssl rand -hex 32)
+#   docker compose up -d
+#   curl -s http://localhost:8080/v0/health | jq .
+#
+# After it boots, the graph database is reachable on :8080 with bearer
+# token = $NAMIDB_AUTH_TOKEN. The MinIO console is on :9001
+# (login: minioadmin / minioadmin).
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      retries: 30
+
+  bucket-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/namidb
+      "
+
+  namidb-server:
+    image: namidb-server:0.1
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    environment:
+      NAMIDB_STORE: "s3://namidb?ns=prod&endpoint=http://minio:9000&region=us-east-1&allow_http=true"
+      NAMIDB_LISTEN: "0.0.0.0:8080"
+      NAMIDB_AUTH_TOKEN: "${NAMIDB_AUTH_TOKEN:?set NAMIDB_AUTH_TOKEN in your env (e.g. openssl rand -hex 32)}"
+      NAMIDB_FLUSH_INTERVAL: "30s"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+      RUST_LOG: "info"
+    ports:
+      - "8080:8080"
+
+volumes:
+  minio-data: {}

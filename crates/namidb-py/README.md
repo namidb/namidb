@@ -213,10 +213,24 @@ table = client.scan_label_arrow("Person")
 | URI scheme | Backend | Status |
 |---|---|---|
 | `memory://<ns>` | `object_store::memory::InMemory` | Stable. Ephemeral, single-process. |
-| `s3://<bucket>[/<prefix>]?ns=<ns>...` | `object_store::aws::AmazonS3` | Stable. Works against any S3-compatible service. |
-| `file://...` | `object_store::local::LocalFileSystem` | **Not supported in v0.** Upstream lacks `PutMode::Update`, required by manifest CAS. |
-| `gs://...` | `object_store::gcp` | Planned. |
-| `az://...` | `object_store::azure` | Planned. |
+| `file:///abs/dir?ns=<ns>` (or `file://./rel?ns=<ns>`) | NamiDB `LocalFileObjectStore` (wraps `LocalFileSystem` and adds manifest CAS via `flock` + atomic rename) | Stable. |
+| `s3://<bucket>[/<prefix>]?ns=<ns>...` | `object_store::aws::AmazonS3` | Stable. AWS S3, Cloudflare R2, MinIO, Tigris, LocalStack — any S3-compatible service. |
+| `gs://<bucket>[/<prefix>]?ns=<ns>` | `object_store::gcp::GoogleCloudStorage` | Stable. Auth via `GOOGLE_APPLICATION_CREDENTIALS` or `?service_account=…`. |
+| `az://<account>/<container>[/<prefix>]?ns=<ns>` | `object_store::azure::MicrosoftAzure` | Stable. Auth via `AZURE_STORAGE_*` env vars; `?use_emulator=true` for Azurite. |
+
+### Local filesystem
+
+For development, single-machine deployments, and CI fixtures. Full
+manifest CAS via per-namespace `flock` + atomic rename — passes the
+same concurrency test suite as `s3://`.
+
+```python
+import namidb as tg
+
+client = tg.Client("file:///var/lib/namidb?ns=prod")
+# or relative
+client = tg.Client("file://./data?ns=dev")
+```
 
 ### AWS S3
 
@@ -232,6 +246,40 @@ client = tg.Client(
 Credentials are read from the standard AWS environment variables
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_DEFAULT_REGION`). Query-string `region=...` overrides the env.
+
+### Cloudflare R2
+
+```python
+import namidb as tg
+
+client = tg.Client(
+    "s3://my-bucket?ns=prod"
+    "&endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+    "&region=auto"
+)
+```
+
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` should hold the R2 API
+token credentials.
+
+### Google Cloud Storage
+
+```python
+import os
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/gcs-key.json"
+
+client = tg.Client("gs://my-bucket/data?ns=prod")
+```
+
+### Azure Blob Storage
+
+```python
+import os
+os.environ["AZURE_STORAGE_ACCOUNT_NAME"] = "myacct"
+os.environ["AZURE_STORAGE_ACCESS_KEY"]   = "..."
+
+client = tg.Client("az://myacct/mycontainer?ns=prod")
+```
 
 ### LocalStack (local persistent storage)
 
@@ -256,10 +304,11 @@ serve TLS by default.
 
 ## Scope (v0)
 
-- `memory://` for single-process testing, `s3://` for persistent
-  storage (any S3-compatible service; LocalStack works for local
-  persistence). `file://` is intentionally unsupported — see the
-  backends table above.
+- Six storage backends: `memory://`, `file://`, `s3://`, `gs://`,
+  `az://`. All five non-memory backends share the same manifest CAS
+  protocol (`If-Match` on object stores, `flock` + atomic rename on
+  the filesystem) and the same single-writer-per-namespace epoch
+  fencing.
 - Synchronous Python API + async coroutine API (`acypher`). Under the
   hood every call drives a tokio runtime owned by the `Client`; the
   first call you make per process pays the bootstrap cost.

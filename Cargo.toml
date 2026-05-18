@@ -8,6 +8,7 @@ members = [
     "crates/namidb-cli",
     "crates/namidb",
     "crates/namidb-py",
+    "crates/namidb-server",
     "crates/namidb-bench",
 ]
 
@@ -64,6 +65,8 @@ crc32fast = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 blake3 = "1.5"
+fs2 = "0.4"
+url = "2"
 
 # Errors
 anyhow = "1"
@@ -83,7 +86,7 @@ tempfile = "3.13"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
 # CLI
-clap = { version = "4", features = ["derive", "wrap_help"] }
+clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 indicatif = "0.17"
 console = "0.15"
 

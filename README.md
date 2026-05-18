@@ -6,11 +6,14 @@
 
 # NamiDB
 
-**Embedded like DuckDB. Multi-tenant on object storage. Built for the AI of this decade.**
+### Your graph database lives in your S3 bucket.
+
+**Embedded like DuckDB. Multi-tenant by namespace. Built for the AI of this decade.**
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-1f6feb.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![PyPI](https://img.shields.io/badge/PyPI-namidb-3776ab.svg?logo=pypi&logoColor=white)](https://pypi.org/project/namidb/)
+[![Docker](https://img.shields.io/badge/Docker-namidb--server-2496ed.svg?logo=docker&logoColor=white)](crates/namidb-server/Dockerfile)
 [![Website](https://img.shields.io/badge/Website-namidb.com-0a7ea4.svg)](https://namidb.com)
 [![Docs](https://img.shields.io/badge/Docs-docs.namidb.com-0a7ea4.svg)](https://docs.namidb.com)
 
@@ -43,24 +46,29 @@ So we are building the database for that decade.
 
 <br />
 
+## The shape
+
+**NamiDB writes Cypher to your S3 bucket.**
+
+No control plane to provision. No Raft to tune. No etcd to babysit. Conditional writes (`If-Match` / `If-None-Match`) on object storage replace the consensus tier — the bucket itself is the source of truth. Your graph database is *just files in your bucket*: durability is whatever S3, R2, GCS, or Azure already give you; cost scales to zero when nobody queries; backups are `aws s3 sync`; tenants are folders.
+
+The engine is the same whether you run it as a library inside your app, as a Rust daemon over HTTP, or on our hosted multi-tenant cloud — and it works equally well against **AWS S3**, **Cloudflare R2**, **GCS**, **Azure Blob**, **MinIO**, or your local disk.
+
+<br />
+
 ## Three deployments, one engine
 
-<!-- ─────────────────────────────────────────────────────────────────── -->
-<!-- TODO: deployments diagram. Suggested: three columns, one engine     -->
-<!-- icon at the centre, arrows showing the same binary fanning out to   -->
-<!-- Embedded / Server / Cloud.                                          -->
-<!-- ─────────────────────────────────────────────────────────────────── -->
 <p align="center">
   <img src=".assets/namidb-deployments.png" alt="NamiDB deployments — Embedded, Server, Cloud" width="780" />
 </p>
 
-| Mode | Best for | How it ships |
-|---|---|---|
-| **Embedded** | Notebooks, single-process apps, local development, CI fixtures | `pip install namidb` — file-based or in-memory, no daemon |
-| **Server** | Single-node production, persistent workloads | A single Rust binary backed by any S3-compatible object store |
-| **Cloud** | Multi-tenant SaaS, agent memory, scale-to-zero per namespace | Namespace-per-tenant on S3 with snapshot isolation |
+| Mode | Status | Best for | How it ships |
+|---|---|---|---|
+| **Server** | ✅ v0.1 | **Self-hosted production over your S3 / R2 / GCS / Azure bucket** | `namidb-server` binary + Docker image |
+| **Embedded** | ✅ v0.1 | Notebooks, single-process apps, local dev, CI fixtures | `pip install namidb` — talks to a bucket from inside your process |
+| **Cloud** | 🔒 closed beta | Multi-tenant SaaS, agent memory, scale-to-zero per namespace | Managed by Fonles Studios on namidb.com — [request access](https://namidb.com) |
 
-Same engine across all three. No rewrites when you graduate from a notebook to a cluster.
+Same engine across all three. Server and Embedded write to the same bucket layout — you can boot an embedded notebook against the same `s3://…` URI a production daemon is serving.
 
 <br />
 
@@ -73,79 +81,393 @@ Same engine across all three. No rewrites when you graduate from a notebook to a
 - **Columnar storage on object storage** — Parquet node SSTs, custom edge-SST format with CSR adjacency (RFC-002), zstd compression, bloom filters, fence-pointer indices.
 - **Coordination-free correctness** — single-writer-per-namespace with epoch fencing via manifest CAS. Conditional writes (`If-Match`, `If-None-Match`) replace external consensus.
 - **Tiered caches** — process-wide `AdjacencyCache` (CSR), `NodeViewCache`, and `SstCache` (decoded body + edge property streams + reader). Cross-snapshot reuse with `Arc`-shared, byte-budgeted memory.
-- **Python bindings** — `pip install namidb`, abi3 wheels for Linux (x86_64 + aarch64), macOS (arm64) and Windows (x86_64), with sdist fallback for other targets. Sync + async (`acypher`). Arrow / pandas / polars output. `s3://` and `memory://` URIs.
-- **CLI** — `namidb parse`, `namidb explain --verbose`, `namidb run` for ad-hoc query work.
+- **Six storage backends** — `memory://`, `file://` (with `flock`-based CAS), `s3://` (AWS S3 / R2 / MinIO / Tigris / LocalStack), `gs://`, `az://`.
+- **Python bindings** — `pip install namidb`, abi3 wheels for Linux (x86_64 + aarch64), macOS (arm64) and Windows (x86_64), with sdist fallback for other targets. Sync + async (`acypher`). Arrow / pandas / polars output.
+- **CLI** — `namidb parse`, `namidb explain --verbose`, `namidb run --store <uri>` for ad-hoc query work against any backend.
+- **HTTP server** — `namidb-server` binary with bearer-token auth, periodic flush loop, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`).
 - **Bench harness** — synthetic, deterministic LDBC SNB Interactive harness with a paired Kùzu runner under [`bench/`](./bench/).
 
 <br />
 
-## Quick start
+## Quickstart
 
-### Python
+Two doors. Both are the same engine.
+
+### Door 1 — A real graph database in your S3 bucket
+
+This is the headline use case. Point at a bucket, write Cypher,
+durability is whatever S3 already gives you.
 
 ```bash
 pip install namidb
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
 ```
 
 ```python
 import namidb as tg
 
-# Embedded, in-memory namespace.
-client = tg.Client("memory://acme")
+# Open (or bootstrap) the `prod` namespace on your bucket.
+client = tg.Client("s3://my-bucket/data?ns=prod&region=us-east-1")
 
 client.cypher("CREATE (a:Person {name: 'Alice', age: 30})")
 client.cypher("CREATE (b:Person {name: 'Bob',   age: 25})")
-client.cypher("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
-              "CREATE (a)-[:KNOWS {since: 2020}]->(b)")
+client.cypher(
+    "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
+    "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
+)
 
 result = client.cypher(
     "MATCH (p:Person) WHERE p.age >= $min RETURN p.name AS name, p.age AS age",
     params={"min": 18},
 )
-
-print(result.columns)  # ['name', 'age']
-print(result.first())  # {'name': 'Alice', 'age': 30}
-df = result.to_pandas()
+print(result.to_pandas())
 ```
 
-S3 / R2 / GCS / Azure / LocalStack are reachable via the `s3://` URI:
+Restart your process. Open a notebook on another machine with the
+same URI. The graph is still there. **The bucket is the database.**
+
+### Door 2 — 30-second taste, no credentials
+
+For when you just want to feel the engine before pointing it at a
+bucket. Ephemeral, in-process, no setup:
 
 ```python
+import namidb as tg
+client = tg.Client("memory://acme")
+client.cypher("CREATE (a:Person {name: 'Alice'})")
+print(client.cypher("MATCH (p:Person) RETURN p.name").rows())
+```
+
+Same six lines work against `file://`, `gs://`, `az://`, or any
+S3-compatible endpoint — only the URI changes.
+
+<br />
+
+## Pick your storage backend
+
+The URI tells the client which bucket and which namespace.
+
+| Scheme | Backend |
+|---|---|
+| `s3://<bucket>[/<prefix>]?ns=<ns>` | **AWS S3, Cloudflare R2, MinIO, Tigris, LocalStack — anything S3-compatible** |
+| `gs://<bucket>?ns=<ns>` | Google Cloud Storage |
+| `az://<account>/<container>?ns=<ns>` | Azure Blob Storage |
+| `file:///abs/dir?ns=<ns>` | Local filesystem (CAS via `flock` + atomic rename) |
+| `memory://<ns>` | In-process, ephemeral — testing only |
+
+Every backend supports the **same** Cypher, the **same** Python /
+Rust / HTTP APIs, and the **same** snapshot-isolated read semantics.
+
+### AWS S3 ⭐ the primary path
+
+```python
+import os
+os.environ["AWS_ACCESS_KEY_ID"]     = "AKIA..."
+os.environ["AWS_SECRET_ACCESS_KEY"] = "..."
+
 client = tg.Client(
     "s3://my-bucket/data?ns=prod"
     "&region=us-west-2"
 )
 ```
 
-Bulk APIs, async (`acypher`), Arrow output and the LocalStack flow are
-documented in [**`crates/namidb-py/README.md`**](./crates/namidb-py/README.md).
+Credentials read from standard AWS env vars
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_DEFAULT_REGION`). IAM roles on EC2 / EKS / Lambda /
+ECS work transparently — no NamiDB-specific auth to wire.
 
-### CLI
+The only IAM permissions NamiDB needs on the bucket are
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`.
+That's it. No DynamoDB lock table, no separate metadata service.
 
-```bash
-$ namidb run "CREATE (a:Person {id: 'alice', name: 'Alice'}), \
-              (b:Person {id: 'bob',   name: 'Bob'}), (a)-[:KNOWS]->(b)"
+### Cloudflare R2 ⭐ the zero-egress alternative
 
-$ namidb run "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name"
+R2 charges no egress, has full S3-compatible conditional writes, and
+in our experience reads ~1.5–2× faster than S3 from outside AWS.
+Same scheme, with the R2 endpoint and `region=auto`:
 
-$ namidb explain --verbose \
-    "MATCH (a:Person)-[:KNOWS]->(b) RETURN b ORDER BY b.id LIMIT 20"
+```python
+import os
+os.environ["AWS_ACCESS_KEY_ID"]     = "<R2 access key>"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "<R2 secret>"
+
+client = tg.Client(
+    "s3://my-bucket?ns=prod"
+    "&endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+    "&region=auto"
+)
 ```
 
-### Rust (embedded)
+If you're running NamiDB outside AWS — on Cloudflare Workers, Fly.io,
+your own VPS, your laptop — **R2 is almost always the right call**.
+
+### Other backends
+
+Same `tg.Client(...)` call, just a different URI. Click for the
+copy-paste credential snippet.
+
+<details>
+<summary><strong>Google Cloud Storage</strong> — <code>gs://</code></summary>
+
+```python
+import os
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/gcs-key.json"
+client = tg.Client("gs://my-bucket/data?ns=prod")
+```
+
+Service-account path can also be supplied per-URI:
+`gs://my-bucket?ns=prod&service_account=/etc/gcs-key.json`.
+</details>
+
+<details>
+<summary><strong>Azure Blob Storage</strong> — <code>az://</code></summary>
+
+```python
+import os
+os.environ["AZURE_STORAGE_ACCOUNT_NAME"] = "myacct"
+os.environ["AZURE_STORAGE_ACCESS_KEY"]   = "..."
+client = tg.Client("az://myacct/mycontainer?ns=prod")
+```
+
+For Azurite (the local emulator) append `&use_emulator=true`.
+</details>
+
+<details>
+<summary><strong>MinIO</strong> (self-hosted S3) — <code>s3://</code> with <code>endpoint=…</code></summary>
+
+```bash
+docker run -d --rm -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  --name minio minio/minio server /data --console-address ":9001"
+docker exec minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+docker exec minio mc mb local/namidb
+```
+
+```python
+import os
+os.environ["AWS_ACCESS_KEY_ID"]     = "minioadmin"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "minioadmin"
+client = tg.Client(
+    "s3://namidb?ns=dev"
+    "&endpoint=http://127.0.0.1:9000"
+    "&region=us-east-1"
+    "&allow_http=true"
+)
+```
+
+For the production-style **MinIO + `namidb-server` + docker-compose** stack,
+see [Self-host as a database](#self-host-as-a-database) below.
+</details>
+
+<details>
+<summary><strong>LocalStack</strong> (S3 mock for tests) — <code>s3://</code> with <code>endpoint=…</code></summary>
+
+```bash
+docker run -p 4566:4566 -e SERVICES=s3 localstack/localstack
+aws --endpoint-url=http://localhost:4566 s3 mb s3://namidb-dev
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+```
+
+```python
+client = tg.Client(
+    "s3://namidb-dev?ns=local"
+    "&endpoint=http://localhost:4566"
+    "&allow_http=true"
+    "&region=us-east-1"
+)
+```
+</details>
+
+<details>
+<summary><strong>Local filesystem</strong> — <code>file://</code></summary>
+
+For CI fixtures or single-machine dev when you want durability without
+a bucket. Full manifest CAS via per-namespace `flock` + atomic
+`rename(2)`.
+
+```python
+client = tg.Client("file:///var/lib/namidb?ns=prod")
+# relative paths work too:
+client = tg.Client("file://./data?ns=dev")
+```
+</details>
+
+<br />
+
+## Self-host as a database
+
+There are two ways to run NamiDB as a database you own end-to-end —
+pick the one that matches how your app wants to talk to it.
+
+### Option A — Embedded library + your bucket
+
+Your application (Python or Rust) imports NamiDB directly and points
+at a bucket you control. Lowest latency, no extra hop, no network
+boundary, no auth surface. The "DuckDB for graphs" mode.
+
+```python
+# Python service
+import namidb as tg
+client = tg.Client("s3://your-bucket/data?ns=prod&region=us-east-1")
+result = client.cypher("MATCH (n:Person) RETURN count(n) AS n")
+```
+
+```rust
+// Rust service
+use namidb::{
+    core::id::NamespaceId,
+    storage::{parse_uri, WriterSession},
+};
+
+let (store, paths) = parse_uri("s3://your-bucket/data?ns=prod")?;
+let mut writer = WriterSession::open(store, paths).await?;
+// upserts, commit_batch, snapshot reads…
+```
+
+Best when your read fan-out fits in one process and you want zero
+network overhead. **Object storage is the source of truth**, so two
+replicas of your service can independently open the same namespace —
+NamiDB's epoch-CAS protocol fences out stale writers automatically.
+
+### Option B — `namidb-server` daemon + REST
+
+A single Rust binary (or container image) opens a namespace and
+exposes it over HTTP. Best when the database lives on a different
+machine than the app, or you want a network boundary with bearer-
+token auth.
+
+```bash
+# Install from source
+cargo install --path crates/namidb-server
+
+# Or build the Docker image (from the repo root)
+docker build -t namidb-server:0.1 -f crates/namidb-server/Dockerfile .
+```
+
+```bash
+namidb-server \
+  --store s3://your-bucket/data?ns=prod&region=us-east-1 \
+  --listen 0.0.0.0:8080 \
+  --auth-token "$NAMIDB_AUTH_TOKEN"
+```
+
+```bash
+curl -X POST http://your-host:8080/v0/cypher \
+  -H "Authorization: Bearer $NAMIDB_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "MATCH (n:Person) RETURN count(n) AS n"}'
+# {"columns":["n"],"rows":[{"n": 42}]}
+```
+
+See [`crates/namidb-server/README.md`](./crates/namidb-server/README.md)
+for the full route reference (`/v0/cypher`, `/v0/health`,
+`/v0/version`, `/v0/admin/flush`), JSON ↔ Cypher type mapping, and
+concurrency model.
+
+### Recipe — `docker-compose` with MinIO + `namidb-server`
+
+A complete, self-contained self-hosted database in one file. Bring
+your own auth token; everything else is wired:
+
+```yaml
+# docker-compose.yml
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      retries: 30
+
+  bucket-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/namidb
+      "
+
+  namidb-server:
+    image: namidb-server:0.1   # built from crates/namidb-server/Dockerfile
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    environment:
+      NAMIDB_STORE: "s3://namidb?ns=prod&endpoint=http://minio:9000&region=us-east-1&allow_http=true"
+      NAMIDB_LISTEN: "0.0.0.0:8080"
+      NAMIDB_AUTH_TOKEN: "${NAMIDB_AUTH_TOKEN:?set NAMIDB_AUTH_TOKEN in your env}"
+      NAMIDB_FLUSH_INTERVAL: "30s"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+    ports:
+      - "8080:8080"
+
+volumes:
+  minio-data: {}
+```
+
+```bash
+export NAMIDB_AUTH_TOKEN=$(openssl rand -hex 32)
+docker compose up -d
+curl -s http://localhost:8080/v0/health | jq .
+```
+
+That's it. A graph database, your data on disk in MinIO, an
+authenticated REST API on `:8080`. Swap the `NAMIDB_STORE` URI to
+move the same setup to AWS S3, R2, GCS, or Azure without touching
+anything else.
+
+<br />
+
+## CLI
+
+```bash
+# Ephemeral in-memory namespace — same as before.
+namidb run "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})"
+namidb run "MATCH (p:Person) RETURN p.name"
+
+# Persistent — any URI scheme is accepted.
+namidb run --store "file:///var/lib/namidb?ns=prod" \
+  "CREATE (a:Person {name: 'Alice'})"
+namidb run --store "file:///var/lib/namidb?ns=prod" \
+  "MATCH (p:Person) RETURN p.name"
+
+namidb run --store "s3://my-bucket/data?ns=prod&region=us-west-2" \
+  "MATCH (p:Person) RETURN count(*) AS n"
+
+# Plan inspection — does not touch storage.
+namidb explain --verbose \
+  "MATCH (a:Person)-[:KNOWS]->(b) RETURN b ORDER BY b.id LIMIT 20"
+```
+
+See [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md)
+for every subcommand.
+
+<br />
+
+## Rust (embedded)
 
 ```rust
 use std::sync::Arc;
 
 use namidb_core::id::NamespaceId;
 use namidb_query::{execute, lower, parse, Params};
-use namidb_storage::{NamespacePaths, WriterSession};
-use object_store::{memory::InMemory, ObjectStore};
+use namidb_storage::{parse_uri, WriterSession};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let paths   = NamespacePaths::new("tenants", NamespaceId::new("demo")?);
+    // Any supported URI scheme — memory://, file://, s3://, gs://, az://.
+    let (store, paths) = parse_uri("memory://demo")?;
     let mut writer = WriterSession::open(store, paths).await?;
 
     // ... upsert nodes / edges, then commit_batch + flush ...
@@ -160,16 +482,13 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+The umbrella crate ([`crates/namidb/`](./crates/namidb/)) re-exports
+the stable surface so a downstream `Cargo.toml` only needs one line.
+
 <br />
 
 ## Architecture
 
-<!-- ─────────────────────────────────────────────────────────────────── -->
-<!-- TODO: detailed architecture illustration.                           -->
-<!-- Suggested: parser → logical plan → optimizer → executor on top,     -->
-<!-- LSM + SST + manifest CAS in the middle, S3/R2/GCS/Azure at the      -->
-<!-- bottom, with caches as side-cars.                                   -->
-<!-- ─────────────────────────────────────────────────────────────────── -->
 <p align="center">
   <img src=".assets/namidb-architecture.png" alt="NamiDB architecture — query, storage and object-store tiers" width="820" />
 </p>
@@ -184,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
 │  LSM tree · WAL · Memtable · SST · Manifest CAS                     │
 │  Hybrid buffer pool (memory + NVMe)                                 │
 ├─────────────────────────────────────────────────────────────────────┤
-│  S3 · R2 · GCS · Azure Blob · MinIO · Tigris                        │
+│  S3 · R2 · GCS · Azure Blob · MinIO · Tigris · Local FS             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -196,9 +515,8 @@ Design proposals live in [`docs/rfc/`](./docs/rfc/). Start with
 
 ## Configuration
 
-NamiDB attaches three cross-snapshot caches by default. Set the env
-var to `0` to disable individually — useful for performance debugging
-or memory-constrained environments.
+Tunable env vars. Defaults are sane for most workloads; reach for
+these when you are debugging performance or memory.
 
 | Env var | Default | What it does |
 |---|---|---|
@@ -207,6 +525,15 @@ or memory-constrained environments.
 | `NAMIDB_SST_CACHE` | ON | SST body + decoded edge property streams + parsed `EdgeSstReader` (RFC-020). |
 | `NAMIDB_FACTORIZE` | OFF | Factorized intermediate results in the executor (RFC-017). |
 | `NAMIDB_PROFILE_DUMP` | OFF | Dump per-stage profile counters to stderr after each query. |
+
+`namidb-server` adds its own:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `NAMIDB_STORE` | — (required) | Storage URI (e.g. `s3://bucket?ns=prod`). |
+| `NAMIDB_LISTEN` | `0.0.0.0:8080` | TCP bind address. |
+| `NAMIDB_AUTH_TOKEN` | unset (open) | Bearer token; when unset the server warns and accepts all requests. |
+| `NAMIDB_FLUSH_INTERVAL` | `30s` | Background memtable → L0 flush cadence. `0s` disables. |
 
 <br />
 
@@ -223,11 +550,12 @@ or memory-constrained environments.
 │   └── rfc/                # Design proposals (RFC-001 → RFC-020)
 ├── crates/
 │   ├── namidb-core/        # Common types, errors, schema
-│   ├── namidb-storage/     # LSM, WAL, manifest, SST, memtable
+│   ├── namidb-storage/     # LSM, WAL, manifest, SST, memtable, URI parser, file:// CAS
 │   ├── namidb-graph/       # Property columns + CSR adjacency
 │   ├── namidb-query/       # Cypher / GQL parser, optimizer, executor
 │   ├── namidb-cli/         # `namidb` command-line tool
 │   ├── namidb-py/          # Python bindings (PyO3 + maturin)
+│   ├── namidb-server/      # `namidb-server` HTTP daemon + Dockerfile
 │   ├── namidb-bench/       # LDBC-shaped synthetic bench harness
 │   └── namidb/             # Public façade crate
 ├── bench/                  # Kùzu runner + cross-engine comparator
@@ -244,7 +572,24 @@ or memory-constrained environments.
 | **Reference docs & guides** | [docs.namidb.com](https://docs.namidb.com) |
 | **Design RFCs** | [`docs/rfc/`](./docs/rfc/) |
 | **Python bindings** | [`crates/namidb-py/README.md`](./crates/namidb-py/README.md) |
+| **HTTP server** | [`crates/namidb-server/README.md`](./crates/namidb-server/README.md) |
+| **CLI** | [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md) |
 | **Benchmark harness** | [`bench/README.md`](./bench/README.md) |
+
+<br />
+
+## Roadmap
+
+- **Cloud (closed beta)** — multi-tenant SaaS on namidb.com with
+  per-namespace scale-to-zero, encrypted-at-rest tenants, and a hosted
+  control plane. [Request access](https://namidb.com).
+- **Streaming responses** — `/v0/cypher/stream` (NDJSON) and
+  `/v0/cypher/arrow` (Arrow IPC) for zero-copy DataFrame ingestion.
+- **Bolt protocol** — wire compatibility with Neo4j drivers (Python,
+  Java, JS, …) sitting on top of the same engine.
+- **Concurrent reads** — RFC-021 removes the single-writer mutex
+  from the read path so a `namidb-server` can fan out reads to every
+  core.
 
 <br />
 
