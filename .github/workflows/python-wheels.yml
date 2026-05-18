@@ -1,0 +1,182 @@
+# Build the namidb Python wheel for every supported (OS, arch) tuple,
+# build the sdist, smoke-test the resulting wheel, and (on tag push)
+# publish to PyPI using OIDC trusted publishing.
+#
+# abi3-py39 means **one wheel per (OS, arch)** covers Python 3.9
+# through 3.13+ — no Python-version matrix needed.
+#
+# Triggers:
+#   * `py-v*` tag push  → build all wheels + sdist + publish.
+#   * `workflow_dispatch`   → manual run (build + smoke, no publish).
+#   * PR / push to main / changes to the bindings crate → smoke
+#                              build to catch regressions early.
+#
+# PyPI setup (one-time, manual on pypi.org):
+#   1. Create the `namidb` project on PyPI (or claim the existing one).
+#   2. Settings → Publishing → "Add a new pending publisher" with:
+#        owner = namidb, repo = namidb,
+#        workflow = python-wheels.yml,
+#        environment = pypi
+#   3. After the first successful publish, the publisher becomes
+#      "trusted" and tagged releases auto-upload.
+#
+# Tagging convention: `py-v0.1.0`, `py-v0.2.0-rc1`, etc.  The crate
+# version inside `pyproject.toml` MUST match the tag (without the
+# `py-v` prefix) or the build will succeed and the publish will
+# upload a mis-labelled wheel.
+
+name: python-wheels
+
+on:
+  push:
+    tags:
+      - "py-v*"
+    branches: [main]
+    paths:
+      - "crates/namidb-py/**"
+      - "crates/namidb-core/**"
+      - "crates/namidb-storage/**"
+      - "crates/namidb-graph/**"
+      - "crates/namidb-query/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/python-wheels.yml"
+  pull_request:
+    paths:
+      - "crates/namidb-py/**"
+      - "crates/namidb-core/**"
+      - "crates/namidb-storage/**"
+      - "crates/namidb-graph/**"
+      - "crates/namidb-query/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/python-wheels.yml"
+  workflow_dispatch: {}
+
+# Cancel in-progress runs of the same branch / PR so tag pushes
+# always race to the head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Wheels (one per OS × arch — abi3-py39 covers every CPython >= 3.9) ─
+  build-wheels:
+    name: wheel · ${{ matrix.target.os }} · ${{ matrix.target.arch }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: linux,   arch: x86_64,  runner: ubuntu-22.04, manylinux: "2_28" }
+          - { os: linux,   arch: aarch64, runner: ubuntu-22.04, manylinux: "2_28" }
+          - { os: macos,   arch: x86_64,  runner: macos-13,     manylinux: "" }
+          - { os: macos,   arch: arm64,   runner: macos-14,     manylinux: "" }
+          - { os: windows, arch: x86_64,  runner: windows-2022, manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel via maturin-action
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target.arch }}
+          args: --release --out dist --manifest-path crates/namidb-py/Cargo.toml
+          manylinux: ${{ matrix.target.manylinux }}
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Source distribution (single platform-independent build) ────────────
+  build-sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist via maturin-action
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path crates/namidb-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Smoke test: install one of the built wheels and import namidb ──────
+  smoke-test:
+    name: smoke · ${{ matrix.os }} · py${{ matrix.python }}
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.9",  artifact: wheel-linux-x86_64 }
+          - { os: ubuntu-22.04, python: "3.13", artifact: wheel-linux-x86_64 }
+          - { os: macos-14,     python: "3.12", artifact: wheel-macos-arm64 }
+          - { os: windows-2022, python: "3.12", artifact: wheel-windows-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Install the freshly-built wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --find-links dist namidb
+      - name: Smoke (import + Client roundtrip)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import namidb as tg
+          assert isinstance(tg.__version__, str)
+          c = tg.Client("memory://ci-smoke")
+          c.cypher("CREATE (a:Person {name: 'CI'})")
+          r = c.cypher("MATCH (p:Person) RETURN p.name AS name")
+          assert r.first() == {"name": "CI"}, r.first()
+          print("ok:", tg.__version__)
+          PY
+      - name: Pytest the package against the installed wheel
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python -m pip install pytest pytest-asyncio pandas polars
+          python -m pytest crates/namidb-py/tests -v
+
+  # ── PyPI publish (only on tag push, OIDC trusted publisher) ────────────
+  publish:
+    name: publish to PyPI
+    needs: [build-wheels, build-sdist, smoke-test]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/namidb
+    permissions:
+      id-token: write   # OIDC — no token secret required
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Inspect what will be uploaded
+        run: ls -lh dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

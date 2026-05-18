@@ -1,0 +1,69 @@
+[package]
+name = "namidb-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "LSM storage engine on object storage for NamiDB"
+readme = "README.md"
+
+[dependencies]
+namidb-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+foyer = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+crc32fast = { workspace = true }
+zstd = { workspace = true }
+xxhash-rust = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+arrow-ipc = "55"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+# Bench-only: install aws-lc-rs as the rustls crypto provider so the S3
+# client can negotiate TLS 1.3 against Cloudflare R2 (which rejects the
+# default `ring` provider's ClientHello — likely a signature-algorithm
+# preference mismatch on their account-id-prefixed endpoint).
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "read_latency"
+harness = false
+
+[[bench]]
+name = "ingest_throughput"
+harness = false
+
+[[bench]]
+name = "recovery_replay"
+harness = false
+
+[[bench]]
+name = "parquet_ingest"
+harness = false
+
+[[bench]]
+name = "concurrent_mix"
+harness = false

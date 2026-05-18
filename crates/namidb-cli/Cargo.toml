@@ -1,0 +1,27 @@
+[package]
+name = "namidb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface for NamiDB"
+readme = "README.md"
+
+[[bin]]
+name = "namidb"
+path = "src/main.rs"
+
+[dependencies]
+namidb-core = { workspace = true }
+namidb-storage = { workspace = true }
+namidb-query = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+console = { workspace = true }
+indicatif = { workspace = true }
+object_store = { workspace = true }

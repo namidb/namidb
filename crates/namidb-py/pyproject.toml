@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "namidb"
+version = "0.0.1"
+description = "Cloud-native graph database on object storage — Python bindings"
+readme = "README.md"
+license = { text = "BUSL-1.1" }
+requires-python = ">=3.9"
+dependencies = [
+    "pyarrow>=14",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+polars = ["polars>=0.20"]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "pandas>=2.0",
+]
+
+[project.urls]
+Homepage = "https://namidb.com"
+Repository = "https://github.com/namidb/namidb"
+
+[tool.maturin]
+# Mixed layout (S19.D): pure-Python wrapper + PEP 561 type stubs live
+# under `python/namidb/`; the Rust extension is built as
+# `namidb._lib` and re-exported from `python/namidb/__init__.py`.
+module-name = "namidb._lib"
+python-source = "python"
+features = ["pyo3/extension-module"]
+manifest-path = "Cargo.toml"
+strip = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

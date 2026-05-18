@@ -1,0 +1,24 @@
+[package]
+name = "namidb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Common types, errors, and schema primitives for NamiDB"
+readme = "README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

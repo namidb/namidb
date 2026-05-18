@@ -1,0 +1,54 @@
+# LocalStack-backed S3-compatible store for end-to-end CAS tests.
+#
+# LocalStack is used because it documents support for S3 conditional
+# writes (`If-Match`, `If-None-Match`), the API surface that the
+# manifest CAS protocol depends on.
+#
+# Usage:
+#   docker compose -f tests/docker-compose.s3.yml up -d
+#   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+#   AWS_ENDPOINT_URL=http://127.0.0.1:4566 AWS_ALLOW_HTTP=true \
+#   AWS_REGION=us-east-1 \
+#   NAMIDB_TEST_BUCKET=namidb-tests \
+#   cargo test -p namidb-storage --test s3_integration -- --ignored
+#
+#   docker compose -f tests/docker-compose.s3.yml down -v
+
+services:
+  localstack:
+    # Pinned to the last fully-free major. `latest` flips to a Pro image
+    # that requires `LOCALSTACK_AUTH_TOKEN` (exit 55 on bootstrap otherwise).
+    image: localstack/localstack:3
+    container_name: namidb-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEBUG: 0
+      PERSISTENCE: 0
+      AWS_DEFAULT_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - localstack-data:/var/lib/localstack
+
+  bucket-bootstrap:
+    image: amazon/aws-cli:latest
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: >
+      /bin/sh -c "
+        aws --endpoint-url http://localstack:4566 s3 mb s3://namidb-tests || true &&
+        echo 'bucket ready'
+      "
+
+volumes:
+  localstack-data:
