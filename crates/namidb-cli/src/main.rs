@@ -5,9 +5,12 @@
 //! - `namespace-check <name>` — validate a namespace identifier.
 //! - `parse <cypher>` — parse a Cypher query; print round-trip form.
 //! - `explain <cypher>` — parse + lower; print the logical plan tree.
-//! - `run [--namespace <ns>] <cypher>` — open an in-memory namespace,
-//! execute the query, print rows or `WriteOutcome`. Ephemeral —
-//! state lives only for the duration of the command.
+//! - `run [--store <uri>] [--namespace <ns>] <cypher>` — open a
+//! namespace, execute the query, print rows or `WriteOutcome`.
+//! With no `--store`, runs against an ephemeral `memory://`
+//! namespace. With `--store file:///path?ns=…` or any other
+//! supported scheme (s3, gs, az), state is durable on the
+//! configured backend.
 
 use std::sync::Arc;
 
@@ -18,7 +21,7 @@ use namidb_query::{
  explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
  WriteOutcome,
 };
-use namidb_storage::{NamespacePaths, WriterSession};
+use namidb_storage::{parse_uri, NamespacePaths, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -60,11 +63,26 @@ enum Cmd {
  /// Cypher source. Wrap multi-word queries in quotes.
  query: String,
  },
- /// Run a Cypher query against an in-memory namespace and print
- /// rows (for read queries) or the `WriteOutcome` (for write
- /// queries). State is ephemeral — destroyed on process exit.
+ /// Run a Cypher query against a NamiDB namespace and print rows
+ /// (for read queries) or the `WriteOutcome` (for write queries).
+ ///
+ /// Without `--store`, the command opens an ephemeral in-memory
+ /// namespace whose state vanishes on exit. With `--store <uri>`,
+ /// the namespace is durable on the configured backend
+ /// (`file://`, `s3://`, `gs://`, `az://`, or `memory://`).
  Run {
- /// Namespace name. Defaults to `default`.
+ /// Storage URI. Examples:
+ ///
+ ///   memory://acme
+ ///   file:///var/lib/namidb?ns=prod
+ ///   s3://my-bucket/data?ns=prod&region=us-east-1
+ ///   gs://my-bucket?ns=prod
+ ///   az://acct/container?ns=prod
+ #[arg(long)]
+ store: Option<String>,
+ /// Namespace name when `--store` is not supplied (defaults to
+ /// `default`; ignored when `--store` is set because the URI
+ /// carries its own `?ns=` parameter).
  #[arg(short, long, default_value = "default")]
  namespace: String,
  /// Cypher source. Wrap multi-word queries in quotes.
@@ -115,22 +133,31 @@ fn main() -> anyhow::Result<()> {
  };
  print!("{}", tree);
  }
- Cmd::Run { namespace, query } => {
+ Cmd::Run {
+ store,
+ namespace,
+ query,
+ } => {
  let rt = tokio::runtime::Builder::new_current_thread()
  .enable_all()
  .build()?;
- rt.block_on(run_query(&namespace, &query))?;
+ rt.block_on(run_query(store.as_deref(), &namespace, &query))?;
  }
  }
  Ok(())
 }
 
-async fn run_query(namespace: &str, query: &str) -> anyhow::Result<()> {
+async fn run_query(store_uri: Option<&str>, namespace: &str, query: &str) -> anyhow::Result<()> {
  let q = parse(query).map_err(|errs| parse_err(&errs))?;
 
+ let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
+ Some(uri) => parse_uri(uri).map_err(|e| anyhow::anyhow!("{e}"))?,
+ None => {
  let ns = NamespaceId::new(namespace)?;
  let paths = NamespacePaths::new("tenants", ns);
- let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+ (Arc::new(InMemory::new()), paths)
+ }
+ };
 
  let mut writer = WriterSession::open(store, paths).await?;
  let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
