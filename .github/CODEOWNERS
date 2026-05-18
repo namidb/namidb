@@ -1,0 +1,24 @@
+# Code owners for NamiDB
+#
+# Every PR auto-requests review from the owners of the touched paths.
+# Order is important — the last matching pattern takes precedence.
+
+# Default owner for everything
+*                                       @matiasfonseca
+
+# Workspace / build / CI
+/Cargo.toml                             @matiasfonseca
+/Cargo.lock                             @matiasfonseca
+/rust-toolchain.toml                    @matiasfonseca
+/.github/                               @matiasfonseca
+
+# Storage / query / Python bindings
+/crates/namidb-storage/                 @matiasfonseca
+/crates/namidb-query/                   @matiasfonseca
+/crates/namidb-py/                      @matiasfonseca
+
+# Design RFCs
+/docs/rfc/                              @matiasfonseca
+
+# Licensing & legal
+/LICENSE                                @matiasfonseca
