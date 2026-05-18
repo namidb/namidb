@@ -73,7 +73,7 @@ commercial license offered by the Licensor. A formal CLA will be
 requested for code contributions before they land in `main`.
 
 For commercial / proprietary embedding contact
-[`licensing@namidb.com`](mailto:licensing@namidb.com).
+[`info@namidb.com`](mailto:info@namidb.com).
 
 ## Communication
 
