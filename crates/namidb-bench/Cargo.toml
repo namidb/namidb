@@ -23,6 +23,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 object_store = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
-rand = "0.8"
+rand = "0.10"
 rand_chacha = "0.3"
 csv = "1.3"
