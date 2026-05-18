@@ -1,0 +1,30 @@
+[package]
+name = "namidb-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Python bindings for the NamiDB storage engine (pyo3 + maturin)"
+
+[lib]
+# Mixed maturin layout (S19.D): the Rust extension is shipped as
+# `namidb._lib`; users see the public surface re-exported from
+# `python/namidb/__init__.py` (so `import namidb` keeps working).
+name = "_lib"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+namidb-core = { workspace = true }
+namidb-storage = { workspace = true }
+namidb-query = { workspace = true }
+tokio = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+url = "2"
+chrono = { workspace = true }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39", "chrono"] }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
