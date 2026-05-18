@@ -1,0 +1,28 @@
+[package]
+name = "namidb-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "LDBC-shaped synthetic benchmark harness for NamiDB"
+
+[[bin]]
+name = "namidb-bench"
+path = "src/main.rs"
+
+[dependencies]
+namidb-core = { workspace = true }
+namidb-storage = { workspace = true }
+namidb-query = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+object_store = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+rand = "0.8"
+rand_chacha = "0.3"
+csv = "1.3"

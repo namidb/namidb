@@ -1,0 +1,37 @@
+/target
+/Cargo.lock
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.envrc
+.direnv/
+
+# Local minio/test data
+/.local/
+/scratch/
+/tmp/
+*.tgdb
+*.tgdb-shm
+*.tgdb-wal
+
+# Generated docs
+/docs/build/
+
+# Python artifacts (for bindings)
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Maturin `develop` drops the compiled extension into the python-source
+# directory for editable installs — don't ship build artifacts.
+crates/namidb-py/python/**/*.so
+crates/namidb-py/python/**/*.dylib
+crates/namidb-py/python/**/*.pyd
