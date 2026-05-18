@@ -59,7 +59,10 @@ The engine is the same whether you run it as a library inside your app, as a Rus
 ## Three deployments, one engine
 
 <p align="center">
-  <img src=".assets/namidb-deployments.png" alt="NamiDB deployments — Embedded, Server, Cloud" width="780" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".assets/namidb-deployments-dark.svg" />
+    <img src=".assets/namidb-deployments.svg" alt="NamiDB deployments — Server, Embedded, Cloud — converging on a single object-storage bucket" width="900" />
+  </picture>
 </p>
 
 | Mode | Status | Best for | How it ships |
@@ -490,7 +493,10 @@ the stable surface so a downstream `Cargo.toml` only needs one line.
 ## Architecture
 
 <p align="center">
-  <img src=".assets/namidb-architecture.png" alt="NamiDB architecture — query, storage and object-store tiers" width="820" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".assets/namidb-architecture-dark.svg" />
+    <img src=".assets/namidb-architecture.svg" alt="NamiDB architecture — Query / Graph / Storage (LSM) / Object store layers, with a cross-snapshot caches side-car" width="900" />
+  </picture>
 </p>
 
 ```

@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720"
+     role="img" aria-labelledby="t d">
+  <title id="t">NamiDB architecture</title>
+  <desc id="d">Four-layer engine stack — Query, Graph, Storage (LSM), Object store — with a cross-snapshot Caches side-car feeding back into the Query layer.</desc>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5eb5c8"/>
+    </marker>
+    <marker id="arrLight" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="720" fill="#0f172a"/>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       LEFT COLUMN — main 4-layer stack
+       ════════════════════════════════════════════════════════════════ -->
+
+  <!-- ── Layer 1: Query ───────────────────────────────────────────── -->
+  <g transform="translate(40 40)">
+    <rect width="800" height="120" rx="8"
+          fill="#1e293b" stroke="#e2e8f0" stroke-width="1.5"/>
+    <rect width="6" height="120" rx="3" fill="#5eb5c8"/>
+    <text x="28" y="38"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="22" font-weight="600" fill="#e2e8f0">Query</text>
+    <text x="28" y="58"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="11" fill="#94a3b8">crates/namidb-query</text>
+    <text x="28" y="92"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="13" fill="#cbd5e1">Cypher / GQL parsing  ·  Cost-based optimizer  ·  Morsel-driven executor  ·  Factorization (RFC-017)</text>
+    <text x="28" y="110"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-style="italic" font-size="11.5" fill="#94a3b8">openCypher 9 · GQL (ISO/IEC 39075:2024) · LDBC SNB IC01–IC12</text>
+  </g>
+
+  <!-- Arrow L1 → L2 -->
+  <path d="M 440 162 L 440 178" stroke="#5eb5c8" stroke-width="1.5"
+        fill="none" marker-end="url(#arr)"/>
+
+  <!-- ── Layer 2: Graph ───────────────────────────────────────────── -->
+  <g transform="translate(40 180)">
+    <rect width="800" height="120" rx="8"
+          fill="#1e293b" stroke="#e2e8f0" stroke-width="1.5"/>
+    <rect width="6" height="120" rx="3" fill="#5eb5c8"/>
+    <text x="28" y="38"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="22" font-weight="600" fill="#e2e8f0">Graph</text>
+    <text x="28" y="58"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="11" fill="#94a3b8">crates/namidb-graph</text>
+    <text x="28" y="92"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="13" fill="#cbd5e1">Property graph  ·  CSR adjacency (RFC-018)  ·  Columnar SSTs (RFC-002)</text>
+    <text x="28" y="110"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-style="italic" font-size="11.5" fill="#94a3b8">Parquet node rows · custom edge-SST format · zstd · bloom filters</text>
+  </g>
+
+  <!-- Arrow L2 → L3 -->
+  <path d="M 440 302 L 440 318" stroke="#5eb5c8" stroke-width="1.5"
+        fill="none" marker-end="url(#arr)"/>
+
+  <!-- ── Layer 3: Storage (LSM) ───────────────────────────────────── -->
+  <g transform="translate(40 320)">
+    <rect width="800" height="120" rx="8"
+          fill="#1e293b" stroke="#e2e8f0" stroke-width="1.5"/>
+    <rect width="6" height="120" rx="3" fill="#5eb5c8"/>
+    <text x="28" y="38"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="22" font-weight="600" fill="#e2e8f0">Storage<tspan font-size="14" font-weight="400" fill="#94a3b8">  ·  LSM</tspan></text>
+    <text x="28" y="58"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="11" fill="#94a3b8">crates/namidb-storage</text>
+    <text x="28" y="92"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="13" fill="#cbd5e1">WAL  ·  Memtable  ·  SST  ·  Manifest CAS  ·  Hybrid buffer pool (memory + NVMe)</text>
+    <text x="28" y="110"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-style="italic" font-size="11.5" fill="#94a3b8">single-writer per namespace · epoch fencing · flock CAS on file://</text>
+  </g>
+
+  <!-- Arrow L3 → L4 -->
+  <path d="M 440 442 L 440 458" stroke="#5eb5c8" stroke-width="1.5"
+        fill="none" marker-end="url(#arr)"/>
+
+  <!-- ── Layer 4: Object store (foundation, special styling) ──────── -->
+  <g transform="translate(40 460)">
+    <rect width="800" height="200" rx="8"
+          fill="#1e3a3f" stroke="#e2e8f0" stroke-width="1.5"/>
+    <rect width="6" height="200" rx="3" fill="#e2e8f0"/>
+    <text x="28" y="38"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="22" font-weight="600" fill="#e2e8f0">Object store</text>
+    <text x="28" y="58"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="11" fill="#94a3b8">the bucket is the database — source of truth</text>
+
+    <!-- Provider chips -->
+    <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+       font-size="12" font-weight="500">
+      <g transform="translate(28 82)">
+        <rect width="105" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="52.5" y="20.5" text-anchor="middle" fill="#e2e8f0">AWS S3</text>
+      </g>
+      <g transform="translate(143 82)">
+        <rect width="125" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="62.5" y="20.5" text-anchor="middle" fill="#e2e8f0">Cloudflare R2</text>
+      </g>
+      <g transform="translate(278 82)">
+        <rect width="80" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="40" y="20.5" text-anchor="middle" fill="#e2e8f0">GCS</text>
+      </g>
+      <g transform="translate(368 82)">
+        <rect width="105" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="52.5" y="20.5" text-anchor="middle" fill="#e2e8f0">Azure Blob</text>
+      </g>
+      <g transform="translate(483 82)">
+        <rect width="85" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="42.5" y="20.5" text-anchor="middle" fill="#e2e8f0">MinIO</text>
+      </g>
+      <g transform="translate(578 82)">
+        <rect width="85" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="42.5" y="20.5" text-anchor="middle" fill="#e2e8f0">Tigris</text>
+      </g>
+      <g transform="translate(673 82)">
+        <rect width="95" height="32" rx="4" fill="#2a4d52" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="3 2"/>
+        <text x="47.5" y="20.5" text-anchor="middle"
+              font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+              font-size="11.5" fill="#e2e8f0">file://</text>
+      </g>
+    </g>
+
+    <!-- Tagline -->
+    <text x="28" y="148"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="13" fill="#e2e8f0">Conditional writes (<tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12">If-Match</tspan>  ·  <tspan font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12">If-None-Match</tspan>) replace the consensus tier.</text>
+    <text x="28" y="170"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-style="italic" font-size="11.5" fill="#94a3b8">No Raft, no ZooKeeper, no etcd. Durability and tenancy come from the bucket.</text>
+    <text x="28" y="186"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="10.5" fill="#94a3b8">backed by object_store 0.13 (aws · gcp · azure)</text>
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════════
+       RIGHT COLUMN — Caches side-car
+       ════════════════════════════════════════════════════════════════ -->
+
+  <g transform="translate(880 40)">
+    <!-- Container: dashed border to denote "side-car" -->
+    <rect width="280" height="400" rx="8"
+          fill="#1e293b" stroke="#94a3b8" stroke-width="1.2"
+          stroke-dasharray="4 3"/>
+
+    <!-- Header -->
+    <text x="20" y="36"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-size="18" font-weight="600" fill="#e2e8f0">Caches</text>
+    <text x="20" y="56"
+          font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+          font-style="italic" font-size="11.5" fill="#94a3b8">cross-snapshot · byte-budgeted</text>
+
+    <!-- Card 1: AdjacencyCache -->
+    <g transform="translate(20 78)">
+      <rect width="240" height="86" rx="6"
+            fill="#1e293b" stroke="#e2e8f0" stroke-width="1.2"/>
+      <rect width="4" height="86" rx="2" fill="#5eb5c8"/>
+      <text x="18" y="26"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="14" font-weight="600" fill="#e2e8f0">AdjacencyCache</text>
+      <text x="18" y="44"
+            font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+            font-size="10.5" fill="#94a3b8">RFC-018</text>
+      <text x="18" y="64"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">CSR adjacency in-RAM,</text>
+      <text x="18" y="78"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">shared across snapshots</text>
+    </g>
+
+    <!-- Card 2: NodeViewCache -->
+    <g transform="translate(20 178)">
+      <rect width="240" height="86" rx="6"
+            fill="#1e293b" stroke="#e2e8f0" stroke-width="1.2"/>
+      <rect width="4" height="86" rx="2" fill="#5eb5c8"/>
+      <text x="18" y="26"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="14" font-weight="600" fill="#e2e8f0">NodeViewCache</text>
+      <text x="18" y="44"
+            font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+            font-size="10.5" fill="#94a3b8">RFC-019</text>
+      <text x="18" y="64"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">Cross-snapshot NodeView</text>
+      <text x="18" y="78"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">lookup cache (Arc-shared)</text>
+    </g>
+
+    <!-- Card 3: SstCache -->
+    <g transform="translate(20 278)">
+      <rect width="240" height="86" rx="6"
+            fill="#1e293b" stroke="#e2e8f0" stroke-width="1.2"/>
+      <rect width="4" height="86" rx="2" fill="#5eb5c8"/>
+      <text x="18" y="26"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="14" font-weight="600" fill="#e2e8f0">SstCache</text>
+      <text x="18" y="44"
+            font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+            font-size="10.5" fill="#94a3b8">RFC-020</text>
+      <text x="18" y="64"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">Decoded SST body +</text>
+      <text x="18" y="78"
+            font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+            font-size="11.5" fill="#cbd5e1">edge stream + reader</text>
+    </g>
+
+    <!-- Footer -->
+    <text x="140" y="386" text-anchor="middle"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="10" fill="#64748b">backed by foyer 0.22 (memory + disk)</text>
+  </g>
+
+  <!-- ── Feedback arrow: Caches → Query (read-through) ────────────── -->
+  <g>
+    <path d="M 884 70 C 870 70, 855 80, 845 95"
+          fill="none" stroke="#64748b" stroke-width="1.3"
+          stroke-dasharray="4 3"
+          marker-end="url(#arrLight)"/>
+    <text x="868" y="56"
+          font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+          font-size="9.5" fill="#64748b" text-anchor="end">read-through</text>
+  </g>
+
+  <!-- ── Footer ───────────────────────────────────────────────────── -->
+  <text x="1184" y="708" text-anchor="end"
+        font-family="ui-monospace, 'SF Mono', Menlo, monospace"
+        font-size="9" fill="#64748b">© NamiDB · BSL 1.1</text>
+</svg>

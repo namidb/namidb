@@ -343,8 +343,8 @@ export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
 2. Update `CHANGELOG.md` (or this README's release notes section).
 3. Commit, then tag and push:
    ```bash
-   git tag py-v0.1.0
-   git push origin py-v0.1.0
+   git tag py-v0.2.0
+   git push origin py-v0.2.0
    ```
 4. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
    arm64, Windows x86_64) + sdist, smoke-tests one wheel on Python
