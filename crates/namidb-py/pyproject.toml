@@ -4,7 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "namidb"
-version = "0.1.0"
+# Keep in sync with the workspace `version` in /Cargo.toml.
+# `python-wheels.yml` publishes a wheel whose filename uses THIS
+# version; the release tag `py-vX.Y.Z` must match X.Y.Z exactly.
+version = "0.2.0"
 description = "Cloud-native graph database on object storage — Python bindings"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
