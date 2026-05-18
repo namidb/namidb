@@ -25,6 +25,69 @@ below and in the release notes.
 
 ---
 
+## [0.2.0] — 2026-05-18 · self-host story
+
+### Added
+
+- **`file://` storage backend** with full manifest CAS via per-namespace
+  `flock` + atomic `rename(2)` (`namidb-storage::local::LocalFileObjectStore`).
+  Previously rejected with a `ValueError`; now a first-class durable
+  backend. Works in CI fixtures, single-machine deployments, and
+  anywhere a real bucket is overkill.
+- **`gs://` storage backend** for Google Cloud Storage. Credentials
+  via `GOOGLE_APPLICATION_CREDENTIALS` or `?service_account=` query
+  parameter. Previously rejected as "planned"; now stable.
+- **`az://` storage backend** for Azure Blob Storage. Credentials via
+  the standard `AZURE_STORAGE_*` env vars; supports the Azurite
+  emulator via `?use_emulator=true`. Previously rejected as "planned";
+  now stable.
+- **`namidb-server` crate and binary** — Rust HTTP daemon exposing a
+  REST API over any backend. Endpoints: `POST /v0/cypher`,
+  `GET /v0/health`, `GET /v0/version`, `POST /v0/admin/flush`. Bearer
+  token auth (`--auth-token`), periodic memtable flush
+  (`--flush-interval`), multi-stage Dockerfile, full JSON ↔ Cypher
+  type mapping for Node / Rel / Path values.
+- **`docker-compose.yml`** at the repo root — copy-paste recipe that
+  brings up MinIO + bucket-init + `namidb-server` and exposes an
+  authenticated graph database on `:8080`.
+- **Shared URI parser** (`namidb-storage::uri::parse_uri`) used by
+  the Python client, the CLI, and the server.
+- **Architecture and deployment diagrams** as native SVGs, with
+  matching dark-mode variants (`*-dark.svg`) selected by GitHub
+  automatically via `<picture media="(prefers-color-scheme: dark)">`.
+  System-font stack only; the dark palette swaps the slate ink for
+  a near-white on `#0f172a` ground and brightens the accent teal
+  to `#5eb5c8` for legibility.
+
+### Changed
+
+- **CLI `namidb run` learns `--store <uri>`** — accepts any supported
+  scheme (`memory://`, `file://`, `s3://`, `gs://`, `az://`) for
+  durable runs. Defaults to `memory://default` when omitted, preserving
+  the previous one-shot ephemeral UX.
+- **Python `tg.Client(uri)`** now delegates URI parsing to the shared
+  Rust implementation. `PyValueError` is raised on malformed URIs and
+  `PyRuntimeError` on backend-init failures; messages unchanged.
+- **README** reorganised into an S3-first self-host guide: hero hook
+  ("Your graph database lives in your S3 bucket"), "The shape"
+  paragraph, AWS S3 / Cloudflare R2 as starred backends, MinIO and the
+  others tucked into collapsible sections, and a new Roadmap section.
+- **`clap`** workspace feature set now includes `env` so server flags
+  can be supplied via `NAMIDB_*` env vars.
+
+### Fixed
+
+- `plan::explain::tests::explain_renders_full_chain` indent
+  expectation aligned with the tree-renderer's per-depth indentation.
+
+### Breaking
+
+- (none) — every previously-rejected scheme now returns a working
+  client instead of a `ValueError`; all existing `memory://` and
+  `s3://` URIs continue to work unchanged.
+
+---
+
 ## [0.1.0] — initial public release
 
 First public release of the NamiDB engine under
@@ -78,5 +141,6 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/namidb/namidb/releases/tag/v0.2.0
 [0.1.0]: https://github.com/namidb/namidb/releases/tag/v0.1.0
