@@ -14,7 +14,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -23,7 +22,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use namidb_core::{NamespaceId, NodeId, Value};
+use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
  execute, execute_write, parse as cypher_parse, plan as build_plan, ExecError, LogicalPlan,
@@ -51,14 +50,19 @@ impl Client {
  ///
  /// `uri` accepts:
  /// - `memory://<namespace>` — in-process store (testing).
- /// - `s3://<bucket>[/<prefix>]?ns=<namespace>[&region=...][&endpoint=...][&allow_http=true|false]`
- /// — any S3-compatible service. Credentials come from the
- /// standard AWS env vars (`AWS_ACCESS_KEY_ID`,
- /// `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`).
- ///
- /// `file://` is intentionally unsupported in v0 — see
- /// [`parse_uri`] for the rationale. `gs://` and `az://` are
- /// planned for a follow-up release.
+ /// - `file:///abs/dir?ns=<ns>` or `file://./rel?ns=<ns>` — local
+ /// filesystem with full manifest CAS (via flock + atomic rename).
+ /// - `s3://<bucket>[/<prefix>]?ns=<ns>[&region=...][&endpoint=...][&allow_http=true|false]`
+ /// — any S3-compatible service (AWS S3, Cloudflare R2, MinIO,
+ /// Tigris, LocalStack, …). Credentials come from the standard
+ /// AWS env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+ /// optional `AWS_SESSION_TOKEN`).
+ /// - `gs://<bucket>[/<prefix>]?ns=<ns>[&service_account=/path/key.json]`
+ /// — Google Cloud Storage. Auth from `GOOGLE_APPLICATION_CREDENTIALS`
+ /// or `?service_account=`.
+ /// - `az://<account>/<container>[/<prefix>]?ns=<ns>[&endpoint=...][&allow_http=true][&use_emulator=true]`
+ /// — Azure Blob Storage. Auth from `AZURE_STORAGE_ACCOUNT_NAME`
+ /// + `AZURE_STORAGE_ACCESS_KEY` (or SAS token via env).
  #[new]
  #[pyo3(signature = (uri, cache_bytes=None))]
  fn new(uri: &str, cache_bytes: Option<usize>) -> PyResult<Self> {
@@ -607,127 +611,14 @@ impl QueryResult {
 
 // ── URI parsing ───────────────────────────────────────────────────────
 
-/// Supported v0 schemes:
-///
-/// - `memory://<namespace>` — ephemeral, single-process.
-/// - `s3://<bucket>[/<prefix>]?ns=<namespace>[&region=...][&endpoint=...][&allow_http=true|false]`
-/// — works against any S3-compatible service. Credentials come from
-/// the standard AWS env vars (`AWS_ACCESS_KEY_ID`,
-/// `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`).
-///
-/// `file://` is intentionally **not** supported in v0: the upstream
-/// `object_store::local::LocalFileSystem` does not implement
-/// `PutMode::Update`, which the NamiDB manifest CAS protocol relies
-/// on. Use `s3://` against a local LocalStack instance for
-/// persistent local storage. `gs://` and `az://` are planned for a
-/// follow-up.
+/// Thin wrapper over [`namidb_storage::parse_uri`] that maps
+/// [`UriError`] variants onto pyo3 exceptions. See the storage crate
+/// for the canonical scheme reference.
 fn parse_uri(uri: &str) -> PyResult<(Arc<dyn ObjectStore>, namidb_storage::NamespacePaths)> {
- if uri.starts_with("memory://") {
- return parse_memory_uri(uri);
- }
- if uri.starts_with("s3://") {
- return parse_s3_uri(uri);
- }
- if uri.starts_with("file://") {
- return Err(PyValueError::new_err(
- "file:// is not supported in v0. The upstream \
- `object_store::local::LocalFileSystem` does not implement \
- `PutMode::Update`, which the NamiDB manifest CAS protocol \
- relies on. Use `memory://` for in-process testing or \
- `s3://` against any S3-compatible service \
- (LocalStack works for local persistence: \
- `s3://<bucket>?ns=<ns>&endpoint=http://localhost:4566&allow_http=true`).",
- ));
- }
- if uri.starts_with("gs://") || uri.starts_with("az://") {
- let scheme = uri.split("://").next().unwrap_or("?");
- return Err(PyValueError::new_err(format!(
- "{scheme}:// backend is planned for a follow-up release. \
- Use `s3://` (with any S3-compatible service) or `memory://` for now."
- )));
- }
- Err(PyValueError::new_err(format!(
- "unsupported URI scheme: {uri}. v0 supports `memory://<ns>` and \
- `s3://<bucket>[/<prefix>]?ns=<ns>[&region=...][&endpoint=...]`."
- )))
-}
-
-fn parse_memory_uri(uri: &str) -> PyResult<(Arc<dyn ObjectStore>, namidb_storage::NamespacePaths)> {
- let rest = uri
- .strip_prefix("memory://")
- .expect("caller checked memory:// prefix");
- if rest.is_empty() {
- return Err(PyValueError::new_err(
- "memory:// requires a namespace (e.g. memory://acme)",
- ));
- }
- let namespace = NamespaceId::new(rest)
- .map_err(|e| PyValueError::new_err(format!("bad namespace '{rest}': {e}")))?;
- let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
- Ok((store, namidb_storage::NamespacePaths::new("", namespace)))
-}
-
-fn parse_s3_uri(uri: &str) -> PyResult<(Arc<dyn ObjectStore>, namidb_storage::NamespacePaths)> {
- let parsed = url::Url::parse(uri)
- .map_err(|e| PyValueError::new_err(format!("invalid s3:// URI '{uri}': {e}")))?;
- let bucket = parsed.host_str().ok_or_else(|| {
- PyValueError::new_err(
- "s3:// URI requires a bucket name: \
- `s3://<bucket>[/<prefix>]?ns=<namespace>`",
- )
- })?;
- let path_prefix = parsed.path().trim_start_matches('/');
- // Default to `tenants` when no path prefix is supplied — keeps
- // multiple namespaces grouped under a predictable root.
- let store_prefix = if path_prefix.is_empty() {
- "tenants".to_string()
- } else {
- path_prefix.to_string()
- };
-
- let mut ns_str: Option<String> = None;
- let mut region: Option<String> = None;
- let mut endpoint: Option<String> = None;
- let mut allow_http = false;
- for (key, val) in parsed.query_pairs() {
- match key.as_ref() {
- "ns" | "namespace" => ns_str = Some(val.into_owned()),
- "region" => region = Some(val.into_owned()),
- "endpoint" => endpoint = Some(val.into_owned()),
- "allow_http" => allow_http = matches!(val.as_ref(), "true" | "1" | "yes"),
- _ => {} // forward-compat: ignore unknown params silently
- }
- }
- let ns_str = ns_str.ok_or_else(|| {
- PyValueError::new_err(
- "s3:// URI requires the `?ns=<namespace>` query parameter \
- (e.g. `s3://my-bucket?ns=acme`)",
- )
- })?;
- let namespace = NamespaceId::new(&ns_str)
- .map_err(|e| PyValueError::new_err(format!("bad namespace '{ns_str}': {e}")))?;
-
- // AmazonS3Builder picks up AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
- // AWS_SESSION_TOKEN, AWS_DEFAULT_REGION / AWS_REGION, etc. from the
- // environment. Query-string params override env where supplied.
- let mut builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
- if let Some(r) = region {
- builder = builder.with_region(r);
- }
- if let Some(ep) = endpoint {
- builder = builder.with_endpoint(ep);
- }
- if allow_http {
- builder = builder.with_allow_http(true);
- }
- let store = builder.build().map_err(|e| {
- PyRuntimeError::new_err(format!("failed to build S3 client for '{uri}': {e}"))
- })?;
-
- Ok((
- Arc::new(store) as Arc<dyn ObjectStore>,
- namidb_storage::NamespacePaths::new(&store_prefix, namespace),
- ))
+ namidb_storage::parse_uri(uri).map_err(|e| match e {
+ namidb_storage::UriError::BackendInit { .. } => PyRuntimeError::new_err(e.to_string()),
+ _ => PyValueError::new_err(e.to_string()),
+ })
 }
 
 fn parse_node_id(id: &str) -> PyResult<NodeId> {

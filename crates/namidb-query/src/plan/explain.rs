@@ -744,8 +744,8 @@ mod tests {
  let expected = "\
 TopN keys=[b DESC] limit=10
  Project [b=b]
- Expand source=a edge_type=KNOWS dir=-> rel=r target=b
- NodeScan label=Person alias=a
+  Expand source=a edge_type=KNOWS dir=-> rel=r target=b
+   NodeScan label=Person alias=a
 ";
  assert_eq!(out, expected);
  }

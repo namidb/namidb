@@ -21,6 +21,7 @@ pub mod fence;
 pub mod flush;
 pub mod ingest;
 pub mod janitor;
+pub mod local;
 pub mod manifest;
 pub mod memtable;
 pub mod node_cache;
@@ -29,6 +30,7 @@ pub mod paths;
 pub mod read;
 pub mod recovery;
 pub mod sst;
+pub mod uri;
 pub mod wal;
 
 pub use adjacency::{
@@ -45,6 +47,8 @@ pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
 pub use ingest::{CommitOutcome, WriterSession};
 pub use janitor::{sweep_orphans, JanitorReport};
+pub use local::LocalFileObjectStore;
+pub use uri::{parse_uri, UriError};
 pub use manifest::{
  KindSpecificStats, Manifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
  WalSegmentDescriptor,
