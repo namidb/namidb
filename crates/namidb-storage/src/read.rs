@@ -270,6 +270,37 @@ impl<'mt> Snapshot<'mt> {
  &self.manifest
  }
 
+ /// Every edge type observable through this snapshot — declared in the
+ /// manifest schema, present in the borrowed memtable, or persisted in
+ /// at least one SST descriptor (forward or inverse). Mirrors
+ /// [`crate::ingest::WriterSession::observed_edge_types`] for the
+ /// read-side: query executors that need to fan-out across all edge
+ /// types (e.g. typeless `Expand`, `DETACH DELETE` on the read path)
+ /// can rely on this rather than the bare declared schema, which is
+ /// empty for namespaces that never went through `SchemaBuilder`.
+ pub fn observed_edge_types(&self) -> Vec<String> {
+ use std::collections::BTreeSet;
+ let mut set: BTreeSet<String> = self
+ .manifest
+ .manifest
+ .schema
+ .edge_types
+ .keys()
+ .cloned()
+ .collect();
+ for (key, _) in self.memtable.iter() {
+ if let MemKey::Edge { edge_type, .. } = key {
+ set.insert(edge_type.clone());
+ }
+ }
+ for sst in &self.manifest.manifest.ssts {
+ if matches!(sst.kind, SstKind::EdgesFwd | SstKind::EdgesInv) {
+ set.insert(sst.scope.clone());
+ }
+ }
+ set.into_iter().collect()
+ }
+
  /// Look up a single node by `(label, id)`. Returns `None` for both
  /// "never inserted" and "winning record is a tombstone" outcomes.
  #[instrument(skip(self), fields(label = label, id = %id))]
