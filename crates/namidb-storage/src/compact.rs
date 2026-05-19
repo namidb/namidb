@@ -133,7 +133,7 @@ pub async fn compact_l0_to_l1(
  let body = get_sst_body(store.as_ref(), paths, desc).await?;
  readers.push(NodeSstReader::open(label_def.clone(), body)?);
  }
- let finish = compact_node_ssts(&label_def, &readers)?;
+ let (finish, merged_rows) = compact_node_ssts(&label_def, &readers)?;
  if finish.stats.row_count == 0 {
  // Nothing to write; still mark sources for removal so the
  // bucket truly shrinks.
@@ -143,7 +143,8 @@ pub async fn compact_l0_to_l1(
  continue;
  }
  let (descriptor, wrote_bloom) =
- put_node_sst_l1(store.as_ref(), paths, &label, finish).await?;
+ put_node_sst_l1(store.as_ref(), paths, &label, &label_def, &merged_rows, finish)
+ .await?;
  if wrote_bloom {
  bloom_count += 1;
  }
@@ -253,7 +254,10 @@ async fn compact_and_write_edges(
  Ok((Some(descriptor), wrote_bloom, removed))
 }
 
-fn compact_node_ssts(label_def: &LabelDef, sources: &[NodeSstReader]) -> Result<NodeSstFinish> {
+fn compact_node_ssts(
+ label_def: &LabelDef,
+ sources: &[NodeSstReader],
+) -> Result<(NodeSstFinish, Vec<NodeRow>)> {
  let mut rows: Vec<NodeRow> = Vec::new();
  for reader in sources {
  rows.extend(extract_node_rows_from_reader(reader, label_def)?);
@@ -262,7 +266,12 @@ fn compact_node_ssts(label_def: &LabelDef, sources: &[NodeSstReader]) -> Result<
  // dedup_by_key below preserves the winner.
  rows.sort_by(|a, b| a.id.cmp(&b.id).then(b.lsn.cmp(&a.lsn)));
  rows.dedup_by_key(|r| r.id);
- build_node_sst(label_def, &rows)
+ let finish = build_node_sst(label_def, &rows)?;
+ // Caller (`put_node_sst_l1`) consumes the merged rows to re-emit
+ // the unique-property side-cars; without this, post-compaction
+ // lookups on `(label, unique_prop)` fall back to the legacy full
+ // scan (P4.19 sidecar emission only happened in flush).
+ Ok((finish, rows))
 }
 
 fn extract_node_rows_from_reader(
@@ -412,6 +421,8 @@ async fn put_node_sst_l1(
  store: &dyn ObjectStore,
  paths: &NamespacePaths,
  label: &str,
+ label_def: &LabelDef,
+ merged_rows: &[NodeRow],
  finish: NodeSstFinish,
 ) -> Result<(SstDescriptor, bool)> {
  let id = Uuid::now_v7();
@@ -440,6 +451,23 @@ async fn put_node_sst_l1(
  )
  .await?;
 
+ // Re-emit unique-property side-cars for the merged L1 SST so the
+ // reader's `lookup_node_by_property` keeps the O(log N) probe
+ // path after compaction. Without this, every compaction silently
+ // demotes affected queries back to the legacy full label scan
+ // (P4.19 only emitted sidecars on flush).
+ let (unique_property_indices, index_sidecars) = crate::flush::prepare_unique_property_sidecars(
+ paths,
+ level.as_u32(),
+ &id,
+ label,
+ label_def,
+ merged_rows,
+ )?;
+ for (path, body) in &index_sidecars {
+ put_create(store, path, body.clone()).await?;
+ }
+
  let stats = finish.stats;
  let descriptor = SstDescriptor {
  id,
@@ -461,7 +489,7 @@ async fn put_node_sst_l1(
  tombstone_count: stats.tombstone_count,
  },
  bloom: bloom_descriptor,
- unique_property_indices: Vec::new(),
+ unique_property_indices,
  };
  Ok((descriptor, wrote_bloom))
 }
