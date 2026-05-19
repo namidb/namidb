@@ -606,3 +606,99 @@ async fn explicit_schema_round_trip() {
     let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
     assert_eq!(rows[0].get("n"), Some(&RuntimeValue::Integer(5)));
 }
+
+#[tokio::test]
+async fn match_expand_without_rel_type_enumerates_all_edge_types() {
+    // Regression for Bug #4: `MATCH (a)-[r]->(b)` without an explicit
+    // edge type must traverse every type declared on the manifest
+    // schema. Previously the executor aborted with "Expand requires
+    // explicit edge type".
+    let mut writer = WriterSession::open(store(), paths("exec-no-rel-type"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    let carol = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    writer
+        .upsert_node("Person", bob, &person("Bob", 25))
+        .unwrap();
+    writer
+        .upsert_node("Person", carol, &person("Carol", 40))
+        .unwrap();
+    writer.upsert_edge("KNOWS", alice, bob, &edge()).unwrap();
+    writer.upsert_edge("LIKES", bob, carol, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let q = parse(
+        "MATCH (a:Person)-[r]->(b:Person) \
+         RETURN a.name AS from, b.name AS to \
+         ORDER BY from, to",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| match (r.get("from"), r.get("to")) {
+            (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(b))) => {
+                (a.clone(), b.clone())
+            }
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "Bob".to_string()),
+            ("Bob".to_string(), "Carol".to_string()),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn var_length_expand_without_rel_type_crosses_heterogeneous_types() {
+    // Regression for Bug #6: `[*1..N]` without an explicit edge type
+    // must traverse every type at each hop. With `Alice -KNOWS-> Bob
+    // -LIKES-> Carol`, the pattern `(Alice)-[*1..2]->(c)` should reach
+    // Bob at hop 1 (via KNOWS) and Carol at hop 2 (KNOWS then LIKES).
+    let mut writer = WriterSession::open(store(), paths("exec-no-rel-type-varlen"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    let carol = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    writer
+        .upsert_node("Person", bob, &person("Bob", 25))
+        .unwrap();
+    writer
+        .upsert_node("Person", carol, &person("Carol", 40))
+        .unwrap();
+    writer.upsert_edge("KNOWS", alice, bob, &edge()).unwrap();
+    writer.upsert_edge("LIKES", bob, carol, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let q = parse(
+        "MATCH (a:Person {name: 'Alice'})-[*1..2]->(c:Person) \
+         RETURN c.name AS reached \
+         ORDER BY reached",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let reached: Vec<String> = rows
+        .iter()
+        .map(|r| match r.get("reached") {
+            Some(RuntimeValue::String(s)) => s.clone(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(reached, vec!["Bob".to_string(), "Carol".to_string()]);
+}

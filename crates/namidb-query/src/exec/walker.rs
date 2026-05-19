@@ -556,11 +556,7 @@ async fn execute_expand(
  want_properties: bool,
 ) -> Result<Vec<Row>, ExecError> {
  namidb_core::profile_scope!("walker::execute_expand");
- let edge_type = edge_type.ok_or_else(|| {
- ExecError::Runtime(
- "Expand requires explicit edge type (planned for future)".into(),
- )
- })?;
+ let edge_types = resolve_edge_types(snapshot, edge_type);
  let min = length.map(|l| l.min).unwrap_or(1);
  let max = length.map(|l| l.max).unwrap_or(1);
 
@@ -632,8 +628,13 @@ async fn execute_expand(
  for hop in 1..=max {
  let mut next_frontier = Vec::new();
  for step in frontier.drain(..) {
- let neighbours =
- neighbours_of(snapshot, edge_type, direction, step.tail, want_properties)
+ let neighbours = neighbours_of_any(
+ snapshot,
+ &edge_types,
+ direction,
+ step.tail,
+ want_properties,
+ )
  .await?;
  for edge in neighbours {
  let target_id = partner_id(&edge, direction, step.tail);
@@ -708,6 +709,38 @@ async fn execute_expand(
 struct Step {
  tail: NodeId,
  row: Row,
+}
+
+/// Resolve the set of edge types an `Expand` operator must traverse.
+///
+/// `Some(t)` → traverse only `t`. `None` (pattern wrote `-[r]->` without
+/// a type label, or `-[*1..N]->` with no type) → enumerate every edge
+/// type observable through the snapshot (declared schema + memtable +
+/// persisted SSTs). Cost grows linearly with the observed type count —
+/// EXPLAIN surfaces this so users can opt back into typed expansion.
+fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&str>) -> Vec<String> {
+ match edge_type {
+ Some(t) => vec![t.to_string()],
+ None => snapshot.observed_edge_types(),
+ }
+}
+
+async fn neighbours_of_any(
+ snapshot: &Snapshot<'_>,
+ edge_types: &[String],
+ direction: RelationshipDirection,
+ node: NodeId,
+ want_properties: bool,
+) -> Result<Vec<EdgeView>, ExecError> {
+ if edge_types.len() == 1 {
+ return neighbours_of(snapshot, &edge_types[0], direction, node, want_properties).await;
+ }
+ let mut all = Vec::new();
+ for et in edge_types {
+ let edges = neighbours_of(snapshot, et, direction, node, want_properties).await?;
+ all.extend(edges);
+ }
+ Ok(all)
 }
 
 async fn neighbours_of(
@@ -1571,11 +1604,7 @@ async fn execute_expand_factor(
  want_properties: bool,
 ) -> Result<FactorRowSet, ExecError> {
  namidb_core::profile_scope!("walker::execute_expand_factor");
- let edge_type = edge_type.ok_or_else(|| {
- ExecError::Runtime(
- "Expand requires explicit edge type (planned for future)".into(),
- )
- })?;
+ let edge_types = resolve_edge_types(snapshot, edge_type);
  let min = length.map(|l| l.min).unwrap_or(1);
  let max = length.map(|l| l.max).unwrap_or(1);
 
@@ -1667,7 +1696,8 @@ async fn execute_expand_factor(
  let mut next_frontier: Vec<(crate::exec::FactorIdx, NodeId)> = Vec::new();
  for (cur_parent, tail) in frontier.drain(..) {
  let neighbours =
- neighbours_of(snapshot, edge_type, direction, tail, want_properties).await?;
+ neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
+ .await?;
  for edge in neighbours {
  let target_id = partner_id(&edge, direction, tail);
  let target_view_opt = if back_reference {

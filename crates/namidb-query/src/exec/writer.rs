@@ -681,86 +681,120 @@ async fn apply_merge(
 
 /// Try to match the MERGE pattern against the current snapshot. Returns
 /// every row of bindings produced by the match (empty if no match).
+///
+/// `lower_create_pattern_element` emits Nodes and Rels in CREATE order
+/// (target Node before its incoming Rel), so callers must NOT assume
+/// positional layout. We locate the head by alias (the source of the
+/// single Rel for a 1-hop pattern, or the only Node for a 0-hop one)
+/// and dispatch by alias from there.
 async fn find_merge_matches(
  pattern: &[CreateElement],
  outer_row: &Row,
  writer: &mut WriterSession,
  params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- // v0 shape: at most one Node, optionally followed by Rel + Node.
- let head = match pattern.first() {
- Some(CreateElement::Node {
- alias,
- label,
- properties,
- }) => (alias.as_str(), label.as_str(), properties.as_slice()),
- _ => {
- return Err(ExecError::Runtime(
- "MERGE pattern must start with a node".into(),
- ));
- }
- };
-
- let snap = writer.snapshot();
- // Match the head node by scanning the label and filtering on the
- // declared properties (all must match exactly).
- let candidates = snap.scan_label(head.1).await.map_err(ExecError::Storage)?;
-
- let mut matched_rows: Vec<Row> = Vec::new();
- for view in candidates {
- let node_val = NodeValue::from(view);
- if !merge_props_match(head.2, &node_val.properties, outer_row, params)? {
- continue;
- }
- let mut new_row = outer_row.clone();
- new_row.set(head.0.to_string(), RuntimeValue::Node(Box::new(node_val)));
- matched_rows.push(new_row);
- }
-
- if pattern.len() == 1 {
- return Ok(matched_rows);
- }
- // 3-element pattern: [Node, Rel, Node].
- if pattern.len() != 3 {
- return Err(ExecError::Runtime(
- "MERGE patterns with more than one relationship hop land".into(),
- ));
- }
- let rel = match &pattern[1] {
- CreateElement::Rel {
- edge_type,
- direction,
- properties,
- ..
- } => (edge_type.as_str(), *direction, properties.as_slice()),
- _ => {
- return Err(ExecError::Runtime(
- "MERGE pattern second element must be a relationship".into(),
- ));
- }
- };
- let tail = match &pattern[2] {
+ // Split the pattern into Nodes (by alias) and Rels (in insertion
+ // order). v0 supports either a single Node, or exactly one Rel
+ // joining two Nodes.
+ let mut nodes: BTreeMap<&str, (&str, &[(String, Expression)])> = BTreeMap::new();
+ let mut rels: Vec<&CreateElement> = Vec::new();
+ for el in pattern {
+ match el {
  CreateElement::Node {
  alias,
  label,
  properties,
- } => (alias.as_str(), label.as_str(), properties.as_slice()),
- _ => {
+ } => {
+ nodes.insert(alias.as_str(), (label.as_str(), properties.as_slice()));
+ }
+ CreateElement::Rel { .. } => rels.push(el),
+ }
+ }
+
+ if rels.is_empty() {
+ // Single-node MERGE: pattern must contain exactly one Node.
+ if nodes.len() != 1 {
  return Err(ExecError::Runtime(
- "MERGE pattern third element must be a node".into(),
+ "MERGE pattern must contain at least one node".into(),
  ));
  }
+ let (head_alias, (head_label, head_props)) =
+ nodes.into_iter().next().expect("len == 1");
+ let snap = writer.snapshot();
+ let candidates = snap
+ .scan_label(head_label)
+ .await
+ .map_err(ExecError::Storage)?;
+ let mut matched_rows: Vec<Row> = Vec::new();
+ for view in candidates {
+ let node_val = NodeValue::from(view);
+ if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
+ continue;
+ }
+ let mut new_row = outer_row.clone();
+ new_row.set(head_alias.to_string(), RuntimeValue::Node(Box::new(node_val)));
+ matched_rows.push(new_row);
+ }
+ return Ok(matched_rows);
+ }
+
+ if rels.len() != 1 || nodes.len() != 2 {
+ return Err(ExecError::Runtime(
+ "MERGE patterns with more than one relationship hop are not supported yet".into(),
+ ));
+ }
+
+ let (rel_edge_type, rel_direction, rel_props, head_alias, tail_alias) = match rels[0] {
+ CreateElement::Rel {
+ edge_type,
+ direction,
+ properties,
+ source_alias,
+ target_alias,
+ ..
+ } => (
+ edge_type.as_str(),
+ *direction,
+ properties.as_slice(),
+ source_alias.as_str(),
+ target_alias.as_str(),
+ ),
+ _ => unreachable!("rels only contains Rel variants"),
  };
+
+ let (head_label, head_props) = *nodes
+ .get(head_alias)
+ .ok_or_else(|| ExecError::Runtime(format!("MERGE head `{}` not found", head_alias)))?;
+ let (tail_label, tail_props) = *nodes
+ .get(tail_alias)
+ .ok_or_else(|| ExecError::Runtime(format!("MERGE tail `{}` not found", tail_alias)))?;
+
+ let snap = writer.snapshot();
+ let candidates = snap
+ .scan_label(head_label)
+ .await
+ .map_err(ExecError::Storage)?;
+
+ let mut matched_rows: Vec<Row> = Vec::new();
+ for view in candidates {
+ let node_val = NodeValue::from(view);
+ if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
+ continue;
+ }
+ let mut new_row = outer_row.clone();
+ new_row.set(head_alias.to_string(), RuntimeValue::Node(Box::new(node_val)));
+ matched_rows.push(new_row);
+ }
 
  let mut chained: Vec<Row> = Vec::new();
  for head_row in matched_rows {
- let head_node = match head_row.get(head.0) {
- Some(RuntimeValue::Node(n)) => (n.id, n.label.clone()),
+ let head_node_id = match head_row.get(head_alias) {
+ Some(RuntimeValue::Node(n)) => n.id,
  _ => continue,
  };
- let neighbours = match rel.1 {
- RelationshipDirection::Right => snap.out_edges(rel.0, head_node.0).await,
- RelationshipDirection::Left => snap.in_edges(rel.0, head_node.0).await,
+ let neighbours = match rel_direction {
+ RelationshipDirection::Right => snap.out_edges(rel_edge_type, head_node_id).await,
+ RelationshipDirection::Left => snap.in_edges(rel_edge_type, head_node_id).await,
  RelationshipDirection::Both => {
  return Err(ExecError::Runtime(
  "MERGE relationship must be directed".into(),
@@ -770,29 +804,28 @@ async fn find_merge_matches(
  .map_err(ExecError::Storage)?;
 
  for e in neighbours.edges {
- let partner_id = match rel.1 {
+ let partner_id = match rel_direction {
  RelationshipDirection::Right => e.dst,
  RelationshipDirection::Left => e.src,
  _ => unreachable!(),
  };
  let partner = match snap
- .lookup_node(tail.1, partner_id)
+ .lookup_node(tail_label, partner_id)
  .await
  .map_err(ExecError::Storage)?
  {
  Some(v) => NodeValue::from(v),
  None => continue,
  };
- if !merge_props_match(tail.2, &partner.properties, &head_row, params)? {
+ if !merge_props_match(tail_props, &partner.properties, &head_row, params)? {
  continue;
  }
- // Edge-properties match check
  let rel_value = RelValue::from(e);
- if !merge_props_match(rel.2, &rel_value.properties, &head_row, params)? {
+ if !merge_props_match(rel_props, &rel_value.properties, &head_row, params)? {
  continue;
  }
  let mut new_row = head_row.clone();
- new_row.set(tail.0.to_string(), RuntimeValue::Node(Box::new(partner)));
+ new_row.set(tail_alias.to_string(), RuntimeValue::Node(Box::new(partner)));
  chained.push(new_row);
  }
  }
