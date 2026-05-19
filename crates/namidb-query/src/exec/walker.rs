@@ -550,6 +550,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
  *back_reference,
  snapshot,
  routing.needs_properties(rel_alias.as_deref()),
+ should_skip_target_materialize(
+ snapshot,
+ routing,
+ target_alias,
+ edge_type.as_deref(),
+ *direction,
+ target_label.as_deref(),
+ *length,
+ *back_reference,
+ ),
  )
  .await
  }
@@ -583,6 +593,7 @@ async fn execute_expand(
  back_reference: bool,
  snapshot: &Snapshot<'_>,
  want_properties: bool,
+ skip_target_materialize: bool,
 ) -> Result<Vec<Row>, ExecError> {
  namidb_core::profile_scope!("walker::execute_expand");
  let edge_types = resolve_edge_types(snapshot, edge_type);
@@ -673,6 +684,13 @@ async fn execute_expand(
  // can populate / label-filter.
  let target_view_opt = if back_reference {
  None
+ } else if skip_target_materialize {
+ // Fix #3: the binding is "transit only" — the next
+ // Expand reads only `.id`. Skip the SST decode and
+ // synthesise an id-only stub below. Schema-guaranteed
+ // dst_label means no correctness drift vs the
+ // `continue`-on-None branch below.
+ None
  } else if let Some(label) = target_label {
  match snapshot.lookup_node(label, target_id).await? {
  Some(v) => Some(v),
@@ -692,6 +710,18 @@ async fn execute_expand(
  new_row.set(
  target_alias.to_string(),
  RuntimeValue::Node(Box::new(NodeValue::from(view))),
+ );
+ } else if skip_target_materialize && !back_reference {
+ // id-only stub: enough for the next Expand to read
+ // `.id`; `label` is preserved so RuntimeValue::Node
+ // still type-checks for downstream Expand source reads.
+ new_row.set(
+ target_alias.to_string(),
+ RuntimeValue::Node(Box::new(NodeValue {
+ id: target_id,
+ label: target_label.unwrap_or_default().to_string(),
+ properties: std::collections::BTreeMap::new(),
+ })),
  );
  }
  // Back-reference: the binding stays at the
@@ -836,6 +866,76 @@ fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId)
  } else {
  edge.src
  }
+ }
+ }
+}
+
+/// Fix #3 entry point: decide whether the Expand's `target_alias`
+/// binding can be stubbed (id-only) instead of materialised via
+/// `lookup_node`. Five conditions must hold:
+///
+/// 1. `target_alias` is never read by any expression in the plan —
+///    not in RETURN, WHERE, ORDER BY, projection items, join keys,
+///    aggregation args, etc. Determined by [`PlanRouting::references`].
+///    A `Variable(t)` or `Property(t, _)` anywhere flips this off.
+/// 2. The length is single-hop (`*1..1`, the default). Variable-length
+///    paths bind `target_alias` at every intermediate hop, so the
+///    "transit only" assumption breaks down.
+/// 3. The Expand is not a back-reference (the existing binding already
+///    carries the materialised NodeView; we leave it alone).
+/// 4. The edge_type is known statically (un-typed expand `(-[]-)` would
+///    require enumerating every edge_type and we can't constrain the
+///    target label).
+/// 5. The `(edge_type, direction, target_label)` triple is
+///    schema-guaranteed: the schema declares an edge_type whose
+///    dst_label (Right) or src_label (Left) matches the target_label.
+///    Any edge surfacing through the CSR / SST adjacency for that
+///    `(edge_type, direction)` then points at a node guaranteed to be
+///    of that label — the same invariant `lookup_node(label, id)`
+///    enforces via its `continue`-on-None branch, but for free.
+#[allow(clippy::too_many_arguments)]
+fn should_skip_target_materialize(
+ snapshot: &Snapshot<'_>,
+ routing: &PlanRouting,
+ target_alias: &str,
+ edge_type: Option<&str>,
+ direction: RelationshipDirection,
+ target_label: Option<&str>,
+ length: Option<crate::parser::RelationshipLength>,
+ back_reference: bool,
+) -> bool {
+ if back_reference {
+ return false;
+ }
+ if routing.references(target_alias) {
+ return false;
+ }
+ // Single-hop only. None means "default *1..1" by lowering convention.
+ let single_hop = length.map(|l| l.min == 1 && l.max == 1).unwrap_or(true);
+ if !single_hop {
+ return false;
+ }
+ let Some(edge_type) = edge_type else {
+ return false;
+ };
+ let Some(target_label) = target_label else {
+ // Without target_label the legacy path uses `scan_node_for_id`
+ // to confirm the id resolves to *some* node. We could try
+ // harder (e.g. require the schema-declared dst_label to be a
+ // singleton across all edge_types), but the conservative gate
+ // covers IC09 / IC02 already.
+ return false;
+ };
+ let schema = &snapshot.manifest().manifest.schema;
+ let Some(edge_def) = schema.edge_type(edge_type) else {
+ return false;
+ };
+ match direction {
+ RelationshipDirection::Right => edge_def.dst_label == target_label,
+ RelationshipDirection::Left => edge_def.src_label == target_label,
+ // Undirected: we'd have to inspect each edge individually.
+ RelationshipDirection::Both => {
+ edge_def.dst_label == target_label && edge_def.src_label == target_label
  }
  }
 }
@@ -1430,6 +1530,16 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
  *back_reference,
  snapshot,
  routing.needs_properties(rel_alias.as_deref()),
+ should_skip_target_materialize(
+ snapshot,
+ routing,
+ target_alias,
+ edge_type.as_deref(),
+ *direction,
+ target_label.as_deref(),
+ *length,
+ *back_reference,
+ ),
  )
  .await
  }
@@ -1738,6 +1848,7 @@ async fn execute_expand_factor(
  back_reference: bool,
  snapshot: &Snapshot<'_>,
  want_properties: bool,
+ skip_target_materialize: bool,
 ) -> Result<FactorRowSet, ExecError> {
  namidb_core::profile_scope!("walker::execute_expand_factor");
  let edge_types = resolve_edge_types(snapshot, edge_type);
@@ -1838,6 +1949,9 @@ async fn execute_expand_factor(
  let target_id = partner_id(&edge, direction, tail);
  let target_view_opt = if back_reference {
  None
+ } else if skip_target_materialize {
+ // Fix #3: transit-only binding, see flat-path comment.
+ None
  } else if let Some(label) = target_label {
  match snapshot.lookup_node(label, target_id).await? {
  Some(v) => Some(v),
@@ -1860,6 +1974,16 @@ async fn execute_expand_factor(
  slots.push(Slot {
  name: target_arc.clone(),
  value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+ });
+ } else if skip_target_materialize && !back_reference {
+ // id-only stub for the next Expand's `.id` read.
+ slots.push(Slot {
+ name: target_arc.clone(),
+ value: RuntimeValue::Node(Box::new(NodeValue {
+ id: target_id,
+ label: target_label.unwrap_or_default().to_string(),
+ properties: std::collections::BTreeMap::new(),
+ })),
  });
  }
  // One arena push per (parent, edge) pair. NO Row clone.
@@ -2265,9 +2389,22 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
 // — `r.prop` already lands `r` in the set, which is exactly the
 // invariant we need (whole-rel returns must also see populated
 // properties, so they take the SST path too).
+//
+// Second invariant: the same set drives **target-materialise skipping**
+// for chained Expands (Fix #3 — closes cold IC09 by removing the
+// per-edge `lookup_node` on intermediate hops). A target_alias that
+// never appears in any expression (RETURN / WHERE / ORDER BY /
+// projection / join key / aggregation) is only ever read by the next
+// Expand's `source` lookup, which uses only `NodeValue.id`. We can
+// therefore stub the binding with an id-only `NodeValue` and avoid the
+// SST decode entirely. Correctness is preserved when the
+// `(edge_type, direction, target_label)` triple is schema-guaranteed
+// (the dst/src label of the edge matches the declared target label) —
+// any edge surfacing through neighbours_of_any then points at a node
+// that *is* of the expected label.
 #[derive(Debug, Default)]
 pub(crate) struct PlanRouting {
- rel_aliases_needing_properties: BTreeSet<String>,
+ referenced_aliases: BTreeSet<String>,
 }
 
 impl PlanRouting {
@@ -2275,15 +2412,26 @@ impl PlanRouting {
  let mut refs: BTreeSet<String> = BTreeSet::new();
  collect_plan_referenced_variables(plan, &mut refs);
  Self {
- rel_aliases_needing_properties: refs,
+ referenced_aliases: refs,
  }
  }
 
  pub(crate) fn needs_properties(&self, rel_alias: Option<&str>) -> bool {
  match rel_alias {
  None => false,
- Some(a) => self.rel_aliases_needing_properties.contains(a),
+ Some(a) => self.referenced_aliases.contains(a),
  }
+ }
+
+ /// `true` ⇔ `alias` is read anywhere in the plan — RETURN, WHERE,
+ /// ORDER BY, projection, join keys, aggregation args, etc. Bare
+ /// `Variable(alias)` and `Property(alias, k)` both count.
+ ///
+ /// An Expand whose `target_alias` returns `false` here is "transit
+ /// only": the next Expand reads its `.id`, nothing else, so we can
+ /// skip materialising the NodeView entirely (Fix #3).
+ pub(crate) fn references(&self, alias: &str) -> bool {
+ self.referenced_aliases.contains(alias)
  }
 }
 
