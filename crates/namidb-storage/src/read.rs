@@ -454,6 +454,204 @@ impl<'mt> Snapshot<'mt> {
  Ok(result)
  }
 
+ /// Batched analogue of [`Self::lookup_node`]: probe many `ids` for
+ /// the same `label` in one pass over the `(Nodes, label)` SST set.
+ ///
+ /// Returns a `Vec<Option<NodeView>>` aligned 1:1 with `ids`. `None`
+ /// means absent or tombstoned at this snapshot. Duplicates in `ids`
+ /// resolve to the same `NodeView` value (cheap clone — same Arc).
+ ///
+ /// Why this exists: in cold IC09-shaped workloads
+ /// (`(a)-[:KNOWS]->(b)-[:KNOWS]->(c)`) the per-edge `lookup_node`
+ /// loop in `walker::execute_expand` issues N×M calls (~2 k for SF1).
+ /// Each call decodes the same Person SST once. The batched variant
+ /// decodes each candidate SST once total and matches all `ids`
+ /// against the resulting `RecordBatch`es in one pass — turning a
+ /// linear N×M ladder into one SST decode per `(label, scope)`.
+ ///
+ /// Layered consistency: results are LSN-merged across memtable + all
+ /// candidate SSTs, exactly like the single-id path. The cache tiers
+ /// are checked first (L1 intra-snapshot, L2 cross-snapshot when
+ /// attached) so already-resolved ids skip the SST scan entirely.
+ /// Fresh resolutions populate L1 and L2 on the way out.
+ #[instrument(skip(self, ids), fields(label = label, ids_len = ids.len()))]
+ pub async fn batch_lookup_nodes(
+ &self,
+ label: &str,
+ ids: &[NodeId],
+ ) -> Result<Vec<Option<NodeView>>> {
+ namidb_core::profile_scope!("Snapshot::batch_lookup_nodes");
+ if ids.is_empty() {
+ return Ok(Vec::new());
+ }
+
+ let mut out: Vec<Option<NodeView>> = vec![None; ids.len()];
+
+ // Group output indices by id_bytes so duplicate `ids` map to the
+ // same view, and so the L2 / SST passes only do unique work.
+ let mut id_to_outputs: HashMap<[u8; 16], Vec<usize>> = HashMap::new();
+ for (i, id) in ids.iter().enumerate() {
+ id_to_outputs.entry(*id.as_bytes()).or_default().push(i);
+ }
+
+ // L1 cache pass: drop any id that's already resolved.
+ let mut pending: std::collections::HashSet<[u8; 16]> = id_to_outputs.keys().copied().collect();
+ {
+ let cache = self.node_cache.lock().unwrap();
+ for (id_bytes, outputs) in &id_to_outputs {
+ let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
+ let intra_key = (label.to_string(), id);
+ if let Some(cached) = cache.get(&intra_key).cloned() {
+ namidb_core::profile::record(
+ "Snapshot::batch_lookup_nodes.l1_hit",
+ 0,
+ );
+ for &i in outputs {
+ out[i] = cached.clone();
+ }
+ pending.remove(id_bytes);
+ }
+ }
+ }
+
+ // L2 cache pass: same logic against the cross-snapshot cache.
+ if let Some(shared) = &self.shared_node_cache {
+ let manifest_version = self.manifest.manifest.version;
+ let mut promote: Vec<(NodeCacheKey, Option<NodeView>)> = Vec::new();
+ for id_bytes in &pending {
+ let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
+ let shared_key = NodeCacheKey {
+ manifest_version,
+ label: label.to_string(),
+ node_id: id,
+ };
+ if let Some(cached) = shared.get(&shared_key) {
+ namidb_core::profile::record(
+ "Snapshot::batch_lookup_nodes.l2_hit",
+ 0,
+ );
+ for &i in &id_to_outputs[id_bytes] {
+ out[i] = cached.clone();
+ }
+ promote.push((shared_key.clone(), cached));
+ }
+ }
+ let mut cache = self.node_cache.lock().unwrap();
+ for (key, view) in promote {
+ let id_bytes = *key.node_id.as_bytes();
+ pending.remove(&id_bytes);
+ cache.insert((key.label, key.node_id), view);
+ }
+ }
+
+ if pending.is_empty() {
+ return Ok(out);
+ }
+
+ // Aggregate winners across memtable + every (Nodes, label) SST
+ // candidate. Last-LSN-wins, mirroring `lookup_node_uncached`.
+ let mut winners: HashMap<[u8; 16], (u64, Option<NodeView>)> = HashMap::new();
+
+ // 1. Memtable: probe each pending id.
+ for id_bytes in &pending {
+ let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
+ if let Some(entry) = self.memtable.get(&MemKey::Node {
+ label: label.to_string(),
+ id,
+ }) {
+ let view = match &entry.op {
+ MemOp::Tombstone => None,
+ MemOp::Upsert(payload) => Some(node_view_from_payload(
+ id,
+ label.to_string(),
+ entry.lsn,
+ payload,
+ )?),
+ };
+ // Inline last-LSN-wins: equivalent to update_node_winner
+ // but keyed by raw bytes (cheaper than NodeId for the SST
+ // harvest path).
+ match winners.get(id_bytes) {
+ Some((existing_lsn, _)) if *existing_lsn >= entry.lsn => {}
+ _ => {
+ winners.insert(*id_bytes, (entry.lsn, view));
+ }
+ }
+ }
+ }
+
+ // 2. SST pass: iterate every `(Nodes, label)` descriptor exactly
+ // once, decode its body, and harvest every pending id in one
+ // sweep over the record batches.
+ let label_def = self
+ .manifest
+ .manifest
+ .schema
+ .label(label)
+ .cloned()
+ .unwrap_or_else(|| LabelDef {
+ name: label.to_string(),
+ properties: vec![],
+ });
+ let sst_idxs: Vec<usize> = self
+ .manifest
+ .index
+ .scope_descriptors(SstKind::Nodes, label)
+ .to_vec();
+ for idx in sst_idxs {
+ let desc = &self.manifest.manifest.ssts[idx];
+ // Cheap pre-filter: skip the SST if its [min_key, max_key]
+ // range is disjoint from every pending id. For typical
+ // LDBC IDs this still admits the SST (UUIDv7 hashes spread
+ // across the range), but it cheaply rules out partition
+ // scenarios where a label is split into per-tenant SSTs.
+ let min_key = desc.min_key;
+ let max_key = desc.max_key;
+ if !pending
+ .iter()
+ .any(|id| id >= &min_key && id <= &max_key)
+ {
+ continue;
+ }
+ // Always go through the body cache: one decode per SST,
+ // amortising the cost across every pending id.
+ let body = self.get_sst_body(desc).await?;
+ let reader = NodeSstReader::open(label_def.clone(), body)?;
+ let batches = reader.scan()?;
+ batch_harvest_node_rows(
+ &batches,
+ &label_def,
+ label,
+ &pending,
+ &mut winners,
+ )?;
+ }
+
+ // 3. Push every (resolved or negative) outcome into the output
+ // vector and populate the cache tiers.
+ let shared = self.shared_node_cache.clone();
+ let manifest_version = self.manifest.manifest.version;
+ let mut cache_l1 = self.node_cache.lock().unwrap();
+ for id_bytes in &pending {
+ let view = winners.remove(id_bytes).map(|(_, v)| v).unwrap_or(None);
+ for &i in &id_to_outputs[id_bytes] {
+ out[i] = view.clone();
+ }
+ let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
+ cache_l1.insert((label.to_string(), id), view.clone());
+ if let Some(ref shared) = shared {
+ let shared_key = NodeCacheKey {
+ manifest_version,
+ label: label.to_string(),
+ node_id: id,
+ };
+ shared.insert(shared_key, view);
+ }
+ }
+
+ Ok(out)
+ }
+
  /// Force the legacy uncached path. Bypasses both L1 and L2. Used by
  /// parity tests (RFC-019) to compare against the tiered path
  /// without mutating env state.
@@ -1515,6 +1713,90 @@ fn find_node_row_in_batches(
  }
  }
  Ok(None)
+}
+
+/// Batched analogue of `find_node_row_in_batches`: walk `batches` ONCE,
+/// emit a `NodeView` (or tombstone marker) for every row whose `node_id`
+/// is in `pending`, and last-LSN-merge into `winners`. The hot inner
+/// loop short-circuits on rows whose id isn't in the pending set, so
+/// the per-row cost on irrelevant rows is one `HashSet::contains`.
+fn batch_harvest_node_rows(
+ batches: &[RecordBatch],
+ label_def: &LabelDef,
+ label: &str,
+ pending: &std::collections::HashSet<[u8; 16]>,
+ winners: &mut HashMap<[u8; 16], (u64, Option<NodeView>)>,
+) -> Result<()> {
+ for batch in batches {
+ let id_col = batch
+ .column_by_name(COL_NODE_ID)
+ .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+ .ok_or_else(|| Error::invariant("node_id column missing"))?;
+ let tomb_col = batch
+ .column_by_name(COL_TOMBSTONE)
+ .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+ .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+ let lsn_col = batch
+ .column_by_name(COL_LSN)
+ .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+ .ok_or_else(|| Error::invariant("lsn column missing"))?;
+ let ovf_col = batch
+ .column_by_name(OVERFLOW_JSON)
+ .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+ .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
+ let sv_col = batch
+ .column_by_name(SCHEMA_VERSION)
+ .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+ .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
+ for row in 0..batch.num_rows() {
+ let row_id: [u8; 16] = id_col
+ .value(row)
+ .try_into()
+ .map_err(|_| Error::invariant("node_id row length != 16"))?;
+ if !pending.contains(&row_id) {
+ continue;
+ }
+ let tomb = tomb_col.value(row);
+ let lsn = lsn_col.value(row);
+ // Last-LSN-wins early skip: if the existing winner already
+ // beats us, decoding the row's properties would be wasted.
+ if let Some((existing_lsn, _)) = winners.get(&row_id) {
+ if *existing_lsn >= lsn {
+ continue;
+ }
+ }
+ let view = if tomb {
+ None
+ } else {
+ let mut properties: BTreeMap<String, Value> = BTreeMap::new();
+ for p in &label_def.properties {
+ let col_name = prop_column_name(p);
+ let col = batch
+ .column_by_name(&col_name)
+ .ok_or_else(|| Error::invariant(format!("missing column {col_name}")))?;
+ if let Some(v) = arrow_value_to_value(col.as_ref(), row, &p.data_type)? {
+ properties.insert(p.name.clone(), v);
+ }
+ }
+ if !ovf_col.is_null(row) {
+ let json_str = ovf_col.value(row);
+ let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
+ properties.extend(extra);
+ }
+ let schema_version = sv_col.value(row);
+ let id = NodeId::from_uuid(Uuid::from_bytes(row_id));
+ Some(NodeView {
+ id,
+ label: label.to_string(),
+ properties,
+ lsn,
+ schema_version,
+ })
+ };
+ winners.insert(row_id, (lsn, view));
+ }
+ }
+ Ok(())
 }
 
 pub(crate) fn arrow_value_to_value(

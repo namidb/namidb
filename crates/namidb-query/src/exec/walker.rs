@@ -667,6 +667,16 @@ async fn execute_expand(
  let _ = hop_start;
  for hop in 1..=max {
  let mut next_frontier = Vec::new();
+ // Phase 1: pre-collect neighbours for every step so we can
+ // batch-prewarm `Snapshot::lookup_node` once per hop (Fix #3b).
+ // Without this, each (step, edge) pair issues its own
+ // `lookup_node` SST decode — the dominant cost in cold IC09
+ // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
+ let mut step_neighbours: Vec<(Step, Vec<EdgeView>)> =
+ Vec::with_capacity(frontier.len());
+ let mut unique_targets: Vec<NodeId> = Vec::new();
+ let mut seen_targets: std::collections::HashSet<NodeId> =
+ std::collections::HashSet::new();
  for step in frontier.drain(..) {
  let neighbours = neighbours_of_any(
  snapshot,
@@ -676,6 +686,26 @@ async fn execute_expand(
  want_properties,
  )
  .await?;
+ if !back_reference && !skip_target_materialize {
+ for edge in &neighbours {
+ let tid = partner_id(edge, direction, step.tail);
+ if seen_targets.insert(tid) {
+ unique_targets.push(tid);
+ }
+ }
+ }
+ step_neighbours.push((step, neighbours));
+ }
+ // Phase 2: batch prewarm. Populates L1 (and L2 if attached)
+ // so the per-edge `lookup_node` below hits the cache instead
+ // of decoding the SST again. We discard the returned `Vec`;
+ // the cache is the only side-effect we care about.
+ if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
+ if let Some(label) = target_label {
+ let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
+ }
+ }
+ for (step, neighbours) in step_neighbours {
  for edge in neighbours {
  let target_id = partner_id(&edge, direction, step.tail);
  // Back-reference fast path: skip the lookup_node
@@ -1941,10 +1971,35 @@ async fn execute_expand_factor(
 
  for hop in 1..=max {
  let mut next_frontier: Vec<(crate::exec::FactorIdx, NodeId)> = Vec::new();
+ // Phase 1: pre-collect neighbours per frontier entry so the
+ // batch prewarm below can populate L1 with one SST decode
+ // (Fix #3b — same rationale as the flat path).
+ let mut step_neighbours: Vec<((crate::exec::FactorIdx, NodeId), Vec<EdgeView>)> =
+ Vec::with_capacity(frontier.len());
+ let mut unique_targets: Vec<NodeId> = Vec::new();
+ let mut seen_targets: std::collections::HashSet<NodeId> =
+ std::collections::HashSet::new();
  for (cur_parent, tail) in frontier.drain(..) {
  let neighbours =
  neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
  .await?;
+ if !back_reference && !skip_target_materialize {
+ for edge in &neighbours {
+ let tid = partner_id(edge, direction, tail);
+ if seen_targets.insert(tid) {
+ unique_targets.push(tid);
+ }
+ }
+ }
+ step_neighbours.push(((cur_parent, tail), neighbours));
+ }
+ // Phase 2: batch prewarm.
+ if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
+ if let Some(label) = target_label {
+ let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
+ }
+ }
+ for ((cur_parent, tail), neighbours) in step_neighbours {
  for edge in neighbours {
  let target_id = partner_id(&edge, direction, tail);
  let target_view_opt = if back_reference {
