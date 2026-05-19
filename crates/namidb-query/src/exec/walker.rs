@@ -1015,7 +1015,7 @@ pub(crate) fn execute_aggregate(
  let mut out = Vec::with_capacity(groups.len());
  for (_, (key_vals, group_rows)) in groups {
  let mut row = Row::new();
- for ((_, alias), v) in group_by.iter().zip(key_vals.into_iter()) {
+ for ((_, alias), v) in group_by.iter().zip(key_vals) {
  row.set(alias.clone(), v);
  }
  for (alias, agg) in aggregations {
