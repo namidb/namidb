@@ -620,7 +620,12 @@ fn prepare_node_pending(
 /// without the property (nullable column, schema-evolved out, ...)
 /// contribute nothing either. Non-string property values are skipped —
 /// v0 covers LDBC's `id` only; a future bump can promote typed keys.
-fn prepare_unique_property_sidecars(
+///
+/// `pub(crate)` so `compact.rs` can re-emit sidecars when merging
+/// L0 SSTs into L1 (without this, post-compaction `lookup_node_by_property`
+/// falls back to the legacy full label scan because none of the L1
+/// SSTs carry the sidecar).
+pub(crate) fn prepare_unique_property_sidecars(
  paths: &NamespacePaths,
  level: u32,
  sst_id: &Uuid,
