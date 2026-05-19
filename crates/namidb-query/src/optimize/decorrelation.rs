@@ -133,7 +133,7 @@ fn property_expression(alias: &str, key: &str) -> Expression {
 fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<String>>) {
  match plan {
  LogicalPlan::NodeScan { alias, label, .. } => {
- out.insert(alias.clone(), Some(label.clone()));
+ out.insert(alias.clone(), label.clone());
  }
  LogicalPlan::NodeById {
  alias,
@@ -205,7 +205,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
  match plan {
  LogicalPlan::Argument { bindings } if bindings.iter().any(|b| b == x) => {
  LogicalPlan::NodeScan {
- label: label.to_string(),
+ label: Some(label.to_string()),
  alias: x.to_string(),
  predicates: Vec::new(),
  projection: None,
@@ -460,7 +460,7 @@ mod tests {
  }
  fn scan(label: &str, alias: &str) -> LogicalPlan {
  LogicalPlan::NodeScan {
- label: label.into(),
+ label: Some(label.into()),
  alias: alias.into(),
  predicates: Vec::new(),
  projection: None,
@@ -525,7 +525,7 @@ mod tests {
  if let LogicalPlan::Expand { input, .. } = *inner {
  assert!(
  matches!(*input, LogicalPlan::NodeScan { ref alias, ref label, .. }
- if alias == "a" && label == "Person")
+ if alias == "a" && label.as_deref() == Some("Person"))
  );
  } else {
  panic!("expected Expand at inner root");

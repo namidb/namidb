@@ -525,7 +525,7 @@ fn snap_borrow_check(_snap: &Snapshot<'_>) {
 fn filter_directly_over_nodescan(plan: &LogicalPlan, target_label: &str) -> Option<String> {
     match plan {
         LogicalPlan::Filter { input, .. } => match input.as_ref() {
-            LogicalPlan::NodeScan { label, alias, .. } if label == target_label => {
+            LogicalPlan::NodeScan { label, alias, .. } if label.as_deref() == Some(target_label) => {
                 Some(alias.clone())
             }
             _ => filter_directly_over_nodescan(input, target_label),

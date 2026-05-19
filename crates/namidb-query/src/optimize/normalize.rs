@@ -296,7 +296,7 @@ mod tests {
 
  fn scan(label: &str, alias: &str) -> LogicalPlan {
  LogicalPlan::NodeScan {
- label: label.into(),
+ label: Some(label.into()),
  alias: alias.into(),
  predicates: vec![],
  projection: None,

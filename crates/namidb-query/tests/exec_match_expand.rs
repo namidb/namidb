@@ -608,6 +608,39 @@ async fn explicit_schema_round_trip() {
 }
 
 #[tokio::test]
+async fn match_without_label_scans_every_observed_label() {
+    // Regression for Bug #3: `MATCH (n) RETURN count(*) AS n` must
+    // include every label present in the snapshot, not just one.
+    let mut writer = WriterSession::open(store(), paths("exec-no-label"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let post = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    let mut post_props = BTreeMap::new();
+    post_props.insert("title".into(), CoreValue::Str("Hello".into()));
+    writer
+        .upsert_node(
+            "Post",
+            post,
+            &NodeWriteRecord {
+                properties: post_props,
+                schema_version: 1,
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let q = parse("MATCH (n) RETURN count(*) AS n").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("n"), Some(&RuntimeValue::Integer(2)));
+}
+
+#[tokio::test]
 async fn match_expand_without_rel_type_enumerates_all_edge_types() {
     // Regression for Bug #4: `MATCH (a)-[r]->(b)` without an explicit
     // edge type must traverse every type declared on the manifest

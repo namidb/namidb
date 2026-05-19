@@ -153,7 +153,12 @@ fn sum_rows(card: &Cardinality) -> f64 {
 
 fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
  match plan {
- LogicalPlan::NodeScan { label, .. } | LogicalPlan::NodeById { label, .. } => catalog
+ LogicalPlan::NodeScan { label, .. } => label
+ .as_deref()
+ .and_then(|l| catalog.label(l))
+ .map(|l| l.node_count > 0)
+ .unwrap_or(false),
+ LogicalPlan::NodeById { label, .. } => catalog
  .label(label)
  .map(|l| l.node_count > 0)
  .unwrap_or(false),
@@ -176,7 +181,8 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
  predicates,
  projection,
  } => {
- let _ = write!(out, "NodeScan label={} alias={}", label, alias);
+ let label_str = label.as_deref().unwrap_or("*");
+ let _ = write!(out, "NodeScan label={} alias={}", label_str, alias);
  if let Some(cols) = projection {
  let _ = write!(out, " projection=[{}]", cols.join(", "));
  }
@@ -679,7 +685,7 @@ mod tests {
  #[test]
  fn explain_renders_scan_only() {
  let p = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -691,7 +697,7 @@ mod tests {
  fn explain_renders_filter_over_scan() {
  let p = LogicalPlan::Filter {
  input: Box::new(LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -705,7 +711,7 @@ mod tests {
  #[test]
  fn explain_renders_full_chain() {
  let scan = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -754,7 +760,7 @@ TopN keys=[b DESC] limit=10
  fn explain_renders_optional_expand() {
  let p = LogicalPlan::Expand {
  input: Box::new(LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -809,7 +815,7 @@ TopN keys=[b DESC] limit=10
  let cat = micro_catalog();
  let plan = LogicalPlan::Expand {
  input: Box::new(LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -838,7 +844,7 @@ TopN keys=[b DESC] limit=10
  fn explain_verbose_marks_missing_stats() {
  let cat = StatsCatalog::empty();
  let plan = LogicalPlan::NodeScan {
- label: "Unknown".into(),
+ label: Some("Unknown".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -869,7 +875,7 @@ TopN keys=[b DESC] limit=10
  });
  let plan = LogicalPlan::Filter {
  input: Box::new(LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -915,7 +921,7 @@ TopN keys=[b DESC] limit=10
  use crate::plan::logical::AggregateExpr;
  let p = LogicalPlan::Aggregate {
  input: Box::new(LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
