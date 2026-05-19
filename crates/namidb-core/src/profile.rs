@@ -95,7 +95,7 @@ pub fn dump() -> Vec<(&'static str, u64, u128)> {
  .iter()
  .map(|(k, v)| (*k, v.count, v.total_ns))
  .collect();
- out.sort_by(|a, b| b.2.cmp(&a.2));
+ out.sort_by_key(|b| std::cmp::Reverse(b.2));
  out
 }
 
