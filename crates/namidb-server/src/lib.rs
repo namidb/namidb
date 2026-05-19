@@ -244,11 +244,11 @@ struct WriteSummary {
 impl From<&WriteOutcome> for WriteSummary {
     fn from(o: &WriteOutcome) -> Self {
         Self {
-            nodes_created: o.nodes_created as u64,
-            edges_created: o.edges_created as u64,
-            nodes_deleted: o.nodes_deleted as u64,
-            edges_deleted: o.edges_deleted as u64,
-            properties_set: o.properties_set as u64,
+            nodes_created: o.nodes_created,
+            edges_created: o.edges_created,
+            nodes_deleted: o.nodes_deleted,
+            edges_deleted: o.edges_deleted,
+            properties_set: o.properties_set,
         }
     }
 }
