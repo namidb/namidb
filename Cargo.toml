@@ -88,7 +88,7 @@ criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # CLI
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 indicatif = "0.17"
-console = "0.15"
+console = "0.16"
 
 # HTTP server (later)
 axum = "0.7"
