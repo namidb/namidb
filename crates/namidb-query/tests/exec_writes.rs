@@ -98,6 +98,61 @@ async fn match_then_create_relationship() {
 }
 
 #[tokio::test]
+async fn two_match_clauses_then_create_relationship() {
+ // Regression: two separate MATCH clauses must propagate both
+ // bindings to CREATE. Previously `combine` discarded the prior
+ // plan, so only the second MATCH's binding survived and CREATE
+ // failed to resolve the first endpoint.
+ let mut writer = WriterSession::open(store(), paths("w-two-match-create"))
+ .await
+ .unwrap();
+ let alice = NodeId::new();
+ let bob = NodeId::new();
+ let mut p_alice = BTreeMap::new();
+ p_alice.insert("name".into(), CoreValue::Str("Alice".into()));
+ let mut p_bob = BTreeMap::new();
+ p_bob.insert("name".into(), CoreValue::Str("Bob".into()));
+ writer
+ .upsert_node(
+ "Person",
+ alice,
+ &NodeWriteRecord {
+ properties: p_alice,
+ schema_version: 1,
+ },
+ )
+ .unwrap();
+ writer
+ .upsert_node(
+ "Person",
+ bob,
+ &NodeWriteRecord {
+ properties: p_bob,
+ schema_version: 1,
+ },
+ )
+ .unwrap();
+ writer.commit_batch().await.unwrap();
+
+ let q = parse(
+ "MATCH (a:Person {id: $aid}) \
+ MATCH (b:Person {id: $bid}) \
+ CREATE (a)-[r:KNOWS]->(b) RETURN r",
+ )
+ .unwrap();
+ let plan = lower(&q).unwrap();
+ let mut params = Params::new();
+ params.insert("aid".into(), RuntimeValue::String(alice.to_string()));
+ params.insert("bid".into(), RuntimeValue::String(bob.to_string()));
+ let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+ assert_eq!(outcome.edges_created, 1);
+ let snap = writer.snapshot();
+ let edges = snap.out_edges("KNOWS", alice).await.unwrap();
+ assert_eq!(edges.edges.len(), 1);
+ assert_eq!(edges.edges[0].dst, bob);
+}
+
+#[tokio::test]
 async fn set_property_round_trips() {
  let mut writer = WriterSession::open(store(), paths("w-set")).await.unwrap();
  let alice = NodeId::new();
@@ -290,6 +345,56 @@ async fn merge_create_path_creates_and_runs_on_create_sets() {
  nodes[0].properties.get("firstSeen"),
  Some(&CoreValue::I64(1))
  );
+}
+
+#[tokio::test]
+async fn merge_with_relationship_creates_then_matches_idempotently() {
+ // Regression: MERGE (a)-[r:R]->(b) was lowering to [Node, Node, Rel]
+ // but `find_merge_matches` reads pattern positionally as
+ // [Node head, Rel, Node tail]. After the lower_merge reorder, this
+ // round-trips: first execution creates both nodes + the edge, second
+ // execution finds them and is a no-op.
+ let mut writer = WriterSession::open(store(), paths("w-merge-rel"))
+ .await
+ .unwrap();
+
+ let q = parse(
+ "MERGE (a:Person {externalId: 1})-[r:KNOWS]->(b:Person {externalId: 2}) \
+ RETURN a, b",
+ )
+ .unwrap();
+ let plan = lower(&q).unwrap();
+
+ // First run: create path. Two nodes + one edge.
+ let outcome = execute_write(&plan, &mut writer, &Params::new())
+ .await
+ .unwrap();
+ assert_eq!(outcome.nodes_created, 2);
+ assert_eq!(outcome.edges_created, 1);
+ let snap = writer.snapshot();
+ let people = snap.scan_label("Person").await.unwrap();
+ assert_eq!(people.len(), 2);
+ let alice = people
+ .iter()
+ .find(|n| n.properties.get("externalId") == Some(&CoreValue::I64(1)))
+ .expect("alice present")
+ .id;
+ let bob = people
+ .iter()
+ .find(|n| n.properties.get("externalId") == Some(&CoreValue::I64(2)))
+ .expect("bob present")
+ .id;
+ let edges = snap.out_edges("KNOWS", alice).await.unwrap();
+ assert_eq!(edges.edges.len(), 1);
+ assert_eq!(edges.edges[0].dst, bob);
+
+ // Second run: match path must find the existing triple and not
+ // create duplicates.
+ let outcome2 = execute_write(&plan, &mut writer, &Params::new())
+ .await
+ .unwrap();
+ assert_eq!(outcome2.nodes_created, 0, "MERGE must not duplicate nodes");
+ assert_eq!(outcome2.edges_created, 0, "MERGE must not duplicate edges");
 }
 
 #[tokio::test]

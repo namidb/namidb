@@ -1907,15 +1907,10 @@ fn combine(prev: Option<LogicalPlan>, current: LogicalPlan) -> LogicalPlan {
  Some(prev_plan) => match (prev_plan, current) {
  (LogicalPlan::Empty, c) => c,
  (p, LogicalPlan::Empty) => p,
- // For multi-pattern MATCH we'd build a cross-product here. v1
- // doesn't support it — caller already errored.
- (p, c) => {
- // Build a sequence: append current as input-of nothing
- // since current already drives from scratch. We'll relax
- // this once Join lands.
- let _ = p;
- c
- }
+ (p, c) => LogicalPlan::CrossProduct {
+ left: Box::new(p),
+ right: Box::new(c),
+ },
  },
  }
 }
@@ -2141,6 +2136,43 @@ mod tests {
  }
  other => panic!("expected Merge, got {:?}", other),
  }
+ }
+
+ #[test]
+ fn merge_with_relationship_lowers_to_node_rel_node_set() {
+ // Regression: MERGE (a)-[r]->(b) must lower a triple containing
+ // a head Node, a tail Node, and a Rel linking their aliases.
+ // The order inside `pattern` follows the CREATE-friendly layout
+ // (so apply_create can resolve endpoints sequentially); the
+ // MERGE executor reads by alias, not by position.
+ let p = lp("MERGE (a:Person {externalId: 1})-[r:KNOWS]->(b:Person {externalId: 2})");
+ let pattern = match &p {
+ LogicalPlan::Merge { pattern, .. } => pattern,
+ other => panic!("expected Merge, got {:?}", other),
+ };
+ assert_eq!(pattern.len(), 3, "pattern: {:?}", pattern);
+ let mut node_aliases: Vec<&str> = pattern
+ .iter()
+ .filter_map(|e| match e {
+ CreateElement::Node { alias, .. } => Some(alias.as_str()),
+ _ => None,
+ })
+ .collect();
+ node_aliases.sort();
+ assert_eq!(node_aliases, vec!["a", "b"]);
+ let rel = pattern
+ .iter()
+ .find_map(|e| match e {
+ CreateElement::Rel {
+ source_alias,
+ target_alias,
+ edge_type,
+ ..
+ } => Some((source_alias.as_str(), target_alias.as_str(), edge_type.as_str())),
+ _ => None,
+ })
+ .expect("Rel element present");
+ assert_eq!(rel, ("a", "b", "KNOWS"));
  }
 
  #[test]
@@ -2375,5 +2407,28 @@ mod tests {
  }
  }
  assert!(has_optional_expand(&project_input));
+ }
+
+ #[test]
+ fn two_match_clauses_lower_to_cross_product() {
+ // Two separate MATCH clauses with no shared binding must join via
+ // CrossProduct so downstream clauses (CREATE/RETURN) see both
+ // sides of bindings. Regression: `combine` used to drop `prev`.
+ let p = lp("MATCH (a:Person) MATCH (b:Person) RETURN a, b");
+ let project_input = match p {
+ LogicalPlan::Project { input, .. } => *input,
+ other => panic!("expected Project, got {:?}", other),
+ };
+ fn has_cross_product(plan: &LogicalPlan) -> bool {
+ match plan {
+ LogicalPlan::CrossProduct { .. } => true,
+ _ => plan.children().iter().any(|c| has_cross_product(c)),
+ }
+ }
+ assert!(
+ has_cross_product(&project_input),
+ "expected CrossProduct under Project, got {:?}",
+ project_input,
+ );
  }
 }
