@@ -25,6 +25,30 @@ below and in the release notes.
 
 ---
 
+## [0.2.1] — 2026-05-18 · CI fix
+
+Tag `py-v0.2.0` built every wheel and the sdist, but the smoke-test
+job (`pytest` against the installed wheel) flagged three stale
+expectations and the publish step was skipped — nothing reached PyPI.
+`0.2.1` ships the same code with the test expectations brought up to
+date.
+
+### Fixed
+
+- `crates/namidb-py/tests/test_uri.py` — three tests were asserting
+  the *pre-0.2.0* contract (`file://`, `gs://`, `az://` raise
+  `ValueError`). Replaced with:
+  - `test_file_uri_round_trip` — full CREATE / MATCH against a
+    temp-dir-backed namespace, exercising the new
+    `LocalFileObjectStore` end-to-end from Python.
+  - `test_gs_uri_missing_namespace_raises`,
+    `test_az_uri_missing_container_raises`,
+    `test_az_uri_missing_namespace_raises` — grammar checks that
+    surface before the GCS / Azure client is built, so they don't
+    need real cloud credentials on CI runners.
+
+---
+
 ## [0.2.0] — 2026-05-18 · self-host story
 
 ### Added
@@ -141,6 +165,7 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/namidb/namidb/releases/tag/v0.2.1
 [0.2.0]: https://github.com/namidb/namidb/releases/tag/v0.2.0
 [0.1.0]: https://github.com/namidb/namidb/releases/tag/v0.1.0
