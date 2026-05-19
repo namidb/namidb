@@ -1,4 +1,4 @@
 // LDBC SNB Interactive Update — IU2: a Person likes a Message.
-MATCH (p:Person {id: $personId}), (m:Message {id: $messageId})
+MATCH (p:Person {_id: $personId}), (m:Message {_id: $messageId})
 CREATE (p)-[l:LIKES {creationDate: $creationDate}]->(m)
-RETURN p.id AS personId, m.id AS messageId
+RETURN p._id AS personId, m._id AS messageId

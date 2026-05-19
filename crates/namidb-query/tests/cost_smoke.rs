@@ -1569,7 +1569,7 @@ async fn join_reorder_swaps_to_smaller_build_when_predicate_shrinks_probe() {
     // 'Alice' reduces a's estimate sharply (1/ndv ≈ 1). The HashJoin
     // should pick `a` as build.
     let q =
-        parse("MATCH (a:Person), (b:Person) WHERE a.firstName = 'Alice' AND a.id = b.id RETURN a")
+        parse("MATCH (a:Person), (b:Person) WHERE a.firstName = 'Alice' AND a._id = b._id RETURN a")
             .unwrap();
     let plan = build_plan(&q, &catalog).unwrap();
 
