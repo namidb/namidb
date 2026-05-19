@@ -166,6 +166,14 @@ pub struct Snapshot<'mt> {
  /// `Snapshot::lookup_node_by_property` populates it on first miss
  /// and reuses it for the warm-path point lookups.
  property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
+ /// Intra-snapshot cache of decoded Parquet `RecordBatch`es keyed by
+ /// the absolute SST path. Populated by [`Self::batch_lookup_nodes`]
+ /// on the first probe of an SST; subsequent probes within the same
+ /// snapshot reuse the decoded batches via `Arc::clone` instead of
+ /// re-parsing the body. Amortises the SST decode cost across the N
+ /// per-parent batch calls the factor-path executor issues during a
+ /// 2-hop Expand chain (LDBC SNB IC09: 150+ calls/query).
+ decoded_node_sst_batches: Mutex<HashMap<String, Arc<Vec<RecordBatch>>>>,
 }
 
 /// Cold-path routing policy for [`Snapshot::lookup_node`]. See
@@ -222,6 +230,7 @@ impl<'mt> Snapshot<'mt> {
  adjacency_cache: None,
  shared_node_cache: None,
  property_index_cache: None,
+ decoded_node_sst_batches: Mutex::new(HashMap::new()),
  }
  }
 
@@ -744,11 +753,39 @@ impl<'mt> Snapshot<'mt> {
  {
  continue;
  }
- // Always go through the body cache: one decode per SST,
- // amortising the cost across every pending id.
+ // Intra-snapshot decoded-batches cache: amortises the
+ // per-call `reader.scan()` Parquet decode across the N
+ // batch calls a factor-path Expand chain issues (one per
+ // parent_leaf). Without this, SF1 IC09 cold pays the SST
+ // decode ~150 times.
+ let absolute = format!(
+ "{}/{}",
+ self.paths.namespace_prefix().as_ref(),
+ desc.path
+ );
+ // Probe the cache in a separate scope so the MutexGuard is
+ // released before the await — futures-Send requires the guard
+ // type itself to be Send + Sync, which `MutexGuard` isn't.
+ let cached: Option<Arc<Vec<RecordBatch>>> = self
+ .decoded_node_sst_batches
+ .lock()
+ .unwrap()
+ .get(&absolute)
+ .cloned();
+ let batches: Arc<Vec<RecordBatch>> = if let Some(b) = cached {
+ b
+ } else {
  let body = self.get_sst_body(desc).await?;
  let reader = NodeSstReader::open(label_def.clone(), body)?;
- let batches = reader.scan()?;
+ let decoded = Arc::new(reader.scan()?);
+ // Re-acquire the lock to insert — last write wins on
+ // a race because both threads decoded identical bytes.
+ self.decoded_node_sst_batches
+ .lock()
+ .unwrap()
+ .insert(absolute.clone(), decoded.clone());
+ decoded
+ };
  batch_harvest_node_rows(
  &batches,
  &label_def,
