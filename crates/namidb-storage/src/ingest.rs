@@ -109,6 +109,13 @@ pub struct WriterSession {
  /// surfaced as the dominant per-call cost of `edge_lookup_via_sst`.
  /// Set `NAMIDB_SST_CACHE=0` to disable.
  sst_cache: Option<SstCache>,
+ /// Cross-snapshot lazy index over `(label, property) → value → NodeId`
+ /// (RFC-pending). Always constructed (cheap empty map); the
+ /// per-snapshot `Snapshot::lookup_node_by_property` populates it on
+ /// the first miss and reuses it from every subsequent snapshot.
+ /// Reset on `flush` because a flush bumps the manifest version and
+ /// can introduce new nodes.
+ property_index_cache: Arc<crate::property_index::PropertyIndexCache>,
 }
 
 impl std::fmt::Debug for WriterSession {
@@ -181,7 +188,15 @@ impl WriterSession {
  adjacency_cache,
  node_cache,
  sst_cache,
+ property_index_cache: Arc::new(crate::property_index::PropertyIndexCache::new()),
  })
+ }
+
+ /// Cross-snapshot lazy property index. Hand it to every `Snapshot`
+ /// the writer emits (`Snapshot::with_property_index_cache`) so
+ /// warm-path `lookup_node_by_property` calls hit the same `HashMap`.
+ pub fn property_index_cache(&self) -> &Arc<crate::property_index::PropertyIndexCache> {
+ &self.property_index_cache
  }
 
  /// Adjacency cache attached to this writer (RFC-018). `None`
@@ -272,6 +287,7 @@ impl WriterSession {
  if let Some(cache) = &self.node_cache {
  snap = snap.with_shared_node_cache(cache.clone());
  }
+ snap = snap.with_property_index_cache(self.property_index_cache.clone());
  snap
  }
 
@@ -491,6 +507,12 @@ impl WriterSession {
  )
  .await?;
  self.current = outcome.committed.clone();
+ // Invalidate the cross-snapshot property index — a flush can
+ // promote new nodes from the memtable into SSTs, and the cached
+ // value→NodeId map is built off a snapshot that pre-dates the
+ // new manifest version. Subsequent snapshots will rebuild on
+ // their first miss.
+ self.property_index_cache.reset();
  Ok(outcome)
  }
 
