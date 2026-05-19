@@ -1,14 +1,20 @@
-"""S19.C — URI scheme parsing + S3 backend (LocalStack integration).
+"""URI scheme parsing across every backend NamiDB supports.
 
-Most tests exercise the URI parsing surface (which fails before the
-client actually bootstraps storage). The opt-in LocalStack test at
-the bottom validates the full s3:// round-trip — set
-`NAMIDB_TEST_LOCALSTACK_BUCKET=<pre-created-bucket>` to enable it.
+Covers `memory://`, `file://`, `s3://`, `gs://`, `az://`.
+
+- `memory://` and `file://` get full CREATE / MATCH round-trips —
+  both backends are reachable on any runner without external services.
+- `s3://` exercises grammar offline and a full round-trip against
+  LocalStack (opt-in via `NAMIDB_TEST_LOCALSTACK_BUCKET`).
+- `gs://` and `az://` only assert URI-grammar errors here. Their
+  live round-trips need real GCS / Azure credentials and would belong
+  in a separate, env-gated suite.
 """
 
 from __future__ import annotations
 
 import os
+import tempfile
 import uuid
 
 import pytest
@@ -32,33 +38,68 @@ def test_memory_uri_missing_namespace_raises() -> None:
     assert "namespace" in str(exc_info.value).lower()
 
 
-# ── file:// — intentionally unsupported in v0 ──────────────────────────
+# ── file:// — durable, no bucket needed (0.2.0+) ───────────────────────
 
 
-def test_file_uri_raises_with_helpful_message() -> None:
+def test_file_uri_round_trip() -> None:
+    """A fresh `file://` namespace must support CREATE then MATCH in
+    two separate `Client` lifecycles. This is the same round-trip
+    contract `s3://` honours via LocalStack, but reachable on every
+    runner (no service to spin up)."""
+    with tempfile.TemporaryDirectory() as root:
+        ns = f"ns{uuid.uuid4().hex[:8]}"
+        uri = f"file://{root}?ns={ns}"
+
+        client = tg.Client(uri)
+        client.cypher("CREATE (p:Person {name: 'Alice', age: 30})")
+        client.flush()
+        del client
+
+        client2 = tg.Client(uri)
+        result = client2.cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.age AS age"
+        )
+        assert result.first() == {"name": "Alice", "age": 30}
+
+
+def test_file_uri_missing_namespace_raises() -> None:
+    """The URI grammar is the same shape as `s3://` — `?ns=` is
+    required and its absence must surface as a clean `ValueError`
+    rather than a mid-bootstrap surprise."""
+    with tempfile.TemporaryDirectory() as root:
+        with pytest.raises(ValueError) as exc_info:
+            tg.Client(f"file://{root}")
+        msg = str(exc_info.value).lower()
+        assert "ns" in msg or "namespace" in msg
+
+
+# ── gs:// / az:// — URI grammar validation (no live connection) ────────
+#
+# Live round-trips against GCS / Azure need real credentials and a
+# pre-provisioned bucket, neither of which the public CI runners have.
+# These tests confirm the URI parser accepts the scheme and surfaces
+# malformed inputs as `ValueError`; an opt-in live test (analogous to
+# the LocalStack one below) would go in a separate, env-gated case.
+
+
+def test_gs_uri_missing_namespace_raises() -> None:
     with pytest.raises(ValueError) as exc_info:
-        tg.Client("file:///tmp/some-path?ns=acme")
-    msg = str(exc_info.value)
-    assert "file://" in msg
-    assert "PutMode::Update" in msg
-    # Suggest the workarounds.
-    assert "memory://" in msg
-    assert "s3://" in msg
+        tg.Client("gs://my-bucket")
+    msg = str(exc_info.value).lower()
+    assert "ns" in msg or "namespace" in msg
 
 
-# ── gs:// / az:// — planned ────────────────────────────────────────────
-
-
-def test_gs_uri_raises_helpful_message() -> None:
+def test_az_uri_missing_container_raises() -> None:
     with pytest.raises(ValueError) as exc_info:
-        tg.Client("gs://my-bucket?ns=acme")
-    assert "gs" in str(exc_info.value).lower()
+        tg.Client("az://my-account?ns=acme")
+    assert "container" in str(exc_info.value).lower()
 
 
-def test_az_uri_raises_helpful_message() -> None:
+def test_az_uri_missing_namespace_raises() -> None:
     with pytest.raises(ValueError) as exc_info:
-        tg.Client("az://my-account/my-container?ns=acme")
-    assert "az" in str(exc_info.value).lower()
+        tg.Client("az://my-account/my-container")
+    msg = str(exc_info.value).lower()
+    assert "ns" in msg or "namespace" in msg
 
 
 def test_unknown_scheme_raises() -> None:
