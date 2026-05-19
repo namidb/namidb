@@ -299,7 +299,8 @@ impl<'mt> Snapshot<'mt> {
  property: &str,
  value: &str,
  ) -> Result<Option<NodeView>> {
- // 1. Try the cross-snapshot index — `O(1)` warm path.
+ namidb_core::profile_scope!("Snapshot::lookup_node_by_property");
+ // 1. Try the cross-snapshot in-memory index — `O(1)` warm path.
  if let Some(cache) = &self.property_index_cache {
  if let Some(idx) = cache.get(label, property) {
  if let Some(node_id) = idx.get(value).copied() {
@@ -312,7 +313,137 @@ impl<'mt> Snapshot<'mt> {
  }
  }
 
- // 2. Cold path: full label scan to build the index, then look up.
+ // 2. Sidecar path (RFC-pending): every Nodes SST in this scope
+ // emits a `value → NodeId` map alongside the body on flush. If
+ // every candidate SST carries the sidecar for `property`, we
+ // can resolve the lookup with one bincode decode per SST
+ // instead of a full label scan.
+ let sst_idxs: Vec<usize> = self
+ .manifest
+ .index
+ .scope_descriptors(SstKind::Nodes, label)
+ .to_vec();
+ let all_have_sidecar = !sst_idxs.is_empty()
+ && sst_idxs.iter().all(|i| {
+ self.manifest.manifest.ssts[*i]
+ .unique_property_indices
+ .iter()
+ .any(|d| d.property == property)
+ });
+ if all_have_sidecar {
+ namidb_core::profile_scope!("Snapshot::lookup_node_by_property.sidecar");
+ // Memtable wins on conflicts: scan memtable first for any
+ // upsert / tombstone of the same `value` so cross-store
+ // last-write-wins logic stays correct. Memtable rows
+ // without an LSN newer than the SST sidecar's authoritative
+ // entry won't override it, but a memtable upsert with the
+ // same `value` does: the user might have re-inserted a row
+ // under the same property between the SST's flush and
+ // ours. Materialise as a full label scan over the memtable
+ // — bounded by memtable size, not the SST.
+ let mut winner: Option<(u64, namidb_core::id::NodeId, bool)> = None;
+ for (mk, e) in self.memtable.iter() {
+ if let MemKey::Node {
+ label: mlabel,
+ id,
+ } = mk
+ {
+ if mlabel != label {
+ continue;
+ }
+ match &e.op {
+ MemOp::Upsert(payload) => {
+ let rec = NodeWriteRecord::decode(payload)?;
+ if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
+ if s == value {
+ let bump = winner
+ .as_ref()
+ .map(|(lsn, _, _)| e.lsn > *lsn)
+ .unwrap_or(true);
+ if bump {
+ winner = Some((e.lsn, *id, false));
+ }
+ }
+ }
+ }
+ MemOp::Tombstone => {
+ // A node tombstone on a winning id removes it; a
+ // tombstone on a non-winning id is irrelevant.
+ if let Some((lsn, win_id, _)) = winner {
+ if win_id == *id && e.lsn > lsn {
+ winner = Some((e.lsn, *id, true));
+ }
+ }
+ }
+ }
+ }
+ }
+
+ // SST sidecar pass: bincode-decode each candidate's
+ // `(value → NodeId)` map and probe `value`. Last LSN wins
+ // when multiple SSTs carry an entry for the same value;
+ // SST LSN is `max_lsn` of the SST.
+ for idx in &sst_idxs {
+ let desc = &self.manifest.manifest.ssts[*idx];
+ let sidecar_desc = desc
+ .unique_property_indices
+ .iter()
+ .find(|d| d.property == property)
+ .expect("all_have_sidecar guard");
+ let absolute = format!(
+ "{}/{}",
+ self.paths.namespace_prefix().as_ref(),
+ sidecar_desc.path
+ );
+ // Reuse the body cache for sidecar bodies too. They're
+ // immutable per UUIDv7 path so the standard cache key
+ // works without conflict.
+ let body = if let Some(b) = self.cache_get(&absolute) {
+ b
+ } else {
+ let object_path = object_store::path::Path::from(absolute.clone());
+ let bytes = self
+ .store
+ .get(&object_path)
+ .await
+ .map_err(Error::ObjectStore)?
+ .bytes()
+ .await
+ .map_err(Error::ObjectStore)?;
+ if let Some(cache) = &self.cache {
+ cache.insert(absolute.clone(), bytes.clone());
+ }
+ bytes
+ };
+ let map: std::collections::BTreeMap<String, [u8; 16]> =
+ bincode::deserialize(&body).map_err(|e| {
+ Error::invariant(format!("unique-index bincode decode: {e}"))
+ })?;
+ if let Some(id_bytes) = map.get(value) {
+ let id = namidb_core::id::NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
+ let bump = winner
+ .as_ref()
+ .map(|(lsn, _, _)| desc.max_lsn > *lsn)
+ .unwrap_or(true);
+ if bump {
+ winner = Some((desc.max_lsn, id, false));
+ }
+ }
+ }
+
+ return match winner {
+ Some((_, _, true)) => Ok(None), // tombstone-on-winner
+ Some((_, id, false)) => self.lookup_node(label, id).await,
+ None => Ok(None), // not in any sidecar
+ };
+ }
+
+ // 3. Legacy cold path: full label scan to build the index, then look up.
+ //
+ // Reached when at least one SST in the scope was written by a
+ // pre-sidecar build (or when the property wasn't declared
+ // `unique` at flush time). The in-memory cache caches the
+ // result so subsequent calls bypass the scan.
  let all_nodes = self.scan_label(label).await?;
  let mut idx: std::collections::HashMap<String, namidb_core::id::NodeId> =
  std::collections::HashMap::with_capacity(all_nodes.len());
@@ -2742,6 +2873,7 @@ mod tests {
  property_stats: vec![],
  kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
  bloom: Some(bloom_desc),
+ unique_property_indices: Vec::new(),
  };
 
  let empty = Memtable::new();
@@ -2763,6 +2895,7 @@ mod tests {
  // Sanity: an SstDescriptor with `bloom = None` admits everything.
  let no_bloom = SstDescriptor {
  bloom: None,
+ unique_property_indices: Vec::new(),
  ..descriptor.clone()
  };
  assert!(snap

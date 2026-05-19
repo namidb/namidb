@@ -575,6 +575,7 @@ mod tests {
  tombstone_count: tombs,
  },
  bloom: None,
+ unique_property_indices: Vec::new(),
  }
  }
 
@@ -608,6 +609,7 @@ mod tests {
  degree_histogram: Box::new(hist),
  },
  bloom: None,
+ unique_property_indices: Vec::new(),
  }
  }
 

@@ -195,6 +195,38 @@ pub struct SstDescriptor {
  // ── bloom side-car pointer (None when omitted per RFC-002 §4.2) ──
  #[serde(default)]
  pub bloom: Option<BloomDescriptor>,
+
+ // ── unique-property side-car pointers (RFC-pending) ──
+ //
+ // For every `PropertyDef::unique == true` in the SST's label schema
+ // at flush time, the writer emits a sidecar mapping
+ // `value_string → NodeId`. The reader's `lookup_node_by_property`
+ // loads these on demand instead of full-scanning the label.
+ //
+ // Empty for edge SSTs and for older manifests that pre-date the
+ // sidecar emission (`serde(default)` covers backward compatibility).
+ #[serde(default)]
+ pub unique_property_indices: Vec<UniquePropertyIndexDescriptor>,
+}
+
+/// Side-car pointer for a single `(SST, unique property)` pair. The
+/// sidecar body is a bincode-serialised `BTreeMap<String, NodeId>` —
+/// sorted by value string so a future binary-search reader can probe
+/// in O(log N) without deserialising the whole map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UniquePropertyIndexDescriptor {
+ /// Name of the unique property this sidecar indexes (e.g. `id`
+ /// for the LDBC SNB anchor pattern).
+ pub property: String,
+ /// Object-store path relative to the namespace prefix.
+ pub path: String,
+ /// On-disk size of the sidecar body. Used for budget accounting
+ /// when foyer caches the body.
+ pub size_bytes: u64,
+ /// Number of `(value, NodeId)` entries. Mirrors the SST's
+ /// non-tombstone row count modulo nulls; surfaced for diagnostics
+ /// and the cache prewarm decision.
+ pub entry_count: u64,
 }
 
 /// JSON serde helper: `[u8; 16]` ↔ base64-standard string.
@@ -792,6 +824,7 @@ mod tests {
  block_count: 482,
  xxhash3_64: 0xDEADBEEFCAFEBABE,
  }),
+ unique_property_indices: Vec::new(),
  }
  }
 
@@ -822,6 +855,7 @@ mod tests {
  degree_histogram: Box::new(h),
  },
  bloom: None, // small SST → no side-car
+ unique_property_indices: Vec::new(),
  }
  }
 
