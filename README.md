@@ -101,7 +101,7 @@ Same engine across all three. Server and Embedded write to the same bucket layou
 - **Python bindings** — `pip install namidb`, abi3 wheels for Linux (x86_64 + aarch64), macOS (arm64) and Windows (x86_64), with sdist fallback for other targets. Sync + async (`acypher`). Arrow / pandas / polars output.
 - **CLI** — `namidb parse`, `namidb explain --verbose`, `namidb run --store <uri>` for ad-hoc query work against any backend.
 - **HTTP server** — `namidb-server` binary with bearer-token auth, periodic flush loop, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`).
-- **Bench harness** — synthetic, deterministic LDBC SNB Interactive harness with a paired Kùzu runner under [`bench/`](./bench/).
+- **Bench harness** — synthetic, deterministic LDBC SNB Interactive harness under [`bench/`](./bench/).
 
 <br />
 
@@ -199,8 +199,7 @@ That's it. No DynamoDB lock table, no separate metadata service.
 
 ### Cloudflare R2 ⭐ the zero-egress alternative
 
-R2 charges no egress, has full S3-compatible conditional writes, and
-in our experience reads ~1.5–2× faster than S3 from outside AWS.
+R2 charges no egress and has full S3-compatible conditional writes.
 Same scheme, with the R2 endpoint and `region=auto`:
 
 ```python
@@ -577,7 +576,7 @@ these when you are debugging performance or memory.
 │   ├── namidb-server/      # `namidb-server` HTTP daemon + Dockerfile
 │   ├── namidb-bench/       # LDBC-shaped synthetic bench harness
 │   └── namidb/             # Public façade crate
-├── bench/                  # Kùzu runner + cross-engine comparator
+├── bench/                  # LDBC SNB Interactive bench harness
 └── tests/                  # Integration helpers (LocalStack, R2 wrapper)
 ```
 
