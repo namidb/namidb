@@ -32,6 +32,19 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
  alias,
  id,
  },
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => LogicalPlan::NodeByPropertyValue {
+ input: Box::new(normalize_filters(*input)),
+ label,
+ alias,
+ property,
+ value,
+ },
  LogicalPlan::Expand {
  input,
  source,

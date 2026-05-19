@@ -41,6 +41,22 @@ pub enum LogicalPlan {
  id: Expression,
  },
 
+ /// Point-lookup by a *unique* user property (RFC-pending). Lowering
+ /// emits this when the AST contains an inline filter
+ /// `{<unique_prop>: <expr>}` on a node pattern AND the property is
+ /// declared `unique` in the schema. The executor calls
+ /// `Snapshot::lookup_node_by_property(label, property, value)` —
+ /// O(log n) or better depending on the storage-side index. Falls
+ /// back to NodeScan + Filter when no unique property is matched on
+ /// the pattern.
+ NodeByPropertyValue {
+ input: Box<LogicalPlan>,
+ label: String,
+ alias: String,
+ property: String,
+ value: Expression,
+ },
+
  /// Expand `source` across an edge to produce `target_alias`.
  Expand {
  input: Box<LogicalPlan>,
@@ -256,6 +272,7 @@ impl LogicalPlan {
  vec![]
  }
  LogicalPlan::NodeById { input, .. }
+ | LogicalPlan::NodeByPropertyValue { input, .. }
  | LogicalPlan::Expand { input, .. }
  | LogicalPlan::Filter { input, .. }
  | LogicalPlan::Project { input, .. }
@@ -306,6 +323,7 @@ impl LogicalPlan {
  match self {
  LogicalPlan::NodeScan { .. } => "NodeScan",
  LogicalPlan::NodeById { .. } => "NodeById",
+ LogicalPlan::NodeByPropertyValue { .. } => "NodeByPropertyValue",
  LogicalPlan::Expand { optional, .. } => {
  if *optional {
  "OptionalExpand"

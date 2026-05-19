@@ -79,6 +79,32 @@ enum Cmd {
  #[arg(long)]
  dataset_dir: Option<PathBuf>,
  },
+ /// Bulk-load the dataset into a *remote* S3/R2 namespace. Used by the
+ /// publishable Bench B to materialise the LDBC SF1 dataset on R2 so
+ /// the gateway/worker stack in production can serve it. Reads AWS
+ /// credentials from env (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+ /// optional `AWS_ENDPOINT_URL` for R2).
+ ///
+ /// Idempotent against an existing namespace at version > 0: the loader
+ /// `upsert`s, so a re-run with the same dataset produces the same
+ /// committed state but at a higher manifest version.
+ LoadR2 {
+ #[arg(short, long, default_value = "0.1")]
+ scale: f64,
+ #[arg(short = 'S', long, default_value_t = 42)]
+ seed: u64,
+ #[arg(long)]
+ dataset_dir: Option<PathBuf>,
+ /// R2 / S3 bucket name.
+ #[arg(long)]
+ bucket: String,
+ /// Namespace id (e.g. `bench-snb-sf1`).
+ #[arg(long)]
+ namespace: String,
+ /// Object-store root prefix; must match the worker's `storage.root_prefix`.
+ #[arg(long, default_value = "tenants")]
+ root_prefix: String,
+ },
 }
 
 #[tokio::main]
@@ -220,6 +246,86 @@ async fn main() -> Result<()> {
  report.elements,
  report.load_time_secs,
  report.elements as f64 / report.load_time_secs,
+ );
+ println!("{}", serde_json::to_string_pretty(&report)?);
+ }
+ Cmd::LoadR2 {
+ scale,
+ seed,
+ dataset_dir,
+ bucket,
+ namespace,
+ root_prefix,
+ } => {
+ // Resolve or generate the dataset.
+ let (dataset_dir, _kept) = if let Some(d) = dataset_dir {
+ (d, None)
+ } else {
+ let tmp = std::env::temp_dir()
+ .join(format!("namidb-bench-{}", uuid::Uuid::now_v7().simple()));
+ std::fs::create_dir_all(&tmp)?;
+ (tmp.clone(), Some(tmp))
+ };
+ let sizes = if dataset_dir.join("persons.csv").exists() {
+ DatasetSizes::from_scale(scale)
+ } else {
+ dataset::generate(&dataset_dir, &DatasetConfig { scale, seed })?
+ };
+
+ // Build the S3/R2 object store from env. The worker uses the
+ // exact same construction in `namidb-worker::namespaces`.
+ let store: std::sync::Arc<dyn object_store::ObjectStore> = {
+ let mut builder = object_store::aws::AmazonS3Builder::from_env()
+ .with_bucket_name(&bucket);
+ if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
+ builder = builder.with_endpoint(endpoint);
+ }
+ if let Ok(allow) = std::env::var("AWS_ALLOW_HTTP") {
+ if allow == "true" || allow == "1" {
+ builder = builder.with_allow_http(true);
+ }
+ }
+ std::sync::Arc::new(builder.build()?)
+ };
+
+ eprintln!(
+ "load-r2: bucket={bucket} prefix={root_prefix} namespace={namespace} \
+  elements={} (scale={scale})",
+ sizes.persons + sizes.posts + sizes.comments
+ + sizes.knows + sizes.has_creator + sizes.likes + sizes.reply_of,
+ );
+
+ let start = std::time::Instant::now();
+ let writer = loader::load_into_store(
+ store,
+ &root_prefix,
+ &namespace,
+ &dataset_dir,
+ )
+ .await?;
+ let load_time_secs = start.elapsed().as_secs_f64();
+ let manifest_version = writer.manifest_version();
+ drop(writer);
+
+ let report = serde_json::json!({
+ "backend": "namidb-engine-r2",
+ "scale": scale,
+ "seed": seed,
+ "dataset_sizes": SizesReport::from(&sizes),
+ "namespace": namespace,
+ "root_prefix": root_prefix,
+ "bucket": bucket,
+ "manifest_version": manifest_version,
+ "elements": sizes.persons + sizes.posts + sizes.comments
+ + sizes.knows + sizes.has_creator + sizes.likes + sizes.reply_of,
+ "load_time_secs": load_time_secs,
+ });
+ eprintln!(
+ "load-r2 done: manifest_version={manifest_version} \
+  load_time={load_time_secs:.1}s ({:.0} elem/s)",
+ (sizes.persons + sizes.posts + sizes.comments
+ + sizes.knows + sizes.has_creator + sizes.likes + sizes.reply_of) as f64
+ / load_time_secs,
  );
  println!("{}", serde_json::to_string_pretty(&report)?);
  }

@@ -240,6 +240,33 @@ pub(crate) fn execute_inner_with_routing<'a>(
  Ok(out)
  }
 
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => {
+ let input_rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+ let mut out = Vec::with_capacity(input_rows.len());
+ for row in input_rows {
+ let lookup_val = evaluate(value, &row, params)?;
+ if let Some(view) = lookup_node_by_property_via_scan(
+ snapshot, label, property, &lookup_val,
+ )
+ .await?
+ {
+ let mut new_row = row;
+ new_row.set(
+ alias.clone(),
+ RuntimeValue::Node(Box::new(NodeValue::from(view))),
+ );
+ out.push(new_row);
+ }
+ }
+ Ok(out)
+ }
+
  LogicalPlan::Filter { input, predicate } => {
  let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
  let mut out = Vec::with_capacity(rows.len());
@@ -1175,6 +1202,65 @@ pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<N
  }
 }
 
+/// Lookup a node by a unique user property via predicate-pushed scan
+/// + first-match short-circuit. Used by `LogicalPlan::NodeByPropertyValue`.
+///
+/// The storage layer's `scan_label_with_predicates` already pushes the
+/// `Eq` predicate to the row-group level (only matching row-groups are
+/// decoded — bloom + min/max prune away the rest). Once it returns the
+/// candidate set, we filter exactly and take the first match: per the
+/// `PropertyDef::unique` contract there's at most one.
+///
+/// Future optimisation: a dedicated `Snapshot::lookup_node_by_property`
+/// that short-circuits the *storage-side* iteration once the first
+/// match is found (today the scan still materialises all matches
+/// before returning; for a truly unique property that's exactly one
+/// row, so the waste is bounded — for a misdeclared "unique" property
+/// with multiple matches, we silently take the first).
+pub(crate) async fn lookup_node_by_property_via_scan(
+ snapshot: &Snapshot<'_>,
+ label: &str,
+ property: &str,
+ value: &RuntimeValue,
+) -> Result<Option<namidb_storage::NodeView>, ExecError> {
+ // Convert RuntimeValue → StatScalar for predicate pushdown. We
+ // only support the common cases; anything else falls through to a
+ // plain scan + post-filter below.
+ let scalar = match value {
+ RuntimeValue::String(s) => Some(namidb_storage::sst::stats::StatScalar::Utf8(s.clone())),
+ RuntimeValue::Integer(i) => Some(namidb_storage::sst::stats::StatScalar::Int64(*i)),
+ RuntimeValue::Bool(b) => Some(namidb_storage::sst::stats::StatScalar::Bool(*b)),
+ RuntimeValue::Float(f) => Some(namidb_storage::sst::stats::StatScalar::Float64(*f)),
+ _ => None,
+ };
+
+ let candidates = if let Some(s) = scalar {
+ let pred = namidb_storage::sst::predicates::ScanPredicate::Eq {
+ column: property.to_string(),
+ value: s,
+ };
+ snapshot
+ .scan_label_with_predicates(label, &[pred])
+ .await
+ .map_err(ExecError::Storage)?
+ } else {
+ // Unsupported scalar type (List/Map/etc) — fall through to
+ // a plain scan; we'd need an external filter step below but
+ // the planner doesn't emit NodeByPropertyValue for those.
+ snapshot
+ .scan_label(label)
+ .await
+ .map_err(ExecError::Storage)?
+ };
+
+ // `scan_label_with_predicates` already applies the Eq predicate at
+ // row level (see `node_view_matches_predicates` in
+ // namidb-storage::read). The candidate set therefore contains
+ // exact matches only — for a unique property that's at most one.
+ // Take it without re-filtering.
+ Ok(candidates.into_iter().next())
+}
+
 // ────────────────────────── Factor path ────────────────────────
 //
 // `execute_factor_inner` mirrors `execute_inner` but operates on
@@ -1255,6 +1341,39 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
  let id_value = evaluate(id, &row, params)?;
  let node_id = node_id_from_value(&id_value, id.span)?;
  if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+ let slot = Slot {
+ name: alias_arc.clone(),
+ value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+ };
+ out_leaves.push(next_arena.push(leaf, vec![slot]));
+ }
+ }
+ Ok(FactorRowSet {
+ arena: next_arena,
+ leaves: out_leaves,
+ })
+ }
+
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => {
+ let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
+ let alias_arc: Arc<str> = Arc::from(alias.as_str());
+ let mut out_leaves = Vec::new();
+ let arena_view = input_set.arena.clone();
+ let mut next_arena = input_set.arena;
+ for leaf in input_set.leaves {
+ let row = arena_view.materialize(leaf, None);
+ let lookup_val = evaluate(value, &row, params)?;
+ if let Some(view) = lookup_node_by_property_via_scan(
+ snapshot, label, property, &lookup_val,
+ )
+ .await?
+ {
  let slot = Slot {
  name: alias_arc.clone(),
  value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
@@ -2212,6 +2331,9 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
  }
  LogicalPlan::NodeById { id, .. } => {
  collect_referenced_variables(id, out);
+ }
+ LogicalPlan::NodeByPropertyValue { value, .. } => {
+ collect_referenced_variables(value, out);
  }
  LogicalPlan::Unwind { list, .. } => {
  collect_referenced_variables(list, out);

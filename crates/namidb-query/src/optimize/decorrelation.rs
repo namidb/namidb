@@ -143,6 +143,12 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
  label,
  input,
  ..
+ }
+ | LogicalPlan::NodeByPropertyValue {
+ alias,
+ label,
+ input,
+ ..
  } => {
  collect_outer_labels(input, out);
  out.insert(alias.clone(), Some(label.clone()));
@@ -227,6 +233,19 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
  alias,
  id,
  },
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label: l,
+ alias,
+ property,
+ value,
+ } => LogicalPlan::NodeByPropertyValue {
+ input: Box::new(replace_argument(*input, x, label)),
+ label: l,
+ alias,
+ property,
+ value,
+ },
  LogicalPlan::Expand {
  input,
  source,
@@ -288,6 +307,19 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
  label,
  alias,
  id,
+ },
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => LogicalPlan::NodeByPropertyValue {
+ input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
+ label,
+ alias,
+ property,
+ value,
  },
  LogicalPlan::Expand {
  input,

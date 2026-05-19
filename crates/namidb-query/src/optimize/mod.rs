@@ -33,6 +33,7 @@ pub mod normalize;
 pub mod parquet_pushdown;
 pub mod projection_pushdown;
 pub mod pushdown;
+pub mod unique_lookup;
 
 pub use decorrelation::convert_semi_apply_to_hash_semi_join;
 pub use join_conversion::convert_cross_to_hash;
@@ -56,7 +57,12 @@ const MAX_FIXPOINT_ROUNDS: usize = 8;
 pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
  let mut current = plan;
  for _ in 0..MAX_FIXPOINT_ROUNDS {
- let pushed = normalize_filters(predicate_pushdown(current.clone()));
+ // RFC-pending: unique-property lookup rewrite runs FIRST so the
+ // downstream pushdowns (which assume NodeScan input) see the
+ // already-replaced point-lookup operator and don't re-introduce
+ // a Filter on top of it.
+ let unique_lookup = unique_lookup::apply_unique_property_lookup(current.clone(), catalog);
+ let pushed = normalize_filters(predicate_pushdown(unique_lookup));
  let hashed = convert_cross_to_hash(pushed, catalog);
  let decorrelated = convert_semi_apply_to_hash_semi_join(hashed, catalog);
  // RFC-016: reorder HashJoin orientations using the now-final
@@ -235,7 +241,8 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
  LogicalPlan::NodeScan { alias, .. } => {
  out.insert(alias.clone());
  }
- LogicalPlan::NodeById { input, alias, .. } => {
+ LogicalPlan::NodeById { input, alias, .. }
+ | LogicalPlan::NodeByPropertyValue { input, alias, .. } => {
  collect_produced(input, out);
  out.insert(alias.clone());
  }

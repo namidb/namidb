@@ -41,6 +41,19 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
  alias,
  id,
  },
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => LogicalPlan::NodeByPropertyValue {
+ input: Box::new(convert_cross_to_hash(*input, catalog)),
+ label,
+ alias,
+ property,
+ value,
+ },
  LogicalPlan::Expand {
  input,
  source,

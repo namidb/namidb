@@ -289,6 +289,36 @@ fn execute_write_inner<'a>(
  Ok(out)
  }
 
+ // Same shape as NodeById: writes commit first, then the
+ // unique-property lookup runs against the post-write snapshot.
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => {
+ let input_rows = execute_write_inner(input, writer, params, outcome).await?;
+ let snap = writer.snapshot();
+ let mut out = Vec::with_capacity(input_rows.len());
+ for row in input_rows {
+ let lookup_val = evaluate(value, &row, params)?;
+ if let Some(view) = crate::exec::walker::lookup_node_by_property_via_scan(
+ &snap, label, property, &lookup_val,
+ )
+ .await?
+ {
+ let mut new_row = row;
+ new_row.set(
+ alias.clone(),
+ RuntimeValue::Node(Box::new(NodeValue::from(view))),
+ );
+ out.push(new_row);
+ }
+ }
+ Ok(out)
+ }
+
  // ─── Pure read leaves and pattern-driven operators that do
  // NOT contain writes: delegate to the read-only walker on a
  // freshly pinned snapshot. v0: no read-your-own-writes.
