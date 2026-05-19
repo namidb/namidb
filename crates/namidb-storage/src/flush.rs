@@ -55,6 +55,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use tokio::io::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 use uuid::Uuid;
@@ -221,7 +222,7 @@ pub async fn flush(
  let path = p.body_path.clone();
  let store_ref = store.clone();
  put_futures.push(
- Box::pin(async move { put_create(store_ref.as_ref(), &path, body).await })
+ Box::pin(async move { put_object(store_ref, &path, body).await })
  as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
  );
  if let (Some(bloom_path), Some(bloom_body)) = (&p.bloom_path, &p.bloom_body) {
@@ -229,7 +230,7 @@ pub async fn flush(
  let path = bloom_path.clone();
  let store_ref = store.clone();
  put_futures.push(Box::pin(async move {
- put_create(store_ref.as_ref(), &path, body).await
+ put_object(store_ref, &path, body).await
  }));
  }
  }
@@ -662,6 +663,61 @@ async fn put_create(store: &dyn ObjectStore, path: &Path, body: Bytes) -> Result
  .put_opts(path, PutPayload::from(body), opts)
  .await
  .map_err(Error::ObjectStore)?;
+ Ok(())
+}
+
+/// Threshold above which an SST body is uploaded via multipart instead of a
+/// single PUT. Sits just below the S3 5 MiB per-part minimum so any body
+/// that produces at least one full part (~SF1 edge SSTs at 2–5 MiB and
+/// every L1 compacted SST) crosses the multipart path; bodies smaller than
+/// this still go single-PUT (no multipart overhead and `PutMode::Create`
+/// stays available for collision protection).
+const MULTIPART_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Per-part chunk size for multipart uploads. S3's hard floor is 5 MiB on
+/// every part except the trailing one; we match that floor so each part
+/// is valid in isolation. R2 inherits the same floor.
+const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Default in-flight concurrency for multipart upload parts. The
+/// `object_store::buffered::BufWriter` default is also 8; we mirror it
+/// explicitly so the call site documents the chosen rate.
+const MULTIPART_MAX_CONCURRENCY: usize = 8;
+
+/// Upload `body` to `path`. For small bodies, falls back to the single-PUT
+/// `PutMode::Create` path so the CAS-style "no overwrite" semantics still
+/// protect against a competing writer stomping on a UUIDv7 path. For
+/// bodies past [`MULTIPART_THRESHOLD`] (SST bodies in the LDBC SNB SF1
+/// range — 10–50 MiB), uses `BufWriter` with `MULTIPART_PART_SIZE` chunks
+/// and `MULTIPART_MAX_CONCURRENCY` in-flight uploads.
+///
+/// Why the split: S3 / R2 multipart uploads do NOT honour the `If-None-Match`
+/// header that backs `PutMode::Create`. SST paths embed a UUIDv7 per writer
+/// (see [`crate::flush`] §"PUT helpers") so collisions are impossible in
+/// practice; the small-PUT branch is kept for bloom side-cars and any
+/// future small body, where the CAS protection is cheap to keep.
+async fn put_object(
+ store: std::sync::Arc<dyn ObjectStore>,
+ path: &Path,
+ body: Bytes,
+) -> Result<()> {
+ if body.len() < MULTIPART_THRESHOLD {
+ return put_create(store.as_ref(), path, body).await;
+ }
+ let mut writer = object_store::buffered::BufWriter::with_capacity(
+ store,
+ path.clone(),
+ MULTIPART_PART_SIZE,
+ )
+ .with_max_concurrency(MULTIPART_MAX_CONCURRENCY);
+ writer.put(body).await.map_err(Error::ObjectStore)?;
+ writer
+ .shutdown()
+ .await
+ .map_err(|e| Error::ObjectStore(object_store::Error::Generic {
+ store: "BufWriter",
+ source: Box::new(e),
+ }))?;
  Ok(())
 }
 
