@@ -25,6 +25,78 @@ below and in the release notes.
 
 ---
 
+## [0.3.0] — 2026-05-18 · Cypher v0.2.1 limitation sweep
+
+Closes the six query-engine limitations documented in the v0.2.1
+README (`MATCH (n)` rejected, MERGE with relationship broken, `id`
+reserved, etc.). One of them — the `id` reservation — is breaking;
+see **Breaking** below.
+
+### Fixed
+
+- **#5** `lower::combine` now emits `CrossProduct` between two
+  non-Empty plans instead of dropping the earlier one, so
+  `MATCH (a:A) MATCH (b:B) CREATE (a)-[:R]->(b)` finally propagates
+  both bindings to `CREATE` (`crates/namidb-query/src/plan/lower.rs`).
+- **#2** `find_merge_matches` indexes the `Vec<CreateElement>` by
+  alias instead of positionally, so `MERGE (a)-[r:R]->(b)` works
+  against the CREATE-shaped pattern the lowerer produces
+  (`crates/namidb-query/src/exec/writer.rs`).
+- **#4 / #6** `execute_expand` (and its factor sibling) accept
+  `edge_type=None` and fan out across every type observable through
+  the snapshot, so `MATCH (a)-[r]->(b)` and `-[*1..N]->` work without
+  an explicit relationship type. Backed by a new
+  `Snapshot::observed_edge_types` that unions declared schema +
+  memtable + persisted SSTs — needed because the declared schema is
+  empty for namespaces that never went through `SchemaBuilder`
+  (`crates/namidb-storage/src/read.rs`,
+  `crates/namidb-query/src/exec/walker.rs`).
+- **#3** `LogicalPlan::NodeScan.label` becomes `Option<String>`;
+  walker resolves the set via `Snapshot::observed_labels` so
+  `MATCH (n)` without a label predicate fans out across every label.
+  Cardinality falls back to `catalog.total_nodes()`; `EXPLAIN`
+  renders `label=*`. The id-lookup branch (`{_id: $x}`, see Breaking)
+  still requires an explicit label because `NodeById` needs a
+  specific column family (`crates/namidb-query/src/plan/logical.rs`,
+  `crates/namidb-query/src/plan/lower.rs`,
+  `crates/namidb-query/src/exec/walker.rs`, and cascade).
+
+### Breaking
+
+- **#1 `id` is now a user property; the internal NodeId moves to
+  `_id`.** Previously `id` hijacked Cypher map literals as the
+  internal NodeId sigil — a `CREATE (n:Foo {id: $uuid})` parsed
+  `$uuid` as a `NodeId` and refused to persist `id` as a property.
+  After this release, `id` is treated like any other property; the
+  internal NodeId is addressed via `_id`. The Cypher `id(n)`
+  function keeps returning the internal NodeId for callers that want
+  it.
+
+  **Migration.** Anywhere a query passes `{id: $uuid}` to refer to
+  the internal NodeId, rename the key to `{_id: $uuid}`. Likewise
+  `n.id` (accessor) → `n._id` when you want the NodeId, or `id(n)`
+  for the function form. Reading `n.id` now returns the user
+  property (or `Null` when absent). Failures are loud rather than
+  silent — a wrong UUID lands as a plain `Filter` over a missing
+  property and returns no rows rather than throwing.
+
+  Behavioural pivots:
+  - `CREATE (n:Foo {_id: $uuid, id: 'external-42'})` assigns the
+    storage NodeId from `_id` and persists `id` in the property map.
+  - `MATCH (n:Foo {_id: $uuid})` lowers to `NodeById`; `{id: ...}`
+    falls through to `NodeScan + Filter`.
+  - `n._id` and `id(n)` materialise the internal NodeId; `n.id`
+    reads the user-owned property (or `Null`).
+
+  Sites updated alongside the engine change: every LDBC fixture in
+  `crates/namidb-query/tests/fixtures/`, the optimizer's
+  decorrelation join-key
+  (`crates/namidb-query/src/optimize/decorrelation.rs`), and the
+  integration tests in `exec_writes`, `exec_match_expand`,
+  `cost_smoke`, `exec_ldbc_snb`.
+
+---
+
 ## [0.2.1] — 2026-05-18 · CI fix
 
 Tag `py-v0.2.0` built every wheel and the sdist, but the smoke-test
