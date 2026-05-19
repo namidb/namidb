@@ -571,6 +571,7 @@ mod tests {
  min: Some(StatScalar::Int64(min)),
  max: Some(StatScalar::Int64(max)),
  ndv,
+ unique: false,
  },
  );
  LabelStats {

@@ -729,6 +729,7 @@ mod tests {
  min: Some(StatScalar::Int64(0)),
  max: Some(StatScalar::Int64(100)),
  ndv: Some(50),
+ unique: false,
  };
  let person = LabelStats {
  name: "Person".into(),

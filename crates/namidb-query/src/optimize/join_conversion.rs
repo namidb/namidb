@@ -400,6 +400,7 @@ mod tests {
  min: Some(StatScalar::Utf8("Alice".into())),
  max: Some(StatScalar::Utf8("Zoe".into())),
  ndv: Some(ndv),
+ unique: false,
  },
  );
  props.insert(
@@ -410,6 +411,7 @@ mod tests {
  min: Some(StatScalar::Int64(18)),
  max: Some(StatScalar::Int64(99)),
  ndv: Some(ndv),
+ unique: false,
  },
  );
  cat.__test_insert_label(LabelStats {
@@ -581,6 +583,7 @@ mod tests {
  min: None,
  max: None,
  ndv: Some(10),
+ unique: false,
  },
  );
  m
@@ -599,6 +602,7 @@ mod tests {
  min: None,
  max: None,
  ndv: Some(1000),
+ unique: false,
  },
  );
  m
