@@ -46,6 +46,19 @@ So we are building the database for that decade.
 
 <br />
 
+## Where this came from
+
+NamiDB started in late 2024 as a private graph layer inside Fonles Studios. For ~18 months it ran in production behind **[ALHELÍ](https://alheli.ai)** — Fonles's legal-AI platform serving lawyers, entrepreneurs, students and citizens across Ecuador and El Salvador. Every Cypher query, every manifest CAS, every CSR adjacency table in this repository has been exercised against real production workloads inside that product.
+
+We are open-sourcing the engine now for two reasons that finally lined up:
+
+1. **Apple archived Kùzu in October 2025**, leaving the columnar property-graph space without a maintained option. We had already converged on the same design Kùzu pioneered — open-sourcing NamiDB is the most useful thing we can contribute to that hole.
+2. **Our own roadmap pivoted to a hosted product** — [NamiDB Cloud](https://namidb.com) (multi-tenant, scale-to-zero per namespace) — so the engine no longer needs to be a competitive secret. The engine is open; the cloud is the business.
+
+*The git history of this repository starts on 2026-05-17 because the private codebase was squashed at release. Tags `v0.1.0` and onwards mark the public-release line; internal history lives in the company archive.*
+
+<br />
+
 ## The shape
 
 **NamiDB writes Cypher to your S3 bucket.**
