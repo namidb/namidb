@@ -3,7 +3,7 @@
 // to express the "not previously seen" filter — equivalent to the LDBC
 // canonical form which originally relied on `WHERE NOT EXISTS { ... }`
 // (Cypher-25 subquery, out-of-scope in v0).
-MATCH (p:Person {id: $personId})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)
+MATCH (p:Person {_id: $personId})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)
 WHERE post.creationDate >= $startDate
   AND post.creationDate < $endDate
 WITH friend, tag, count(post) AS postCount

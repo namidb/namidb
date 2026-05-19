@@ -331,10 +331,11 @@ fn apply_create(
  let mut explicit_id: Option<NodeId> = None;
  for (k, expr) in properties {
  let v = evaluate(expr, &row, params)?;
- if k == "id" {
- // `{id: ...}` becomes the storage NodeId; not
- // stored as a regular property. The `.id`
- // accessor materialises the NodeId on read.
+ if k == "_id" {
+ // `{_id: ...}` becomes the storage NodeId; not stored
+ // as a regular property. The `._id` accessor (and the
+ // `id(n)` Cypher function) materialise it on read.
+ // Plain `id` is now a user-owned property.
  explicit_id = Some(crate::exec::walker::node_id_from_value(&v, expr.span)?);
  continue;
  }

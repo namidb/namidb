@@ -81,7 +81,7 @@ async fn match_then_create_relationship() {
  writer.commit_batch().await.unwrap();
 
  let q = parse(
- "MATCH (a:Person {id: $aid}), (b:Person {id: $bid}) \
+ "MATCH (a:Person {_id: $aid}), (b:Person {_id: $bid}) \
  CREATE (a)-[r:KNOWS]->(b) RETURN r",
  )
  .unwrap();
@@ -135,8 +135,8 @@ async fn two_match_clauses_then_create_relationship() {
  writer.commit_batch().await.unwrap();
 
  let q = parse(
- "MATCH (a:Person {id: $aid}) \
- MATCH (b:Person {id: $bid}) \
+ "MATCH (a:Person {_id: $aid}) \
+ MATCH (b:Person {_id: $bid}) \
  CREATE (a)-[r:KNOWS]->(b) RETURN r",
  )
  .unwrap();
@@ -171,7 +171,7 @@ async fn set_property_round_trips() {
  .unwrap();
  writer.commit_batch().await.unwrap();
 
- let q = parse("MATCH (a:Person {id: $aid}) SET a.age = 31").unwrap();
+ let q = parse("MATCH (a:Person {_id: $aid}) SET a.age = 31").unwrap();
  let plan = lower(&q).unwrap();
  let mut params = Params::new();
  params.insert("aid".into(), RuntimeValue::String(alice.to_string()));
@@ -208,7 +208,7 @@ async fn remove_property() {
  .unwrap();
  writer.commit_batch().await.unwrap();
 
- let q = parse("MATCH (a:Person {id: $aid}) REMOVE a.age").unwrap();
+ let q = parse("MATCH (a:Person {_id: $aid}) REMOVE a.age").unwrap();
  let plan = lower(&q).unwrap();
  let mut params = Params::new();
  params.insert("aid".into(), RuntimeValue::String(alice.to_string()));
@@ -263,7 +263,7 @@ async fn detach_delete_removes_node_and_edges() {
  .unwrap();
  writer.commit_batch().await.unwrap();
 
- let q = parse("MATCH (a:Person {id: $aid}) DETACH DELETE a").unwrap();
+ let q = parse("MATCH (a:Person {_id: $aid}) DETACH DELETE a").unwrap();
  let plan = lower(&q).unwrap();
  let mut params = Params::new();
  params.insert("aid".into(), RuntimeValue::String(alice.to_string()));
@@ -345,6 +345,60 @@ async fn merge_create_path_creates_and_runs_on_create_sets() {
  nodes[0].properties.get("firstSeen"),
  Some(&CoreValue::I64(1))
  );
+}
+
+#[tokio::test]
+async fn id_property_is_user_owned_after_reservation_lifted() {
+ // Regression for Bug #1: `id` used to be reserved as the internal
+ // NodeId sigil; after the rename to `_id`, `id` is just another
+ // user property. `CREATE (n:Foo {_id: $uuid, id: 'external-42'})`
+ // must persist `id` and a later `MATCH (n) WHERE n.id = 'external-42'`
+ // should find that node by user property.
+ let mut writer = WriterSession::open(store(), paths("w-id-prop"))
+ .await
+ .unwrap();
+ let nid = NodeId::new();
+ let q = parse(
+ "CREATE (n:Foo {_id: $nid, id: 'external-42', name: 'Ada'}) RETURN n",
+ )
+ .unwrap();
+ let plan = lower(&q).unwrap();
+ let mut params = Params::new();
+ params.insert("nid".into(), RuntimeValue::String(nid.to_string()));
+ let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+ assert_eq!(outcome.nodes_created, 1);
+
+ // Snapshot must show `id` as a real property, while the storage
+ // NodeId equals the `_id` we passed in.
+ let snap = writer.snapshot();
+ let stored = snap.lookup_node("Foo", nid).await.unwrap().expect("Foo present");
+ assert_eq!(
+ stored.properties.get("id"),
+ Some(&CoreValue::Str("external-42".into())),
+ "id must be persisted as a user property",
+ );
+ assert!(
+ !stored.properties.contains_key("_id"),
+ "_id must NOT leak into the property map",
+ );
+
+ // Read-side: `n._id` should surface the internal NodeId and
+ // `n.id` the user value.
+ let read_q = parse(
+ "MATCH (n:Foo {_id: $nid}) RETURN n._id AS nid, n.id AS biz_id",
+ )
+ .unwrap();
+ let read_plan = lower(&read_q).unwrap();
+ let outcome = execute_write(&read_plan, &mut writer, &params).await.unwrap();
+ assert_eq!(outcome.rows.len(), 1);
+ match outcome.rows[0].get("nid") {
+ Some(RuntimeValue::String(s)) => assert_eq!(s, &nid.to_string()),
+ other => panic!("unexpected nid: {:?}", other),
+ }
+ match outcome.rows[0].get("biz_id") {
+ Some(RuntimeValue::String(s)) => assert_eq!(s, "external-42"),
+ other => panic!("unexpected biz_id: {:?}", other),
+ }
 }
 
 #[tokio::test]

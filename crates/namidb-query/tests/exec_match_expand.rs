@@ -212,7 +212,7 @@ async fn match_with_id_parameter_uses_node_by_id() {
     let ids = build_friend_graph(&mut writer).await;
     let snapshot = writer.snapshot();
 
-    let q = parse("MATCH (a:Person {id: $personId}) RETURN a.name AS name").unwrap();
+    let q = parse("MATCH (a:Person {_id: $personId}) RETURN a.name AS name").unwrap();
     let plan = lower(&q).unwrap();
 
     let mut params = Params::new();
