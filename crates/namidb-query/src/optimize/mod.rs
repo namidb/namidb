@@ -615,7 +615,7 @@ mod tests {
  #[test]
  fn produced_aliases_scan_emits_alias() {
  let plan = LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -628,7 +628,7 @@ mod tests {
  fn produced_aliases_expand_includes_target_and_rel() {
  let plan = LogicalPlan::Expand {
  input: Box::new(LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -653,7 +653,7 @@ mod tests {
  fn produced_aliases_project_discard_drops_input() {
  let plan = LogicalPlan::Project {
  input: Box::new(LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -673,13 +673,13 @@ mod tests {
  #[test]
  fn produced_aliases_union_intersects_sides() {
  let l = LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
  };
  let r = LogicalPlan::NodeScan {
- label: "P".into(),
+ label: Some("P".into()),
  alias: "b".into(),
  predicates: vec![],
  projection: None,

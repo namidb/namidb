@@ -637,7 +637,7 @@ fn lower_node_pattern_head(
  }));
  }
  }
- let label = require_single_label(head)?;
+ let label = optional_single_label(head)?;
  let alias = head
  .binding
  .as_ref()
@@ -653,6 +653,16 @@ fn lower_node_pattern_head(
  .find(|(k, _)| k.name == "id")
  .map(|(_, v)| v.clone())
  {
+ // NodeById requires a label (single-label CF lookup). Reject
+ // typeless `MATCH ({id: $x})` here — the user should write
+ // `MATCH (n:Label {id: $x})` to use the fast point lookup.
+ let label = label.ok_or_else(|| {
+ LowerError::new(
+ LowerErrorKind::UnsupportedFeature,
+ "id-lookup requires an explicit label (e.g. `MATCH (n:Label {id: $x})`)",
+ head.span,
+ )
+ })?;
  // Map must contain ONLY `id` — any extra props become Filter.
  let extra_filters: Vec<_> = map
  .entries
@@ -679,7 +689,7 @@ fn lower_node_pattern_head(
  }
  // Map without `id`: build NodeScan + Filter for each prop.
  let mut plan = LogicalPlan::NodeScan {
- label: label.to_string(),
+ label: label.map(str::to_string),
  alias: alias.clone(),
  predicates: vec![],
  projection: None,
@@ -695,7 +705,7 @@ fn lower_node_pattern_head(
  }
 
  let scan = LogicalPlan::NodeScan {
- label: label.to_string(),
+ label: label.map(str::to_string),
  alias,
  predicates: vec![],
  projection: None,
@@ -810,14 +820,10 @@ fn previous_source(plan: &LogicalPlan) -> Result<String, LowerError> {
  }
 }
 
-fn require_single_label(node: &NodePattern) -> Result<&str, LowerError> {
+fn optional_single_label(node: &NodePattern) -> Result<Option<&str>, LowerError> {
  match node.labels.as_slice() {
- [single] => Ok(&single.name),
- [] => Err(LowerError::new(
- LowerErrorKind::UnsupportedFeature,
- "anonymous node patterns without label require global scan — are not yet supported",
- node.span,
- )),
+ [single] => Ok(Some(&single.name)),
+ [] => Ok(None),
  _ => Err(LowerError::new(
  LowerErrorKind::UnsupportedFeature,
  "multi-label node patterns are not yet supported",
@@ -2407,6 +2413,30 @@ mod tests {
  }
  }
  assert!(has_optional_expand(&project_input));
+ }
+
+ #[test]
+ fn match_without_label_lowers_to_typeless_node_scan() {
+ // Regression for Bug #3: `MATCH (n)` (no label predicate) used to
+ // be rejected by `require_single_label`. Lowering must now produce
+ // a `NodeScan { label: None, ... }` so the executor can fan out
+ // across observed labels.
+ let p = lp("MATCH (n) RETURN n");
+ let project_input = match p {
+ LogicalPlan::Project { input, .. } => *input,
+ other => panic!("expected Project, got {:?}", other),
+ };
+ match project_input {
+ LogicalPlan::NodeScan {
+ label,
+ alias,
+ ..
+ } => {
+ assert!(label.is_none(), "expected typeless NodeScan, got label={:?}", label);
+ assert_eq!(alias, "n");
+ }
+ other => panic!("expected NodeScan under Project, got {:?}", other),
+ }
  }
 
  #[test]

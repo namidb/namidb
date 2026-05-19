@@ -253,7 +253,7 @@ mod tests {
  }
  fn scan(label: &str, alias: &str) -> LogicalPlan {
  LogicalPlan::NodeScan {
- label: label.into(),
+ label: Some(label.into()),
  alias: alias.into(),
  predicates: Vec::new(),
  projection: None,
@@ -286,11 +286,11 @@ mod tests {
  } => {
  assert!(matches!(
  *build,
- LogicalPlan::NodeScan { ref label, .. } if label == "Small"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Small")
  ));
  assert!(matches!(
  *probe,
- LogicalPlan::NodeScan { ref label, .. } if label == "Big"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Big")
  ));
  // Keys must mirror — what was probe is now build.
  assert_eq!(on.len(), 1);
@@ -325,11 +325,11 @@ mod tests {
  LogicalPlan::HashJoin { build, probe, .. } => {
  assert!(matches!(
  *build,
- LogicalPlan::NodeScan { ref label, .. } if label == "Small"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Small")
  ));
  assert!(matches!(
  *probe,
- LogicalPlan::NodeScan { ref label, .. } if label == "Big"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Big")
  ));
  }
  _ => panic!(),
@@ -400,7 +400,7 @@ mod tests {
  // Outer: Tiny is smallest → becomes build.
  assert!(matches!(
  *build,
- LogicalPlan::NodeScan { ref label, .. } if label == "Tiny"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Tiny")
  ));
  // The other side is the (now-reoriented) inner.
  match *probe {
@@ -408,7 +408,7 @@ mod tests {
  build: inner_build, ..
  } => assert!(matches!(
  *inner_build,
- LogicalPlan::NodeScan { ref label, .. } if label == "Small"
+ LogicalPlan::NodeScan { ref label, .. } if label.as_deref() == Some("Small")
  )),
  _ => panic!("expected nested HashJoin"),
  }

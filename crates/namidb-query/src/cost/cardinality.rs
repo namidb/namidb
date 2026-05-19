@@ -72,15 +72,18 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
  predicates,
  projection: _, // RFC-015: projection doesn't change row count.
  } => {
- let n = catalog
- .label(label)
- .map(|l| l.node_count as f64)
- .unwrap_or(0.0);
+ let n = match label {
+ Some(l) => catalog
+ .label(l)
+ .map(|s| s.node_count as f64)
+ .unwrap_or(0.0),
+ None => catalog.total_nodes() as f64,
+ };
  let mut b = BTreeMap::new();
  b.insert(
  alias.clone(),
  BindingMeta {
- label: Some(label.clone()),
+ label: label.clone(),
  ..Default::default()
  },
  );
@@ -92,8 +95,10 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
  n
  } else {
  let mut bs = BindingStats::empty();
- if let Some(stats) = catalog.label(label) {
+ if let Some(l) = label {
+ if let Some(stats) = catalog.label(l) {
  bs = bs.with(alias.clone(), stats);
+ }
  }
  let mut acc = n;
  for p in predicates {
@@ -750,7 +755,7 @@ mod tests {
 
  fn person_scan() -> LogicalPlan {
  LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "p".into(),
  predicates: vec![],
  projection: None,

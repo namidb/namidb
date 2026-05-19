@@ -199,20 +199,22 @@ pub(crate) fn execute_inner_with_routing<'a>(
  predicates,
  projection,
  } => {
+ let labels = resolve_node_labels(snapshot, label.as_deref());
+ let mut rows: Vec<Row> = Vec::new();
+ for label_name in &labels {
  let nodes = snapshot
  .scan_label_with_predicates_and_projection(
- label,
+ label_name,
  predicates,
  projection.as_deref(),
  )
  .await?;
- Ok(nodes
- .into_iter()
- .map(|n| {
+ for n in nodes {
  let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
- Row::new().with(alias.clone(), value)
- })
- .collect())
+ rows.push(Row::new().with(alias.clone(), value));
+ }
+ }
+ Ok(rows)
  }
 
  LogicalPlan::NodeById {
@@ -711,6 +713,20 @@ struct Step {
  row: Row,
 }
 
+/// Resolve the set of labels a `NodeScan` operator must visit.
+///
+/// `Some(l)` → scan only label `l`. `None` (pattern wrote `MATCH (n)`
+/// without a label predicate) → enumerate every label observable through
+/// the snapshot (`Snapshot::observed_labels`). Cost grows linearly with
+/// the observed label count; the existing label-by-label `scan_label`
+/// path is reused so per-label predicates and projections still apply.
+fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<String> {
+ match label {
+ Some(l) => vec![l.to_string()],
+ None => snapshot.observed_labels(),
+ }
+}
+
 /// Resolve the set of edge types an `Expand` operator must traverse.
 ///
 /// `Some(t)` → traverse only `t`. `None` (pattern wrote `-[r]->` without
@@ -1191,24 +1207,28 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
  } => {
  // NodeScan produces N independent rows — emit each as a
  // direct child of root. No clone path; one FactorNode per
- // result.
+ // result. For typeless scans we fan out across every
+ // observed label and concatenate the result.
+ let labels = resolve_node_labels(snapshot, label.as_deref());
+ let mut set = FactorRowSet::singleton_root();
+ let root = set.arena.root();
+ let alias_arc: Arc<str> = Arc::from(alias.as_str());
+ let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
+ for label_name in &labels {
  let nodes = snapshot
  .scan_label_with_predicates_and_projection(
- label,
+ label_name,
  predicates,
  projection.as_deref(),
  )
  .await?;
- let mut set = FactorRowSet::singleton_root();
- let root = set.arena.root();
- let alias_arc: Arc<str> = Arc::from(alias.as_str());
- let mut leaves = Vec::with_capacity(nodes.len());
  for n in nodes {
  let slot = Slot {
  name: alias_arc.clone(),
  value: RuntimeValue::Node(Box::new(NodeValue::from(n))),
  };
  leaves.push(set.arena.push(root, vec![slot]));
+ }
  }
  set.leaves = leaves;
  Ok(set)
