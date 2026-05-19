@@ -173,7 +173,7 @@ pub async fn flush(
  for (label, rows) in node_buckets {
  let label_def = schema_label_or_synthetic(&schema, &label);
  let finish = build_node_sst(&label_def, &rows)?;
- pendings.push(prepare_node_pending(paths, &label, finish));
+ pendings.push(prepare_node_pending(paths, &label, &label_def, &rows, finish)?);
  }
  for (edge_type, rows) in edge_buckets {
  let edge_def = schema.edge_type(&edge_type).cloned();
@@ -233,6 +233,19 @@ pub async fn flush(
  put_object(store_ref, &path, body).await
  }));
  }
+ // Per-unique-property side-cars (RFC-pending). PUT'd alongside
+ // the body / bloom so the entire SST + its lookup acceleration
+ // structures land atomically from the writer's perspective; the
+ // manifest CAS below makes the new descriptors visible only
+ // when every sidecar has been durably persisted.
+ for (path, body) in &p.index_sidecars {
+ let body = body.clone();
+ let path = path.clone();
+ let store_ref = store.clone();
+ put_futures.push(Box::pin(async move {
+ put_object(store_ref, &path, body).await
+ }));
+ }
  }
  futures::future::try_join_all(put_futures).await?;
 
@@ -256,13 +269,20 @@ pub async fn flush(
 
 /// Per-SST work product: descriptor + body bytes + their object-store paths,
 /// kept together so the parallel-PUT phase can issue them without re-touching
-/// the schema/Arrow builders.
+/// the schema/Arrow builders. `index_sidecars` is non-empty when the SST is
+/// a Node SST and the label declares one or more `unique` properties — each
+/// entry is a `(value_string → NodeId)` map serialised to bincode that the
+/// reader can probe in O(log N) without rescanning the SST body.
 struct PendingSst {
  descriptor: SstDescriptor,
  body_path: Path,
  body: Bytes,
  bloom_path: Option<Path>,
  bloom_body: Option<Bytes>,
+ /// `(path, body)` for each unique-property side-car emitted alongside
+ /// this SST. Empty for edge SSTs and for node SSTs whose label has no
+ /// `PropertyDef::unique == true`.
+ index_sidecars: Vec<(Path, Bytes)>,
 }
 
 // ── Bucketing ──────────────────────────────────────────────────────────
@@ -518,7 +538,13 @@ pub(crate) fn build_edge_sst(
 
 // ── PUT helpers ────────────────────────────────────────────────────────
 
-fn prepare_node_pending(paths: &NamespacePaths, label: &str, finish: NodeSstFinish) -> PendingSst {
+fn prepare_node_pending(
+ paths: &NamespacePaths,
+ label: &str,
+ label_def: &LabelDef,
+ rows: &[NodeRow],
+ finish: NodeSstFinish,
+) -> Result<PendingSst> {
  let id = Uuid::now_v7();
  let level = SstLevel::L0;
  let file_name = format!(
@@ -539,6 +565,13 @@ fn prepare_node_pending(paths: &NamespacePaths, label: &str, finish: NodeSstFini
  label,
  finish.bloom,
  );
+
+ // Per-property unique sidecars (RFC-pending): for each declared
+ // `unique` property emit a `value_string → NodeId` map serialised to
+ // bincode. The reader probes these instead of full-scanning the SST
+ // to resolve `MATCH (a:Label {prop: 'X'})`.
+ let (unique_property_indices, index_sidecars) =
+ prepare_unique_property_sidecars(paths, level.as_u32(), &id, label, label_def, rows)?;
 
  let stats = finish.stats;
  let descriptor = SstDescriptor {
@@ -561,15 +594,87 @@ fn prepare_node_pending(paths: &NamespacePaths, label: &str, finish: NodeSstFini
  tombstone_count: stats.tombstone_count,
  },
  bloom: bloom_descriptor,
+ unique_property_indices,
  };
 
- PendingSst {
+ Ok(PendingSst {
  descriptor,
  body_path,
  body: finish.body,
  bloom_path,
  bloom_body,
+ index_sidecars,
+ })
+}
+
+/// For every `PropertyDef::unique == true` in `label_def.properties`,
+/// walk `rows`, harvest `(value_string, NodeId)` pairs, sort them into a
+/// `BTreeMap`, serialise to bincode, and produce one
+/// `(UniquePropertyIndexDescriptor, (path, body))` pair per property.
+///
+/// Returns the parallel collections so the descriptor can land in the
+/// manifest and the body can be PUT alongside the SST body.
+///
+/// Tombstoned rows contribute nothing — they're encoded in the SST body
+/// and the reader's last-LSN-wins logic surfaces them correctly. Rows
+/// without the property (nullable column, schema-evolved out, ...)
+/// contribute nothing either. Non-string property values are skipped —
+/// v0 covers LDBC's `id` only; a future bump can promote typed keys.
+fn prepare_unique_property_sidecars(
+ paths: &NamespacePaths,
+ level: u32,
+ sst_id: &Uuid,
+ label: &str,
+ label_def: &LabelDef,
+ rows: &[NodeRow],
+) -> Result<(
+ Vec<crate::manifest::UniquePropertyIndexDescriptor>,
+ Vec<(Path, Bytes)>,
+)> {
+ let mut descriptors = Vec::new();
+ let mut bodies = Vec::new();
+ for prop in &label_def.properties {
+ if !prop.unique {
+ continue;
  }
+ let mut index: BTreeMap<String, [u8; 16]> = BTreeMap::new();
+ for row in rows {
+ if let MemOp::Upsert(payload) = &row.op {
+ let rec = NodeWriteRecord::decode(payload)?;
+ if let Some(Value::Str(s)) = rec.properties.get(&prop.name) {
+ // Last-write-wins within one SST; the BTreeMap
+ // overwrites cleanly when the same value re-occurs
+ // (writer guarantees row order matches lsn order).
+ index.insert(s.clone(), row.id);
+ }
+ }
+ }
+ if index.is_empty() {
+ continue;
+ }
+ let body_bytes = bincode::serialize(&index)
+ .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?;
+ let entry_count = index.len() as u64;
+ let body = Bytes::from(body_bytes);
+
+ let file_name = format!(
+ "{}-{}-{}.idx_{}.bin",
+ uuid_path_id(sst_id),
+ SstKind::Nodes.path_tag(),
+ label,
+ prop.name,
+ );
+ let object_path = paths.sst_object(level, &file_name);
+ let relative = relative_sst_path(level, &file_name);
+ descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
+ property: prop.name.clone(),
+ path: relative,
+ size_bytes: body.len() as u64,
+ entry_count,
+ });
+ bodies.push((object_path, body));
+ }
+ Ok((descriptors, bodies))
 }
 
 fn prepare_edge_pending(
@@ -626,6 +731,7 @@ fn prepare_edge_pending(
  degree_histogram: Box::new(stats.degree_histogram),
  },
  bloom: bloom_descriptor,
+ unique_property_indices: Vec::new(),
  };
 
  PendingSst {
@@ -634,6 +740,7 @@ fn prepare_edge_pending(
  body: finish.body,
  bloom_path,
  bloom_body,
+ index_sidecars: Vec::new(),
  }
 }
 

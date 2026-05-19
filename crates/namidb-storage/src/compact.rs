@@ -461,6 +461,7 @@ async fn put_node_sst_l1(
  tombstone_count: stats.tombstone_count,
  },
  bloom: bloom_descriptor,
+ unique_property_indices: Vec::new(),
  };
  Ok((descriptor, wrote_bloom))
 }
@@ -525,6 +526,7 @@ async fn put_edge_sst_l1(
  degree_histogram: Box::new(stats.degree_histogram),
  },
  bloom: bloom_descriptor,
+ unique_property_indices: Vec::new(),
  };
  Ok((descriptor, wrote_bloom))
 }
