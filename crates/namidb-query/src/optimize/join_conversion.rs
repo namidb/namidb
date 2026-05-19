@@ -369,7 +369,7 @@ mod tests {
 
  fn scan(label: &str, alias: &str) -> LogicalPlan {
  LogicalPlan::NodeScan {
- label: label.into(),
+ label: Some(label.into()),
  alias: alias.into(),
  predicates: vec![],
  projection: None,
@@ -596,13 +596,13 @@ mod tests {
  let plan = LogicalPlan::Filter {
  input: Box::new(LogicalPlan::CrossProduct {
  left: Box::new(LogicalPlan::NodeScan {
- label: "Big".into(),
+ label: Some("Big".into()),
  alias: "b".into(),
  predicates: vec![],
  projection: None,
  }),
  right: Box::new(LogicalPlan::NodeScan {
- label: "Small".into(),
+ label: Some("Small".into()),
  alias: "s".into(),
  predicates: vec![],
  projection: None,
@@ -616,7 +616,7 @@ mod tests {
  // The chosen build subtree should be the smaller one
  // (`Small`).
  match *build {
- LogicalPlan::NodeScan { label, .. } => assert_eq!(label, "Small"),
+ LogicalPlan::NodeScan { label, .. } => assert_eq!(label.as_deref(), Some("Small")),
  other => panic!("expected NodeScan, got {:?}", other),
  }
  }

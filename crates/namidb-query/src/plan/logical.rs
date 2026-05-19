@@ -19,7 +19,11 @@ pub enum LogicalPlan {
  /// analysis ran; `Some(cols)` ⇒ storage decodes only those
  /// property columns plus the engine columns.
  NodeScan {
- label: String,
+ /// `Some(label)` restricts the scan to one label; `None`
+ /// fans out across every label observable through the
+ /// snapshot (`Snapshot::observed_labels`). Lowering produces
+ /// `None` for `MATCH (n)` without a label predicate.
+ label: Option<String>,
  alias: String,
  predicates: Vec<ScanPredicate>,
  projection: Option<Vec<String>>,
@@ -530,7 +534,7 @@ mod tests {
  #[test]
  fn operator_names_match_explain_expectation() {
  let scan = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -542,7 +546,7 @@ mod tests {
  #[test]
  fn filter_exposes_input_as_child() {
  let scan = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -559,7 +563,7 @@ mod tests {
  #[test]
  fn union_exposes_both_children() {
  let s = LogicalPlan::NodeScan {
- label: "L".into(),
+ label: Some("L".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
@@ -659,13 +663,13 @@ mod tests {
  #[test]
  fn hash_join_exposes_build_and_probe_as_children() {
  let l = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "a".into(),
  predicates: vec![],
  projection: None,
  };
  let r = LogicalPlan::NodeScan {
- label: "Person".into(),
+ label: Some("Person".into()),
  alias: "b".into(),
  predicates: vec![],
  projection: None,

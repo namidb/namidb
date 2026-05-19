@@ -301,6 +301,36 @@ impl<'mt> Snapshot<'mt> {
  set.into_iter().collect()
  }
 
+ /// Every node label observable through this snapshot — declared in the
+ /// manifest schema, present in the borrowed memtable, or persisted in
+ /// at least one node SST. Sister to [`Self::observed_edge_types`]:
+ /// query executors that need to fan-out across all labels (typeless
+ /// `NodeScan`, full-graph counts) can rely on this rather than the
+ /// declared schema, which is empty for namespaces that never went
+ /// through `SchemaBuilder`.
+ pub fn observed_labels(&self) -> Vec<String> {
+ use std::collections::BTreeSet;
+ let mut set: BTreeSet<String> = self
+ .manifest
+ .manifest
+ .schema
+ .labels
+ .keys()
+ .cloned()
+ .collect();
+ for (key, _) in self.memtable.iter() {
+ if let MemKey::Node { label, .. } = key {
+ set.insert(label.clone());
+ }
+ }
+ for sst in &self.manifest.manifest.ssts {
+ if matches!(sst.kind, SstKind::Nodes) {
+ set.insert(sst.scope.clone());
+ }
+ }
+ set.into_iter().collect()
+ }
+
  /// Look up a single node by `(label, id)`. Returns `None` for both
  /// "never inserted" and "winning record is a tombstone" outcomes.
  #[instrument(skip(self), fields(label = label, id = %id))]
