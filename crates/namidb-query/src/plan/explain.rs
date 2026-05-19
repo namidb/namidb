@@ -81,7 +81,7 @@ pub fn explain_query_raw_verbose(
 
 fn write_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
  for _ in 0..depth {
- out.push_str(" ");
+ out.push(' ');
  }
  write_header(plan, out);
  out.push('\n');
@@ -98,7 +98,7 @@ fn write_node_verbose(
  out: &mut String,
 ) {
  for _ in 0..depth {
- out.push_str(" ");
+ out.push(' ');
  }
  write_header(plan, out);
  if let LogicalPlan::Filter { input, predicate } = plan {
