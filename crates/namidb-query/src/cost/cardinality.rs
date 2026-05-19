@@ -114,6 +114,12 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
  label,
  alias,
  ..
+ }
+ | LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ ..
  } => {
  let child = estimate_inner(input, catalog);
  // Point lookup: each input row triggers at most one hit.

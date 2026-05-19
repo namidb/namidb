@@ -56,6 +56,10 @@ pub struct PropStats {
  pub min: Option<StatScalar>,
  pub max: Option<StatScalar>,
  pub ndv: Option<u64>,
+ /// Mirrors `PropertyDef::unique` from the schema — the optimizer
+ /// reads this to rewrite `Filter(prop = literal)` on top of
+ /// `NodeScan(label)` into `NodeByPropertyValue` (point lookup).
+ pub unique: bool,
 }
 
 /// Per-edge-type aggregate stats.
@@ -122,11 +126,21 @@ impl StatsCatalog {
  // even if no SST exists yet — keeps `LabelStats::name` always
  // populated and lets the optimizer distinguish "no SST" from
  // "label unknown".
- for name in m.schema.labels.keys() {
- labels.entry(name.clone()).or_insert_with(|| LabelStats {
+ for (name, ldef) in &m.schema.labels {
+ let entry = labels.entry(name.clone()).or_insert_with(|| LabelStats {
  name: name.clone(),
  ..Default::default()
  });
+ // Seed the `unique` bit from the schema for every declared
+ // property. The merge_node_sst pass populates the numeric
+ // stats below; uniqueness is metadata, not a stat.
+ for pd in &ldef.properties {
+ entry.properties.entry(pd.name.clone())
+ .or_insert_with(|| PropStats {
+ unique: pd.unique,
+ ..Default::default()
+ });
+ }
  }
  for (name, et) in &m.schema.edge_types {
  edge_types

@@ -29,7 +29,7 @@ pub fn schema() -> Schema {
  // declared here and written by the loader, every IC02/07/08/09
  // bind for the `p:Person` anchor returns zero rows.
  properties: vec![
- PropertyDef::new("id", DataType::Utf8, true).unwrap(),
+ PropertyDef::new("id", DataType::Utf8, true).unwrap().with_unique(true),
  PropertyDef::new("firstName", DataType::Utf8, true).unwrap(),
  PropertyDef::new("lastName", DataType::Utf8, true).unwrap(),
  PropertyDef::new("age", DataType::Int64, true).unwrap(),
@@ -40,7 +40,7 @@ pub fn schema() -> Schema {
  .label(LabelDef {
  name: "Post".into(),
  properties: vec![
- PropertyDef::new("id", DataType::Utf8, true).unwrap(),
+ PropertyDef::new("id", DataType::Utf8, true).unwrap().with_unique(true),
  PropertyDef::new("content", DataType::Utf8, true).unwrap(),
  PropertyDef::new("creationDate", DataType::Int64, true).unwrap(),
  PropertyDef::new("length", DataType::Int64, true).unwrap(),
@@ -50,7 +50,7 @@ pub fn schema() -> Schema {
  .label(LabelDef {
  name: "Comment".into(),
  properties: vec![
- PropertyDef::new("id", DataType::Utf8, true).unwrap(),
+ PropertyDef::new("id", DataType::Utf8, true).unwrap().with_unique(true),
  PropertyDef::new("content", DataType::Utf8, true).unwrap(),
  PropertyDef::new("creationDate", DataType::Int64, true).unwrap(),
  PropertyDef::new("length", DataType::Int64, true).unwrap(),
@@ -94,6 +94,27 @@ pub fn schema() -> Schema {
 pub async fn load_into_in_memory(csv_dir: &Path, namespace: &str) -> Result<WriterSession> {
  let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
  let paths = NamespacePaths::new("tenants", NamespaceId::new(namespace).unwrap());
+ let mut writer = WriterSession::open(store, paths)
+ .await
+ .context("open writer session")?;
+ bulk_load(&mut writer, csv_dir).await?;
+ Ok(writer)
+}
+
+/// Bulk-load the dataset into a caller-supplied object store + namespace
+/// + root prefix. Used by `Cmd::LoadR2` to load directly against R2 so
+/// the publishable Bench B can serve the same LDBC dataset NamiDB-cloud
+/// would in production.
+///
+/// `root_prefix` mirrors the worker config (`storage.root_prefix`,
+/// default `"tenants"`).
+pub async fn load_into_store(
+ store: Arc<dyn ObjectStore>,
+ root_prefix: &str,
+ namespace: &str,
+ csv_dir: &Path,
+) -> Result<WriterSession> {
+ let paths = NamespacePaths::new(root_prefix, NamespaceId::new(namespace).unwrap());
  let mut writer = WriterSession::open(store, paths)
  .await
  .context("open writer session")?;

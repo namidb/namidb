@@ -81,6 +81,30 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
  )
  }
 
+ // Same alias-introducing shape as NodeById.
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => {
+ let mut introduced = BTreeSet::new();
+ introduced.insert(alias.clone());
+ let (pushable, stay) = partition_by_alias_disjoint(pending, &introduced);
+ let new_input = pushdown_at(*input, pushable);
+ apply_filters(
+ LogicalPlan::NodeByPropertyValue {
+ input: Box::new(new_input),
+ label,
+ alias,
+ property,
+ value,
+ },
+ stay,
+ )
+ }
+
  // ─── Expand: introduces target_alias (+ rel_alias?) ────────────
  LogicalPlan::Expand {
  input,

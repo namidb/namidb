@@ -93,6 +93,20 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
  collect_from_plan(input, req);
  collect_from_expr(id, req);
  }
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ alias,
+ property,
+ value,
+ ..
+ } => {
+ collect_from_plan(input, req);
+ // The lookup property column must survive projection pushdown
+ // — `lookup_node_by_property_via_scan` reads it back to verify
+ // the exact-equality match.
+ req.record_property(alias, property);
+ collect_from_expr(value, req);
+ }
  LogicalPlan::Expand { input, source, .. } => {
  // The source binding must expose its `id` for traversal —
  // the executor reads `row.get(source).id` to call
@@ -500,6 +514,19 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
  label,
  alias,
  id,
+ },
+ LogicalPlan::NodeByPropertyValue {
+ input,
+ label,
+ alias,
+ property,
+ value,
+ } => LogicalPlan::NodeByPropertyValue {
+ input: Box::new(rewrite(*input, req)),
+ label,
+ alias,
+ property,
+ value,
  },
  LogicalPlan::Expand {
  input,

@@ -83,6 +83,17 @@ pub struct PropertyDef {
  pub name: String,
  pub data_type: DataType,
  pub nullable: bool,
+ /// When `true`, the planner is allowed to assume *at most one* node
+ /// of the parent label has any given value for this property, which
+ /// lets `MATCH (a:Label {prop: literal})` lower to a point-lookup
+ /// instead of a full label scan + filter. The engine does NOT
+ /// enforce uniqueness on write — it's a planner hint, equivalent
+ /// to Kuzu's `PRIMARY KEY` or Neo4j's `UNIQUENESS CONSTRAINT`
+ /// without the enforcement. Caller takes responsibility.
+ ///
+ /// Defaults to `false` so existing schemas / manifests load
+ /// unchanged via the `#[serde(default)]` on the wire repr.
+ pub unique: bool,
 }
 
 /// Wire-level representation used only by serde. The public type validates
@@ -93,12 +104,16 @@ struct PropertyDefRepr {
  data_type: DataType,
  #[serde(default)]
  nullable: bool,
+ #[serde(default)]
+ unique: bool,
 }
 
 impl TryFrom<PropertyDefRepr> for PropertyDef {
  type Error = Error;
  fn try_from(r: PropertyDefRepr) -> Result<Self> {
- PropertyDef::new(r.name, r.data_type, r.nullable)
+ let mut p = PropertyDef::new(r.name, r.data_type, r.nullable)?;
+ p.unique = r.unique;
+ Ok(p)
  }
 }
 
@@ -108,6 +123,7 @@ impl From<PropertyDef> for PropertyDefRepr {
  name: p.name,
  data_type: p.data_type,
  nullable: p.nullable,
+ unique: p.unique,
  }
  }
 }
@@ -128,7 +144,19 @@ impl PropertyDef {
  name,
  data_type,
  nullable,
+ unique: false,
  })
+ }
+
+ /// Builder method: declare this property as unique (planner hint —
+ /// the engine does NOT enforce uniqueness on write).
+ ///
+ /// ```ignore
+ /// PropertyDef::new("id", DataType::Utf8, true)?.with_unique(true)
+ /// ```
+ pub fn with_unique(mut self, unique: bool) -> Self {
+ self.unique = unique;
+ self
  }
 
  pub fn to_arrow_field(&self) -> Field {
