@@ -688,6 +688,7 @@ async fn apply_merge(
 /// positional layout. We locate the head by alias (the source of the
 /// single Rel for a 1-hop pattern, or the only Node for a 0-hop one)
 /// and dispatch by alias from there.
+#[allow(clippy::type_complexity)] // local BTreeMap of borrowed pattern slots
 async fn find_merge_matches(
  pattern: &[CreateElement],
  outer_row: &Row,
