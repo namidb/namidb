@@ -23,7 +23,13 @@ pub fn schema() -> Schema {
  SchemaBuilder::new()
  .label(LabelDef {
  name: "Person".into(),
+ // `id` is a *user* property (LDBC SNB convention; matches Kuzu
+ // `PRIMARY KEY (id)` and Neo4j `:Person(id)`). The engine
+ // lowers `{id: 'literal'}` to NodeScan + Filter, so without `id`
+ // declared here and written by the loader, every IC02/07/08/09
+ // bind for the `p:Person` anchor returns zero rows.
  properties: vec![
+ PropertyDef::new("id", DataType::Utf8, true).unwrap(),
  PropertyDef::new("firstName", DataType::Utf8, true).unwrap(),
  PropertyDef::new("lastName", DataType::Utf8, true).unwrap(),
  PropertyDef::new("age", DataType::Int64, true).unwrap(),
@@ -34,6 +40,7 @@ pub fn schema() -> Schema {
  .label(LabelDef {
  name: "Post".into(),
  properties: vec![
+ PropertyDef::new("id", DataType::Utf8, true).unwrap(),
  PropertyDef::new("content", DataType::Utf8, true).unwrap(),
  PropertyDef::new("creationDate", DataType::Int64, true).unwrap(),
  PropertyDef::new("length", DataType::Int64, true).unwrap(),
@@ -43,6 +50,7 @@ pub fn schema() -> Schema {
  .label(LabelDef {
  name: "Comment".into(),
  properties: vec![
+ PropertyDef::new("id", DataType::Utf8, true).unwrap(),
  PropertyDef::new("content", DataType::Utf8, true).unwrap(),
  PropertyDef::new("creationDate", DataType::Int64, true).unwrap(),
  PropertyDef::new("length", DataType::Int64, true).unwrap(),
@@ -119,6 +127,10 @@ fn load_persons(writer: &mut WriterSession, path: &Path) -> Result<()> {
  }
  let id = parse_node_id(parts[0])?;
  let mut props: BTreeMap<String, Value> = BTreeMap::new();
+ // Mirror the user-facing `id` from the CSV. The internal NodeId
+ // is what we pass to `upsert_node`; the property is what queries
+ // like `MATCH (:Person {id: $personId})` filter against.
+ props.insert("id".into(), Value::Str(parts[0].into()));
  props.insert("firstName".into(), Value::Str(parts[1].into()));
  props.insert("lastName".into(), Value::Str(parts[2].into()));
  props.insert("age".into(), Value::I64(parts[3].parse::<i64>()?));
@@ -148,6 +160,7 @@ fn load_posts(writer: &mut WriterSession, path: &Path) -> Result<()> {
  }
  let id = parse_node_id(parts[0])?;
  let mut props: BTreeMap<String, Value> = BTreeMap::new();
+ props.insert("id".into(), Value::Str(parts[0].into()));
  props.insert("content".into(), Value::Str(parts[1].into()));
  props.insert("creationDate".into(), Value::I64(parts[2].parse::<i64>()?));
  props.insert("length".into(), Value::I64(parts[3].parse::<i64>()?));
@@ -176,6 +189,7 @@ fn load_comments(writer: &mut WriterSession, path: &Path) -> Result<()> {
  }
  let id = parse_node_id(parts[0])?;
  let mut props: BTreeMap<String, Value> = BTreeMap::new();
+ props.insert("id".into(), Value::Str(parts[0].into()));
  props.insert("content".into(), Value::Str(parts[1].into()));
  props.insert("creationDate".into(), Value::I64(parts[2].parse::<i64>()?));
  props.insert("length".into(), Value::I64(parts[3].parse::<i64>()?));
