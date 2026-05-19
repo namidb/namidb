@@ -64,6 +64,21 @@ enum Cmd {
  #[arg(long, value_enum)]
  only: Vec<Query>,
  },
+ /// Load-only timing: bulk-load the dataset into an InMemory namespace
+ /// and emit `{load_time_secs, dataset_sizes}` JSON. Used by the
+ /// publishable bench harness's "write throughput" track to compare
+ /// the engine's load path against Kuzu COPY / Neo4j UNWIND on the
+ /// same CSV dataset. Includes the final `flush()` so the number
+ /// reflects "memtable + SST flushed" — apples-to-apples with Kuzu's
+ /// COPY (which also persists to disk).
+ Load {
+ #[arg(short, long, default_value = "0.1")]
+ scale: f64,
+ #[arg(short = 'S', long, default_value_t = 42)]
+ seed: u64,
+ #[arg(long)]
+ dataset_dir: Option<PathBuf>,
+ },
 }
 
 #[tokio::main]
@@ -154,8 +169,75 @@ async fn main() -> Result<()> {
  };
  println!("{}", serde_json::to_string_pretty(&out)?);
  }
+ Cmd::Load {
+ scale,
+ seed,
+ dataset_dir,
+ } => {
+ // Resolve or generate the dataset, same protocol as `Run`.
+ let (dataset_dir, _kept) = if let Some(d) = dataset_dir {
+ (d, None)
+ } else {
+ let tmp = std::env::temp_dir()
+ .join(format!("namidb-bench-{}", uuid::Uuid::now_v7().simple()));
+ std::fs::create_dir_all(&tmp)?;
+ (tmp.clone(), Some(tmp))
+ };
+ let sizes = if dataset_dir.join("persons.csv").exists() {
+ DatasetSizes::from_scale(scale)
+ } else {
+ dataset::generate(&dataset_dir, &DatasetConfig { scale, seed })?
+ };
+
+ // Time the load: open writer + bulk_load (which flushes SSTs).
+ // Drop the writer afterwards so its allocations are freed by the
+ // time we print the result, in case a harness reuses the process.
+ // The number we publish is `load_time_secs` (includes flush). The
+ // pre-load `WriterSession::open` is ~ms; we keep it inside the
+ // headline number because the equivalent Kuzu `Database::new`
+ // and Neo4j `Driver.connect` are similarly tiny + always counted.
+ let start = std::time::Instant::now();
+ let writer = loader::load_into_in_memory(&dataset_dir, "bench").await?;
+ let load_time_secs = start.elapsed().as_secs_f64();
+ drop(writer);
+
+ let report = LoadReport {
+ backend: "namidb-engine-inmemory",
+ scale,
+ seed,
+ dataset_sizes: SizesReport::from(&sizes),
+ load_time_secs,
+ elements: sizes.persons
+ + sizes.posts
+ + sizes.comments
+ + sizes.knows
+ + sizes.has_creator
+ + sizes.likes
+ + sizes.reply_of,
+ };
+ eprintln!(
+ "load: {} elements in {:.3}s = {:.0} elem/s",
+ report.elements,
+ report.load_time_secs,
+ report.elements as f64 / report.load_time_secs,
+ );
+ println!("{}", serde_json::to_string_pretty(&report)?);
+ }
  }
  Ok(())
+}
+
+/// One-shot load-only timing report emitted by `Cmd::Load`. The
+/// publishable bench harness consumes this JSON via
+/// `scripts/bench_publish/bench_d_write_throughput.py`.
+#[derive(Debug, serde::Serialize)]
+struct LoadReport {
+ backend: &'static str,
+ scale: f64,
+ seed: u64,
+ dataset_sizes: SizesReport,
+ elements: usize,
+ load_time_secs: f64,
 }
 
 fn make_person_id_hex(i: usize) -> String {
