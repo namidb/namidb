@@ -27,6 +27,7 @@ pub mod memtable;
 pub mod node_cache;
 pub mod parquet_loader;
 pub mod paths;
+pub mod property_index;
 pub mod read;
 pub mod recovery;
 pub mod sst;

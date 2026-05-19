@@ -1223,17 +1223,23 @@ pub(crate) async fn lookup_node_by_property_via_scan(
  property: &str,
  value: &RuntimeValue,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
- // Convert RuntimeValue → StatScalar for predicate pushdown. We
- // only support the common cases; anything else falls through to a
- // plain scan + post-filter below.
+ // For v0 we only index String-valued properties (LDBC's `id`).
+ // Other scalar types fall back to `scan_label_with_predicates` —
+ // accurate but pays the per-row decoder overhead every call.
+ if let RuntimeValue::String(s) = value {
+ return snapshot
+ .lookup_node_by_property(label, property, s)
+ .await
+ .map_err(ExecError::Storage);
+ }
+
+ // Fallback for non-string keys.
  let scalar = match value {
- RuntimeValue::String(s) => Some(namidb_storage::sst::stats::StatScalar::Utf8(s.clone())),
  RuntimeValue::Integer(i) => Some(namidb_storage::sst::stats::StatScalar::Int64(*i)),
  RuntimeValue::Bool(b) => Some(namidb_storage::sst::stats::StatScalar::Bool(*b)),
  RuntimeValue::Float(f) => Some(namidb_storage::sst::stats::StatScalar::Float64(*f)),
  _ => None,
  };
-
  let candidates = if let Some(s) = scalar {
  let pred = namidb_storage::sst::predicates::ScanPredicate::Eq {
  column: property.to_string(),
@@ -1244,20 +1250,11 @@ pub(crate) async fn lookup_node_by_property_via_scan(
  .await
  .map_err(ExecError::Storage)?
  } else {
- // Unsupported scalar type (List/Map/etc) — fall through to
- // a plain scan; we'd need an external filter step below but
- // the planner doesn't emit NodeByPropertyValue for those.
  snapshot
  .scan_label(label)
  .await
  .map_err(ExecError::Storage)?
  };
-
- // `scan_label_with_predicates` already applies the Eq predicate at
- // row level (see `node_view_matches_predicates` in
- // namidb-storage::read). The candidate set therefore contains
- // exact matches only — for a unique property that's at most one.
- // Take it without re-filtering.
  Ok(candidates.into_iter().next())
 }
 

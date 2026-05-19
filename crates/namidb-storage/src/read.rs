@@ -161,6 +161,11 @@ pub struct Snapshot<'mt> {
  /// stays resolved for every subsequent snapshot at that manifest
  /// version.
  shared_node_cache: Option<Arc<NodeViewCache>>,
+ /// Cross-snapshot lazy index over `(label, property) → value → NodeId`
+ /// (RFC-pending). Attached via [`Self::with_property_index_cache`].
+ /// `Snapshot::lookup_node_by_property` populates it on first miss
+ /// and reuses it for the warm-path point lookups.
+ property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
 }
 
 /// Cold-path routing policy for [`Snapshot::lookup_node`]. See
@@ -216,6 +221,7 @@ impl<'mt> Snapshot<'mt> {
  ranged_threshold_bytes: DEFAULT_RANGED_THRESHOLD_BYTES,
  adjacency_cache: None,
  shared_node_cache: None,
+ property_index_cache: None,
  }
  }
 
@@ -264,6 +270,69 @@ impl<'mt> Snapshot<'mt> {
  pub fn with_shared_node_cache(mut self, cache: Arc<NodeViewCache>) -> Self {
  self.shared_node_cache = Some(cache);
  self
+ }
+
+ /// Attach a cross-snapshot lazy property index. The first call to
+ /// [`Self::lookup_node_by_property`] for any (label, prop) pair
+ /// scans the label once and builds the `value → NodeId` map; every
+ /// subsequent call (even on a different snapshot from the same
+ /// writer) is an `O(1)` `HashMap::get`.
+ pub fn with_property_index_cache(
+ mut self,
+ cache: Arc<crate::property_index::PropertyIndexCache>,
+ ) -> Self {
+ self.property_index_cache = Some(cache);
+ self
+ }
+
+ /// Point-lookup a node by a *unique* user property. The first call
+ /// per (label, prop) pays a full label scan to populate the
+ /// cross-snapshot cache; subsequent calls are `O(1)`. Caller is
+ /// responsible for the unique invariant — without it the lookup
+ /// returns an arbitrary matching row.
+ ///
+ /// Today only `String`-valued properties are indexed (LDBC's `id`).
+ /// Non-string types fall back to the scan + filter path.
+ pub async fn lookup_node_by_property(
+ &self,
+ label: &str,
+ property: &str,
+ value: &str,
+ ) -> Result<Option<NodeView>> {
+ // 1. Try the cross-snapshot index — `O(1)` warm path.
+ if let Some(cache) = &self.property_index_cache {
+ if let Some(idx) = cache.get(label, property) {
+ if let Some(node_id) = idx.get(value).copied() {
+ return self.lookup_node(label, node_id).await;
+ } else {
+ // Property is declared unique → "not in index" is a
+ // definitive negative answer, no need to scan.
+ return Ok(None);
+ }
+ }
+ }
+
+ // 2. Cold path: full label scan to build the index, then look up.
+ let all_nodes = self.scan_label(label).await?;
+ let mut idx: std::collections::HashMap<String, namidb_core::id::NodeId> =
+ std::collections::HashMap::with_capacity(all_nodes.len());
+ let mut found: Option<NodeView> = None;
+ for view in &all_nodes {
+ if let Some(namidb_core::Value::Str(s)) = view.properties.get(property) {
+ if s == value {
+ found = Some(view.clone());
+ }
+ idx.insert(s.clone(), view.id);
+ }
+ }
+ if let Some(cache) = &self.property_index_cache {
+ cache.insert(
+ label.to_string(),
+ property.to_string(),
+ std::sync::Arc::new(idx),
+ );
+ }
+ Ok(found)
  }
 
  pub fn manifest(&self) -> &LoadedManifest {
