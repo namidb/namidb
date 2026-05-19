@@ -197,11 +197,15 @@ fn property_access(target: &RuntimeValue, key: &str) -> RuntimeValue {
  match target {
  RuntimeValue::Null => RuntimeValue::Null,
  RuntimeValue::Node(n) => match key {
- "id" => RuntimeValue::String(n.id.to_string()),
+ // `_id` materialises the internal NodeId. Plain `id` falls
+ // through to the property map so users can store their own.
+ "_id" => RuntimeValue::String(n.id.to_string()),
  _ => n.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
  },
  RuntimeValue::Rel(r) => match key {
- "id" => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
+ // Rel internal identifier — see Node accessor above for the
+ // rationale behind the `_id` sigil.
+ "_id" => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
  _ => r.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
  },
  RuntimeValue::Map(m) => m.get(key).cloned().unwrap_or(RuntimeValue::Null),
@@ -970,7 +974,7 @@ mod tests {
  }
 
  #[test]
- fn dot_id_on_node_returns_uuid_string() {
+ fn dot_underscore_id_on_node_returns_uuid_string() {
  let id = namidb_core::id::NodeId::new();
  let node = RuntimeValue::Node(Box::new(NodeValue {
  id,
@@ -978,15 +982,18 @@ mod tests {
  properties: BTreeMap::new(),
  }));
  let row = row_with(&[("a", node)]);
- let r = eval_str("a.id", &row, &Params::new());
+ let r = eval_str("a._id", &row, &Params::new());
  assert_eq!(r, RuntimeValue::String(id.to_string()));
  }
 
  #[test]
- fn dot_id_on_node_takes_precedence_over_properties() {
+ fn dot_id_on_node_returns_user_property_not_internal_id() {
+ // Regression: `id` was previously aliased to the internal NodeId.
+ // After the rename to `_id`, plain `id` must surface the
+ // user-owned property value verbatim.
  let id = namidb_core::id::NodeId::new();
  let mut props = BTreeMap::new();
- props.insert("id".into(), RuntimeValue::String("not-the-real-id".into()));
+ props.insert("id".into(), RuntimeValue::String("external-42".into()));
  let node = RuntimeValue::Node(Box::new(NodeValue {
  id,
  label: "Person".into(),
@@ -994,7 +1001,21 @@ mod tests {
  }));
  let row = row_with(&[("a", node)]);
  let r = eval_str("a.id", &row, &Params::new());
- assert_eq!(r, RuntimeValue::String(id.to_string()));
+ assert_eq!(r, RuntimeValue::String("external-42".into()));
+ }
+
+ #[test]
+ fn dot_id_on_node_without_property_returns_null() {
+ // No user-defined `id` property → accessor must yield Null, not
+ // fall back to the internal NodeId.
+ let node = RuntimeValue::Node(Box::new(NodeValue {
+ id: namidb_core::id::NodeId::new(),
+ label: "Person".into(),
+ properties: BTreeMap::new(),
+ }));
+ let row = row_with(&[("a", node)]);
+ let r = eval_str("a.id", &row, &Params::new());
+ assert_eq!(r, RuntimeValue::Null);
  }
 
  #[test]

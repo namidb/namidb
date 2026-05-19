@@ -89,7 +89,10 @@ fn try_convert_at_root(plan: LogicalPlan, _catalog: &StatsCatalog) -> LogicalPla
  // Replace the single Argument with a fresh NodeScan on `X`'s label.
  let new_subplan = replace_argument(*subplan, &x, &label);
 
- let key_expr = property_expression(&x, "id");
+ // Join key uses the internal NodeId, accessed via the `_id`
+ // accessor since the unqualified `id` is now a user property
+ // (Bug #1 rename).
+ let key_expr = property_expression(&x, "_id");
  LogicalPlan::HashSemiJoin {
  outer: input,
  inner: Box::new(new_subplan),

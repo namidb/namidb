@@ -448,7 +448,7 @@ async fn ic09_friends_of_friends_messages() {
                 assert_ne!(
                     s,
                     &f.alice.to_string(),
-                    "Alice should be filtered by NOT friend.id = p.id"
+                    "Alice should be filtered by NOT friend._id = p._id"
                 );
             }
             other => panic!("unexpected: {:?}", other),

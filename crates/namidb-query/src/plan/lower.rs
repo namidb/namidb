@@ -645,29 +645,31 @@ fn lower_node_pattern_head(
  .unwrap_or_else(|| anonymous_alias(ctx));
  ctx.introduce(&alias, head.span)?;
 
- // Detect inline `{id: $param}` filter and lower to NodeById.
+ // Detect inline `{_id: $param}` filter and lower to NodeById.
+ // The `id` key is reserved for user properties; only `_id` (the
+ // explicit internal-NodeId sigil) triggers the fast point lookup.
  if let Some(map) = &head.properties {
  if let Some(id_expr) = map
  .entries
  .iter()
- .find(|(k, _)| k.name == "id")
+ .find(|(k, _)| k.name == "_id")
  .map(|(_, v)| v.clone())
  {
  // NodeById requires a label (single-label CF lookup). Reject
- // typeless `MATCH ({id: $x})` here — the user should write
- // `MATCH (n:Label {id: $x})` to use the fast point lookup.
+ // typeless `MATCH ({_id: $x})` here — the user should write
+ // `MATCH (n:Label {_id: $x})` to use the fast point lookup.
  let label = label.ok_or_else(|| {
  LowerError::new(
  LowerErrorKind::UnsupportedFeature,
- "id-lookup requires an explicit label (e.g. `MATCH (n:Label {id: $x})`)",
+ "_id-lookup requires an explicit label (e.g. `MATCH (n:Label {_id: $x})`)",
  head.span,
  )
  })?;
- // Map must contain ONLY `id` — any extra props become Filter.
+ // Map must contain ONLY `_id` — any extra props become Filter.
  let extra_filters: Vec<_> = map
  .entries
  .iter()
- .filter(|(k, _)| k.name != "id")
+ .filter(|(k, _)| k.name != "_id")
  .cloned()
  .collect();
  let inner_input = input.unwrap_or(LogicalPlan::Empty);
@@ -1950,8 +1952,10 @@ mod tests {
  }
 
  #[test]
- fn match_with_id_lookup_lowers_to_node_by_id() {
- let p = lp("MATCH (a:Person {id: $personId}) RETURN a");
+ fn match_with_underscore_id_lookup_lowers_to_node_by_id() {
+ // The internal NodeId sigil is `_id` (Bug #1 rename). The legacy
+ // plain `id` key is no longer reserved.
+ let p = lp("MATCH (a:Person {_id: $personId}) RETURN a");
  match p {
  LogicalPlan::Project { input, .. } => match *input {
  LogicalPlan::NodeById { label, alias, .. } => {
@@ -1962,6 +1966,25 @@ mod tests {
  },
  _ => panic!("expected Project"),
  }
+ }
+
+ #[test]
+ fn match_with_plain_id_property_lowers_to_filter_not_node_by_id() {
+ // Regression for Bug #1: `id` is a user property now. `{id: ...}`
+ // must NOT trigger a NodeById point-lookup; it should fall through
+ // to NodeScan + Filter so the engine treats it like any other prop.
+ let p = lp("MATCH (a:Person {id: 'external-42'}) RETURN a");
+ fn has_node_by_id(plan: &LogicalPlan) -> bool {
+ match plan {
+ LogicalPlan::NodeById { .. } => true,
+ _ => plan.children().iter().any(|c| has_node_by_id(c)),
+ }
+ }
+ assert!(
+ !has_node_by_id(&p),
+ "expected no NodeById in plan for plain `id` property, got {:?}",
+ p,
+ );
  }
 
  #[test]
