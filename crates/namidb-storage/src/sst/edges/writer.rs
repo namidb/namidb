@@ -408,7 +408,7 @@ impl EdgeSstWriter {
  for (stream, value) in self
  .declared_streams
  .iter_mut()
- .zip(record.declared_properties.into_iter())
+ .zip(record.declared_properties)
  {
  stream.append(value)?;
  }
@@ -509,7 +509,7 @@ impl EdgeSstWriter {
  Vec::with_capacity(self.declared_streams.len());
  for (name, stream) in declared_property_names
  .iter()
- .zip(std::mem::take(&mut self.declared_streams).into_iter())
+ .zip(std::mem::take(&mut self.declared_streams))
  {
  if let Some((body, codec)) = stream.finish(opts.compress_property_streams)? {
  declared_sections.push((name.clone(), body, codec));
