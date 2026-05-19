@@ -40,7 +40,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --exclude namidb-py -- -D warnings
+      # `doc_lazy_continuation` (Rust 1.95) flags ~120 multi-line
+      # docstring bullets across the codebase — purely stylistic; the
+      # tracking ticket reformats them in a dedicated change. Allow it
+      # here so the lint stays informative without gating every PR.
+      - run: cargo clippy --workspace --all-targets --exclude namidb-py -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
     name: test (${{ matrix.os }})
