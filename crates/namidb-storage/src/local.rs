@@ -86,12 +86,11 @@ impl LocalFileObjectStore {
                 source: Box::new(e),
             }
         })?;
-        let inner = LocalFileSystem::new_with_prefix(&root).map_err(|e| {
-            object_store::Error::Generic {
+        let inner =
+            LocalFileSystem::new_with_prefix(&root).map_err(|e| object_store::Error::Generic {
                 store: "LocalFileObjectStore",
                 source: Box::new(e),
-            }
-        })?;
+            })?;
         Ok(Self {
             inner: Arc::new(inner),
             root,
@@ -449,7 +448,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Some(crate::error::Error::ManifestCommitCas { .. })))
             .count();
-        assert_eq!(oks, 1, "exactly one writer should succeed; got {r_a:?} / {r_b:?}");
+        assert_eq!(
+            oks, 1,
+            "exactly one writer should succeed; got {r_a:?} / {r_b:?}"
+        );
         assert_eq!(cas_losses, 1, "the other writer must report CAS loss");
 
         // Final state at v1.

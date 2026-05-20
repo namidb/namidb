@@ -42,8 +42,8 @@ use std::fs::File;
 use std::path::Path;
 
 use arrow_array::{
- cast::AsArray, types::*, Array, BinaryArray, BooleanArray, FixedSizeBinaryArray,
- FixedSizeListArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    cast::AsArray, types::*, Array, BinaryArray, BooleanArray, FixedSizeBinaryArray,
+    FixedSizeListArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType as ArrowDataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -64,11 +64,11 @@ const DEFAULT_BATCH_SIZE: usize = 8192;
 /// Outcome of a successful [`load_nodes`] run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LoadOutcome {
- /// Rows pushed to the writer via `upsert_node`.
- pub rows_loaded: usize,
- /// Number of `commit_batch` calls fired during the load (not
- /// counting the implicit one inside `flush`).
- pub commit_batches: usize,
+    /// Rows pushed to the writer via `upsert_node`.
+    pub rows_loaded: usize,
+    /// Number of `commit_batch` calls fired during the load (not
+    /// counting the implicit one inside `flush`).
+    pub commit_batches: usize,
 }
 
 /// Load every row in a Parquet file as a node upsert for `label`.
@@ -82,297 +82,297 @@ pub struct LoadOutcome {
 /// everything pending for the caller's final flush" — useful when the
 /// caller wants exactly one durability boundary at the end of the load.
 pub async fn load_nodes(
- path: &Path,
- writer: &mut WriterSession,
- label: &str,
- commit_every: usize,
+    path: &Path,
+    writer: &mut WriterSession,
+    label: &str,
+    commit_every: usize,
 ) -> Result<LoadOutcome> {
- let file = File::open(path)
- .map_err(|e| Error::invariant(format!("open parquet file {}: {e}", path.display())))?;
- let builder = ParquetRecordBatchReaderBuilder::try_new(file)
- .map_err(|e| Error::invariant(format!("open parquet reader: {e}")))?;
- // Cap the reader batch to the commit cadence: otherwise a small
- // `commit_every` would only fire once per (much larger) Arrow
- // batch, since we only check the commit threshold at batch
- // boundaries.
- let batch_size = if commit_every > 0 {
- DEFAULT_BATCH_SIZE.min(commit_every)
- } else {
- DEFAULT_BATCH_SIZE
- };
- let reader = builder
- .with_batch_size(batch_size)
- .build()
- .map_err(|e| Error::invariant(format!("build parquet reader: {e}")))?;
+    let file = File::open(path)
+        .map_err(|e| Error::invariant(format!("open parquet file {}: {e}", path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::invariant(format!("open parquet reader: {e}")))?;
+    // Cap the reader batch to the commit cadence: otherwise a small
+    // `commit_every` would only fire once per (much larger) Arrow
+    // batch, since we only check the commit threshold at batch
+    // boundaries.
+    let batch_size = if commit_every > 0 {
+        DEFAULT_BATCH_SIZE.min(commit_every)
+    } else {
+        DEFAULT_BATCH_SIZE
+    };
+    let reader = builder
+        .with_batch_size(batch_size)
+        .build()
+        .map_err(|e| Error::invariant(format!("build parquet reader: {e}")))?;
 
- let mut outcome = LoadOutcome::default();
- let mut rows_since_commit: usize = 0;
+    let mut outcome = LoadOutcome::default();
+    let mut rows_since_commit: usize = 0;
 
- for batch in reader {
- let batch: RecordBatch =
- batch.map_err(|e| Error::invariant(format!("read parquet batch: {e}")))?;
- ingest_batch(&batch, writer, label, &mut outcome)?;
+    for batch in reader {
+        let batch: RecordBatch =
+            batch.map_err(|e| Error::invariant(format!("read parquet batch: {e}")))?;
+        ingest_batch(&batch, writer, label, &mut outcome)?;
 
- rows_since_commit += batch.num_rows();
- if commit_every > 0 && rows_since_commit >= commit_every {
- writer.commit_batch().await?;
- outcome.commit_batches += 1;
- rows_since_commit = 0;
- }
- }
- Ok(outcome)
+        rows_since_commit += batch.num_rows();
+        if commit_every > 0 && rows_since_commit >= commit_every {
+            writer.commit_batch().await?;
+            outcome.commit_batches += 1;
+            rows_since_commit = 0;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Process one `RecordBatch` worth of rows. Pulled out so the per-row
 /// loop is testable without spinning up Parquet I/O.
 fn ingest_batch(
- batch: &RecordBatch,
- writer: &mut WriterSession,
- label: &str,
- outcome: &mut LoadOutcome,
+    batch: &RecordBatch,
+    writer: &mut WriterSession,
+    label: &str,
+    outcome: &mut LoadOutcome,
 ) -> Result<()> {
- let schema = batch.schema();
+    let schema = batch.schema();
 
- // Locate the node_id column once per batch.
- let id_col_idx = schema
- .index_of("node_id")
- .map_err(|_| Error::invariant("parquet schema is missing required 'node_id' column"))?;
- let id_col = batch.column(id_col_idx);
- let id_array = id_col
- .as_any()
- .downcast_ref::<FixedSizeBinaryArray>()
- .ok_or_else(|| {
- Error::invariant(format!(
- "'node_id' column must be FixedSizeBinary(16), got {:?}",
- id_col.data_type()
- ))
- })?;
- if id_array.value_length() != 16 {
- return Err(Error::invariant(format!(
- "'node_id' FixedSizeBinary width must be 16, got {}",
- id_array.value_length()
- )));
- }
+    // Locate the node_id column once per batch.
+    let id_col_idx = schema
+        .index_of("node_id")
+        .map_err(|_| Error::invariant("parquet schema is missing required 'node_id' column"))?;
+    let id_col = batch.column(id_col_idx);
+    let id_array = id_col
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .ok_or_else(|| {
+            Error::invariant(format!(
+                "'node_id' column must be FixedSizeBinary(16), got {:?}",
+                id_col.data_type()
+            ))
+        })?;
+    if id_array.value_length() != 16 {
+        return Err(Error::invariant(format!(
+            "'node_id' FixedSizeBinary width must be 16, got {}",
+            id_array.value_length()
+        )));
+    }
 
- // Precompute the property column indices. We skip node_id and any
- // reserved engine-managed names (refusing the row if we see them).
- let mut prop_indices: Vec<(usize, String)> = Vec::with_capacity(schema.fields().len());
- for (idx, field) in schema.fields().iter().enumerate() {
- if idx == id_col_idx {
- continue;
- }
- let name = field.name();
- if matches!(name.as_str(), "tombstone" | "lsn") {
- return Err(Error::invariant(format!(
- "parquet column '{name}' collides with engine-managed column"
- )));
- }
- prop_indices.push((idx, name.clone()));
- }
+    // Precompute the property column indices. We skip node_id and any
+    // reserved engine-managed names (refusing the row if we see them).
+    let mut prop_indices: Vec<(usize, String)> = Vec::with_capacity(schema.fields().len());
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if idx == id_col_idx {
+            continue;
+        }
+        let name = field.name();
+        if matches!(name.as_str(), "tombstone" | "lsn") {
+            return Err(Error::invariant(format!(
+                "parquet column '{name}' collides with engine-managed column"
+            )));
+        }
+        prop_indices.push((idx, name.clone()));
+    }
 
- for row in 0..batch.num_rows() {
- if id_array.is_null(row) {
- return Err(Error::invariant(format!(
- "row {row}: 'node_id' is null; null ids are not allowed"
- )));
- }
- let bytes = id_array.value(row);
- let mut uuid_bytes = [0u8; 16];
- uuid_bytes.copy_from_slice(bytes);
- let id = NodeId::from_uuid(Uuid::from_bytes(uuid_bytes));
+    for row in 0..batch.num_rows() {
+        if id_array.is_null(row) {
+            return Err(Error::invariant(format!(
+                "row {row}: 'node_id' is null; null ids are not allowed"
+            )));
+        }
+        let bytes = id_array.value(row);
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(bytes);
+        let id = NodeId::from_uuid(Uuid::from_bytes(uuid_bytes));
 
- let mut properties: BTreeMap<String, Value> = BTreeMap::new();
- for (col_idx, name) in &prop_indices {
- let array = batch.column(*col_idx);
- let value = arrow_value_at(array.as_ref(), row, name)?;
- // Skip null values — the property is simply absent for that
- // row. The flush path treats absent and explicit-null the
- // same, but absent saves us a JSON field per row.
- if !value.is_null() {
- properties.insert(name.clone(), value);
- }
- }
+        let mut properties: BTreeMap<String, Value> = BTreeMap::new();
+        for (col_idx, name) in &prop_indices {
+            let array = batch.column(*col_idx);
+            let value = arrow_value_at(array.as_ref(), row, name)?;
+            // Skip null values — the property is simply absent for that
+            // row. The flush path treats absent and explicit-null the
+            // same, but absent saves us a JSON field per row.
+            if !value.is_null() {
+                properties.insert(name.clone(), value);
+            }
+        }
 
- let record = NodeWriteRecord {
- properties,
- schema_version: 1,
- };
- writer.upsert_node(label, id, &record)?;
- outcome.rows_loaded += 1;
- }
- Ok(())
+        let record = NodeWriteRecord {
+            properties,
+            schema_version: 1,
+        };
+        writer.upsert_node(label, id, &record)?;
+        outcome.rows_loaded += 1;
+    }
+    Ok(())
 }
 
 /// Convert a single Arrow array cell to a [`Value`]. Returns
 /// [`Value::Null`] for null cells. Errors on unsupported Arrow types.
 fn arrow_value_at(array: &dyn Array, row: usize, col: &str) -> Result<Value> {
- if array.is_null(row) {
- return Ok(Value::Null);
- }
- match array.data_type() {
- ArrowDataType::Boolean => {
- let a = array
- .as_any()
- .downcast_ref::<BooleanArray>()
- .expect("downcast Boolean");
- Ok(Value::Bool(a.value(row)))
- }
- ArrowDataType::Int8 => Ok(Value::I64(
- array.as_primitive::<Int8Type>().value(row) as i64
- )),
- ArrowDataType::Int16 => Ok(Value::I64(
- array.as_primitive::<Int16Type>().value(row) as i64
- )),
- ArrowDataType::Int32 => Ok(Value::I64(
- array.as_primitive::<Int32Type>().value(row) as i64
- )),
- ArrowDataType::Int64 => Ok(Value::I64(array.as_primitive::<Int64Type>().value(row))),
- ArrowDataType::UInt8 => Ok(Value::I64(
- array.as_primitive::<UInt8Type>().value(row) as i64
- )),
- ArrowDataType::UInt16 => Ok(Value::I64(
- array.as_primitive::<UInt16Type>().value(row) as i64
- )),
- ArrowDataType::UInt32 => Ok(Value::I64(
- array.as_primitive::<UInt32Type>().value(row) as i64
- )),
- ArrowDataType::Float32 => Ok(Value::F64(
- array.as_primitive::<Float32Type>().value(row) as f64
- )),
- ArrowDataType::Float64 => Ok(Value::F64(array.as_primitive::<Float64Type>().value(row))),
- ArrowDataType::Utf8 => {
- let a = array
- .as_any()
- .downcast_ref::<StringArray>()
- .expect("downcast Utf8");
- Ok(Value::Str(a.value(row).to_owned()))
- }
- ArrowDataType::LargeUtf8 => {
- let a = array
- .as_any()
- .downcast_ref::<LargeStringArray>()
- .expect("downcast LargeUtf8");
- Ok(Value::Str(a.value(row).to_owned()))
- }
- ArrowDataType::Binary => {
- let a = array
- .as_any()
- .downcast_ref::<BinaryArray>()
- .expect("downcast Binary");
- Ok(Value::Bytes(a.value(row).to_vec()))
- }
- ArrowDataType::LargeBinary => {
- let a = array
- .as_any()
- .downcast_ref::<LargeBinaryArray>()
- .expect("downcast LargeBinary");
- Ok(Value::Bytes(a.value(row).to_vec()))
- }
- ArrowDataType::Date32 => Ok(Value::I64(
- array.as_primitive::<Date32Type>().value(row) as i64
- )),
- ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => Ok(Value::I64(
- array.as_primitive::<TimestampMicrosecondType>().value(row),
- )),
- ArrowDataType::FixedSizeList(field, dim) => {
- if !matches!(field.data_type(), ArrowDataType::Float32) {
- return Err(Error::invariant(format!(
- "column '{col}' FixedSizeList element must be Float32, got {:?}",
- field.data_type()
- )));
- }
- let a = array
- .as_any()
- .downcast_ref::<FixedSizeListArray>()
- .expect("downcast FixedSizeList");
- let cell = a.value(row);
- let floats = cell
- .as_any()
- .downcast_ref::<arrow_array::Float32Array>()
- .ok_or_else(|| {
- Error::invariant(format!(
- "column '{col}' FixedSizeList values must be Float32"
- ))
- })?;
- let mut v = Vec::with_capacity(*dim as usize);
- for i in 0..floats.len() {
- v.push(floats.value(i));
- }
- Ok(Value::Vec(v))
- }
- other => Err(Error::invariant(format!(
- "column '{col}': unsupported Arrow type {other:?}"
- ))),
- }
+    if array.is_null(row) {
+        return Ok(Value::Null);
+    }
+    match array.data_type() {
+        ArrowDataType::Boolean => {
+            let a = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("downcast Boolean");
+            Ok(Value::Bool(a.value(row)))
+        }
+        ArrowDataType::Int8 => Ok(Value::I64(
+            array.as_primitive::<Int8Type>().value(row) as i64
+        )),
+        ArrowDataType::Int16 => Ok(Value::I64(
+            array.as_primitive::<Int16Type>().value(row) as i64
+        )),
+        ArrowDataType::Int32 => Ok(Value::I64(
+            array.as_primitive::<Int32Type>().value(row) as i64
+        )),
+        ArrowDataType::Int64 => Ok(Value::I64(array.as_primitive::<Int64Type>().value(row))),
+        ArrowDataType::UInt8 => Ok(Value::I64(
+            array.as_primitive::<UInt8Type>().value(row) as i64
+        )),
+        ArrowDataType::UInt16 => Ok(Value::I64(
+            array.as_primitive::<UInt16Type>().value(row) as i64
+        )),
+        ArrowDataType::UInt32 => Ok(Value::I64(
+            array.as_primitive::<UInt32Type>().value(row) as i64
+        )),
+        ArrowDataType::Float32 => Ok(Value::F64(
+            array.as_primitive::<Float32Type>().value(row) as f64
+        )),
+        ArrowDataType::Float64 => Ok(Value::F64(array.as_primitive::<Float64Type>().value(row))),
+        ArrowDataType::Utf8 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("downcast Utf8");
+            Ok(Value::Str(a.value(row).to_owned()))
+        }
+        ArrowDataType::LargeUtf8 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("downcast LargeUtf8");
+            Ok(Value::Str(a.value(row).to_owned()))
+        }
+        ArrowDataType::Binary => {
+            let a = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("downcast Binary");
+            Ok(Value::Bytes(a.value(row).to_vec()))
+        }
+        ArrowDataType::LargeBinary => {
+            let a = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("downcast LargeBinary");
+            Ok(Value::Bytes(a.value(row).to_vec()))
+        }
+        ArrowDataType::Date32 => Ok(Value::I64(
+            array.as_primitive::<Date32Type>().value(row) as i64
+        )),
+        ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => Ok(Value::I64(
+            array.as_primitive::<TimestampMicrosecondType>().value(row),
+        )),
+        ArrowDataType::FixedSizeList(field, dim) => {
+            if !matches!(field.data_type(), ArrowDataType::Float32) {
+                return Err(Error::invariant(format!(
+                    "column '{col}' FixedSizeList element must be Float32, got {:?}",
+                    field.data_type()
+                )));
+            }
+            let a = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("downcast FixedSizeList");
+            let cell = a.value(row);
+            let floats = cell
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| {
+                    Error::invariant(format!(
+                        "column '{col}' FixedSizeList values must be Float32"
+                    ))
+                })?;
+            let mut v = Vec::with_capacity(*dim as usize);
+            for i in 0..floats.len() {
+                v.push(floats.value(i));
+            }
+            Ok(Value::Vec(v))
+        }
+        other => Err(Error::invariant(format!(
+            "column '{col}': unsupported Arrow type {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
- use std::sync::Arc;
+    use std::sync::Arc;
 
- use arrow_array::{Int32Array, RecordBatch, StringArray};
- use arrow_schema::{DataType, Field, Schema};
- use namidb_core::NamespaceId;
- use parquet::arrow::ArrowWriter;
- use tempfile::NamedTempFile;
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use namidb_core::NamespaceId;
+    use parquet::arrow::ArrowWriter;
+    use tempfile::NamedTempFile;
 
- use super::*;
- use crate::paths::NamespacePaths;
+    use super::*;
+    use crate::paths::NamespacePaths;
 
- fn synth_id(i: u64) -> [u8; 16] {
- let mut bytes = [0u8; 16];
- bytes[8..].copy_from_slice(&i.to_be_bytes());
- bytes
- }
+    fn synth_id(i: u64) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&i.to_be_bytes());
+        bytes
+    }
 
- fn write_synth_parquet(path: &Path, n_rows: usize) {
- let schema = Schema::new(vec![
- Field::new("node_id", DataType::FixedSizeBinary(16), false),
- Field::new("name", DataType::Utf8, false),
- Field::new("age", DataType::Int32, true),
- ]);
+    fn write_synth_parquet(path: &Path, n_rows: usize) {
+        let schema = Schema::new(vec![
+            Field::new("node_id", DataType::FixedSizeBinary(16), false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
 
- let ids: Vec<[u8; 16]> = (0..n_rows as u64).map(synth_id).collect();
- let id_array =
- FixedSizeBinaryArray::try_from_iter(ids.iter().map(|b| b.as_slice())).unwrap();
- let names: Vec<String> = (0..n_rows).map(|i| format!("user-{i}")).collect();
- let name_array = StringArray::from(names);
- let ages: Vec<i32> = (0..n_rows as i32).map(|i| i % 100).collect();
- let age_array = Int32Array::from(ages);
+        let ids: Vec<[u8; 16]> = (0..n_rows as u64).map(synth_id).collect();
+        let id_array =
+            FixedSizeBinaryArray::try_from_iter(ids.iter().map(|b| b.as_slice())).unwrap();
+        let names: Vec<String> = (0..n_rows).map(|i| format!("user-{i}")).collect();
+        let name_array = StringArray::from(names);
+        let ages: Vec<i32> = (0..n_rows as i32).map(|i| i % 100).collect();
+        let age_array = Int32Array::from(ages);
 
- let batch = RecordBatch::try_new(
- Arc::new(schema.clone()),
- vec![
- Arc::new(id_array),
- Arc::new(name_array),
- Arc::new(age_array),
- ],
- )
- .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(age_array),
+            ],
+        )
+        .unwrap();
 
- let file = File::create(path).unwrap();
- let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
- writer.write(&batch).unwrap();
- writer.close().unwrap();
- }
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
 
- #[tokio::test]
- async fn loads_small_parquet_through_writer_session() {
- let parquet = NamedTempFile::new().unwrap();
- write_synth_parquet(parquet.path(), 1000);
+    #[tokio::test]
+    async fn loads_small_parquet_through_writer_session() {
+        let parquet = NamedTempFile::new().unwrap();
+        write_synth_parquet(parquet.path(), 1000);
 
- let store: Arc<dyn object_store::ObjectStore> =
- Arc::new(object_store::memory::InMemory::new());
- let paths = NamespacePaths::new("test", NamespaceId::new("pq-load").unwrap());
- let mut writer = WriterSession::open(store, paths).await.unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let paths = NamespacePaths::new("test", NamespaceId::new("pq-load").unwrap());
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
 
- let outcome = load_nodes(parquet.path(), &mut writer, "Person", 100)
- .await
- .unwrap();
- // Commit any tail before checking the count.
- writer.commit_batch().await.unwrap();
+        let outcome = load_nodes(parquet.path(), &mut writer, "Person", 100)
+            .await
+            .unwrap();
+        // Commit any tail before checking the count.
+        writer.commit_batch().await.unwrap();
 
- assert_eq!(outcome.rows_loaded, 1000);
- assert_eq!(outcome.commit_batches, 10);
- }
+        assert_eq!(outcome.rows_loaded, 1000);
+        assert_eq!(outcome.commit_batches, 10);
+    }
 }

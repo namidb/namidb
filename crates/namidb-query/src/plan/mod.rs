@@ -13,8 +13,8 @@ pub mod logical;
 pub mod lower;
 
 pub use explain::{
- explain, explain_query, explain_query_raw, explain_query_raw_verbose, explain_query_verbose,
- explain_verbose,
+    explain, explain_query, explain_query_raw, explain_query_raw_verbose, explain_query_verbose,
+    explain_verbose,
 };
 pub use logical::{AggregateExpr, LogicalPlan, OrderKey, ProjectionItem};
 pub use lower::{lower, LowerError, LowerErrorKind};

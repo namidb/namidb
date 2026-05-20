@@ -253,10 +253,7 @@ impl From<&WriteOutcome> for WriteSummary {
     }
 }
 
-async fn cypher(
-    State(state): State<AppState>,
-    Json(req): Json<CypherRequest>,
-) -> Response {
+async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -> Response {
     let parsed = match cypher_parse(&req.query) {
         Ok(p) => p,
         Err(errs) => {
@@ -371,9 +368,7 @@ async fn admin_flush(State(state): State<AppState>) -> Response {
 
 // ── value <-> json conversions ────────────────────────────────────────
 
-fn params_from_json(
-    m: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Params, String> {
+fn params_from_json(m: &serde_json::Map<String, serde_json::Value>) -> Result<Params, String> {
     let mut params = Params::new();
     for (k, v) in m {
         let rv = json_to_runtime(v)?;
@@ -439,7 +434,9 @@ fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
         RuntimeValue::Null => J::Null,
         RuntimeValue::Bool(b) => J::Bool(*b),
         RuntimeValue::Integer(n) => J::Number((*n).into()),
-        RuntimeValue::Float(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null),
+        RuntimeValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
         RuntimeValue::String(s) => J::String(s.clone()),
         RuntimeValue::Bytes(b) => {
             use base64::Engine as _;
@@ -461,11 +458,11 @@ fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
                 .collect(),
         ),
         RuntimeValue::Date(d) => J::String(d.to_string()),
-        RuntimeValue::DateTime(micros) => chrono::DateTime::<chrono::Utc>::from_timestamp_micros(
-            *micros,
-        )
-        .map(|dt| J::String(dt.to_rfc3339()))
-        .unwrap_or(J::Null),
+        RuntimeValue::DateTime(micros) => {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(*micros)
+                .map(|dt| J::String(dt.to_rfc3339()))
+                .unwrap_or(J::Null)
+        }
         RuntimeValue::Node(n) => {
             let mut o = serde_json::Map::new();
             o.insert("_kind".into(), J::String("node".into()));

@@ -14,23 +14,23 @@ use crate::parser::{BinaryOp, Expression, ExpressionKind, Literal, SourceSpan, S
 /// for diagnostics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalError {
- pub message: String,
- pub span: SourceSpan,
+    pub message: String,
+    pub span: SourceSpan,
 }
 
 impl EvalError {
- pub fn new(msg: impl Into<String>, span: SourceSpan) -> Self {
- Self {
- message: msg.into(),
- span,
- }
- }
+    pub fn new(msg: impl Into<String>, span: SourceSpan) -> Self {
+        Self {
+            message: msg.into(),
+            span,
+        }
+    }
 }
 
 impl fmt::Display for EvalError {
- fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
- write!(f, "EvalError: {} at {}", self.message, self.span)
- }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EvalError: {} at {}", self.message, self.span)
+    }
 }
 
 impl std::error::Error for EvalError {}
@@ -42,1147 +42,1139 @@ pub type Params = BTreeMap<String, RuntimeValue>;
 /// `RuntimeValue::Null` for any operation where a NULL propagates per
 /// three-valued logic.
 pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<RuntimeValue, EvalError> {
- let span = expr.span;
- match &expr.kind {
- ExpressionKind::Literal(l) => Ok(literal_to_runtime(l)),
- ExpressionKind::Star => Err(EvalError::new("`*` is only valid inside `count(*)`", span)),
- ExpressionKind::Variable(id) => row
- .get(&id.name)
- .cloned()
- .ok_or_else(|| EvalError::new(format!("binding `{}` not bound", id.name), id.span)),
- ExpressionKind::Parameter(name) => params
- .get(name)
- .cloned()
- .ok_or_else(|| EvalError::new(format!("parameter `${}` not provided", name), span)),
- ExpressionKind::Property(p) => {
- let target = evaluate(&p.target, row, params)?;
- Ok(property_access(&target, &p.key.name))
- }
- ExpressionKind::Index { target, index } => {
- let t = evaluate(target, row, params)?;
- let i = evaluate(index, row, params)?;
- Ok(index_into(&t, &i))
- }
- ExpressionKind::Range { target, from, to } => {
- let t = evaluate(target, row, params)?;
- let from_v = match from {
- Some(e) => Some(evaluate(e, row, params)?),
- None => None,
- };
- let to_v = match to {
- Some(e) => Some(evaluate(e, row, params)?),
- None => None,
- };
- Ok(range_into(&t, from_v.as_ref(), to_v.as_ref()))
- }
- ExpressionKind::Unary { op, expr: inner } => {
- let v = evaluate(inner, row, params)?;
- Ok(eval_unary(*op, &v))
- }
- ExpressionKind::Binary { op, left, right } => {
- let l = evaluate(left, row, params)?;
- let r = evaluate(right, row, params)?;
- eval_binary(*op, &l, &r, span)
- }
- ExpressionKind::In { item, list } => {
- let item_v = evaluate(item, row, params)?;
- let list_v = evaluate(list, row, params)?;
- Ok(eval_in(&item_v, &list_v))
- }
- ExpressionKind::Between { target, low, high } => {
- let t = evaluate(target, row, params)?;
- let lo = evaluate(low, row, params)?;
- let hi = evaluate(high, row, params)?;
- let cmp_lo = eval_binary(BinaryOp::Ge, &t, &lo, span)?;
- let cmp_hi = eval_binary(BinaryOp::Le, &t, &hi, span)?;
- eval_binary(BinaryOp::And, &cmp_lo, &cmp_hi, span)
- }
- ExpressionKind::StringTest {
- op,
- target,
- pattern,
- } => {
- let t = evaluate(target, row, params)?;
- let p = evaluate(pattern, row, params)?;
- Ok(eval_string_test(*op, &t, &p))
- }
- ExpressionKind::IsNull {
- expr: inner,
- negated,
- } => {
- let v = evaluate(inner, row, params)?;
- let is_null = v.is_null();
- Ok(RuntimeValue::Bool(if *negated {
- !is_null
- } else {
- is_null
- }))
- }
- ExpressionKind::FunctionCall {
- name,
- args,
- distinct: _,
- } => {
- let name_str = name.joined().to_ascii_lowercase();
- let evaluated_args: Vec<RuntimeValue> = args
- .iter()
- .map(|a| evaluate(a, row, params))
- .collect::<Result<_, _>>()?;
- call_scalar_function(&name_str, &evaluated_args, span)
- }
- ExpressionKind::Case {
- scrutinee,
- branches,
- otherwise,
- } => {
- let scrut_v = match scrutinee {
- Some(s) => Some(evaluate(s, row, params)?),
- None => None,
- };
- for b in branches {
- let when_v = evaluate(&b.when, row, params)?;
- let matched = if let Some(s) = &scrut_v {
- is_equal(s, &when_v)
- } else {
- when_v.as_bool().unwrap_or(false)
- };
- if matched {
- return evaluate(&b.then, row, params);
- }
- }
- match otherwise {
- Some(e) => evaluate(e, row, params),
- None => Ok(RuntimeValue::Null),
- }
- }
- ExpressionKind::List(items) => {
- let mut out = Vec::with_capacity(items.len());
- for it in items {
- out.push(evaluate(it, row, params)?);
- }
- Ok(RuntimeValue::List(out))
- }
- ExpressionKind::Map(m) => {
- let mut out = BTreeMap::new();
- for (k, v) in &m.entries {
- out.insert(k.name.clone(), evaluate(v, row, params)?);
- }
- Ok(RuntimeValue::Map(out))
- }
- ExpressionKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params),
- ExpressionKind::PatternComprehension(_) => Err(EvalError::new(
- "pattern comprehension evaluation requires storage access — \
+    let span = expr.span;
+    match &expr.kind {
+        ExpressionKind::Literal(l) => Ok(literal_to_runtime(l)),
+        ExpressionKind::Star => Err(EvalError::new("`*` is only valid inside `count(*)`", span)),
+        ExpressionKind::Variable(id) => row
+            .get(&id.name)
+            .cloned()
+            .ok_or_else(|| EvalError::new(format!("binding `{}` not bound", id.name), id.span)),
+        ExpressionKind::Parameter(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EvalError::new(format!("parameter `${}` not provided", name), span)),
+        ExpressionKind::Property(p) => {
+            let target = evaluate(&p.target, row, params)?;
+            Ok(property_access(&target, &p.key.name))
+        }
+        ExpressionKind::Index { target, index } => {
+            let t = evaluate(target, row, params)?;
+            let i = evaluate(index, row, params)?;
+            Ok(index_into(&t, &i))
+        }
+        ExpressionKind::Range { target, from, to } => {
+            let t = evaluate(target, row, params)?;
+            let from_v = match from {
+                Some(e) => Some(evaluate(e, row, params)?),
+                None => None,
+            };
+            let to_v = match to {
+                Some(e) => Some(evaluate(e, row, params)?),
+                None => None,
+            };
+            Ok(range_into(&t, from_v.as_ref(), to_v.as_ref()))
+        }
+        ExpressionKind::Unary { op, expr: inner } => {
+            let v = evaluate(inner, row, params)?;
+            Ok(eval_unary(*op, &v))
+        }
+        ExpressionKind::Binary { op, left, right } => {
+            let l = evaluate(left, row, params)?;
+            let r = evaluate(right, row, params)?;
+            eval_binary(*op, &l, &r, span)
+        }
+        ExpressionKind::In { item, list } => {
+            let item_v = evaluate(item, row, params)?;
+            let list_v = evaluate(list, row, params)?;
+            Ok(eval_in(&item_v, &list_v))
+        }
+        ExpressionKind::Between { target, low, high } => {
+            let t = evaluate(target, row, params)?;
+            let lo = evaluate(low, row, params)?;
+            let hi = evaluate(high, row, params)?;
+            let cmp_lo = eval_binary(BinaryOp::Ge, &t, &lo, span)?;
+            let cmp_hi = eval_binary(BinaryOp::Le, &t, &hi, span)?;
+            eval_binary(BinaryOp::And, &cmp_lo, &cmp_hi, span)
+        }
+        ExpressionKind::StringTest {
+            op,
+            target,
+            pattern,
+        } => {
+            let t = evaluate(target, row, params)?;
+            let p = evaluate(pattern, row, params)?;
+            Ok(eval_string_test(*op, &t, &p))
+        }
+        ExpressionKind::IsNull {
+            expr: inner,
+            negated,
+        } => {
+            let v = evaluate(inner, row, params)?;
+            let is_null = v.is_null();
+            Ok(RuntimeValue::Bool(if *negated {
+                !is_null
+            } else {
+                is_null
+            }))
+        }
+        ExpressionKind::FunctionCall {
+            name,
+            args,
+            distinct: _,
+        } => {
+            let name_str = name.joined().to_ascii_lowercase();
+            let evaluated_args: Vec<RuntimeValue> = args
+                .iter()
+                .map(|a| evaluate(a, row, params))
+                .collect::<Result<_, _>>()?;
+            call_scalar_function(&name_str, &evaluated_args, span)
+        }
+        ExpressionKind::Case {
+            scrutinee,
+            branches,
+            otherwise,
+        } => {
+            let scrut_v = match scrutinee {
+                Some(s) => Some(evaluate(s, row, params)?),
+                None => None,
+            };
+            for b in branches {
+                let when_v = evaluate(&b.when, row, params)?;
+                let matched = if let Some(s) = &scrut_v {
+                    is_equal(s, &when_v)
+                } else {
+                    when_v.as_bool().unwrap_or(false)
+                };
+                if matched {
+                    return evaluate(&b.then, row, params);
+                }
+            }
+            match otherwise {
+                Some(e) => evaluate(e, row, params),
+                None => Ok(RuntimeValue::Null),
+            }
+        }
+        ExpressionKind::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(evaluate(it, row, params)?);
+            }
+            Ok(RuntimeValue::List(out))
+        }
+        ExpressionKind::Map(m) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in &m.entries {
+                out.insert(k.name.clone(), evaluate(v, row, params)?);
+            }
+            Ok(RuntimeValue::Map(out))
+        }
+        ExpressionKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params),
+        ExpressionKind::PatternComprehension(_) => Err(EvalError::new(
+            "pattern comprehension evaluation requires storage access — \
  must be hoisted to a PatternList operator before evaluate()",
- span,
- )),
- ExpressionKind::Exists(_) => Err(EvalError::new(
- "EXISTS pattern predicates require storage access — \
+            span,
+        )),
+        ExpressionKind::Exists(_) => Err(EvalError::new(
+            "EXISTS pattern predicates require storage access — \
  must be hoisted to a SemiApply operator before evaluate()",
- span,
- )),
- }
+            span,
+        )),
+    }
 }
 
 fn literal_to_runtime(l: &Literal) -> RuntimeValue {
- match l {
- Literal::Integer(n) => RuntimeValue::Integer(*n),
- Literal::Float(f) => RuntimeValue::Float(*f),
- Literal::String(s) => RuntimeValue::String(s.clone()),
- Literal::Boolean(b) => RuntimeValue::Bool(*b),
- Literal::Null => RuntimeValue::Null,
- }
+    match l {
+        Literal::Integer(n) => RuntimeValue::Integer(*n),
+        Literal::Float(f) => RuntimeValue::Float(*f),
+        Literal::String(s) => RuntimeValue::String(s.clone()),
+        Literal::Boolean(b) => RuntimeValue::Bool(*b),
+        Literal::Null => RuntimeValue::Null,
+    }
 }
 
 fn property_access(target: &RuntimeValue, key: &str) -> RuntimeValue {
- match target {
- RuntimeValue::Null => RuntimeValue::Null,
- RuntimeValue::Node(n) => match key {
- // `_id` materialises the internal NodeId. Plain `id` falls
- // through to the property map so users can store their own.
- "_id" => RuntimeValue::String(n.id.to_string()),
- _ => n.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
- },
- RuntimeValue::Rel(r) => match key {
- // Rel internal identifier — see Node accessor above for the
- // rationale behind the `_id` sigil.
- "_id" => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
- _ => r.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
- },
- RuntimeValue::Map(m) => m.get(key).cloned().unwrap_or(RuntimeValue::Null),
- _ => RuntimeValue::Null,
- }
+    match target {
+        RuntimeValue::Null => RuntimeValue::Null,
+        RuntimeValue::Node(n) => match key {
+            // `_id` materialises the internal NodeId. Plain `id` falls
+            // through to the property map so users can store their own.
+            "_id" => RuntimeValue::String(n.id.to_string()),
+            _ => n.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
+        },
+        RuntimeValue::Rel(r) => match key {
+            // Rel internal identifier — see Node accessor above for the
+            // rationale behind the `_id` sigil.
+            "_id" => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
+            _ => r.properties.get(key).cloned().unwrap_or(RuntimeValue::Null),
+        },
+        RuntimeValue::Map(m) => m.get(key).cloned().unwrap_or(RuntimeValue::Null),
+        _ => RuntimeValue::Null,
+    }
 }
 
 fn index_into(target: &RuntimeValue, index: &RuntimeValue) -> RuntimeValue {
- match (target, index) {
- (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => RuntimeValue::Null,
- (RuntimeValue::List(items), RuntimeValue::Integer(i)) => {
- let len = items.len() as i64;
- let resolved = if *i < 0 { len + i } else { *i };
- if resolved < 0 || resolved >= len {
- RuntimeValue::Null
- } else {
- items[resolved as usize].clone()
- }
- }
- (RuntimeValue::Map(m), RuntimeValue::String(k)) => {
- m.get(k).cloned().unwrap_or(RuntimeValue::Null)
- }
- _ => RuntimeValue::Null,
- }
+    match (target, index) {
+        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => RuntimeValue::Null,
+        (RuntimeValue::List(items), RuntimeValue::Integer(i)) => {
+            let len = items.len() as i64;
+            let resolved = if *i < 0 { len + i } else { *i };
+            if resolved < 0 || resolved >= len {
+                RuntimeValue::Null
+            } else {
+                items[resolved as usize].clone()
+            }
+        }
+        (RuntimeValue::Map(m), RuntimeValue::String(k)) => {
+            m.get(k).cloned().unwrap_or(RuntimeValue::Null)
+        }
+        _ => RuntimeValue::Null,
+    }
 }
 
 fn range_into(
- target: &RuntimeValue,
- from: Option<&RuntimeValue>,
- to: Option<&RuntimeValue>,
+    target: &RuntimeValue,
+    from: Option<&RuntimeValue>,
+    to: Option<&RuntimeValue>,
 ) -> RuntimeValue {
- match target {
- RuntimeValue::List(items) => {
- let len = items.len() as i64;
- let resolve = |v: Option<&RuntimeValue>, default: i64| -> i64 {
- match v {
- Some(RuntimeValue::Integer(n)) => {
- if *n < 0 {
- (len + n).max(0)
- } else {
- (*n).min(len)
- }
- }
- _ => default,
- }
- };
- let lo = resolve(from, 0);
- let hi = resolve(to, len);
- if lo >= hi {
- RuntimeValue::List(Vec::new())
- } else {
- RuntimeValue::List(items[lo as usize..hi as usize].to_vec())
- }
- }
- _ => RuntimeValue::Null,
- }
+    match target {
+        RuntimeValue::List(items) => {
+            let len = items.len() as i64;
+            let resolve = |v: Option<&RuntimeValue>, default: i64| -> i64 {
+                match v {
+                    Some(RuntimeValue::Integer(n)) => {
+                        if *n < 0 {
+                            (len + n).max(0)
+                        } else {
+                            (*n).min(len)
+                        }
+                    }
+                    _ => default,
+                }
+            };
+            let lo = resolve(from, 0);
+            let hi = resolve(to, len);
+            if lo >= hi {
+                RuntimeValue::List(Vec::new())
+            } else {
+                RuntimeValue::List(items[lo as usize..hi as usize].to_vec())
+            }
+        }
+        _ => RuntimeValue::Null,
+    }
 }
 
 fn eval_unary(op: UnaryOp, v: &RuntimeValue) -> RuntimeValue {
- if v.is_null() {
- return RuntimeValue::Null;
- }
- match op {
- UnaryOp::Neg => match v {
- RuntimeValue::Integer(n) => RuntimeValue::Integer(-*n),
- RuntimeValue::Float(f) => RuntimeValue::Float(-*f),
- _ => RuntimeValue::Null,
- },
- UnaryOp::Not => match v.as_bool() {
- Some(b) => RuntimeValue::Bool(!b),
- None => RuntimeValue::Null,
- },
- }
+    if v.is_null() {
+        return RuntimeValue::Null;
+    }
+    match op {
+        UnaryOp::Neg => match v {
+            RuntimeValue::Integer(n) => RuntimeValue::Integer(-*n),
+            RuntimeValue::Float(f) => RuntimeValue::Float(-*f),
+            _ => RuntimeValue::Null,
+        },
+        UnaryOp::Not => match v.as_bool() {
+            Some(b) => RuntimeValue::Bool(!b),
+            None => RuntimeValue::Null,
+        },
+    }
 }
 
 fn eval_binary(
- op: BinaryOp,
- a: &RuntimeValue,
- b: &RuntimeValue,
- span: SourceSpan,
+    op: BinaryOp,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
 ) -> Result<RuntimeValue, EvalError> {
- match op {
- // 3VL logical: special NULL handling.
- BinaryOp::And => match (a.as_bool(), b.as_bool()) {
- (Some(false), _) | (_, Some(false)) => Ok(RuntimeValue::Bool(false)),
- (Some(true), Some(true)) => Ok(RuntimeValue::Bool(true)),
- _ => Ok(RuntimeValue::Null),
- },
- BinaryOp::Or => match (a.as_bool(), b.as_bool()) {
- (Some(true), _) | (_, Some(true)) => Ok(RuntimeValue::Bool(true)),
- (Some(false), Some(false)) => Ok(RuntimeValue::Bool(false)),
- _ => Ok(RuntimeValue::Null),
- },
- BinaryOp::Xor => match (a.as_bool(), b.as_bool()) {
- (Some(x), Some(y)) => Ok(RuntimeValue::Bool(x ^ y)),
- _ => Ok(RuntimeValue::Null),
- },
- _ => {
- if a.is_null() || b.is_null() {
- return Ok(RuntimeValue::Null);
- }
- match op {
- BinaryOp::Add => arith(a, b, span, "+", |x, y| x + y, |x, y| x + y, true),
- BinaryOp::Sub => arith(a, b, span, "-", |x, y| x - y, |x, y| x - y, false),
- BinaryOp::Mul => arith(a, b, span, "*", |x, y| x * y, |x, y| x * y, false),
- BinaryOp::Div => arith_div(a, b, span),
- BinaryOp::Mod => {
- arith(a, b, span, "%", |x, y| x.rem_euclid(y), |x, y| x % y, false)
- }
- BinaryOp::Pow => arith_pow(a, b, span),
- BinaryOp::Eq => Ok(RuntimeValue::Bool(is_equal(a, b))),
- BinaryOp::Ne => Ok(RuntimeValue::Bool(!is_equal(a, b))),
- BinaryOp::Lt => order_cmp(a, b, |o| o == Ordering::Less),
- BinaryOp::Gt => order_cmp(a, b, |o| o == Ordering::Greater),
- BinaryOp::Le => order_cmp(a, b, |o| o != Ordering::Greater),
- BinaryOp::Ge => order_cmp(a, b, |o| o != Ordering::Less),
- BinaryOp::RegexMatch => {
- // Naïve: real regex engine arrives with the runtime
- // function library expansion. For now do substring
- // match — sufficient for tests, flagged as TODO.
- Ok(eval_string_test(StringOp::Contains, a, b))
- }
- BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => unreachable!(),
- }
- }
- }
+    match op {
+        // 3VL logical: special NULL handling.
+        BinaryOp::And => match (a.as_bool(), b.as_bool()) {
+            (Some(false), _) | (_, Some(false)) => Ok(RuntimeValue::Bool(false)),
+            (Some(true), Some(true)) => Ok(RuntimeValue::Bool(true)),
+            _ => Ok(RuntimeValue::Null),
+        },
+        BinaryOp::Or => match (a.as_bool(), b.as_bool()) {
+            (Some(true), _) | (_, Some(true)) => Ok(RuntimeValue::Bool(true)),
+            (Some(false), Some(false)) => Ok(RuntimeValue::Bool(false)),
+            _ => Ok(RuntimeValue::Null),
+        },
+        BinaryOp::Xor => match (a.as_bool(), b.as_bool()) {
+            (Some(x), Some(y)) => Ok(RuntimeValue::Bool(x ^ y)),
+            _ => Ok(RuntimeValue::Null),
+        },
+        _ => {
+            if a.is_null() || b.is_null() {
+                return Ok(RuntimeValue::Null);
+            }
+            match op {
+                BinaryOp::Add => arith(a, b, span, "+", |x, y| x + y, |x, y| x + y, true),
+                BinaryOp::Sub => arith(a, b, span, "-", |x, y| x - y, |x, y| x - y, false),
+                BinaryOp::Mul => arith(a, b, span, "*", |x, y| x * y, |x, y| x * y, false),
+                BinaryOp::Div => arith_div(a, b, span),
+                BinaryOp::Mod => {
+                    arith(a, b, span, "%", |x, y| x.rem_euclid(y), |x, y| x % y, false)
+                }
+                BinaryOp::Pow => arith_pow(a, b, span),
+                BinaryOp::Eq => Ok(RuntimeValue::Bool(is_equal(a, b))),
+                BinaryOp::Ne => Ok(RuntimeValue::Bool(!is_equal(a, b))),
+                BinaryOp::Lt => order_cmp(a, b, |o| o == Ordering::Less),
+                BinaryOp::Gt => order_cmp(a, b, |o| o == Ordering::Greater),
+                BinaryOp::Le => order_cmp(a, b, |o| o != Ordering::Greater),
+                BinaryOp::Ge => order_cmp(a, b, |o| o != Ordering::Less),
+                BinaryOp::RegexMatch => {
+                    // Naïve: real regex engine arrives with the runtime
+                    // function library expansion. For now do substring
+                    // match — sufficient for tests, flagged as TODO.
+                    Ok(eval_string_test(StringOp::Contains, a, b))
+                }
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => unreachable!(),
+            }
+        }
+    }
 }
 
 fn arith(
- a: &RuntimeValue,
- b: &RuntimeValue,
- span: SourceSpan,
- op_label: &'static str,
- f_int: impl Fn(i64, i64) -> i64,
- f_float: impl Fn(f64, f64) -> f64,
- string_concat: bool,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
+    op_label: &'static str,
+    f_int: impl Fn(i64, i64) -> i64,
+    f_float: impl Fn(f64, f64) -> f64,
+    string_concat: bool,
 ) -> Result<RuntimeValue, EvalError> {
- match (a, b) {
- (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => {
- Ok(RuntimeValue::Integer(f_int(*x, *y)))
- }
- (RuntimeValue::Float(x), RuntimeValue::Float(y)) => {
- Ok(RuntimeValue::Float(f_float(*x, *y)))
- }
- (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => {
- Ok(RuntimeValue::Float(f_float(*x as f64, *y)))
- }
- (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => {
- Ok(RuntimeValue::Float(f_float(*x, *y as f64)))
- }
- (RuntimeValue::String(x), RuntimeValue::String(y)) if string_concat => {
- Ok(RuntimeValue::String(format!("{}{}", x, y)))
- }
- (RuntimeValue::String(x), other) if string_concat => Ok(RuntimeValue::String(format!(
- "{}{}",
- x,
- runtime_to_string_concat(other)
- ))),
- (other, RuntimeValue::String(y)) if string_concat => Ok(RuntimeValue::String(format!(
- "{}{}",
- runtime_to_string_concat(other),
- y
- ))),
- (RuntimeValue::List(xs), RuntimeValue::List(ys)) if string_concat => {
- let mut out = xs.clone();
- out.extend_from_slice(ys);
- Ok(RuntimeValue::List(out))
- }
- _ => Err(EvalError::new(
- format!(
- "cannot apply `{}` between {} and {}",
- op_label,
- a.type_name(),
- b.type_name()
- ),
- span,
- )),
- }
+    match (a, b) {
+        (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => {
+            Ok(RuntimeValue::Integer(f_int(*x, *y)))
+        }
+        (RuntimeValue::Float(x), RuntimeValue::Float(y)) => {
+            Ok(RuntimeValue::Float(f_float(*x, *y)))
+        }
+        (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => {
+            Ok(RuntimeValue::Float(f_float(*x as f64, *y)))
+        }
+        (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => {
+            Ok(RuntimeValue::Float(f_float(*x, *y as f64)))
+        }
+        (RuntimeValue::String(x), RuntimeValue::String(y)) if string_concat => {
+            Ok(RuntimeValue::String(format!("{}{}", x, y)))
+        }
+        (RuntimeValue::String(x), other) if string_concat => Ok(RuntimeValue::String(format!(
+            "{}{}",
+            x,
+            runtime_to_string_concat(other)
+        ))),
+        (other, RuntimeValue::String(y)) if string_concat => Ok(RuntimeValue::String(format!(
+            "{}{}",
+            runtime_to_string_concat(other),
+            y
+        ))),
+        (RuntimeValue::List(xs), RuntimeValue::List(ys)) if string_concat => {
+            let mut out = xs.clone();
+            out.extend_from_slice(ys);
+            Ok(RuntimeValue::List(out))
+        }
+        _ => Err(EvalError::new(
+            format!(
+                "cannot apply `{}` between {} and {}",
+                op_label,
+                a.type_name(),
+                b.type_name()
+            ),
+            span,
+        )),
+    }
 }
 
 fn arith_div(
- a: &RuntimeValue,
- b: &RuntimeValue,
- span: SourceSpan,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
 ) -> Result<RuntimeValue, EvalError> {
- match (a, b) {
- (_, RuntimeValue::Integer(0)) => Err(EvalError::new("integer division by zero", span)),
- (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => Ok(RuntimeValue::Integer(x / y)),
- (RuntimeValue::Float(x), RuntimeValue::Float(y)) => Ok(RuntimeValue::Float(x / y)),
- (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => {
- Ok(RuntimeValue::Float(*x as f64 / *y))
- }
- (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => {
- Ok(RuntimeValue::Float(*x / *y as f64))
- }
- _ => Err(EvalError::new(
- format!(
- "cannot apply `/` between {} and {}",
- a.type_name(),
- b.type_name()
- ),
- span,
- )),
- }
+    match (a, b) {
+        (_, RuntimeValue::Integer(0)) => Err(EvalError::new("integer division by zero", span)),
+        (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => Ok(RuntimeValue::Integer(x / y)),
+        (RuntimeValue::Float(x), RuntimeValue::Float(y)) => Ok(RuntimeValue::Float(x / y)),
+        (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => {
+            Ok(RuntimeValue::Float(*x as f64 / *y))
+        }
+        (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => {
+            Ok(RuntimeValue::Float(*x / *y as f64))
+        }
+        _ => Err(EvalError::new(
+            format!(
+                "cannot apply `/` between {} and {}",
+                a.type_name(),
+                b.type_name()
+            ),
+            span,
+        )),
+    }
 }
 
 fn arith_pow(
- a: &RuntimeValue,
- b: &RuntimeValue,
- span: SourceSpan,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
 ) -> Result<RuntimeValue, EvalError> {
- let to_f64 = |v: &RuntimeValue| -> Option<f64> {
- match v {
- RuntimeValue::Integer(n) => Some(*n as f64),
- RuntimeValue::Float(f) => Some(*f),
- _ => None,
- }
- };
- match (to_f64(a), to_f64(b)) {
- (Some(x), Some(y)) => Ok(RuntimeValue::Float(x.powf(y))),
- _ => Err(EvalError::new(
- format!(
- "cannot apply `^` between {} and {}",
- a.type_name(),
- b.type_name()
- ),
- span,
- )),
- }
+    let to_f64 = |v: &RuntimeValue| -> Option<f64> {
+        match v {
+            RuntimeValue::Integer(n) => Some(*n as f64),
+            RuntimeValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    };
+    match (to_f64(a), to_f64(b)) {
+        (Some(x), Some(y)) => Ok(RuntimeValue::Float(x.powf(y))),
+        _ => Err(EvalError::new(
+            format!(
+                "cannot apply `^` between {} and {}",
+                a.type_name(),
+                b.type_name()
+            ),
+            span,
+        )),
+    }
 }
 
 fn runtime_to_string_concat(v: &RuntimeValue) -> String {
- match v {
- RuntimeValue::Null => "".to_string(),
- RuntimeValue::Integer(n) => n.to_string(),
- RuntimeValue::Float(f) => f.to_string(),
- RuntimeValue::String(s) => s.clone(),
- RuntimeValue::Bool(b) => b.to_string(),
- _ => format!("{:?}", v),
- }
+    match v {
+        RuntimeValue::Null => "".to_string(),
+        RuntimeValue::Integer(n) => n.to_string(),
+        RuntimeValue::Float(f) => f.to_string(),
+        RuntimeValue::String(s) => s.clone(),
+        RuntimeValue::Bool(b) => b.to_string(),
+        _ => format!("{:?}", v),
+    }
 }
 
 fn is_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
- match (a, b) {
- (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => false,
- (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => x == y,
- (RuntimeValue::Float(x), RuntimeValue::Float(y)) => x == y,
- (RuntimeValue::Integer(x), RuntimeValue::Float(y))
- | (RuntimeValue::Float(y), RuntimeValue::Integer(x)) => (*x as f64) == *y,
- (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => x == y,
- (RuntimeValue::String(x), RuntimeValue::String(y)) => x == y,
- (RuntimeValue::List(x), RuntimeValue::List(y)) => x == y,
- (RuntimeValue::Map(x), RuntimeValue::Map(y)) => x == y,
- (RuntimeValue::Node(x), RuntimeValue::Node(y)) => x.id == y.id,
- (RuntimeValue::Rel(x), RuntimeValue::Rel(y)) => {
- x.edge_type == y.edge_type && x.src == y.src && x.dst == y.dst
- }
- (RuntimeValue::Date(x), RuntimeValue::Date(y)) => x == y,
- (RuntimeValue::DateTime(x), RuntimeValue::DateTime(y)) => x == y,
- _ => false,
- }
+    match (a, b) {
+        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => false,
+        (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => x == y,
+        (RuntimeValue::Float(x), RuntimeValue::Float(y)) => x == y,
+        (RuntimeValue::Integer(x), RuntimeValue::Float(y))
+        | (RuntimeValue::Float(y), RuntimeValue::Integer(x)) => (*x as f64) == *y,
+        (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => x == y,
+        (RuntimeValue::String(x), RuntimeValue::String(y)) => x == y,
+        (RuntimeValue::List(x), RuntimeValue::List(y)) => x == y,
+        (RuntimeValue::Map(x), RuntimeValue::Map(y)) => x == y,
+        (RuntimeValue::Node(x), RuntimeValue::Node(y)) => x.id == y.id,
+        (RuntimeValue::Rel(x), RuntimeValue::Rel(y)) => {
+            x.edge_type == y.edge_type && x.src == y.src && x.dst == y.dst
+        }
+        (RuntimeValue::Date(x), RuntimeValue::Date(y)) => x == y,
+        (RuntimeValue::DateTime(x), RuntimeValue::DateTime(y)) => x == y,
+        _ => false,
+    }
 }
 
 fn order_cmp(
- a: &RuntimeValue,
- b: &RuntimeValue,
- predicate: impl Fn(Ordering) -> bool,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    predicate: impl Fn(Ordering) -> bool,
 ) -> Result<RuntimeValue, EvalError> {
- match compare(a, b) {
- Some(o) => Ok(RuntimeValue::Bool(predicate(o))),
- None => Ok(RuntimeValue::Null),
- }
+    match compare(a, b) {
+        Some(o) => Ok(RuntimeValue::Bool(predicate(o))),
+        None => Ok(RuntimeValue::Null),
+    }
 }
 
 fn compare(a: &RuntimeValue, b: &RuntimeValue) -> Option<Ordering> {
- match (a, b) {
- (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => None,
- (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => Some(x.cmp(y)),
- (RuntimeValue::Float(x), RuntimeValue::Float(y)) => x.partial_cmp(y),
- (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => (*x as f64).partial_cmp(y),
- (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => x.partial_cmp(&(*y as f64)),
- (RuntimeValue::String(x), RuntimeValue::String(y)) => Some(x.cmp(y)),
- (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => Some(x.cmp(y)),
- (RuntimeValue::Date(x), RuntimeValue::Date(y)) => Some(x.cmp(y)),
- (RuntimeValue::DateTime(x), RuntimeValue::DateTime(y)) => Some(x.cmp(y)),
- _ => None,
- }
+    match (a, b) {
+        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => None,
+        (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => Some(x.cmp(y)),
+        (RuntimeValue::Float(x), RuntimeValue::Float(y)) => x.partial_cmp(y),
+        (RuntimeValue::Integer(x), RuntimeValue::Float(y)) => (*x as f64).partial_cmp(y),
+        (RuntimeValue::Float(x), RuntimeValue::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        (RuntimeValue::String(x), RuntimeValue::String(y)) => Some(x.cmp(y)),
+        (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => Some(x.cmp(y)),
+        (RuntimeValue::Date(x), RuntimeValue::Date(y)) => Some(x.cmp(y)),
+        (RuntimeValue::DateTime(x), RuntimeValue::DateTime(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
 }
 
 /// Public comparator used by Sort/TopN. Returns `Ordering::Equal` for
 /// uncomparable values to preserve input order (stable sort).
 pub fn order_for_sort(a: &RuntimeValue, b: &RuntimeValue, direction_desc: bool) -> Ordering {
- // NULL sorts last by default (Cypher semantics).
- match (a.is_null(), b.is_null()) {
- (true, true) => Ordering::Equal,
- (true, false) => Ordering::Greater,
- (false, true) => Ordering::Less,
- (false, false) => {
- let o = compare(a, b).unwrap_or(Ordering::Equal);
- if direction_desc {
- o.reverse()
- } else {
- o
- }
- }
- }
+    // NULL sorts last by default (Cypher semantics).
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let o = compare(a, b).unwrap_or(Ordering::Equal);
+            if direction_desc {
+                o.reverse()
+            } else {
+                o
+            }
+        }
+    }
 }
 
 fn eval_in(item: &RuntimeValue, list: &RuntimeValue) -> RuntimeValue {
- if item.is_null() || list.is_null() {
- return RuntimeValue::Null;
- }
- match list {
- RuntimeValue::List(items) => {
- let mut has_null = false;
- for v in items {
- if v.is_null() {
- has_null = true;
- continue;
- }
- if is_equal(item, v) {
- return RuntimeValue::Bool(true);
- }
- }
- if has_null {
- RuntimeValue::Null
- } else {
- RuntimeValue::Bool(false)
- }
- }
- _ => RuntimeValue::Null,
- }
+    if item.is_null() || list.is_null() {
+        return RuntimeValue::Null;
+    }
+    match list {
+        RuntimeValue::List(items) => {
+            let mut has_null = false;
+            for v in items {
+                if v.is_null() {
+                    has_null = true;
+                    continue;
+                }
+                if is_equal(item, v) {
+                    return RuntimeValue::Bool(true);
+                }
+            }
+            if has_null {
+                RuntimeValue::Null
+            } else {
+                RuntimeValue::Bool(false)
+            }
+        }
+        _ => RuntimeValue::Null,
+    }
 }
 
 fn eval_string_test(op: StringOp, a: &RuntimeValue, b: &RuntimeValue) -> RuntimeValue {
- match (a, b) {
- (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => RuntimeValue::Null,
- (RuntimeValue::String(s), RuntimeValue::String(p)) => RuntimeValue::Bool(match op {
- StringOp::StartsWith => s.starts_with(p.as_str()),
- StringOp::EndsWith => s.ends_with(p.as_str()),
- StringOp::Contains => s.contains(p.as_str()),
- }),
- _ => RuntimeValue::Null,
- }
+    match (a, b) {
+        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => RuntimeValue::Null,
+        (RuntimeValue::String(s), RuntimeValue::String(p)) => RuntimeValue::Bool(match op {
+            StringOp::StartsWith => s.starts_with(p.as_str()),
+            StringOp::EndsWith => s.ends_with(p.as_str()),
+            StringOp::Contains => s.contains(p.as_str()),
+        }),
+        _ => RuntimeValue::Null,
+    }
 }
 
 fn call_scalar_function(
- name: &str,
- args: &[RuntimeValue],
- span: SourceSpan,
+    name: &str,
+    args: &[RuntimeValue],
+    span: SourceSpan,
 ) -> Result<RuntimeValue, EvalError> {
- match name {
- // --- Identity / graph projection
- "id" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Node(n) => RuntimeValue::String(n.id.to_string()),
- RuntimeValue::Rel(r) => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
- _ => RuntimeValue::Null,
- }),
- "labels" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Node(n) => {
- RuntimeValue::List(vec![RuntimeValue::String(n.label.clone())])
- }
- _ => RuntimeValue::Null,
- }),
- "type" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Rel(r) => RuntimeValue::String(r.edge_type.clone()),
- _ => RuntimeValue::Null,
- }),
- "keys" => single_arg(name, args, span).map(|v| {
- let keys: Vec<String> = match v {
- RuntimeValue::Node(n) => n.properties.keys().cloned().collect(),
- RuntimeValue::Rel(r) => r.properties.keys().cloned().collect(),
- RuntimeValue::Map(m) => m.keys().cloned().collect(),
- _ => return RuntimeValue::Null,
- };
- RuntimeValue::List(
- keys.into_iter()
- .map(RuntimeValue::String)
- .collect::<Vec<_>>(),
- )
- }),
- "properties" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Node(n) => RuntimeValue::Map(n.properties.clone()),
- RuntimeValue::Rel(r) => RuntimeValue::Map(r.properties.clone()),
- RuntimeValue::Map(m) => RuntimeValue::Map(m.clone()),
- _ => RuntimeValue::Null,
- }),
+    match name {
+        // --- Identity / graph projection
+        "id" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Node(n) => RuntimeValue::String(n.id.to_string()),
+            RuntimeValue::Rel(r) => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
+            _ => RuntimeValue::Null,
+        }),
+        "labels" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Node(n) => {
+                RuntimeValue::List(vec![RuntimeValue::String(n.label.clone())])
+            }
+            _ => RuntimeValue::Null,
+        }),
+        "type" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Rel(r) => RuntimeValue::String(r.edge_type.clone()),
+            _ => RuntimeValue::Null,
+        }),
+        "keys" => single_arg(name, args, span).map(|v| {
+            let keys: Vec<String> = match v {
+                RuntimeValue::Node(n) => n.properties.keys().cloned().collect(),
+                RuntimeValue::Rel(r) => r.properties.keys().cloned().collect(),
+                RuntimeValue::Map(m) => m.keys().cloned().collect(),
+                _ => return RuntimeValue::Null,
+            };
+            RuntimeValue::List(
+                keys.into_iter()
+                    .map(RuntimeValue::String)
+                    .collect::<Vec<_>>(),
+            )
+        }),
+        "properties" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Node(n) => RuntimeValue::Map(n.properties.clone()),
+            RuntimeValue::Rel(r) => RuntimeValue::Map(r.properties.clone()),
+            RuntimeValue::Map(m) => RuntimeValue::Map(m.clone()),
+            _ => RuntimeValue::Null,
+        }),
 
- // --- Collection ops
- "size" | "length" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::String(s) => RuntimeValue::Integer(s.chars().count() as i64),
- RuntimeValue::List(items) => RuntimeValue::Integer(items.len() as i64),
- RuntimeValue::Map(m) => RuntimeValue::Integer(m.len() as i64),
- _ => RuntimeValue::Null,
- }),
- "head" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::List(items) => items.first().cloned().unwrap_or(RuntimeValue::Null),
- _ => RuntimeValue::Null,
- }),
- "last" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::List(items) => items.last().cloned().unwrap_or(RuntimeValue::Null),
- _ => RuntimeValue::Null,
- }),
- "tail" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::List(items) if !items.is_empty() => {
- RuntimeValue::List(items[1..].to_vec())
- }
- RuntimeValue::List(_) => RuntimeValue::List(Vec::new()),
- _ => RuntimeValue::Null,
- }),
- "coalesce" => {
- for a in args {
- if !a.is_null() {
- return Ok(a.clone());
- }
- }
- Ok(RuntimeValue::Null)
- }
+        // --- Collection ops
+        "size" | "length" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::Integer(s.chars().count() as i64),
+            RuntimeValue::List(items) => RuntimeValue::Integer(items.len() as i64),
+            RuntimeValue::Map(m) => RuntimeValue::Integer(m.len() as i64),
+            _ => RuntimeValue::Null,
+        }),
+        "head" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::List(items) => items.first().cloned().unwrap_or(RuntimeValue::Null),
+            _ => RuntimeValue::Null,
+        }),
+        "last" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::List(items) => items.last().cloned().unwrap_or(RuntimeValue::Null),
+            _ => RuntimeValue::Null,
+        }),
+        "tail" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::List(items) if !items.is_empty() => {
+                RuntimeValue::List(items[1..].to_vec())
+            }
+            RuntimeValue::List(_) => RuntimeValue::List(Vec::new()),
+            _ => RuntimeValue::Null,
+        }),
+        "coalesce" => {
+            for a in args {
+                if !a.is_null() {
+                    return Ok(a.clone());
+                }
+            }
+            Ok(RuntimeValue::Null)
+        }
 
- // --- String functions
- "tolower" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::String(s) => RuntimeValue::String(s.to_lowercase()),
- _ => RuntimeValue::Null,
- }),
- "toupper" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::String(s) => RuntimeValue::String(s.to_uppercase()),
- _ => RuntimeValue::Null,
- }),
- "trim" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::String(s) => RuntimeValue::String(s.trim().to_string()),
- _ => RuntimeValue::Null,
- }),
- "tostring" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Null => RuntimeValue::Null,
- other => RuntimeValue::String(runtime_to_string_concat(&other)),
- }),
- "tointeger" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Integer(n) => RuntimeValue::Integer(n),
- RuntimeValue::Float(f) => RuntimeValue::Integer(f as i64),
- RuntimeValue::String(s) => match s.trim().parse::<i64>() {
- Ok(n) => RuntimeValue::Integer(n),
- Err(_) => RuntimeValue::Null,
- },
- RuntimeValue::Bool(b) => RuntimeValue::Integer(if b { 1 } else { 0 }),
- _ => RuntimeValue::Null,
- }),
- "tofloat" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Float(f) => RuntimeValue::Float(f),
- RuntimeValue::Integer(n) => RuntimeValue::Float(n as f64),
- RuntimeValue::String(s) => match s.trim().parse::<f64>() {
- Ok(f) => RuntimeValue::Float(f),
- Err(_) => RuntimeValue::Null,
- },
- _ => RuntimeValue::Null,
- }),
+        // --- String functions
+        "tolower" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.to_lowercase()),
+            _ => RuntimeValue::Null,
+        }),
+        "toupper" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.to_uppercase()),
+            _ => RuntimeValue::Null,
+        }),
+        "trim" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.trim().to_string()),
+            _ => RuntimeValue::Null,
+        }),
+        "tostring" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Null => RuntimeValue::Null,
+            other => RuntimeValue::String(runtime_to_string_concat(&other)),
+        }),
+        "tointeger" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Integer(n) => RuntimeValue::Integer(n),
+            RuntimeValue::Float(f) => RuntimeValue::Integer(f as i64),
+            RuntimeValue::String(s) => match s.trim().parse::<i64>() {
+                Ok(n) => RuntimeValue::Integer(n),
+                Err(_) => RuntimeValue::Null,
+            },
+            RuntimeValue::Bool(b) => RuntimeValue::Integer(if b { 1 } else { 0 }),
+            _ => RuntimeValue::Null,
+        }),
+        "tofloat" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Float(f) => RuntimeValue::Float(f),
+            RuntimeValue::Integer(n) => RuntimeValue::Float(n as f64),
+            RuntimeValue::String(s) => match s.trim().parse::<f64>() {
+                Ok(f) => RuntimeValue::Float(f),
+                Err(_) => RuntimeValue::Null,
+            },
+            _ => RuntimeValue::Null,
+        }),
 
- // --- Numeric
- "abs" => single_arg(name, args, span).map(|v| match v {
- RuntimeValue::Integer(n) => RuntimeValue::Integer(n.abs()),
- RuntimeValue::Float(f) => RuntimeValue::Float(f.abs()),
- _ => RuntimeValue::Null,
- }),
+        // --- Numeric
+        "abs" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Integer(n) => RuntimeValue::Integer(n.abs()),
+            RuntimeValue::Float(f) => RuntimeValue::Float(f.abs()),
+            _ => RuntimeValue::Null,
+        }),
 
- // --- Vector constructor
- // `vector([x, y, …])` lifts a numeric list into a first-class
- // `Vector(Vec<f32>)`, which round-trips through `runtime_to_core`
- // → `CoreValue::Vec` → Parquet column. Without this builtin, a
- // bare `[0.1, 0.2]` literal stays a `List` and the writer rejects
- // it with "only scalars are storable in v0".
- "vector" => {
- let v = single_arg(name, args, span)?;
- match v {
- RuntimeValue::Null => Ok(RuntimeValue::Null),
- RuntimeValue::Vector(items) => Ok(RuntimeValue::Vector(items)),
- RuntimeValue::List(items) => {
- let mut out = Vec::with_capacity(items.len());
- for (idx, item) in items.into_iter().enumerate() {
- let coerced = match item {
- RuntimeValue::Float(f) => f as f32,
- RuntimeValue::Integer(n) => n as f32,
- other => {
- return Err(EvalError::new(
- format!(
- "vector() requires numeric elements; got {} at index {}",
- other.type_name(),
- idx
- ),
- span,
- ));
- }
- };
- out.push(coerced);
- }
- Ok(RuntimeValue::Vector(out))
- }
- other => Err(EvalError::new(
- format!(
- "vector() requires a list of numbers; got {}",
- other.type_name()
- ),
- span,
- )),
- }
- }
+        // --- Vector constructor
+        // `vector([x, y, …])` lifts a numeric list into a first-class
+        // `Vector(Vec<f32>)`, which round-trips through `runtime_to_core`
+        // → `CoreValue::Vec` → Parquet column. Without this builtin, a
+        // bare `[0.1, 0.2]` literal stays a `List` and the writer rejects
+        // it with "only scalars are storable in v0".
+        "vector" => {
+            let v = single_arg(name, args, span)?;
+            match v {
+                RuntimeValue::Null => Ok(RuntimeValue::Null),
+                RuntimeValue::Vector(items) => Ok(RuntimeValue::Vector(items)),
+                RuntimeValue::List(items) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (idx, item) in items.into_iter().enumerate() {
+                        let coerced = match item {
+                            RuntimeValue::Float(f) => f as f32,
+                            RuntimeValue::Integer(n) => n as f32,
+                            other => {
+                                return Err(EvalError::new(
+                                    format!(
+                                        "vector() requires numeric elements; got {} at index {}",
+                                        other.type_name(),
+                                        idx
+                                    ),
+                                    span,
+                                ));
+                            }
+                        };
+                        out.push(coerced);
+                    }
+                    Ok(RuntimeValue::Vector(out))
+                }
+                other => Err(EvalError::new(
+                    format!(
+                        "vector() requires a list of numbers; got {}",
+                        other.type_name()
+                    ),
+                    span,
+                )),
+            }
+        }
 
- // --- Lowering helpers (internal)
- "__path" => Ok(RuntimeValue::Path(args.to_vec())),
- "__label_eq" => match args {
- [target, RuntimeValue::String(label)] => Ok(match target {
- RuntimeValue::Node(n) => RuntimeValue::Bool(&n.label == label),
- RuntimeValue::Null => RuntimeValue::Null,
- _ => RuntimeValue::Bool(false),
- }),
- _ => Err(EvalError::new("__label_eq expects (node, string)", span)),
- },
+        // --- Lowering helpers (internal)
+        "__path" => Ok(RuntimeValue::Path(args.to_vec())),
+        "__label_eq" => match args {
+            [target, RuntimeValue::String(label)] => Ok(match target {
+                RuntimeValue::Node(n) => RuntimeValue::Bool(&n.label == label),
+                RuntimeValue::Null => RuntimeValue::Null,
+                _ => RuntimeValue::Bool(false),
+            }),
+            _ => Err(EvalError::new("__label_eq expects (node, string)", span)),
+        },
 
- _ => Err(EvalError::new(
- format!("function `{}` is not supported in v0", name),
- span,
- )),
- }
+        _ => Err(EvalError::new(
+            format!("function `{}` is not supported in v0", name),
+            span,
+        )),
+    }
 }
 
 fn single_arg(
- name: &str,
- args: &[RuntimeValue],
- span: SourceSpan,
+    name: &str,
+    args: &[RuntimeValue],
+    span: SourceSpan,
 ) -> Result<RuntimeValue, EvalError> {
- match args {
- [single] => Ok(single.clone()),
- _ => Err(EvalError::new(
- format!("`{}` expects exactly 1 argument", name),
- span,
- )),
- }
+    match args {
+        [single] => Ok(single.clone()),
+        _ => Err(EvalError::new(
+            format!("`{}` expects exactly 1 argument", name),
+            span,
+        )),
+    }
 }
 
 fn eval_list_comprehension(
- lc: &crate::parser::ListComprehension,
- row: &Row,
- params: &Params,
+    lc: &crate::parser::ListComprehension,
+    row: &Row,
+    params: &Params,
 ) -> Result<RuntimeValue, EvalError> {
- let list_v = evaluate(&lc.list, row, params)?;
- let items = match list_v {
- RuntimeValue::List(items) => items,
- RuntimeValue::Null => return Ok(RuntimeValue::Null),
- other => {
- return Err(EvalError::new(
- format!(
- "list comprehension requires a list, got {}",
- other.type_name()
- ),
- lc.list.span,
- ));
- }
- };
- let mut out = Vec::with_capacity(items.len());
- for item in items {
- let mut local = row.clone();
- local.set(lc.variable.name.clone(), item.clone());
- if let Some(pred) = &lc.predicate {
- let v = evaluate(pred, &local, params)?;
- if v.as_bool() != Some(true) {
- continue;
- }
- }
- let projected = match &lc.projection {
- Some(p) => evaluate(p, &local, params)?,
- None => item,
- };
- out.push(projected);
- }
- Ok(RuntimeValue::List(out))
+    let list_v = evaluate(&lc.list, row, params)?;
+    let items = match list_v {
+        RuntimeValue::List(items) => items,
+        RuntimeValue::Null => return Ok(RuntimeValue::Null),
+        other => {
+            return Err(EvalError::new(
+                format!(
+                    "list comprehension requires a list, got {}",
+                    other.type_name()
+                ),
+                lc.list.span,
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let mut local = row.clone();
+        local.set(lc.variable.name.clone(), item.clone());
+        if let Some(pred) = &lc.predicate {
+            let v = evaluate(pred, &local, params)?;
+            if v.as_bool() != Some(true) {
+                continue;
+            }
+        }
+        let projected = match &lc.projection {
+            Some(p) => evaluate(p, &local, params)?,
+            None => item,
+        };
+        out.push(projected);
+    }
+    Ok(RuntimeValue::List(out))
 }
 
 #[cfg(test)]
 mod tests {
- use super::super::value::NodeValue;
- use super::*;
- use crate::parser::parse;
+    use super::super::value::NodeValue;
+    use super::*;
+    use crate::parser::parse;
 
- fn row_with(bindings: &[(&str, RuntimeValue)]) -> Row {
- let mut r = Row::new();
- for (k, v) in bindings {
- r.set(*k, v.clone());
- }
- r
- }
+    fn row_with(bindings: &[(&str, RuntimeValue)]) -> Row {
+        let mut r = Row::new();
+        for (k, v) in bindings {
+            r.set(*k, v.clone());
+        }
+        r
+    }
 
- fn eval_str(src: &str, row: &Row, params: &Params) -> RuntimeValue {
- let q = parse(&format!("RETURN {} AS r", src)).unwrap();
- let item = match &q.head.clauses[0] {
- crate::parser::Clause::Return(r) => &r.items[0].expression,
- _ => panic!(),
- };
- evaluate(item, row, params).unwrap()
- }
+    fn eval_str(src: &str, row: &Row, params: &Params) -> RuntimeValue {
+        let q = parse(&format!("RETURN {} AS r", src)).unwrap();
+        let item = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        evaluate(item, row, params).unwrap()
+    }
 
- #[test]
- fn arith_int_add() {
- let r = eval_str("1 + 2", &Row::new(), &Params::new());
- assert_eq!(r, RuntimeValue::Integer(3));
- }
+    #[test]
+    fn arith_int_add() {
+        let r = eval_str("1 + 2", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Integer(3));
+    }
 
- #[test]
- fn arith_int_float_promotion() {
- let r = eval_str("1 + 2.5", &Row::new(), &Params::new());
- assert_eq!(r, RuntimeValue::Float(3.5));
- }
+    #[test]
+    fn arith_int_float_promotion() {
+        let r = eval_str("1 + 2.5", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Float(3.5));
+    }
 
- #[test]
- fn null_propagates_through_arith() {
- let r = eval_str("1 + NULL", &Row::new(), &Params::new());
- assert!(r.is_null());
- }
+    #[test]
+    fn null_propagates_through_arith() {
+        let r = eval_str("1 + NULL", &Row::new(), &Params::new());
+        assert!(r.is_null());
+    }
 
- #[test]
- fn three_valued_and_or() {
- assert_eq!(
- eval_str("TRUE AND FALSE", &Row::new(), &Params::new()),
- RuntimeValue::Bool(false)
- );
- assert_eq!(
- eval_str("TRUE AND NULL", &Row::new(), &Params::new()),
- RuntimeValue::Null
- );
- assert_eq!(
- eval_str("FALSE AND NULL", &Row::new(), &Params::new()),
- RuntimeValue::Bool(false)
- );
- assert_eq!(
- eval_str("TRUE OR NULL", &Row::new(), &Params::new()),
- RuntimeValue::Bool(true)
- );
- assert_eq!(
- eval_str("NULL OR NULL", &Row::new(), &Params::new()),
- RuntimeValue::Null
- );
- }
+    #[test]
+    fn three_valued_and_or() {
+        assert_eq!(
+            eval_str("TRUE AND FALSE", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+        assert_eq!(
+            eval_str("TRUE AND NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Null
+        );
+        assert_eq!(
+            eval_str("FALSE AND NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+        assert_eq!(
+            eval_str("TRUE OR NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            eval_str("NULL OR NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Null
+        );
+    }
 
- #[test]
- fn in_list_with_null() {
- assert_eq!(
- eval_str("1 IN [1, 2, 3]", &Row::new(), &Params::new()),
- RuntimeValue::Bool(true)
- );
- assert_eq!(
- eval_str("5 IN [1, 2, 3]", &Row::new(), &Params::new()),
- RuntimeValue::Bool(false)
- );
- assert_eq!(
- eval_str("5 IN [1, NULL, 3]", &Row::new(), &Params::new()),
- RuntimeValue::Null
- );
- }
+    #[test]
+    fn in_list_with_null() {
+        assert_eq!(
+            eval_str("1 IN [1, 2, 3]", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            eval_str("5 IN [1, 2, 3]", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+        assert_eq!(
+            eval_str("5 IN [1, NULL, 3]", &Row::new(), &Params::new()),
+            RuntimeValue::Null
+        );
+    }
 
- #[test]
- fn is_null_returns_bool() {
- assert_eq!(
- eval_str("NULL IS NULL", &Row::new(), &Params::new()),
- RuntimeValue::Bool(true)
- );
- assert_eq!(
- eval_str("1 IS NOT NULL", &Row::new(), &Params::new()),
- RuntimeValue::Bool(true)
- );
- }
+    #[test]
+    fn is_null_returns_bool() {
+        assert_eq!(
+            eval_str("NULL IS NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            eval_str("1 IS NOT NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+    }
 
- #[test]
- fn property_access_on_node() {
- let mut props = BTreeMap::new();
- props.insert("name".into(), RuntimeValue::String("Ada".into()));
- let node = RuntimeValue::Node(Box::new(NodeValue {
- id: namidb_core::id::NodeId::new(),
- label: "Person".into(),
- properties: props,
- }));
- let row = row_with(&[("a", node)]);
- let r = eval_str("a.name", &row, &Params::new());
- assert_eq!(r, RuntimeValue::String("Ada".into()));
- let r = eval_str("a.missing", &row, &Params::new());
- assert!(r.is_null());
- }
+    #[test]
+    fn property_access_on_node() {
+        let mut props = BTreeMap::new();
+        props.insert("name".into(), RuntimeValue::String("Ada".into()));
+        let node = RuntimeValue::Node(Box::new(NodeValue {
+            id: namidb_core::id::NodeId::new(),
+            label: "Person".into(),
+            properties: props,
+        }));
+        let row = row_with(&[("a", node)]);
+        let r = eval_str("a.name", &row, &Params::new());
+        assert_eq!(r, RuntimeValue::String("Ada".into()));
+        let r = eval_str("a.missing", &row, &Params::new());
+        assert!(r.is_null());
+    }
 
- #[test]
- fn parameter_lookup() {
- let mut params = Params::new();
- params.insert("x".into(), RuntimeValue::Integer(7));
- let r = eval_str("$x", &Row::new(), &params);
- assert_eq!(r, RuntimeValue::Integer(7));
- }
+    #[test]
+    fn parameter_lookup() {
+        let mut params = Params::new();
+        params.insert("x".into(), RuntimeValue::Integer(7));
+        let r = eval_str("$x", &Row::new(), &params);
+        assert_eq!(r, RuntimeValue::Integer(7));
+    }
 
- #[test]
- fn order_cmp_int_vs_float() {
- assert_eq!(
- eval_str("1 < 2.5", &Row::new(), &Params::new()),
- RuntimeValue::Bool(true)
- );
- }
+    #[test]
+    fn order_cmp_int_vs_float() {
+        assert_eq!(
+            eval_str("1 < 2.5", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+    }
 
- #[test]
- fn string_concat_via_plus() {
- assert_eq!(
- eval_str("'hello' + ' ' + 'world'", &Row::new(), &Params::new()),
- RuntimeValue::String("hello world".into())
- );
- }
+    #[test]
+    fn string_concat_via_plus() {
+        assert_eq!(
+            eval_str("'hello' + ' ' + 'world'", &Row::new(), &Params::new()),
+            RuntimeValue::String("hello world".into())
+        );
+    }
 
- #[test]
- fn coalesce_picks_first_non_null() {
- let r = eval_str("coalesce(NULL, NULL, 42)", &Row::new(), &Params::new());
- assert_eq!(r, RuntimeValue::Integer(42));
- }
+    #[test]
+    fn coalesce_picks_first_non_null() {
+        let r = eval_str("coalesce(NULL, NULL, 42)", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Integer(42));
+    }
 
- #[test]
- fn integer_division_by_zero_errors() {
- let q = parse("RETURN 1 / 0 AS r").unwrap();
- let item = match &q.head.clauses[0] {
- crate::parser::Clause::Return(r) => &r.items[0].expression,
- _ => panic!(),
- };
- let err = evaluate(item, &Row::new(), &Params::new()).unwrap_err();
- assert!(err.message.contains("division"));
- }
+    #[test]
+    fn integer_division_by_zero_errors() {
+        let q = parse("RETURN 1 / 0 AS r").unwrap();
+        let item = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        let err = evaluate(item, &Row::new(), &Params::new()).unwrap_err();
+        assert!(err.message.contains("division"));
+    }
 
- #[test]
- fn case_expression_matches_branch() {
- let r = eval_str(
- "CASE WHEN 1 = 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END",
- &Row::new(),
- &Params::new(),
- );
- assert_eq!(r, RuntimeValue::String("b".into()));
- }
+    #[test]
+    fn case_expression_matches_branch() {
+        let r = eval_str(
+            "CASE WHEN 1 = 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END",
+            &Row::new(),
+            &Params::new(),
+        );
+        assert_eq!(r, RuntimeValue::String("b".into()));
+    }
 
- #[test]
- fn list_index_negative() {
- let r = eval_str("[10, 20, 30][-1]", &Row::new(), &Params::new());
- assert_eq!(r, RuntimeValue::Integer(30));
- }
+    #[test]
+    fn list_index_negative() {
+        let r = eval_str("[10, 20, 30][-1]", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Integer(30));
+    }
 
- #[test]
- fn list_range_slice() {
- let r = eval_str("[1, 2, 3, 4, 5][1..3]", &Row::new(), &Params::new());
- assert_eq!(
- r,
- RuntimeValue::List(vec![RuntimeValue::Integer(2), RuntimeValue::Integer(3)])
- );
- }
+    #[test]
+    fn list_range_slice() {
+        let r = eval_str("[1, 2, 3, 4, 5][1..3]", &Row::new(), &Params::new());
+        assert_eq!(
+            r,
+            RuntimeValue::List(vec![RuntimeValue::Integer(2), RuntimeValue::Integer(3)])
+        );
+    }
 
- #[test]
- fn list_comprehension_projection_only() {
- let r = eval_str("[x IN [1, 2, 3] | x * 2]", &Row::new(), &Params::new());
- assert_eq!(
- r,
- RuntimeValue::List(vec![
- RuntimeValue::Integer(2),
- RuntimeValue::Integer(4),
- RuntimeValue::Integer(6),
- ])
- );
- }
+    #[test]
+    fn list_comprehension_projection_only() {
+        let r = eval_str("[x IN [1, 2, 3] | x * 2]", &Row::new(), &Params::new());
+        assert_eq!(
+            r,
+            RuntimeValue::List(vec![
+                RuntimeValue::Integer(2),
+                RuntimeValue::Integer(4),
+                RuntimeValue::Integer(6),
+            ])
+        );
+    }
 
- #[test]
- fn list_comprehension_predicate_only() {
- let r = eval_str(
- "[x IN [1, 2, 3, 4] WHERE x > 2]",
- &Row::new(),
- &Params::new(),
- );
- assert_eq!(
- r,
- RuntimeValue::List(vec![RuntimeValue::Integer(3), RuntimeValue::Integer(4)])
- );
- }
+    #[test]
+    fn list_comprehension_predicate_only() {
+        let r = eval_str(
+            "[x IN [1, 2, 3, 4] WHERE x > 2]",
+            &Row::new(),
+            &Params::new(),
+        );
+        assert_eq!(
+            r,
+            RuntimeValue::List(vec![RuntimeValue::Integer(3), RuntimeValue::Integer(4)])
+        );
+    }
 
- #[test]
- fn list_comprehension_predicate_and_projection() {
- let r = eval_str(
- "[x IN [1, 2, 3, 4] WHERE x % 2 = 0 | x * 10]",
- &Row::new(),
- &Params::new(),
- );
- assert_eq!(
- r,
- RuntimeValue::List(vec![RuntimeValue::Integer(20), RuntimeValue::Integer(40)])
- );
- }
+    #[test]
+    fn list_comprehension_predicate_and_projection() {
+        let r = eval_str(
+            "[x IN [1, 2, 3, 4] WHERE x % 2 = 0 | x * 10]",
+            &Row::new(),
+            &Params::new(),
+        );
+        assert_eq!(
+            r,
+            RuntimeValue::List(vec![RuntimeValue::Integer(20), RuntimeValue::Integer(40)])
+        );
+    }
 
- #[test]
- fn list_comprehension_null_list_returns_null() {
- let r = eval_str("[x IN NULL | x]", &Row::new(), &Params::new());
- assert!(r.is_null());
- }
+    #[test]
+    fn list_comprehension_null_list_returns_null() {
+        let r = eval_str("[x IN NULL | x]", &Row::new(), &Params::new());
+        assert!(r.is_null());
+    }
 
- #[test]
- fn list_comprehension_can_reference_outer_row() {
- let row = row_with(&[("threshold", RuntimeValue::Integer(2))]);
- let r = eval_str(
- "[x IN [1, 2, 3, 4] WHERE x > threshold | x]",
- &row,
- &Params::new(),
- );
- assert_eq!(
- r,
- RuntimeValue::List(vec![RuntimeValue::Integer(3), RuntimeValue::Integer(4)])
- );
- }
+    #[test]
+    fn list_comprehension_can_reference_outer_row() {
+        let row = row_with(&[("threshold", RuntimeValue::Integer(2))]);
+        let r = eval_str(
+            "[x IN [1, 2, 3, 4] WHERE x > threshold | x]",
+            &row,
+            &Params::new(),
+        );
+        assert_eq!(
+            r,
+            RuntimeValue::List(vec![RuntimeValue::Integer(3), RuntimeValue::Integer(4)])
+        );
+    }
 
- #[test]
- fn dot_underscore_id_on_node_returns_uuid_string() {
- let id = namidb_core::id::NodeId::new();
- let node = RuntimeValue::Node(Box::new(NodeValue {
- id,
- label: "Person".into(),
- properties: BTreeMap::new(),
- }));
- let row = row_with(&[("a", node)]);
- let r = eval_str("a._id", &row, &Params::new());
- assert_eq!(r, RuntimeValue::String(id.to_string()));
- }
+    #[test]
+    fn dot_underscore_id_on_node_returns_uuid_string() {
+        let id = namidb_core::id::NodeId::new();
+        let node = RuntimeValue::Node(Box::new(NodeValue {
+            id,
+            label: "Person".into(),
+            properties: BTreeMap::new(),
+        }));
+        let row = row_with(&[("a", node)]);
+        let r = eval_str("a._id", &row, &Params::new());
+        assert_eq!(r, RuntimeValue::String(id.to_string()));
+    }
 
- #[test]
- fn dot_id_on_node_returns_user_property_not_internal_id() {
- // Regression: `id` was previously aliased to the internal NodeId.
- // After the rename to `_id`, plain `id` must surface the
- // user-owned property value verbatim.
- let id = namidb_core::id::NodeId::new();
- let mut props = BTreeMap::new();
- props.insert("id".into(), RuntimeValue::String("external-42".into()));
- let node = RuntimeValue::Node(Box::new(NodeValue {
- id,
- label: "Person".into(),
- properties: props,
- }));
- let row = row_with(&[("a", node)]);
- let r = eval_str("a.id", &row, &Params::new());
- assert_eq!(r, RuntimeValue::String("external-42".into()));
- }
+    #[test]
+    fn dot_id_on_node_returns_user_property_not_internal_id() {
+        // Regression: `id` was previously aliased to the internal NodeId.
+        // After the rename to `_id`, plain `id` must surface the
+        // user-owned property value verbatim.
+        let id = namidb_core::id::NodeId::new();
+        let mut props = BTreeMap::new();
+        props.insert("id".into(), RuntimeValue::String("external-42".into()));
+        let node = RuntimeValue::Node(Box::new(NodeValue {
+            id,
+            label: "Person".into(),
+            properties: props,
+        }));
+        let row = row_with(&[("a", node)]);
+        let r = eval_str("a.id", &row, &Params::new());
+        assert_eq!(r, RuntimeValue::String("external-42".into()));
+    }
 
- #[test]
- fn dot_id_on_node_without_property_returns_null() {
- // No user-defined `id` property → accessor must yield Null, not
- // fall back to the internal NodeId.
- let node = RuntimeValue::Node(Box::new(NodeValue {
- id: namidb_core::id::NodeId::new(),
- label: "Person".into(),
- properties: BTreeMap::new(),
- }));
- let row = row_with(&[("a", node)]);
- let r = eval_str("a.id", &row, &Params::new());
- assert_eq!(r, RuntimeValue::Null);
- }
+    #[test]
+    fn dot_id_on_node_without_property_returns_null() {
+        // No user-defined `id` property → accessor must yield Null, not
+        // fall back to the internal NodeId.
+        let node = RuntimeValue::Node(Box::new(NodeValue {
+            id: namidb_core::id::NodeId::new(),
+            label: "Person".into(),
+            properties: BTreeMap::new(),
+        }));
+        let row = row_with(&[("a", node)]);
+        let r = eval_str("a.id", &row, &Params::new());
+        assert_eq!(r, RuntimeValue::Null);
+    }
 
- #[test]
- fn label_eq_internal_function() {
- let node = RuntimeValue::Node(Box::new(NodeValue {
- id: namidb_core::id::NodeId::new(),
- label: "Person".into(),
- properties: BTreeMap::new(),
- }));
- let row = row_with(&[("a", node)]);
- let q = parse("RETURN __label_eq(a, 'Person') AS r").unwrap();
- let expr = match &q.head.clauses[0] {
- crate::parser::Clause::Return(r) => &r.items[0].expression,
- _ => panic!(),
- };
- let r = evaluate(expr, &row, &Params::new()).unwrap();
- assert_eq!(r, RuntimeValue::Bool(true));
- }
+    #[test]
+    fn label_eq_internal_function() {
+        let node = RuntimeValue::Node(Box::new(NodeValue {
+            id: namidb_core::id::NodeId::new(),
+            label: "Person".into(),
+            properties: BTreeMap::new(),
+        }));
+        let row = row_with(&[("a", node)]);
+        let q = parse("RETURN __label_eq(a, 'Person') AS r").unwrap();
+        let expr = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        let r = evaluate(expr, &row, &Params::new()).unwrap();
+        assert_eq!(r, RuntimeValue::Bool(true));
+    }
 
- // ─── vector() constructor ─────────────────────────────────────
+    // ─── vector() constructor ─────────────────────────────────────
 
- fn eval_expr_err(src: &str) -> EvalError {
- let q = parse(&format!("RETURN {} AS r", src)).unwrap();
- let item = match &q.head.clauses[0] {
- crate::parser::Clause::Return(r) => &r.items[0].expression,
- _ => panic!(),
- };
- evaluate(item, &Row::new(), &Params::new()).unwrap_err()
- }
+    fn eval_expr_err(src: &str) -> EvalError {
+        let q = parse(&format!("RETURN {} AS r", src)).unwrap();
+        let item = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        evaluate(item, &Row::new(), &Params::new()).unwrap_err()
+    }
 
- #[test]
- fn vector_from_float_list() {
- let r = eval_str("vector([0.1, 0.2, 0.3])", &Row::new(), &Params::new());
- assert_eq!(
- r,
- RuntimeValue::Vector(vec![0.1_f32, 0.2_f32, 0.3_f32])
- );
- }
+    #[test]
+    fn vector_from_float_list() {
+        let r = eval_str("vector([0.1, 0.2, 0.3])", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Vector(vec![0.1_f32, 0.2_f32, 0.3_f32]));
+    }
 
- #[test]
- fn vector_from_integer_list_promotes_to_f32() {
- let r = eval_str("vector([1, 2, 3])", &Row::new(), &Params::new());
- assert_eq!(
- r,
- RuntimeValue::Vector(vec![1.0_f32, 2.0_f32, 3.0_f32])
- );
- }
+    #[test]
+    fn vector_from_integer_list_promotes_to_f32() {
+        let r = eval_str("vector([1, 2, 3])", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Vector(vec![1.0_f32, 2.0_f32, 3.0_f32]));
+    }
 
- #[test]
- fn vector_from_mixed_int_float_list() {
- let r = eval_str("vector([1, 2.5, 3])", &Row::new(), &Params::new());
- assert_eq!(
- r,
- RuntimeValue::Vector(vec![1.0_f32, 2.5_f32, 3.0_f32])
- );
- }
+    #[test]
+    fn vector_from_mixed_int_float_list() {
+        let r = eval_str("vector([1, 2.5, 3])", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Vector(vec![1.0_f32, 2.5_f32, 3.0_f32]));
+    }
 
- #[test]
- fn vector_empty_list() {
- let r = eval_str("vector([])", &Row::new(), &Params::new());
- assert_eq!(r, RuntimeValue::Vector(Vec::new()));
- }
+    #[test]
+    fn vector_empty_list() {
+        let r = eval_str("vector([])", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Vector(Vec::new()));
+    }
 
- #[test]
- fn vector_null_passthrough() {
- let r = eval_str("vector(NULL)", &Row::new(), &Params::new());
- assert!(r.is_null());
- }
+    #[test]
+    fn vector_null_passthrough() {
+        let r = eval_str("vector(NULL)", &Row::new(), &Params::new());
+        assert!(r.is_null());
+    }
 
- #[test]
- fn vector_idempotent_on_existing_vector() {
- // `vector(vec)` where `vec` is already a Vector — uses a parameter
- // because there is no Cypher literal for Vector. Idempotency keeps
- // composition (e.g. `vector(vector(x))`) safe.
- let mut params = Params::new();
- params.insert(
- "v".into(),
- RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]),
- );
- let q = parse("RETURN vector($v) AS r").unwrap();
- let item = match &q.head.clauses[0] {
- crate::parser::Clause::Return(r) => &r.items[0].expression,
- _ => panic!(),
- };
- let r = evaluate(item, &Row::new(), &params).unwrap();
- assert_eq!(r, RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]));
- }
+    #[test]
+    fn vector_idempotent_on_existing_vector() {
+        // `vector(vec)` where `vec` is already a Vector — uses a parameter
+        // because there is no Cypher literal for Vector. Idempotency keeps
+        // composition (e.g. `vector(vector(x))`) safe.
+        let mut params = Params::new();
+        params.insert("v".into(), RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]));
+        let q = parse("RETURN vector($v) AS r").unwrap();
+        let item = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        let r = evaluate(item, &Row::new(), &params).unwrap();
+        assert_eq!(r, RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]));
+    }
 
- #[test]
- fn vector_rejects_non_numeric_element() {
- let err = eval_expr_err(r#"vector([1, "x", 3])"#);
- assert!(
- err.message.contains("vector()") && err.message.contains("STRING") && err.message.contains("index 1"),
- "unexpected message: {}",
- err.message
- );
- }
+    #[test]
+    fn vector_rejects_non_numeric_element() {
+        let err = eval_expr_err(r#"vector([1, "x", 3])"#);
+        assert!(
+            err.message.contains("vector()")
+                && err.message.contains("STRING")
+                && err.message.contains("index 1"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
 
- #[test]
- fn vector_rejects_null_element() {
- let err = eval_expr_err("vector([1.0, NULL, 3.0])");
- assert!(
- err.message.contains("vector()") && err.message.contains("NULL") && err.message.contains("index 1"),
- "unexpected message: {}",
- err.message
- );
- }
+    #[test]
+    fn vector_rejects_null_element() {
+        let err = eval_expr_err("vector([1.0, NULL, 3.0])");
+        assert!(
+            err.message.contains("vector()")
+                && err.message.contains("NULL")
+                && err.message.contains("index 1"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
 
- #[test]
- fn vector_rejects_non_list_argument() {
- let err = eval_expr_err(r#"vector("not a list")"#);
- assert!(
- err.message.contains("vector()") && err.message.contains("STRING"),
- "unexpected message: {}",
- err.message
- );
- }
+    #[test]
+    fn vector_rejects_non_list_argument() {
+        let err = eval_expr_err(r#"vector("not a list")"#);
+        assert!(
+            err.message.contains("vector()") && err.message.contains("STRING"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
 
- #[test]
- fn vector_requires_single_argument() {
- let err = eval_expr_err("vector([1.0], [2.0])");
- assert!(
- err.message.contains("vector") && err.message.contains("exactly 1"),
- "unexpected message: {}",
- err.message
- );
- }
+    #[test]
+    fn vector_requires_single_argument() {
+        let err = eval_expr_err("vector([1.0], [2.0])");
+        assert!(
+            err.message.contains("vector") && err.message.contains("exactly 1"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
 }

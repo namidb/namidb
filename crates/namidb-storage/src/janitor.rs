@@ -63,18 +63,18 @@ use crate::manifest::ManifestStore;
 /// be freed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JanitorReport {
- /// Distinct objects classified as orphan (not referenced by the
- /// current manifest, older than `min_age`).
- pub orphans_found: usize,
- /// Objects actually deleted by this run. Equal to `orphans_found`
- /// when `delete = true`; zero otherwise.
- pub orphans_deleted: usize,
- /// Bytes freed (or that would have been freed in dry-run mode).
- pub bytes_freed: u64,
- /// Objects that are unreferenced but were spared because their
- /// `last_modified` falls within `min_age`. These are the candidates
- /// the operator should re-evaluate on the next sweep.
- pub skipped_too_young: usize,
+    /// Distinct objects classified as orphan (not referenced by the
+    /// current manifest, older than `min_age`).
+    pub orphans_found: usize,
+    /// Objects actually deleted by this run. Equal to `orphans_found`
+    /// when `delete = true`; zero otherwise.
+    pub orphans_deleted: usize,
+    /// Bytes freed (or that would have been freed in dry-run mode).
+    pub bytes_freed: u64,
+    /// Objects that are unreferenced but were spared because their
+    /// `last_modified` falls within `min_age`. These are the candidates
+    /// the operator should re-evaluate on the next sweep.
+    pub skipped_too_young: usize,
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
@@ -96,261 +96,261 @@ pub struct JanitorReport {
  )
 )]
 pub async fn sweep_orphans(
- manifest_store: &ManifestStore,
- min_age: std::time::Duration,
- max_level: u32,
- delete: bool,
+    manifest_store: &ManifestStore,
+    min_age: std::time::Duration,
+    max_level: u32,
+    delete: bool,
 ) -> Result<JanitorReport> {
- let manifest = manifest_store.load_current().await?;
- let mut referenced: HashSet<String> = HashSet::new();
- for desc in &manifest.manifest.ssts {
- referenced.insert(desc.path.clone());
- if let Some(b) = &desc.bloom {
- referenced.insert(b.path.clone());
- }
- }
+    let manifest = manifest_store.load_current().await?;
+    let mut referenced: HashSet<String> = HashSet::new();
+    for desc in &manifest.manifest.ssts {
+        referenced.insert(desc.path.clone());
+        if let Some(b) = &desc.bloom {
+            referenced.insert(b.path.clone());
+        }
+    }
 
- let store = manifest_store.store().clone();
- let paths = manifest_store.paths();
- let ns_prefix = paths.namespace_prefix();
- let ns_prefix_str = ns_prefix.as_ref();
+    let store = manifest_store.store().clone();
+    let paths = manifest_store.paths();
+    let ns_prefix = paths.namespace_prefix();
+    let ns_prefix_str = ns_prefix.as_ref();
 
- let mut report = JanitorReport::default();
- let min_age_secs = min_age.as_secs() as i64;
- let now = Utc::now();
+    let mut report = JanitorReport::default();
+    let min_age_secs = min_age.as_secs() as i64;
+    let now = Utc::now();
 
- for level in 0..=max_level {
- let level_dir = paths.sst_dir(level);
- let mut stream = store.list(Some(&level_dir));
- while let Some(meta) = stream.try_next().await.map_err(Error::ObjectStore)? {
- let absolute = meta.location.as_ref();
- // Convert to namespace-relative form so the comparison matches
- // what's stored in `SstDescriptor::path`.
- let Some(relative) = absolute
- .strip_prefix(ns_prefix_str)
- .and_then(|s| s.strip_prefix('/'))
- else {
- debug!(path = %absolute, "list returned object outside namespace prefix; skipping");
- continue;
- };
- if referenced.contains(relative) {
- continue;
- }
- let age_secs = (now - meta.last_modified).num_seconds();
- if age_secs < min_age_secs {
- report.skipped_too_young += 1;
- debug!(path = %absolute, age_secs, "orphan candidate too young, deferring");
- continue;
- }
- report.orphans_found += 1;
- report.bytes_freed = report.bytes_freed.saturating_add(meta.size);
- if delete {
- store
- .delete(&meta.location)
- .await
- .map_err(Error::ObjectStore)?;
- report.orphans_deleted += 1;
- }
- }
- }
+    for level in 0..=max_level {
+        let level_dir = paths.sst_dir(level);
+        let mut stream = store.list(Some(&level_dir));
+        while let Some(meta) = stream.try_next().await.map_err(Error::ObjectStore)? {
+            let absolute = meta.location.as_ref();
+            // Convert to namespace-relative form so the comparison matches
+            // what's stored in `SstDescriptor::path`.
+            let Some(relative) = absolute
+                .strip_prefix(ns_prefix_str)
+                .and_then(|s| s.strip_prefix('/'))
+            else {
+                debug!(path = %absolute, "list returned object outside namespace prefix; skipping");
+                continue;
+            };
+            if referenced.contains(relative) {
+                continue;
+            }
+            let age_secs = (now - meta.last_modified).num_seconds();
+            if age_secs < min_age_secs {
+                report.skipped_too_young += 1;
+                debug!(path = %absolute, age_secs, "orphan candidate too young, deferring");
+                continue;
+            }
+            report.orphans_found += 1;
+            report.bytes_freed = report.bytes_freed.saturating_add(meta.size);
+            if delete {
+                store
+                    .delete(&meta.location)
+                    .await
+                    .map_err(Error::ObjectStore)?;
+                report.orphans_deleted += 1;
+            }
+        }
+    }
 
- Ok(report)
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
- use std::sync::Arc;
- use std::time::Duration;
+    use std::sync::Arc;
+    use std::time::Duration;
 
- use bytes::Bytes;
- use namidb_core::{LabelDef, NamespaceId, NodeId, PropertyDef, Schema, SchemaBuilder};
- use object_store::memory::InMemory;
- use object_store::{ObjectStore, PutPayload};
- use uuid::Uuid;
+    use bytes::Bytes;
+    use namidb_core::{LabelDef, NamespaceId, NodeId, PropertyDef, Schema, SchemaBuilder};
+    use object_store::memory::InMemory;
+    use object_store::{ObjectStore, PutPayload};
+    use uuid::Uuid;
 
- use super::*;
- use crate::fence::WriterFence;
- use crate::flush::{flush, NodeWriteRecord};
- use crate::manifest::ManifestStore;
- use crate::memtable::{MemKey, MemOp, Memtable};
- use crate::paths::NamespacePaths;
- use namidb_core::{DataType, Value};
+    use super::*;
+    use crate::fence::WriterFence;
+    use crate::flush::{flush, NodeWriteRecord};
+    use crate::manifest::ManifestStore;
+    use crate::memtable::{MemKey, MemOp, Memtable};
+    use crate::paths::NamespacePaths;
+    use namidb_core::{DataType, Value};
 
- fn make_store() -> Arc<dyn ObjectStore> {
- Arc::new(InMemory::new())
- }
+    fn make_store() -> Arc<dyn ObjectStore> {
+        Arc::new(InMemory::new())
+    }
 
- fn make_paths(name: &str) -> NamespacePaths {
- NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
- }
+    fn make_paths(name: &str) -> NamespacePaths {
+        NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+    }
 
- fn person_label() -> LabelDef {
- LabelDef {
- name: "Person".into(),
- properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
- }
- }
+    fn person_label() -> LabelDef {
+        LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        }
+    }
 
- fn node_payload(name: &str) -> Bytes {
- let mut props = std::collections::BTreeMap::new();
- props.insert("name".into(), Value::Str(name.into()));
- NodeWriteRecord {
- properties: props,
- schema_version: 1,
- }
- .encode()
- .unwrap()
- }
+    fn node_payload(name: &str) -> Bytes {
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("name".into(), Value::Str(name.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+        }
+        .encode()
+        .unwrap()
+    }
 
- fn sorted_node_id(b: u8) -> NodeId {
- let mut bytes = [0u8; 16];
- bytes[15] = b;
- NodeId::from_uuid(Uuid::from_bytes(bytes))
- }
+    fn sorted_node_id(b: u8) -> NodeId {
+        let mut bytes = [0u8; 16];
+        bytes[15] = b;
+        NodeId::from_uuid(Uuid::from_bytes(bytes))
+    }
 
- async fn flush_one_node(
- ms: &ManifestStore,
- fence: &WriterFence,
- base: &crate::manifest::LoadedManifest,
- schema: &Schema,
- id: NodeId,
- name: &str,
- lsn: u64,
- ) -> crate::manifest::LoadedManifest {
- let mut mt = Memtable::new();
- mt.apply(
- MemKey::Node {
- label: "Person".into(),
- id,
- },
- lsn,
- MemOp::Upsert(node_payload(name)),
- );
- let frozen = mt.freeze();
- flush(ms, fence, base, &frozen, schema.clone())
- .await
- .unwrap()
- .committed
- }
+    async fn flush_one_node(
+        ms: &ManifestStore,
+        fence: &WriterFence,
+        base: &crate::manifest::LoadedManifest,
+        schema: &Schema,
+        id: NodeId,
+        name: &str,
+        lsn: u64,
+    ) -> crate::manifest::LoadedManifest {
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id,
+            },
+            lsn,
+            MemOp::Upsert(node_payload(name)),
+        );
+        let frozen = mt.freeze();
+        flush(ms, fence, base, &frozen, schema.clone())
+            .await
+            .unwrap()
+            .committed
+    }
 
- #[tokio::test]
- async fn sweep_finds_no_orphans_when_manifest_references_everything() {
- let store = make_store();
- let paths = make_paths("janitor-clean");
- let ms = ManifestStore::new(store.clone(), paths.clone());
- let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
- let fence = WriterFence::new(base.manifest.epoch);
- let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+    #[tokio::test]
+    async fn sweep_finds_no_orphans_when_manifest_references_everything() {
+        let store = make_store();
+        let paths = make_paths("janitor-clean");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
- let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
+        let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
 
- let report = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
- .await
- .unwrap();
- assert_eq!(report.orphans_found, 0);
- assert_eq!(report.orphans_deleted, 0);
- assert_eq!(report.bytes_freed, 0);
- assert_eq!(report.skipped_too_young, 0);
- }
+        let report = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(report.orphans_found, 0);
+        assert_eq!(report.orphans_deleted, 0);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.skipped_too_young, 0);
+    }
 
- #[tokio::test]
- async fn sweep_identifies_and_deletes_a_planted_orphan() {
- let store = make_store();
- let paths = make_paths("janitor-orphan");
- let ms = ManifestStore::new(store.clone(), paths.clone());
- let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
- let fence = WriterFence::new(base.manifest.epoch);
- let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+    #[tokio::test]
+    async fn sweep_identifies_and_deletes_a_planted_orphan() {
+        let store = make_store();
+        let paths = make_paths("janitor-orphan");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
- // Real, manifest-referenced SST so the live set is non-empty.
- let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
+        // Real, manifest-referenced SST so the live set is non-empty.
+        let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
 
- // Plant an extra body under sst/level0/ that no manifest references.
- let orphan = paths.sst_object(0, "0000-orphan-Person.parquet");
- let body: Bytes = b"orphan-body-bytes".to_vec().into();
- let orphan_size = body.len() as u64;
- store.put(&orphan, PutPayload::from(body)).await.unwrap();
+        // Plant an extra body under sst/level0/ that no manifest references.
+        let orphan = paths.sst_object(0, "0000-orphan-Person.parquet");
+        let body: Bytes = b"orphan-body-bytes".to_vec().into();
+        let orphan_size = body.len() as u64;
+        store.put(&orphan, PutPayload::from(body)).await.unwrap();
 
- // Dry run: report should flag the orphan but the body must remain.
- let dry = sweep_orphans(&ms, Duration::from_secs(0), 4, false)
- .await
- .unwrap();
- assert_eq!(dry.orphans_found, 1);
- assert_eq!(dry.orphans_deleted, 0);
- assert_eq!(dry.bytes_freed, orphan_size);
- assert!(store.head(&orphan).await.is_ok(), "dry run must not delete");
+        // Dry run: report should flag the orphan but the body must remain.
+        let dry = sweep_orphans(&ms, Duration::from_secs(0), 4, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.orphans_found, 1);
+        assert_eq!(dry.orphans_deleted, 0);
+        assert_eq!(dry.bytes_freed, orphan_size);
+        assert!(store.head(&orphan).await.is_ok(), "dry run must not delete");
 
- // Real run: deletes the orphan.
- let real = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
- .await
- .unwrap();
- assert_eq!(real.orphans_found, 1);
- assert_eq!(real.orphans_deleted, 1);
- assert_eq!(real.bytes_freed, orphan_size);
- assert!(
- store.head(&orphan).await.is_err(),
- "orphan must be gone after real sweep"
- );
+        // Real run: deletes the orphan.
+        let real = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(real.orphans_found, 1);
+        assert_eq!(real.orphans_deleted, 1);
+        assert_eq!(real.bytes_freed, orphan_size);
+        assert!(
+            store.head(&orphan).await.is_err(),
+            "orphan must be gone after real sweep"
+        );
 
- // Idempotent: a second sweep finds nothing.
- let again = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
- .await
- .unwrap();
- assert_eq!(again.orphans_found, 0);
- }
+        // Idempotent: a second sweep finds nothing.
+        let again = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(again.orphans_found, 0);
+    }
 
- #[tokio::test]
- async fn sweep_respects_min_age_safety_window() {
- let store = make_store();
- let paths = make_paths("janitor-young");
- let ms = ManifestStore::new(store.clone(), paths.clone());
- let _base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+    #[tokio::test]
+    async fn sweep_respects_min_age_safety_window() {
+        let store = make_store();
+        let paths = make_paths("janitor-young");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let _base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
 
- // Plant a fresh orphan.
- let orphan = paths.sst_object(0, "young-orphan.parquet");
- store
- .put(&orphan, PutPayload::from(Bytes::from_static(b"recent")))
- .await
- .unwrap();
+        // Plant a fresh orphan.
+        let orphan = paths.sst_object(0, "young-orphan.parquet");
+        store
+            .put(&orphan, PutPayload::from(Bytes::from_static(b"recent")))
+            .await
+            .unwrap();
 
- // min_age = 24h → the freshly-written orphan must be skipped.
- let report = sweep_orphans(&ms, Duration::from_secs(86_400), 4, true)
- .await
- .unwrap();
- assert_eq!(report.orphans_found, 0);
- assert_eq!(report.orphans_deleted, 0);
- assert_eq!(report.skipped_too_young, 1);
- assert!(
- store.head(&orphan).await.is_ok(),
- "young orphan must survive the sweep"
- );
- }
+        // min_age = 24h → the freshly-written orphan must be skipped.
+        let report = sweep_orphans(&ms, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(report.orphans_found, 0);
+        assert_eq!(report.orphans_deleted, 0);
+        assert_eq!(report.skipped_too_young, 1);
+        assert!(
+            store.head(&orphan).await.is_ok(),
+            "young orphan must survive the sweep"
+        );
+    }
 
- #[tokio::test]
- async fn sweep_respects_max_level_window() {
- let store = make_store();
- let paths = make_paths("janitor-levels");
- let ms = ManifestStore::new(store.clone(), paths.clone());
- let _base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+    #[tokio::test]
+    async fn sweep_respects_max_level_window() {
+        let store = make_store();
+        let paths = make_paths("janitor-levels");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let _base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
 
- // Plant orphans at L0 and L3.
- let l0 = paths.sst_object(0, "l0-orphan.parquet");
- let l3 = paths.sst_object(3, "l3-orphan.parquet");
- store
- .put(&l0, PutPayload::from(Bytes::from_static(b"l0")))
- .await
- .unwrap();
- store
- .put(&l3, PutPayload::from(Bytes::from_static(b"l3")))
- .await
- .unwrap();
+        // Plant orphans at L0 and L3.
+        let l0 = paths.sst_object(0, "l0-orphan.parquet");
+        let l3 = paths.sst_object(3, "l3-orphan.parquet");
+        store
+            .put(&l0, PutPayload::from(Bytes::from_static(b"l0")))
+            .await
+            .unwrap();
+        store
+            .put(&l3, PutPayload::from(Bytes::from_static(b"l3")))
+            .await
+            .unwrap();
 
- // max_level = 1 catches only the L0 body.
- let report = sweep_orphans(&ms, Duration::from_secs(0), 1, true)
- .await
- .unwrap();
- assert_eq!(report.orphans_found, 1);
- assert!(store.head(&l0).await.is_err(), "l0 orphan must be deleted");
- assert!(store.head(&l3).await.is_ok(), "l3 orphan must survive");
- }
+        // max_level = 1 catches only the L0 body.
+        let report = sweep_orphans(&ms, Duration::from_secs(0), 1, true)
+            .await
+            .unwrap();
+        assert_eq!(report.orphans_found, 1);
+        assert!(store.head(&l0).await.is_err(), "l0 orphan must be deleted");
+        assert!(store.head(&l3).await.is_ok(), "l3 orphan must survive");
+    }
 }

@@ -15,7 +15,7 @@ pub mod writer;
 
 pub use expr::{evaluate, EvalError, Params};
 pub use factor::{
- factorize_enabled, FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot, FACTOR_ROOT,
+    factorize_enabled, FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot, FACTOR_ROOT,
 };
 pub use row::Row;
 pub use value::{NodeValue, RelValue, RuntimeValue};

@@ -28,33 +28,33 @@ use crate::plan::logical::{AggregateExpr, LogicalPlan, OrderKey, ProjectionItem}
 /// storage errors and structural runtime mismatches.
 #[derive(Debug)]
 pub enum ExecError {
- Eval(EvalError),
- Storage(namidb_storage::Error),
- Runtime(String),
+    Eval(EvalError),
+    Storage(namidb_storage::Error),
+    Runtime(String),
 }
 
 impl fmt::Display for ExecError {
- fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
- match self {
- ExecError::Eval(e) => write!(f, "{}", e),
- ExecError::Storage(e) => write!(f, "storage: {}", e),
- ExecError::Runtime(m) => write!(f, "runtime: {}", m),
- }
- }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecError::Eval(e) => write!(f, "{}", e),
+            ExecError::Storage(e) => write!(f, "storage: {}", e),
+            ExecError::Runtime(m) => write!(f, "runtime: {}", m),
+        }
+    }
 }
 
 impl std::error::Error for ExecError {}
 
 impl From<EvalError> for ExecError {
- fn from(e: EvalError) -> Self {
- ExecError::Eval(e)
- }
+    fn from(e: EvalError) -> Self {
+        ExecError::Eval(e)
+    }
 }
 
 impl From<namidb_storage::Error> for ExecError {
- fn from(e: namidb_storage::Error) -> Self {
- ExecError::Storage(e)
- }
+    fn from(e: namidb_storage::Error) -> Self {
+        ExecError::Storage(e)
+    }
 }
 
 /// Execute `plan` against `snapshot`, returning all result rows.
@@ -64,41 +64,41 @@ impl From<namidb_storage::Error> for ExecError {
 /// the same row set; the factor path defers materialisation and avoids
 /// the per-edge `BTreeMap` clone in multi-hop Expand chains (RFC-017).
 pub async fn execute(
- plan: &LogicalPlan,
- snapshot: &Snapshot<'_>,
- params: &Params,
+    plan: &LogicalPlan,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- namidb_core::profile_scope!("walker::execute");
- if factorize_enabled() {
- execute_factor_path(plan, snapshot, params).await
- } else {
- execute_flat_path(plan, snapshot, params).await
- }
+    namidb_core::profile_scope!("walker::execute");
+    if factorize_enabled() {
+        execute_factor_path(plan, snapshot, params).await
+    } else {
+        execute_flat_path(plan, snapshot, params).await
+    }
 }
 
 /// Always-flat entry point — bypasses the `NAMIDB_FACTORIZE` env check.
 /// Used by parity tests to compare the two paths side-by-side without
 /// global env mutation.
 pub async fn execute_flat_path(
- plan: &LogicalPlan,
- snapshot: &Snapshot<'_>,
- params: &Params,
+    plan: &LogicalPlan,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- let routing = PlanRouting::analyze(plan);
- execute_inner_with_routing(plan, snapshot, params, None, &routing).await
+    let routing = PlanRouting::analyze(plan);
+    execute_inner_with_routing(plan, snapshot, params, None, &routing).await
 }
 
 /// Always-factor entry point — bypasses the `NAMIDB_FACTORIZE` env check.
 /// Executes the factor plan recursively and materialises every leaf into
 /// a flat `Row` at the root sink. Used by parity tests.
 pub async fn execute_factor_path(
- plan: &LogicalPlan,
- snapshot: &Snapshot<'_>,
- params: &Params,
+    plan: &LogicalPlan,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- let routing = PlanRouting::analyze(plan);
- let set = execute_factor_inner_with_routing(plan, snapshot, params, None, &routing).await?;
- Ok(set.materialize_all(None))
+    let routing = PlanRouting::analyze(plan);
+    let set = execute_factor_inner_with_routing(plan, snapshot, params, None, &routing).await?;
+    Ok(set.materialize_all(None))
 }
 
 /// Public wrapper for callers outside `walker.rs` (e.g. `writer.rs`,
@@ -107,697 +107,712 @@ pub async fn execute_factor_path(
 /// `execute_inner_with_routing` reuse the parent's routing — see the
 /// note in [`PlanRouting`].
 pub(crate) fn execute_inner<'a>(
- plan: &'a LogicalPlan,
- snapshot: &'a Snapshot<'_>,
- params: &'a Params,
- outer: Option<&'a Row>,
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
- async move {
- let routing = PlanRouting::analyze(plan);
- execute_inner_with_routing(plan, snapshot, params, outer, &routing).await
- }
- .boxed()
+    async move {
+        let routing = PlanRouting::analyze(plan);
+        execute_inner_with_routing(plan, snapshot, params, outer, &routing).await
+    }
+    .boxed()
 }
 
 pub(crate) fn execute_inner_with_routing<'a>(
- plan: &'a LogicalPlan,
- snapshot: &'a Snapshot<'_>,
- params: &'a Params,
- outer: Option<&'a Row>,
- routing: &'a PlanRouting,
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
+    routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
- async move {
- match plan {
- LogicalPlan::Empty => Ok(vec![Row::new()]),
+    async move {
+        match plan {
+            LogicalPlan::Empty => Ok(vec![Row::new()]),
 
- LogicalPlan::Argument { bindings } => {
- let outer = outer.ok_or_else(|| {
- ExecError::Runtime(
+            LogicalPlan::Argument { bindings } => {
+                let outer = outer.ok_or_else(|| {
+                    ExecError::Runtime(
  "Argument operator requires an outer row from a containing SemiApply / PatternList".into(),
  )
- })?;
- let mut row = Row::new();
- for name in bindings {
- if let Some(v) = outer.get(name) {
- row.set(name.clone(), v.clone());
- }
- }
- Ok(vec![row])
- }
+                })?;
+                let mut row = Row::new();
+                for name in bindings {
+                    if let Some(v) = outer.get(name) {
+                        row.set(name.clone(), v.clone());
+                    }
+                }
+                Ok(vec![row])
+            }
 
- LogicalPlan::SemiApply {
- input,
- subplan,
- negated,
- } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let sub_rows = execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
- let matched = !sub_rows.is_empty();
- let keep = if *negated { !matched } else { matched };
- if keep {
- out.push(row);
- }
- }
- Ok(out)
- }
+            LogicalPlan::SemiApply {
+                input,
+                subplan,
+                negated,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let sub_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    let matched = !sub_rows.is_empty();
+                    let keep = if *negated { !matched } else { matched };
+                    if keep {
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Create { .. }
- | LogicalPlan::Merge { .. }
- | LogicalPlan::Set { .. }
- | LogicalPlan::Remove { .. }
- | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
- "write operators require execute_write(plan, &mut WriterSession, params)"
- .to_string(),
- )),
+            LogicalPlan::Create { .. }
+            | LogicalPlan::Merge { .. }
+            | LogicalPlan::Set { .. }
+            | LogicalPlan::Remove { .. }
+            | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
+                "write operators require execute_write(plan, &mut WriterSession, params)"
+                    .to_string(),
+            )),
 
- LogicalPlan::PatternList {
- input,
- subplan,
- projection,
- alias,
- } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let inner_rows = execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
- let mut list = Vec::with_capacity(inner_rows.len());
- for inner in inner_rows {
- list.push(evaluate(projection, &inner, params)?);
- }
- let mut new_row = row;
- new_row.set(alias.clone(), RuntimeValue::List(list));
- out.push(new_row);
- }
- Ok(out)
- }
+            LogicalPlan::PatternList {
+                input,
+                subplan,
+                projection,
+                alias,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let inner_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    let mut list = Vec::with_capacity(inner_rows.len());
+                    for inner in inner_rows {
+                        list.push(evaluate(projection, &inner, params)?);
+                    }
+                    let mut new_row = row;
+                    new_row.set(alias.clone(), RuntimeValue::List(list));
+                    out.push(new_row);
+                }
+                Ok(out)
+            }
 
- LogicalPlan::NodeScan {
- label,
- alias,
- predicates,
- projection,
- } => {
- let labels = resolve_node_labels(snapshot, label.as_deref());
- let mut rows: Vec<Row> = Vec::new();
- for label_name in &labels {
- let nodes = snapshot
- .scan_label_with_predicates_and_projection(
- label_name,
- predicates,
- projection.as_deref(),
- )
- .await?;
- for n in nodes {
- let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
- rows.push(Row::new().with(alias.clone(), value));
- }
- }
- Ok(rows)
- }
+            LogicalPlan::NodeScan {
+                label,
+                alias,
+                predicates,
+                projection,
+            } => {
+                let labels = resolve_node_labels(snapshot, label.as_deref());
+                let mut rows: Vec<Row> = Vec::new();
+                for label_name in &labels {
+                    let nodes = snapshot
+                        .scan_label_with_predicates_and_projection(
+                            label_name,
+                            predicates,
+                            projection.as_deref(),
+                        )
+                        .await?;
+                    for n in nodes {
+                        let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
+                        rows.push(Row::new().with(alias.clone(), value));
+                    }
+                }
+                Ok(rows)
+            }
 
- LogicalPlan::NodeById {
- input,
- label,
- alias,
- id,
- } => {
- let input_rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(input_rows.len());
- for row in input_rows {
- let id_value = evaluate(id, &row, params)?;
- let node_id = node_id_from_value(&id_value, id.span)?;
- if let Some(view) = snapshot.lookup_node(label, node_id).await? {
- let mut new_row = row;
- new_row.set(
- alias.clone(),
- RuntimeValue::Node(Box::new(NodeValue::from(view))),
- );
- out.push(new_row);
- }
- }
- Ok(out)
- }
+            LogicalPlan::NodeById {
+                input,
+                label,
+                alias,
+                id,
+            } => {
+                let input_rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(input_rows.len());
+                for row in input_rows {
+                    let id_value = evaluate(id, &row, params)?;
+                    let node_id = node_id_from_value(&id_value, id.span)?;
+                    if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+                        let mut new_row = row;
+                        new_row.set(
+                            alias.clone(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::NodeByPropertyValue {
- input,
- label,
- alias,
- property,
- value,
- } => {
- let input_rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(input_rows.len());
- for row in input_rows {
- let lookup_val = evaluate(value, &row, params)?;
- if let Some(view) = lookup_node_by_property_via_scan(
- snapshot, label, property, &lookup_val,
- )
- .await?
- {
- let mut new_row = row;
- new_row.set(
- alias.clone(),
- RuntimeValue::Node(Box::new(NodeValue::from(view))),
- );
- out.push(new_row);
- }
- }
- Ok(out)
- }
+            LogicalPlan::NodeByPropertyValue {
+                input,
+                label,
+                alias,
+                property,
+                value,
+            } => {
+                let input_rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(input_rows.len());
+                for row in input_rows {
+                    let lookup_val = evaluate(value, &row, params)?;
+                    if let Some(view) =
+                        lookup_node_by_property_via_scan(snapshot, label, property, &lookup_val)
+                            .await?
+                    {
+                        let mut new_row = row;
+                        new_row.set(
+                            alias.clone(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Filter { input, predicate } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let v = evaluate(predicate, &row, params)?;
- if v.as_bool() == Some(true) {
- out.push(row);
- }
- }
- Ok(out)
- }
+            LogicalPlan::Filter { input, predicate } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let v = evaluate(predicate, &row, params)?;
+                    if v.as_bool() == Some(true) {
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Project {
- input,
- items,
- distinct,
- discard_input_bindings,
- } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let projected = project_rows(&rows, items, *discard_input_bindings, params)?;
- if *distinct {
- Ok(dedup_rows(projected))
- } else {
- Ok(projected)
- }
- }
+            LogicalPlan::Project {
+                input,
+                items,
+                distinct,
+                discard_input_bindings,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let projected = project_rows(&rows, items, *discard_input_bindings, params)?;
+                if *distinct {
+                    Ok(dedup_rows(projected))
+                } else {
+                    Ok(projected)
+                }
+            }
 
- LogicalPlan::TopN {
- input,
- keys,
- skip,
- limit,
- } => {
- let mut rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- if !keys.is_empty() {
- sort_rows(&mut rows, keys, params)?;
- }
- let skip = *skip as usize;
- if skip >= rows.len() {
- return Ok(Vec::new());
- }
- let mut iter = rows.into_iter().skip(skip);
- let take = if *limit == u64::MAX {
- usize::MAX
- } else {
- *limit as usize
- };
- let mut out = Vec::with_capacity(take.min(64));
- for _ in 0..take {
- match iter.next() {
- Some(r) => out.push(r),
- None => break,
- }
- }
- Ok(out)
- }
+            LogicalPlan::TopN {
+                input,
+                keys,
+                skip,
+                limit,
+            } => {
+                let mut rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                if !keys.is_empty() {
+                    sort_rows(&mut rows, keys, params)?;
+                }
+                let skip = *skip as usize;
+                if skip >= rows.len() {
+                    return Ok(Vec::new());
+                }
+                let mut iter = rows.into_iter().skip(skip);
+                let take = if *limit == u64::MAX {
+                    usize::MAX
+                } else {
+                    *limit as usize
+                };
+                let mut out = Vec::with_capacity(take.min(64));
+                for _ in 0..take {
+                    match iter.next() {
+                        Some(r) => out.push(r),
+                        None => break,
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Distinct { input } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- Ok(dedup_rows(rows))
- }
+            LogicalPlan::Distinct { input } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                Ok(dedup_rows(rows))
+            }
 
- LogicalPlan::Union { left, right, all } => {
- let mut l = execute_inner_with_routing(left, snapshot, params, outer, routing).await?;
- let r = execute_inner_with_routing(right, snapshot, params, outer, routing).await?;
- l.extend(r);
- if *all {
- Ok(l)
- } else {
- Ok(dedup_rows(l))
- }
- }
+            LogicalPlan::Union { left, right, all } => {
+                let mut l =
+                    execute_inner_with_routing(left, snapshot, params, outer, routing).await?;
+                let r = execute_inner_with_routing(right, snapshot, params, outer, routing).await?;
+                l.extend(r);
+                if *all {
+                    Ok(l)
+                } else {
+                    Ok(dedup_rows(l))
+                }
+            }
 
- LogicalPlan::CrossProduct { left, right } => {
- let l = execute_inner_with_routing(left, snapshot, params, outer, routing).await?;
- let r = execute_inner_with_routing(right, snapshot, params, outer, routing).await?;
- Ok(cross_product(l, r))
- }
+            LogicalPlan::CrossProduct { left, right } => {
+                let l = execute_inner_with_routing(left, snapshot, params, outer, routing).await?;
+                let r = execute_inner_with_routing(right, snapshot, params, outer, routing).await?;
+                Ok(cross_product(l, r))
+            }
 
- LogicalPlan::HashJoin {
- build,
- probe,
- on,
- residual,
- } => {
- // Build phase: materialise hash table over build-side keys.
- // We use the existing row fingerprint machinery as the
- // key — it is the same canonical form used by Distinct,
- // so semantics match Cypher 3VL elsewhere.
- let build_rows = execute_inner_with_routing(build, snapshot, params, outer, routing).await?;
- let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
- std::collections::HashMap::new();
- for row in build_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.build_side, &row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue; // NULL key never matches (3VL).
- }
- table.entry(key).or_default().push(row);
- }
- // Probe phase: stream probe-side, look up each row, emit
- // joined tuples passing residual.
- let probe_rows = execute_inner_with_routing(probe, snapshot, params, outer, routing).await?;
- let mut out = Vec::new();
- for prow in probe_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.probe_side, &prow, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue;
- }
- if let Some(matches) = table.get(&key) {
- for brow in matches {
- let mut combined = brow.clone();
- for (k, v) in &prow.bindings {
- combined.bindings.insert(k.clone(), v.clone());
- }
- if let Some(res) = residual {
- // False / NULL silently drop the joined row.
- if let RuntimeValue::Bool(true) =
- evaluate(res, &combined, params)?
- {
- out.push(combined);
- }
- } else {
- out.push(combined);
- }
- }
- }
- }
- Ok(out)
- }
+            LogicalPlan::HashJoin {
+                build,
+                probe,
+                on,
+                residual,
+            } => {
+                // Build phase: materialise hash table over build-side keys.
+                // We use the existing row fingerprint machinery as the
+                // key — it is the same canonical form used by Distinct,
+                // so semantics match Cypher 3VL elsewhere.
+                let build_rows =
+                    execute_inner_with_routing(build, snapshot, params, outer, routing).await?;
+                let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
+                    std::collections::HashMap::new();
+                for row in build_rows {
+                    let mut key = Vec::with_capacity(on.len());
+                    let mut has_null = false;
+                    for jk in on {
+                        let v = evaluate(&jk.build_side, &row, params)?;
+                        if matches!(v, RuntimeValue::Null) {
+                            has_null = true;
+                            break;
+                        }
+                        key.push(fingerprint_value(&v));
+                    }
+                    if has_null {
+                        continue; // NULL key never matches (3VL).
+                    }
+                    table.entry(key).or_default().push(row);
+                }
+                // Probe phase: stream probe-side, look up each row, emit
+                // joined tuples passing residual.
+                let probe_rows =
+                    execute_inner_with_routing(probe, snapshot, params, outer, routing).await?;
+                let mut out = Vec::new();
+                for prow in probe_rows {
+                    let mut key = Vec::with_capacity(on.len());
+                    let mut has_null = false;
+                    for jk in on {
+                        let v = evaluate(&jk.probe_side, &prow, params)?;
+                        if matches!(v, RuntimeValue::Null) {
+                            has_null = true;
+                            break;
+                        }
+                        key.push(fingerprint_value(&v));
+                    }
+                    if has_null {
+                        continue;
+                    }
+                    if let Some(matches) = table.get(&key) {
+                        for brow in matches {
+                            let mut combined = brow.clone();
+                            for (k, v) in &prow.bindings {
+                                combined.bindings.insert(k.clone(), v.clone());
+                            }
+                            if let Some(res) = residual {
+                                // False / NULL silently drop the joined row.
+                                if let RuntimeValue::Bool(true) = evaluate(res, &combined, params)?
+                                {
+                                    out.push(combined);
+                                }
+                            } else {
+                                out.push(combined);
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::HashSemiJoin {
- outer: outer_plan,
- inner: inner_plan,
- on,
- negated,
- residual,
- } => {
- // Build phase: execute inner ONCE (no outer correlation),
- // hash each row by the JoinKey::build_side fingerprint.
- let inner_rows = execute_inner_with_routing(inner_plan, snapshot, params, outer, routing).await?;
- let mut key_set: std::collections::HashSet<Vec<String>> =
- std::collections::HashSet::new();
- let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
- std::collections::HashMap::new();
- for row in inner_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.build_side, &row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue;
- }
- if residual.is_some() {
- residual_index.entry(key.clone()).or_default().push(row);
- }
- key_set.insert(key);
- }
+            LogicalPlan::HashSemiJoin {
+                outer: outer_plan,
+                inner: inner_plan,
+                on,
+                negated,
+                residual,
+            } => {
+                // Build phase: execute inner ONCE (no outer correlation),
+                // hash each row by the JoinKey::build_side fingerprint.
+                let inner_rows =
+                    execute_inner_with_routing(inner_plan, snapshot, params, outer, routing)
+                        .await?;
+                let mut key_set: std::collections::HashSet<Vec<String>> =
+                    std::collections::HashSet::new();
+                let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
+                    std::collections::HashMap::new();
+                for row in inner_rows {
+                    let mut key = Vec::with_capacity(on.len());
+                    let mut has_null = false;
+                    for jk in on {
+                        let v = evaluate(&jk.build_side, &row, params)?;
+                        if matches!(v, RuntimeValue::Null) {
+                            has_null = true;
+                            break;
+                        }
+                        key.push(fingerprint_value(&v));
+                    }
+                    if has_null {
+                        continue;
+                    }
+                    if residual.is_some() {
+                        residual_index.entry(key.clone()).or_default().push(row);
+                    }
+                    key_set.insert(key);
+                }
 
- // Probe phase: stream outer, lookup, emit per (matched,
- // negated) truth table.
- let outer_rows = execute_inner_with_routing(outer_plan, snapshot, params, outer, routing).await?;
- let mut out = Vec::with_capacity(outer_rows.len());
- for orow in outer_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.probe_side, &orow, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- let matched = if has_null {
- false
- } else if let Some(res) = residual {
- // Residual semantics: at least one inner row whose
- // residual evaluates to true.
- match residual_index.get(&key) {
- Some(inner_rows) => {
- let mut any = false;
- for irow in inner_rows {
- let mut combined = irow.clone();
- for (k, v) in &orow.bindings {
- combined.bindings.insert(k.clone(), v.clone());
- }
- if let RuntimeValue::Bool(true) =
- evaluate(res, &combined, params)?
- {
- any = true;
- break;
- }
- }
- any
- }
- None => false,
- }
- } else {
- key_set.contains(&key)
- };
- let keep = if *negated { !matched } else { matched };
- if keep {
- out.push(orow);
- }
- }
- Ok(out)
- }
+                // Probe phase: stream outer, lookup, emit per (matched,
+                // negated) truth table.
+                let outer_rows =
+                    execute_inner_with_routing(outer_plan, snapshot, params, outer, routing)
+                        .await?;
+                let mut out = Vec::with_capacity(outer_rows.len());
+                for orow in outer_rows {
+                    let mut key = Vec::with_capacity(on.len());
+                    let mut has_null = false;
+                    for jk in on {
+                        let v = evaluate(&jk.probe_side, &orow, params)?;
+                        if matches!(v, RuntimeValue::Null) {
+                            has_null = true;
+                            break;
+                        }
+                        key.push(fingerprint_value(&v));
+                    }
+                    let matched = if has_null {
+                        false
+                    } else if let Some(res) = residual {
+                        // Residual semantics: at least one inner row whose
+                        // residual evaluates to true.
+                        match residual_index.get(&key) {
+                            Some(inner_rows) => {
+                                let mut any = false;
+                                for irow in inner_rows {
+                                    let mut combined = irow.clone();
+                                    for (k, v) in &orow.bindings {
+                                        combined.bindings.insert(k.clone(), v.clone());
+                                    }
+                                    if let RuntimeValue::Bool(true) =
+                                        evaluate(res, &combined, params)?
+                                    {
+                                        any = true;
+                                        break;
+                                    }
+                                }
+                                any
+                            }
+                            None => false,
+                        }
+                    } else {
+                        key_set.contains(&key)
+                    };
+                    let keep = if *negated { !matched } else { matched };
+                    if keep {
+                        out.push(orow);
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Unwind { input, list, alias } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let mut out = Vec::new();
- for row in rows {
- let v = evaluate(list, &row, params)?;
- match v {
- RuntimeValue::List(items) => {
- for item in items {
- let mut new_row = row.clone();
- new_row.set(alias.clone(), item);
- out.push(new_row);
- }
- }
- RuntimeValue::Null => {} // empty unwind
- _ => {
- return Err(ExecError::Runtime(format!(
- "UNWIND requires a list; got {}",
- v.type_name()
- )))
- }
- }
- }
- Ok(out)
- }
+            LogicalPlan::Unwind { input, list, alias } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let v = evaluate(list, &row, params)?;
+                    match v {
+                        RuntimeValue::List(items) => {
+                            for item in items {
+                                let mut new_row = row.clone();
+                                new_row.set(alias.clone(), item);
+                                out.push(new_row);
+                            }
+                        }
+                        RuntimeValue::Null => {} // empty unwind
+                        _ => {
+                            return Err(ExecError::Runtime(format!(
+                                "UNWIND requires a list; got {}",
+                                v.type_name()
+                            )))
+                        }
+                    }
+                }
+                Ok(out)
+            }
 
- LogicalPlan::Expand {
- input,
- source,
- edge_type,
- direction,
- rel_alias,
- target_alias,
- target_label,
- length,
- optional,
- back_reference,
- } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- execute_expand(
- rows,
- source,
- edge_type.as_deref(),
- *direction,
- rel_alias.as_deref(),
- target_alias,
- target_label.as_deref(),
- *length,
- *optional,
- *back_reference,
- snapshot,
- routing.needs_properties(rel_alias.as_deref()),
- should_skip_target_materialize(
- snapshot,
- routing,
- target_alias,
- edge_type.as_deref(),
- *direction,
- target_label.as_deref(),
- *length,
- *back_reference,
- ),
- )
- .await
- }
+            LogicalPlan::Expand {
+                input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_label,
+                length,
+                optional,
+                back_reference,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                execute_expand(
+                    rows,
+                    source,
+                    edge_type.as_deref(),
+                    *direction,
+                    rel_alias.as_deref(),
+                    target_alias,
+                    target_label.as_deref(),
+                    *length,
+                    *optional,
+                    *back_reference,
+                    snapshot,
+                    routing.needs_properties(rel_alias.as_deref()),
+                    should_skip_target_materialize(
+                        snapshot,
+                        routing,
+                        target_alias,
+                        edge_type.as_deref(),
+                        *direction,
+                        target_label.as_deref(),
+                        *length,
+                        *back_reference,
+                    ),
+                )
+                .await
+            }
 
- LogicalPlan::Aggregate {
- input,
- group_by,
- aggregations,
- } => {
- let rows = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
- execute_aggregate(rows, group_by, aggregations, params)
- }
- }
- }
- .boxed()
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                execute_aggregate(rows, group_by, aggregations, params)
+            }
+        }
+    }
+    .boxed()
 }
 
 // ───────────────────────── Expand ────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_expand(
- rows: Vec<Row>,
- source: &str,
- edge_type: Option<&str>,
- direction: RelationshipDirection,
- rel_alias: Option<&str>,
- target_alias: &str,
- target_label: Option<&str>,
- length: Option<crate::parser::RelationshipLength>,
- optional: bool,
- back_reference: bool,
- snapshot: &Snapshot<'_>,
- want_properties: bool,
- skip_target_materialize: bool,
+    rows: Vec<Row>,
+    source: &str,
+    edge_type: Option<&str>,
+    direction: RelationshipDirection,
+    rel_alias: Option<&str>,
+    target_alias: &str,
+    target_label: Option<&str>,
+    length: Option<crate::parser::RelationshipLength>,
+    optional: bool,
+    back_reference: bool,
+    snapshot: &Snapshot<'_>,
+    want_properties: bool,
+    skip_target_materialize: bool,
 ) -> Result<Vec<Row>, ExecError> {
- namidb_core::profile_scope!("walker::execute_expand");
- let edge_types = resolve_edge_types(snapshot, edge_type);
- let min = length.map(|l| l.min).unwrap_or(1);
- let max = length.map(|l| l.max).unwrap_or(1);
+    namidb_core::profile_scope!("walker::execute_expand");
+    let edge_types = resolve_edge_types(snapshot, edge_type);
+    let min = length.map(|l| l.min).unwrap_or(1);
+    let max = length.map(|l| l.max).unwrap_or(1);
 
- let mut out = Vec::new();
- for row in rows {
- let starting = match row.get(source) {
- Some(RuntimeValue::Node(n)) => n.id,
- _ => {
- return Err(ExecError::Runtime(format!(
- "Expand source `{}` is not a Node",
- source
- )))
- }
- };
+    let mut out = Vec::new();
+    for row in rows {
+        let starting = match row.get(source) {
+            Some(RuntimeValue::Node(n)) => n.id,
+            _ => {
+                return Err(ExecError::Runtime(format!(
+                    "Expand source `{}` is not a Node",
+                    source
+                )))
+            }
+        };
 
- // Back-reference: read the existing binding once. The
- // traversal explores the frontier freely; only paths whose
- // tail matches `existing_target_id` are kept as results.
- let existing_target_id: Option<NodeId> = if back_reference {
- match row.get(target_alias) {
- Some(RuntimeValue::Node(n)) => Some(n.id),
- Some(RuntimeValue::Null) => None,
- other => {
- return Err(ExecError::Runtime(format!(
- "Expand back-reference target `{}` is not a Node (got {:?})",
- target_alias, other
- )))
- }
- }
- } else {
- None
- };
+        // Back-reference: read the existing binding once. The
+        // traversal explores the frontier freely; only paths whose
+        // tail matches `existing_target_id` are kept as results.
+        let existing_target_id: Option<NodeId> = if back_reference {
+            match row.get(target_alias) {
+                Some(RuntimeValue::Node(n)) => Some(n.id),
+                Some(RuntimeValue::Null) => None,
+                other => {
+                    return Err(ExecError::Runtime(format!(
+                        "Expand back-reference target `{}` is not a Node (got {:?})",
+                        target_alias, other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
 
- // Zero-length patterns (`*0..n`): the source node itself
- // counts as a valid match at hop 0. Emit it before stepping
- // out; downstream filters / target labels still apply.
- let mut hop_results: Vec<Row> = Vec::new();
- let mut matched_any = false;
- if min == 0 {
- let mut zero_row = row.clone();
- if !back_reference {
- // The target_alias must be bound for downstream
- // operators that read it. Materialise the source as
- // the target (graph-theoretic identity at hop 0).
- if let Some(RuntimeValue::Node(n)) = row.get(source) {
- zero_row.set(target_alias.to_string(), RuntimeValue::Node(n.clone()));
- }
- }
- if let Some(name) = rel_alias {
- // No edge traversed at hop 0 → rel binding is NULL.
- zero_row.set(name, RuntimeValue::Null);
- }
- let zero_keeps = match existing_target_id {
- Some(existing) => starting == existing,
- None => true,
- };
- if zero_keeps {
- hop_results.push(zero_row);
- matched_any = true;
- }
- }
+        // Zero-length patterns (`*0..n`): the source node itself
+        // counts as a valid match at hop 0. Emit it before stepping
+        // out; downstream filters / target labels still apply.
+        let mut hop_results: Vec<Row> = Vec::new();
+        let mut matched_any = false;
+        if min == 0 {
+            let mut zero_row = row.clone();
+            if !back_reference {
+                // The target_alias must be bound for downstream
+                // operators that read it. Materialise the source as
+                // the target (graph-theoretic identity at hop 0).
+                if let Some(RuntimeValue::Node(n)) = row.get(source) {
+                    zero_row.set(target_alias.to_string(), RuntimeValue::Node(n.clone()));
+                }
+            }
+            if let Some(name) = rel_alias {
+                // No edge traversed at hop 0 → rel binding is NULL.
+                zero_row.set(name, RuntimeValue::Null);
+            }
+            let zero_keeps = match existing_target_id {
+                Some(existing) => starting == existing,
+                None => true,
+            };
+            if zero_keeps {
+                hop_results.push(zero_row);
+                matched_any = true;
+            }
+        }
 
- let mut frontier: Vec<Step> = vec![Step {
- tail: starting,
- row: row.clone(),
- }];
- let hop_start = min.max(1);
- let _ = hop_start;
- for hop in 1..=max {
- let mut next_frontier = Vec::new();
- // Phase 1: pre-collect neighbours for every step so we can
- // batch-prewarm `Snapshot::lookup_node` once per hop (Fix #3b).
- // Without this, each (step, edge) pair issues its own
- // `lookup_node` SST decode — the dominant cost in cold IC09
- // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
- let mut step_neighbours: Vec<(Step, Vec<EdgeView>)> =
- Vec::with_capacity(frontier.len());
- let mut unique_targets: Vec<NodeId> = Vec::new();
- let mut seen_targets: std::collections::HashSet<NodeId> =
- std::collections::HashSet::new();
- for step in frontier.drain(..) {
- let neighbours = neighbours_of_any(
- snapshot,
- &edge_types,
- direction,
- step.tail,
- want_properties,
- )
- .await?;
- if !back_reference && !skip_target_materialize {
- for edge in &neighbours {
- let tid = partner_id(edge, direction, step.tail);
- if seen_targets.insert(tid) {
- unique_targets.push(tid);
- }
- }
- }
- step_neighbours.push((step, neighbours));
- }
- // Phase 2: batch prewarm. Populates L1 (and L2 if attached)
- // so the per-edge `lookup_node` below hits the cache instead
- // of decoding the SST again. We discard the returned `Vec`;
- // the cache is the only side-effect we care about.
- if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
- if let Some(label) = target_label {
- let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
- }
- }
- for (step, neighbours) in step_neighbours {
- for edge in neighbours {
- let target_id = partner_id(&edge, direction, step.tail);
- // Back-reference fast path: skip the lookup_node
- // (the binding's NodeView is already on the row).
- // For non-back-reference, fetch the view so we
- // can populate / label-filter.
- let target_view_opt = if back_reference {
- None
- } else if skip_target_materialize {
- // Fix #3: the binding is "transit only" — the next
- // Expand reads only `.id`. Skip the SST decode and
- // synthesise an id-only stub below. Schema-guaranteed
- // dst_label means no correctness drift vs the
- // `continue`-on-None branch below.
- None
- } else if let Some(label) = target_label {
- match snapshot.lookup_node(label, target_id).await? {
- Some(v) => Some(v),
- None => continue,
- }
- } else {
- match scan_node_for_id(snapshot, target_id).await? {
- Some(v) => Some(v),
- None => continue,
- }
- };
- let mut new_row = step.row.clone();
- if let Some(name) = rel_alias {
- new_row.set(name, RuntimeValue::Rel(Box::new(RelValue::from(edge))));
- }
- if let Some(view) = target_view_opt {
- new_row.set(
- target_alias.to_string(),
- RuntimeValue::Node(Box::new(NodeValue::from(view))),
- );
- } else if skip_target_materialize && !back_reference {
- // id-only stub: enough for the next Expand to read
- // `.id`; `label` is preserved so RuntimeValue::Node
- // still type-checks for downstream Expand source reads.
- new_row.set(
- target_alias.to_string(),
- RuntimeValue::Node(Box::new(NodeValue {
- id: target_id,
- label: target_label.unwrap_or_default().to_string(),
- properties: std::collections::BTreeMap::new(),
- })),
- );
- }
- // Back-reference: the binding stays at the
- // original existing target; new_row already
- // carries it from row.clone() above.
- next_frontier.push(Step {
- tail: target_id,
- row: new_row.clone(),
- });
- if hop >= min.max(1) {
- let keeps = match existing_target_id {
- Some(existing) => target_id == existing,
- None => true,
- };
- if keeps {
- hop_results.push(new_row);
- matched_any = true;
- }
- }
- }
- }
- frontier = next_frontier;
- if frontier.is_empty() {
- break;
- }
- }
+        let mut frontier: Vec<Step> = vec![Step {
+            tail: starting,
+            row: row.clone(),
+        }];
+        let hop_start = min.max(1);
+        let _ = hop_start;
+        for hop in 1..=max {
+            let mut next_frontier = Vec::new();
+            // Phase 1: pre-collect neighbours for every step so we can
+            // batch-prewarm `Snapshot::lookup_node` once per hop (Fix #3b).
+            // Without this, each (step, edge) pair issues its own
+            // `lookup_node` SST decode — the dominant cost in cold IC09
+            // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
+            let mut step_neighbours: Vec<(Step, Vec<EdgeView>)> =
+                Vec::with_capacity(frontier.len());
+            let mut unique_targets: Vec<NodeId> = Vec::new();
+            let mut seen_targets: std::collections::HashSet<NodeId> =
+                std::collections::HashSet::new();
+            for step in frontier.drain(..) {
+                let neighbours =
+                    neighbours_of_any(snapshot, &edge_types, direction, step.tail, want_properties)
+                        .await?;
+                if !back_reference && !skip_target_materialize {
+                    for edge in &neighbours {
+                        let tid = partner_id(edge, direction, step.tail);
+                        if seen_targets.insert(tid) {
+                            unique_targets.push(tid);
+                        }
+                    }
+                }
+                step_neighbours.push((step, neighbours));
+            }
+            // Phase 2: batch prewarm. Populates L1 (and L2 if attached)
+            // so the per-edge `lookup_node` below hits the cache instead
+            // of decoding the SST again. We discard the returned `Vec`;
+            // the cache is the only side-effect we care about.
+            if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
+                if let Some(label) = target_label {
+                    let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
+                }
+            }
+            for (step, neighbours) in step_neighbours {
+                for edge in neighbours {
+                    let target_id = partner_id(&edge, direction, step.tail);
+                    // Back-reference fast path: skip the lookup_node
+                    // (the binding's NodeView is already on the row).
+                    // For non-back-reference, fetch the view so we
+                    // can populate / label-filter.
+                    let target_view_opt = if back_reference {
+                        None
+                    } else if skip_target_materialize {
+                        // Fix #3: the binding is "transit only" — the next
+                        // Expand reads only `.id`. Skip the SST decode and
+                        // synthesise an id-only stub below. Schema-guaranteed
+                        // dst_label means no correctness drift vs the
+                        // `continue`-on-None branch below.
+                        None
+                    } else if let Some(label) = target_label {
+                        match snapshot.lookup_node(label, target_id).await? {
+                            Some(v) => Some(v),
+                            None => continue,
+                        }
+                    } else {
+                        match scan_node_for_id(snapshot, target_id).await? {
+                            Some(v) => Some(v),
+                            None => continue,
+                        }
+                    };
+                    let mut new_row = step.row.clone();
+                    if let Some(name) = rel_alias {
+                        new_row.set(name, RuntimeValue::Rel(Box::new(RelValue::from(edge))));
+                    }
+                    if let Some(view) = target_view_opt {
+                        new_row.set(
+                            target_alias.to_string(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                    } else if skip_target_materialize && !back_reference {
+                        // id-only stub: enough for the next Expand to read
+                        // `.id`; `label` is preserved so RuntimeValue::Node
+                        // still type-checks for downstream Expand source reads.
+                        new_row.set(
+                            target_alias.to_string(),
+                            RuntimeValue::Node(Box::new(NodeValue {
+                                id: target_id,
+                                label: target_label.unwrap_or_default().to_string(),
+                                properties: std::collections::BTreeMap::new(),
+                            })),
+                        );
+                    }
+                    // Back-reference: the binding stays at the
+                    // original existing target; new_row already
+                    // carries it from row.clone() above.
+                    next_frontier.push(Step {
+                        tail: target_id,
+                        row: new_row.clone(),
+                    });
+                    if hop >= min.max(1) {
+                        let keeps = match existing_target_id {
+                            Some(existing) => target_id == existing,
+                            None => true,
+                        };
+                        if keeps {
+                            hop_results.push(new_row);
+                            matched_any = true;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
 
- if matched_any {
- out.append(&mut hop_results);
- } else if optional {
- let mut empty = row.clone();
- if let Some(name) = rel_alias {
- empty.set(name, RuntimeValue::Null);
- }
- if !back_reference {
- empty.set(target_alias.to_string(), RuntimeValue::Null);
- }
- out.push(empty);
- }
- }
- Ok(out)
+        if matched_any {
+            out.append(&mut hop_results);
+        } else if optional {
+            let mut empty = row.clone();
+            if let Some(name) = rel_alias {
+                empty.set(name, RuntimeValue::Null);
+            }
+            if !back_reference {
+                empty.set(target_alias.to_string(), RuntimeValue::Null);
+            }
+            out.push(empty);
+        }
+    }
+    Ok(out)
 }
 
 struct Step {
- tail: NodeId,
- row: Row,
+    tail: NodeId,
+    row: Row,
 }
 
 /// Resolve the set of labels a `NodeScan` operator must visit.
@@ -808,10 +823,10 @@ struct Step {
 /// the observed label count; the existing label-by-label `scan_label`
 /// path is reused so per-label predicates and projections still apply.
 fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<String> {
- match label {
- Some(l) => vec![l.to_string()],
- None => snapshot.observed_labels(),
- }
+    match label {
+        Some(l) => vec![l.to_string()],
+        None => snapshot.observed_labels(),
+    }
 }
 
 /// Resolve the set of edge types an `Expand` operator must traverse.
@@ -822,82 +837,82 @@ fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<Stri
 /// persisted SSTs). Cost grows linearly with the observed type count —
 /// EXPLAIN surfaces this so users can opt back into typed expansion.
 fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&str>) -> Vec<String> {
- match edge_type {
- Some(t) => vec![t.to_string()],
- None => snapshot.observed_edge_types(),
- }
+    match edge_type {
+        Some(t) => vec![t.to_string()],
+        None => snapshot.observed_edge_types(),
+    }
 }
 
 async fn neighbours_of_any(
- snapshot: &Snapshot<'_>,
- edge_types: &[String],
- direction: RelationshipDirection,
- node: NodeId,
- want_properties: bool,
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    node: NodeId,
+    want_properties: bool,
 ) -> Result<Vec<EdgeView>, ExecError> {
- if edge_types.len() == 1 {
- return neighbours_of(snapshot, &edge_types[0], direction, node, want_properties).await;
- }
- let mut all = Vec::new();
- for et in edge_types {
- let edges = neighbours_of(snapshot, et, direction, node, want_properties).await?;
- all.extend(edges);
- }
- Ok(all)
+    if edge_types.len() == 1 {
+        return neighbours_of(snapshot, &edge_types[0], direction, node, want_properties).await;
+    }
+    let mut all = Vec::new();
+    for et in edge_types {
+        let edges = neighbours_of(snapshot, et, direction, node, want_properties).await?;
+        all.extend(edges);
+    }
+    Ok(all)
 }
 
 async fn neighbours_of(
- snapshot: &Snapshot<'_>,
- edge_type: &str,
- direction: RelationshipDirection,
- node: NodeId,
- want_properties: bool,
+    snapshot: &Snapshot<'_>,
+    edge_type: &str,
+    direction: RelationshipDirection,
+    node: NodeId,
+    want_properties: bool,
 ) -> Result<Vec<EdgeView>, ExecError> {
- // Plan-aware routing (RFC-018 §4): when the rel binding the
- // Expand produces is read downstream — as `r` or as `r.prop` — we
- // force the SST path so `EdgeView.properties` is populated.
- // Otherwise we go through the default `out_edges` / `in_edges`
- // dispatch, which uses the CSR path when `NAMIDB_ADJACENCY=1` is
- // set and an adjacency cache is attached. Memtable-sourced edges
- // carry full properties on both paths.
- if want_properties {
- return match direction {
- RelationshipDirection::Right => {
- Ok(snapshot.out_edges_via_sst(edge_type, node).await?.edges)
- }
- RelationshipDirection::Left => {
- Ok(snapshot.in_edges_via_sst(edge_type, node).await?.edges)
- }
- RelationshipDirection::Both => {
- let mut out = snapshot.out_edges_via_sst(edge_type, node).await?.edges;
- out.extend(snapshot.in_edges_via_sst(edge_type, node).await?.edges);
- Ok(out)
- }
- };
- }
- match direction {
- RelationshipDirection::Right => Ok(snapshot.out_edges(edge_type, node).await?.edges),
- RelationshipDirection::Left => Ok(snapshot.in_edges(edge_type, node).await?.edges),
- RelationshipDirection::Both => {
- let mut out = snapshot.out_edges(edge_type, node).await?.edges;
- out.extend(snapshot.in_edges(edge_type, node).await?.edges);
- Ok(out)
- }
- }
+    // Plan-aware routing (RFC-018 §4): when the rel binding the
+    // Expand produces is read downstream — as `r` or as `r.prop` — we
+    // force the SST path so `EdgeView.properties` is populated.
+    // Otherwise we go through the default `out_edges` / `in_edges`
+    // dispatch, which uses the CSR path when `NAMIDB_ADJACENCY=1` is
+    // set and an adjacency cache is attached. Memtable-sourced edges
+    // carry full properties on both paths.
+    if want_properties {
+        return match direction {
+            RelationshipDirection::Right => {
+                Ok(snapshot.out_edges_via_sst(edge_type, node).await?.edges)
+            }
+            RelationshipDirection::Left => {
+                Ok(snapshot.in_edges_via_sst(edge_type, node).await?.edges)
+            }
+            RelationshipDirection::Both => {
+                let mut out = snapshot.out_edges_via_sst(edge_type, node).await?.edges;
+                out.extend(snapshot.in_edges_via_sst(edge_type, node).await?.edges);
+                Ok(out)
+            }
+        };
+    }
+    match direction {
+        RelationshipDirection::Right => Ok(snapshot.out_edges(edge_type, node).await?.edges),
+        RelationshipDirection::Left => Ok(snapshot.in_edges(edge_type, node).await?.edges),
+        RelationshipDirection::Both => {
+            let mut out = snapshot.out_edges(edge_type, node).await?.edges;
+            out.extend(snapshot.in_edges(edge_type, node).await?.edges);
+            Ok(out)
+        }
+    }
 }
 
 fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId) -> NodeId {
- match direction {
- RelationshipDirection::Right => edge.dst,
- RelationshipDirection::Left => edge.src,
- RelationshipDirection::Both => {
- if edge.src == source {
- edge.dst
- } else {
- edge.src
- }
- }
- }
+    match direction {
+        RelationshipDirection::Right => edge.dst,
+        RelationshipDirection::Left => edge.src,
+        RelationshipDirection::Both => {
+            if edge.src == source {
+                edge.dst
+            } else {
+                edge.src
+            }
+        }
+    }
 }
 
 /// Fix #3 entry point: decide whether the Expand's `target_alias`
@@ -925,49 +940,49 @@ fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId)
 ///    enforces via its `continue`-on-None branch, but for free.
 #[allow(clippy::too_many_arguments)]
 fn should_skip_target_materialize(
- snapshot: &Snapshot<'_>,
- routing: &PlanRouting,
- target_alias: &str,
- edge_type: Option<&str>,
- direction: RelationshipDirection,
- target_label: Option<&str>,
- length: Option<crate::parser::RelationshipLength>,
- back_reference: bool,
+    snapshot: &Snapshot<'_>,
+    routing: &PlanRouting,
+    target_alias: &str,
+    edge_type: Option<&str>,
+    direction: RelationshipDirection,
+    target_label: Option<&str>,
+    length: Option<crate::parser::RelationshipLength>,
+    back_reference: bool,
 ) -> bool {
- if back_reference {
- return false;
- }
- if routing.references(target_alias) {
- return false;
- }
- // Single-hop only. None means "default *1..1" by lowering convention.
- let single_hop = length.map(|l| l.min == 1 && l.max == 1).unwrap_or(true);
- if !single_hop {
- return false;
- }
- let Some(edge_type) = edge_type else {
- return false;
- };
- let Some(target_label) = target_label else {
- // Without target_label the legacy path uses `scan_node_for_id`
- // to confirm the id resolves to *some* node. We could try
- // harder (e.g. require the schema-declared dst_label to be a
- // singleton across all edge_types), but the conservative gate
- // covers IC09 / IC02 already.
- return false;
- };
- let schema = &snapshot.manifest().manifest.schema;
- let Some(edge_def) = schema.edge_type(edge_type) else {
- return false;
- };
- match direction {
- RelationshipDirection::Right => edge_def.dst_label == target_label,
- RelationshipDirection::Left => edge_def.src_label == target_label,
- // Undirected: we'd have to inspect each edge individually.
- RelationshipDirection::Both => {
- edge_def.dst_label == target_label && edge_def.src_label == target_label
- }
- }
+    if back_reference {
+        return false;
+    }
+    if routing.references(target_alias) {
+        return false;
+    }
+    // Single-hop only. None means "default *1..1" by lowering convention.
+    let single_hop = length.map(|l| l.min == 1 && l.max == 1).unwrap_or(true);
+    if !single_hop {
+        return false;
+    }
+    let Some(edge_type) = edge_type else {
+        return false;
+    };
+    let Some(target_label) = target_label else {
+        // Without target_label the legacy path uses `scan_node_for_id`
+        // to confirm the id resolves to *some* node. We could try
+        // harder (e.g. require the schema-declared dst_label to be a
+        // singleton across all edge_types), but the conservative gate
+        // covers IC09 / IC02 already.
+        return false;
+    };
+    let schema = &snapshot.manifest().manifest.schema;
+    let Some(edge_def) = schema.edge_type(edge_type) else {
+        return false;
+    };
+    match direction {
+        RelationshipDirection::Right => edge_def.dst_label == target_label,
+        RelationshipDirection::Left => edge_def.src_label == target_label,
+        // Undirected: we'd have to inspect each edge individually.
+        RelationshipDirection::Both => {
+            edge_def.dst_label == target_label && edge_def.src_label == target_label
+        }
+    }
 }
 
 /// Walk every label in the manifest looking for a node with `id`.
@@ -975,361 +990,361 @@ fn should_skip_target_materialize(
 /// edge type), so we trial-search until storage provides a
 /// label-index for ids.
 async fn scan_node_for_id(
- snapshot: &Snapshot<'_>,
- id: NodeId,
+    snapshot: &Snapshot<'_>,
+    id: NodeId,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
- let manifest = snapshot.manifest();
- let labels: Vec<String> = manifest.manifest.schema.labels.keys().cloned().collect();
- for label in labels {
- if let Some(view) = snapshot.lookup_node(&label, id).await? {
- return Ok(Some(view));
- }
- }
- Ok(None)
+    let manifest = snapshot.manifest();
+    let labels: Vec<String> = manifest.manifest.schema.labels.keys().cloned().collect();
+    for label in labels {
+        if let Some(view) = snapshot.lookup_node(&label, id).await? {
+            return Ok(Some(view));
+        }
+    }
+    Ok(None)
 }
 
 // ───────────────────────── Project ───────────────────────────────────
 
 pub(crate) fn project_rows(
- rows: &[Row],
- items: &[ProjectionItem],
- discard_input_bindings: bool,
- params: &Params,
+    rows: &[Row],
+    items: &[ProjectionItem],
+    discard_input_bindings: bool,
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let mut new_row = if discard_input_bindings {
- Row::new()
- } else {
- row.clone()
- };
- for item in items {
- let v = evaluate(&item.expression, row, params)?;
- new_row.set(item.alias.clone(), v);
- }
- out.push(new_row);
- }
- Ok(out)
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut new_row = if discard_input_bindings {
+            Row::new()
+        } else {
+            row.clone()
+        };
+        for item in items {
+            let v = evaluate(&item.expression, row, params)?;
+            new_row.set(item.alias.clone(), v);
+        }
+        out.push(new_row);
+    }
+    Ok(out)
 }
 
 // ───────────────────────── Sort / Distinct ───────────────────────────
 
 pub(crate) fn sort_rows(
- rows: &mut Vec<Row>,
- keys: &[OrderKey],
- params: &Params,
+    rows: &mut Vec<Row>,
+    keys: &[OrderKey],
+    params: &Params,
 ) -> Result<(), ExecError> {
- // Pre-compute key values for each row to avoid re-evaluating during
- // comparisons.
- let mut keyed: Vec<(Vec<RuntimeValue>, Row)> = Vec::with_capacity(rows.len());
- for row in rows.drain(..) {
- let mut row_keys = Vec::with_capacity(keys.len());
- for k in keys {
- row_keys.push(evaluate(&k.expression, &row, params)?);
- }
- keyed.push((row_keys, row));
- }
- keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
- *rows = keyed.into_iter().map(|(_, r)| r).collect();
- Ok(())
+    // Pre-compute key values for each row to avoid re-evaluating during
+    // comparisons.
+    let mut keyed: Vec<(Vec<RuntimeValue>, Row)> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let mut row_keys = Vec::with_capacity(keys.len());
+        for k in keys {
+            row_keys.push(evaluate(&k.expression, &row, params)?);
+        }
+        keyed.push((row_keys, row));
+    }
+    keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
+    *rows = keyed.into_iter().map(|(_, r)| r).collect();
+    Ok(())
 }
 
 fn compare_keys(a: &[RuntimeValue], b: &[RuntimeValue], keys: &[OrderKey]) -> Ordering {
- for (i, k) in keys.iter().enumerate() {
- let desc = matches!(k.direction, crate::parser::OrderDirection::Desc);
- let o = order_for_sort(&a[i], &b[i], desc);
- if o != Ordering::Equal {
- return o;
- }
- }
- Ordering::Equal
+    for (i, k) in keys.iter().enumerate() {
+        let desc = matches!(k.direction, crate::parser::OrderDirection::Desc);
+        let o = order_for_sort(&a[i], &b[i], desc);
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
 }
 
 pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
- if left.is_empty() || right.is_empty() {
- return Vec::new();
- }
- let mut out = Vec::with_capacity(left.len() * right.len());
- for l in &left {
- for r in &right {
- let mut merged = l.clone();
- for (k, v) in &r.bindings {
- merged.set(k.clone(), v.clone());
- }
- out.push(merged);
- }
- }
- out
+    if left.is_empty() || right.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(left.len() * right.len());
+    for l in &left {
+        for r in &right {
+            let mut merged = l.clone();
+            for (k, v) in &r.bindings {
+                merged.set(k.clone(), v.clone());
+            }
+            out.push(merged);
+        }
+    }
+    out
 }
 
 pub(crate) fn dedup_rows(mut rows: Vec<Row>) -> Vec<Row> {
- // For determinism we sort by canonical key first then dedup. Since
- // RuntimeValue can hold Floats (which don't implement Ord), we use
- // a String fingerprint computed by serialising the row.
- rows.sort_by_key(row_fingerprint);
- rows.dedup();
- rows
+    // For determinism we sort by canonical key first then dedup. Since
+    // RuntimeValue can hold Floats (which don't implement Ord), we use
+    // a String fingerprint computed by serialising the row.
+    rows.sort_by_key(row_fingerprint);
+    rows.dedup();
+    rows
 }
 
 fn row_fingerprint(row: &Row) -> String {
- let mut out = String::new();
- for (k, v) in &row.bindings {
- out.push_str(k);
- out.push('=');
- out.push_str(&fingerprint_value(v));
- out.push(';');
- }
- out
+    let mut out = String::new();
+    for (k, v) in &row.bindings {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(&fingerprint_value(v));
+        out.push(';');
+    }
+    out
 }
 
 fn fingerprint_value(v: &RuntimeValue) -> String {
- match v {
- RuntimeValue::Null => "<null>".into(),
- RuntimeValue::Bool(b) => b.to_string(),
- RuntimeValue::Integer(n) => format!("i:{}", n),
- RuntimeValue::Float(f) => format!("f:{:.10}", f),
- RuntimeValue::String(s) => format!("s:{}", s),
- RuntimeValue::List(items) => {
- let mut s = "[".to_string();
- for (i, it) in items.iter().enumerate() {
- if i > 0 {
- s.push(',');
- }
- s.push_str(&fingerprint_value(it));
- }
- s.push(']');
- s
- }
- RuntimeValue::Map(m) => {
- let mut s = "{".to_string();
- for (i, (k, v)) in m.iter().enumerate() {
- if i > 0 {
- s.push(',');
- }
- s.push_str(k);
- s.push(':');
- s.push_str(&fingerprint_value(v));
- }
- s.push('}');
- s
- }
- RuntimeValue::Node(n) => format!("n:{}", n.id),
- RuntimeValue::Rel(r) => format!("r:{}:{}->{}", r.edge_type, r.src, r.dst),
- RuntimeValue::Date(d) => format!("d:{}", d),
- RuntimeValue::DateTime(d) => format!("dt:{}", d),
- RuntimeValue::Bytes(b) => format!("b:{}", b.len()),
- RuntimeValue::Vector(v) => format!("v:{}", v.len()),
- RuntimeValue::Path(items) => {
- let mut s = "p:[".to_string();
- for (i, it) in items.iter().enumerate() {
- if i > 0 {
- s.push(',');
- }
- s.push_str(&fingerprint_value(it));
- }
- s.push(']');
- s
- }
- }
+    match v {
+        RuntimeValue::Null => "<null>".into(),
+        RuntimeValue::Bool(b) => b.to_string(),
+        RuntimeValue::Integer(n) => format!("i:{}", n),
+        RuntimeValue::Float(f) => format!("f:{:.10}", f),
+        RuntimeValue::String(s) => format!("s:{}", s),
+        RuntimeValue::List(items) => {
+            let mut s = "[".to_string();
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&fingerprint_value(it));
+            }
+            s.push(']');
+            s
+        }
+        RuntimeValue::Map(m) => {
+            let mut s = "{".to_string();
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(k);
+                s.push(':');
+                s.push_str(&fingerprint_value(v));
+            }
+            s.push('}');
+            s
+        }
+        RuntimeValue::Node(n) => format!("n:{}", n.id),
+        RuntimeValue::Rel(r) => format!("r:{}:{}->{}", r.edge_type, r.src, r.dst),
+        RuntimeValue::Date(d) => format!("d:{}", d),
+        RuntimeValue::DateTime(d) => format!("dt:{}", d),
+        RuntimeValue::Bytes(b) => format!("b:{}", b.len()),
+        RuntimeValue::Vector(v) => format!("v:{}", v.len()),
+        RuntimeValue::Path(items) => {
+            let mut s = "p:[".to_string();
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&fingerprint_value(it));
+            }
+            s.push(']');
+            s
+        }
+    }
 }
 
 // ───────────────────────── Aggregate ─────────────────────────────────
 
 pub(crate) fn execute_aggregate(
- rows: Vec<Row>,
- group_by: &[(Expression, String)],
- aggregations: &[(String, AggregateExpr)],
- params: &Params,
+    rows: Vec<Row>,
+    group_by: &[(Expression, String)],
+    aggregations: &[(String, AggregateExpr)],
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
- use std::collections::BTreeMap;
+    use std::collections::BTreeMap;
 
- let mut groups: BTreeMap<String, (Vec<RuntimeValue>, Vec<Row>)> = BTreeMap::new();
- for row in rows {
- let mut key_vals = Vec::with_capacity(group_by.len());
- let mut fingerprint = String::new();
- for (expr, _) in group_by {
- let v = evaluate(expr, &row, params)?;
- fingerprint.push_str(&fingerprint_value(&v));
- fingerprint.push('|');
- key_vals.push(v);
- }
- groups
- .entry(fingerprint)
- .or_insert_with(|| (key_vals, Vec::new()))
- .1
- .push(row);
- }
- // Empty input + no group keys: emit one row of "empty group" so that
- // `RETURN count(*)` over zero rows yields `0`.
- if groups.is_empty() && group_by.is_empty() {
- let mut row = Row::new();
- for (alias, agg) in aggregations {
- row.set(alias.clone(), aggregate_over(&[], agg, params)?);
- }
- return Ok(vec![row]);
- }
+    let mut groups: BTreeMap<String, (Vec<RuntimeValue>, Vec<Row>)> = BTreeMap::new();
+    for row in rows {
+        let mut key_vals = Vec::with_capacity(group_by.len());
+        let mut fingerprint = String::new();
+        for (expr, _) in group_by {
+            let v = evaluate(expr, &row, params)?;
+            fingerprint.push_str(&fingerprint_value(&v));
+            fingerprint.push('|');
+            key_vals.push(v);
+        }
+        groups
+            .entry(fingerprint)
+            .or_insert_with(|| (key_vals, Vec::new()))
+            .1
+            .push(row);
+    }
+    // Empty input + no group keys: emit one row of "empty group" so that
+    // `RETURN count(*)` over zero rows yields `0`.
+    if groups.is_empty() && group_by.is_empty() {
+        let mut row = Row::new();
+        for (alias, agg) in aggregations {
+            row.set(alias.clone(), aggregate_over(&[], agg, params)?);
+        }
+        return Ok(vec![row]);
+    }
 
- let mut out = Vec::with_capacity(groups.len());
- for (_, (key_vals, group_rows)) in groups {
- let mut row = Row::new();
- for ((_, alias), v) in group_by.iter().zip(key_vals) {
- row.set(alias.clone(), v);
- }
- for (alias, agg) in aggregations {
- row.set(alias.clone(), aggregate_over(&group_rows, agg, params)?);
- }
- out.push(row);
- }
- Ok(out)
+    let mut out = Vec::with_capacity(groups.len());
+    for (_, (key_vals, group_rows)) in groups {
+        let mut row = Row::new();
+        for ((_, alias), v) in group_by.iter().zip(key_vals) {
+            row.set(alias.clone(), v);
+        }
+        for (alias, agg) in aggregations {
+            row.set(alias.clone(), aggregate_over(&group_rows, agg, params)?);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 fn aggregate_over(
- rows: &[Row],
- agg: &AggregateExpr,
- params: &Params,
+    rows: &[Row],
+    agg: &AggregateExpr,
+    params: &Params,
 ) -> Result<RuntimeValue, ExecError> {
- match agg {
- AggregateExpr::Count { arg, distinct } => match arg {
- None => Ok(RuntimeValue::Integer(rows.len() as i64)),
- Some(e) => {
- let mut count: i64 = 0;
- let mut seen = BTreeSet::new();
- for row in rows {
- let v = evaluate(e, row, params)?;
- if v.is_null() {
- continue;
- }
- if *distinct {
- let fp = fingerprint_value(&v);
- if seen.insert(fp) {
- count += 1;
- }
- } else {
- count += 1;
- }
- }
- Ok(RuntimeValue::Integer(count))
- }
- },
- AggregateExpr::Sum { arg, distinct } => {
- let vals = collect_non_null(rows, arg, *distinct, params)?;
- sum_values(&vals)
- }
- AggregateExpr::Avg { arg, distinct } => {
- let vals = collect_non_null(rows, arg, *distinct, params)?;
- if vals.is_empty() {
- return Ok(RuntimeValue::Null);
- }
- let total = sum_values(&vals)?;
- match total {
- RuntimeValue::Integer(n) => Ok(RuntimeValue::Float(n as f64 / vals.len() as f64)),
- RuntimeValue::Float(f) => Ok(RuntimeValue::Float(f / vals.len() as f64)),
- _ => Ok(RuntimeValue::Null),
- }
- }
- AggregateExpr::Min { arg } => {
- let vals = collect_non_null(rows, arg, false, params)?;
- Ok(vals
- .into_iter()
- .min_by(|a, b| order_for_sort(a, b, false))
- .unwrap_or(RuntimeValue::Null))
- }
- AggregateExpr::Max { arg } => {
- let vals = collect_non_null(rows, arg, false, params)?;
- Ok(vals
- .into_iter()
- .max_by(|a, b| order_for_sort(a, b, false))
- .unwrap_or(RuntimeValue::Null))
- }
- AggregateExpr::Collect { arg, distinct } => {
- let vals = collect_non_null(rows, arg, *distinct, params)?;
- Ok(RuntimeValue::List(vals))
- }
- }
+    match agg {
+        AggregateExpr::Count { arg, distinct } => match arg {
+            None => Ok(RuntimeValue::Integer(rows.len() as i64)),
+            Some(e) => {
+                let mut count: i64 = 0;
+                let mut seen = BTreeSet::new();
+                for row in rows {
+                    let v = evaluate(e, row, params)?;
+                    if v.is_null() {
+                        continue;
+                    }
+                    if *distinct {
+                        let fp = fingerprint_value(&v);
+                        if seen.insert(fp) {
+                            count += 1;
+                        }
+                    } else {
+                        count += 1;
+                    }
+                }
+                Ok(RuntimeValue::Integer(count))
+            }
+        },
+        AggregateExpr::Sum { arg, distinct } => {
+            let vals = collect_non_null(rows, arg, *distinct, params)?;
+            sum_values(&vals)
+        }
+        AggregateExpr::Avg { arg, distinct } => {
+            let vals = collect_non_null(rows, arg, *distinct, params)?;
+            if vals.is_empty() {
+                return Ok(RuntimeValue::Null);
+            }
+            let total = sum_values(&vals)?;
+            match total {
+                RuntimeValue::Integer(n) => Ok(RuntimeValue::Float(n as f64 / vals.len() as f64)),
+                RuntimeValue::Float(f) => Ok(RuntimeValue::Float(f / vals.len() as f64)),
+                _ => Ok(RuntimeValue::Null),
+            }
+        }
+        AggregateExpr::Min { arg } => {
+            let vals = collect_non_null(rows, arg, false, params)?;
+            Ok(vals
+                .into_iter()
+                .min_by(|a, b| order_for_sort(a, b, false))
+                .unwrap_or(RuntimeValue::Null))
+        }
+        AggregateExpr::Max { arg } => {
+            let vals = collect_non_null(rows, arg, false, params)?;
+            Ok(vals
+                .into_iter()
+                .max_by(|a, b| order_for_sort(a, b, false))
+                .unwrap_or(RuntimeValue::Null))
+        }
+        AggregateExpr::Collect { arg, distinct } => {
+            let vals = collect_non_null(rows, arg, *distinct, params)?;
+            Ok(RuntimeValue::List(vals))
+        }
+    }
 }
 
 fn collect_non_null(
- rows: &[Row],
- arg: &Expression,
- distinct: bool,
- params: &Params,
+    rows: &[Row],
+    arg: &Expression,
+    distinct: bool,
+    params: &Params,
 ) -> Result<Vec<RuntimeValue>, ExecError> {
- let mut out = Vec::with_capacity(rows.len());
- let mut seen = BTreeSet::new();
- for row in rows {
- let v = evaluate(arg, row, params)?;
- if v.is_null() {
- continue;
- }
- if distinct {
- let fp = fingerprint_value(&v);
- if !seen.insert(fp) {
- continue;
- }
- }
- out.push(v);
- }
- Ok(out)
+    let mut out = Vec::with_capacity(rows.len());
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        let v = evaluate(arg, row, params)?;
+        if v.is_null() {
+            continue;
+        }
+        if distinct {
+            let fp = fingerprint_value(&v);
+            if !seen.insert(fp) {
+                continue;
+            }
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
- let mut is_float = false;
- let mut i_total: i64 = 0;
- let mut f_total: f64 = 0.0;
- for v in vals {
- match v {
- RuntimeValue::Integer(n) => {
- if is_float {
- f_total += *n as f64;
- } else {
- i_total += *n;
- }
- }
- RuntimeValue::Float(f) => {
- if !is_float {
- f_total = i_total as f64;
- is_float = true;
- }
- f_total += *f;
- }
- _ => {
- return Err(ExecError::Runtime(format!(
- "sum/avg requires numeric values, got {}",
- v.type_name()
- )))
- }
- }
- }
- if vals.is_empty() {
- return Ok(RuntimeValue::Null);
- }
- if is_float {
- Ok(RuntimeValue::Float(f_total))
- } else {
- Ok(RuntimeValue::Integer(i_total))
- }
+    let mut is_float = false;
+    let mut i_total: i64 = 0;
+    let mut f_total: f64 = 0.0;
+    for v in vals {
+        match v {
+            RuntimeValue::Integer(n) => {
+                if is_float {
+                    f_total += *n as f64;
+                } else {
+                    i_total += *n;
+                }
+            }
+            RuntimeValue::Float(f) => {
+                if !is_float {
+                    f_total = i_total as f64;
+                    is_float = true;
+                }
+                f_total += *f;
+            }
+            _ => {
+                return Err(ExecError::Runtime(format!(
+                    "sum/avg requires numeric values, got {}",
+                    v.type_name()
+                )))
+            }
+        }
+    }
+    if vals.is_empty() {
+        return Ok(RuntimeValue::Null);
+    }
+    if is_float {
+        Ok(RuntimeValue::Float(f_total))
+    } else {
+        Ok(RuntimeValue::Integer(i_total))
+    }
 }
 
 // ───────────────────────── NodeId conversion ─────────────────────────
 
 pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<NodeId, ExecError> {
- match v {
- RuntimeValue::String(s) => match uuid::Uuid::parse_str(s) {
- Ok(u) => Ok(NodeId::from_uuid(u)),
- Err(e) => Err(ExecError::Eval(EvalError::new(
- format!("invalid NodeId `{}`: {}", s, e),
- span,
- ))),
- },
- RuntimeValue::Node(n) => Ok(n.id),
- _ => Err(ExecError::Eval(EvalError::new(
- format!(
- "NodeId must be a UUID string or Node, got {}",
- v.type_name()
- ),
- span,
- ))),
- }
+    match v {
+        RuntimeValue::String(s) => match uuid::Uuid::parse_str(s) {
+            Ok(u) => Ok(NodeId::from_uuid(u)),
+            Err(e) => Err(ExecError::Eval(EvalError::new(
+                format!("invalid NodeId `{}`: {}", s, e),
+                span,
+            ))),
+        },
+        RuntimeValue::Node(n) => Ok(n.id),
+        _ => Err(ExecError::Eval(EvalError::new(
+            format!(
+                "NodeId must be a UUID string or Node, got {}",
+                v.type_name()
+            ),
+            span,
+        ))),
+    }
 }
 
 /// Lookup a node by a unique user property via predicate-pushed scan
@@ -1348,44 +1363,44 @@ pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<N
 /// row, so the waste is bounded — for a misdeclared "unique" property
 /// with multiple matches, we silently take the first).
 pub(crate) async fn lookup_node_by_property_via_scan(
- snapshot: &Snapshot<'_>,
- label: &str,
- property: &str,
- value: &RuntimeValue,
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    property: &str,
+    value: &RuntimeValue,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
- // For v0 we only index String-valued properties (LDBC's `id`).
- // Other scalar types fall back to `scan_label_with_predicates` —
- // accurate but pays the per-row decoder overhead every call.
- if let RuntimeValue::String(s) = value {
- return snapshot
- .lookup_node_by_property(label, property, s)
- .await
- .map_err(ExecError::Storage);
- }
+    // For v0 we only index String-valued properties (LDBC's `id`).
+    // Other scalar types fall back to `scan_label_with_predicates` —
+    // accurate but pays the per-row decoder overhead every call.
+    if let RuntimeValue::String(s) = value {
+        return snapshot
+            .lookup_node_by_property(label, property, s)
+            .await
+            .map_err(ExecError::Storage);
+    }
 
- // Fallback for non-string keys.
- let scalar = match value {
- RuntimeValue::Integer(i) => Some(namidb_storage::sst::stats::StatScalar::Int64(*i)),
- RuntimeValue::Bool(b) => Some(namidb_storage::sst::stats::StatScalar::Bool(*b)),
- RuntimeValue::Float(f) => Some(namidb_storage::sst::stats::StatScalar::Float64(*f)),
- _ => None,
- };
- let candidates = if let Some(s) = scalar {
- let pred = namidb_storage::sst::predicates::ScanPredicate::Eq {
- column: property.to_string(),
- value: s,
- };
- snapshot
- .scan_label_with_predicates(label, &[pred])
- .await
- .map_err(ExecError::Storage)?
- } else {
- snapshot
- .scan_label(label)
- .await
- .map_err(ExecError::Storage)?
- };
- Ok(candidates.into_iter().next())
+    // Fallback for non-string keys.
+    let scalar = match value {
+        RuntimeValue::Integer(i) => Some(namidb_storage::sst::stats::StatScalar::Int64(*i)),
+        RuntimeValue::Bool(b) => Some(namidb_storage::sst::stats::StatScalar::Bool(*b)),
+        RuntimeValue::Float(f) => Some(namidb_storage::sst::stats::StatScalar::Float64(*f)),
+        _ => None,
+    };
+    let candidates = if let Some(s) = scalar {
+        let pred = namidb_storage::sst::predicates::ScanPredicate::Eq {
+            column: property.to_string(),
+            value: s,
+        };
+        snapshot
+            .scan_label_with_predicates(label, &[pred])
+            .await
+            .map_err(ExecError::Storage)?
+    } else {
+        snapshot
+            .scan_label(label)
+            .await
+            .map_err(ExecError::Storage)?
+    };
+    Ok(candidates.into_iter().next())
 }
 
 // ────────────────────────── Factor path ────────────────────────
@@ -1401,462 +1416,490 @@ pub(crate) async fn lookup_node_by_property_via_scan(
 // operators (CrossProduct, HashJoin) and later iterations will port sinks.
 
 pub(crate) fn execute_factor_inner_with_routing<'a>(
- plan: &'a LogicalPlan,
- snapshot: &'a Snapshot<'_>,
- params: &'a Params,
- outer: Option<&'a Row>,
- routing: &'a PlanRouting,
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
+    routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
- async move {
- match plan {
- // Operators that benefit directly: keep everything factorised.
- LogicalPlan::Empty => Ok(FactorRowSet::singleton_root()),
+    async move {
+        match plan {
+            // Operators that benefit directly: keep everything factorised.
+            LogicalPlan::Empty => Ok(FactorRowSet::singleton_root()),
 
- LogicalPlan::NodeScan {
- label,
- alias,
- predicates,
- projection,
- } => {
- // NodeScan produces N independent rows — emit each as a
- // direct child of root. No clone path; one FactorNode per
- // result. For typeless scans we fan out across every
- // observed label and concatenate the result.
- let labels = resolve_node_labels(snapshot, label.as_deref());
- let mut set = FactorRowSet::singleton_root();
- let root = set.arena.root();
- let alias_arc: Arc<str> = Arc::from(alias.as_str());
- let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
- for label_name in &labels {
- let nodes = snapshot
- .scan_label_with_predicates_and_projection(
- label_name,
- predicates,
- projection.as_deref(),
- )
- .await?;
- for n in nodes {
- let slot = Slot {
- name: alias_arc.clone(),
- value: RuntimeValue::Node(Box::new(NodeValue::from(n))),
- };
- leaves.push(set.arena.push(root, vec![slot]));
- }
- }
- set.leaves = leaves;
- Ok(set)
- }
+            LogicalPlan::NodeScan {
+                label,
+                alias,
+                predicates,
+                projection,
+            } => {
+                // NodeScan produces N independent rows — emit each as a
+                // direct child of root. No clone path; one FactorNode per
+                // result. For typeless scans we fan out across every
+                // observed label and concatenate the result.
+                let labels = resolve_node_labels(snapshot, label.as_deref());
+                let mut set = FactorRowSet::singleton_root();
+                let root = set.arena.root();
+                let alias_arc: Arc<str> = Arc::from(alias.as_str());
+                let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
+                for label_name in &labels {
+                    let nodes = snapshot
+                        .scan_label_with_predicates_and_projection(
+                            label_name,
+                            predicates,
+                            projection.as_deref(),
+                        )
+                        .await?;
+                    for n in nodes {
+                        let slot = Slot {
+                            name: alias_arc.clone(),
+                            value: RuntimeValue::Node(Box::new(NodeValue::from(n))),
+                        };
+                        leaves.push(set.arena.push(root, vec![slot]));
+                    }
+                }
+                set.leaves = leaves;
+                Ok(set)
+            }
 
- LogicalPlan::NodeById {
- input,
- label,
- alias,
- id,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let alias_arc: Arc<str> = Arc::from(alias.as_str());
- let mut out_leaves = Vec::new();
- // We need a temporary materialised row per leaf to evaluate
- // `id` (which is an Expression over bindings). Building
- // the row only includes the bindings the Expression
- // references is a future optimisation;
- // materialising the whole chain is correct now.
- let arena_view = input_set.arena.clone();
- let mut next_arena = input_set.arena;
- for leaf in input_set.leaves {
- let row = arena_view.materialize(leaf, None);
- let id_value = evaluate(id, &row, params)?;
- let node_id = node_id_from_value(&id_value, id.span)?;
- if let Some(view) = snapshot.lookup_node(label, node_id).await? {
- let slot = Slot {
- name: alias_arc.clone(),
- value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
- };
- out_leaves.push(next_arena.push(leaf, vec![slot]));
- }
- }
- Ok(FactorRowSet {
- arena: next_arena,
- leaves: out_leaves,
- })
- }
+            LogicalPlan::NodeById {
+                input,
+                label,
+                alias,
+                id,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let alias_arc: Arc<str> = Arc::from(alias.as_str());
+                let mut out_leaves = Vec::new();
+                // We need a temporary materialised row per leaf to evaluate
+                // `id` (which is an Expression over bindings). Building
+                // the row only includes the bindings the Expression
+                // references is a future optimisation;
+                // materialising the whole chain is correct now.
+                let arena_view = input_set.arena.clone();
+                let mut next_arena = input_set.arena;
+                for leaf in input_set.leaves {
+                    let row = arena_view.materialize(leaf, None);
+                    let id_value = evaluate(id, &row, params)?;
+                    let node_id = node_id_from_value(&id_value, id.span)?;
+                    if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+                        let slot = Slot {
+                            name: alias_arc.clone(),
+                            value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        };
+                        out_leaves.push(next_arena.push(leaf, vec![slot]));
+                    }
+                }
+                Ok(FactorRowSet {
+                    arena: next_arena,
+                    leaves: out_leaves,
+                })
+            }
 
- LogicalPlan::NodeByPropertyValue {
- input,
- label,
- alias,
- property,
- value,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let alias_arc: Arc<str> = Arc::from(alias.as_str());
- let mut out_leaves = Vec::new();
- let arena_view = input_set.arena.clone();
- let mut next_arena = input_set.arena;
- for leaf in input_set.leaves {
- let row = arena_view.materialize(leaf, None);
- let lookup_val = evaluate(value, &row, params)?;
- if let Some(view) = lookup_node_by_property_via_scan(
- snapshot, label, property, &lookup_val,
- )
- .await?
- {
- let slot = Slot {
- name: alias_arc.clone(),
- value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
- };
- out_leaves.push(next_arena.push(leaf, vec![slot]));
- }
- }
- Ok(FactorRowSet {
- arena: next_arena,
- leaves: out_leaves,
- })
- }
+            LogicalPlan::NodeByPropertyValue {
+                input,
+                label,
+                alias,
+                property,
+                value,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let alias_arc: Arc<str> = Arc::from(alias.as_str());
+                let mut out_leaves = Vec::new();
+                let arena_view = input_set.arena.clone();
+                let mut next_arena = input_set.arena;
+                for leaf in input_set.leaves {
+                    let row = arena_view.materialize(leaf, None);
+                    let lookup_val = evaluate(value, &row, params)?;
+                    if let Some(view) =
+                        lookup_node_by_property_via_scan(snapshot, label, property, &lookup_val)
+                            .await?
+                    {
+                        let slot = Slot {
+                            name: alias_arc.clone(),
+                            value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        };
+                        out_leaves.push(next_arena.push(leaf, vec![slot]));
+                    }
+                }
+                Ok(FactorRowSet {
+                    arena: next_arena,
+                    leaves: out_leaves,
+                })
+            }
 
- LogicalPlan::Filter { input, predicate } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let arena_view = input_set.arena.clone();
- let mut out_leaves = Vec::with_capacity(input_set.leaves.len());
- for leaf in input_set.leaves {
- // Materialise full row to evaluate predicate. Column-
- // aware materialise is a follow-up; today we accept the
- // O(depth) walk + transient Row alloc per leaf.
- let row = arena_view.materialize(leaf, None);
- let v = evaluate(predicate, &row, params)?;
- if v.as_bool() == Some(true) {
- out_leaves.push(leaf);
- }
- }
- Ok(FactorRowSet {
- arena: input_set.arena,
- leaves: out_leaves,
- })
- }
+            LogicalPlan::Filter { input, predicate } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let arena_view = input_set.arena.clone();
+                let mut out_leaves = Vec::with_capacity(input_set.leaves.len());
+                for leaf in input_set.leaves {
+                    // Materialise full row to evaluate predicate. Column-
+                    // aware materialise is a follow-up; today we accept the
+                    // O(depth) walk + transient Row alloc per leaf.
+                    let row = arena_view.materialize(leaf, None);
+                    let v = evaluate(predicate, &row, params)?;
+                    if v.as_bool() == Some(true) {
+                        out_leaves.push(leaf);
+                    }
+                }
+                Ok(FactorRowSet {
+                    arena: input_set.arena,
+                    leaves: out_leaves,
+                })
+            }
 
- LogicalPlan::Expand {
- input,
- source,
- edge_type,
- direction,
- rel_alias,
- target_alias,
- target_label,
- length,
- optional,
- back_reference,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- execute_expand_factor(
- input_set,
- source,
- edge_type.as_deref(),
- *direction,
- rel_alias.as_deref(),
- target_alias,
- target_label.as_deref(),
- *length,
- *optional,
- *back_reference,
- snapshot,
- routing.needs_properties(rel_alias.as_deref()),
- should_skip_target_materialize(
- snapshot,
- routing,
- target_alias,
- edge_type.as_deref(),
- *direction,
- target_label.as_deref(),
- *length,
- *back_reference,
- ),
- )
- .await
- }
+            LogicalPlan::Expand {
+                input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_label,
+                length,
+                optional,
+                back_reference,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                execute_expand_factor(
+                    input_set,
+                    source,
+                    edge_type.as_deref(),
+                    *direction,
+                    rel_alias.as_deref(),
+                    target_alias,
+                    target_label.as_deref(),
+                    *length,
+                    *optional,
+                    *back_reference,
+                    snapshot,
+                    routing.needs_properties(rel_alias.as_deref()),
+                    should_skip_target_materialize(
+                        snapshot,
+                        routing,
+                        target_alias,
+                        edge_type.as_deref(),
+                        *direction,
+                        target_label.as_deref(),
+                        *length,
+                        *back_reference,
+                    ),
+                )
+                .await
+            }
 
- LogicalPlan::CrossProduct { left, right } => {
- let l = execute_factor_inner_with_routing(left, snapshot, params, outer, routing).await?;
- let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing).await?;
- Ok(cross_product_factor(l, r))
- }
+            LogicalPlan::CrossProduct { left, right } => {
+                let l = execute_factor_inner_with_routing(left, snapshot, params, outer, routing)
+                    .await?;
+                let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing)
+                    .await?;
+                Ok(cross_product_factor(l, r))
+            }
 
- LogicalPlan::HashJoin {
- build,
- probe,
- on,
- residual,
- } => {
- hash_join_factor(
- build,
- probe,
- on,
- residual.as_ref(),
- snapshot,
- params,
- outer,
- routing,
- )
- .await
- }
+            LogicalPlan::HashJoin {
+                build,
+                probe,
+                on,
+                residual,
+            } => {
+                hash_join_factor(
+                    build,
+                    probe,
+                    on,
+                    residual.as_ref(),
+                    snapshot,
+                    params,
+                    outer,
+                    routing,
+                )
+                .await
+            }
 
- LogicalPlan::HashSemiJoin {
- outer: outer_plan,
- inner: inner_plan,
- on,
- negated,
- residual,
- } => {
- hash_semi_join_factor(
- outer_plan,
- inner_plan,
- on,
- *negated,
- residual.as_ref(),
- snapshot,
- params,
- outer,
- routing,
- )
- .await
- }
+            LogicalPlan::HashSemiJoin {
+                outer: outer_plan,
+                inner: inner_plan,
+                on,
+                negated,
+                residual,
+            } => {
+                hash_semi_join_factor(
+                    outer_plan,
+                    inner_plan,
+                    on,
+                    *negated,
+                    residual.as_ref(),
+                    snapshot,
+                    params,
+                    outer,
+                    routing,
+                )
+                .await
+            }
 
- // Operators not yet ported to the factor path: execute flat
- // and wrap. The wrap inserts one FactorNode per result row,
- // each as a direct child of root; downstream operators continue
- // Sinks / pass-through operators: recurse children via the
- // factor path (so multi-hop Expand chains underneath stay
- // factorised), then materialise at the operator boundary and
- // re-use the existing flat helpers. v0 strategy — later iterations add
- // true factor-native versions (heap-by-lookup_binding for
- // TopN, fingerprint group-by without full materialise, etc.).
- LogicalPlan::Project {
- input,
- items,
- distinct,
- discard_input_bindings,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let input_rows = input_set.materialize_all(None);
- let projected =
- project_rows(&input_rows, items, *discard_input_bindings, params)?;
- let rows = if *distinct {
- dedup_rows(projected)
- } else {
- projected
- };
- Ok(FactorRowSet::from_flat(rows))
- }
+            // Operators not yet ported to the factor path: execute flat
+            // and wrap. The wrap inserts one FactorNode per result row,
+            // each as a direct child of root; downstream operators continue
+            // Sinks / pass-through operators: recurse children via the
+            // factor path (so multi-hop Expand chains underneath stay
+            // factorised), then materialise at the operator boundary and
+            // re-use the existing flat helpers. v0 strategy — later iterations add
+            // true factor-native versions (heap-by-lookup_binding for
+            // TopN, fingerprint group-by without full materialise, etc.).
+            LogicalPlan::Project {
+                input,
+                items,
+                distinct,
+                discard_input_bindings,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let input_rows = input_set.materialize_all(None);
+                let projected = project_rows(&input_rows, items, *discard_input_bindings, params)?;
+                let rows = if *distinct {
+                    dedup_rows(projected)
+                } else {
+                    projected
+                };
+                Ok(FactorRowSet::from_flat(rows))
+            }
 
- LogicalPlan::TopN {
- input,
- keys,
- skip,
- limit,
- } => {
- // TopN heap-native over the arena. Instead of
- // materialising every leaf and then sorting / taking, we:
- // 1. Compute each ORDER BY key per leaf using a thin row
- // that holds only the bindings the key expressions
- // reference (collected statically). Avoids cloning
- // unrelated NodeValue properties for IC09-shaped
- // queries (1500 leaves × 3 unused NodeValues =
- // ~4500 RuntimeValue clones avoided).
- // 2. Sort the (key_vals, leaf) pairs.
- // 3. Materialise the full row only for the `skip..skip+limit`
- // window — 20 materialisations for `LIMIT 20`
- // regardless of input cardinality.
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
+            LogicalPlan::TopN {
+                input,
+                keys,
+                skip,
+                limit,
+            } => {
+                // TopN heap-native over the arena. Instead of
+                // materialising every leaf and then sorting / taking, we:
+                // 1. Compute each ORDER BY key per leaf using a thin row
+                // that holds only the bindings the key expressions
+                // reference (collected statically). Avoids cloning
+                // unrelated NodeValue properties for IC09-shaped
+                // queries (1500 leaves × 3 unused NodeValues =
+                // ~4500 RuntimeValue clones avoided).
+                // 2. Sort the (key_vals, leaf) pairs.
+                // 3. Materialise the full row only for the `skip..skip+limit`
+                // window — 20 materialisations for `LIMIT 20`
+                // regardless of input cardinality.
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
 
- // Empty keys: stable order, just skip+take + materialise.
- if keys.is_empty() {
- let skip = *skip as usize;
- if skip >= input_set.cardinality() {
- return Ok(FactorRowSet::from_flat(Vec::new()));
- }
- let take = if *limit == u64::MAX {
- usize::MAX
- } else {
- *limit as usize
- };
- let rows: Vec<Row> = input_set
- .leaves
- .iter()
- .skip(skip)
- .take(take)
- .map(|&leaf| input_set.arena.materialize(leaf, None))
- .collect();
- return Ok(FactorRowSet::from_flat(rows));
- }
+                // Empty keys: stable order, just skip+take + materialise.
+                if keys.is_empty() {
+                    let skip = *skip as usize;
+                    if skip >= input_set.cardinality() {
+                        return Ok(FactorRowSet::from_flat(Vec::new()));
+                    }
+                    let take = if *limit == u64::MAX {
+                        usize::MAX
+                    } else {
+                        *limit as usize
+                    };
+                    let rows: Vec<Row> = input_set
+                        .leaves
+                        .iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|&leaf| input_set.arena.materialize(leaf, None))
+                        .collect();
+                    return Ok(FactorRowSet::from_flat(rows));
+                }
 
- // Variables referenced by ANY of the ORDER BY expressions.
- let mut needed: BTreeSet<String> = BTreeSet::new();
- for k in keys {
- collect_referenced_variables(&k.expression, &mut needed);
- }
+                // Variables referenced by ANY of the ORDER BY expressions.
+                let mut needed: BTreeSet<String> = BTreeSet::new();
+                for k in keys {
+                    collect_referenced_variables(&k.expression, &mut needed);
+                }
 
- let mut keyed: Vec<(Vec<RuntimeValue>, crate::exec::FactorIdx)> =
- Vec::with_capacity(input_set.cardinality());
- for &leaf in &input_set.leaves {
- // Thin row: only the bindings the keys actually read.
- let mut thin_row = Row::new();
- for var_name in &needed {
- if let Some(v) = input_set.arena.lookup_binding(leaf, var_name) {
- thin_row.set(var_name.clone(), v.clone());
- }
- }
- let mut key_vals = Vec::with_capacity(keys.len());
- for k in keys {
- key_vals.push(evaluate(&k.expression, &thin_row, params)?);
- }
- keyed.push((key_vals, leaf));
- }
+                let mut keyed: Vec<(Vec<RuntimeValue>, crate::exec::FactorIdx)> =
+                    Vec::with_capacity(input_set.cardinality());
+                for &leaf in &input_set.leaves {
+                    // Thin row: only the bindings the keys actually read.
+                    let mut thin_row = Row::new();
+                    for var_name in &needed {
+                        if let Some(v) = input_set.arena.lookup_binding(leaf, var_name) {
+                            thin_row.set(var_name.clone(), v.clone());
+                        }
+                    }
+                    let mut key_vals = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        key_vals.push(evaluate(&k.expression, &thin_row, params)?);
+                    }
+                    keyed.push((key_vals, leaf));
+                }
 
- keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
+                keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
 
- let skip = *skip as usize;
- if skip >= keyed.len() {
- return Ok(FactorRowSet::from_flat(Vec::new()));
- }
- let take = if *limit == u64::MAX {
- usize::MAX
- } else {
- *limit as usize
- };
- let rows: Vec<Row> = keyed
- .into_iter()
- .skip(skip)
- .take(take)
- .map(|(_, leaf)| input_set.arena.materialize(leaf, None))
- .collect();
- Ok(FactorRowSet::from_flat(rows))
- }
+                let skip = *skip as usize;
+                if skip >= keyed.len() {
+                    return Ok(FactorRowSet::from_flat(Vec::new()));
+                }
+                let take = if *limit == u64::MAX {
+                    usize::MAX
+                } else {
+                    *limit as usize
+                };
+                let rows: Vec<Row> = keyed
+                    .into_iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|(_, leaf)| input_set.arena.materialize(leaf, None))
+                    .collect();
+                Ok(FactorRowSet::from_flat(rows))
+            }
 
- LogicalPlan::Distinct { input } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let rows = input_set.materialize_all(None);
- Ok(FactorRowSet::from_flat(dedup_rows(rows)))
- }
+            LogicalPlan::Distinct { input } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let rows = input_set.materialize_all(None);
+                Ok(FactorRowSet::from_flat(dedup_rows(rows)))
+            }
 
- LogicalPlan::Union { left, right, all } => {
- let l = execute_factor_inner_with_routing(left, snapshot, params, outer, routing).await?;
- let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing).await?;
- let mut rows = l.materialize_all(None);
- rows.extend(r.materialize_all(None));
- let out = if *all { rows } else { dedup_rows(rows) };
- Ok(FactorRowSet::from_flat(out))
- }
+            LogicalPlan::Union { left, right, all } => {
+                let l = execute_factor_inner_with_routing(left, snapshot, params, outer, routing)
+                    .await?;
+                let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing)
+                    .await?;
+                let mut rows = l.materialize_all(None);
+                rows.extend(r.materialize_all(None));
+                let out = if *all { rows } else { dedup_rows(rows) };
+                Ok(FactorRowSet::from_flat(out))
+            }
 
- LogicalPlan::Unwind { input, list, alias } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let input_rows = input_set.materialize_all(None);
- let mut out = Vec::new();
- for row in input_rows {
- let v = evaluate(list, &row, params)?;
- match v {
- RuntimeValue::List(items) => {
- for item in items {
- let mut new_row = row.clone();
- new_row.set(alias.clone(), item);
- out.push(new_row);
- }
- }
- RuntimeValue::Null => {}
- _ => {
- return Err(ExecError::Runtime(format!(
- "UNWIND requires a list; got {}",
- v.type_name()
- )));
- }
- }
- }
- Ok(FactorRowSet::from_flat(out))
- }
+            LogicalPlan::Unwind { input, list, alias } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let input_rows = input_set.materialize_all(None);
+                let mut out = Vec::new();
+                for row in input_rows {
+                    let v = evaluate(list, &row, params)?;
+                    match v {
+                        RuntimeValue::List(items) => {
+                            for item in items {
+                                let mut new_row = row.clone();
+                                new_row.set(alias.clone(), item);
+                                out.push(new_row);
+                            }
+                        }
+                        RuntimeValue::Null => {}
+                        _ => {
+                            return Err(ExecError::Runtime(format!(
+                                "UNWIND requires a list; got {}",
+                                v.type_name()
+                            )));
+                        }
+                    }
+                }
+                Ok(FactorRowSet::from_flat(out))
+            }
 
- LogicalPlan::Aggregate {
- input,
- group_by,
- aggregations,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let rows = input_set.materialize_all(None);
- let agg_rows = execute_aggregate(rows, group_by, aggregations, params)?;
- Ok(FactorRowSet::from_flat(agg_rows))
- }
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregations,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let rows = input_set.materialize_all(None);
+                let agg_rows = execute_aggregate(rows, group_by, aggregations, params)?;
+                Ok(FactorRowSet::from_flat(agg_rows))
+            }
 
- // Correlated subplan operators: the outer row is threaded into
- // the inner execute. Inner planning is read-once but the outer
- // may bind ad-hoc fields, so we materialise the outer per row
- // to thread it through `execute_inner(subplan, ..., Some(row))`.
- LogicalPlan::SemiApply {
- input,
- subplan,
- negated,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let rows = input_set.materialize_all(None);
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let sub_rows = execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
- let matched = !sub_rows.is_empty();
- let keep = if *negated { !matched } else { matched };
- if keep {
- out.push(row);
- }
- }
- Ok(FactorRowSet::from_flat(out))
- }
+            // Correlated subplan operators: the outer row is threaded into
+            // the inner execute. Inner planning is read-once but the outer
+            // may bind ad-hoc fields, so we materialise the outer per row
+            // to thread it through `execute_inner(subplan, ..., Some(row))`.
+            LogicalPlan::SemiApply {
+                input,
+                subplan,
+                negated,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let rows = input_set.materialize_all(None);
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let sub_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    let matched = !sub_rows.is_empty();
+                    let keep = if *negated { !matched } else { matched };
+                    if keep {
+                        out.push(row);
+                    }
+                }
+                Ok(FactorRowSet::from_flat(out))
+            }
 
- LogicalPlan::PatternList {
- input,
- subplan,
- projection,
- alias,
- } => {
- let input_set = execute_factor_inner_with_routing(input, snapshot, params, outer, routing).await?;
- let rows = input_set.materialize_all(None);
- let mut out = Vec::with_capacity(rows.len());
- for row in rows {
- let inner_rows = execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
- let mut list = Vec::with_capacity(inner_rows.len());
- for inner in inner_rows {
- list.push(evaluate(projection, &inner, params)?);
- }
- let mut new_row = row;
- new_row.set(alias.clone(), RuntimeValue::List(list));
- out.push(new_row);
- }
- Ok(FactorRowSet::from_flat(out))
- }
+            LogicalPlan::PatternList {
+                input,
+                subplan,
+                projection,
+                alias,
+            } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let rows = input_set.materialize_all(None);
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let inner_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    let mut list = Vec::with_capacity(inner_rows.len());
+                    for inner in inner_rows {
+                        list.push(evaluate(projection, &inner, params)?);
+                    }
+                    let mut new_row = row;
+                    new_row.set(alias.clone(), RuntimeValue::List(list));
+                    out.push(new_row);
+                }
+                Ok(FactorRowSet::from_flat(out))
+            }
 
- LogicalPlan::Argument { bindings } => {
- let outer = outer.ok_or_else(|| {
- ExecError::Runtime(
+            LogicalPlan::Argument { bindings } => {
+                let outer = outer.ok_or_else(|| {
+                    ExecError::Runtime(
  "Argument operator requires an outer row from a containing SemiApply / PatternList".into(),
  )
- })?;
- let mut row = Row::new();
- for name in bindings {
- if let Some(v) = outer.get(name) {
- row.set(name.clone(), v.clone());
- }
- }
- Ok(FactorRowSet::from_flat(vec![row]))
- }
+                })?;
+                let mut row = Row::new();
+                for name in bindings {
+                    if let Some(v) = outer.get(name) {
+                        row.set(name.clone(), v.clone());
+                    }
+                }
+                Ok(FactorRowSet::from_flat(vec![row]))
+            }
 
- // Write operators must go through execute_write. Surface a
- // clear error if they reach the read executor regardless of
- // path.
- LogicalPlan::Create { .. }
- | LogicalPlan::Merge { .. }
- | LogicalPlan::Set { .. }
- | LogicalPlan::Remove { .. }
- | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
- "write operators require execute_write(plan, &mut WriterSession, params)"
- .to_string(),
- )),
- }
- }
- .boxed()
+            // Write operators must go through execute_write. Surface a
+            // clear error if they reach the read executor regardless of
+            // path.
+            LogicalPlan::Create { .. }
+            | LogicalPlan::Merge { .. }
+            | LogicalPlan::Set { .. }
+            | LogicalPlan::Remove { .. }
+            | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
+                "write operators require execute_write(plan, &mut WriterSession, params)"
+                    .to_string(),
+            )),
+        }
+    }
+    .boxed()
 }
 
 // Pointer-based Expand that avoids the per-edge `BTreeMap` clone in
@@ -1866,228 +1909,228 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
 // via the parent chain.
 #[allow(clippy::too_many_arguments)]
 async fn execute_expand_factor(
- input: FactorRowSet,
- source: &str,
- edge_type: Option<&str>,
- direction: RelationshipDirection,
- rel_alias: Option<&str>,
- target_alias: &str,
- target_label: Option<&str>,
- length: Option<crate::parser::RelationshipLength>,
- optional: bool,
- back_reference: bool,
- snapshot: &Snapshot<'_>,
- want_properties: bool,
- skip_target_materialize: bool,
+    input: FactorRowSet,
+    source: &str,
+    edge_type: Option<&str>,
+    direction: RelationshipDirection,
+    rel_alias: Option<&str>,
+    target_alias: &str,
+    target_label: Option<&str>,
+    length: Option<crate::parser::RelationshipLength>,
+    optional: bool,
+    back_reference: bool,
+    snapshot: &Snapshot<'_>,
+    want_properties: bool,
+    skip_target_materialize: bool,
 ) -> Result<FactorRowSet, ExecError> {
- namidb_core::profile_scope!("walker::execute_expand_factor");
- let edge_types = resolve_edge_types(snapshot, edge_type);
- let min = length.map(|l| l.min).unwrap_or(1);
- let max = length.map(|l| l.max).unwrap_or(1);
+    namidb_core::profile_scope!("walker::execute_expand_factor");
+    let edge_types = resolve_edge_types(snapshot, edge_type);
+    let min = length.map(|l| l.min).unwrap_or(1);
+    let max = length.map(|l| l.max).unwrap_or(1);
 
- let FactorRowSet {
- mut arena,
- leaves: input_leaves,
- } = input;
- let target_arc: Arc<str> = Arc::from(target_alias);
- let rel_arc: Option<Arc<str>> = rel_alias.map(Arc::from);
+    let FactorRowSet {
+        mut arena,
+        leaves: input_leaves,
+    } = input;
+    let target_arc: Arc<str> = Arc::from(target_alias);
+    let rel_arc: Option<Arc<str>> = rel_alias.map(Arc::from);
 
- let mut out_leaves: Vec<crate::exec::FactorIdx> = Vec::new();
+    let mut out_leaves: Vec<crate::exec::FactorIdx> = Vec::new();
 
- for parent_leaf in input_leaves {
- // Read the source binding from the chain. lookup_binding walks
- // root-ward without materialising the whole row.
- let starting = match arena.lookup_binding(parent_leaf, source) {
- Some(RuntimeValue::Node(n)) => n.id,
- Some(_) => {
- return Err(ExecError::Runtime(format!(
- "Expand source `{}` is not a Node",
- source
- )))
- }
- None => {
- return Err(ExecError::Runtime(format!(
- "Expand source `{}` is not bound in the input row",
- source
- )))
- }
- };
+    for parent_leaf in input_leaves {
+        // Read the source binding from the chain. lookup_binding walks
+        // root-ward without materialising the whole row.
+        let starting = match arena.lookup_binding(parent_leaf, source) {
+            Some(RuntimeValue::Node(n)) => n.id,
+            Some(_) => {
+                return Err(ExecError::Runtime(format!(
+                    "Expand source `{}` is not a Node",
+                    source
+                )))
+            }
+            None => {
+                return Err(ExecError::Runtime(format!(
+                    "Expand source `{}` is not bound in the input row",
+                    source
+                )))
+            }
+        };
 
- // Back-reference: pull the existing target id once. Only paths
- // ending at this id survive emission.
- let existing_target_id: Option<NodeId> = if back_reference {
- match arena.lookup_binding(parent_leaf, target_alias) {
- Some(RuntimeValue::Node(n)) => Some(n.id),
- Some(RuntimeValue::Null) => None,
- other => {
- return Err(ExecError::Runtime(format!(
- "Expand back-reference target `{}` is not a Node (got {:?})",
- target_alias, other
- )))
- }
- }
- } else {
- None
- };
+        // Back-reference: pull the existing target id once. Only paths
+        // ending at this id survive emission.
+        let existing_target_id: Option<NodeId> = if back_reference {
+            match arena.lookup_binding(parent_leaf, target_alias) {
+                Some(RuntimeValue::Node(n)) => Some(n.id),
+                Some(RuntimeValue::Null) => None,
+                other => {
+                    return Err(ExecError::Runtime(format!(
+                        "Expand back-reference target `{}` is not a Node (got {:?})",
+                        target_alias, other
+                    )))
+                }
+            }
+        } else {
+            None
+        };
 
- let mut hop_outputs_for_this_input: Vec<crate::exec::FactorIdx> = Vec::new();
- let mut matched_any = false;
+        let mut hop_outputs_for_this_input: Vec<crate::exec::FactorIdx> = Vec::new();
+        let mut matched_any = false;
 
- if min == 0 {
- // hop=0 — emit a leaf with the source itself as target (or
- // skip the target binding entirely under back_reference).
- let mut slots: Vec<Slot> = Vec::with_capacity(2);
- if let Some(name) = &rel_arc {
- slots.push(Slot {
- name: name.clone(),
- value: RuntimeValue::Null,
- });
- }
- if !back_reference {
- if let Some(RuntimeValue::Node(n)) = arena.lookup_binding(parent_leaf, source) {
- slots.push(Slot {
- name: target_arc.clone(),
- value: RuntimeValue::Node(n.clone()),
- });
- }
- }
- let zero_keeps = match existing_target_id {
- Some(existing) => starting == existing,
- None => true,
- };
- if zero_keeps {
- let new_idx = arena.push(parent_leaf, slots);
- hop_outputs_for_this_input.push(new_idx);
- matched_any = true;
- }
- }
+        if min == 0 {
+            // hop=0 — emit a leaf with the source itself as target (or
+            // skip the target binding entirely under back_reference).
+            let mut slots: Vec<Slot> = Vec::with_capacity(2);
+            if let Some(name) = &rel_arc {
+                slots.push(Slot {
+                    name: name.clone(),
+                    value: RuntimeValue::Null,
+                });
+            }
+            if !back_reference {
+                if let Some(RuntimeValue::Node(n)) = arena.lookup_binding(parent_leaf, source) {
+                    slots.push(Slot {
+                        name: target_arc.clone(),
+                        value: RuntimeValue::Node(n.clone()),
+                    });
+                }
+            }
+            let zero_keeps = match existing_target_id {
+                Some(existing) => starting == existing,
+                None => true,
+            };
+            if zero_keeps {
+                let new_idx = arena.push(parent_leaf, slots);
+                hop_outputs_for_this_input.push(new_idx);
+                matched_any = true;
+            }
+        }
 
- // Frontier holds (factor_idx_for_this_hop, tail_id). At each hop
- // we expand neighbours and push a new FactorNode under the prior
- // frontier entry, NOT under the original parent_leaf. That keeps
- // per-step bindings (rel and intermediate target_alias) attached
- // to the correct chain for variable-length paths.
- let mut frontier: Vec<(crate::exec::FactorIdx, NodeId)> = vec![(parent_leaf, starting)];
+        // Frontier holds (factor_idx_for_this_hop, tail_id). At each hop
+        // we expand neighbours and push a new FactorNode under the prior
+        // frontier entry, NOT under the original parent_leaf. That keeps
+        // per-step bindings (rel and intermediate target_alias) attached
+        // to the correct chain for variable-length paths.
+        let mut frontier: Vec<(crate::exec::FactorIdx, NodeId)> = vec![(parent_leaf, starting)];
 
- for hop in 1..=max {
- let mut next_frontier: Vec<(crate::exec::FactorIdx, NodeId)> = Vec::new();
- // Phase 1: pre-collect neighbours per frontier entry so the
- // batch prewarm below can populate L1 with one SST decode
- // (Fix #3b — same rationale as the flat path).
- let mut step_neighbours: Vec<((crate::exec::FactorIdx, NodeId), Vec<EdgeView>)> =
- Vec::with_capacity(frontier.len());
- let mut unique_targets: Vec<NodeId> = Vec::new();
- let mut seen_targets: std::collections::HashSet<NodeId> =
- std::collections::HashSet::new();
- for (cur_parent, tail) in frontier.drain(..) {
- let neighbours =
- neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
- .await?;
- if !back_reference && !skip_target_materialize {
- for edge in &neighbours {
- let tid = partner_id(edge, direction, tail);
- if seen_targets.insert(tid) {
- unique_targets.push(tid);
- }
- }
- }
- step_neighbours.push(((cur_parent, tail), neighbours));
- }
- // Phase 2: batch prewarm.
- if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
- if let Some(label) = target_label {
- let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
- }
- }
- for ((cur_parent, tail), neighbours) in step_neighbours {
- for edge in neighbours {
- let target_id = partner_id(&edge, direction, tail);
- let target_view_opt = if back_reference {
- None
- } else if skip_target_materialize {
- // Fix #3: transit-only binding, see flat-path comment.
- None
- } else if let Some(label) = target_label {
- match snapshot.lookup_node(label, target_id).await? {
- Some(v) => Some(v),
- None => continue,
- }
- } else {
- match scan_node_for_id(snapshot, target_id).await? {
- Some(v) => Some(v),
- None => continue,
- }
- };
- let mut slots: Vec<Slot> = Vec::with_capacity(2);
- if let Some(name) = &rel_arc {
- slots.push(Slot {
- name: name.clone(),
- value: RuntimeValue::Rel(Box::new(RelValue::from(edge))),
- });
- }
- if let Some(view) = target_view_opt {
- slots.push(Slot {
- name: target_arc.clone(),
- value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
- });
- } else if skip_target_materialize && !back_reference {
- // id-only stub for the next Expand's `.id` read.
- slots.push(Slot {
- name: target_arc.clone(),
- value: RuntimeValue::Node(Box::new(NodeValue {
- id: target_id,
- label: target_label.unwrap_or_default().to_string(),
- properties: std::collections::BTreeMap::new(),
- })),
- });
- }
- // One arena push per (parent, edge) pair. NO Row clone.
- let new_idx = arena.push(cur_parent, slots);
- next_frontier.push((new_idx, target_id));
- if hop >= min.max(1) {
- let keeps = match existing_target_id {
- Some(existing) => target_id == existing,
- None => true,
- };
- if keeps {
- hop_outputs_for_this_input.push(new_idx);
- matched_any = true;
- }
- }
- }
- }
- frontier = next_frontier;
- if frontier.is_empty() {
- break;
- }
- }
+        for hop in 1..=max {
+            let mut next_frontier: Vec<(crate::exec::FactorIdx, NodeId)> = Vec::new();
+            // Phase 1: pre-collect neighbours per frontier entry so the
+            // batch prewarm below can populate L1 with one SST decode
+            // (Fix #3b — same rationale as the flat path).
+            let mut step_neighbours: Vec<((crate::exec::FactorIdx, NodeId), Vec<EdgeView>)> =
+                Vec::with_capacity(frontier.len());
+            let mut unique_targets: Vec<NodeId> = Vec::new();
+            let mut seen_targets: std::collections::HashSet<NodeId> =
+                std::collections::HashSet::new();
+            for (cur_parent, tail) in frontier.drain(..) {
+                let neighbours =
+                    neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
+                        .await?;
+                if !back_reference && !skip_target_materialize {
+                    for edge in &neighbours {
+                        let tid = partner_id(edge, direction, tail);
+                        if seen_targets.insert(tid) {
+                            unique_targets.push(tid);
+                        }
+                    }
+                }
+                step_neighbours.push(((cur_parent, tail), neighbours));
+            }
+            // Phase 2: batch prewarm.
+            if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
+                if let Some(label) = target_label {
+                    let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
+                }
+            }
+            for ((cur_parent, tail), neighbours) in step_neighbours {
+                for edge in neighbours {
+                    let target_id = partner_id(&edge, direction, tail);
+                    let target_view_opt = if back_reference {
+                        None
+                    } else if skip_target_materialize {
+                        // Fix #3: transit-only binding, see flat-path comment.
+                        None
+                    } else if let Some(label) = target_label {
+                        match snapshot.lookup_node(label, target_id).await? {
+                            Some(v) => Some(v),
+                            None => continue,
+                        }
+                    } else {
+                        match scan_node_for_id(snapshot, target_id).await? {
+                            Some(v) => Some(v),
+                            None => continue,
+                        }
+                    };
+                    let mut slots: Vec<Slot> = Vec::with_capacity(2);
+                    if let Some(name) = &rel_arc {
+                        slots.push(Slot {
+                            name: name.clone(),
+                            value: RuntimeValue::Rel(Box::new(RelValue::from(edge))),
+                        });
+                    }
+                    if let Some(view) = target_view_opt {
+                        slots.push(Slot {
+                            name: target_arc.clone(),
+                            value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        });
+                    } else if skip_target_materialize && !back_reference {
+                        // id-only stub for the next Expand's `.id` read.
+                        slots.push(Slot {
+                            name: target_arc.clone(),
+                            value: RuntimeValue::Node(Box::new(NodeValue {
+                                id: target_id,
+                                label: target_label.unwrap_or_default().to_string(),
+                                properties: std::collections::BTreeMap::new(),
+                            })),
+                        });
+                    }
+                    // One arena push per (parent, edge) pair. NO Row clone.
+                    let new_idx = arena.push(cur_parent, slots);
+                    next_frontier.push((new_idx, target_id));
+                    if hop >= min.max(1) {
+                        let keeps = match existing_target_id {
+                            Some(existing) => target_id == existing,
+                            None => true,
+                        };
+                        if keeps {
+                            hop_outputs_for_this_input.push(new_idx);
+                            matched_any = true;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
 
- if matched_any {
- out_leaves.append(&mut hop_outputs_for_this_input);
- } else if optional {
- // Emit a leaf with NULL bindings for rel and target so OPTIONAL
- // MATCH semantics survive.
- let mut slots: Vec<Slot> = Vec::with_capacity(2);
- if let Some(name) = &rel_arc {
- slots.push(Slot {
- name: name.clone(),
- value: RuntimeValue::Null,
- });
- }
- if !back_reference {
- slots.push(Slot {
- name: target_arc.clone(),
- value: RuntimeValue::Null,
- });
- }
- out_leaves.push(arena.push(parent_leaf, slots));
- }
- }
+        if matched_any {
+            out_leaves.append(&mut hop_outputs_for_this_input);
+        } else if optional {
+            // Emit a leaf with NULL bindings for rel and target so OPTIONAL
+            // MATCH semantics survive.
+            let mut slots: Vec<Slot> = Vec::with_capacity(2);
+            if let Some(name) = &rel_arc {
+                slots.push(Slot {
+                    name: name.clone(),
+                    value: RuntimeValue::Null,
+                });
+            }
+            if !back_reference {
+                slots.push(Slot {
+                    name: target_arc.clone(),
+                    value: RuntimeValue::Null,
+                });
+            }
+            out_leaves.push(arena.push(parent_leaf, slots));
+        }
+    }
 
- Ok(FactorRowSet {
- arena,
- leaves: out_leaves,
- })
+    Ok(FactorRowSet {
+        arena,
+        leaves: out_leaves,
+    })
 }
 
 // Cross product of two factorised sets. RFC-017 §3.2.2.
@@ -2103,41 +2146,41 @@ async fn execute_expand_factor(
 // chain still has one parent — at the cost of materialising the right
 // row once per output leaf.
 fn cross_product_factor(left: FactorRowSet, right: FactorRowSet) -> FactorRowSet {
- if left.leaves.is_empty() || right.leaves.is_empty() {
- return FactorRowSet {
- arena: left.arena,
- leaves: Vec::new(),
- };
- }
- let FactorRowSet {
- mut arena,
- leaves: left_leaves,
- } = left;
+    if left.leaves.is_empty() || right.leaves.is_empty() {
+        return FactorRowSet {
+            arena: left.arena,
+            leaves: Vec::new(),
+        };
+    }
+    let FactorRowSet {
+        mut arena,
+        leaves: left_leaves,
+    } = left;
 
- let mut out_leaves = Vec::with_capacity(left_leaves.len() * right.leaves.len());
- for &l in &left_leaves {
- for &r in &right.leaves {
- let r_row = right.arena.materialize(r, None);
- let mut slots: Vec<Slot> = Vec::with_capacity(r_row.bindings.len());
- for (name, value) in r_row.bindings {
- // Skip names the left chain already binds — Cypher
- // cross-products only arise between disconnected pattern
- // parts, so the intersection should be empty, but be
- // defensive: `arena.lookup_binding` already returns the
- // ancestor value and shadowing would silently drop the
- // duplicate, so dropping here just avoids arena bloat.
- if arena.lookup_binding(l, &name).is_some() {
- continue;
- }
- slots.push(Slot::new(Arc::from(name.as_str()), value));
- }
- out_leaves.push(arena.push(l, slots));
- }
- }
- FactorRowSet {
- arena,
- leaves: out_leaves,
- }
+    let mut out_leaves = Vec::with_capacity(left_leaves.len() * right.leaves.len());
+    for &l in &left_leaves {
+        for &r in &right.leaves {
+            let r_row = right.arena.materialize(r, None);
+            let mut slots: Vec<Slot> = Vec::with_capacity(r_row.bindings.len());
+            for (name, value) in r_row.bindings {
+                // Skip names the left chain already binds — Cypher
+                // cross-products only arise between disconnected pattern
+                // parts, so the intersection should be empty, but be
+                // defensive: `arena.lookup_binding` already returns the
+                // ancestor value and shadowing would silently drop the
+                // duplicate, so dropping here just avoids arena bloat.
+                if arena.lookup_binding(l, &name).is_some() {
+                    continue;
+                }
+                slots.push(Slot::new(Arc::from(name.as_str()), value));
+            }
+            out_leaves.push(arena.push(l, slots));
+        }
+    }
+    FactorRowSet {
+        arena,
+        leaves: out_leaves,
+    }
 }
 
 // Hash join: build side materialises to flat (the hash table requires
@@ -2150,90 +2193,90 @@ fn cross_product_factor(left: FactorRowSet, right: FactorRowSet) -> FactorRowSet
 // referenced again) but do not appear in `out_leaves`.
 #[allow(clippy::too_many_arguments)]
 async fn hash_join_factor(
- build_plan: &LogicalPlan,
- probe_plan: &LogicalPlan,
- on: &[crate::plan::logical::JoinKey],
- residual: Option<&Expression>,
- snapshot: &Snapshot<'_>,
- params: &Params,
- outer: Option<&Row>,
- routing: &PlanRouting,
+    build_plan: &LogicalPlan,
+    probe_plan: &LogicalPlan,
+    on: &[crate::plan::logical::JoinKey],
+    residual: Option<&Expression>,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    outer: Option<&Row>,
+    routing: &PlanRouting,
 ) -> Result<FactorRowSet, ExecError> {
- // Build phase: execute factor, materialise, hash by build_side key.
- let build_set =
- execute_factor_inner_with_routing(build_plan, snapshot, params, outer, routing).await?;
- let build_rows = build_set.materialize_all(None);
- let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
- std::collections::HashMap::new();
- for row in build_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.build_side, &row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue;
- }
- table.entry(key).or_default().push(row);
- }
+    // Build phase: execute factor, materialise, hash by build_side key.
+    let build_set =
+        execute_factor_inner_with_routing(build_plan, snapshot, params, outer, routing).await?;
+    let build_rows = build_set.materialize_all(None);
+    let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
+        std::collections::HashMap::new();
+    for row in build_rows {
+        let mut key = Vec::with_capacity(on.len());
+        let mut has_null = false;
+        for jk in on {
+            let v = evaluate(&jk.build_side, &row, params)?;
+            if matches!(v, RuntimeValue::Null) {
+                has_null = true;
+                break;
+            }
+            key.push(fingerprint_value(&v));
+        }
+        if has_null {
+            continue;
+        }
+        table.entry(key).or_default().push(row);
+    }
 
- // Probe phase: stream factor, look up, emit per matched build row.
- let probe_set =
- execute_factor_inner_with_routing(probe_plan, snapshot, params, outer, routing).await?;
- let FactorRowSet {
- mut arena,
- leaves: probe_leaves,
- } = probe_set;
- let mut out_leaves = Vec::new();
- for probe_leaf in probe_leaves {
- let probe_row = arena.materialize(probe_leaf, None);
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.probe_side, &probe_row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue;
- }
- if let Some(matches) = table.get(&key) {
- for brow in matches {
- let mut slots: Vec<Slot> = Vec::with_capacity(brow.bindings.len());
- for (name, value) in &brow.bindings {
- if arena.lookup_binding(probe_leaf, name).is_some() {
- continue;
- }
- slots.push(Slot::new(Arc::from(name.as_str()), value.clone()));
- }
- let new_idx = arena.push(probe_leaf, slots);
- if let Some(res) = residual {
- let combined = arena.materialize(new_idx, None);
- if let RuntimeValue::Bool(true) = evaluate(res, &combined, params)? {
- out_leaves.push(new_idx);
- }
- // else: orphan node; arena holds it but we don't expose
- // a leaf to it. Acceptable for v0 — would matter only
- // for memory-bound queries that exercise this path
- // intensively.
- } else {
- out_leaves.push(new_idx);
- }
- }
- }
- }
- Ok(FactorRowSet {
- arena,
- leaves: out_leaves,
- })
+    // Probe phase: stream factor, look up, emit per matched build row.
+    let probe_set =
+        execute_factor_inner_with_routing(probe_plan, snapshot, params, outer, routing).await?;
+    let FactorRowSet {
+        mut arena,
+        leaves: probe_leaves,
+    } = probe_set;
+    let mut out_leaves = Vec::new();
+    for probe_leaf in probe_leaves {
+        let probe_row = arena.materialize(probe_leaf, None);
+        let mut key = Vec::with_capacity(on.len());
+        let mut has_null = false;
+        for jk in on {
+            let v = evaluate(&jk.probe_side, &probe_row, params)?;
+            if matches!(v, RuntimeValue::Null) {
+                has_null = true;
+                break;
+            }
+            key.push(fingerprint_value(&v));
+        }
+        if has_null {
+            continue;
+        }
+        if let Some(matches) = table.get(&key) {
+            for brow in matches {
+                let mut slots: Vec<Slot> = Vec::with_capacity(brow.bindings.len());
+                for (name, value) in &brow.bindings {
+                    if arena.lookup_binding(probe_leaf, name).is_some() {
+                        continue;
+                    }
+                    slots.push(Slot::new(Arc::from(name.as_str()), value.clone()));
+                }
+                let new_idx = arena.push(probe_leaf, slots);
+                if let Some(res) = residual {
+                    let combined = arena.materialize(new_idx, None);
+                    if let RuntimeValue::Bool(true) = evaluate(res, &combined, params)? {
+                        out_leaves.push(new_idx);
+                    }
+                // else: orphan node; arena holds it but we don't expose
+                // a leaf to it. Acceptable for v0 — would matter only
+                // for memory-bound queries that exercise this path
+                // intensively.
+                } else {
+                    out_leaves.push(new_idx);
+                }
+            }
+        }
+    }
+    Ok(FactorRowSet {
+        arena,
+        leaves: out_leaves,
+    })
 }
 
 // Hash semi-join: outer survives, inner is a set lookup. No bindings
@@ -2244,95 +2287,95 @@ async fn hash_join_factor(
 // `leaves` filtering. RFC-017 §3.2.3.
 #[allow(clippy::too_many_arguments)]
 async fn hash_semi_join_factor(
- outer_plan: &LogicalPlan,
- inner_plan: &LogicalPlan,
- on: &[crate::plan::logical::JoinKey],
- negated: bool,
- residual: Option<&Expression>,
- snapshot: &Snapshot<'_>,
- params: &Params,
- outer: Option<&Row>,
- routing: &PlanRouting,
+    outer_plan: &LogicalPlan,
+    inner_plan: &LogicalPlan,
+    on: &[crate::plan::logical::JoinKey],
+    negated: bool,
+    residual: Option<&Expression>,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    outer: Option<&Row>,
+    routing: &PlanRouting,
 ) -> Result<FactorRowSet, ExecError> {
- // Build inner: factor → materialise → hash by build_side.
- let inner_set =
- execute_factor_inner_with_routing(inner_plan, snapshot, params, outer, routing).await?;
- let inner_rows = inner_set.materialize_all(None);
- let mut key_set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
- let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
- std::collections::HashMap::new();
- for row in inner_rows {
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.build_side, &row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- if has_null {
- continue;
- }
- if residual.is_some() {
- residual_index.entry(key.clone()).or_default().push(row);
- }
- key_set.insert(key);
- }
+    // Build inner: factor → materialise → hash by build_side.
+    let inner_set =
+        execute_factor_inner_with_routing(inner_plan, snapshot, params, outer, routing).await?;
+    let inner_rows = inner_set.materialize_all(None);
+    let mut key_set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
+        std::collections::HashMap::new();
+    for row in inner_rows {
+        let mut key = Vec::with_capacity(on.len());
+        let mut has_null = false;
+        for jk in on {
+            let v = evaluate(&jk.build_side, &row, params)?;
+            if matches!(v, RuntimeValue::Null) {
+                has_null = true;
+                break;
+            }
+            key.push(fingerprint_value(&v));
+        }
+        if has_null {
+            continue;
+        }
+        if residual.is_some() {
+            residual_index.entry(key.clone()).or_default().push(row);
+        }
+        key_set.insert(key);
+    }
 
- // Probe outer: factor stream, retain leaf iff truth table says so.
- let outer_set =
- execute_factor_inner_with_routing(outer_plan, snapshot, params, outer, routing).await?;
- let FactorRowSet {
- arena,
- leaves: outer_leaves,
- } = outer_set;
- let mut out_leaves = Vec::with_capacity(outer_leaves.len());
- for outer_leaf in outer_leaves {
- let outer_row = arena.materialize(outer_leaf, None);
- let mut key = Vec::with_capacity(on.len());
- let mut has_null = false;
- for jk in on {
- let v = evaluate(&jk.probe_side, &outer_row, params)?;
- if matches!(v, RuntimeValue::Null) {
- has_null = true;
- break;
- }
- key.push(fingerprint_value(&v));
- }
- let matched = if has_null {
- false
- } else if let Some(res) = residual {
- match residual_index.get(&key) {
- Some(irows) => {
- let mut any = false;
- for irow in irows {
- let mut combined = irow.clone();
- for (k, v) in &outer_row.bindings {
- combined.bindings.insert(k.clone(), v.clone());
- }
- if let RuntimeValue::Bool(true) = evaluate(res, &combined, params)? {
- any = true;
- break;
- }
- }
- any
- }
- None => false,
- }
- } else {
- key_set.contains(&key)
- };
- let keep = if negated { !matched } else { matched };
- if keep {
- out_leaves.push(outer_leaf);
- }
- }
- Ok(FactorRowSet {
- arena,
- leaves: out_leaves,
- })
+    // Probe outer: factor stream, retain leaf iff truth table says so.
+    let outer_set =
+        execute_factor_inner_with_routing(outer_plan, snapshot, params, outer, routing).await?;
+    let FactorRowSet {
+        arena,
+        leaves: outer_leaves,
+    } = outer_set;
+    let mut out_leaves = Vec::with_capacity(outer_leaves.len());
+    for outer_leaf in outer_leaves {
+        let outer_row = arena.materialize(outer_leaf, None);
+        let mut key = Vec::with_capacity(on.len());
+        let mut has_null = false;
+        for jk in on {
+            let v = evaluate(&jk.probe_side, &outer_row, params)?;
+            if matches!(v, RuntimeValue::Null) {
+                has_null = true;
+                break;
+            }
+            key.push(fingerprint_value(&v));
+        }
+        let matched = if has_null {
+            false
+        } else if let Some(res) = residual {
+            match residual_index.get(&key) {
+                Some(irows) => {
+                    let mut any = false;
+                    for irow in irows {
+                        let mut combined = irow.clone();
+                        for (k, v) in &outer_row.bindings {
+                            combined.bindings.insert(k.clone(), v.clone());
+                        }
+                        if let RuntimeValue::Bool(true) = evaluate(res, &combined, params)? {
+                            any = true;
+                            break;
+                        }
+                    }
+                    any
+                }
+                None => false,
+            }
+        } else {
+            key_set.contains(&key)
+        };
+        let keep = if negated { !matched } else { matched };
+        if keep {
+            out_leaves.push(outer_leaf);
+        }
+    }
+    Ok(FactorRowSet {
+        arena,
+        leaves: out_leaves,
+    })
 }
 
 // Helper: collect the set of variable bindings an Expression
@@ -2345,88 +2388,88 @@ async fn hash_semi_join_factor(
 // `execute_factor_inner`, not by the sink. `Star` and `Parameter` and
 // `Literal` similarly read no host binding.
 fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
- use crate::parser::ExpressionKind;
- match &expr.kind {
- ExpressionKind::Variable(ident) => {
- out.insert(ident.name.to_string());
- }
- ExpressionKind::Property(pa) => {
- collect_referenced_variables(&pa.target, out);
- }
- ExpressionKind::Index { target, index } => {
- collect_referenced_variables(target, out);
- collect_referenced_variables(index, out);
- }
- ExpressionKind::Range { target, from, to } => {
- collect_referenced_variables(target, out);
- if let Some(e) = from {
- collect_referenced_variables(e, out);
- }
- if let Some(e) = to {
- collect_referenced_variables(e, out);
- }
- }
- ExpressionKind::Unary { expr, .. } => collect_referenced_variables(expr, out),
- ExpressionKind::Binary { left, right, .. } => {
- collect_referenced_variables(left, out);
- collect_referenced_variables(right, out);
- }
- ExpressionKind::In { item, list } => {
- collect_referenced_variables(item, out);
- collect_referenced_variables(list, out);
- }
- ExpressionKind::Between { target, low, high } => {
- collect_referenced_variables(target, out);
- collect_referenced_variables(low, out);
- collect_referenced_variables(high, out);
- }
- ExpressionKind::StringTest {
- target, pattern, ..
- } => {
- collect_referenced_variables(target, out);
- collect_referenced_variables(pattern, out);
- }
- ExpressionKind::IsNull { expr, .. } => collect_referenced_variables(expr, out),
- ExpressionKind::FunctionCall { args, .. } => {
- for arg in args {
- collect_referenced_variables(arg, out);
- }
- }
- ExpressionKind::Case {
- scrutinee,
- branches,
- otherwise,
- } => {
- if let Some(s) = scrutinee {
- collect_referenced_variables(s, out);
- }
- for b in branches {
- collect_referenced_variables(&b.when, out);
- collect_referenced_variables(&b.then, out);
- }
- if let Some(o) = otherwise {
- collect_referenced_variables(o, out);
- }
- }
- ExpressionKind::List(items) => {
- for e in items {
- collect_referenced_variables(e, out);
- }
- }
- ExpressionKind::Map(map) => {
- for (_k, v) in &map.entries {
- collect_referenced_variables(v, out);
- }
- }
- // Closed pattern forms — the binding reads they perform live
- // inside their own sub-plan, not in the host expression.
- ExpressionKind::Exists(_)
- | ExpressionKind::ListComprehension(_)
- | ExpressionKind::PatternComprehension(_)
- | ExpressionKind::Literal(_)
- | ExpressionKind::Parameter(_)
- | ExpressionKind::Star => {}
- }
+    use crate::parser::ExpressionKind;
+    match &expr.kind {
+        ExpressionKind::Variable(ident) => {
+            out.insert(ident.name.to_string());
+        }
+        ExpressionKind::Property(pa) => {
+            collect_referenced_variables(&pa.target, out);
+        }
+        ExpressionKind::Index { target, index } => {
+            collect_referenced_variables(target, out);
+            collect_referenced_variables(index, out);
+        }
+        ExpressionKind::Range { target, from, to } => {
+            collect_referenced_variables(target, out);
+            if let Some(e) = from {
+                collect_referenced_variables(e, out);
+            }
+            if let Some(e) = to {
+                collect_referenced_variables(e, out);
+            }
+        }
+        ExpressionKind::Unary { expr, .. } => collect_referenced_variables(expr, out),
+        ExpressionKind::Binary { left, right, .. } => {
+            collect_referenced_variables(left, out);
+            collect_referenced_variables(right, out);
+        }
+        ExpressionKind::In { item, list } => {
+            collect_referenced_variables(item, out);
+            collect_referenced_variables(list, out);
+        }
+        ExpressionKind::Between { target, low, high } => {
+            collect_referenced_variables(target, out);
+            collect_referenced_variables(low, out);
+            collect_referenced_variables(high, out);
+        }
+        ExpressionKind::StringTest {
+            target, pattern, ..
+        } => {
+            collect_referenced_variables(target, out);
+            collect_referenced_variables(pattern, out);
+        }
+        ExpressionKind::IsNull { expr, .. } => collect_referenced_variables(expr, out),
+        ExpressionKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_referenced_variables(arg, out);
+            }
+        }
+        ExpressionKind::Case {
+            scrutinee,
+            branches,
+            otherwise,
+        } => {
+            if let Some(s) = scrutinee {
+                collect_referenced_variables(s, out);
+            }
+            for b in branches {
+                collect_referenced_variables(&b.when, out);
+                collect_referenced_variables(&b.then, out);
+            }
+            if let Some(o) = otherwise {
+                collect_referenced_variables(o, out);
+            }
+        }
+        ExpressionKind::List(items) => {
+            for e in items {
+                collect_referenced_variables(e, out);
+            }
+        }
+        ExpressionKind::Map(map) => {
+            for (_k, v) in &map.entries {
+                collect_referenced_variables(v, out);
+            }
+        }
+        // Closed pattern forms — the binding reads they perform live
+        // inside their own sub-plan, not in the host expression.
+        ExpressionKind::Exists(_)
+        | ExpressionKind::ListComprehension(_)
+        | ExpressionKind::PatternComprehension(_)
+        | ExpressionKind::Literal(_)
+        | ExpressionKind::Parameter(_)
+        | ExpressionKind::Star => {}
+    }
 }
 
 // ─────────────────── Plan-aware routing ─────────────────────
@@ -2459,236 +2502,236 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
 // that *is* of the expected label.
 #[derive(Debug, Default)]
 pub(crate) struct PlanRouting {
- referenced_aliases: BTreeSet<String>,
+    referenced_aliases: BTreeSet<String>,
 }
 
 impl PlanRouting {
- pub(crate) fn analyze(plan: &LogicalPlan) -> Self {
- let mut refs: BTreeSet<String> = BTreeSet::new();
- collect_plan_referenced_variables(plan, &mut refs);
- Self {
- referenced_aliases: refs,
- }
- }
+    pub(crate) fn analyze(plan: &LogicalPlan) -> Self {
+        let mut refs: BTreeSet<String> = BTreeSet::new();
+        collect_plan_referenced_variables(plan, &mut refs);
+        Self {
+            referenced_aliases: refs,
+        }
+    }
 
- pub(crate) fn needs_properties(&self, rel_alias: Option<&str>) -> bool {
- match rel_alias {
- None => false,
- Some(a) => self.referenced_aliases.contains(a),
- }
- }
+    pub(crate) fn needs_properties(&self, rel_alias: Option<&str>) -> bool {
+        match rel_alias {
+            None => false,
+            Some(a) => self.referenced_aliases.contains(a),
+        }
+    }
 
- /// `true` ⇔ `alias` is read anywhere in the plan — RETURN, WHERE,
- /// ORDER BY, projection, join keys, aggregation args, etc. Bare
- /// `Variable(alias)` and `Property(alias, k)` both count.
- ///
- /// An Expand whose `target_alias` returns `false` here is "transit
- /// only": the next Expand reads its `.id`, nothing else, so we can
- /// skip materialising the NodeView entirely (Fix #3).
- pub(crate) fn references(&self, alias: &str) -> bool {
- self.referenced_aliases.contains(alias)
- }
+    /// `true` ⇔ `alias` is read anywhere in the plan — RETURN, WHERE,
+    /// ORDER BY, projection, join keys, aggregation args, etc. Bare
+    /// `Variable(alias)` and `Property(alias, k)` both count.
+    ///
+    /// An Expand whose `target_alias` returns `false` here is "transit
+    /// only": the next Expand reads its `.id`, nothing else, so we can
+    /// skip materialising the NodeView entirely (Fix #3).
+    pub(crate) fn references(&self, alias: &str) -> bool {
+        self.referenced_aliases.contains(alias)
+    }
 }
 
 fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
- use crate::plan::logical::{AggregateExpr, CreateElement, RemoveOp};
+    use crate::plan::logical::{AggregateExpr, CreateElement, RemoveOp};
 
- match plan {
- LogicalPlan::Filter { predicate, .. } => {
- collect_referenced_variables(predicate, out);
- }
- LogicalPlan::Project { items, .. } => {
- for it in items {
- collect_referenced_variables(&it.expression, out);
- }
- }
- LogicalPlan::TopN { keys, .. } => {
- for k in keys {
- collect_referenced_variables(&k.expression, out);
- }
- }
- LogicalPlan::Aggregate {
- group_by,
- aggregations,
- ..
- } => {
- for (e, _alias) in group_by {
- collect_referenced_variables(e, out);
- }
- for (_alias, agg) in aggregations {
- match agg {
- AggregateExpr::Count { arg: Some(e), .. }
- | AggregateExpr::Sum { arg: e, .. }
- | AggregateExpr::Avg { arg: e, .. }
- | AggregateExpr::Min { arg: e }
- | AggregateExpr::Max { arg: e }
- | AggregateExpr::Collect { arg: e, .. } => {
- collect_referenced_variables(e, out);
- }
- AggregateExpr::Count { arg: None, .. } => {}
- }
- }
- }
- LogicalPlan::NodeById { id, .. } => {
- collect_referenced_variables(id, out);
- }
- LogicalPlan::NodeByPropertyValue { value, .. } => {
- collect_referenced_variables(value, out);
- }
- LogicalPlan::Unwind { list, .. } => {
- collect_referenced_variables(list, out);
- }
- LogicalPlan::HashJoin { on, residual, .. } => {
- for k in on {
- collect_referenced_variables(&k.build_side, out);
- collect_referenced_variables(&k.probe_side, out);
- }
- if let Some(r) = residual {
- collect_referenced_variables(r, out);
- }
- }
- LogicalPlan::HashSemiJoin { on, residual, .. } => {
- for k in on {
- collect_referenced_variables(&k.build_side, out);
- collect_referenced_variables(&k.probe_side, out);
- }
- if let Some(r) = residual {
- collect_referenced_variables(r, out);
- }
- }
- LogicalPlan::PatternList { projection, .. } => {
- collect_referenced_variables(projection, out);
- }
- LogicalPlan::Create { elements, .. } => {
- for el in elements {
- match el {
- CreateElement::Node { properties, .. }
- | CreateElement::Rel { properties, .. } => {
- for (_k, e) in properties {
- collect_referenced_variables(e, out);
- }
- }
- }
- }
- }
- LogicalPlan::Merge {
- pattern,
- on_match_sets,
- on_create_sets,
- ..
- } => {
- for el in pattern {
- match el {
- CreateElement::Node { properties, .. }
- | CreateElement::Rel { properties, .. } => {
- for (_k, e) in properties {
- collect_referenced_variables(e, out);
- }
- }
- }
- }
- for s in on_match_sets.iter().chain(on_create_sets.iter()) {
- visit_set_op(s, out);
- }
- }
- LogicalPlan::Set { items, .. } => {
- for s in items {
- visit_set_op(s, out);
- }
- }
- LogicalPlan::Remove { items, .. } => {
- for r in items {
- match r {
- RemoveOp::Property { target_alias, .. }
- | RemoveOp::Labels { target_alias, .. } => {
- out.insert(target_alias.clone());
- }
- }
- }
- }
- LogicalPlan::Delete { targets, .. } => {
- for e in targets {
- collect_referenced_variables(e, out);
- }
- }
- LogicalPlan::Expand { .. }
- | LogicalPlan::Distinct { .. }
- | LogicalPlan::Union { .. }
- | LogicalPlan::CrossProduct { .. }
- | LogicalPlan::SemiApply { .. }
- | LogicalPlan::NodeScan { .. }
- | LogicalPlan::Empty
- | LogicalPlan::Argument { .. } => {}
- }
+    match plan {
+        LogicalPlan::Filter { predicate, .. } => {
+            collect_referenced_variables(predicate, out);
+        }
+        LogicalPlan::Project { items, .. } => {
+            for it in items {
+                collect_referenced_variables(&it.expression, out);
+            }
+        }
+        LogicalPlan::TopN { keys, .. } => {
+            for k in keys {
+                collect_referenced_variables(&k.expression, out);
+            }
+        }
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregations,
+            ..
+        } => {
+            for (e, _alias) in group_by {
+                collect_referenced_variables(e, out);
+            }
+            for (_alias, agg) in aggregations {
+                match agg {
+                    AggregateExpr::Count { arg: Some(e), .. }
+                    | AggregateExpr::Sum { arg: e, .. }
+                    | AggregateExpr::Avg { arg: e, .. }
+                    | AggregateExpr::Min { arg: e }
+                    | AggregateExpr::Max { arg: e }
+                    | AggregateExpr::Collect { arg: e, .. } => {
+                        collect_referenced_variables(e, out);
+                    }
+                    AggregateExpr::Count { arg: None, .. } => {}
+                }
+            }
+        }
+        LogicalPlan::NodeById { id, .. } => {
+            collect_referenced_variables(id, out);
+        }
+        LogicalPlan::NodeByPropertyValue { value, .. } => {
+            collect_referenced_variables(value, out);
+        }
+        LogicalPlan::Unwind { list, .. } => {
+            collect_referenced_variables(list, out);
+        }
+        LogicalPlan::HashJoin { on, residual, .. } => {
+            for k in on {
+                collect_referenced_variables(&k.build_side, out);
+                collect_referenced_variables(&k.probe_side, out);
+            }
+            if let Some(r) = residual {
+                collect_referenced_variables(r, out);
+            }
+        }
+        LogicalPlan::HashSemiJoin { on, residual, .. } => {
+            for k in on {
+                collect_referenced_variables(&k.build_side, out);
+                collect_referenced_variables(&k.probe_side, out);
+            }
+            if let Some(r) = residual {
+                collect_referenced_variables(r, out);
+            }
+        }
+        LogicalPlan::PatternList { projection, .. } => {
+            collect_referenced_variables(projection, out);
+        }
+        LogicalPlan::Create { elements, .. } => {
+            for el in elements {
+                match el {
+                    CreateElement::Node { properties, .. }
+                    | CreateElement::Rel { properties, .. } => {
+                        for (_k, e) in properties {
+                            collect_referenced_variables(e, out);
+                        }
+                    }
+                }
+            }
+        }
+        LogicalPlan::Merge {
+            pattern,
+            on_match_sets,
+            on_create_sets,
+            ..
+        } => {
+            for el in pattern {
+                match el {
+                    CreateElement::Node { properties, .. }
+                    | CreateElement::Rel { properties, .. } => {
+                        for (_k, e) in properties {
+                            collect_referenced_variables(e, out);
+                        }
+                    }
+                }
+            }
+            for s in on_match_sets.iter().chain(on_create_sets.iter()) {
+                visit_set_op(s, out);
+            }
+        }
+        LogicalPlan::Set { items, .. } => {
+            for s in items {
+                visit_set_op(s, out);
+            }
+        }
+        LogicalPlan::Remove { items, .. } => {
+            for r in items {
+                match r {
+                    RemoveOp::Property { target_alias, .. }
+                    | RemoveOp::Labels { target_alias, .. } => {
+                        out.insert(target_alias.clone());
+                    }
+                }
+            }
+        }
+        LogicalPlan::Delete { targets, .. } => {
+            for e in targets {
+                collect_referenced_variables(e, out);
+            }
+        }
+        LogicalPlan::Expand { .. }
+        | LogicalPlan::Distinct { .. }
+        | LogicalPlan::Union { .. }
+        | LogicalPlan::CrossProduct { .. }
+        | LogicalPlan::SemiApply { .. }
+        | LogicalPlan::NodeScan { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::Argument { .. } => {}
+    }
 
- for child in plan.children() {
- collect_plan_referenced_variables(child, out);
- }
+    for child in plan.children() {
+        collect_plan_referenced_variables(child, out);
+    }
 }
 
 fn visit_set_op(s: &crate::plan::logical::SetOp, out: &mut BTreeSet<String>) {
- use crate::plan::logical::SetOp;
- match s {
- SetOp::Property {
- target_alias,
- value,
- ..
- }
- | SetOp::Replace {
- target_alias,
- value,
- }
- | SetOp::Merge {
- target_alias,
- value,
- } => {
- out.insert(target_alias.clone());
- collect_referenced_variables(value, out);
- }
- SetOp::Labels { target_alias, .. } => {
- out.insert(target_alias.clone());
- }
- }
+    use crate::plan::logical::SetOp;
+    match s {
+        SetOp::Property {
+            target_alias,
+            value,
+            ..
+        }
+        | SetOp::Replace {
+            target_alias,
+            value,
+        }
+        | SetOp::Merge {
+            target_alias,
+            value,
+        } => {
+            out.insert(target_alias.clone());
+            collect_referenced_variables(value, out);
+        }
+        SetOp::Labels { target_alias, .. } => {
+            out.insert(target_alias.clone());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
- use super::*;
- use namidb_core::id::NodeId;
+    use super::*;
+    use namidb_core::id::NodeId;
 
- #[test]
- fn node_id_from_string_value() {
- let id = NodeId::new();
- let v = RuntimeValue::String(id.to_string());
- let parsed = node_id_from_value(&v, SourceSpan::point(0)).unwrap();
- assert_eq!(parsed, id);
- }
+    #[test]
+    fn node_id_from_string_value() {
+        let id = NodeId::new();
+        let v = RuntimeValue::String(id.to_string());
+        let parsed = node_id_from_value(&v, SourceSpan::point(0)).unwrap();
+        assert_eq!(parsed, id);
+    }
 
- #[test]
- fn node_id_from_non_uuid_string_errors() {
- let v = RuntimeValue::String("not-a-uuid".into());
- let err = node_id_from_value(&v, SourceSpan::point(0)).unwrap_err();
- assert!(matches!(err, ExecError::Eval(_)));
- }
+    #[test]
+    fn node_id_from_non_uuid_string_errors() {
+        let v = RuntimeValue::String("not-a-uuid".into());
+        let err = node_id_from_value(&v, SourceSpan::point(0)).unwrap_err();
+        assert!(matches!(err, ExecError::Eval(_)));
+    }
 
- #[test]
- fn fingerprint_distinguishes_distinct_values() {
- let a = fingerprint_value(&RuntimeValue::Integer(1));
- let b = fingerprint_value(&RuntimeValue::Integer(2));
- let c = fingerprint_value(&RuntimeValue::String("1".into()));
- assert_ne!(a, b);
- assert_ne!(a, c);
- }
+    #[test]
+    fn fingerprint_distinguishes_distinct_values() {
+        let a = fingerprint_value(&RuntimeValue::Integer(1));
+        let b = fingerprint_value(&RuntimeValue::Integer(2));
+        let c = fingerprint_value(&RuntimeValue::String("1".into()));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
 
- #[test]
- fn sum_integers_yields_integer() {
- let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Integer(2)]).unwrap();
- assert_eq!(v, RuntimeValue::Integer(3));
- }
+    #[test]
+    fn sum_integers_yields_integer() {
+        let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Integer(2)]).unwrap();
+        assert_eq!(v, RuntimeValue::Integer(3));
+    }
 
- #[test]
- fn sum_mixed_promotes_to_float() {
- let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Float(2.5)]).unwrap();
- assert_eq!(v, RuntimeValue::Float(3.5));
- }
+    #[test]
+    fn sum_mixed_promotes_to_float() {
+        let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Float(2.5)]).unwrap();
+        assert_eq!(v, RuntimeValue::Float(3.5));
+    }
 }

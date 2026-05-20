@@ -525,7 +525,9 @@ fn snap_borrow_check(_snap: &Snapshot<'_>) {
 fn filter_directly_over_nodescan(plan: &LogicalPlan, target_label: &str) -> Option<String> {
     match plan {
         LogicalPlan::Filter { input, .. } => match input.as_ref() {
-            LogicalPlan::NodeScan { label, alias, .. } if label.as_deref() == Some(target_label) => {
+            LogicalPlan::NodeScan { label, alias, .. }
+                if label.as_deref() == Some(target_label) =>
+            {
                 Some(alias.clone())
             }
             _ => filter_directly_over_nodescan(input, target_label),
@@ -1568,9 +1570,10 @@ async fn join_reorder_swaps_to_smaller_build_when_predicate_shrinks_probe() {
     // a is Person (6 rows). b is Person (6 rows). Predicate a.firstName=
     // 'Alice' reduces a's estimate sharply (1/ndv ≈ 1). The HashJoin
     // should pick `a` as build.
-    let q =
-        parse("MATCH (a:Person), (b:Person) WHERE a.firstName = 'Alice' AND a._id = b._id RETURN a")
-            .unwrap();
+    let q = parse(
+        "MATCH (a:Person), (b:Person) WHERE a.firstName = 'Alice' AND a._id = b._id RETURN a",
+    )
+    .unwrap();
     let plan = build_plan(&q, &catalog).unwrap();
 
     // Walk to find the HashJoin and check that the build alias is `a`.

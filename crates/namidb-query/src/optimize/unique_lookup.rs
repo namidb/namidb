@@ -43,9 +43,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             } = input.as_ref()
             {
                 if predicates.is_empty() && projection.is_none() {
-                    if let Some((prop, value_expr)) =
-                        extract_eq_on_prop(&predicate, alias)
-                    {
+                    if let Some((prop, value_expr)) = extract_eq_on_prop(&predicate, alias) {
                         if catalog
                             .label(label)
                             .and_then(|l| l.properties.get(&prop))

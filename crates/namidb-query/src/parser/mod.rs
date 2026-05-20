@@ -28,17 +28,17 @@ pub use lexer::{lex, Spanned, Token};
 /// On success returns `Ok(Query)`. On failure returns `Err(Vec<ParseError>)`
 /// where the vector is guaranteed to be non-empty.
 pub fn parse(src: &str) -> ParseResult<Query> {
- let tokens = lex(src).map_err(|e| vec![e])?;
- grammar::parse_query(src, tokens)
+    let tokens = lex(src).map_err(|e| vec![e])?;
+    grammar::parse_query(src, tokens)
 }
 
 #[cfg(test)]
 mod tests {
- use super::*;
+    use super::*;
 
- #[test]
- fn empty_input_is_an_error() {
- let result = parse("");
- assert!(result.is_err());
- }
+    #[test]
+    fn empty_input_is_an_error() {
+        let result = parse("");
+        assert!(result.is_err());
+    }
 }

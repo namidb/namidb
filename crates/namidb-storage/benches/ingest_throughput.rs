@@ -49,17 +49,17 @@ const DEFAULT_NODES: u64 = 1_000_000;
 const DEFAULT_BATCH_COMMIT: u64 = 10_000;
 
 fn nodes_count() -> u64 {
- std::env::var("BENCH_NODES")
- .ok()
- .and_then(|s| s.parse().ok())
- .unwrap_or(DEFAULT_NODES)
+    std::env::var("BENCH_NODES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NODES)
 }
 
 fn batch_commit_size() -> u64 {
- std::env::var("BENCH_BATCH_COMMIT")
- .ok()
- .and_then(|s| s.parse().ok())
- .unwrap_or(DEFAULT_BATCH_COMMIT)
+    std::env::var("BENCH_BATCH_COMMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BATCH_COMMIT)
 }
 
 /// Install `aws-lc-rs` as the rustls crypto provider. Idempotent —
@@ -67,121 +67,121 @@ fn batch_commit_size() -> u64 {
 /// intentionally ignore. Required when targeting Cloudflare R2; harmless
 /// for LocalStack / inmemory.
 fn install_rustls_provider() {
- let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 fn build_store() -> (Arc<dyn ObjectStore>, String) {
- install_rustls_provider();
- let mode = std::env::var("BENCH_STORE").unwrap_or_else(|_| "inmemory".into());
- match mode.as_str() {
- "s3" => {
- let bucket = std::env::var("NAMIDB_TEST_BUCKET")
- .expect("BENCH_STORE=s3 requires NAMIDB_TEST_BUCKET");
- let s3 = AmazonS3Builder::from_env()
- .with_bucket_name(&bucket)
- .build()
- .expect("AmazonS3 client must build from env");
- (Arc::new(s3), format!("s3://{bucket}"))
- }
- "inmemory" | "" => (Arc::new(InMemory::new()), "inmemory://".into()),
- other => panic!("unknown BENCH_STORE='{other}' (want 'inmemory' or 's3')"),
- }
+    install_rustls_provider();
+    let mode = std::env::var("BENCH_STORE").unwrap_or_else(|_| "inmemory".into());
+    match mode.as_str() {
+        "s3" => {
+            let bucket = std::env::var("NAMIDB_TEST_BUCKET")
+                .expect("BENCH_STORE=s3 requires NAMIDB_TEST_BUCKET");
+            let s3 = AmazonS3Builder::from_env()
+                .with_bucket_name(&bucket)
+                .build()
+                .expect("AmazonS3 client must build from env");
+            (Arc::new(s3), format!("s3://{bucket}"))
+        }
+        "inmemory" | "" => (Arc::new(InMemory::new()), "inmemory://".into()),
+        other => panic!("unknown BENCH_STORE='{other}' (want 'inmemory' or 's3')"),
+    }
 }
 
 fn synth_node_id(i: u64) -> NodeId {
- let mut bytes = [0u8; 16];
- bytes[8..].copy_from_slice(&i.to_be_bytes());
- NodeId::from_uuid(Uuid::from_bytes(bytes))
+    let mut bytes = [0u8; 16];
+    bytes[8..].copy_from_slice(&i.to_be_bytes());
+    NodeId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 fn synth_record(i: u64) -> NodeWriteRecord {
- let mut props = std::collections::BTreeMap::new();
- props.insert("name".into(), Value::Str(format!("user-{i}")));
- props.insert("age".into(), Value::I64((i % 100) as i64));
- NodeWriteRecord {
- properties: props,
- schema_version: 1,
- }
+    let mut props = std::collections::BTreeMap::new();
+    props.insert("name".into(), Value::Str(format!("user-{i}")));
+    props.insert("age".into(), Value::I64((i % 100) as i64));
+    NodeWriteRecord {
+        properties: props,
+        schema_version: 1,
+    }
 }
 
 fn person_label() -> LabelDef {
- LabelDef {
- name: "Person".into(),
- properties: vec![
- PropertyDef::new("name", DataType::Utf8, false).unwrap(),
- PropertyDef::new("age", DataType::Int32, true).unwrap(),
- ],
- }
+    LabelDef {
+        name: "Person".into(),
+        properties: vec![
+            PropertyDef::new("name", DataType::Utf8, false).unwrap(),
+            PropertyDef::new("age", DataType::Int32, true).unwrap(),
+        ],
+    }
 }
 
 /// Run one full ingest cycle and return the elapsed wall-clock time.
 async fn ingest_once(node_count: u64, commit_every: u64) -> Duration {
- let (store, backend) = build_store();
- let unique = Uuid::now_v7().simple().to_string();
- let ns = format!("it-{}", &unique[..16]);
- eprintln!(
- "[ingest] backend={} ns={} nodes={} commit_every={}",
- backend, ns, node_count, commit_every
- );
- let paths = NamespacePaths::new("bench", NamespaceId::new(&ns).unwrap());
- let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+    let (store, backend) = build_store();
+    let unique = Uuid::now_v7().simple().to_string();
+    let ns = format!("it-{}", &unique[..16]);
+    eprintln!(
+        "[ingest] backend={} ns={} nodes={} commit_every={}",
+        backend, ns, node_count, commit_every
+    );
+    let paths = NamespacePaths::new("bench", NamespaceId::new(&ns).unwrap());
+    let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
- let mut writer = WriterSession::open(store, paths)
- .await
- .expect("WriterSession::open");
+    let mut writer = WriterSession::open(store, paths)
+        .await
+        .expect("WriterSession::open");
 
- let start = Instant::now();
- let commit_every = commit_every.max(1);
- for i in 0..node_count {
- let id = synth_node_id(i);
- let record = synth_record(i);
- writer.upsert_node("Person", id, &record).expect("upsert");
- if (i + 1) % commit_every == 0 {
- writer.commit_batch().await.expect("commit_batch");
- }
- }
- if writer.pending_len() > 0 {
- writer.commit_batch().await.expect("commit_batch tail");
- }
- let _outcome = writer.flush(schema).await.expect("flush");
- start.elapsed()
+    let start = Instant::now();
+    let commit_every = commit_every.max(1);
+    for i in 0..node_count {
+        let id = synth_node_id(i);
+        let record = synth_record(i);
+        writer.upsert_node("Person", id, &record).expect("upsert");
+        if (i + 1) % commit_every == 0 {
+            writer.commit_batch().await.expect("commit_batch");
+        }
+    }
+    if writer.pending_len() > 0 {
+        writer.commit_batch().await.expect("commit_batch tail");
+    }
+    let _outcome = writer.flush(schema).await.expect("flush");
+    start.elapsed()
 }
 
 fn rt() -> Runtime {
- // Multi-thread runtime with 2 workers so this bench is directly
- // comparable to `concurrent_mix.rs`. The single-threaded current-
- // thread runtime previously used here was ~3 × slower under the
- // same workload, which made the "isolated vs concurrent" comparison
- // misleading.
- tokio::runtime::Builder::new_multi_thread()
- .worker_threads(2)
- .enable_all()
- .build()
- .unwrap()
+    // Multi-thread runtime with 2 workers so this bench is directly
+    // comparable to `concurrent_mix.rs`. The single-threaded current-
+    // thread runtime previously used here was ~3 × slower under the
+    // same workload, which made the "isolated vs concurrent" comparison
+    // misleading.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 fn bench_ingest(c: &mut Criterion) {
- let total = nodes_count();
- let commit_every = batch_commit_size();
+    let total = nodes_count();
+    let commit_every = batch_commit_size();
 
- let mut group = c.benchmark_group("writer_session/ingest");
- // Throughput tests want few-but-long samples, not 50 short ones.
- group.sample_size(10);
- group.measurement_time(Duration::from_secs(120));
- group.throughput(Throughput::Elements(total));
+    let mut group = c.benchmark_group("writer_session/ingest");
+    // Throughput tests want few-but-long samples, not 50 short ones.
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(120));
+    group.throughput(Throughput::Elements(total));
 
- group.bench_function("upsert_commit_flush", |b| {
- b.iter_custom(|iters| {
- let runtime = rt();
- let mut acc = Duration::ZERO;
- for _ in 0..iters {
- acc += runtime.block_on(ingest_once(total, commit_every));
- }
- acc
- });
- });
+    group.bench_function("upsert_commit_flush", |b| {
+        b.iter_custom(|iters| {
+            let runtime = rt();
+            let mut acc = Duration::ZERO;
+            for _ in 0..iters {
+                acc += runtime.block_on(ingest_once(total, commit_every));
+            }
+            acc
+        });
+    });
 
- group.finish();
+    group.finish();
 }
 
 criterion_group!(benches, bench_ingest);
