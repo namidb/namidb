@@ -12,6 +12,28 @@ below and in the release notes.
 ## [Unreleased]
 
 ### Added
+- (nothing yet)
+
+### Changed
+- (nothing yet)
+
+### Fixed
+- (nothing yet)
+
+### Breaking
+- (nothing yet)
+
+---
+
+## [0.4.1] — 2026-05-19 · `vector()` + reproducible Docker build
+
+Small follow-up to 0.4.0 driven by an end-to-end run against the
+published Docker image: one packaging fix that was blocking a clean
+`docker build`, and one Cypher surface that was blocking the only
+test in the E2E battery that did not pass on 0.4.0 (vector
+properties).
+
+### Added
 - **`vector()` Cypher builtin.** Lifts a numeric list literal or
   parameter into a first-class `Vector(Vec<f32>)`, the only shape that
   round-trips through `runtime_to_core` into `CoreValue::Vec` and the
@@ -26,9 +48,6 @@ below and in the release notes.
   point; the missing surface was flagged by an E2E run against the
   Docker image.
 
-### Changed
-- (nothing yet)
-
 ### Fixed
 - **Track `Cargo.lock` in the repository.** The workspace ships
   distributable binaries (`namidb-server`, `namidb-cli`); the lockfile
@@ -37,9 +56,6 @@ below and in the release notes.
   Previously `.gitignore` excluded `Cargo.lock`, so the documented
   `docker build` recipe failed on a fresh clone unless the user ran
   `cargo generate-lockfile` first.
-
-### Breaking
-- (nothing yet)
 
 ---
 
@@ -334,7 +350,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/namidb/namidb/releases/tag/v0.4.1
 [0.4.0]: https://github.com/namidb/namidb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/namidb/namidb/releases/tag/v0.3.0
 [0.2.1]: https://github.com/namidb/namidb/releases/tag/v0.2.1

@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "namidb"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "namidb-core",
  "namidb-graph",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bench"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-graph"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-py"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-query"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow",
