@@ -12,7 +12,19 @@ below and in the release notes.
 ## [Unreleased]
 
 ### Added
-- (nothing yet)
+- **`vector()` Cypher builtin.** Lifts a numeric list literal or
+  parameter into a first-class `Vector(Vec<f32>)`, the only shape that
+  round-trips through `runtime_to_core` into `CoreValue::Vec` and the
+  Parquet column writer (`crates/namidb-query/src/exec/expr.rs`,
+  `crates/namidb-query/src/exec/writer.rs`). Accepts homogeneous
+  `[Integer | Float]` lists (ints are coerced to `f32`) and propagates
+  `NULL`. Non-numeric or non-list arguments produce a typed
+  `EvalError` that names the offending element index. Bare list
+  literals (e.g. `[0.1, 0.2]`) still error with `only scalars are
+  storable in v0` — the constructor is the explicit opt-in. Engine
+  vector capability has existed since v0.3 but lacked a Cypher entry
+  point; the missing surface was flagged by an E2E run against the
+  Docker image.
 
 ### Changed
 - (nothing yet)

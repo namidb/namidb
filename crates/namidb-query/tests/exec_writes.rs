@@ -477,3 +477,87 @@ async fn create_chain_node_rel_node() {
  other => panic!("unexpected: {:?}", other),
  }
 }
+
+#[tokio::test]
+async fn create_node_with_vector_literal_persists_as_corevalue_vec() {
+ // The whole point of `vector()` is to land as `CoreValue::Vec` on
+ // disk — verify the property survives the writer round-trip and
+ // is visible to a snapshot read.
+ let mut writer = WriterSession::open(store(), paths("w-create-vector"))
+ .await
+ .unwrap();
+ let q = parse(
+ "CREATE (d:Doc {title: 'embedding-1', emb: vector([0.1, 0.2, 0.3])}) RETURN d",
+ )
+ .unwrap();
+ let plan = lower(&q).unwrap();
+ let outcome = execute_write(&plan, &mut writer, &Params::new())
+ .await
+ .unwrap();
+ assert_eq!(outcome.nodes_created, 1);
+
+ let snap = writer.snapshot();
+ let nodes = snap.scan_label("Doc").await.unwrap();
+ assert_eq!(nodes.len(), 1);
+ assert_eq!(
+ nodes[0].properties.get("emb"),
+ Some(&CoreValue::Vec(vec![0.1_f32, 0.2_f32, 0.3_f32])),
+ "expected emb to round-trip as CoreValue::Vec"
+ );
+ assert_eq!(
+ nodes[0].properties.get("title"),
+ Some(&CoreValue::Str("embedding-1".into()))
+ );
+}
+
+#[tokio::test]
+async fn create_node_with_vector_from_list_parameter() {
+ // Embeddings normally arrive as a `$param` — exercise the path
+ // where `vector()` consumes a `List` value passed through `Params`.
+ let mut writer = WriterSession::open(store(), paths("w-vector-param"))
+ .await
+ .unwrap();
+ let q = parse("CREATE (d:Doc {emb: vector($v)}) RETURN d").unwrap();
+ let plan = lower(&q).unwrap();
+ let mut params = Params::new();
+ params.insert(
+ "v".into(),
+ RuntimeValue::List(vec![
+ RuntimeValue::Float(1.5),
+ RuntimeValue::Integer(2),
+ RuntimeValue::Float(-3.25),
+ ]),
+ );
+ let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+ assert_eq!(outcome.nodes_created, 1);
+
+ let snap = writer.snapshot();
+ let nodes = snap.scan_label("Doc").await.unwrap();
+ assert_eq!(nodes.len(), 1);
+ assert_eq!(
+ nodes[0].properties.get("emb"),
+ Some(&CoreValue::Vec(vec![1.5_f32, 2.0_f32, -3.25_f32])),
+ "integer elements must be coerced to f32 alongside floats"
+ );
+}
+
+#[tokio::test]
+async fn bare_list_literal_still_rejected_without_vector_wrapper() {
+ // Regression guard: `vector()` is the *only* way to persist a
+ // numeric collection. A bare `[…]` literal must keep failing so
+ // users do not silently get a List stored as something else.
+ let mut writer = WriterSession::open(store(), paths("w-bare-list"))
+ .await
+ .unwrap();
+ let q = parse("CREATE (d:Doc {emb: [0.1, 0.2, 0.3]}) RETURN d").unwrap();
+ let plan = lower(&q).unwrap();
+ let err = execute_write(&plan, &mut writer, &Params::new())
+ .await
+ .expect_err("bare list literal must not be storable in v0");
+ let msg = format!("{:?}", err);
+ assert!(
+ msg.contains("only scalars are storable"),
+ "unexpected error: {}",
+ msg
+ );
+}
