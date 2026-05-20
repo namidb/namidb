@@ -414,8 +414,10 @@ same setup moves to AWS S3, R2, GCS or Azure without touching anything
 else.
 
 <br />
+<br />
 
 ## CLI
+
 
 ```bash
 # Ephemeral in-memory namespace, same as the quickstart.
