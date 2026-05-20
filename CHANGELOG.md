@@ -18,7 +18,13 @@ below and in the release notes.
 - (nothing yet)
 
 ### Fixed
-- (nothing yet)
+- **Track `Cargo.lock` in the repository.** The workspace ships
+  distributable binaries (`namidb-server`, `namidb-cli`); the lockfile
+  is required by `crates/namidb-server/Dockerfile` (`COPY Cargo.toml
+  Cargo.lock …`) and by anyone wanting reproducible release builds.
+  Previously `.gitignore` excluded `Cargo.lock`, so the documented
+  `docker build` recipe failed on a fresh clone unless the user ran
+  `cargo generate-lockfile` first.
 
 ### Breaking
 - (nothing yet)
