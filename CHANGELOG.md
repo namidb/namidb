@@ -274,7 +274,7 @@ up to date.
   scheme (`memory://`, `file://`, `s3://`, `gs://`, `az://`) for
   durable runs. Defaults to `memory://default` when omitted, preserving
   the previous one-shot ephemeral UX.
-- **Python `tg.Client(uri)`** now delegates URI parsing to the shared
+- **Python `namidb.Client(uri)`** now delegates URI parsing to the shared
   Rust implementation. `PyValueError` is raised on malformed URIs and
   `PyRuntimeError` on backend-init failures; messages unchanged.
 - **README** reorganised into an S3-first self-host guide: the hero
