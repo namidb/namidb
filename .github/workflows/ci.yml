@@ -16,14 +16,8 @@ concurrency:
 
 jobs:
   fmt:
-    # Informational only — the historic codebase mixes 1-space and 2-space
-    # indentation that neither default rustfmt nor a single `tab_spaces`
-    # value can certify. Run rustfmt anyway so regressions surface in the
-    # job log, but don't block CI on the diff. Re-enable strict mode once
-    # the whole tree is reformatted in a dedicated change.
     name: fmt
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,11 +39,9 @@ jobs:
       # tracking ticket reformats them in a dedicated change. Allow it
       # here so the lint stays informative without gating every PR.
       #
-      # `--all-targets` is intentionally NOT passed: it would also
-      # compile benches, and `crates/namidb-storage/benches/parquet_ingest.rs`
-      # has long-standing syntax breakage (missing parens around `.method()`
-      # calls) that predates this gate. Benches are exercised on demand
-      # via `cargo bench`, not in CI.
+      # `--all-targets` is intentionally NOT passed: it would pull
+      # criterion and the other bench-only dev-deps into the lint gate.
+      # Benches are exercised on demand via `cargo bench`, not in CI.
       - run: cargo clippy --workspace --lib --tests --exclude namidb-py -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
