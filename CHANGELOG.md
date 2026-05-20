@@ -25,7 +25,7 @@ below and in the release notes.
 
 ---
 
-## [0.4.1] — 2026-05-19 · `vector()` + reproducible Docker build
+## [0.4.1] - 2026-05-19: vector() + reproducible Docker build
 
 Small follow-up to 0.4.0 driven by an end-to-end run against the
 published Docker image: one packaging fix that was blocking a clean
@@ -43,7 +43,7 @@ properties).
   `NULL`. Non-numeric or non-list arguments produce a typed
   `EvalError` that names the offending element index. Bare list
   literals (e.g. `[0.1, 0.2]`) still error with `only scalars are
-  storable in v0` — the constructor is the explicit opt-in. Engine
+  storable in v0`. The constructor is the explicit opt-in. Engine
   vector capability has existed since v0.3 but lacked a Cypher entry
   point; the missing surface was flagged by an E2E run against the
   Docker image.
@@ -51,28 +51,28 @@ properties).
 ### Fixed
 - **Track `Cargo.lock` in the repository.** The workspace ships
   distributable binaries (`namidb-server`, `namidb-cli`); the lockfile
-  is required by `crates/namidb-server/Dockerfile` (`COPY Cargo.toml
-  Cargo.lock …`) and by anyone wanting reproducible release builds.
-  Previously `.gitignore` excluded `Cargo.lock`, so the documented
-  `docker build` recipe failed on a fresh clone unless the user ran
-  `cargo generate-lockfile` first.
+  is required by `crates/namidb-server/Dockerfile` (its `COPY
+  Cargo.toml Cargo.lock` line) and by anyone wanting reproducible
+  release builds. Previously `.gitignore` excluded `Cargo.lock`, so
+  the documented `docker build` recipe failed on a fresh clone unless
+  the user ran `cargo generate-lockfile` first.
 
 ---
 
-## [0.4.0] — 2026-05-19 · engine perf sweep
+## [0.4.0] - 2026-05-19: engine perf sweep
 
-Headline gains over 0.3.0 (LDBC SNB SF1, M-series laptop, 30 warm
-runs × 3 params; reproducible from `scripts/bench_publish/`):
+Performance gains over 0.3.0 (LDBC SNB SF1, M-series laptop, 30 warm
+runs x 3 params; reproducible from `scripts/bench_publish/`):
 
-- Cold IC09 SF1: 9.0 s → 170 ms (52×) — `batch_lookup_nodes` +
+- Cold IC09 SF1: 9.0 s to 170 ms (52x), from `batch_lookup_nodes` +
   decoded RecordBatch cache + persisted unique-property sidecar +
   skip intermediate target materialise in chained Expand.
-- Cold IC02 SF1: 720 ms → 51 ms (17×) — sidecar property index +
-  decoded batches cache.
+- Cold IC02 SF1: 720 ms to 51 ms (17x), from the sidecar property
+  index + decoded batches cache.
 - Engine warm vs Kùzu: NamiDB now beats Kùzu warm on every IC02 / 07
-  / 08 / 09 (3-4× on IC02 and IC08).
-- Bulk-write to R2: 5.5 K → 31.9 K elem/s (laptop, 5.5×) and 51.5 K
-  elem/s in-region (9×) via 5 MiB multipart upload at 8-way
+  / 08 / 09 (3-4x on IC02 and IC08).
+- Bulk-write to R2: 5.5 K to 31.9 K elem/s (laptop, 5.5x) and 51.5 K
+  elem/s in-region (9x) via 5 MiB multipart upload at 8-way
   concurrency.
 
 Workspace tests: ~700 passing across storage / query / server /
@@ -86,33 +86,33 @@ bench / control / gateway / worker / CLI crates.
   and `SstCache` populate on the way out
   (`crates/namidb-storage/src/read.rs`,
   `crates/namidb-query/src/exec/walker.rs`).
-- **Persisted unique-property index sidecar** —
-  `SstDescriptor.unique_property_indices` + bincode sidecar alongside
-  every Node SST. `lookup_node_by_property` resolves the point query
-  with one bincode decode per candidate SST instead of scanning the
-  full label. Re-emitted on L0 → L1 compaction so the fast path
-  survives the merge (`crates/namidb-storage/src/flush.rs`,
+- **Persisted unique-property index sidecar.**
+  `SstDescriptor.unique_property_indices` + a bincode sidecar
+  alongside every Node SST. `lookup_node_by_property` resolves the
+  point query with one bincode decode per candidate SST instead of
+  scanning the full label. Re-emitted on L0 to L1 compaction so the
+  fast path survives the merge (`crates/namidb-storage/src/flush.rs`,
   `compact.rs`, `manifest.rs`, `read.rs`,
   `crates/namidb-query/src/cost/stats.rs`).
-- **`PropertyDef::unique: bool` schema flag + planner rewrite** —
+- **`PropertyDef::unique: bool` schema flag + planner rewrite.**
   `Filter(NodeScan {label})` with an equality on a unique property is
   rewritten to `NodeByPropertyValue` for SST-level pushdown. New
   optimizer pass `crates/namidb-query/src/optimize/unique_lookup.rs`;
   schema in `crates/namidb-core/src/schema.rs`.
-- **In-memory property index on the write session** — closes the
+- **In-memory property index on the write session.** Closes the
   warm-path gap on repeated unique-property lookups before flush
   (new file `crates/namidb-storage/src/property_index.rs`,
   `ingest.rs`, `lib.rs`, `read.rs`).
-- **Intra-snapshot decoded RecordBatch cache** keyed by SST path —
+- **Intra-snapshot decoded RecordBatch cache** keyed by SST path.
   `decoded_node_sst_batches: Mutex<HashMap<path, Arc<Vec<RecordBatch>>>>`
   amortises the per-call Parquet decode across N `batch_lookup_nodes`
   invocations inside a single query (`crates/namidb-storage/src/read.rs`).
-- **Multipart PUT for SST bodies ≥ 4 MiB on flush** —
+- **Multipart PUT for SST bodies >= 4 MiB on flush.**
   `flush::put_object` switches to `object_store::buffered::BufWriter`
-  (5 MiB parts × 8 in-flight). Small bodies keep the single-PUT +
+  (5 MiB parts, 8 in flight). Small bodies keep the single-PUT +
   `PutMode::Create` collision protection
   (`crates/namidb-storage/src/flush.rs`).
-- **`namidb-bench load`** — write-throughput timing for Bench D
+- **`namidb-bench load`.** Write-throughput timing for Bench D
   (`crates/namidb-bench/src/main.rs`).
 
 ### Changed
@@ -130,7 +130,7 @@ bench / control / gateway / worker / CLI crates.
 
 - The bench loader declares `id` as a user property so the LDBC
   IC02 / 07 / 08 / 09 fixtures bind rows correctly under the v0.3.0
-  `id` → `_id` semantics (`crates/namidb-bench/src/loader.rs`).
+  `id` to `_id` semantics (`crates/namidb-bench/src/loader.rs`).
 
 ### Breaking
 
@@ -138,12 +138,12 @@ bench / control / gateway / worker / CLI crates.
 
 ---
 
-## [0.3.0] — 2026-05-18 · Cypher v0.2.1 limitation sweep
+## [0.3.0] - 2026-05-18: Cypher v0.2.1 limitation sweep
 
 Closes the six query-engine limitations documented in the v0.2.1
 README (`MATCH (n)` rejected, MERGE with relationship broken, `id`
-reserved, etc.). One of them — the `id` reservation — is breaking;
-see **Breaking** below.
+reserved, etc.). One of them, the `id` reservation, is breaking; see
+**Breaking** below.
 
 ### Fixed
 
@@ -160,7 +160,7 @@ see **Breaking** below.
   the snapshot, so `MATCH (a)-[r]->(b)` and `-[*1..N]->` work without
   an explicit relationship type. Backed by a new
   `Snapshot::observed_edge_types` that unions declared schema +
-  memtable + persisted SSTs — needed because the declared schema is
+  memtable + persisted SSTs, needed because the declared schema is
   empty for namespaces that never went through `SchemaBuilder`
   (`crates/namidb-storage/src/read.rs`,
   `crates/namidb-query/src/exec/walker.rs`).
@@ -178,7 +178,7 @@ see **Breaking** below.
 
 - **#1 `id` is now a user property; the internal NodeId moves to
   `_id`.** Previously `id` hijacked Cypher map literals as the
-  internal NodeId sigil — a `CREATE (n:Foo {id: $uuid})` parsed
+  internal NodeId sigil: a `CREATE (n:Foo {id: $uuid})` parsed
   `$uuid` as a `NodeId` and refused to persist `id` as a property.
   After this release, `id` is treated like any other property; the
   internal NodeId is addressed via `_id`. The Cypher `id(n)`
@@ -187,10 +187,10 @@ see **Breaking** below.
 
   **Migration.** Anywhere a query passes `{id: $uuid}` to refer to
   the internal NodeId, rename the key to `{_id: $uuid}`. Likewise
-  `n.id` (accessor) → `n._id` when you want the NodeId, or `id(n)`
-  for the function form. Reading `n.id` now returns the user
+  `n.id` (accessor) becomes `n._id` when you want the NodeId, or
+  `id(n)` for the function form. Reading `n.id` now returns the user
   property (or `Null` when absent). Failures are loud rather than
-  silent — a wrong UUID lands as a plain `Filter` over a missing
+  silent: a wrong UUID lands as a plain `Filter` over a missing
   property and returns no rows rather than throwing.
 
   Behavioural pivots:
@@ -210,31 +210,31 @@ see **Breaking** below.
 
 ---
 
-## [0.2.1] — 2026-05-18 · CI fix
+## [0.2.1] - 2026-05-18: CI fix
 
 Tag `py-v0.2.0` built every wheel and the sdist, but the smoke-test
 job (`pytest` against the installed wheel) flagged three stale
-expectations and the publish step was skipped — nothing reached PyPI.
-`0.2.1` ships the same code with the test expectations brought up to
-date.
+expectations and the publish step was skipped, so nothing reached
+PyPI. `0.2.1` ships the same code with the test expectations brought
+up to date.
 
 ### Fixed
 
-- `crates/namidb-py/tests/test_uri.py` — three tests were asserting
+- `crates/namidb-py/tests/test_uri.py`: three tests were asserting
   the *pre-0.2.0* contract (`file://`, `gs://`, `az://` raise
   `ValueError`). Replaced with:
-  - `test_file_uri_round_trip` — full CREATE / MATCH against a
+  - `test_file_uri_round_trip`: full CREATE / MATCH against a
     temp-dir-backed namespace, exercising the new
     `LocalFileObjectStore` end-to-end from Python.
   - `test_gs_uri_missing_namespace_raises`,
     `test_az_uri_missing_container_raises`,
-    `test_az_uri_missing_namespace_raises` — grammar checks that
+    `test_az_uri_missing_namespace_raises`: grammar checks that
     surface before the GCS / Azure client is built, so they don't
     need real cloud credentials on CI runners.
 
 ---
 
-## [0.2.0] — 2026-05-18 · self-host story
+## [0.2.0] - 2026-05-18: self-host story
 
 ### Added
 
@@ -250,13 +250,13 @@ date.
   the standard `AZURE_STORAGE_*` env vars; supports the Azurite
   emulator via `?use_emulator=true`. Previously rejected as "planned";
   now stable.
-- **`namidb-server` crate and binary** — Rust HTTP daemon exposing a
+- **`namidb-server` crate and binary.** Rust HTTP daemon exposing a
   REST API over any backend. Endpoints: `POST /v0/cypher`,
   `GET /v0/health`, `GET /v0/version`, `POST /v0/admin/flush`. Bearer
   token auth (`--auth-token`), periodic memtable flush
-  (`--flush-interval`), multi-stage Dockerfile, full JSON ↔ Cypher
-  type mapping for Node / Rel / Path values.
-- **`docker-compose.yml`** at the repo root — copy-paste recipe that
+  (`--flush-interval`), multi-stage Dockerfile, full two-way
+  JSON/Cypher type mapping for Node / Rel / Path values.
+- **`docker-compose.yml`** at the repo root: a copy-paste recipe that
   brings up MinIO + bucket-init + `namidb-server` and exposes an
   authenticated graph database on `:8080`.
 - **Shared URI parser** (`namidb-storage::uri::parse_uri`) used by
@@ -270,15 +270,15 @@ date.
 
 ### Changed
 
-- **CLI `namidb run` learns `--store <uri>`** — accepts any supported
+- **CLI `namidb run` learns `--store <uri>`.** Accepts any supported
   scheme (`memory://`, `file://`, `s3://`, `gs://`, `az://`) for
   durable runs. Defaults to `memory://default` when omitted, preserving
   the previous one-shot ephemeral UX.
 - **Python `tg.Client(uri)`** now delegates URI parsing to the shared
   Rust implementation. `PyValueError` is raised on malformed URIs and
   `PyRuntimeError` on backend-init failures; messages unchanged.
-- **README** reorganised into an S3-first self-host guide: hero hook
-  ("Your graph database lives in your S3 bucket"), "The shape"
+- **README** reorganised into an S3-first self-host guide: the hero
+  line ("Your graph database lives in your S3 bucket"), a "The shape"
   paragraph, AWS S3 / Cloudflare R2 as starred backends, MinIO and the
   others tucked into collapsible sections, and a new Roadmap section.
 - **`clap`** workspace feature set now includes `env` so server flags
@@ -291,13 +291,13 @@ date.
 
 ### Breaking
 
-- (none) — every previously-rejected scheme now returns a working
+- (none). Every previously-rejected scheme now returns a working
   client instead of a `ValueError`; all existing `memory://` and
   `s3://` URIs continue to work unchanged.
 
 ---
 
-## [0.1.0] — initial public release
+## [0.1.0] - initial public release
 
 First public release of the NamiDB engine under
 [Business Source License 1.1](LICENSE) (Change Date: 2029-05-18,
@@ -307,7 +307,7 @@ Change License: Apache License 2.0).
 
 - Cypher / GQL parser covering a strict subset of GQL (ISO/IEC
   39075:2024) + openCypher 9. End-to-end execution of LDBC SNB
-  Interactive Complex Read queries IC01–IC12.
+  Interactive Complex Read queries IC01-IC12.
 - Writes via Cypher: `CREATE`, `MERGE`, `SET`, `DELETE`, `DETACH
   DELETE`, `REMOVE`. Durable on `commit_batch` (WAL append + manifest
   CAS).
