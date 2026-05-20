@@ -25,6 +25,85 @@ below and in the release notes.
 
 ---
 
+## [0.4.0] — 2026-05-19 · engine perf sweep
+
+Headline gains over 0.3.0 (LDBC SNB SF1, M-series laptop, 30 warm
+runs × 3 params; reproducible from `scripts/bench_publish/`):
+
+- Cold IC09 SF1: 9.0 s → 170 ms (52×) — `batch_lookup_nodes` +
+  decoded RecordBatch cache + persisted unique-property sidecar +
+  skip intermediate target materialise in chained Expand.
+- Cold IC02 SF1: 720 ms → 51 ms (17×) — sidecar property index +
+  decoded batches cache.
+- Engine warm vs Kùzu: NamiDB now beats Kùzu warm on every IC02 / 07
+  / 08 / 09 (3-4× on IC02 and IC08).
+- Bulk-write to R2: 5.5 K → 31.9 K elem/s (laptop, 5.5×) and 51.5 K
+  elem/s in-region (9×) via 5 MiB multipart upload at 8-way
+  concurrency.
+
+Workspace tests: ~700 passing across storage / query / server /
+bench / control / gateway / worker / CLI crates.
+
+### Added
+
+- **`Snapshot::batch_lookup_nodes(label, &[NodeId])`** materialises
+  many node views in one pass over the candidate SST set. Last-LSN
+  merge across memtable + SSTs preserves consistency; `NodeViewCache`
+  and `SstCache` populate on the way out
+  (`crates/namidb-storage/src/read.rs`,
+  `crates/namidb-query/src/exec/walker.rs`).
+- **Persisted unique-property index sidecar** —
+  `SstDescriptor.unique_property_indices` + bincode sidecar alongside
+  every Node SST. `lookup_node_by_property` resolves the point query
+  with one bincode decode per candidate SST instead of scanning the
+  full label. Re-emitted on L0 → L1 compaction so the fast path
+  survives the merge (`crates/namidb-storage/src/flush.rs`,
+  `compact.rs`, `manifest.rs`, `read.rs`,
+  `crates/namidb-query/src/cost/stats.rs`).
+- **`PropertyDef::unique: bool` schema flag + planner rewrite** —
+  `Filter(NodeScan {label})` with an equality on a unique property is
+  rewritten to `NodeByPropertyValue` for SST-level pushdown. New
+  optimizer pass `crates/namidb-query/src/optimize/unique_lookup.rs`;
+  schema in `crates/namidb-core/src/schema.rs`.
+- **In-memory property index on the write session** — closes the
+  warm-path gap on repeated unique-property lookups before flush
+  (new file `crates/namidb-storage/src/property_index.rs`,
+  `ingest.rs`, `lib.rs`, `read.rs`).
+- **Intra-snapshot decoded RecordBatch cache** keyed by SST path —
+  `decoded_node_sst_batches: Mutex<HashMap<path, Arc<Vec<RecordBatch>>>>`
+  amortises the per-call Parquet decode across N `batch_lookup_nodes`
+  invocations inside a single query (`crates/namidb-storage/src/read.rs`).
+- **Multipart PUT for SST bodies ≥ 4 MiB on flush** —
+  `flush::put_object` switches to `object_store::buffered::BufWriter`
+  (5 MiB parts × 8 in-flight). Small bodies keep the single-PUT +
+  `PutMode::Create` collision protection
+  (`crates/namidb-storage/src/flush.rs`).
+- **`namidb-bench load`** — write-throughput timing for Bench D
+  (`crates/namidb-bench/src/main.rs`).
+
+### Changed
+
+- **Chained `Expand` skips intermediate target materialise** when the
+  target alias is only consumed as the next `Expand`'s source.
+  `walker::PlanRouting` extended with a target-alias-references-out
+  check (`crates/namidb-query/src/exec/walker.rs`,
+  `crates/namidb-query/src/cost/cardinality.rs`,
+  `crates/namidb-query/src/cost/selectivity.rs`,
+  `crates/namidb-query/src/optimize/join_conversion.rs`,
+  `crates/namidb-query/src/plan/explain.rs`).
+
+### Fixed
+
+- The bench loader declares `id` as a user property so the LDBC
+  IC02 / 07 / 08 / 09 fixtures bind rows correctly under the v0.3.0
+  `id` → `_id` semantics (`crates/namidb-bench/src/loader.rs`).
+
+### Breaking
+
+- (none)
+
+---
+
 ## [0.3.0] — 2026-05-18 · Cypher v0.2.1 limitation sweep
 
 Closes the six query-engine limitations documented in the v0.2.1
@@ -237,7 +316,9 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/namidb/namidb/releases/tag/v0.4.0
+[0.3.0]: https://github.com/namidb/namidb/releases/tag/v0.3.0
 [0.2.1]: https://github.com/namidb/namidb/releases/tag/v0.2.1
 [0.2.0]: https://github.com/namidb/namidb/releases/tag/v0.2.0
 [0.1.0]: https://github.com/namidb/namidb/releases/tag/v0.1.0
