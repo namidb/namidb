@@ -669,6 +669,48 @@ fn call_scalar_function(
  _ => RuntimeValue::Null,
  }),
 
+ // --- Vector constructor
+ // `vector([x, y, …])` lifts a numeric list into a first-class
+ // `Vector(Vec<f32>)`, which round-trips through `runtime_to_core`
+ // → `CoreValue::Vec` → Parquet column. Without this builtin, a
+ // bare `[0.1, 0.2]` literal stays a `List` and the writer rejects
+ // it with "only scalars are storable in v0".
+ "vector" => {
+ let v = single_arg(name, args, span)?;
+ match v {
+ RuntimeValue::Null => Ok(RuntimeValue::Null),
+ RuntimeValue::Vector(items) => Ok(RuntimeValue::Vector(items)),
+ RuntimeValue::List(items) => {
+ let mut out = Vec::with_capacity(items.len());
+ for (idx, item) in items.into_iter().enumerate() {
+ let coerced = match item {
+ RuntimeValue::Float(f) => f as f32,
+ RuntimeValue::Integer(n) => n as f32,
+ other => {
+ return Err(EvalError::new(
+ format!(
+ "vector() requires numeric elements; got {} at index {}",
+ other.type_name(),
+ idx
+ ),
+ span,
+ ));
+ }
+ };
+ out.push(coerced);
+ }
+ Ok(RuntimeValue::Vector(out))
+ }
+ other => Err(EvalError::new(
+ format!(
+ "vector() requires a list of numbers; got {}",
+ other.type_name()
+ ),
+ span,
+ )),
+ }
+ }
+
  // --- Lowering helpers (internal)
  "__path" => Ok(RuntimeValue::Path(args.to_vec())),
  "__label_eq" => match args {
@@ -1033,5 +1075,114 @@ mod tests {
  };
  let r = evaluate(expr, &row, &Params::new()).unwrap();
  assert_eq!(r, RuntimeValue::Bool(true));
+ }
+
+ // ─── vector() constructor ─────────────────────────────────────
+
+ fn eval_expr_err(src: &str) -> EvalError {
+ let q = parse(&format!("RETURN {} AS r", src)).unwrap();
+ let item = match &q.head.clauses[0] {
+ crate::parser::Clause::Return(r) => &r.items[0].expression,
+ _ => panic!(),
+ };
+ evaluate(item, &Row::new(), &Params::new()).unwrap_err()
+ }
+
+ #[test]
+ fn vector_from_float_list() {
+ let r = eval_str("vector([0.1, 0.2, 0.3])", &Row::new(), &Params::new());
+ assert_eq!(
+ r,
+ RuntimeValue::Vector(vec![0.1_f32, 0.2_f32, 0.3_f32])
+ );
+ }
+
+ #[test]
+ fn vector_from_integer_list_promotes_to_f32() {
+ let r = eval_str("vector([1, 2, 3])", &Row::new(), &Params::new());
+ assert_eq!(
+ r,
+ RuntimeValue::Vector(vec![1.0_f32, 2.0_f32, 3.0_f32])
+ );
+ }
+
+ #[test]
+ fn vector_from_mixed_int_float_list() {
+ let r = eval_str("vector([1, 2.5, 3])", &Row::new(), &Params::new());
+ assert_eq!(
+ r,
+ RuntimeValue::Vector(vec![1.0_f32, 2.5_f32, 3.0_f32])
+ );
+ }
+
+ #[test]
+ fn vector_empty_list() {
+ let r = eval_str("vector([])", &Row::new(), &Params::new());
+ assert_eq!(r, RuntimeValue::Vector(Vec::new()));
+ }
+
+ #[test]
+ fn vector_null_passthrough() {
+ let r = eval_str("vector(NULL)", &Row::new(), &Params::new());
+ assert!(r.is_null());
+ }
+
+ #[test]
+ fn vector_idempotent_on_existing_vector() {
+ // `vector(vec)` where `vec` is already a Vector — uses a parameter
+ // because there is no Cypher literal for Vector. Idempotency keeps
+ // composition (e.g. `vector(vector(x))`) safe.
+ let mut params = Params::new();
+ params.insert(
+ "v".into(),
+ RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]),
+ );
+ let q = parse("RETURN vector($v) AS r").unwrap();
+ let item = match &q.head.clauses[0] {
+ crate::parser::Clause::Return(r) => &r.items[0].expression,
+ _ => panic!(),
+ };
+ let r = evaluate(item, &Row::new(), &params).unwrap();
+ assert_eq!(r, RuntimeValue::Vector(vec![1.0_f32, 2.0_f32]));
+ }
+
+ #[test]
+ fn vector_rejects_non_numeric_element() {
+ let err = eval_expr_err(r#"vector([1, "x", 3])"#);
+ assert!(
+ err.message.contains("vector()") && err.message.contains("STRING") && err.message.contains("index 1"),
+ "unexpected message: {}",
+ err.message
+ );
+ }
+
+ #[test]
+ fn vector_rejects_null_element() {
+ let err = eval_expr_err("vector([1.0, NULL, 3.0])");
+ assert!(
+ err.message.contains("vector()") && err.message.contains("NULL") && err.message.contains("index 1"),
+ "unexpected message: {}",
+ err.message
+ );
+ }
+
+ #[test]
+ fn vector_rejects_non_list_argument() {
+ let err = eval_expr_err(r#"vector("not a list")"#);
+ assert!(
+ err.message.contains("vector()") && err.message.contains("STRING"),
+ "unexpected message: {}",
+ err.message
+ );
+ }
+
+ #[test]
+ fn vector_requires_single_argument() {
+ let err = eval_expr_err("vector([1.0], [2.0])");
+ assert!(
+ err.message.contains("vector") && err.message.contains("exactly 1"),
+ "unexpected message: {}",
+ err.message
+ );
  }
 }
