@@ -35,6 +35,11 @@ use std::sync::{Arc, RwLock};
 
 use namidb_core::id::NodeId;
 
+/// `(label, property)` keys mapped to a shared per-pair `value -> NodeId`
+/// index. Aliased so the `RwLock` field below stays under clippy's
+/// type-complexity threshold.
+type PropertyIndices = HashMap<(String, String), Arc<HashMap<String, NodeId>>>;
+
 /// Shared cache that lives at `WriterSession` scope and is cloned (as
 /// an `Arc`) into every `Snapshot` the session emits.
 #[derive(Debug, Default)]
@@ -42,7 +47,7 @@ pub struct PropertyIndexCache {
     /// `(label_name, property_name) → Arc<value_string → NodeId>`.
     /// `Arc` on the inner so readers can release the outer lock as
     /// soon as they have the per-(label, prop) handle.
-    indices: RwLock<HashMap<(String, String), Arc<HashMap<String, NodeId>>>>,
+    indices: RwLock<PropertyIndices>,
 }
 
 impl PropertyIndexCache {
@@ -64,12 +69,7 @@ impl PropertyIndexCache {
 
     /// Insert a pre-built index. Idempotent — last write wins under a
     /// race; the contents are identical by construction so this is safe.
-    pub fn insert(
-        &self,
-        label: String,
-        property: String,
-        index: Arc<HashMap<String, NodeId>>,
-    ) {
+    pub fn insert(&self, label: String, property: String, index: Arc<HashMap<String, NodeId>>) {
         if let Ok(mut w) = self.indices.write() {
             w.insert((label, property), index);
         }
