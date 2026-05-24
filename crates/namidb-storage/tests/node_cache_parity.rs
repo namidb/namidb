@@ -80,10 +80,11 @@ async fn parity_pure_sst_nodes() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(NodeViewCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &empty,
+        &empty_view,
         store.clone(),
         paths.clone(),
     )
@@ -142,9 +143,10 @@ async fn parity_with_tombstone_caches_negative() {
     );
 
     let cache = Arc::new(NodeViewCache::new(1024 * 1024));
+    let live_view = live.snapshot_view();
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &live,
+        &live_view,
         store.clone(),
         paths.clone(),
     )
@@ -191,13 +193,14 @@ async fn cache_reuses_across_snapshots_of_same_manifest_version() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(NodeViewCache::new(1024 * 1024));
 
     // Snapshot #1: cold miss → insert.
     {
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         )
@@ -211,7 +214,7 @@ async fn cache_reuses_across_snapshots_of_same_manifest_version() {
     {
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         )
@@ -253,10 +256,11 @@ async fn l1_hit_short_circuits_before_l2() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(NodeViewCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &empty,
+        &empty_view,
         store.clone(),
         paths.clone(),
     )

@@ -13,6 +13,26 @@ below and in the release notes.
 
 ### Added
 
+- **Concurrent reads without the writer mutex (RFC-021).** Reads no
+  longer take `state.writer.lock()`. A new `OwnedSnapshot` carries an
+  `Arc<MemtableSnapshot>` plus the manifest, object store, and the
+  cross-snapshot caches; multiple readers share it through a
+  `SnapshotCell` (`std::sync::Mutex<Arc<OwnedSnapshot>>`). Writes
+  refresh the cell after each successful `commit_batch` / `flush`,
+  so subsequent reads see the latest durable state. Snapshot
+  isolation, the single-writer-per-namespace invariant from RFC-001,
+  and the Bolt bookmark format all stay intact. Integration test
+  `crates/namidb-server/tests/concurrent_reads.rs` measures a ~7x
+  fan-out at 8 readers on a 4-core box (~1x before this change).
+  Design in [RFC-021](docs/rfc/021-concurrent-reads.md).
+- **`MemtableSnapshot`** in `namidb-storage`: a read-only,
+  point-in-time view of a `Memtable` with the same iter / get /
+  iter_label / iter_edge_type surface. Snapshots own their memtable
+  view via `Arc` instead of borrowing from the writer.
+- **`OwnedSnapshot`, `SnapshotCell`, `WriterSession::owned_snapshot`**
+  in `namidb-storage::read`. The cell lives in
+  `namidb_server::AppState` so HTTP and Bolt share one published
+  snapshot per process.
 - **`Value::Date(i32)` and `Value::DateTime(i64)`** in `namidb-core`,
   with custom serde that tags them as `{"$date": <days>}` and
   `{"$datetime": <us>}` on JSON so the typing survives a round-trip

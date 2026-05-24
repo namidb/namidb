@@ -61,7 +61,7 @@ use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
 use crate::manifest::{LoadedManifest, ManifestStore, WalSegmentDescriptor};
-use crate::memtable::{MemKey, MemOp, Memtable};
+use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
 use crate::paths::NamespacePaths;
 use crate::read::Snapshot;
@@ -89,6 +89,11 @@ pub struct WriterSession {
     fence: WriterFence,
     current: LoadedManifest,
     memtable: Memtable,
+    /// Immutable snapshot of `memtable` taken at the last successful
+    /// commit / flush / open. Readers consume it via `Arc` so multiple
+    /// concurrent snapshots share the same allocation without locking
+    /// the writer (RFC-021). Refreshed by [`Self::refresh_published`].
+    published_memtable: Arc<MemtableSnapshot>,
     next_lsn: u64,
     next_wal_seq: u64,
     pending: WalSegment,
@@ -175,12 +180,14 @@ impl WriterSession {
         };
         let sst_cache = sst_cache_enabled().then(|| SstCache::new(sst_cache_budget_bytes()));
 
+        let published_memtable = Arc::new(recovered.memtable.snapshot_view());
         Ok(Self {
             manifest_store,
             wal_store,
             fence,
             current,
             memtable: recovered.memtable,
+            published_memtable,
             next_lsn,
             next_wal_seq,
             pending: WalSegment::new(next_wal_seq),
@@ -190,6 +197,14 @@ impl WriterSession {
             sst_cache,
             property_index_cache: Arc::new(crate::property_index::PropertyIndexCache::new()),
         })
+    }
+
+    /// Refresh [`Self::published_memtable`] from the current `memtable`.
+    /// Called by `commit_batch` / `flush` after a successful CAS so
+    /// readers picking up a fresh snapshot see the newly-durable
+    /// records. O(memtable_size) for the BTreeMap clone.
+    fn refresh_published(&mut self) {
+        self.published_memtable = Arc::new(self.memtable.snapshot_view());
     }
 
     /// Cross-snapshot lazy property index. Hand it to every `Snapshot`
@@ -267,6 +282,26 @@ impl WriterSession {
         set.into_iter().collect()
     }
 
+    /// Build an [`OwnedSnapshot`] pointing at the same published
+    /// memtable + manifest [`Self::snapshot`] uses, but without a
+    /// borrowed lifetime. Wrap in `Arc` and hand to a
+    /// [`SnapshotCell`] so concurrent readers consume it without
+    /// holding the writer mutex (RFC-021).
+    pub fn owned_snapshot(&self) -> Arc<crate::read::OwnedSnapshot> {
+        Arc::new(crate::read::OwnedSnapshot {
+            manifest: self.current.clone(),
+            memtable: Arc::clone(&self.published_memtable),
+            store: self.manifest_store.store().clone(),
+            paths: self.manifest_store.paths().clone(),
+            cache: self.sst_cache.clone(),
+            ranged_mode: crate::read::RangedMode::Auto,
+            ranged_threshold_bytes: crate::read::DEFAULT_RANGED_THRESHOLD_BYTES,
+            adjacency_cache: self.adjacency_cache.clone(),
+            shared_node_cache: self.node_cache.clone(),
+            property_index_cache: Some(self.property_index_cache.clone()),
+        })
+    }
+
     /// Snapshot view of the namespace as of the last successful
     /// [`commit_batch`] / [`flush`] / [`open`]. The snapshot does NOT
     /// see records that have only been queued via `upsert_*` /
@@ -274,7 +309,7 @@ impl WriterSession {
     pub fn snapshot(&self) -> Snapshot<'_> {
         let mut snap = Snapshot::new(
             self.current.clone(),
-            &self.memtable,
+            &self.published_memtable,
             self.manifest_store.store().clone(),
             self.manifest_store.paths().clone(),
         );
@@ -460,6 +495,10 @@ impl WriterSession {
 
         self.current = new_current;
         self.next_wal_seq = seq.saturating_add(1);
+        // Publish the new memtable snapshot so subsequent reads (HTTP,
+        // Bolt, embedded) pick up the just-committed records without
+        // taking the writer lock. See RFC-021.
+        self.refresh_published();
 
         debug!(
             wal_seq = seq,
@@ -507,6 +546,9 @@ impl WriterSession {
         )
         .await?;
         self.current = outcome.committed.clone();
+        // The flush emptied the live memtable (memtable.freeze() drained
+        // it), so the published snapshot must reset to empty too.
+        self.refresh_published();
         // Invalidate the cross-snapshot property index — a flush can
         // promote new nodes from the memtable into SSTs, and the cached
         // value→NodeId map is built off a snapshot that pre-dates the

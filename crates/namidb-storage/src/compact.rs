@@ -808,7 +808,8 @@ mod tests {
 
         // Snapshot through the new manifest must still see both nodes.
         let mt = Memtable::new();
-        let snap = Snapshot::new(out.committed.clone(), &mt, s, p);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let alice = sorted_node_id(1);
         let bob = sorted_node_id(2);
         let v_alice = snap.lookup_node("Person", alice).await.unwrap().unwrap();
@@ -869,7 +870,8 @@ mod tests {
         assert_eq!(out.new_ssts_written, 1);
 
         let mt = Memtable::new();
-        let snap = Snapshot::new(out.committed.clone(), &mt, s, p);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
         assert_eq!(view.lsn, 12);
         assert_eq!(
@@ -923,7 +925,8 @@ mod tests {
         assert_eq!(out.new_ssts_written, 1);
 
         let mt = Memtable::new();
-        let snap = Snapshot::new(out.committed.clone(), &mt, s, p);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let v = snap.lookup_node("Person", alice).await.unwrap();
         assert!(v.is_none(), "tombstone in L1 must hide the upsert");
     }
@@ -985,7 +988,8 @@ mod tests {
         }
 
         let mt = Memtable::new();
-        let snap = Snapshot::new(out.committed.clone(), &mt, s, p);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let out_edges = snap.out_edges("KNOWS", alice).await.unwrap();
         assert_eq!(out_edges.edges.len(), 2);
         let dsts: Vec<NodeId> = out_edges.edges.iter().map(|e| e.dst).collect();
@@ -1088,7 +1092,8 @@ mod tests {
         assert!(out.source_ssts_removed >= 2);
 
         let mt = Memtable::new();
-        let snap = Snapshot::new(out.committed.clone(), &mt, s, p);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let outs = snap.out_edges("KNOWS", alice).await.unwrap();
         assert_eq!(outs.edges.len(), 2);
         let by_dst: BTreeMap<NodeId, &EdgeView> = outs.edges.iter().map(|e| (e.dst, e)).collect();

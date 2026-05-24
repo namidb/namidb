@@ -26,7 +26,7 @@ use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
     StatsCatalog, WriteOutcome,
 };
-use namidb_storage::WriterSession;
+use namidb_storage::{SnapshotCell, WriterSession};
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -43,18 +43,23 @@ pub struct Config {
 }
 
 /// Shared application state — one `WriterSession` (single-writer
-/// invariant) plus the auth token reference.
+/// invariant) plus the auth token reference and a [`SnapshotCell`]
+/// readers consume to serve reads in parallel without taking the
+/// writer mutex. See RFC-021.
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) writer: Arc<Mutex<WriterSession>>,
+    pub writer: Arc<Mutex<WriterSession>>,
+    pub snapshot: Arc<SnapshotCell>,
     auth_token: Option<Arc<str>>,
     namespace: String,
 }
 
 impl AppState {
     pub fn new(writer: WriterSession, auth_token: Option<String>, namespace: String) -> Self {
+        let snapshot = Arc::new(SnapshotCell::new(writer.owned_snapshot()));
         Self {
             writer: Arc::new(Mutex::new(writer)),
+            snapshot,
             auth_token: auth_token.map(Arc::from),
             namespace,
         }
@@ -113,8 +118,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 tick.tick().await;
                 let mut w = state_for_flush.writer.lock().await;
                 let schema = w.snapshot().manifest().manifest.schema.clone();
-                if let Err(e) = w.flush(schema).await {
-                    error!(error = %e, "periodic flush failed");
+                match w.flush(schema).await {
+                    Ok(_) => state_for_flush.snapshot.store(w.owned_snapshot()),
+                    Err(e) => error!(error = %e, "periodic flush failed"),
                 }
             }
         });
@@ -292,24 +298,31 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
         }
     };
 
-    let mut writer = state.writer.lock().await;
-    let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
-    let plan = match build_plan(&parsed, &catalog) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: format!("plan error: {e}"),
-                }),
-            )
-                .into_response();
+    // Plan against the latest published snapshot — no writer lock yet.
+    let owned = state.snapshot.load();
+    let plan = {
+        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
+        match build_plan(&parsed, &catalog) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("plan error: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
         }
     };
 
     if plan.contains_write() {
+        let mut writer = state.writer.lock().await;
         match execute_write(&plan, &mut writer, &params).await {
             Ok(outcome) => {
+                // Refresh the published snapshot so subsequent reads
+                // see the just-committed records (RFC-021).
+                state.snapshot.store(writer.owned_snapshot());
                 let summary = WriteSummary::from(&outcome);
                 let (columns, rows) = rows_to_json(&outcome.rows);
                 Json(CypherResponse {
@@ -328,13 +341,10 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
                 .into_response(),
         }
     } else {
-        // Snapshot is `Snapshot<'_>` borrowed from the writer, so we
-        // hold the lock for the duration of the read. Concurrent
-        // readers are serialised by the writer mutex; this is the
-        // single-writer-per-namespace invariant pulled up to the
-        // request layer. Lifting it requires snapshots that own their
-        // state (Arc-only), which is RFC-021 work.
-        let snap = writer.snapshot();
+        // Read path: no writer lock. Borrow a short-lived `Snapshot`
+        // from the owned one; the `OwnedSnapshot` Arc keeps the
+        // underlying memtable alive for the duration of the query.
+        let snap = owned.borrow();
         match execute(&plan, &snap, &params).await {
             Ok(rows) => {
                 let (columns, rows) = rows_to_json(&rows);
@@ -367,12 +377,15 @@ async fn admin_flush(State(state): State<AppState>) -> Response {
     let mut w = state.writer.lock().await;
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
-        Ok(outcome) => Json(FlushResponse {
-            ssts_written: outcome.ssts_written,
-            bloom_sidecars_written: outcome.bloom_sidecars_written,
-            manifest_version: outcome.committed.manifest.version,
-        })
-        .into_response(),
+        Ok(outcome) => {
+            state.snapshot.store(w.owned_snapshot());
+            Json(FlushResponse {
+                ssts_written: outcome.ssts_written,
+                bloom_sidecars_written: outcome.bloom_sidecars_written,
+                manifest_version: outcome.committed.manifest.version,
+            })
+            .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorBody {

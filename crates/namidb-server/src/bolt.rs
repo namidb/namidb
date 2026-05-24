@@ -52,14 +52,20 @@ impl Backend for ServerBackend {
                 )));
             }
         };
-        let mut writer = self.state.writer.lock().await;
-        let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
+        // Plan against the latest published snapshot — no writer lock.
+        let owned = self.state.snapshot.load();
+        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
         let plan = build_plan(&parsed, &catalog).map_err(map_lower_err)?;
 
         if plan.contains_write() {
+            // Writes still take the writer lock (single-writer invariant).
+            // On success we refresh the snapshot cell so subsequent reads
+            // see the just-committed records (RFC-021).
+            let mut writer = self.state.writer.lock().await;
             let outcome = execute_write(&plan, &mut writer, &params)
                 .await
                 .map_err(map_exec_err)?;
+            self.state.snapshot.store(writer.owned_snapshot());
             let stype = classify_write(&outcome);
             let fields = field_list(&outcome.rows);
             let mut counters = std::collections::BTreeMap::new();
@@ -75,7 +81,10 @@ impl Backend for ServerBackend {
                 counters,
             })
         } else {
-            let snap = writer.snapshot();
+            // Read path: borrow a short-lived `Snapshot` from the owned
+            // snapshot; the Arc keeps the underlying memtable alive for
+            // the duration of the query, no writer lock needed.
+            let snap = owned.borrow();
             let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
             let fields = field_list(&rows);
             Ok(RunOutcome {
@@ -88,10 +97,10 @@ impl Backend for ServerBackend {
     }
 
     async fn current_bookmark(&self) -> Option<String> {
-        let w = self.state.writer.lock().await;
-        let snapshot = w.snapshot();
-        let version = snapshot.manifest().manifest.version;
-        Some(format!("namidb:v{}", version))
+        Some(format!(
+            "namidb:v{}",
+            self.state.snapshot.manifest_version()
+        ))
     }
 }
 

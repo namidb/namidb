@@ -103,10 +103,11 @@ async fn csr_path_matches_sst_path_on_pure_sst_edges() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(AdjacencyCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &empty,
+        &empty_view,
         store.clone(),
         paths.clone(),
     )
@@ -186,11 +187,12 @@ async fn csr_path_handles_tombstones_from_memtable_overlay() {
         20,
         MemOp::Tombstone,
     );
+    let live_view = live.snapshot_view();
 
     let cache = Arc::new(AdjacencyCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &live,
+        &live_view,
         store.clone(),
         paths.clone(),
     )
@@ -255,10 +257,11 @@ async fn csr_inverse_partner_serves_in_edges_in_parity() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(AdjacencyCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &empty,
+        &empty_view,
         store.clone(),
         paths.clone(),
     )
@@ -321,10 +324,11 @@ async fn csr_returns_empty_properties_for_sst_sourced_edges() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(AdjacencyCache::new(1024 * 1024));
     let snap = Snapshot::new(
         outcome.committed.clone(),
-        &empty,
+        &empty_view,
         store.clone(),
         paths.clone(),
     )
@@ -383,13 +387,14 @@ async fn csr_cache_reuses_across_snapshots_of_same_manifest_version() {
         .unwrap();
 
     let empty = Memtable::new();
+    let empty_view = empty.snapshot_view();
     let cache = Arc::new(AdjacencyCache::new(1024 * 1024));
 
     // Snapshot #1: cold miss → 1 build.
     {
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         )
@@ -402,7 +407,7 @@ async fn csr_cache_reuses_across_snapshots_of_same_manifest_version() {
     {
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         )

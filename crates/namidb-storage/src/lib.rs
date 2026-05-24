@@ -53,14 +53,14 @@ pub use manifest::{
     KindSpecificStats, Manifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
     WalSegmentDescriptor,
 };
-pub use memtable::{FrozenMemtable, MemEntry, MemKey, MemOp, Memtable};
+pub use memtable::{FrozenMemtable, MemEntry, MemKey, MemOp, Memtable, MemtableSnapshot};
 pub use node_cache::{
     node_cache_budget_bytes, node_cache_enabled, CachedNodeView, NodeCacheKey, NodeViewCache,
     DEFAULT_NODE_CACHE_BUDGET_MIB,
 };
 pub use parquet_loader::{load_nodes as load_nodes_from_parquet, LoadOutcome};
 pub use paths::NamespacePaths;
-pub use read::{EdgeListView, EdgeView, NodeView, Snapshot};
+pub use read::{EdgeListView, EdgeView, NodeView, OwnedSnapshot, Snapshot, SnapshotCell};
 pub use recovery::{recover_memtable, RecoveredMemtable, WalEntry, WalOp};
 pub use sst::{
     BloomDescriptor, BloomFilter, DegreeHistogram, EdgeDirection, EdgeRecord, EdgeSstFinish,

@@ -80,6 +80,13 @@ pub struct MemEntry {
 }
 
 /// In-memory write buffer.
+///
+/// `Memtable` is the writer-side, mutable form: the writer keeps a
+/// single instance and applies records into it. Readers consume the
+/// memtable through a [`MemtableSnapshot`] taken at a well-defined
+/// moment (commit_batch / flush) and shared via `Arc` so multiple
+/// concurrent reads see the same point-in-time view without holding
+/// any writer lock. See RFC-021.
 #[derive(Debug, Default)]
 pub struct Memtable {
     inner: BTreeMap<MemKey, MemEntry>,
@@ -163,6 +170,79 @@ impl Memtable {
         let inner = std::mem::take(&mut self.inner);
         let bytes = std::mem::take(&mut self.bytes);
         FrozenMemtable { inner, bytes }
+    }
+
+    /// Build an immutable [`MemtableSnapshot`] of the current state.
+    ///
+    /// The snapshot owns its own copy of the `BTreeMap`, so the
+    /// returned value lives independently of the writer that produced
+    /// it. Readers consume the snapshot via `Arc<MemtableSnapshot>` so
+    /// many concurrent reads share the same allocation without locking
+    /// the writer (RFC-021).
+    pub fn snapshot_view(&self) -> MemtableSnapshot {
+        MemtableSnapshot {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Immutable, read-only view of a memtable at a point in time.
+///
+/// Built by [`Memtable::snapshot_view`] and shared across concurrent
+/// readers via `Arc`. Exposes the same read API a `&Memtable` did
+/// (`iter`, `get`, `iter_label`, `iter_edge_type`), with no mutation
+/// surface. See RFC-021.
+#[derive(Debug, Default, Clone)]
+pub struct MemtableSnapshot {
+    inner: BTreeMap<MemKey, MemEntry>,
+}
+
+impl MemtableSnapshot {
+    /// Empty snapshot. Used as the initial value of the published cell
+    /// before any commit has happened.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn get(&self, key: &MemKey) -> Option<&MemEntry> {
+        self.inner.get(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
+        self.inner.iter()
+    }
+
+    pub fn iter_label<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+        let start = MemKey::Node {
+            label: label.to_string(),
+            id: NodeId::from_uuid(uuid::Uuid::nil()),
+        };
+        let end = MemKey::Node {
+            label: label.to_string(),
+            id: NodeId::from_uuid(uuid::Uuid::max()),
+        };
+        self.inner
+            .range((Bound::Included(start), Bound::Included(end)))
+            .filter(move |(k, _)| matches!(k, MemKey::Node { label: l, .. } if l == label))
+    }
+
+    pub fn iter_edge_type<'a>(
+        &'a self,
+        edge_type: &'a str,
+    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+        self.inner.iter().filter(
+            move |(k, _)| matches!(k, MemKey::Edge { edge_type: et, .. } if et == edge_type),
+        )
     }
 }
 

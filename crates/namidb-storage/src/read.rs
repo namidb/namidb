@@ -67,7 +67,7 @@ use crate::cache::{EdgeStreamBundle, SstCache};
 use crate::error::{Error, Result};
 use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
 use crate::manifest::{LoadedManifest, SstDescriptor, SstKind};
-use crate::memtable::{MemKey, MemOp, Memtable};
+use crate::memtable::{MemKey, MemOp, MemtableSnapshot};
 use crate::node_cache::{NodeCacheKey, NodeViewCache};
 use crate::paths::NamespacePaths;
 use crate::sst::bloom::BloomFilter;
@@ -109,7 +109,7 @@ pub struct EdgeListView {
 /// Pinned read view of a namespace.
 pub struct Snapshot<'mt> {
     manifest: LoadedManifest,
-    memtable: &'mt Memtable,
+    memtable: &'mt MemtableSnapshot,
     store: Arc<dyn ObjectStore>,
     paths: NamespacePaths,
     cache: Option<SstCache>,
@@ -214,7 +214,7 @@ impl<'mt> std::fmt::Debug for Snapshot<'mt> {
 impl<'mt> Snapshot<'mt> {
     pub fn new(
         manifest: LoadedManifest,
-        memtable: &'mt Memtable,
+        memtable: &'mt MemtableSnapshot,
         store: Arc<dyn ObjectStore>,
         paths: NamespacePaths,
     ) -> Self {
@@ -471,6 +471,12 @@ impl<'mt> Snapshot<'mt> {
 
     pub fn manifest(&self) -> &LoadedManifest {
         &self.manifest
+    }
+
+    /// Manifest version this snapshot is pinned at. Surfaced in Bolt
+    /// bookmarks and observability metrics (RFC-021).
+    pub fn manifest_version(&self) -> u64 {
+        self.manifest.manifest.version
     }
 
     /// Every edge type observable through this snapshot — declared in the
@@ -2051,6 +2057,130 @@ pub(crate) fn arrow_value_to_value(
     Ok(Some(value))
 }
 
+/// Owned, lifetime-free read snapshot of a namespace.
+///
+/// `OwnedSnapshot` carries an `Arc<MemtableSnapshot>` (a frozen copy
+/// of the writer's memtable at commit time) plus the manifest, object
+/// store and the cross-snapshot caches. Multiple concurrent readers
+/// share one `OwnedSnapshot` via `Arc`, so reads run in parallel
+/// across the tokio runtime without taking the writer mutex. See
+/// RFC-021.
+///
+/// Each read call materialises a short-lived [`Snapshot`] borrowed
+/// from the owned state. The per-query scratch caches (intra-snapshot
+/// node lookups, decoded RecordBatch reuse) live on that temporary
+/// borrowed snapshot and drop at the end of the query.
+pub struct OwnedSnapshot {
+    pub(crate) manifest: LoadedManifest,
+    pub(crate) memtable: Arc<MemtableSnapshot>,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) paths: NamespacePaths,
+    pub(crate) cache: Option<SstCache>,
+    pub(crate) ranged_mode: RangedMode,
+    pub(crate) ranged_threshold_bytes: u64,
+    pub(crate) adjacency_cache: Option<Arc<AdjacencyCache>>,
+    pub(crate) shared_node_cache: Option<Arc<NodeViewCache>>,
+    pub(crate) property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
+}
+
+impl std::fmt::Debug for OwnedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedSnapshot")
+            .field("manifest_version", &self.manifest.manifest.version)
+            .field("memtable_entries", &self.memtable.len())
+            .field("sst_count", &self.manifest.manifest.ssts.len())
+            .finish()
+    }
+}
+
+impl OwnedSnapshot {
+    pub fn manifest(&self) -> &LoadedManifest {
+        &self.manifest
+    }
+
+    pub fn manifest_version(&self) -> u64 {
+        self.manifest.manifest.version
+    }
+
+    /// Build a short-lived [`Snapshot`] borrowed from this owned state.
+    /// Hand it to the query executor; the lifetime is bounded by
+    /// `&self`, so the owned snapshot must outlive every read it
+    /// drives.
+    pub fn borrow(&self) -> Snapshot<'_> {
+        let mut snap = Snapshot::new(
+            self.manifest.clone(),
+            &self.memtable,
+            self.store.clone(),
+            self.paths.clone(),
+        );
+        if let Some(c) = &self.cache {
+            snap = snap.with_cache(c.clone());
+        }
+        snap = snap.with_ranged_threshold_bytes(self.ranged_threshold_bytes);
+        if let RangedMode::Force(b) = self.ranged_mode {
+            snap = snap.with_ranged_reads(b);
+        }
+        if let Some(c) = &self.adjacency_cache {
+            snap = snap.with_adjacency_cache(c.clone());
+        }
+        if let Some(c) = &self.shared_node_cache {
+            snap = snap.with_shared_node_cache(c.clone());
+        }
+        if let Some(c) = &self.property_index_cache {
+            snap = snap.with_property_index_cache(c.clone());
+        }
+        snap
+    }
+}
+
+/// Atomic publisher cell for the currently-active [`OwnedSnapshot`].
+///
+/// `SnapshotCell` is the lock-light handoff between the writer (which
+/// rebuilds the snapshot after every successful commit / flush) and the
+/// readers (which load the Arc and drop the writer mutex entirely).
+///
+/// The current implementation guards the inner `Arc` with a
+/// `std::sync::Mutex` for clarity. The critical section is exactly
+/// one pointer load plus an `Arc` strong-count bump (tens of
+/// nanoseconds). A lock-free swap (via `arc-swap`) is the natural
+/// follow-up once a flamegraph shows the mutex matters.
+#[derive(Debug)]
+pub struct SnapshotCell {
+    inner: std::sync::Mutex<Arc<OwnedSnapshot>>,
+}
+
+impl SnapshotCell {
+    pub fn new(snap: Arc<OwnedSnapshot>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(snap),
+        }
+    }
+
+    /// Pick up the current snapshot. Cheap: one mutex acquire plus
+    /// one `Arc::clone`. The returned `Arc` is independent of any
+    /// future `store` calls, so the read can run for as long as it
+    /// needs without holding any cell lock.
+    pub fn load(&self) -> Arc<OwnedSnapshot> {
+        Arc::clone(&self.inner.lock().expect("snapshot cell poisoned"))
+    }
+
+    /// Publish a new snapshot. The previous Arc is dropped once
+    /// every reader holding it lets go.
+    pub fn store(&self, snap: Arc<OwnedSnapshot>) {
+        *self.inner.lock().expect("snapshot cell poisoned") = snap;
+    }
+
+    /// Manifest version currently published. Cheap diagnostic for
+    /// observability — equivalent to `self.load().manifest_version()`
+    /// without the Arc clone path.
+    pub fn manifest_version(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("snapshot cell poisoned")
+            .manifest_version()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2148,9 +2278,10 @@ mod tests {
         // After flush the persisted state lives in SSTs; the live memtable
         // is empty.
         let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         );
@@ -2183,7 +2314,8 @@ mod tests {
             MemOp::Upsert(node_payload("Alice", Some(28))),
         );
 
-        let snap = Snapshot::new(base.clone(), &mt, store, paths);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(base.clone(), &mt_view, store, paths);
         let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
         assert_eq!(view.lsn, 7);
         assert_eq!(
@@ -2199,7 +2331,8 @@ mod tests {
         let ms = ManifestStore::new(store.clone(), paths.clone());
         let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
         let mt = Memtable::new();
-        let snap = Snapshot::new(base, &mt, store, paths);
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &mt_view, store, paths);
         let res = snap
             .lookup_node("Person", sorted_node_id(99))
             .await
@@ -2244,7 +2377,8 @@ mod tests {
             MemOp::Tombstone,
         );
 
-        let snap = Snapshot::new(outcome.committed.clone(), &live_mt, store, paths);
+        let live_mt_view = live_mt.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &live_mt_view, store, paths);
         let res = snap.lookup_node("Person", alice).await.unwrap();
         assert!(res.is_none(), "tombstone at higher LSN must win");
     }
@@ -2301,9 +2435,10 @@ mod tests {
             .unwrap();
 
         let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
         let snap = Snapshot::new(
             outcome.committed.clone(),
-            &empty,
+            &empty_view,
             store.clone(),
             paths.clone(),
         );
@@ -2376,7 +2511,8 @@ mod tests {
             MemOp::Tombstone,
         );
 
-        let snap = Snapshot::new(outcome.committed.clone(), &live, store, paths);
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &live_view, store, paths);
         let out = snap.out_edges("KNOWS", alice).await.unwrap();
         // bob's edge tombstoned, only carol remains.
         assert_eq!(out.edges.len(), 1);
@@ -2430,7 +2566,8 @@ mod tests {
         assert_eq!(after2.committed.manifest.ssts.len(), 2);
 
         let empty = Memtable::new();
-        let snap = Snapshot::new(after2.committed.clone(), &empty, store, paths);
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(after2.committed.clone(), &empty_view, store, paths);
         let low = snap.lookup_node("Person", id_low).await.unwrap().unwrap();
         assert_eq!(low.properties.get("name"), Some(&Value::Str("Low".into())));
         let high = snap.lookup_node("Person", id_high).await.unwrap().unwrap();
@@ -2468,8 +2605,9 @@ mod tests {
 
         let cache = SstCache::new(8 * 1024 * 1024);
         let empty = Memtable::new();
-        let snap =
-            Snapshot::new(after.committed.clone(), &empty, store, paths).with_cache(cache.clone());
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(after.committed.clone(), &empty_view, store, paths)
+            .with_cache(cache.clone());
 
         // Cold read: cache miss, then insert.
         let cold = snap.lookup_node("Person", alice).await.unwrap().unwrap();
@@ -2563,7 +2701,8 @@ mod tests {
             .unwrap();
 
         let empty = Memtable::new();
-        let snap = Snapshot::new(after.committed, &empty, store, paths);
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(after.committed, &empty_view, store, paths);
 
         let out = snap.out_edges("KNOWS", alice).await.unwrap();
         assert_eq!(out.edges.len(), 2);
@@ -2664,7 +2803,8 @@ mod tests {
             .unwrap();
 
         let empty = Memtable::new();
-        let snap = Snapshot::new(after.committed, &empty, store, paths);
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(after.committed, &empty_view, store, paths);
 
         // out_edges: both declared and ad-hoc properties round-trip.
         let out = snap.out_edges("KNOWS", alice).await.unwrap();
@@ -2747,7 +2887,8 @@ mod tests {
             MemOp::Upsert(node_payload("Dave", None)),
         );
 
-        let snap = Snapshot::new(after.committed, &live, store, paths);
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(after.committed, &live_view, store, paths);
         let rows = snap.scan_label("Person").await.unwrap();
 
         // bob (tombstoned) absent; alice, carol, dave present (3 nodes).
@@ -2828,7 +2969,8 @@ mod tests {
             MemOp::Upsert(edge_payload()),
         );
 
-        let snap = Snapshot::new(after.committed, &live, store, paths);
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(after.committed, &live_view, store, paths);
         let edges = snap.scan_edge_type("KNOWS").await.unwrap();
 
         // Expected: bob→carol (from SST) and carol→alice (from memtable).
@@ -2890,7 +3032,8 @@ mod tests {
         };
 
         let empty = Memtable::new();
-        let snap = Snapshot::new(base, &empty, store.clone(), paths);
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(base, &empty_view, store.clone(), paths);
         assert!(
             snap.bloom_admits(&descriptor, sorted_node_id(5).as_bytes())
                 .await
@@ -2968,7 +3111,8 @@ mod tests {
         assert_eq!(recovered.records_replayed, 1);
         assert_eq!(recovered.max_lsn, 30);
 
-        let snap = Snapshot::new(with_wal, &recovered.memtable, store, paths);
+        let view = recovered.memtable.snapshot_view();
+        let snap = Snapshot::new(with_wal, &view, store, paths);
         let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
         assert_eq!(view.lsn, 30);
         assert_eq!(
