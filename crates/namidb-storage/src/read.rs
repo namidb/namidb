@@ -2013,14 +2013,14 @@ pub(crate) fn arrow_value_to_value(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| Error::invariant("expected Date32Array"))?;
-            Value::I64(a.value(row) as i64)
+            Value::Date(a.value(row))
         }
         DataType::TimestampMicrosUtc => {
             let a = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| Error::invariant("expected TimestampMicrosecondArray"))?;
-            Value::I64(a.value(row))
+            Value::DateTime(a.value(row))
         }
         DataType::FloatVector { dim } => {
             let a = array

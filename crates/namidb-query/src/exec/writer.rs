@@ -934,6 +934,8 @@ fn runtime_to_core(v: &RuntimeValue, expr: &Expression) -> Result<CoreValue, Str
         RuntimeValue::String(s) => Ok(CoreValue::Str(s.clone())),
         RuntimeValue::Bytes(b) => Ok(CoreValue::Bytes(b.clone())),
         RuntimeValue::Vector(v) => Ok(CoreValue::Vec(v.clone())),
+        RuntimeValue::Date(d) => Ok(CoreValue::Date(*d)),
+        RuntimeValue::DateTime(m) => Ok(CoreValue::DateTime(*m)),
         other => Err(format!(
             "property value at `{}` is {} — only scalars are storable in v0",
             expr,
@@ -969,12 +971,18 @@ fn node_runtime_props_to_core(
             RuntimeValue::Vector(v) => {
                 out.insert(k.clone(), CoreValue::Vec(v.clone()));
             }
+            RuntimeValue::Date(d) => {
+                out.insert(k.clone(), CoreValue::Date(*d));
+            }
+            RuntimeValue::DateTime(m) => {
+                out.insert(k.clone(), CoreValue::DateTime(*m));
+            }
             other => {
                 return Err(ExecError::Runtime(format!(
- "property `{}` is {} — non-scalar values cannot round-trip through storage in v0",
- k,
- other.type_name()
- )));
+                    "property `{}` is {} — non-scalar values cannot round-trip through storage in v0",
+                    k,
+                    other.type_name()
+                )));
             }
         }
     }

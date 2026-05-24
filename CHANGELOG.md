@@ -13,6 +13,18 @@ below and in the release notes.
 
 ### Added
 
+- **`Value::Date(i32)` and `Value::DateTime(i64)`** in `namidb-core`,
+  with custom serde that tags them as `{"$date": <days>}` and
+  `{"$datetime": <us>}` on JSON so the typing survives a round-trip
+  through `__overflow_json` (undeclared properties). Declared
+  columns of type `Date32` and `TimestampMicrosUtc` now decode to
+  these variants instead of the previous lossy `Value::I64`, and
+  the executor's `runtime_to_core` + `node_runtime_props_to_core`
+  pass them through. The flush-side `PropertyBuilder` learns the
+  two new match arms. Closes the limit found while smoke-testing
+  Bolt: `datetime()` parameters from a Neo4j driver now persist and
+  read back as `neo4j.time.DateTime` / `neo4j.time.Date` instead of
+  raw integers.
 - **Bolt protocol listener** in `namidb-server`. Opt-in via
   `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`). Speaks Bolt
   4.4 / 5.0 / 5.4 so the official Neo4j drivers (Python, Java,

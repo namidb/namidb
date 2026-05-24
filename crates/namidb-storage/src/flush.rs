@@ -971,7 +971,15 @@ impl PropertyBuilder {
                 b.append_value(v32);
                 Ok(())
             }
+            (PropertyBuilder::Date32(b), Value::Date(v)) => {
+                b.append_value(*v);
+                Ok(())
+            }
             (PropertyBuilder::Timestamp(b), Value::I64(v)) => {
+                b.append_value(*v);
+                Ok(())
+            }
+            (PropertyBuilder::Timestamp(b), Value::DateTime(v)) => {
                 b.append_value(*v);
                 Ok(())
             }

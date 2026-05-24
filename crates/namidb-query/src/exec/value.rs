@@ -126,6 +126,8 @@ impl From<CoreValue> for RuntimeValue {
             CoreValue::Str(s) => RuntimeValue::String(s),
             CoreValue::Bytes(b) => RuntimeValue::Bytes(b),
             CoreValue::Vec(v) => RuntimeValue::Vector(v),
+            CoreValue::Date(d) => RuntimeValue::Date(d),
+            CoreValue::DateTime(m) => RuntimeValue::DateTime(m),
         }
     }
 }
