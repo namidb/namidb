@@ -553,6 +553,8 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 length,
                 optional,
                 back_reference,
+                shortest,
+                path_binding,
             } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
@@ -567,6 +569,8 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     *length,
                     *optional,
                     *back_reference,
+                    *shortest,
+                    path_binding.as_deref(),
                     snapshot,
                     routing.needs_properties(rel_alias.as_deref()),
                     should_skip_target_materialize(
@@ -611,6 +615,8 @@ async fn execute_expand(
     length: Option<crate::parser::RelationshipLength>,
     optional: bool,
     back_reference: bool,
+    shortest: crate::plan::ShortestMode,
+    path_binding: Option<&str>,
     snapshot: &Snapshot<'_>,
     want_properties: bool,
     skip_target_materialize: bool,
@@ -679,9 +685,25 @@ async fn execute_expand(
             }
         }
 
+        // Materialise the BFS trail only when shortestPath asked for
+        // it. The head node opens the trail; each Expand hop appends
+        // a Rel + a target Node so `RuntimeValue::Path` can be
+        // assembled on the hit row (RFC-023).
+        let materialise_trail = path_binding.is_some();
+        let initial_trail = if materialise_trail {
+            match row.get(source) {
+                Some(RuntimeValue::Node(n)) => {
+                    vec![RuntimeValue::Node(n.clone())]
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let mut frontier: Vec<Step> = vec![Step {
             tail: starting,
             row: row.clone(),
+            trail: initial_trail,
         }];
         let hop_start = min.max(1);
         let _ = hop_start;
@@ -747,10 +769,35 @@ async fn execute_expand(
                             None => continue,
                         }
                     };
+                    let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge)));
                     let mut new_row = step.row.clone();
                     if let Some(name) = rel_alias {
-                        new_row.set(name, RuntimeValue::Rel(Box::new(RelValue::from(edge))));
+                        new_row.set(name, rel_value.clone());
                     }
+                    // For shortestPath trail materialisation we need a
+                    // target NodeValue regardless of `skip_target_materialize`.
+                    // Compute it once below and reuse for both the row binding
+                    // and the trail.
+                    let target_node_value: Option<NodeValue> =
+                        if let Some(view) = target_view_opt.as_ref() {
+                            Some(NodeValue::from(view.clone()))
+                        } else if back_reference {
+                            // Back-reference uses the pre-bound NodeView from
+                            // the existing target_alias on the seed row.
+                            match row.get(target_alias) {
+                                Some(RuntimeValue::Node(n)) => Some(n.as_ref().clone()),
+                                _ => None,
+                            }
+                        } else if skip_target_materialize {
+                            Some(NodeValue {
+                                id: target_id,
+                                label: target_label.unwrap_or_default().to_string(),
+                                properties: std::collections::BTreeMap::new(),
+                            })
+                        } else {
+                            None
+                        };
+
                     if let Some(view) = target_view_opt {
                         new_row.set(
                             target_alias.to_string(),
@@ -760,21 +807,29 @@ async fn execute_expand(
                         // id-only stub: enough for the next Expand to read
                         // `.id`; `label` is preserved so RuntimeValue::Node
                         // still type-checks for downstream Expand source reads.
-                        new_row.set(
-                            target_alias.to_string(),
-                            RuntimeValue::Node(Box::new(NodeValue {
-                                id: target_id,
-                                label: target_label.unwrap_or_default().to_string(),
-                                properties: std::collections::BTreeMap::new(),
-                            })),
-                        );
+                        if let Some(nv) = &target_node_value {
+                            new_row.set(
+                                target_alias.to_string(),
+                                RuntimeValue::Node(Box::new(nv.clone())),
+                            );
+                        }
                     }
                     // Back-reference: the binding stays at the
                     // original existing target; new_row already
                     // carries it from row.clone() above.
+                    let mut new_trail = step.trail.clone();
+                    if materialise_trail {
+                        new_trail.push(rel_value);
+                        if let Some(nv) = target_node_value {
+                            new_trail.push(RuntimeValue::Node(Box::new(nv)));
+                        } else {
+                            new_trail.push(RuntimeValue::Null);
+                        }
+                    }
                     next_frontier.push(Step {
                         tail: target_id,
                         row: new_row.clone(),
+                        trail: new_trail.clone(),
                     });
                     if hop >= min.max(1) {
                         let keeps = match existing_target_id {
@@ -782,11 +837,31 @@ async fn execute_expand(
                             None => true,
                         };
                         if keeps {
-                            hop_results.push(new_row);
+                            let mut hit_row = new_row;
+                            if let Some(name) = path_binding {
+                                hit_row.set(name.to_string(), RuntimeValue::Path(new_trail));
+                            }
+                            hop_results.push(hit_row);
                             matched_any = true;
+                            // shortestPath: at most one row per
+                            // (source, target). Stop the whole BFS
+                            // for this seed row.
+                            if shortest == crate::plan::ShortestMode::First {
+                                break;
+                            }
                         }
                     }
                 }
+                if shortest == crate::plan::ShortestMode::First && matched_any {
+                    break;
+                }
+            }
+            // shortestPath: hit found this hop → don't extend the
+            // frontier into hop+1.
+            // allShortestPaths: hit found this hop → emit every
+            // row of this length (already done above), then stop.
+            if matched_any && shortest != crate::plan::ShortestMode::None {
+                break;
             }
             frontier = next_frontier;
             if frontier.is_empty() {
@@ -813,6 +888,12 @@ async fn execute_expand(
 struct Step {
     tail: NodeId,
     row: Row,
+    /// Path materialisation trail for RFC-023 `shortestPath`. Empty
+    /// when the Expand doesn't need to materialise a path (the
+    /// common case). The trail alternates Node, Rel, Node, Rel, ...
+    /// — for shortestPath we only fill it when `path_binding` is
+    /// `Some(_)`.
+    trail: Vec<RuntimeValue>,
 }
 
 /// Resolve the set of labels a `NodeScan` operator must visit.
@@ -1565,6 +1646,8 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 length,
                 optional,
                 back_reference,
+                shortest: _, // factor path: shortestPath routes via the flat path; see Plan-aware routing.
+                path_binding: _,
             } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)

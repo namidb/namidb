@@ -6,6 +6,23 @@ use namidb_storage::sst::predicates::ScanPredicate;
 
 use crate::parser::{Expression, OrderDirection, RelationshipDirection, RelationshipLength};
 
+/// Shortest-path variant attached to [`LogicalPlan::Expand`]. See
+/// RFC-023.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShortestMode {
+    /// Regular variable-length traversal — emit every reachable
+    /// row.
+    #[default]
+    None,
+    /// `shortestPath((a)-[*..N]-(b))` — at most one row per
+    /// (source, target) pair, emitted at the first hop the target
+    /// appears.
+    First,
+    /// `allShortestPaths(...)` — every distinct path of the minimum
+    /// length.
+    All,
+}
+
 /// Tree of relational/graph operators produced by lowering the AST and
 /// consumed by the executor. See RFC-008.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +99,18 @@ pub enum LogicalPlan {
         /// still explore the frontier freely, but only paths that
         /// terminate at the existing target survive.
         back_reference: bool,
+        /// `None` for an ordinary `[*min..max]` traversal. `Some(...)`
+        /// for `shortestPath((a)-[*..N]-(b))` (`First`) or
+        /// `allShortestPaths(...)` (`All`); the executor terminates
+        /// the BFS at the hop that first reaches `target_alias`. See
+        /// RFC-023.
+        shortest: ShortestMode,
+        /// When `shortest != None` and the user bound the path
+        /// (`MATCH p = shortestPath(...)`), the executor materialises
+        /// the alternating Node / Rel trail into the named runtime
+        /// variable so `length(p)` etc. work. `None` for ordinary
+        /// expands.
+        path_binding: Option<String>,
     },
 
     /// Selection predicate.

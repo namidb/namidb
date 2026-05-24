@@ -681,6 +681,7 @@ mod tests {
         Expression, ExpressionKind, Identifier, Literal, OrderDirection, RelationshipDirection,
         SourceSpan,
     };
+    use crate::plan::logical::ShortestMode;
     use crate::plan::logical::{LogicalPlan, OrderKey, ProjectionItem};
 
     fn ident_expr(name: &str) -> Expression {
@@ -742,6 +743,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let project = LogicalPlan::Project {
             input: Box::new(expand),
@@ -789,6 +792,8 @@ TopN keys=[b DESC] limit=10
             length: None,
             optional: true,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let s = explain(&p);
         assert!(s.starts_with("OptionalExpand"));
@@ -845,6 +850,8 @@ TopN keys=[b DESC] limit=10
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let s = explain_verbose(&plan, &cat);
         assert!(s.starts_with("# Estimated rows: 500"));

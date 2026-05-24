@@ -13,6 +13,22 @@ below and in the release notes.
 
 ### Added
 
+- **`shortestPath` and `allShortestPaths` (RFC-023).** The parser
+  accepts the wrapping function form
+  (`MATCH p = shortestPath((a)-[*..N]-(b))`), the lower validates
+  the v0 rules (path binding required, single hop, finite upper
+  bound, both endpoints in scope), and the executor terminates the
+  BFS in `execute_expand` at the hop where the back-reference target
+  first appears. `shortestPath` emits one row per (source, target)
+  pair; `allShortestPaths` emits every distinct path of the minimum
+  length and stops the BFS at that hop. The variable-length parser
+  also accepts the `*..M` form (min defaults to 1) so `-[:KNOWS*..15]-`
+  matches the Neo4j surface. `length(p)` now answers correctly on
+  `RuntimeValue::Path` (number of hops). Closes the LDBC SNB
+  Interactive IC13 and IC14 parser gap: 15/15 fixtures round-trip.
+  Design in [RFC-023](docs/rfc/023-shortest-path.md). 5 new
+  end-to-end tests in
+  `crates/namidb-query/tests/exec_shortest_path.rs`.
 - **Concurrent reads without the writer mutex (RFC-021).** Reads no
   longer take `state.writer.lock()`. A new `OwnedSnapshot` carries an
   `Arc<MemtableSnapshot>` plus the manifest, object store, and the

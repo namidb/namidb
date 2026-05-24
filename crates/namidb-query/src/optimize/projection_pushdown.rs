@@ -539,6 +539,8 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, req)),
             source,
@@ -550,6 +552,8 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(rewrite(*input, req)),
@@ -696,7 +700,7 @@ mod tests {
     use crate::parser::ast::{BinaryOp, Identifier, Literal, PropertyAccess};
     use crate::parser::SourceSpan;
     use crate::plan::logical::ProjectionItem;
-
+    
     fn span() -> SourceSpan {
         SourceSpan::point(0)
     }

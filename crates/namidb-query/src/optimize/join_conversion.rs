@@ -65,6 +65,8 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(convert_cross_to_hash(*input, catalog)),
             source,
@@ -76,6 +78,8 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(convert_cross_to_hash(*input, catalog)),
@@ -337,7 +341,7 @@ mod tests {
     use crate::parser::ast::{Identifier, Literal, PropertyAccess};
     use crate::parser::SourceSpan;
     use crate::plan::logical::ProjectionItem;
-    use namidb_storage::sst::stats::StatScalar;
+        use namidb_storage::sst::stats::StatScalar;
     use std::collections::BTreeMap;
 
     fn span() -> SourceSpan {

@@ -1,18 +1,15 @@
 //! Integration tests against the LDBC SNB Interactive Complex queries.
 //!
-//! Each `tests/fixtures/ic*.cypher` is parsed and checked according to
-//! RFC-004:
-//!
-//! - **IC1–IC12** must parse successfully and round-trip
-//! (`parse → display → parse` produces an identical canonical string).
-//! - **IC13–IC14** are out-of-scope v0 (they need `shortestPath` /
-//! `allShortestPaths`, whose canonical Cypher forms use unbounded
-//! `*` patterns) and must fail with `ErrorCode::UnboundedVariableLength`.
+//! Each `tests/fixtures/ic*.cypher` is parsed and round-trips
+//! (`parse → display → parse` produces an identical canonical
+//! string). With RFC-023 IC13 and IC14 (shortestPath /
+//! allShortestPaths) now parse alongside IC01–IC12, so every
+//! fixture is exercised through the same round-trip harness.
 
 use std::fs;
 use std::path::PathBuf;
 
-use namidb_query::parser::{parse, ErrorCode};
+use namidb_query::parser::parse;
 
 fn fixture(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -105,28 +102,20 @@ fn ic12_expert_search() {
     parse_and_roundtrip("ic12_expert_search.cypher");
 }
 
-// ────────────────── OUT-OF-SCOPE queries (must reject) ─────────────
+// ────────────────── shortest-path queries (RFC-023) ────────────────
+//
+// IC13 / IC14 use `shortestPath` and `allShortestPaths`. RFC-023
+// lands the parser + lower + executor support, so the parser must
+// now accept them as a regular round-trip.
 
 #[test]
-fn ic13_shortest_path_is_out_of_scope_v0() {
-    let src = fixture("ic13_shortest_path.cypher");
-    let errs = parse(&src).expect_err("IC13 must fail in v0");
-    assert!(
-        errs.iter().any(|e| e.code == ErrorCode::UnsupportedFeature),
-        "expected UnsupportedFeature, got {:?}",
-        errs
-    );
+fn ic13_shortest_path() {
+    parse_and_roundtrip("ic13_shortest_path.cypher");
 }
 
 #[test]
-fn ic14_all_shortest_paths_is_out_of_scope_v0() {
-    let src = fixture("ic14_all_shortest_paths.cypher");
-    let errs = parse(&src).expect_err("IC14 must fail in v0");
-    assert!(
-        errs.iter().any(|e| e.code == ErrorCode::UnsupportedFeature),
-        "expected UnsupportedFeature, got {:?}",
-        errs
-    );
+fn ic14_all_shortest_paths() {
+    parse_and_roundtrip("ic14_all_shortest_paths.cypher");
 }
 
 // ────────────────── meta-check: every fixture is exercised ─────────

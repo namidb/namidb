@@ -102,6 +102,8 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(recurse(*input, catalog)),
             source,
@@ -113,6 +115,8 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(recurse(*input, catalog)),
@@ -240,7 +244,7 @@ mod tests {
     use crate::cost::stats::StatsCatalog;
     use crate::parser::ast::{Expression, ExpressionKind, Identifier, PropertyAccess};
     use crate::parser::SourceSpan;
-
+    
     fn span() -> SourceSpan {
         SourceSpan::point(0)
     }

@@ -705,6 +705,7 @@ mod tests {
     use crate::parser::ast::Identifier;
     use crate::parser::SourceSpan;
     use crate::plan::logical::AggregateExpr;
+    use crate::plan::logical::ShortestMode;
     use namidb_storage::sst::stats::StatScalar;
 
     fn span() -> SourceSpan {
@@ -847,6 +848,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let c = estimate(&expand, &cat);
         // 1000 * 5.0 = 5000.
@@ -870,6 +873,8 @@ mod tests {
             length: Some(crate::parser::ast::RelationshipLength { min: 1, max: 10 }),
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let c = estimate(&expand, &cat);
         assert!(c.rows <= 1000.0 * MAX_VARLEN_BRANCH);

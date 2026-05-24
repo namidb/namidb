@@ -56,6 +56,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(normalize_filters(*input)),
             source,
@@ -67,6 +69,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(normalize_filters(*input)),
@@ -259,6 +263,7 @@ mod tests {
     use super::*;
     use crate::parser::ast::{BinaryOp, Identifier, QualifiedName, RelationshipDirection};
     use crate::parser::SourceSpan;
+    use crate::plan::logical::ShortestMode;
 
     fn span() -> SourceSpan {
         SourceSpan::point(0)
@@ -400,6 +405,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -437,6 +444,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -474,6 +483,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -502,6 +513,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let result = normalize_filters(plan);
         match result {
@@ -575,6 +588,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Filter {

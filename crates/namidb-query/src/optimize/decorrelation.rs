@@ -257,6 +257,8 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(replace_argument(*input, x, label)),
             source,
@@ -268,6 +270,8 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(replace_argument(*input, x, label)),
@@ -332,6 +336,8 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => LogicalPlan::Expand {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
             source,
@@ -343,6 +349,8 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
@@ -482,6 +490,7 @@ mod tests {
     use super::*;
     use crate::parser::ast::{BinaryOp, Literal, RelationshipDirection};
     use crate::plan::logical::ProjectionItem;
+    use crate::plan::logical::ShortestMode;
 
     fn span() -> SourceSpan {
         SourceSpan::point(0)
@@ -518,6 +527,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         }
     }
     fn semi_apply(input: LogicalPlan, subplan: LogicalPlan, negated: bool) -> LogicalPlan {

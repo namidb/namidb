@@ -259,6 +259,20 @@ pub struct PatternPart {
     pub binding: Option<Identifier>,
     pub element: PatternElement,
     pub span: SourceSpan,
+    /// `Some(...)` when the pattern part is wrapped in
+    /// `shortestPath(...)` or `allShortestPaths(...)`. Lower
+    /// translates this into the `shortest` field on
+    /// [`crate::plan::LogicalPlan::Expand`]. See RFC-023.
+    pub shortest_path: Option<ShortestPathMode>,
+}
+
+/// Shortest-path variant a [`PatternPart`] was wrapped in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortestPathMode {
+    /// `shortestPath(...)` — one path per (source, target) pair.
+    First,
+    /// `allShortestPaths(...)` — every path of the minimum length.
+    All,
 }
 
 /// A pattern element starts with a node and alternates relationship→node.

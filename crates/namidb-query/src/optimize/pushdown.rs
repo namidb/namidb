@@ -117,6 +117,8 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
             length,
             optional,
             back_reference,
+            shortest,
+            path_binding,
         } => {
             let mut introduced = BTreeSet::new();
             introduced.insert(target_alias.clone());
@@ -137,6 +139,8 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
                     length,
                     optional,
                     back_reference,
+                    shortest,
+                    path_binding,
                 },
                 stay,
             )
@@ -528,6 +532,7 @@ mod tests {
     use crate::optimize::optimize;
     use crate::parser::ast::{BinaryOp, Identifier, Literal, RelationshipDirection};
     use crate::parser::SourceSpan;
+    use crate::plan::logical::ShortestMode;
     use crate::plan::logical::{AggregateExpr, ProjectionItem};
 
     fn span() -> SourceSpan {
@@ -611,6 +616,8 @@ mod tests {
                 length: None,
                 optional: false,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: pred,
         };
@@ -642,6 +649,8 @@ mod tests {
                 length: None,
                 optional: false,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: pred,
         };
@@ -671,6 +680,8 @@ mod tests {
                 length: None,
                 optional: true,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: pred,
         };
@@ -697,6 +708,8 @@ mod tests {
                 length: None,
                 optional: false,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: compound,
         };
@@ -1019,6 +1032,8 @@ mod tests {
                 length: None,
                 optional: false,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: pred,
         };
@@ -1045,6 +1060,8 @@ mod tests {
                     length: None,
                     optional: false,
                     back_reference: false,
+                    shortest: ShortestMode::None,
+                    path_binding: None,
                 }),
                 predicate: p1,
             }),
@@ -1099,6 +1116,8 @@ mod tests {
                 length: None,
                 optional: false,
                 back_reference: false,
+                shortest: ShortestMode::None,
+                path_binding: None,
             }),
             predicate: pred,
         };

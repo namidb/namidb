@@ -12,6 +12,7 @@ use std::fmt;
 
 use super::logical::{
     AggregateExpr, CreateElement, LogicalPlan, OrderKey, ProjectionItem, RemoveOp, SetOp,
+    ShortestMode,
 };
 use crate::parser::{
     self as ast, BinaryOp, Clause, Expression, ExpressionKind, Literal, MatchClause, NodePattern,
@@ -327,7 +328,7 @@ fn lower_exists_subplan(
 ) -> Result<LogicalPlan, LowerError> {
     let mut sub = LowerCtx::new();
     sub.bindings = outer_ctx.bindings.clone();
-    lower_pattern_element(elem, None, false, &mut sub)
+    lower_pattern_element(elem, None, false, ShortestMode::None, &mut sub)
 }
 
 /// Lower the subplan of a pattern comprehension. Like `lower_exists_subplan`
@@ -339,7 +340,7 @@ fn lower_pattern_comprehension_subplan(
 ) -> Result<LogicalPlan, LowerError> {
     let mut sub = LowerCtx::new();
     sub.bindings = outer_ctx.bindings.clone();
-    let mut plan = lower_pattern_element(&pc.pattern, None, false, &mut sub)?;
+    let mut plan = lower_pattern_element(&pc.pattern, None, false, ShortestMode::None, &mut sub)?;
     if let Some(pred) = &pc.predicate {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
@@ -507,9 +508,30 @@ fn lower_pattern_part(
     optional: bool,
     ctx: &mut LowerCtx,
 ) -> Result<LogicalPlan, LowerError> {
+    let shortest = part
+        .shortest_path
+        .map(|m| match m {
+            ast::ShortestPathMode::First => ShortestMode::First,
+            ast::ShortestPathMode::All => ShortestMode::All,
+        })
+        .unwrap_or(ShortestMode::None);
+    if shortest != ShortestMode::None {
+        validate_shortest_path_pattern_v0(part, &part.element)?;
+        // shortestPath: the executor materialises the path trail
+        // directly into the named binding, so the lower does NOT
+        // emit a Project + build_path_constructor (which would
+        // produce a static node list). We thread the path name
+        // through to the Expand so the walker can populate it.
+        if let Some(path_bind) = &part.binding {
+            ctx.introduce(&path_bind.name, path_bind.span)?;
+            let plan = lower_pattern_element(&part.element, input, optional, shortest, ctx)?;
+            return Ok(attach_path_binding(plan, &path_bind.name));
+        }
+        return lower_pattern_element(&part.element, input, optional, shortest, ctx);
+    }
     if let Some(path_bind) = &part.binding {
         validate_path_pattern_v0(&part.element)?;
-        let plan = lower_pattern_element(&part.element, input, optional, ctx)?;
+        let plan = lower_pattern_element(&part.element, input, optional, shortest, ctx)?;
         ctx.introduce(&path_bind.name, path_bind.span)?;
         let path_expr = build_path_constructor(&part.element, path_bind.span);
         return Ok(LogicalPlan::Project {
@@ -522,7 +544,103 @@ fn lower_pattern_part(
             discard_input_bindings: false,
         });
     }
-    lower_pattern_element(&part.element, input, optional, ctx)
+    lower_pattern_element(&part.element, input, optional, shortest, ctx)
+}
+
+/// Walk the plan top-down until the first `Expand` and set its
+/// `path_binding`. Used by `lower_pattern_part` to communicate the
+/// path variable name to the executor for shortestPath.
+fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Expand {
+            input,
+            source,
+            edge_type,
+            direction,
+            rel_alias,
+            target_alias,
+            target_label,
+            length,
+            optional,
+            back_reference,
+            shortest,
+            path_binding: _,
+        } => LogicalPlan::Expand {
+            input,
+            source,
+            edge_type,
+            direction,
+            rel_alias,
+            target_alias,
+            target_label,
+            length,
+            optional,
+            back_reference,
+            shortest,
+            path_binding: Some(name.to_string()),
+        },
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(attach_path_binding(*input, name)),
+            predicate,
+        },
+        other => other,
+    }
+}
+
+fn validate_shortest_path_pattern_v0(
+    part: &PatternPart,
+    elem: &PatternElement,
+) -> Result<(), LowerError> {
+    // 1. path binding required.
+    if part.binding.is_none() {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "shortestPath / allShortestPaths require a path variable \
+             (e.g. `MATCH p = shortestPath(...)`)",
+            part.span,
+        ));
+    }
+    // 2. Single relationship hop.
+    if elem.chain.len() != 1 {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "shortestPath accepts a single relationship hop; \
+             split multi-leg paths across separate MATCH clauses",
+            part.span,
+        ));
+    }
+    let (rel, target) = &elem.chain[0];
+    // 3. Finite upper bound — `*..N` or `*min..N` or fixed `*N`.
+    match rel.length {
+        Some(crate::parser::RelationshipLength { max, .. }) if max < u32::MAX => {}
+        _ => {
+            return Err(LowerError::new(
+                LowerErrorKind::UnsupportedFeature,
+                "shortestPath requires a finite upper bound \
+                 (e.g. `*..15` or `*1..5`); unbounded `*` is rejected",
+                rel.span,
+            ));
+        }
+    }
+    // 4. Both endpoints named, so the executor's back-reference path
+    // identifies the targets. Their values come from a prior MATCH
+    // clause in the query.
+    if elem.head.binding.is_none() {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "shortestPath source must reference a previously bound node \
+             (e.g. `MATCH (a:Person ...) MATCH p = shortestPath((a)-[*..15]-(b))`)",
+            elem.head.span,
+        ));
+    }
+    if target.binding.is_none() {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "shortestPath target must reference a previously bound node",
+            target.span,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_path_pattern_v0(elem: &PatternElement) -> Result<(), LowerError> {
@@ -566,10 +684,22 @@ fn build_path_constructor(elem: &PatternElement, span: SourceSpan) -> Expression
     let head_name = elem.head.binding.as_ref().expect("validated").name.clone();
     args.push(var_expression(&head_name, span));
     for (rel, target) in &elem.chain {
-        let rel_name = rel.binding.as_ref().expect("validated").name.clone();
-        args.push(var_expression(&rel_name, span));
-        let target_name = target.binding.as_ref().expect("validated").name.clone();
-        args.push(var_expression(&target_name, span));
+        // For shortestPath patterns (RFC-023) the rel / target may
+        // lack an explicit binding (LDBC IC13 writes
+        // `shortestPath((a)-[:KNOWS*..15]-(b))`). Use a null literal
+        // for the missing element so `length(p)` still works; the
+        // `__path` builtin tolerates null fillers and counts only
+        // non-null relationships.
+        if let Some(b) = &rel.binding {
+            args.push(var_expression(&b.name, span));
+        } else {
+            args.push(null_expression(span));
+        }
+        if let Some(b) = &target.binding {
+            args.push(var_expression(&b.name, span));
+        } else {
+            args.push(null_expression(span));
+        }
     }
     Expression {
         kind: ExpressionKind::FunctionCall {
@@ -577,6 +707,13 @@ fn build_path_constructor(elem: &PatternElement, span: SourceSpan) -> Expression
             args,
             distinct: false,
         },
+        span,
+    }
+}
+
+fn null_expression(span: SourceSpan) -> Expression {
+    Expression {
+        kind: ExpressionKind::Literal(crate::parser::Literal::Null),
         span,
     }
 }
@@ -592,6 +729,7 @@ fn lower_pattern_element(
     elem: &PatternElement,
     input: Option<LogicalPlan>,
     optional: bool,
+    shortest: ShortestMode,
     ctx: &mut LowerCtx,
 ) -> Result<LogicalPlan, LowerError> {
     let mut plan = lower_node_pattern_head(&elem.head, input, optional, ctx)?;
@@ -611,6 +749,7 @@ fn lower_pattern_element(
             rel,
             target,
             optional,
+            shortest,
             ctx,
         )?;
         // After this rel, the target becomes the source for the next.
@@ -715,6 +854,7 @@ fn lower_node_pattern_head(
     Ok(combine(input, scan))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_rel_node(
     input: LogicalPlan,
     explicit_source: Option<&str>,
@@ -722,6 +862,7 @@ fn lower_rel_node(
     rel: &RelationshipPattern,
     target: &NodePattern,
     optional: bool,
+    shortest: ShortestMode,
     ctx: &mut LowerCtx,
 ) -> Result<LogicalPlan, LowerError> {
     // Prefer the explicit source (passed by `lower_pattern_element`,
@@ -774,6 +915,8 @@ fn lower_rel_node(
         length: rel.length,
         optional,
         back_reference: target_already_bound,
+        shortest,
+        path_binding: None,
     };
     // OPTIONAL MATCH must preserve rows where the target is NULL. Label
     // and property checks are issued via the executor's `target_label`

@@ -675,27 +675,34 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        // RFC-004 §Out-of-scope: shortestPath/allShortestPaths land in RFC-009.
-        if let Some(Token::Ident(name)) = self.peek() {
-            if name.eq_ignore_ascii_case("shortestPath")
-                || name.eq_ignore_ascii_case("allShortestPaths")
-            {
-                let span = self.peek_span();
-                let n = name.clone();
-                return Err(ParseError::new(
-                    ErrorCode::UnsupportedFeature,
-                    format!("`{}` is out-of-scope in v0", n),
-                    span,
-                )
-                .with_help("see RFC-004 §Out-of-scope; lands in RFC-009"));
+        // RFC-023: shortestPath / allShortestPaths wrap a single
+        // pattern. The function name is parser-special so we don't
+        // confuse it with a user-defined function call.
+        let shortest_path = if let Some(Token::Ident(name)) = self.peek() {
+            if name.eq_ignore_ascii_case("shortestPath") {
+                self.bump();
+                self.expect(&Token::LParen)?;
+                Some(ShortestPathMode::First)
+            } else if name.eq_ignore_ascii_case("allShortestPaths") {
+                self.bump();
+                self.expect(&Token::LParen)?;
+                Some(ShortestPathMode::All)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         let element = self.parse_pattern_element()?;
+        if shortest_path.is_some() {
+            self.expect(&Token::RParen)?;
+        }
         let end = element.span.end;
         Ok(PatternPart {
             binding,
             element,
             span: SourceSpan::new(start, end),
+            shortest_path,
         })
     }
 
@@ -880,12 +887,19 @@ impl<'src> Parser<'src> {
         let min = match min_lit {
             Some((n, _)) => n,
             None => {
-                return Err(ParseError::new(
-                    ErrorCode::UnboundedVariableLength,
-                    "variable-length pattern requires explicit min..max bounds in v0",
-                    star_span,
-                )
-                .with_help("see RFC-004 §Out-of-scope: variable-length without upper bound"));
+                // `*..M` form: no min, just an upper bound. The next
+                // token must be `..`; otherwise it's a bare `*` and
+                // we still reject.
+                if matches!(self.peek(), Some(Token::Range)) {
+                    1
+                } else {
+                    return Err(ParseError::new(
+                        ErrorCode::UnboundedVariableLength,
+                        "variable-length pattern requires explicit min..max bounds in v0",
+                        star_span,
+                    )
+                    .with_help("see RFC-004 §Out-of-scope: variable-length without upper bound"));
+                }
             }
         };
         let max = if self.eat(&Token::Range).is_some() {

@@ -457,6 +457,7 @@ fn _keep_imports_live(_p: &ProjectionItem) {}
 mod tests {
     use super::*;
     use crate::parser::ast::{Identifier, Literal, QualifiedName};
+    use crate::plan::logical::ShortestMode;
 
     fn span() -> SourceSpan {
         SourceSpan::point(0)
@@ -649,6 +650,8 @@ mod tests {
             length: None,
             optional: false,
             back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
         };
         let s = produced_aliases(&plan);
         assert!(s.contains("a"));
