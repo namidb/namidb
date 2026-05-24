@@ -1255,6 +1255,191 @@ impl<'mt> Snapshot<'mt> {
             .await
     }
 
+    /// Return every partner of `key` along `(edge_type, direction)` as a
+    /// sorted `Vec<NodeId>` ascending by `NodeId` byte order, with the
+    /// memtable overlay applied last-LSN-wins and tombstones removed.
+    ///
+    /// This is the input shape the leapfrog triejoin executor consumes
+    /// (RFC-024): the WCOJ inner loop wraps the returned `Vec<NodeId>`
+    /// in `SortedSliceIter` and intersects across the constraints
+    /// incident to the current trie level. The CSR partner array is
+    /// already sorted by construction (RFC-018); the memtable overlay
+    /// can introduce out-of-order partners, so the merge stage funnels
+    /// everything through a `BTreeMap` keyed on the raw partner bytes
+    /// and drains it in ascending order. Properties are discarded; the
+    /// caller only needs topology.
+    ///
+    /// Cost is `O(deg + memtable_edges_for_type)`. Production memtables
+    /// flush at a configurable threshold so the second term is
+    /// bounded; the first term comes for free from
+    /// `EdgeAdjacency::lookup`.
+    #[instrument(skip(self), fields(edge_type = edge_type, key = %key, direction = ?direction))]
+    pub async fn sorted_partners(
+        &self,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+    ) -> Result<Vec<NodeId>> {
+        namidb_core::profile_scope!("Snapshot::sorted_partners");
+        let key_bytes = *key.as_bytes();
+        // Partner bytes -> (lsn, is_upsert).
+        let mut latest: BTreeMap<[u8; 16], (u64, bool)> = BTreeMap::new();
+
+        // Memtable sweep first; the SST/CSR path below shadows whatever
+        // the memtable contributed only when its LSN is strictly higher.
+        for (mk, entry) in self.memtable.iter() {
+            let MemKey::Edge {
+                edge_type: et,
+                src: s,
+                dst: d,
+            } = mk
+            else {
+                continue;
+            };
+            if et != edge_type {
+                continue;
+            }
+            let (my_key_id, partner_id) = match direction {
+                EdgeDirection::Forward => (*s.as_bytes(), *d.as_bytes()),
+                EdgeDirection::Inverse => (*d.as_bytes(), *s.as_bytes()),
+            };
+            if my_key_id != key_bytes {
+                continue;
+            }
+            let is_upsert = matches!(entry.op, MemOp::Upsert(_));
+            match latest.get(&partner_id) {
+                Some((existing_lsn, _)) if *existing_lsn >= entry.lsn => {}
+                _ => {
+                    latest.insert(partner_id, (entry.lsn, is_upsert));
+                }
+            }
+        }
+
+        // CSR if available + enabled, otherwise SST fallback. Both paths
+        // emit (partner, lsn, is_upsert) triples into the same map.
+        if adjacency_enabled() {
+            if let Some(cache) = self.adjacency_cache.clone() {
+                self.merge_sorted_partners_csr(
+                    cache,
+                    edge_type,
+                    key,
+                    direction,
+                    &mut latest,
+                )
+                .await?;
+            } else {
+                self.merge_sorted_partners_sst(edge_type, key, direction, &mut latest)
+                    .await?;
+            }
+        } else {
+            self.merge_sorted_partners_sst(edge_type, key, direction, &mut latest)
+                .await?;
+        }
+
+        // BTreeMap drains ascending by key. Drop tombstones; rehydrate
+        // the bytes back into a NodeId.
+        let partners = latest
+            .into_iter()
+            .filter_map(|(partner_bytes, (_lsn, is_upsert))| {
+                if is_upsert {
+                    Some(NodeId::from_uuid(Uuid::from_bytes(partner_bytes)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(partners)
+    }
+
+    async fn merge_sorted_partners_csr(
+        &self,
+        cache: Arc<AdjacencyCache>,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+        latest: &mut BTreeMap<[u8; 16], (u64, bool)>,
+    ) -> Result<()> {
+        let manifest_version = self.manifest.manifest.version;
+        let cache_key = AdjacencyKey::new(manifest_version, edge_type, direction);
+        let adj: Arc<EdgeAdjacency> = {
+            let manifest = self.manifest.clone();
+            let store = self.store.clone();
+            let paths = self.paths.clone();
+            let sst_cache = self.cache.clone();
+            let edge_type_owned = edge_type.to_string();
+            cache
+                .get_or_build(cache_key, || async move {
+                    build_adjacency(
+                        &manifest,
+                        store.as_ref(),
+                        &paths,
+                        sst_cache.as_ref(),
+                        &edge_type_owned,
+                        direction,
+                    )
+                    .await
+                })
+                .await?
+        };
+        if let Some(slice) = adj.lookup(key) {
+            for i in 0..slice.partners.len() {
+                let partner_id = *slice.partners[i].as_bytes();
+                let lsn = slice.lsns[i];
+                let is_upsert = !slice.tombstones[i];
+                match latest.get(&partner_id) {
+                    Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
+                    _ => {
+                        latest.insert(partner_id, (lsn, is_upsert));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn merge_sorted_partners_sst(
+        &self,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+        latest: &mut BTreeMap<[u8; 16], (u64, bool)>,
+    ) -> Result<()> {
+        let key_bytes = *key.as_bytes();
+        let want_kind = match direction {
+            EdgeDirection::Forward => SstKind::EdgesFwd,
+            EdgeDirection::Inverse => SstKind::EdgesInv,
+        };
+        let candidates = self.manifest.index.lookup_candidates(
+            &self.manifest.manifest.ssts,
+            want_kind,
+            edge_type,
+            &key_bytes,
+        );
+        for idx in candidates {
+            let desc = &self.manifest.manifest.ssts[idx];
+            if !self.bloom_admits(desc, &key_bytes).await? {
+                continue;
+            }
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            let reader = self.fetch_edge_reader(&absolute).await?;
+            let Some(lookup) = reader.lookup(&key_bytes)? else {
+                continue;
+            };
+            for i in 0..lookup.partners.len() {
+                let partner_id = lookup.partners[i];
+                let lsn = lookup.lsns[i];
+                let is_upsert = !lookup.tombstones[i];
+                match latest.get(&partner_id) {
+                    Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
+                    _ => {
+                        latest.insert(partner_id, (lsn, is_upsert));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn edge_lookup(
         &self,
         edge_type: &str,
@@ -2189,6 +2374,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::adjacency::{adjacency_budget_bytes, AdjacencyCache};
     use crate::fence::WriterFence;
     use crate::flush::{flush, NodeWriteRecord};
     use crate::manifest::ManifestStore;
@@ -2517,6 +2703,243 @@ mod tests {
         // bob's edge tombstoned, only carol remains.
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].dst, carol);
+    }
+
+    #[tokio::test]
+    async fn sorted_partners_returns_csr_partners_ascending() {
+        let store = make_store();
+        let paths = make_paths("read-sp-csr");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        // Three partners chosen so the order of insertion is not the
+        // order of NodeId byte ordering.
+        let p_03 = sorted_node_id(3);
+        let p_07 = sorted_node_id(7);
+        let p_05 = sorted_node_id(5);
+
+        let mut mt = Memtable::new();
+        for (dst, lsn) in [(p_07, 10u64), (p_03, 11), (p_05, 12)] {
+            mt.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst,
+                },
+                lsn,
+                MemOp::Upsert(edge_payload()),
+            );
+        }
+        let frozen = mt.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &empty_view, store, paths)
+            .with_adjacency_cache(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())));
+
+        let partners = snap
+            .sorted_partners("KNOWS", alice, EdgeDirection::Forward)
+            .await
+            .unwrap();
+        assert_eq!(partners, vec![p_03, p_05, p_07]);
+    }
+
+    #[tokio::test]
+    async fn sorted_partners_merges_memtable_upsert_into_csr() {
+        let store = make_store();
+        let paths = make_paths("read-sp-merge");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+
+        // Flush alice -> bob, alice -> dave at LSN 10/11.
+        let mut mt_flush = Memtable::new();
+        mt_flush.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            10,
+            MemOp::Upsert(edge_payload()),
+        );
+        mt_flush.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: dave,
+            },
+            11,
+            MemOp::Upsert(edge_payload()),
+        );
+        let frozen = mt_flush.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        // Live memtable adds alice -> carol at LSN 20.
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: carol,
+            },
+            20,
+            MemOp::Upsert(edge_payload()),
+        );
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &live_view, store, paths)
+            .with_adjacency_cache(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())));
+
+        let partners = snap
+            .sorted_partners("KNOWS", alice, EdgeDirection::Forward)
+            .await
+            .unwrap();
+        assert_eq!(partners, vec![bob, carol, dave]);
+    }
+
+    #[tokio::test]
+    async fn sorted_partners_drops_memtable_tombstone() {
+        let store = make_store();
+        let paths = make_paths("read-sp-tomb");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+
+        // Flush alice -> bob, alice -> carol.
+        let mut mt_flush = Memtable::new();
+        mt_flush.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            10,
+            MemOp::Upsert(edge_payload()),
+        );
+        mt_flush.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: carol,
+            },
+            11,
+            MemOp::Upsert(edge_payload()),
+        );
+        let frozen = mt_flush.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        // Live memtable: tombstone alice -> bob at LSN 20.
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &live_view, store, paths)
+            .with_adjacency_cache(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())));
+
+        let partners = snap
+            .sorted_partners("KNOWS", alice, EdgeDirection::Forward)
+            .await
+            .unwrap();
+        assert_eq!(partners, vec![carol]);
+    }
+
+    #[tokio::test]
+    async fn sorted_partners_inverse_direction_returns_sources() {
+        let store = make_store();
+        let paths = make_paths("read-sp-inv");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+
+        // bob -> alice, carol -> alice. Inverse of alice should yield
+        // both sources sorted ascending.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: bob,
+                dst: alice,
+            },
+            10,
+            MemOp::Upsert(edge_payload()),
+        );
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: carol,
+                dst: alice,
+            },
+            11,
+            MemOp::Upsert(edge_payload()),
+        );
+        let frozen = mt.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &empty_view, store, paths)
+            .with_adjacency_cache(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())));
+
+        let partners = snap
+            .sorted_partners("KNOWS", alice, EdgeDirection::Inverse)
+            .await
+            .unwrap();
+        assert_eq!(partners, vec![bob, carol]);
     }
 
     #[tokio::test]
