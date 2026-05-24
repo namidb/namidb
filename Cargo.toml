@@ -10,6 +10,7 @@ members = [
     "crates/namidb-py",
     "crates/namidb-server",
     "crates/namidb-bench",
+    "crates/namidb-bolt",
 ]
 
 [workspace.package]
@@ -100,6 +101,7 @@ namidb-core = { path = "crates/namidb-core", version = "0.4.0" }
 namidb-storage = { path = "crates/namidb-storage", version = "0.4.0" }
 namidb-graph = { path = "crates/namidb-graph", version = "0.4.0" }
 namidb-query = { path = "crates/namidb-query", version = "0.4.0" }
+namidb-bolt = { path = "crates/namidb-bolt", version = "0.4.0" }
 
 [profile.release]
 opt-level = 3

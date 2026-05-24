@@ -1,0 +1,28 @@
+[package]
+name = "namidb-bolt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Bolt wire protocol (PackStream + handshake + state machine) for NamiDB"
+readme = "README.md"
+
+[dependencies]
+namidb-core = { workspace = true }
+namidb-query = { workspace = true }
+namidb-storage = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

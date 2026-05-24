@@ -6,6 +6,8 @@
 //! See [`build_router`] for the full route surface and [`run`] for
 //! the end-to-end boot procedure.
 
+pub mod bolt;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,13 +38,15 @@ pub struct Config {
     /// long random secret.
     pub auth_token: Option<String>,
     pub flush_interval: Duration,
+    /// Bolt listener address. `None` keeps the protocol off (HTTP only).
+    pub bolt_listen: Option<std::net::SocketAddr>,
 }
 
 /// Shared application state — one `WriterSession` (single-writer
 /// invariant) plus the auth token reference.
 #[derive(Clone)]
 pub struct AppState {
-    writer: Arc<Mutex<WriterSession>>,
+    pub(crate) writer: Arc<Mutex<WriterSession>>,
     auth_token: Option<Arc<str>>,
     namespace: String,
 }
@@ -112,6 +116,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 if let Err(e) = w.flush(schema).await {
                     error!(error = %e, "periodic flush failed");
                 }
+            }
+        });
+    }
+
+    // Optional Bolt listener (binds an extra TCP port for native
+    // Neo4j drivers — see RFC-022). When not configured we stay
+    // HTTP-only.
+    if let Some(bolt_addr) = config.bolt_listen {
+        let bolt_state = state.clone();
+        let bolt_auth = state.auth_token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bolt::serve(bolt_state, bolt_addr, bolt_auth).await {
+                error!(error = %e, "bolt listener exited");
             }
         });
     }

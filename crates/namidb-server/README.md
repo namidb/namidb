@@ -144,6 +144,34 @@ fenced via epoch CAS).
 task turns the memtable into L0 SSTs. Set it to `0s` to disable the loop
 and call `POST /v0/admin/flush` from cron or a sidecar instead.
 
+## Bolt protocol
+
+Pass `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`) to expose
+a Bolt 4.4 / 5.0 / 5.4 listener alongside the HTTP API. Both protocols
+share the same `WriterSession`, the same auth token, and the same
+single-writer-per-namespace invariant.
+
+```bash
+namidb-server \
+  --store memory://demo \
+  --listen 0.0.0.0:8080 \
+  --bolt-listen 0.0.0.0:7687 \
+  --auth-token "$NAMIDB_AUTH_TOKEN"
+```
+
+```python
+from neo4j import GraphDatabase
+driver = GraphDatabase.driver("bolt://localhost:7687",
+                              auth=("namidb", "$NAMIDB_AUTH_TOKEN"))
+with driver.session() as s:
+    s.run("CREATE (:Person {name: 'Alice'})")
+    for r in s.run("MATCH (p:Person) RETURN p.name AS name"):
+        print(r["name"])
+```
+
+See [RFC-022](../../docs/rfc/022-bolt-protocol.md) for the wire-level
+design.
+
 ## Roadmap
 
 - `/v0/cypher/stream`: NDJSON streaming for large read result sets.
@@ -151,8 +179,6 @@ and call `POST /v0/admin/flush` from cron or a sidecar instead.
   ingestion.
 - `/v0/metrics`: Prometheus exposition (counters, latency histogram,
   cache hit rates).
-- Bolt protocol compatibility, so every language that already speaks
-  Neo4j just works.
 
 See the project [`README`](../../README.md) and [`docs/rfc/`](../../docs/rfc/)
 for engine internals.

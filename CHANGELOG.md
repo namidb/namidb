@@ -12,16 +12,43 @@ below and in the release notes.
 ## [Unreleased]
 
 ### Added
-- (nothing yet)
+
+- **Bolt protocol listener** in `namidb-server`. Opt-in via
+  `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`). Speaks Bolt
+  4.4 / 5.0 / 5.4 so the official Neo4j drivers (Python, Java,
+  JavaScript, .NET, Go, Rust) connect unmodified through
+  `bolt://host:7687`. The HTTP and Bolt listeners share one
+  `WriterSession` per process and the same `--auth-token`. Design in
+  [RFC-022](docs/rfc/022-bolt-protocol.md); see
+  `crates/namidb-bolt` for the codec, handshake and state machine
+  and `crates/namidb-server/src/bolt.rs` for the wiring.
+- **`namidb-bolt` crate.** PackStream encoder/decoder, chunked
+  framing, handshake (`0x6060B017` magic + four 4-byte version
+  offers, with the `range` form supported), full request /
+  response message vocabulary (HELLO / LOGON / LOGOFF / RUN / PULL /
+  DISCARD / BEGIN / COMMIT / ROLLBACK / RESET / ROUTE / TELEMETRY /
+  GOODBYE), a `Session` driver around a `Backend` trait, and a
+  total `RuntimeValue` ↔ Bolt `Value` mapping including Node /
+  Relationship / UnboundRelationship / Path / Date / LocalDateTime.
+  Covered by 43 unit tests (including proptest round-trips) plus a
+  two-test integration suite in
+  `crates/namidb-server/tests/bolt_integration.rs` that drives a
+  real `namidb-server` instance through the Bolt 5.4 handshake,
+  authenticates, and round-trips CREATE / MATCH.
+- **`tests/bolt_neo4j_driver_smoke.py`** — manual smoke script that
+  connects the official `neo4j` PyPI driver to a running
+  `namidb-server` and verifies a CREATE / MATCH round-trip end to end.
 
 ### Changed
-- (nothing yet)
+- `namidb_server::Config` gained `bolt_listen: Option<SocketAddr>`.
+  When unset the server stays HTTP-only (the previous behaviour).
 
 ### Fixed
 - (nothing yet)
 
 ### Breaking
-- (nothing yet)
+- (none) — Bolt is opt-in. Existing `Config` construction sites need
+  to add `bolt_listen: None` for source compatibility.
 
 ---
 

@@ -94,6 +94,7 @@ It's the same engine across all three. Server and Embedded write to an identical
 - **Python bindings.** `pip install namidb`. abi3 wheels for Linux (x86_64 and aarch64), macOS (arm64) and Windows (x86_64), with an sdist fallback everywhere else. Sync and async (`acypher`). Arrow, pandas and polars output.
 - **CLI.** `namidb parse`, `namidb explain --verbose`, `namidb run --store <uri>` for ad-hoc query work against any backend.
 - **HTTP server.** The `namidb-server` binary, with bearer-token auth, a periodic flush loop, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`).
+- **Bolt protocol.** Same `namidb-server` binary speaks Bolt 4.4 / 5.0 / 5.4 on an opt-in TCP listener (default 7687). Every published Neo4j driver (Python, Java, JavaScript, .NET, Go, Rust) connects unmodified via `bolt://host:7687`. See [RFC-022](./docs/rfc/022-bolt-protocol.md).
 - **Bench harness.** A synthetic, deterministic LDBC SNB Interactive harness under [`bench/`](./bench/).
 
 <br />
@@ -578,8 +579,6 @@ performance or memory problem.
   control plane. [Request access](https://namidb.com).
 - **Streaming responses.** `/v0/cypher/stream` (NDJSON) and
   `/v0/cypher/arrow` (Arrow IPC) for zero-copy DataFrame ingestion.
-- **Bolt protocol.** Wire compatibility with the Neo4j drivers (Python,
-  Java, JS and the rest) on top of the same engine.
 - **Concurrent reads.** RFC-021 takes the single-writer mutex off the
   read path so a `namidb-server` can fan reads out across every core.
 

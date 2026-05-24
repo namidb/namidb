@@ -42,6 +42,12 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     flush_interval: Duration,
+
+    /// Address for the Bolt protocol listener (Neo4j driver
+    /// compatibility). When omitted the protocol is off and the
+    /// server is HTTP-only. The canonical Bolt port is 7687.
+    #[arg(long, env = "NAMIDB_BOLT_LISTEN")]
+    bolt_listen: Option<std::net::SocketAddr>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -58,6 +64,7 @@ fn main() -> anyhow::Result<()> {
         listen: cli.listen,
         auth_token: cli.auth_token,
         flush_interval: cli.flush_interval,
+        bolt_listen: cli.bolt_listen,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

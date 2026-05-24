@@ -17,6 +17,7 @@ path = "src/main.rs"
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
 namidb-query = { workspace = true }
+namidb-bolt = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
@@ -38,3 +39,5 @@ humantime = "2"
 tempfile = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio-test = { workspace = true }
+bytes = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1981,6 +1981,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "namidb-bolt"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "namidb-core",
+ "namidb-query",
+ "namidb-storage",
+ "proptest",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "namidb-cli"
 version = "0.4.1"
 dependencies = [
@@ -2080,9 +2100,11 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "humantime",
+ "namidb-bolt",
  "namidb-core",
  "namidb-query",
  "namidb-storage",
