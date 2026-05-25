@@ -540,6 +540,43 @@ async fn create_node_with_vector_from_list_parameter() {
 }
 
 #[tokio::test]
+async fn merge_multi_hop_creates_then_matches_idempotently() {
+    // B2: MERGE with two hops — three nodes, two edges. On the first
+    // execution the whole path is created; on the second the same path
+    // is matched and no duplicates are produced.
+    let mut writer = WriterSession::open(store(), paths("w-merge-multi-hop"))
+        .await
+        .unwrap();
+
+    let q = parse(
+        "MERGE (a:Person {externalId: 1})-[r1:KNOWS]->(b:Person {externalId: 2})\
+         -[r2:KNOWS]->(c:Person {externalId: 3}) \
+         RETURN a, b, c",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 3, "expected three Persons created");
+    assert_eq!(outcome.edges_created, 2, "expected two KNOWS edges");
+
+    // Second run on the same writer must be a pure match — no creates.
+    let outcome2 = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome2.nodes_created, 0,
+        "MERGE must not duplicate nodes on rerun"
+    );
+    assert_eq!(
+        outcome2.edges_created, 0,
+        "MERGE must not duplicate edges on rerun"
+    );
+}
+
+#[tokio::test]
 async fn bare_list_literal_still_rejected_without_vector_wrapper() {
     // Regression guard: `vector()` is the *only* way to persist a
     // numeric collection. A bare `[…]` literal must keep failing so

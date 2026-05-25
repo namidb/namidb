@@ -2316,6 +2316,38 @@ mod tests {
     }
 
     #[test]
+    fn merge_multi_hop_lowers_with_all_endpoints_and_rels() {
+        // B2: a MERGE pattern with multiple hops must lower every node
+        // and every relationship in the chain.
+        let p = lp(
+            "MERGE (a:Person {externalId: 1})-[r1:KNOWS]->(b:Person {externalId: 2})\
+             -[r2:KNOWS]->(c:Person {externalId: 3})",
+        );
+        let pattern = match &p {
+            LogicalPlan::Merge { pattern, .. } => pattern,
+            other => panic!("expected Merge, got {:?}", other),
+        };
+        let mut node_aliases: Vec<&str> = pattern
+            .iter()
+            .filter_map(|e| match e {
+                CreateElement::Node { alias, .. } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        node_aliases.sort();
+        assert_eq!(node_aliases, vec!["a", "b", "c"]);
+        let mut rel_aliases: Vec<&str> = pattern
+            .iter()
+            .filter_map(|e| match e {
+                CreateElement::Rel { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        rel_aliases.sort();
+        assert_eq!(rel_aliases, vec!["r1", "r2"]);
+    }
+
+    #[test]
     fn merge_with_relationship_lowers_to_node_rel_node_set() {
         // Regression: MERGE (a)-[r]->(b) must lower a triple containing
         // a head Node, a tail Node, and a Rel linking their aliases.
