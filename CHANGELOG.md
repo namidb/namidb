@@ -13,6 +13,68 @@ below and in the release notes.
 
 ### Added
 
+- **Worst-case optimal join via leapfrog triejoin (RFC-024).** Cyclic
+  Cypher patterns that used to expand as a chain of binary `HashJoin`
+  / `Expand` operators now fold into a single `LogicalPlan::
+  MultiwayJoin` that runs Veldhuizen 2014 leapfrog over the sorted
+  partner lists `Snapshot::sorted_partners` produces. The new path
+  is opt-in via `NAMIDB_WCOJ=1` (and requires `NAMIDB_FACTORIZE=1`);
+  when off, the planner stays on the existing binary chain so
+  behaviour is unchanged for production. The detection pass at
+  `optimize::multiway_join` walks the plan top-down, harvests a
+  contiguous `Expand` chain rooted at a labelled `NodeScan`, runs
+  union-find to spot a cycle, and emits the `MultiwayJoin`; chains
+  that don't satisfy the v0 preconditions (variable-length,
+  `rel_alias` set, undirected edges, missing target label, mid-chain
+  `Filter` with user predicates) silently fall back to the binary
+  plan. The executor binds variables in the heuristic ordering
+  produced by `variable_ordering` (head NodeScan first, rest by
+  constraint-graph degree), leapfrog-intersects the per-constraint
+  partner lists at each level, and at the leaf scales the per-tuple
+  WCOJ set to the per-path multiset binary emits via
+  `count_edge_multiplicity` so `RETURN a, b, c` (no `DISTINCT`) gets
+  the same row count from both paths.
+- **Relationship type alternation `[:A|:B|...]` (RFC-024 §Q1).** The
+  lowering at `lower.rs:877` no longer rejects alternation;
+  `LogicalPlan::Expand.edge_type` and
+  `EdgeConstraint.edge_types` now carry a non-empty
+  `Vec<String>` of accepted types. The non-cyclic executor unions
+  partner lists across the listed types through the existing
+  per-type iteration in `neighbours_of_any`; the cyclic executor
+  uses a new `MergeSortedUnion` primitive to fold per-type lists
+  into one ascending stream before the outer leapfrog intersection.
+  Singleton `[:KNOWS]` keeps working bit-identically;
+  `[:KNOWS|:LIKES|:FOLLOWS]` now matches across all listed types.
+  An exhaustive sweep
+  (`exec_alternation::multiway_join_alternation_per_path_count_matches
+  _binary_in_all_cases`) covers every single-type / mixed /
+  all-both pair combination on a triangle and asserts WCOJ and
+  binary row counts agree exactly.
+- **AGM-tight cost model for `MultiwayJoin` (RFC-024 §Cost model).**
+  `cost::cardinality::agm_bound_rows` returns the Atserias-Grohe-Marx
+  upper bound for the cyclic match's output. For the shapes the v0
+  detection pass actually produces (triangle, k-clique, k-cycle,
+  triangle-with-dangling-edge, K_{m,n}) the greedy
+  `w_e = 1 / min(deg(from), deg(to))` is the LP optimum exactly;
+  for irregular shapes it remains a guaranteed upper bound. Per-edge
+  cardinality sums catalog `edge_count` across the alternation set,
+  and the result is clipped from above by the cartesian product of
+  per-variable label counts so tiny graphs don't get
+  astronomically pessimistic estimates. 9 closed-form unit tests
+  in `cost::cardinality::tests` (triangle, K_4, 4-cycle, alternation
+  sum, dangling-edge, cartesian clip, no-stats fallback, two-var
+  single-edge, regression vs the prior naïve formula).
+- **`exec::leapfrog::MergeSortedUnion`** — k-way ascending dedup
+  union via min-heap, the companion to `LeapfrogIntersect`. 11 unit
+  tests cover passthrough, disjoint interleave, dedup, empty
+  inputs, zero iterators, identical lists, dense overlap, the
+  alternation-in-cycle composition, five-iterator rotating minima,
+  and `collect()` vs iterative drain parity.
+- **`Snapshot::sorted_partners`** in `namidb-storage`. Returns the
+  partner `NodeId`s for `(edge_type, key, direction)` sorted
+  ascending, merging the CSR adjacency cache (or SST fallback)
+  with the memtable overlay last-LSN-wins. Drops tombstones at the
+  same key. This is the storage primitive WCOJ leapfrogs over.
 - **`shortestPath` and `allShortestPaths` (RFC-023).** The parser
   accepts the wrapping function form
   (`MATCH p = shortestPath((a)-[*..N]-(b))`), the lower validates
@@ -92,7 +154,24 @@ below and in the release notes.
   When unset the server stays HTTP-only (the previous behaviour).
 
 ### Fixed
-- (nothing yet)
+- **WCOJ leaf-multiplicity matches binary per-path semantics.**
+  Before, `MultiwayJoin` emitted one row per `(a, b, c, ...)` tuple
+  regardless of how many type combinations or parallel edges
+  actually closed the cycle, because `Snapshot::sorted_partners`
+  collapses partners to a set. The fix walks `out_edges` /
+  `in_edges` per listed type at the leaf and multiplies the counts
+  across constraints, so `RETURN a, b, c` without `DISTINCT` gets
+  the same row count from the WCOJ and the binary paths even on
+  alternation queries that match multiple edge types between the
+  same pair of nodes.
+- **`namidb-py::value_to_py` handles `Date` / `DateTime`.** The
+  Python binding's value mapping kept an exhaustive match against
+  the original 7 `Value` variants and stopped compiling after
+  `Date(i32)` / `DateTime(i64)` landed in `namidb-core`. Mirror
+  the conversion the runtime-value path already does: turn
+  `Date(days)` into a `chrono::NaiveDate` and `DateTime(micros)`
+  into a `chrono::DateTime<Utc>` so the caller gets a real
+  `datetime.date` / `datetime.datetime` from pyo3.
 
 ### Breaking
 - (none) — Bolt is opt-in. Existing `Config` construction sites need

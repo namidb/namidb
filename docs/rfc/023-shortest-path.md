@@ -72,9 +72,12 @@ Rules enforced by the lower:
 4. **Exactly one relationship hop in the chain.** `shortestPath(
    (a)-[r1]-(b)-[r2]-(c))` is rejected; that's a multi-leg path and
    needs a different operator (RFC-pending; not in scope here).
-5. **No relationship-type alternation in v0.** `shortestPath(
-   (a)-[:A|:B*]-(b))` is rejected with the same error variable-length
-   expand uses today, lifted by WCOJ (RFC-pending).
+5. **No relationship-type alternation inside `shortestPath`.** The
+   wrapping function form still rejects `(a)-[:A|:B*]-(b)`. Plain
+   `Expand` and cyclic `MultiwayJoin` learned alternation in
+   RFC-024, but lifting it into the BFS path-binding executor is a
+   separate diff (the path emission has to know which type each hop
+   actually used).
 
 Mirrors the surface Neo4j accepts for IC13:
 
@@ -171,7 +174,7 @@ same code path RFC-018 already powers.
 | Open-ended length | `E002` | `shortestPath requires a finite upper bound (e.g. *..15)` |
 | Unbound endpoint, no uniqueness | `E010` | `shortestPath endpoints must be bound or filtered by a unique property` |
 | Multi-hop chain inside the call | `E006` | `shortestPath accepts a single relationship hop; use multiple MATCH clauses for longer chains` |
-| Type alternation | `E006` | `relationship type alternation inside shortestPath needs WCOJ (RFC-pending)` |
+| Type alternation | `E006` | `relationship type alternation inside shortestPath is not supported yet (plain Expand and MultiwayJoin do support it; see RFC-024)` |
 
 ## Alternatives considered
 

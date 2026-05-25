@@ -1,10 +1,18 @@
 # RFC 024: WCOJ via leapfrog triejoin
 
-**Status:** draft
+**Status:** implemented
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-05-24
-**Updated:** 2026-05-24
-**Implements:** (pending)
+**Updated:** 2026-05-25
+**Implements:**
+- `db7ecc0` feat(storage): Snapshot::sorted_partners overlay-aware
+- `ffb081e` feat(query): leapfrog triejoin primitives
+- `eebc942` feat(query): MultiwayJoin variant + executor
+- `8c27f9d` feat(query): cycle detection pass + NAMIDB_WCOJ flag
+- `fbfec6f` feat(query): MergeSortedUnion primitive
+- `8fa9135` feat(query): [:A|:B] alternation + AGM-tight cost
+- `2610bd5` fix(query): WCOJ leaf-multiplicity matches binary per-path semantics
+
 **Supersedes:** none
 
 ## Summary
@@ -92,8 +100,9 @@ pub struct NodeBinding {
 pub struct EdgeConstraint {
     pub from_idx: usize,         // index into MultiwayJoin.vars
     pub to_idx: usize,
-    pub edge_type: String,
-    pub direction: EdgeDirection,
+    pub edge_types: Vec<String>, // non-empty; alternation `[:A|:B]` lists
+                                 // every accepted type
+    pub direction: RelationshipDirection,
 }
 
 pub enum LogicalPlan {
@@ -193,17 +202,37 @@ descend(level, ctx):
         partners = leapfrog_intersect(
             for each constraint c where c.from or c.to == var
                 and the other side is already in ctx:
-                snapshot.sorted_partners(c.edge_type, ctx[other], c.direction)
+                merge_sorted_union(
+                    for each t in c.edge_types:
+                        snapshot.sorted_partners(t, ctx[other], c.direction)
+                )
         )
     for each NodeId n in partners:
         if predicates(var, n) fail: continue
         ctx[var.alias] = n
         if level + 1 == vars.len():
+            copies = prod over constraints c of
+                count_edge_multiplicity(
+                    snapshot, ctx[c.from], ctx[c.to],
+                    c.edge_types, c.direction
+                )
             push factor node (parent=L, slots=ctx_slots)
+            replicate the leaf `copies` times in the leaves vector
         else:
             descend(level + 1, ctx)
         ctx.pop(var.alias)
 ```
+
+The `merge_sorted_union` step is what turns alternation
+`[:A|:B|:C]` into a single ascending partner stream for the
+leapfrog. The `count_edge_multiplicity` step at the leaf reads
+`out_edges` / `in_edges` per listed type and counts how many edges
+actually connect the bound endpoints, so the output multiset
+matches what the binary `Expand` chain emits (one row per
+matching path, not one row per `(a, b, c, ...)` tuple).
+Multiplicity is paid only on the success side of the search — at
+the leaf, after the leapfrog has already pruned to the cyclic
+matches.
 
 The push at the leaf level reuses the existing arena API
 (`crates/namidb-query/src/exec/factor.rs::FactorArena::push`). After
@@ -291,30 +320,35 @@ behaviour is unchanged.
 
 ### Cost model
 
-`crates/namidb-query/src/cost/cardinality.rs` gains a `MultiwayJoin`
-arm:
+`crates/namidb-query/src/cost/cardinality.rs::agm_bound_rows` returns
+the Atserias-Grohe-Marx (AGM) upper bound on the multiway join's
+output cardinality. The AGM bound for a join query Q is
 
-```rust
-LogicalPlan::MultiwayJoin { vars, edges, .. } => {
-    let k = vars.len() as i32;
-    let avg_degree = edges
-        .iter()
-        .map(|e| catalog.edge_type(&e.edge_type)
-                  .map(|s| s.avg_out_degree())
-                  .unwrap_or(8.0))
-        .sum::<f64>() / edges.len().max(1) as f64;
-    Cardinality {
-        rows: avg_degree.powi(k - 1).max(1.0),
-        ..Cardinality::default()
-    }
-}
+```text
+    |Q| <= prod_e |R_e| ^ w_e
 ```
 
-The output cardinality is an `O(d^{k-1})` worst case. It is
-deliberately pessimistic. An AGM-tight estimate would require a
-fractional edge cover LP, but the naïve formula matches what
-`Expand` already emits for the same shape, so `reorder_joins` does
-not regress siblings of the multiway subtree.
+for every fractional edge cover `w` (each vertex `v` satisfies
+`sum_{e ∋ v} w_e >= 1`), and the bound is tight.
+
+Solving the LP at planning time is overkill — for every regular-
+degree shape the v0 detection pass produces (triangles, k-cliques,
+k-cycles, complete bipartite) the greedy weight
+`w_e = 1 / min(deg(from(e)), deg(to(e)))` matches the LP optimum
+exactly, and for irregular shapes (e.g. triangle with a dangling
+edge) it remains a guaranteed upper bound. For each constraint
+with alternation `[:A|:B|...]` the per-edge cardinality sums the
+catalog `edge_count` across the alternation set, so a constraint
+that picks either of two types is wider than one that picks a
+single type. The result is clipped from above by the cartesian
+product of per-variable label sizes so the bound stays sane on
+very small graphs.
+
+This replaces the original naïve `avg_degree^(k-1) * |outer|`
+formula. The closed-form bound is what `reorder_joins` reads, so
+sibling subtrees see a defensible estimate instead of the prior
+under-bound that would silently let a binary plan win on shape
+grounds even when the cyclic match was the dominant cost.
 
 ### Composition with `FactorArena`
 
@@ -377,10 +411,6 @@ and keeps the storage surface narrow.
 
 ## Drawbacks
 
-- The cost model approximation is pessimistic. `reorder_joins`
-  cannot promote a `MultiwayJoin` over a binary chain on cost
-  grounds; today the feature flag forces the choice. A follow-up
-  AGM cost RFC closes that loop.
 - `MultiwayJoin` rejects variable-length edges, property predicates
   over participating `rel_alias`es, and presence under a `SemiApply`
   inner. Each rejection silently falls back to the binary plan,
@@ -396,28 +426,37 @@ and keeps the storage surface narrow.
 - The pass is conservative about labels. A constraint between
   `(a:Person)` and `(b:Person|Tag)` is currently rejected because
   the harvested `NodeBinding.label` is a single label. Multi-label
-  binding support comes with the same RFC that opens type
-  alternation in the lowering.
+  binding support is tracked in Q3 below.
+- The leaf-level multiplicity recount walks `out_edges` per type
+  per output tuple to scale per-tuple WCOJ semantics back to
+  per-path multiset semantics (binary parity). Cost is
+  `O(types * deg)` per emitted row. For pathological dense graphs
+  with high multiplicity this can dominate the leaf work; a
+  multiplicity-preserving leapfrog primitive would skip the
+  recount entirely. Open as a follow-up.
 
 ## Open questions
 
-- **Q1: Lowering for `[:A|:B]`.** RFC-023 and RFC-004 flag this as
-  blocked on WCOJ. The mechanic (leapfrog over the union of two
-  sorted partner lists) is in scope here, but the lowering side
-  (the parser, the `Expand` shape, the new `Filter` shape) is a
-  separate diff. Decision: leave `lower.rs:883` rejecting in v0,
-  open a follow-up issue tracked against this RFC.
+- **Q1: Lowering for `[:A|:B]`.** *Resolved.* `LogicalPlan::Expand.
+  edge_type` and `EdgeConstraint.edge_types` accept a non-empty
+  `Vec<String>`; the lowering at `lower.rs:877` produces the type
+  list directly; the executor unions the partner lists per
+  constraint via `MergeSortedUnion` before the leapfrog
+  intersection. Single-type, multi-type, and mixed queries all
+  pass the binary-vs-WCOJ parity sweep
+  (`tests/exec_alternation.rs`).
 - **Q2: Bushy cycle decomposition.** A 6-clique has multiple ways
   to split into smaller triangles. v0 always processes the whole
   cycle as a single `MultiwayJoin`. A bench may show that bushy
   decomposition into two 3-cliques joined on a shared variable
   wins for very dense graphs. Open until SF10 bench surfaces it.
-- **Q3: Multi-label binding.** Today `NodeBinding.label` is
-  `Option<String>`. Some queries match `(n)` without a label or
-  `(n:A|B)` with alternation. The first case scans every observed
-  label (RFC-018 `observed_labels`); the second is currently
-  rejected by lower.rs. Decide whether the executor takes a
-  `Vec<String>` or stays single-label.
+- **Q3: Multi-label binding.** Still open. `NodeBinding.label` is
+  `Option<String>` and the detection pass refuses chains where a
+  participating node pattern uses `(n:A|B)`. Untyped `(n)` is also
+  refused. The fix is the same shape as Q1 (turn the field into a
+  `Vec<String>`, union per-label scans) but is gated on
+  `Snapshot::scan_label_with_predicates_and_projection` learning
+  a multi-label variant. Open until a real query asks for it.
 
 ## References
 
