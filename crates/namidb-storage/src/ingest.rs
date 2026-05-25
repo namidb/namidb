@@ -528,6 +528,37 @@ impl WriterSession {
         Ok(outcome)
     }
 
+    /// Flush the live memtable iff the current manifest already references
+    /// `max_wal_segments` or more WAL segments. No-op below the threshold.
+    /// Returns `true` when a flush ran.
+    ///
+    /// Callers (the cloud worker, the bench loaders) use this after each
+    /// `commit_batch` to keep the cold-start cost bounded — without it,
+    /// every commit appends a WAL segment to the manifest forever and
+    /// `recover_memtable` re-replays the entire history on the next mount.
+    /// The engine does NOT auto-flush inside `commit_batch` itself because
+    /// some workloads (single-shot LDBC bulk load) prefer to batch the
+    /// flush at the end and skip the intermediate SSTs.
+    ///
+    /// The schema is taken from the current manifest; pass `flush(schema)`
+    /// explicitly if you need to flush with a *different* schema version.
+    #[instrument(skip(self), fields(
+ manifest_version = self.current.manifest.version,
+ wal_segments = self.current.manifest.wal_segments.len(),
+ ))]
+    pub async fn maybe_flush(&mut self, max_wal_segments: usize) -> Result<bool> {
+        // `0` is the sentinel for "auto-flush disabled" so the caller can
+        // express that in config without a `None`-wrapping ceremony.
+        if max_wal_segments == 0
+            || self.current.manifest.wal_segments.len() < max_wal_segments
+        {
+            return Ok(false);
+        }
+        let schema = self.current.manifest.schema.clone();
+        self.flush(schema).await?;
+        Ok(true)
+    }
+
     /// Freeze the live memtable and run the SST flush path.
     /// Implicitly commits any pending batch first so the caller doesn't
     /// strand records mid-flush.
@@ -920,6 +951,64 @@ mod tests {
             v_bob.properties.get("name"),
             Some(&Value::Str("Bob".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_flush_is_a_noop_below_threshold() {
+        let store = make_store();
+        let paths = make_paths("ingest-maybe-flush-below");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        // One commit → one wal_segment in the manifest.
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+
+        // Threshold 4 > 1 → no-op, no SST flush.
+        let flushed = session.maybe_flush(4).await.unwrap();
+        assert!(!flushed);
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+        assert_eq!(session.current.manifest.ssts.len(), 0);
+
+        // Threshold 0 → "disabled", still a no-op even when the manifest
+        // has segments. Lets callers express "off" without an `Option`.
+        let flushed = session.maybe_flush(0).await.unwrap();
+        assert!(!flushed);
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maybe_flush_truncates_wal_when_threshold_crossed() {
+        // N1 regression: without this, every commit_batch leaves a wal
+        // segment in the manifest forever and cold-start replays them
+        // all on the next mount. Verify maybe_flush clears them once a
+        // configurable threshold is crossed.
+        let store = make_store();
+        let paths = make_paths("ingest-maybe-flush-threshold");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        for i in 0..3 {
+            session
+                .upsert_node(
+                    "Person",
+                    sorted_node_id(i),
+                    &node_record(&format!("p{}", i), Some(20 + i as i32)),
+                )
+                .unwrap();
+            session.commit_batch().await.unwrap();
+        }
+        assert_eq!(session.current.manifest.wal_segments.len(), 3);
+        assert_eq!(session.current.manifest.ssts.len(), 0);
+
+        let flushed = session.maybe_flush(3).await.unwrap();
+        assert!(flushed);
+        // Flush retired the in-flight WAL into SSTs and cleared the
+        // segment list — cold-start now just opens the manifest, no
+        // replay needed.
+        assert_eq!(session.current.manifest.wal_segments.len(), 0);
+        assert!(!session.current.manifest.ssts.is_empty());
     }
 
     #[tokio::test]
