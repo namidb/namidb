@@ -250,7 +250,10 @@ impl<I: OrdIterator> MergeSortedUnion<I> {
         let mut heap = std::collections::BinaryHeap::with_capacity(iters.len());
         for (idx, it) in iters.iter().enumerate() {
             if let Some(k) = it.key() {
-                heap.push(HeapEntry { key: k, iter_idx: idx });
+                heap.push(HeapEntry {
+                    key: k,
+                    iter_idx: idx,
+                });
             }
         }
         let current = heap.peek().map(|e| e.key);
@@ -546,11 +549,9 @@ mod tests {
             SortedSliceIter::new(&xs),
             SortedSliceIter::new(&ys),
         ]));
-        let from_collect = MergeSortedUnion::new(vec![
-            SortedSliceIter::new(&xs),
-            SortedSliceIter::new(&ys),
-        ])
-        .collect();
+        let from_collect =
+            MergeSortedUnion::new(vec![SortedSliceIter::new(&xs), SortedSliceIter::new(&ys)])
+                .collect();
         assert_eq!(from_drain, from_collect);
     }
 }

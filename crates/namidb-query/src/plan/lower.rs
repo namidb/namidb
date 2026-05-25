@@ -874,9 +874,9 @@ fn lower_rel_node(
         _ => previous_source(&input)?,
     };
     let _ = ctx; // ctx no longer needed; reserved for label resolution.
-    // `[:A|:B|:C]` lowers to a non-empty Vec; `[]` (untyped) lowers to
-    // None. The executor unions the partner lists across listed types
-    // (RFC-024 §"Open questions" Q1).
+                 // `[:A|:B|:C]` lowers to a non-empty Vec; `[]` (untyped) lowers to
+                 // None. The executor unions the partner lists across listed types
+                 // (RFC-024 §"Open questions" Q1).
     let edge_type: Option<Vec<String>> = match rel.types.as_slice() {
         [] => None,
         types => Some(types.iter().map(|t| t.name.clone()).collect()),

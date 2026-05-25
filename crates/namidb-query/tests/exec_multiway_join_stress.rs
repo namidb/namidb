@@ -110,10 +110,7 @@ fn count_multiway_joins(plan: &LogicalPlan) -> usize {
 /// node participates in two triangles (as predecessor and successor),
 /// so total directed triangle count when seen from a single starting
 /// orientation is exactly `n` (or 3*n if we count rotations).
-async fn build_chain_of_triangles(
-    writer: &mut WriterSession,
-    n: usize,
-) -> Vec<NodeId> {
+async fn build_chain_of_triangles(writer: &mut WriterSession, n: usize) -> Vec<NodeId> {
     assert!(n >= 3);
     let ids: Vec<NodeId> = (0..n).map(|_| NodeId::new()).collect();
     for (i, id) in ids.iter().enumerate() {
@@ -176,9 +173,7 @@ async fn four_cycle_rewrites_and_executes_against_complete_graph() {
     // 4-cycle on a fully-connected directed K_4 (every ordered pair
     // has an edge). Cypher binds path as a-b-c-d-a; the v0 detection
     // pass handles any cycle (no special 4-cycle case is needed).
-    let mut w = WriterSession::open(store(), paths("mwj-k4"))
-        .await
-        .unwrap();
+    let mut w = WriterSession::open(store(), paths("mwj-k4")).await.unwrap();
     let ids: [NodeId; 4] = std::array::from_fn(|_| NodeId::new());
     for (i, id) in ids.iter().enumerate() {
         w.upsert_node("Person", *id, &person(&format!("V{}", i)))
@@ -305,7 +300,10 @@ async fn detection_pass_is_idempotent_across_fixpoint_rounds() {
     let p2 = plan_query(&q, &cat).unwrap();
     let count_second = count_multiway_joins(&p2);
 
-    assert_eq!(count_first, 1, "first run must produce exactly 1 MultiwayJoin");
+    assert_eq!(
+        count_first, 1,
+        "first run must produce exactly 1 MultiwayJoin"
+    );
     assert_eq!(count_second, 1, "second run must not double-rewrite");
     assert_eq!(p1, p2, "plan must be deterministic across runs");
 }

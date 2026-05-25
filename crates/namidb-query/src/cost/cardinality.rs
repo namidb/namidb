@@ -1217,8 +1217,8 @@ mod tests {
 
     // ─────────────────────── AGM bound (RFC-024) ─────────────────────────
 
-    use crate::plan::logical::{EdgeConstraint, NodeBinding};
     use crate::parser::RelationshipDirection;
+    use crate::plan::logical::{EdgeConstraint, NodeBinding};
 
     fn person_binding(alias: &str) -> NodeBinding {
         NodeBinding {
@@ -1259,7 +1259,11 @@ mod tests {
         // AGM bound = sqrt(5000^3) ≈ 353_553.
         let cat = make_catalog();
         let plan = LogicalPlan::MultiwayJoin {
-            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+            ],
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,
@@ -1356,8 +1360,16 @@ mod tests {
             direction: RelationshipDirection::Right,
         };
         let plan = LogicalPlan::MultiwayJoin {
-            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
-            edges: vec![edge_with_alt(0, 1), edge_with_alt(1, 2), edge_with_alt(2, 0)],
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+            ],
+            edges: vec![
+                edge_with_alt(0, 1),
+                edge_with_alt(1, 2),
+                edge_with_alt(2, 0),
+            ],
             ordering: vec![0, 1, 2],
             factorize_required: true,
         };
@@ -1420,7 +1432,11 @@ mod tests {
             properties: BTreeMap::new(),
         });
         let plan = LogicalPlan::MultiwayJoin {
-            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+            ],
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,
@@ -1516,7 +1532,11 @@ mod tests {
         // multiway over a binary plan that's actually cheaper.
         let cat = make_catalog();
         let plan = LogicalPlan::MultiwayJoin {
-            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+            ],
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,

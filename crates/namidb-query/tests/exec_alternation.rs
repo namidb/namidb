@@ -120,10 +120,8 @@ async fn lowering_accepts_alternation_and_preserves_order() {
     // Pure lowering check — no executor. Earlier the lowering rejected
     // `[:A|:B]` with UnsupportedFeature; the new lowering hands the
     // types straight to `LogicalPlan::Expand.edge_type` as a Vec.
-    let q = parse(
-        "MATCH (a:Person)-[:KNOWS|:LIKES|:FOLLOWS]->(b:Person) RETURN a.name, b.name",
-    )
-    .unwrap();
+    let q = parse("MATCH (a:Person)-[:KNOWS|:LIKES|:FOLLOWS]->(b:Person) RETURN a.name, b.name")
+        .unwrap();
     let cat = StatsCatalog::default();
     let plan = plan_query(&q, &cat).unwrap();
     let sets = collect_expand_edge_types(&plan);
@@ -163,10 +161,9 @@ async fn expand_alternation_returns_rows_from_both_types() {
     w.commit_batch().await.unwrap();
     let snap = w.snapshot();
 
-    let q = parse(
-        "MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name",
-    )
-    .unwrap();
+    let q =
+        parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name")
+            .unwrap();
     let cat = StatsCatalog::default();
     let plan = plan_query(&q, &cat).unwrap();
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
@@ -203,10 +200,9 @@ async fn expand_alternation_unrelated_third_type_does_not_leak() {
     w.commit_batch().await.unwrap();
     let snap = w.snapshot();
 
-    let q = parse(
-        "MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name",
-    )
-    .unwrap();
+    let q =
+        parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name")
+            .unwrap();
     let cat = StatsCatalog::default();
     let plan = plan_query(&q, &cat).unwrap();
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
@@ -238,10 +234,9 @@ async fn expand_alternation_parallel_edges_yield_distinct_rows() {
     w.commit_batch().await.unwrap();
     let snap = w.snapshot();
 
-    let q = parse(
-        "MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name",
-    )
-    .unwrap();
+    let q =
+        parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS|:LIKES]->(b:Person) RETURN b.name AS name")
+            .unwrap();
     let cat = StatsCatalog::default();
     let plan = plan_query(&q, &cat).unwrap();
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
@@ -301,16 +296,13 @@ async fn expand_alternation_single_type_matches_legacy_path() {
 
     let cat = StatsCatalog::default();
     let p_single = plan_query(
-        &parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN b.name AS n")
-            .unwrap(),
+        &parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN b.name AS n").unwrap(),
         &cat,
     )
     .unwrap();
     let p_alt = plan_query(
-        &parse(
-            "MATCH (a:Person {name: 'Alice'})-[:KNOWS|:KNOWS]->(b:Person) RETURN b.name AS n",
-        )
-        .unwrap(),
+        &parse("MATCH (a:Person {name: 'Alice'})-[:KNOWS|:KNOWS]->(b:Person) RETURN b.name AS n")
+            .unwrap(),
         &cat,
     )
     .unwrap();
@@ -504,19 +496,16 @@ async fn multiway_join_alternation_with_missing_type_drops_rotation() {
 }
 
 #[tokio::test]
-async fn multiway_join_alternation_dense_graph_emits_set_semantics() {
+async fn multiway_join_alternation_dense_graph_matches_binary_multiset() {
     // Stress-test the `MergeSortedUnion` path: every pair of triangle
     // nodes has both a KNOWS and a LIKES edge, so each per-constraint
-    // partner list is a unioned super-set. Important semantic note:
-    // WCOJ binds *variables*, not paths, so for `RETURN a, b, c` the
-    // executor emits one row per `(a, b, c)` tuple regardless of how
-    // many edge-type combinations close the triangle. The binary
-    // plan, by contrast, emits one row per path (2^3 = 8 type
-    // pickings × 3 rotations = 24). The user who wants per-tuple
-    // semantics on either path can wrap with `RETURN DISTINCT a, b, c`;
-    // the user who wants per-path semantics must bind the rels (which
-    // the v0 detection pass refuses anyway, so the plan falls back to
-    // binary). RFC-024 §"Drawbacks" tracks the divergence.
+    // partner list is a unioned super-set. The leaf-level multiplicity
+    // counter (`count_edge_multiplicity`) walks the actual edges per
+    // type and multiplies, so WCOJ emits the same per-path multiset
+    // the binary path produces: 2^3 = 8 type pickings × 3 rotations =
+    // 24 rows. Without the multiplicity counter WCOJ would emit 3
+    // (one per `(a,b,c)` tuple); the counter is what restores Cypher
+    // per-path semantics on the cyclic plan.
     let _env = EnvGuard::set(&[("NAMIDB_WCOJ", "1"), ("NAMIDB_FACTORIZE", "1")]);
 
     let mut w = WriterSession::open(store(), paths("mwj-alt-dense"))
@@ -548,9 +537,12 @@ async fn multiway_join_alternation_dense_graph_emits_set_semantics() {
     assert!(contains_multiway_join(&plan));
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
 
-    // 3 rotations of (A,B,C); WCOJ emits one row per tuple regardless
-    // of type-picking multiplicity.
-    assert_eq!(rows.len(), 3, "expected 3 (a,b,c) tuples under WCOJ set semantics");
+    // 3 rotations × 8 type pickings = 24 rows.
+    assert_eq!(
+        rows.len(),
+        24,
+        "WCOJ must match binary's per-path multiset count"
+    );
 
     // D must never appear in any binding.
     for r in &rows {
@@ -559,17 +551,15 @@ async fn multiway_join_alternation_dense_graph_emits_set_semantics() {
         }
     }
 
-    // Binary path on the same query: per-path semantics gives 24 rows
-    // (2^3 type pickings × 3 rotations). Confirms the divergence is
-    // real and only on the WCOJ path.
+    // Binary path on the same query yields the same multiset.
     drop(_env);
     let _env_off = EnvGuard::set(&[("NAMIDB_WCOJ", "0")]);
     let p_bin = plan_query(&q, &cat).unwrap();
     assert!(!contains_multiway_join(&p_bin));
     let bin_rows = execute(&p_bin, &snap, &Params::new()).await.unwrap();
-    assert_eq!(bin_rows.len(), 24, "binary path multiplies per type-picking");
+    assert_eq!(bin_rows.len(), 24);
 
-    // The DISTINCT variant restores parity between the two paths.
+    // RETURN DISTINCT collapses both paths to the same 3 unique tuples.
     let q_distinct = parse(
         "MATCH (a:Person)-[:KNOWS|:LIKES]->(b:Person)\
                        -[:KNOWS|:LIKES]->(c:Person)\
@@ -579,12 +569,100 @@ async fn multiway_join_alternation_dense_graph_emits_set_semantics() {
     .unwrap();
     let p_dist = plan_query(&q_distinct, &cat).unwrap();
     let dist_rows = execute(&p_dist, &snap, &Params::new()).await.unwrap();
-    assert_eq!(dist_rows.len(), 3, "DISTINCT collapses binary to set semantics");
+    assert_eq!(dist_rows.len(), 3, "DISTINCT collapses to 3 unique tuples");
 }
 
 fn node_id(row: &namidb_query::Row, alias: &str) -> NodeId {
     match row.get(alias) {
         Some(RuntimeValue::Node(n)) => n.id,
         other => panic!("{} not bound to a node: {:?}", alias, other),
+    }
+}
+
+// ─────────────────────── alternation row-count parity ─────────────────
+
+#[tokio::test]
+async fn multiway_join_alternation_per_path_count_matches_binary_in_all_cases() {
+    // Exhaustive parity sweep: every combination of one-or-both type
+    // edges between every pair of triangle nodes, asserting WCOJ
+    // total row count tracks the binary plan exactly. The product
+    // `prod_e (#types_present_between_endpoints)` must equal the
+    // row count and binary's per-edge fan-out must agree.
+    let scenarios: &[(&str, &[(usize, &[&str])])] = &[
+        // (label, per-pair edge types)
+        (
+            "KNOWS only",
+            &[(0, &["KNOWS"]), (1, &["KNOWS"]), (2, &["KNOWS"])],
+        ),
+        (
+            "LIKES only",
+            &[(0, &["LIKES"]), (1, &["LIKES"]), (2, &["LIKES"])],
+        ),
+        (
+            "mixed",
+            &[(0, &["KNOWS"]), (1, &["LIKES"]), (2, &["KNOWS"])],
+        ),
+        (
+            "all-both",
+            &[
+                (0, &["KNOWS", "LIKES"]),
+                (1, &["KNOWS", "LIKES"]),
+                (2, &["KNOWS", "LIKES"]),
+            ],
+        ),
+        (
+            "one-both rest-single",
+            &[(0, &["KNOWS", "LIKES"]), (1, &["KNOWS"]), (2, &["LIKES"])],
+        ),
+    ];
+
+    for (i, (label, spec)) in scenarios.iter().enumerate() {
+        let store = store();
+        let mut w = WriterSession::open(store, paths(&format!("mwj-altparity-{}", i)))
+            .await
+            .unwrap();
+        let _ = label; // used only in assertion messages below
+        let ids: [NodeId; 3] = std::array::from_fn(|_| NodeId::new());
+        for (id, n) in ids.iter().zip(["A", "B", "C"].iter()) {
+            w.upsert_node("Person", *id, &person(n)).unwrap();
+        }
+        for (pair_idx, types) in *spec {
+            let (s, t) = match pair_idx {
+                0 => (ids[0], ids[1]),
+                1 => (ids[1], ids[2]),
+                2 => (ids[2], ids[0]),
+                _ => unreachable!(),
+            };
+            for et in *types {
+                w.upsert_edge(*et, s, t, &rel()).unwrap();
+            }
+        }
+        w.commit_batch().await.unwrap();
+        let snap = w.snapshot();
+
+        let q = parse(
+            "MATCH (a:Person)-[:KNOWS|:LIKES]->(b:Person)\
+                           -[:KNOWS|:LIKES]->(c:Person)\
+                           -[:KNOWS|:LIKES]->(a) \
+             RETURN a, b, c",
+        )
+        .unwrap();
+        let cat = StatsCatalog::default();
+        let binary = {
+            let _g = EnvGuard::set(&[("NAMIDB_WCOJ", "0")]);
+            let p = plan_query(&q, &cat).unwrap();
+            execute(&p, &snap, &Params::new()).await.unwrap().len()
+        };
+        let wcoj = {
+            let _g = EnvGuard::set(&[("NAMIDB_WCOJ", "1"), ("NAMIDB_FACTORIZE", "1")]);
+            let p = plan_query(&q, &cat).unwrap();
+            assert!(contains_multiway_join(&p));
+            execute(&p, &snap, &Params::new()).await.unwrap().len()
+        };
+        assert_eq!(
+            binary, wcoj,
+            "{}: WCOJ row count diverges from binary",
+            label
+        );
     }
 }

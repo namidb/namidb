@@ -2318,7 +2318,41 @@ fn descend_multiway<'a>(
 ) -> BoxFuture<'a, Result<(), ExecError>> {
     async move {
         if level == ordering.len() {
-            // All variables bound — emit one leaf carrying every binding.
+            // Per-tuple multiplicity to match Cypher's per-path semantics
+            // (and the binary executor): for each constraint, count how
+            // many edges actually exist between the bound endpoints
+            // across the constraint's alternation set, then emit
+            // `prod_e mult_e` copies of the leaf. With single-type
+            // single-edge constraints the multiplicity is 1 and the
+            // arena ends up with one leaf per tuple (the original WCOJ
+            // set-semantics behaviour); with `[:A|:B]` or parallel
+            // edges of the same type the row count tracks the binary
+            // path's `Vec<EdgeView>` fan-out exactly.
+            let mut copies: usize = 1;
+            for e in edges {
+                let from = state.bound[e.from_idx].ok_or_else(|| {
+                    ExecError::Runtime("MultiwayJoin: from_idx not bound at leaf level".into())
+                })?;
+                let to = state.bound[e.to_idx].ok_or_else(|| {
+                    ExecError::Runtime("MultiwayJoin: to_idx not bound at leaf level".into())
+                })?;
+                let m =
+                    count_edge_multiplicity(snapshot, from, to, &e.edge_types, e.direction).await?;
+                copies = copies.saturating_mul(m);
+                if copies == 0 {
+                    // The leapfrog said this constraint's partner list
+                    // contained `to`, but a re-scan of the SST/CSR
+                    // found zero edges. The only way this happens is a
+                    // tombstone slipped between the two reads — drop
+                    // the tuple, which matches what the binary path
+                    // would do.
+                    return Ok(());
+                }
+            }
+            // Build the leaf bindings once; push `copies` references
+            // into the leaf list. `materialize_all` walks each leaf
+            // index independently, so pushing the same index N times
+            // yields N identical rows without N times the arena work.
             let root = state.arena.root();
             let mut slots: Vec<Slot> = Vec::with_capacity(vars.len());
             for (i, v) in vars.iter().enumerate() {
@@ -2338,7 +2372,9 @@ fn descend_multiway<'a>(
                 ));
             }
             let leaf = state.arena.push(root, slots);
-            state.leaves.push(leaf);
+            for _ in 0..copies {
+                state.leaves.push(leaf);
+            }
             return Ok(());
         }
 
@@ -2461,6 +2497,52 @@ fn descend_multiway<'a>(
         Ok(())
     }
     .boxed()
+}
+
+/// Count how many edges of any type in `edge_types` actually connect
+/// `from` to `to` in the given direction. Used by the WCOJ leaf
+/// emission to scale per-tuple set semantics back up to per-path
+/// multiset semantics (the binary executor's native shape).
+///
+/// `sorted_partners` only tells us whether at least one edge of a
+/// given type connects the two nodes; here we go through
+/// `out_edges` / `in_edges`, which return `Vec<EdgeView>`, so
+/// parallel edges of the same type contribute one count each. The
+/// cost is `O(types * deg)` per call, paid only once per output
+/// tuple — concretely, leaves are already the pruned cyclic
+/// matches the leapfrog produced, so this dominates only in the
+/// pathological case where the multiplicity per constraint is
+/// huge anyway.
+async fn count_edge_multiplicity(
+    snapshot: &Snapshot<'_>,
+    from: NodeId,
+    to: NodeId,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+) -> Result<usize, ExecError> {
+    let mut total: usize = 0;
+    for et in edge_types {
+        let edges = match direction {
+            RelationshipDirection::Right => snapshot.out_edges(et, from).await?.edges,
+            RelationshipDirection::Left => snapshot.in_edges(et, from).await?.edges,
+            RelationshipDirection::Both => {
+                return Err(ExecError::Runtime(
+                    "MultiwayJoin v0: undirected edges not supported".into(),
+                ));
+            }
+        };
+        for e in edges {
+            let partner = match direction {
+                RelationshipDirection::Right => e.dst,
+                RelationshipDirection::Left => e.src,
+                RelationshipDirection::Both => unreachable!(),
+            };
+            if partner == to {
+                total += 1;
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Translate the Cypher-side `RelationshipDirection` carried by an

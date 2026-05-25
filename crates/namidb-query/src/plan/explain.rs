@@ -167,9 +167,12 @@ fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
         LogicalPlan::Expand {
             edge_type: Some(ets),
             ..
-        } => ets
-            .iter()
-            .any(|et| catalog.edge_type(et).map(|e| e.edge_count > 0).unwrap_or(false)),
+        } => ets.iter().any(|et| {
+            catalog
+                .edge_type(et)
+                .map(|e| e.edge_count > 0)
+                .unwrap_or(false)
+        }),
         _ => true,
     }
 }
