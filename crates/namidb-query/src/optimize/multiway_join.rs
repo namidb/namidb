@@ -93,43 +93,39 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
     // the bottom.
     let mut raw_expands: Vec<RawExpand> = Vec::new();
     let mut cursor = head;
-    loop {
-        match cursor {
-            LogicalPlan::Expand {
-                input,
-                source,
-                edge_type,
-                direction,
-                rel_alias,
-                target_alias,
-                target_label,
-                length,
-                optional,
-                back_reference: _,
-                shortest,
-                path_binding,
-            } => {
-                if length.is_some()
-                    || edge_type.is_none()
-                    || rel_alias.is_some()
-                    || *optional
-                    || !matches!(shortest, crate::plan::logical::ShortestMode::None)
-                    || path_binding.is_some()
-                    || matches!(direction, RelationshipDirection::Both)
-                {
-                    return None;
-                }
-                raw_expands.push(RawExpand {
-                    source: source.clone(),
-                    target: target_alias.clone(),
-                    target_label: target_label.clone(),
-                    edge_types: edge_type.as_ref().unwrap().clone(),
-                    direction: *direction,
-                });
-                cursor = input.as_ref();
-            }
-            _ => break,
+    while let LogicalPlan::Expand {
+        input,
+        source,
+        edge_type,
+        direction,
+        rel_alias,
+        target_alias,
+        target_label,
+        length,
+        optional,
+        back_reference: _,
+        shortest,
+        path_binding,
+    } = cursor
+    {
+        if length.is_some()
+            || edge_type.is_none()
+            || rel_alias.is_some()
+            || *optional
+            || !matches!(shortest, crate::plan::logical::ShortestMode::None)
+            || path_binding.is_some()
+            || matches!(direction, RelationshipDirection::Both)
+        {
+            return None;
         }
+        raw_expands.push(RawExpand {
+            source: source.clone(),
+            target: target_alias.clone(),
+            target_label: target_label.clone(),
+            edge_types: edge_type.as_ref().unwrap().clone(),
+            direction: *direction,
+        });
+        cursor = input.as_ref();
     }
 
     // The chain terminates in a NodeScan with a declared label.

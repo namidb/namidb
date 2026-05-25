@@ -176,7 +176,7 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
         match msg {
             Response::Record(values) => {
                 let mut row = BTreeMap::new();
-                for (k, v) in fields.iter().cloned().zip(values.into_iter()) {
+                for (k, v) in fields.iter().cloned().zip(values) {
                     row.insert(k, v);
                 }
                 rows.push(row);
@@ -210,7 +210,7 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
             }
             Response::Record(values) => {
                 let mut row = BTreeMap::new();
-                for (k, v) in fields.iter().cloned().zip(values.into_iter()) {
+                for (k, v) in fields.iter().cloned().zip(values) {
                     row.insert(k, v);
                 }
                 rows.push(row);

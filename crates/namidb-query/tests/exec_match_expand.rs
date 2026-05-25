@@ -693,6 +693,41 @@ async fn match_expand_without_rel_type_enumerates_all_edge_types() {
 }
 
 #[tokio::test]
+async fn unwind_alias_drives_following_match_property_filter() {
+    // B1 regression: `UNWIND ['Alice', 'Bob'] AS who MATCH (n:Person
+    // {name: who})` must use `who` as a per-row driver, returning one
+    // matched node per element of the list — not 0 rows (alias dropped
+    // during binding) and not the full label scan (alias resolved to
+    // null and the filter became `name = NULL`).
+    let mut writer = WriterSession::open(store(), paths("exec-unwind-match"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "UNWIND ['Alice', 'Bob', 'Eve'] AS who \
+         MATCH (n:Person {name: who}) \
+         RETURN n.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.clone(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string(), "Eve".to_string()],
+    );
+}
+
+#[tokio::test]
 async fn var_length_expand_without_rel_type_crosses_heterogeneous_types() {
     // Regression for Bug #6: `[*1..N]` without an explicit edge type
     // must traverse every type at each hop. With `Alice -KNOWS-> Bob

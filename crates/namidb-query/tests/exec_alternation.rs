@@ -588,6 +588,7 @@ async fn multiway_join_alternation_per_path_count_matches_binary_in_all_cases() 
     // total row count tracks the binary plan exactly. The product
     // `prod_e (#types_present_between_endpoints)` must equal the
     // row count and binary's per-edge fan-out must agree.
+    #[allow(clippy::type_complexity)]
     let scenarios: &[(&str, &[(usize, &[&str])])] = &[
         // (label, per-pair edge types)
         (

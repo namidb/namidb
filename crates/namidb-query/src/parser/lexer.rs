@@ -208,6 +208,57 @@ impl Token {
             Token::Range => "..",
         }
     }
+
+    /// `true` when this token is a reserved Cypher keyword (case-insensitive
+    /// in the source, normalised in the lexer). Used by the parser to give a
+    /// pointed error ("`MATCH` is a reserved keyword, quote it as `\`MATCH\``
+    /// to use it as an identifier") instead of the generic "expected
+    /// identifier" message.
+    pub fn is_reserved_keyword(&self) -> bool {
+        matches!(
+            self,
+            Token::Match
+                | Token::Optional
+                | Token::Where
+                | Token::Return
+                | Token::With
+                | Token::Order
+                | Token::By
+                | Token::Asc
+                | Token::Desc
+                | Token::Skip
+                | Token::Limit
+                | Token::Distinct
+                | Token::As
+                | Token::Unwind
+                | Token::Create
+                | Token::Merge
+                | Token::On
+                | Token::Set
+                | Token::Delete
+                | Token::Detach
+                | Token::Remove
+                | Token::Union
+                | Token::All
+                | Token::And
+                | Token::Or
+                | Token::Xor
+                | Token::Not
+                | Token::In
+                | Token::Is
+                | Token::StartsKw
+                | Token::EndsKw
+                | Token::Contains
+                | Token::Case
+                | Token::When
+                | Token::Then
+                | Token::Else
+                | Token::End
+                | Token::True
+                | Token::False
+                | Token::Null
+        )
+    }
 }
 
 impl fmt::Display for Token {

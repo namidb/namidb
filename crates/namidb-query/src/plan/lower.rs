@@ -828,13 +828,22 @@ fn lower_node_pattern_head(
             let _ = optional; // OPTIONAL on NodeById not meaningful in v0.
             return Ok(plan);
         }
-        // Map without `id`: build NodeScan + Filter for each prop.
-        let mut plan = LogicalPlan::NodeScan {
+        // Map without `_id`: build NodeScan, join with the carried-in
+        // input (e.g. an UNWIND that introduces outer-row bindings the
+        // map filter references) and then layer the per-prop Filters on
+        // top of the joined plan. Doing the Filters BELOW the join would
+        // hide the outer bindings (the right side of CrossProduct sees
+        // only its own subtree), which is the root cause of B1.
+        //
+        // Filter pushdown is then free to re-sink predicates that don't
+        // reference outer bindings — RFC-014 §"Predicate pushdown".
+        let scan = LogicalPlan::NodeScan {
             label: label.map(str::to_string),
             alias: alias.clone(),
             predicates: vec![],
             projection: None,
         };
+        let mut plan = combine(input, scan);
         for (key, val) in map.entries.iter() {
             let pred = build_eq(&alias, &key.name, val.clone(), head.span);
             plan = LogicalPlan::Filter {
@@ -842,7 +851,7 @@ fn lower_node_pattern_head(
                 predicate: pred,
             };
         }
-        return Ok(combine(input, plan));
+        return Ok(plan);
     }
 
     let scan = LogicalPlan::NodeScan {
@@ -2307,6 +2316,38 @@ mod tests {
     }
 
     #[test]
+    fn merge_multi_hop_lowers_with_all_endpoints_and_rels() {
+        // B2: a MERGE pattern with multiple hops must lower every node
+        // and every relationship in the chain.
+        let p = lp(
+            "MERGE (a:Person {externalId: 1})-[r1:KNOWS]->(b:Person {externalId: 2})\
+             -[r2:KNOWS]->(c:Person {externalId: 3})",
+        );
+        let pattern = match &p {
+            LogicalPlan::Merge { pattern, .. } => pattern,
+            other => panic!("expected Merge, got {:?}", other),
+        };
+        let mut node_aliases: Vec<&str> = pattern
+            .iter()
+            .filter_map(|e| match e {
+                CreateElement::Node { alias, .. } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        node_aliases.sort();
+        assert_eq!(node_aliases, vec!["a", "b", "c"]);
+        let mut rel_aliases: Vec<&str> = pattern
+            .iter()
+            .filter_map(|e| match e {
+                CreateElement::Rel { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        rel_aliases.sort();
+        assert_eq!(rel_aliases, vec!["r1", "r2"]);
+    }
+
+    #[test]
     fn merge_with_relationship_lowers_to_node_rel_node_set() {
         // Regression: MERGE (a)-[r]->(b) must lower a triple containing
         // a head Node, a tail Node, and a Rel linking their aliases.
@@ -2356,6 +2397,29 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn unwind_alias_binds_in_following_match_pattern() {
+        // B1: `UNWIND … AS x MATCH (n {id: x})` — the unwind alias must
+        // be visible to the property filter on the following MATCH; if it
+        // isn't, lowering fails with "unknown identifier `x`".
+        let _p = lp("UNWIND ['a', 'b'] AS uid MATCH (n:Person {id: uid}) RETURN n");
+    }
+
+    #[test]
+    fn unwind_alias_binds_in_match_with_where() {
+        let _p = lp("UNWIND ['a', 'b'] AS uid MATCH (n:Person) WHERE n.id = uid RETURN n");
+    }
+
+    #[test]
+    fn unwind_alias_binds_in_match_with_id_filter() {
+        let _p = lp("UNWIND [$ids] AS uid MATCH (n:Person {_id: uid}) RETURN n");
+    }
+
+    #[test]
+    fn unwind_alias_binds_in_chained_match_expand() {
+        let _p = lp("UNWIND ['a'] AS uid MATCH (n:Person {id: uid})-[:KNOWS]->(m:Person) RETURN m");
     }
 
     #[test]
