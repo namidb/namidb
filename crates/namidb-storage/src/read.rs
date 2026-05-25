@@ -1319,14 +1319,8 @@ impl<'mt> Snapshot<'mt> {
         // emit (partner, lsn, is_upsert) triples into the same map.
         if adjacency_enabled() {
             if let Some(cache) = self.adjacency_cache.clone() {
-                self.merge_sorted_partners_csr(
-                    cache,
-                    edge_type,
-                    key,
-                    direction,
-                    &mut latest,
-                )
-                .await?;
+                self.merge_sorted_partners_csr(cache, edge_type, key, direction, &mut latest)
+                    .await?;
             } else {
                 self.merge_sorted_partners_sst(edge_type, key, direction, &mut latest)
                     .await?;
