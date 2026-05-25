@@ -522,7 +522,7 @@ mod tests {
         LogicalPlan::Expand {
             input: Box::new(input),
             source: source.into(),
-            edge_type: Some(et.into()),
+            edge_type: Some(vec![et.into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: target.into(),

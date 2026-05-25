@@ -874,16 +874,12 @@ fn lower_rel_node(
         _ => previous_source(&input)?,
     };
     let _ = ctx; // ctx no longer needed; reserved for label resolution.
-    let edge_type = match rel.types.as_slice() {
+    // `[:A|:B|:C]` lowers to a non-empty Vec; `[]` (untyped) lowers to
+    // None. The executor unions the partner lists across listed types
+    // (RFC-024 §"Open questions" Q1).
+    let edge_type: Option<Vec<String>> = match rel.types.as_slice() {
         [] => None,
-        [single] => Some(single.name.clone()),
-        _ => {
-            return Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "relationship type alternation `:A|:B` lowers via WCOJ (planned)",
-                rel.span,
-            ));
-        }
+        types => Some(types.iter().map(|t| t.name.clone()).collect()),
     };
     let rel_alias = rel.binding.as_ref().map(|b| b.name.clone());
     if let Some(name) = &rel_alias {

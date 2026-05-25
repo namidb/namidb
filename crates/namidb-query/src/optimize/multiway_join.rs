@@ -123,7 +123,7 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
                     source: source.clone(),
                     target: target_alias.clone(),
                     target_label: target_label.clone(),
-                    edge_type: edge_type.as_ref().unwrap().clone(),
+                    edge_types: edge_type.as_ref().unwrap().clone(),
                     direction: *direction,
                 });
                 cursor = input.as_ref();
@@ -187,7 +187,7 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
         .map(|ex| RawEdge {
             from: ex.source.clone(),
             to: ex.target.clone(),
-            edge_type: ex.edge_type.clone(),
+            edge_types: ex.edge_types.clone(),
             direction: ex.direction,
         })
         .collect();
@@ -222,7 +222,7 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
         .map(|e| EdgeConstraint {
             from_idx: alias_index[&e.from],
             to_idx: alias_index[&e.to],
-            edge_type: e.edge_type.clone(),
+            edge_types: e.edge_types.clone(),
             direction: e.direction,
         })
         .collect();
@@ -242,7 +242,7 @@ struct RawExpand {
     source: String,
     target: String,
     target_label: Option<String>,
-    edge_type: String,
+    edge_types: Vec<String>,
     direction: RelationshipDirection,
 }
 
@@ -250,7 +250,7 @@ struct RawExpand {
 struct RawEdge {
     from: String,
     to: String,
-    edge_type: String,
+    edge_types: Vec<String>,
     direction: RelationshipDirection,
 }
 
@@ -582,7 +582,7 @@ mod tests {
         LogicalPlan::Expand {
             input: Box::new(input),
             source: source.into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: target.into(),
@@ -706,13 +706,13 @@ mod tests {
             RawEdge {
                 from: "a".into(),
                 to: "b".into(),
-                edge_type: "X".into(),
+                edge_types: vec!["X".into()],
                 direction: RelationshipDirection::Right,
             },
             RawEdge {
                 from: "b".into(),
                 to: "c".into(),
-                edge_type: "X".into(),
+                edge_types: vec!["X".into()],
                 direction: RelationshipDirection::Right,
             },
         ];
@@ -722,19 +722,19 @@ mod tests {
             RawEdge {
                 from: "a".into(),
                 to: "b".into(),
-                edge_type: "X".into(),
+                edge_types: vec!["X".into()],
                 direction: RelationshipDirection::Right,
             },
             RawEdge {
                 from: "b".into(),
                 to: "c".into(),
-                edge_type: "X".into(),
+                edge_types: vec!["X".into()],
                 direction: RelationshipDirection::Right,
             },
             RawEdge {
                 from: "c".into(),
                 to: "a".into(),
-                edge_type: "X".into(),
+                edge_types: vec!["X".into()],
                 direction: RelationshipDirection::Right,
             },
         ];

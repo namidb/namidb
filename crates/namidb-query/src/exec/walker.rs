@@ -617,7 +617,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
 async fn execute_expand(
     rows: Vec<Row>,
     source: &str,
-    edge_type: Option<&str>,
+    edge_type: Option<&[String]>,
     direction: RelationshipDirection,
     rel_alias: Option<&str>,
     target_alias: &str,
@@ -922,14 +922,15 @@ fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<Stri
 
 /// Resolve the set of edge types an `Expand` operator must traverse.
 ///
-/// `Some(t)` → traverse only `t`. `None` (pattern wrote `-[r]->` without
-/// a type label, or `-[*1..N]->` with no type) → enumerate every edge
-/// type observable through the snapshot (declared schema + memtable +
-/// persisted SSTs). Cost grows linearly with the observed type count —
-/// EXPLAIN surfaces this so users can opt back into typed expansion.
-fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&str>) -> Vec<String> {
+/// `Some(types)` → traverse only the listed types (union for
+/// alternation `[:A|:B]`). `None` (pattern wrote `-[r]->` without
+/// a type label) → enumerate every edge type observable through the
+/// snapshot (declared schema + memtable + persisted SSTs). Cost grows
+/// linearly with the observed type count — EXPLAIN surfaces this so
+/// users can opt back into typed expansion.
+fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&[String]>) -> Vec<String> {
     match edge_type {
-        Some(t) => vec![t.to_string()],
+        Some(types) => types.to_vec(),
         None => snapshot.observed_edge_types(),
     }
 }
@@ -1034,7 +1035,7 @@ fn should_skip_target_materialize(
     snapshot: &Snapshot<'_>,
     routing: &PlanRouting,
     target_alias: &str,
-    edge_type: Option<&str>,
+    edge_type: Option<&[String]>,
     direction: RelationshipDirection,
     target_label: Option<&str>,
     length: Option<crate::parser::RelationshipLength>,
@@ -1051,7 +1052,7 @@ fn should_skip_target_materialize(
     if !single_hop {
         return false;
     }
-    let Some(edge_type) = edge_type else {
+    let Some(edge_types) = edge_type else {
         return false;
     };
     let Some(target_label) = target_label else {
@@ -1063,17 +1064,22 @@ fn should_skip_target_materialize(
         return false;
     };
     let schema = &snapshot.manifest().manifest.schema;
-    let Some(edge_def) = schema.edge_type(edge_type) else {
-        return false;
-    };
-    match direction {
-        RelationshipDirection::Right => edge_def.dst_label == target_label,
-        RelationshipDirection::Left => edge_def.src_label == target_label,
-        // Undirected: we'd have to inspect each edge individually.
-        RelationshipDirection::Both => {
-            edge_def.dst_label == target_label && edge_def.src_label == target_label
+    // Type alternation `[:A|:B]`: every listed type has to point at the
+    // same target label, otherwise we'd silently drop matches where the
+    // label diverges. Walking each declaration is O(types.len()), well
+    // bounded in practice (the parser caps alternation at a handful).
+    edge_types.iter().all(|et| {
+        let Some(edge_def) = schema.edge_type(et) else {
+            return false;
+        };
+        match direction {
+            RelationshipDirection::Right => edge_def.dst_label == target_label,
+            RelationshipDirection::Left => edge_def.src_label == target_label,
+            RelationshipDirection::Both => {
+                edge_def.dst_label == target_label && edge_def.src_label == target_label
+            }
         }
-    }
+    })
 }
 
 /// Walk every label in the manifest looking for a node with `id`.
@@ -2025,7 +2031,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
 async fn execute_expand_factor(
     input: FactorRowSet,
     source: &str,
-    edge_type: Option<&str>,
+    edge_type: Option<&[String]>,
     direction: RelationshipDirection,
     rel_alias: Option<&str>,
     target_alias: &str,
@@ -2341,7 +2347,13 @@ fn descend_multiway<'a>(
 
         // Gather the (bound_partner, storage_direction, edge_type) tuples
         // that constrain this variable to the prefix bound so far.
-        let mut sources: Vec<(NodeId, EdgeDirection, &str)> = Vec::new();
+        // One source entry per (bound_neighbour, storage_direction,
+        // edge_types_for_this_constraint). For a constraint with type
+        // alternation `[:A|:B]` the executor fetches `sorted_partners`
+        // once per listed type and merges them via `MergeSortedUnion`
+        // into a single ascending list before the outer leapfrog
+        // intersects across constraints.
+        let mut sources: Vec<(NodeId, EdgeDirection, &[String])> = Vec::new();
         for e in edges {
             let (bound_idx, bound_is_from) =
                 if e.from_idx == var_idx && state.bound[e.to_idx].is_some() {
@@ -2352,7 +2364,11 @@ fn descend_multiway<'a>(
                     continue;
                 };
             let dir = relationship_to_edge_direction(e.direction, bound_is_from)?;
-            sources.push((state.bound[bound_idx].unwrap(), dir, e.edge_type.as_str()));
+            sources.push((
+                state.bound[bound_idx].unwrap(),
+                dir,
+                e.edge_types.as_slice(),
+            ));
         }
 
         if sources.is_empty() {
@@ -2380,11 +2396,24 @@ fn descend_multiway<'a>(
                 descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
             }
         } else {
-            // Inner level: leapfrog over the partner lists of every edge
-            // that ties this variable to an already-bound one.
+            // Per-constraint partner list. For single-type constraints
+            // we just call `sorted_partners` once; for alternation we
+            // call it per type and union via `MergeSortedUnion` (the
+            // output is sorted ascending without duplicates, which is
+            // what `LeapfrogIntersect` needs).
             let mut lists: Vec<Vec<NodeId>> = Vec::with_capacity(sources.len());
-            for (src, dir, edge_type) in &sources {
-                lists.push(snapshot.sorted_partners(edge_type, *src, *dir).await?);
+            for (src, dir, edge_types) in &sources {
+                if edge_types.len() == 1 {
+                    lists.push(snapshot.sorted_partners(&edge_types[0], *src, *dir).await?);
+                } else {
+                    let mut per_type: Vec<Vec<NodeId>> = Vec::with_capacity(edge_types.len());
+                    for et in *edge_types {
+                        per_type.push(snapshot.sorted_partners(et, *src, *dir).await?);
+                    }
+                    let iters: Vec<SortedSliceIter<'_>> =
+                        per_type.iter().map(|l| SortedSliceIter::new(l)).collect();
+                    lists.push(crate::exec::MergeSortedUnion::new(iters).collect());
+                }
             }
             let iters: Vec<SortedSliceIter<'_>> = lists
                 .iter()

@@ -78,7 +78,16 @@ pub enum LogicalPlan {
     Expand {
         input: Box<LogicalPlan>,
         source: String,
-        edge_type: Option<String>,
+        /// Edge type filter. `None` matches any observed type
+        /// (`MATCH (a)-[]->(b)`); a non-empty `Some(vec)` restricts the
+        /// traversal to the listed types. The executor unions the
+        /// partner lists across all listed types. `Some(vec![])` is
+        /// invariant-violating — the lowering refuses to produce it and
+        /// callers may panic on `vec.first().unwrap()` if they get one.
+        ///
+        /// Cypher `[:A]` lowers to `Some(vec!["A"])`; alternation
+        /// `[:A|:B|:C]` lowers to `Some(vec!["A","B","C"])`.
+        edge_type: Option<Vec<String>>,
         direction: RelationshipDirection,
         rel_alias: Option<String>,
         target_alias: String,
@@ -333,15 +342,21 @@ pub struct NodeBinding {
 
 /// One edge constraint in a [`LogicalPlan::MultiwayJoin`]
 /// (RFC-024). `from_idx` and `to_idx` index into
-/// `MultiwayJoin.vars`; the executor reads
-/// `Snapshot::sorted_partners(edge_type, vars[from_idx],
-/// direction)` and intersects against the partner key it expects
-/// for `vars[to_idx]`.
+/// `MultiwayJoin.vars`; for each listed `edge_type` the executor reads
+/// `Snapshot::sorted_partners(edge_type, vars[from_idx], direction)`
+/// and merge-unions the lists before feeding the result into the
+/// leapfrog intersection with the other constraints at this trie level.
+///
+/// `edge_types` is always non-empty; the detection pass refuses
+/// untyped edges (`MATCH (a)-[]-(b)`) because the resulting union
+/// would be `O(observed_types * deg)` and the cost model has no way
+/// to bound it. Cypher alternation `[:A|:B|:C]` populates the vector
+/// with all listed types in source order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeConstraint {
     pub from_idx: usize,
     pub to_idx: usize,
-    pub edge_type: String,
+    pub edge_types: Vec<String>,
     pub direction: RelationshipDirection,
 }
 

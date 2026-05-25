@@ -165,12 +165,11 @@ fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
                 .unwrap_or(false)
         }
         LogicalPlan::Expand {
-            edge_type: Some(et),
+            edge_type: Some(ets),
             ..
-        } => catalog
-            .edge_type(et)
-            .map(|e| e.edge_count > 0)
-            .unwrap_or(false),
+        } => ets
+            .iter()
+            .any(|et| catalog.edge_type(et).map(|e| e.edge_count > 0).unwrap_or(false)),
         _ => true,
     }
 }
@@ -230,8 +229,8 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 "Expand "
             });
             let _ = write!(out, "source={}", source);
-            if let Some(t) = edge_type {
-                let _ = write!(out, " edge_type={}", t);
+            if let Some(ts) = edge_type {
+                let _ = write!(out, " edge_type={}", ts.join("|"));
             }
             let _ = write!(out, " dir={}", direction_label(*direction));
             if let Some(r) = rel_alias {
@@ -504,7 +503,7 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                     out,
                     "{}-[:{}]{}-{}",
                     vars[e.from_idx].alias,
-                    e.edge_type,
+                    e.edge_types.join("|"),
                     direction_label(e.direction),
                     vars[e.to_idx].alias
                 );
@@ -769,7 +768,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(scan),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "b".into(),
@@ -818,7 +817,7 @@ TopN keys=[b DESC] limit=10
                 projection: None,
             }),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Both,
             rel_alias: None,
             target_alias: "b".into(),
@@ -876,7 +875,7 @@ TopN keys=[b DESC] limit=10
                 projection: None,
             }),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),

@@ -39,7 +39,12 @@ pub struct Cardinality {
 #[derive(Clone, Debug, Default)]
 pub struct BindingMeta {
     pub label: Option<String>,
-    pub edge_type: Option<String>,
+    /// Edge type filter for rel bindings produced by `Expand`. `None`
+    /// for node bindings or for untyped expansion; non-empty `Some`
+    /// matches the corresponding `LogicalPlan::Expand.edge_type` and
+    /// preserves the alternation set when the source pattern wrote
+    /// `[:A|:B]`.
+    pub edge_type: Option<Vec<String>>,
 }
 
 /// Default fan-out for an `Expand` whose edge_type has no stats.
@@ -482,7 +487,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {
-                            edge_type: Some(edge_type.clone()),
+                            edge_type: Some(vec![edge_type.clone()]),
                             ..Default::default()
                         },
                     };
@@ -507,7 +512,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {
-                            edge_type: Some(edge_type.clone()),
+                            edge_type: Some(vec![edge_type.clone()]),
                             ..Default::default()
                         },
                     };
@@ -552,33 +557,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             }
         }
         LogicalPlan::MultiwayJoin { vars, edges, .. } => {
-            // Naïve worst-case approximation: `avg_degree^(k-1) * |outer|`
-            // where `k = vars.len()` and `avg_degree` averages the
-            // branch factor of every participating edge type. An
-            // AGM-tight estimate via fractional edge cover LP is
-            // future work (RFC-024 §"Cost model"). The pessimism is
-            // intentional so `reorder_joins` does not promote a
-            // multiway join when the binary plan happens to be
-            // cheaper on a non-cyclic shape.
-            let k = vars.len().max(1) as i32;
-            let avg_degree = if edges.is_empty() {
-                1.0
-            } else {
-                edges
-                    .iter()
-                    .map(|e| branch_factor(catalog, Some(&e.edge_type), e.direction))
-                    .sum::<f64>()
-                    / edges.len() as f64
-            };
-            // Anchor on the outer variable's label count so we don't
-            // over-estimate against fully empty graphs.
-            let outer = vars
-                .first()
-                .and_then(|v| v.label.as_deref())
-                .and_then(|l| catalog.label(l))
-                .map(|s| s.node_count as f64)
-                .unwrap_or(1.0);
-            let rows = (outer * avg_degree.powi(k - 1)).max(1.0);
+            let rows = agm_bound_rows(vars, edges, catalog);
             let mut bindings = BTreeMap::new();
             for v in vars {
                 bindings.insert(
@@ -594,6 +573,128 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
     }
 }
 
+/// AGM (Atserias-Grohe-Marx) upper bound on the output cardinality of
+/// the multiway join. The Atserias-Grohe-Marx theorem says the maximum
+/// number of output tuples for a join query is
+///
+/// ```text
+///     |Q| <= prod_e |R_e| ^ w_e
+/// ```
+///
+/// for every fractional edge cover `w` (each vertex `v` satisfies
+/// `sum_{e ∋ v} w_e >= 1`), and the bound is tight.
+///
+/// Solving the LP at planning time is overkill — for the shapes the v0
+/// detection pass produces (chordal cycles, k-cliques, k-cycles, and
+/// triangle-with-dangling-edges) the simple greedy `w_e =
+/// 1/min(deg(from(e)), deg(to(e)))` is exactly the LP solution, and for
+/// arbitrary shapes it is a guaranteed upper bound. Per RFC-024
+/// §"Cost model" we keep the bound side of the formula (pessimism is
+/// the right error direction) and document the heuristic.
+///
+/// For each `EdgeConstraint` with alternation `[:A|:B|...]` the binary
+/// relation cardinality is the SUM of per-type `edge_count`s; the
+/// executor unions the partner lists and a single match in either
+/// type lands the same tuple.
+fn agm_bound_rows(
+    vars: &[crate::plan::logical::NodeBinding],
+    edges: &[crate::plan::logical::EdgeConstraint],
+    catalog: &StatsCatalog,
+) -> f64 {
+    let k = vars.len();
+    if k == 0 {
+        return 1.0;
+    }
+    if edges.is_empty() {
+        // Degenerate: no constraints, output is the cartesian product
+        // of per-variable label scans.
+        let mut prod = 1.0;
+        for v in vars {
+            let nodes = v
+                .label
+                .as_deref()
+                .and_then(|l| catalog.label(l))
+                .map(|s| s.node_count as f64)
+                .unwrap_or(DEFAULT_REL_CARDINALITY);
+            prod *= nodes.max(1.0);
+        }
+        return prod.max(1.0);
+    }
+
+    // Per-edge cardinality: sum over the alternation set's
+    // catalog.edge_type(t).edge_count. Empty / unknown types fall back
+    // to the default constant so a cold catalog still produces a
+    // bounded number.
+    let rel_card: Vec<f64> = edges
+        .iter()
+        .map(|e| {
+            let mut total: f64 = 0.0;
+            let mut seen = false;
+            for et in &e.edge_types {
+                if let Some(s) = catalog.edge_type(et) {
+                    total += s.edge_count as f64;
+                    seen = true;
+                }
+            }
+            if seen && total > 0.0 {
+                total
+            } else {
+                // No stats. Use a default scaled by alternation breadth
+                // so `[:A|:B]` is recognised as wider than `[:A]`.
+                DEFAULT_REL_CARDINALITY * (e.edge_types.len().max(1) as f64)
+            }
+        })
+        .collect();
+
+    // Vertex-incidence count. Treats each constraint as an undirected
+    // edge for cover purposes.
+    let mut deg = vec![0usize; k];
+    for e in edges {
+        deg[e.from_idx] += 1;
+        deg[e.to_idx] += 1;
+    }
+
+    // Greedy fractional cover weight per edge: `w_e =
+    // 1 / min(deg(from), deg(to))`. For regular shapes (k-clique,
+    // k-cycle, K_{m,n}) this is the LP optimum; for irregular shapes
+    // it is an upper bound. Coincidentally it produces the exact AGM
+    // tight bound for triangles, 4-cycles, full cliques, and any shape
+    // where every vertex has the same degree.
+    let log_bound: f64 = edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let m = deg[e.from_idx].min(deg[e.to_idx]).max(1) as f64;
+            rel_card[i].ln() / m
+        })
+        .sum();
+    let agm = log_bound.exp().max(1.0);
+
+    // Clip by the cartesian product of per-variable label sizes — an
+    // output tuple has to choose one node per variable. If the catalog
+    // knows the label sizes, that's a strictly tighter bound than AGM
+    // for very small graphs.
+    let cartesian: f64 = vars
+        .iter()
+        .map(|v| {
+            v.label
+                .as_deref()
+                .and_then(|l| catalog.label(l))
+                .map(|s| (s.node_count as f64).max(1.0))
+                .unwrap_or(f64::INFINITY)
+        })
+        .product();
+
+    agm.min(cartesian).max(1.0)
+}
+
+/// Default per-edge relation cardinality when the catalog has no
+/// stats for a participating type. Bigger than `DEFAULT_BRANCH_FACTOR`
+/// so AGM and per-row degree heuristics live in comparable scales
+/// (a "1k edge" default lines up with ~50 avg degree over ~20 nodes,
+/// a reasonable lower-bound on observable graphs).
+const DEFAULT_REL_CARDINALITY: f64 = 1_000.0;
+
 fn leaf(plan: &LogicalPlan, rows: f64, bindings: BTreeMap<String, BindingMeta>) -> Cardinality {
     Cardinality {
         rows,
@@ -603,23 +704,46 @@ fn leaf(plan: &LogicalPlan, rows: f64, bindings: BTreeMap<String, BindingMeta>) 
     }
 }
 
+/// Average outgoing/incoming/bidirectional fan-out for an `Expand`.
+///
+/// `edge_type = Some(types)` sums the per-type branch factor over the
+/// alternation set (`[:A|:B]` traverses A's partners and B's partners
+/// for every source row, so the fan-out adds). `edge_type = None`
+/// (untyped expansion `(-[]-)`) sums over every edge type the catalog
+/// knows about.
 fn branch_factor(
     catalog: &StatsCatalog,
-    edge_type: Option<&str>,
+    edge_type: Option<&[String]>,
     direction: RelationshipDirection,
 ) -> f64 {
-    let stats = match edge_type {
-        Some(et) => catalog.edge_type(et),
-        None => None,
-    };
-    match (stats, edge_type) {
-        (Some(s), _) => match direction {
+    let dir_degree = |s: &crate::cost::EdgeTypeStats| -> f64 {
+        match direction {
             RelationshipDirection::Right => s.avg_out_degree.max(0.0),
             RelationshipDirection::Left => s.avg_in_degree.max(0.0),
             RelationshipDirection::Both => (s.avg_out_degree + s.avg_in_degree).max(0.0),
-        },
-        (None, Some(_)) => DEFAULT_BRANCH_FACTOR,
-        (None, None) => {
+        }
+    };
+    match edge_type {
+        Some(types) if !types.is_empty() => {
+            let mut total = 0.0;
+            let mut seen_any_stats = false;
+            for et in types {
+                if let Some(s) = catalog.edge_type(et) {
+                    total += dir_degree(s);
+                    seen_any_stats = true;
+                }
+            }
+            if seen_any_stats {
+                total.max(0.0)
+            } else {
+                // None of the alternation members had stats — fall back
+                // to the per-type default scaled by the alternation
+                // breadth so the estimator still differentiates
+                // `[:A|:B]` from `[:A]` even on a cold catalog.
+                DEFAULT_BRANCH_FACTOR * types.len() as f64
+            }
+        }
+        _ => {
             // Anonymous edge type — sum over every known edge type.
             let mut total = 0.0;
             for name in catalog.edge_type_names() {
@@ -705,8 +829,19 @@ fn ndv_for_expr_opt(
             if let Some(label) = &meta.label {
                 return Some(catalog.label(label)?.node_count as f64);
             }
-            if let Some(et) = &meta.edge_type {
-                return Some(catalog.edge_type(et)?.edge_count as f64);
+            if let Some(ets) = &meta.edge_type {
+                // For an alternation `[:A|:B]` the rel's NDV is the
+                // sum of per-type cardinalities (a Rel value belongs
+                // to exactly one of the listed types, so the bound is
+                // their sum, not their max).
+                let total: u64 = ets
+                    .iter()
+                    .filter_map(|et| catalog.edge_type(et))
+                    .map(|s| s.edge_count)
+                    .sum();
+                if total > 0 {
+                    return Some(total as f64);
+                }
             }
             None
         }
@@ -880,7 +1015,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(person_scan()),
             source: "p".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "q".into(),
@@ -895,7 +1030,10 @@ mod tests {
         // 1000 * 5.0 = 5000.
         assert!((c.rows - 5000.0).abs() < 1e-9);
         assert_eq!(c.bindings["q"].label.as_deref(), Some("Person"));
-        assert_eq!(c.bindings["r"].edge_type.as_deref(), Some("KNOWS"));
+        assert_eq!(
+            c.bindings["r"].edge_type.as_deref(),
+            Some(["KNOWS".to_string()].as_slice())
+        );
     }
 
     #[test]
@@ -905,7 +1043,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(person_scan()),
             source: "p".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "q".into(),
@@ -1075,5 +1213,321 @@ mod tests {
         };
         let c = estimate(&plan, &cat);
         assert!((c.rows - 3.0).abs() < 1e-9);
+    }
+
+    // ─────────────────────── AGM bound (RFC-024) ─────────────────────────
+
+    use crate::plan::logical::{EdgeConstraint, NodeBinding};
+    use crate::parser::RelationshipDirection;
+
+    fn person_binding(alias: &str) -> NodeBinding {
+        NodeBinding {
+            alias: alias.into(),
+            label: Some("Person".into()),
+            predicates: Vec::new(),
+        }
+    }
+
+    fn knows_edge(from: usize, to: usize) -> EdgeConstraint {
+        EdgeConstraint {
+            from_idx: from,
+            to_idx: to,
+            edge_types: vec!["KNOWS".into()],
+            direction: RelationshipDirection::Right,
+        }
+    }
+
+    fn make_catalog_with_two_edge_types() -> StatsCatalog {
+        let mut cat = make_catalog();
+        let likes = crate::cost::stats::EdgeTypeStats {
+            name: "LIKES".into(),
+            edge_count: 3_000,
+            avg_out_degree: 3.0,
+            max_out_degree: 30,
+            avg_in_degree: 3.0,
+            max_in_degree: 30,
+            src_label: Some("Person".into()),
+            dst_label: Some("Person".into()),
+        };
+        cat.__test_insert_edge_type(likes);
+        cat
+    }
+
+    #[test]
+    fn agm_triangle_matches_closed_form() {
+        // Triangle on Person via 3 KNOWS edges. |KNOWS| = 5000.
+        // AGM bound = sqrt(5000^3) ≈ 353_553.
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
+            ordering: vec![0, 1, 2],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        let expected = (5_000f64.powi(3)).sqrt();
+        // Tolerate the cartesian-product clip if it ever fires; for
+        // |Person|=1000, cartesian = 10^9 >> AGM, so AGM wins.
+        let ratio = c.rows / expected;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "AGM triangle bound diverges: got {}, expected {} (ratio {})",
+            c.rows,
+            expected,
+            ratio
+        );
+    }
+
+    #[test]
+    fn agm_four_clique_matches_closed_form() {
+        // K4 has 6 edges, each vertex degree 3. AGM = (prod R)^(1/3).
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+                person_binding("d"),
+            ],
+            edges: vec![
+                knows_edge(0, 1),
+                knows_edge(0, 2),
+                knows_edge(0, 3),
+                knows_edge(1, 2),
+                knows_edge(1, 3),
+                knows_edge(2, 3),
+            ],
+            ordering: vec![0, 1, 2, 3],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        let expected = 5_000f64.powi(6).powf(1.0 / 3.0);
+        let ratio = c.rows / expected;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "AGM K4 bound diverges: got {}, expected {}",
+            c.rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn agm_four_cycle_matches_closed_form() {
+        // C4 (square): 4 vertices, 4 edges, each vertex degree 2.
+        // AGM bound = (prod R)^(1/2) = R^2 = 5000^2 = 25M, clipped
+        // by cartesian product 1000^4 (so AGM wins).
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+                person_binding("d"),
+            ],
+            edges: vec![
+                knows_edge(0, 1),
+                knows_edge(1, 2),
+                knows_edge(2, 3),
+                knows_edge(3, 0),
+            ],
+            ordering: vec![0, 1, 2, 3],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        let expected = 5_000f64 * 5_000f64;
+        let ratio = c.rows / expected;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "AGM 4-cycle bound diverges: got {}, expected {}",
+            c.rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn agm_alternation_sums_per_type_cardinalities() {
+        // Triangle with alternation `[:KNOWS|:LIKES]` on every edge.
+        // Per-edge R = 5000 + 3000 = 8000. AGM = sqrt(8000^3) ≈ 715_541.
+        let cat = make_catalog_with_two_edge_types();
+        let edge_with_alt = |from, to| EdgeConstraint {
+            from_idx: from,
+            to_idx: to,
+            edge_types: vec!["KNOWS".into(), "LIKES".into()],
+            direction: RelationshipDirection::Right,
+        };
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            edges: vec![edge_with_alt(0, 1), edge_with_alt(1, 2), edge_with_alt(2, 0)],
+            ordering: vec![0, 1, 2],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        let expected = (8_000f64.powi(3)).sqrt();
+        let ratio = c.rows / expected;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "AGM alternation bound diverges: got {}, expected {}",
+            c.rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn agm_irregular_triangle_with_dangle_edge() {
+        // Triangle (a,b,c) plus a dangling edge (a,d). d has degree 1,
+        // a has degree 3. AGM closed form:
+        //   bound = sqrt(R_ab * R_bc * R_ca) * R_ad
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![
+                person_binding("a"),
+                person_binding("b"),
+                person_binding("c"),
+                person_binding("d"),
+            ],
+            edges: vec![
+                knows_edge(0, 1),
+                knows_edge(1, 2),
+                knows_edge(2, 0),
+                knows_edge(0, 3),
+            ],
+            ordering: vec![0, 1, 2, 3],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        // sqrt(5000^3) * 5000 ≈ 1.77 * 10^9, clipped by cartesian
+        // 1000^4 = 10^12 (AGM still wins).
+        let expected = 5_000f64.powi(3).sqrt() * 5_000.0;
+        let ratio = c.rows / expected;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "AGM dangle bound diverges: got {}, expected {}",
+            c.rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn agm_clips_by_cartesian_for_tiny_label() {
+        // Triangle on a 5-node Person label. Cartesian = 5^3 = 125;
+        // AGM (with full KNOWS stats) would say sqrt(5000^3) ≈ 354K.
+        // The clip kicks in and caps at 125.
+        let mut cat = make_catalog();
+        // Overwrite Person's node_count to 5.
+        cat.__test_insert_label(LabelStats {
+            name: "Person".into(),
+            node_count: 5,
+            properties: BTreeMap::new(),
+        });
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
+            ordering: vec![0, 1, 2],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        assert!(
+            c.rows <= 125.0 + 1e-6,
+            "cartesian clip did not engage: got {}",
+            c.rows
+        );
+    }
+
+    #[test]
+    fn agm_no_stats_falls_back_to_default() {
+        // Triangle on an unknown edge type and unknown label. Should
+        // return a finite, non-zero bound based on
+        // `DEFAULT_REL_CARDINALITY`.
+        let cat = StatsCatalog::empty();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![
+                NodeBinding {
+                    alias: "a".into(),
+                    label: Some("Unknown".into()),
+                    predicates: Vec::new(),
+                },
+                NodeBinding {
+                    alias: "b".into(),
+                    label: Some("Unknown".into()),
+                    predicates: Vec::new(),
+                },
+                NodeBinding {
+                    alias: "c".into(),
+                    label: Some("Unknown".into()),
+                    predicates: Vec::new(),
+                },
+            ],
+            edges: vec![
+                EdgeConstraint {
+                    from_idx: 0,
+                    to_idx: 1,
+                    edge_types: vec!["MYSTERY".into()],
+                    direction: RelationshipDirection::Right,
+                },
+                EdgeConstraint {
+                    from_idx: 1,
+                    to_idx: 2,
+                    edge_types: vec!["MYSTERY".into()],
+                    direction: RelationshipDirection::Right,
+                },
+                EdgeConstraint {
+                    from_idx: 2,
+                    to_idx: 0,
+                    edge_types: vec!["MYSTERY".into()],
+                    direction: RelationshipDirection::Right,
+                },
+            ],
+            ordering: vec![0, 1, 2],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        // Default 1000 → sqrt(1000^3) ≈ 31623.
+        assert!(c.rows.is_finite() && c.rows >= 1.0 && c.rows <= 1e6);
+    }
+
+    #[test]
+    fn agm_two_var_single_edge_degenerates_to_relation_size() {
+        // Two variables joined by a single edge: AGM = relation
+        // cardinality (w_e = 1 since both vertices have degree 1, but
+        // we cap at min(deg)=1, so w_e = 1/1 = 1 → bound = R).
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![person_binding("a"), person_binding("b")],
+            edges: vec![knows_edge(0, 1)],
+            ordering: vec![0, 1],
+            factorize_required: true,
+        };
+        let c = estimate(&plan, &cat);
+        // R = 5000, cartesian = 1000*1000 = 1M, so AGM wins.
+        let ratio = c.rows / 5_000.0;
+        assert!(
+            (0.99..1.01).contains(&ratio),
+            "single-edge AGM wrong: got {}",
+            c.rows
+        );
+    }
+
+    #[test]
+    fn agm_higher_than_naive_for_dense_clique() {
+        // The closed-form check above already proves correctness; this
+        // test guards against regressions where AGM accidentally
+        // becomes less pessimistic than the old `avg_degree^(k-1) *
+        // |outer|` formula, which would let `reorder_joins` promote a
+        // multiway over a binary plan that's actually cheaper.
+        let cat = make_catalog();
+        let plan = LogicalPlan::MultiwayJoin {
+            vars: vec![person_binding("a"), person_binding("b"), person_binding("c")],
+            edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
+            ordering: vec![0, 1, 2],
+            factorize_required: true,
+        };
+        let agm = estimate(&plan, &cat).rows;
+        // The old naïve formula was outer * avg_degree^(k-1) = 1000 *
+        // 5^2 = 25000. AGM should be larger (more pessimistic) here.
+        assert!(
+            agm > 25_000.0,
+            "AGM regressed below old naïve estimate: got {}",
+            agm
+        );
     }
 }

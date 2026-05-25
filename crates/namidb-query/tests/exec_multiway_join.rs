@@ -67,21 +67,21 @@ fn triangle_plan() -> LogicalPlan {
         EdgeConstraint {
             from_idx: 0,
             to_idx: 1,
-            edge_type: "KNOWS".into(),
+            edge_types: vec!["KNOWS".into()],
             direction: RelationshipDirection::Right,
         },
         // b -[KNOWS]-> c
         EdgeConstraint {
             from_idx: 1,
             to_idx: 2,
-            edge_type: "KNOWS".into(),
+            edge_types: vec!["KNOWS".into()],
             direction: RelationshipDirection::Right,
         },
         // c -[KNOWS]-> a (closing edge)
         EdgeConstraint {
             from_idx: 2,
             to_idx: 0,
-            edge_type: "KNOWS".into(),
+            edge_types: vec!["KNOWS".into()],
             direction: RelationshipDirection::Right,
         },
     ];

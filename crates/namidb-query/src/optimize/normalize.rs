@@ -400,7 +400,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(scan("Person", "a")),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
@@ -439,7 +439,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(scan("Person", "a")),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
@@ -478,7 +478,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(scan("Person", "a")),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
@@ -508,7 +508,7 @@ mod tests {
         let plan = LogicalPlan::Expand {
             input: Box::new(inner_filter),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
@@ -583,7 +583,7 @@ mod tests {
         let expand = LogicalPlan::Expand {
             input: Box::new(scan("Person", "a")),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),

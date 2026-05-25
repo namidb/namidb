@@ -655,7 +655,7 @@ mod tests {
                 projection: None,
             }),
             source: "a".into(),
-            edge_type: Some("KNOWS".into()),
+            edge_type: Some(vec!["KNOWS".into()]),
             direction: crate::parser::RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "b".into(),
