@@ -198,6 +198,107 @@ impl<I: OrdIterator> LeapfrogIntersect<I> {
     }
 }
 
+/// Multi-way ascending union of `k` ascending `OrdIterator`s, with
+/// duplicates collapsed. Emits each distinct key that appears in at
+/// least one input, in ascending order.
+///
+/// Used by the executor when an `EdgeConstraint` or `Expand` carries
+/// type alternation `[:A|:B|...]`: the partner list per type comes
+/// out of `Snapshot::sorted_partners` already sorted, so the union
+/// across types is a k-way merge. The result feeds straight into
+/// [`LeapfrogIntersect`] when several constraints need to be
+/// intersected.
+///
+/// Implementation: small min-heap keyed by `(key, iter_index)`. Each
+/// `next()` pops the minimum, advances that iterator, pushes its
+/// new key back, then keeps popping equal keys from the heap so the
+/// caller only sees one occurrence of each value. Cost is
+/// `O(log k)` per emitted key for the heap ops plus the underlying
+/// iterators' own advance cost.
+pub struct MergeSortedUnion<I: OrdIterator> {
+    iters: Vec<I>,
+    heap: std::collections::BinaryHeap<HeapEntry>,
+    current: Option<NodeId>,
+}
+
+#[derive(PartialEq, Eq)]
+struct HeapEntry {
+    key: NodeId,
+    iter_idx: usize,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `BinaryHeap` is a max-heap. Reverse so the smallest key
+        // comes out first; break ties by iter_idx so the order is
+        // deterministic.
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.iter_idx.cmp(&self.iter_idx))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<I: OrdIterator> MergeSortedUnion<I> {
+    pub fn new(iters: Vec<I>) -> Self {
+        let mut heap = std::collections::BinaryHeap::with_capacity(iters.len());
+        for (idx, it) in iters.iter().enumerate() {
+            if let Some(k) = it.key() {
+                heap.push(HeapEntry { key: k, iter_idx: idx });
+            }
+        }
+        let current = heap.peek().map(|e| e.key);
+        Self {
+            iters,
+            heap,
+            current,
+        }
+    }
+
+    pub fn key(&self) -> Option<NodeId> {
+        self.current
+    }
+
+    pub fn next(&mut self) {
+        let target = match self.current {
+            Some(k) => k,
+            None => return,
+        };
+        // Advance every iterator whose current key equals `target` so
+        // the next emitted key is strictly greater. This is what
+        // collapses duplicates across iterators.
+        while let Some(top) = self.heap.peek() {
+            if top.key != target {
+                break;
+            }
+            let HeapEntry { iter_idx, .. } = self.heap.pop().unwrap();
+            self.iters[iter_idx].next();
+            if let Some(k) = self.iters[iter_idx].key() {
+                self.heap.push(HeapEntry { key: k, iter_idx });
+            }
+        }
+        self.current = self.heap.peek().map(|e| e.key);
+    }
+
+    /// Drain the entire union into a fresh `Vec<NodeId>`. Convenient
+    /// adapter for callers that need a `&[NodeId]` to hand back into
+    /// a `SortedSliceIter` for downstream leapfrog intersection.
+    pub fn collect(mut self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        while let Some(k) = self.key() {
+            out.push(k);
+            self.next();
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +391,166 @@ mod tests {
         let ys = vec![nid(0), nid(999)];
         let lf = LeapfrogIntersect::new(vec![SortedSliceIter::new(&xs), SortedSliceIter::new(&ys)]);
         assert_eq!(drain(lf), ys);
+    }
+
+    // ─────────────────── MergeSortedUnion ────────────────────────────────
+
+    fn drain_union<I: OrdIterator>(mut u: MergeSortedUnion<I>) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        while let Some(k) = u.key() {
+            out.push(k);
+            u.next();
+        }
+        out
+    }
+
+    #[test]
+    fn union_single_iter_passthrough() {
+        let xs = vec![nid(1), nid(3), nid(5)];
+        let u = MergeSortedUnion::new(vec![SortedSliceIter::new(&xs)]);
+        assert_eq!(drain_union(u), xs);
+    }
+
+    #[test]
+    fn union_two_disjoint_lists_interleaves_in_order() {
+        let xs = vec![nid(1), nid(3), nid(5)];
+        let ys = vec![nid(2), nid(4), nid(6)];
+        let u = MergeSortedUnion::new(vec![SortedSliceIter::new(&xs), SortedSliceIter::new(&ys)]);
+        assert_eq!(
+            drain_union(u),
+            vec![nid(1), nid(2), nid(3), nid(4), nid(5), nid(6)]
+        );
+    }
+
+    #[test]
+    fn union_collapses_duplicates_across_lists() {
+        let xs = vec![nid(1), nid(2), nid(3)];
+        let ys = vec![nid(2), nid(3), nid(4)];
+        let zs = vec![nid(3), nid(4), nid(5)];
+        let u = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&xs),
+            SortedSliceIter::new(&ys),
+            SortedSliceIter::new(&zs),
+        ]);
+        assert_eq!(
+            drain_union(u),
+            vec![nid(1), nid(2), nid(3), nid(4), nid(5)],
+            "every distinct key must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn union_all_empty_is_empty() {
+        let xs: Vec<NodeId> = Vec::new();
+        let ys: Vec<NodeId> = Vec::new();
+        let u = MergeSortedUnion::new(vec![SortedSliceIter::new(&xs), SortedSliceIter::new(&ys)]);
+        assert!(drain_union(u).is_empty());
+    }
+
+    #[test]
+    fn union_with_empty_iter_still_yields_others() {
+        let xs: Vec<NodeId> = Vec::new();
+        let ys = vec![nid(2), nid(4)];
+        let zs = vec![nid(1), nid(3)];
+        let u = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&xs),
+            SortedSliceIter::new(&ys),
+            SortedSliceIter::new(&zs),
+        ]);
+        assert_eq!(drain_union(u), vec![nid(1), nid(2), nid(3), nid(4)]);
+    }
+
+    #[test]
+    fn union_zero_iters_finishes_immediately() {
+        let u: MergeSortedUnion<SortedSliceIter<'_>> = MergeSortedUnion::new(vec![]);
+        assert!(u.key().is_none());
+        assert!(drain_union(u).is_empty());
+    }
+
+    #[test]
+    fn union_identical_lists_dedups() {
+        let xs = vec![nid(1), nid(2), nid(3)];
+        let ys = xs.clone();
+        let zs = xs.clone();
+        let u = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&xs),
+            SortedSliceIter::new(&ys),
+            SortedSliceIter::new(&zs),
+        ]);
+        assert_eq!(drain_union(u), xs);
+    }
+
+    #[test]
+    fn union_drains_long_dense_overlap() {
+        // Two overlapping ranges so the heap rotates between them and
+        // dedup logic engages on every step.
+        let xs: Vec<NodeId> = (0u64..500).map(nid).collect();
+        let ys: Vec<NodeId> = (250u64..750).map(nid).collect();
+        let expected: Vec<NodeId> = (0u64..750).map(nid).collect();
+        let u = MergeSortedUnion::new(vec![SortedSliceIter::new(&xs), SortedSliceIter::new(&ys)]);
+        assert_eq!(drain_union(u), expected);
+    }
+
+    #[test]
+    fn union_then_intersect_simulates_alternation_in_cycle() {
+        // Two "edge types" worth of partner lists per source, unioned
+        // then intersected with a third constraint. This is the exact
+        // shape MultiwayJoin uses for `[:A|:B]` edges inside a cyclic
+        // pattern.
+        let a_type1 = vec![nid(1), nid(3), nid(5), nid(7)];
+        let a_type2 = vec![nid(2), nid(3), nid(8)];
+        let b_type1 = vec![nid(3), nid(5), nid(8), nid(9)];
+
+        let a_union = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&a_type1),
+            SortedSliceIter::new(&a_type2),
+        ])
+        .collect();
+        assert_eq!(
+            a_union,
+            vec![nid(1), nid(2), nid(3), nid(5), nid(7), nid(8)]
+        );
+
+        let intersect = LeapfrogIntersect::new(vec![
+            SortedSliceIter::new(&a_union),
+            SortedSliceIter::new(&b_type1),
+        ]);
+        assert_eq!(drain(intersect), vec![nid(3), nid(5), nid(8)]);
+    }
+
+    #[test]
+    fn union_preserves_order_under_rotating_minima() {
+        // Five iterators whose minima alternate, exercising the
+        // heap-pop path more than a two-iterator test would.
+        let a = vec![nid(1), nid(6), nid(11)];
+        let b = vec![nid(2), nid(7), nid(12)];
+        let c = vec![nid(3), nid(8), nid(13)];
+        let d = vec![nid(4), nid(9), nid(14)];
+        let e = vec![nid(5), nid(10), nid(15)];
+        let u = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&a),
+            SortedSliceIter::new(&b),
+            SortedSliceIter::new(&c),
+            SortedSliceIter::new(&d),
+            SortedSliceIter::new(&e),
+        ]);
+        let expected: Vec<NodeId> = (1u64..=15).map(nid).collect();
+        assert_eq!(drain_union(u), expected);
+    }
+
+    #[test]
+    fn union_collect_matches_iterative_drain() {
+        let xs = vec![nid(1), nid(4), nid(7)];
+        let ys = vec![nid(2), nid(4), nid(6)];
+        let from_drain = drain_union(MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&xs),
+            SortedSliceIter::new(&ys),
+        ]));
+        let from_collect = MergeSortedUnion::new(vec![
+            SortedSliceIter::new(&xs),
+            SortedSliceIter::new(&ys),
+        ])
+        .collect();
+        assert_eq!(from_drain, from_collect);
     }
 }
