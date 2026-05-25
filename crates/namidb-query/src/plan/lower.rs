@@ -2409,23 +2409,17 @@ mod tests {
 
     #[test]
     fn unwind_alias_binds_in_match_with_where() {
-        let _p = lp(
-            "UNWIND ['a', 'b'] AS uid MATCH (n:Person) WHERE n.id = uid RETURN n",
-        );
+        let _p = lp("UNWIND ['a', 'b'] AS uid MATCH (n:Person) WHERE n.id = uid RETURN n");
     }
 
     #[test]
     fn unwind_alias_binds_in_match_with_id_filter() {
-        let _p = lp(
-            "UNWIND [$ids] AS uid MATCH (n:Person {_id: uid}) RETURN n",
-        );
+        let _p = lp("UNWIND [$ids] AS uid MATCH (n:Person {_id: uid}) RETURN n");
     }
 
     #[test]
     fn unwind_alias_binds_in_chained_match_expand() {
-        let _p = lp(
-            "UNWIND ['a'] AS uid MATCH (n:Person {id: uid})-[:KNOWS]->(m:Person) RETURN m",
-        );
+        let _p = lp("UNWIND ['a'] AS uid MATCH (n:Person {id: uid})-[:KNOWS]->(m:Person) RETURN m");
     }
 
     #[test]

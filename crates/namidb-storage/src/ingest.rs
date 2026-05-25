@@ -549,9 +549,7 @@ impl WriterSession {
     pub async fn maybe_flush(&mut self, max_wal_segments: usize) -> Result<bool> {
         // `0` is the sentinel for "auto-flush disabled" so the caller can
         // express that in config without a `None`-wrapping ceremony.
-        if max_wal_segments == 0
-            || self.current.manifest.wal_segments.len() < max_wal_segments
-        {
+        if max_wal_segments == 0 || self.current.manifest.wal_segments.len() < max_wal_segments {
             return Ok(false);
         }
         let schema = self.current.manifest.schema.clone();
