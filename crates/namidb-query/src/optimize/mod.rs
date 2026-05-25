@@ -29,6 +29,7 @@ use crate::plan::logical::{CreateElement, LogicalPlan, ProjectionItem};
 pub mod decorrelation;
 pub mod join_conversion;
 pub mod join_reorder;
+pub mod multiway_join;
 pub mod normalize;
 pub mod parquet_pushdown;
 pub mod projection_pushdown;
@@ -38,6 +39,7 @@ pub mod unique_lookup;
 pub use decorrelation::convert_semi_apply_to_hash_semi_join;
 pub use join_conversion::convert_cross_to_hash;
 pub use join_reorder::reorder_joins;
+pub use multiway_join::{detect_multiway_join, wcoj_enabled};
 pub use normalize::normalize_filters;
 pub use parquet_pushdown::{classify_pending_for_scan, try_into_scan_predicate};
 pub use projection_pushdown::apply_projection_pushdown;
@@ -69,10 +71,16 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // estimate of each branch (predicates + structural rewrites
         // already applied).
         let reordered = reorder_joins(decorrelated, catalog);
+        // RFC-024: detect cyclic Expand chains and fold them into a
+        // single MultiwayJoin. No-op unless NAMIDB_WCOJ=1 (and
+        // NAMIDB_FACTORIZE=1). Runs after reorder_joins so the chain
+        // it inspects is in its final shape, and before projection
+        // pushdown so the new operator sees the right column hint.
+        let multiway = detect_multiway_join(reordered);
         // RFC-015: projection pushdown runs LAST in each round so it
         // sees the final NodeScan shape (with predicates already
         // absorbed) and can compute the minimal column set.
-        let next = apply_projection_pushdown(reordered);
+        let next = apply_projection_pushdown(multiway);
         if next == current {
             return next;
         }
