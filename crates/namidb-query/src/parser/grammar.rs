@@ -103,6 +103,18 @@ impl<'src> Parser<'src> {
         self.pos >= self.tokens.len()
     }
 
+    /// `true` when the next token could legitimately start an identifier —
+    /// either a plain or backtick-quoted ident, or a reserved keyword (which
+    /// is forwarded to [`expect_identifier`] so it surfaces the dedicated
+    /// "reserved keyword" diagnostic instead of a downstream "expected `)`").
+    fn peek_is_identifier_slot(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(_)) | Some(Token::QuotedIdent(_)) => true,
+            Some(tok) => tok.is_reserved_keyword(),
+            None => false,
+        }
+    }
+
     fn expect_identifier(&mut self) -> Result<Identifier, ParseError> {
         let next = self.bump().ok_or_else(|| {
             ParseError::new(
@@ -114,6 +126,20 @@ impl<'src> Parser<'src> {
         match next.value {
             Token::Ident(name) => Ok(Identifier::new(name, next.span)),
             Token::QuotedIdent(name) => Ok(Identifier::quoted(name, next.span)),
+            other if other.is_reserved_keyword() => {
+                let label = other.label();
+                Err(ParseError::new(
+                    ErrorCode::ReservedKeyword,
+                    format!(
+                        "`{label}` is a reserved Cypher keyword and cannot be used \
+                         as an identifier here"
+                    ),
+                    next.span,
+                )
+                .with_help(format!(
+                    "quote it as `` `{label}` `` to use it as a label or variable name"
+                )))
+            }
             other => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 format!("expected identifier, found `{}`", other.label()),
@@ -756,10 +782,11 @@ impl<'src> Parser<'src> {
     fn parse_node_pattern(&mut self) -> Result<NodePattern, ParseError> {
         let lparen = self.expect(&Token::LParen)?;
         let start = lparen.span.start;
-        let binding = if matches!(
-            self.peek(),
-            Some(Token::Ident(_)) | Some(Token::QuotedIdent(_))
-        ) {
+        // Anything that *could* be the binding identifier slot is forwarded
+        // to `expect_identifier`. Reserved keywords are routed there too so
+        // they trip E003 with a quoting hint, instead of producing a generic
+        // "expected `)`" further down the line.
+        let binding = if self.peek_is_identifier_slot() {
             Some(self.expect_identifier()?)
         } else {
             None
@@ -809,10 +836,7 @@ impl<'src> Parser<'src> {
         let mut properties = None;
 
         if self.eat(&Token::LBracket).is_some() {
-            if matches!(
-                self.peek(),
-                Some(Token::Ident(_)) | Some(Token::QuotedIdent(_))
-            ) {
+            if self.peek_is_identifier_slot() {
                 binding = Some(self.expect_identifier()?);
             }
             if self.eat(&Token::Colon).is_some() {
@@ -1920,5 +1944,45 @@ mod tests {
         // RAW without EXPLAIN must NOT flip the flag. The token then
         // ends up as a clause keyword candidate, which fails the grammar.
         let _ = err_code("RAW MATCH (a) RETURN a");
+    }
+
+    // ─── reserved-keyword diagnostics (E003) ─────────────────────────────
+
+    fn first_err(src: &str) -> ParseError {
+        parse(src).expect_err("expected error").remove(0)
+    }
+
+    #[test]
+    fn reserved_keyword_as_label_reports_e003() {
+        let err = first_err("MATCH (n:MATCH) RETURN n");
+        assert_eq!(err.code, ErrorCode::ReservedKeyword);
+        assert!(
+            err.message.contains("`MATCH`") && err.message.contains("reserved"),
+            "message was: {}",
+            err.message
+        );
+        let help = err.help.as_deref().expect("expected help text");
+        assert!(help.contains('`'), "help should suggest backtick quoting");
+    }
+
+    #[test]
+    fn reserved_keyword_as_variable_reports_e003() {
+        let err = first_err("MATCH (RETURN) RETURN x");
+        assert_eq!(err.code, ErrorCode::ReservedKeyword);
+        assert!(err.message.contains("`RETURN`"));
+    }
+
+    #[test]
+    fn reserved_keyword_as_property_key_reports_e003() {
+        let err = first_err("MATCH (n {WHERE: 1}) RETURN n");
+        assert_eq!(err.code, ErrorCode::ReservedKeyword);
+    }
+
+    #[test]
+    fn backtick_quoted_reserved_keyword_is_accepted() {
+        // The error path advertises backtick quoting as the escape hatch;
+        // make sure that path actually parses.
+        let q = ok("MATCH (n:`MATCH`) RETURN n");
+        assert_eq!(q.head.clauses.len(), 2);
     }
 }
