@@ -688,6 +688,20 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
             }
             list.into_any().unbind()
         }
+        Value::Date(days) => {
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("static epoch");
+            let d = epoch + chrono::Duration::days(*days as i64);
+            d.into_py(py)
+        }
+        Value::DateTime(micros) => {
+            let secs = micros.div_euclid(1_000_000);
+            let extra_nanos = (micros.rem_euclid(1_000_000) as u32) * 1000;
+            let dt = Utc
+                .timestamp_opt(secs, extra_nanos)
+                .single()
+                .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+            dt.into_py(py)
+        }
     })
 }
 
