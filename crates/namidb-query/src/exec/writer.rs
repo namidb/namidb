@@ -330,7 +330,8 @@ fn execute_write_inner<'a>(
             | LogicalPlan::Argument { .. }
             | LogicalPlan::Expand { .. }
             | LogicalPlan::SemiApply { .. }
-            | LogicalPlan::PatternList { .. } => {
+            | LogicalPlan::PatternList { .. }
+            | LogicalPlan::MultiwayJoin { .. } => {
                 let snap = writer.snapshot();
                 execute_inner(plan, &snap, params, None).await
             }

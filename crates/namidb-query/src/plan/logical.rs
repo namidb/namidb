@@ -290,6 +290,59 @@ pub enum LogicalPlan {
         targets: Vec<Expression>,
         detach: bool,
     },
+
+    /// Worst-case optimal multiway join (RFC-024). Emitted by the
+    /// `multiway_join` optimiser pass when it detects a cyclic
+    /// constraint graph in a subtree of `Expand` / `HashJoin`
+    /// operators. The executor walks `ordering` left to right; at each
+    /// level it intersects, via leapfrog triejoin, the
+    /// `sorted_partners` lists of every `EdgeConstraint` that ties the
+    /// current variable to one already bound.
+    ///
+    /// `MultiwayJoin` is a leaf in [`Self::children`]: the operator
+    /// drives its own reads from the snapshot rather than streaming a
+    /// `FactorRowSet` through an inner plan. Inherited bindings would
+    /// flow through `factorize_required = true` plus the upstream
+    /// arena once we land non-leaf MultiwayJoin shapes; the v0 pass
+    /// only rewrites contiguous leaf subtrees.
+    MultiwayJoin {
+        vars: Vec<NodeBinding>,
+        edges: Vec<EdgeConstraint>,
+        /// Permutation over `vars`. `ordering[0]` is the variable
+        /// bound first (outer-most level of the trie); subsequent
+        /// entries are the trie descent order.
+        ordering: Vec<usize>,
+        /// Always `true` in v0; the executor refuses to run when
+        /// `NAMIDB_FACTORIZE=0` (the binary plan stays the
+        /// `Vec<Row>`-shaped fallback). Reserved for a follow-up
+        /// flat-path WCOJ.
+        factorize_required: bool,
+    },
+}
+
+/// One participating variable in a [`LogicalPlan::MultiwayJoin`]
+/// (RFC-024). Carries the alias the executor binds, the optional
+/// label that scopes its NodeScan, and any predicates harvested from
+/// `Filter` nodes the detection pass folded into the join.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeBinding {
+    pub alias: String,
+    pub label: Option<String>,
+    pub predicates: Vec<ScanPredicate>,
+}
+
+/// One edge constraint in a [`LogicalPlan::MultiwayJoin`]
+/// (RFC-024). `from_idx` and `to_idx` index into
+/// `MultiwayJoin.vars`; the executor reads
+/// `Snapshot::sorted_partners(edge_type, vars[from_idx],
+/// direction)` and intersects against the partner key it expects
+/// for `vars[to_idx]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeConstraint {
+    pub from_idx: usize,
+    pub to_idx: usize,
+    pub edge_type: String,
+    pub direction: RelationshipDirection,
 }
 
 impl LogicalPlan {
@@ -297,7 +350,10 @@ impl LogicalPlan {
     /// rewriters and EXPLAIN walkers.
     pub fn children(&self) -> Vec<&LogicalPlan> {
         match self {
-            LogicalPlan::NodeScan { .. } | LogicalPlan::Empty | LogicalPlan::Argument { .. } => {
+            LogicalPlan::NodeScan { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::Argument { .. }
+            | LogicalPlan::MultiwayJoin { .. } => {
                 vec![]
             }
             LogicalPlan::NodeById { input, .. }
@@ -409,6 +465,7 @@ impl LogicalPlan {
                     "Delete"
                 }
             }
+            LogicalPlan::MultiwayJoin { .. } => "MultiwayJoin",
         }
     }
 }

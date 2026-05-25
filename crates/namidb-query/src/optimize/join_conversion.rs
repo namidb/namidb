@@ -29,7 +29,10 @@ pub fn convert_cross_to_hash(plan: LogicalPlan, catalog: &StatsCatalog) -> Logic
 
 fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     match plan {
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::NodeScan { .. } => plan,
+        LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::NodeScan { .. }
+        | LogicalPlan::MultiwayJoin { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,
@@ -341,7 +344,7 @@ mod tests {
     use crate::parser::ast::{Identifier, Literal, PropertyAccess};
     use crate::parser::SourceSpan;
     use crate::plan::logical::ProjectionItem;
-        use namidb_storage::sst::stats::StatScalar;
+    use namidb_storage::sst::stats::StatScalar;
     use std::collections::BTreeMap;
 
     fn span() -> SourceSpan {

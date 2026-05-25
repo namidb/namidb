@@ -69,7 +69,10 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         }
 
         // Recurse on every other operator (mechanical).
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::NodeScan { .. } => plan,
+        LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::NodeScan { .. }
+        | LogicalPlan::MultiwayJoin { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

@@ -20,7 +20,10 @@ pub fn normalize_filters(plan: LogicalPlan) -> LogicalPlan {
 
 fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::NodeScan { .. } | LogicalPlan::Empty | LogicalPlan::Argument { .. } => plan,
+        LogicalPlan::NodeScan { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::MultiwayJoin { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

@@ -300,7 +300,10 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
 
 fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     match plan {
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::NodeScan { .. } => plan,
+        LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::NodeScan { .. }
+        | LogicalPlan::MultiwayJoin { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

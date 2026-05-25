@@ -334,6 +334,11 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         LogicalPlan::Set { input, .. }
         | LogicalPlan::Remove { input, .. }
         | LogicalPlan::Delete { input, .. } => collect_produced(input, out),
+        LogicalPlan::MultiwayJoin { vars, .. } => {
+            for v in vars {
+                out.insert(v.alias.clone());
+            }
+        }
     }
 }
 

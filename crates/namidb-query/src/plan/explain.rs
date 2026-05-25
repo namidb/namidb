@@ -477,6 +477,40 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
             }
             out.push(']');
         }
+        LogicalPlan::MultiwayJoin {
+            vars,
+            edges,
+            ordering,
+            ..
+        } => {
+            out.push_str("MultiwayJoin vars=[");
+            for (i, idx) in ordering.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let v = &vars[*idx];
+                if let Some(label) = &v.label {
+                    let _ = write!(out, "{}:{}", v.alias, label);
+                } else {
+                    let _ = write!(out, "{}", v.alias);
+                }
+            }
+            out.push_str("] edges=[");
+            for (i, e) in edges.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(
+                    out,
+                    "{}-[:{}]{}-{}",
+                    vars[e.from_idx].alias,
+                    e.edge_type,
+                    direction_label(e.direction),
+                    vars[e.to_idx].alias
+                );
+            }
+            out.push(']');
+        }
     }
 }
 

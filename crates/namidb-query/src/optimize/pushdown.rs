@@ -24,7 +24,15 @@ pub fn predicate_pushdown(plan: LogicalPlan) -> LogicalPlan {
 fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
     match plan {
         // ─── leaves: materialise pending above and stop ───────────────
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } => apply_filters(plan, pending),
+        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::MultiwayJoin { .. } => {
+            // The detection pass folds predicates over participating
+            // variables into `NodeBinding.predicates` before emitting,
+            // so by the time this pass reaches a MultiwayJoin there
+            // should be nothing left to push. Anything that does
+            // arrive (e.g. a Filter that references a variable bound
+            // by the multiway join) stays above as a regular Filter.
+            apply_filters(plan, pending)
+        }
 
         // ─── NodeScan: try Parquet-pushdown each pending conjunct ─────
         LogicalPlan::NodeScan {

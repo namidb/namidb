@@ -212,6 +212,18 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             collect_from_plan(subplan, req);
         }
         LogicalPlan::Argument { .. } | LogicalPlan::Empty => {}
+        LogicalPlan::MultiwayJoin { vars, .. } => {
+            // The executor reads `id` for every variable to drive the
+            // leapfrog trie. Predicates on those variables are folded
+            // into `NodeBinding.predicates` by the detection pass so
+            // they already mark their own columns.
+            for v in vars {
+                req.record_property(&v.alias, "id");
+                for p in &v.predicates {
+                    req.record_property(&v.alias, p.column());
+                }
+            }
+        }
         // Writes: every binding visible to a write may be materialised
         // by the writer. Mark them All defensively. v0 doesn't push
         // projection through writes; we just collect from subtree.
@@ -651,7 +663,9 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             projection,
             alias,
         },
-        LogicalPlan::Argument { .. } | LogicalPlan::Empty => plan,
+        LogicalPlan::Argument { .. } | LogicalPlan::Empty | LogicalPlan::MultiwayJoin { .. } => {
+            plan
+        }
         LogicalPlan::Create { input, elements } => LogicalPlan::Create {
             input: Box::new(rewrite(*input, req)),
             elements,
@@ -700,7 +714,7 @@ mod tests {
     use crate::parser::ast::{BinaryOp, Identifier, Literal, PropertyAccess};
     use crate::parser::SourceSpan;
     use crate::plan::logical::ProjectionItem;
-    
+
     fn span() -> SourceSpan {
         SourceSpan::point(0)
     }

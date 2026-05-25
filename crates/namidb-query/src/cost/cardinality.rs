@@ -551,6 +551,46 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
+        LogicalPlan::MultiwayJoin { vars, edges, .. } => {
+            // Naïve worst-case approximation: `avg_degree^(k-1) * |outer|`
+            // where `k = vars.len()` and `avg_degree` averages the
+            // branch factor of every participating edge type. An
+            // AGM-tight estimate via fractional edge cover LP is
+            // future work (RFC-024 §"Cost model"). The pessimism is
+            // intentional so `reorder_joins` does not promote a
+            // multiway join when the binary plan happens to be
+            // cheaper on a non-cyclic shape.
+            let k = vars.len().max(1) as i32;
+            let avg_degree = if edges.is_empty() {
+                1.0
+            } else {
+                edges
+                    .iter()
+                    .map(|e| branch_factor(catalog, Some(&e.edge_type), e.direction))
+                    .sum::<f64>()
+                    / edges.len() as f64
+            };
+            // Anchor on the outer variable's label count so we don't
+            // over-estimate against fully empty graphs.
+            let outer = vars
+                .first()
+                .and_then(|v| v.label.as_deref())
+                .and_then(|l| catalog.label(l))
+                .map(|s| s.node_count as f64)
+                .unwrap_or(1.0);
+            let rows = (outer * avg_degree.powi(k - 1)).max(1.0);
+            let mut bindings = BTreeMap::new();
+            for v in vars {
+                bindings.insert(
+                    v.alias.clone(),
+                    BindingMeta {
+                        label: v.label.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+            leaf(plan, rows, bindings)
+        }
     }
 }
 

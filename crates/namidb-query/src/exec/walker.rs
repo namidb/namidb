@@ -15,14 +15,18 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use namidb_core::id::NodeId;
-use namidb_storage::{EdgeView, Snapshot};
+use namidb_storage::sst::predicates::eval_against_value;
+use namidb_storage::{EdgeDirection, EdgeView, Snapshot};
 
 use super::expr::{evaluate, order_for_sort, EvalError, Params};
-use super::factor::{factorize_enabled, FactorRowSet, Slot};
+use super::factor::{factorize_enabled, FactorArena, FactorIdx, FactorRowSet, Slot};
+use super::leapfrog::{LeapfrogIntersect, SortedSliceIter};
 use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
 use crate::parser::{Expression, RelationshipDirection, SourceSpan};
-use crate::plan::logical::{AggregateExpr, LogicalPlan, OrderKey, ProjectionItem};
+use crate::plan::logical::{
+    AggregateExpr, EdgeConstraint, LogicalPlan, NodeBinding, OrderKey, ProjectionItem,
+};
 
 /// Top-level error produced by the executor. Wraps `EvalError`,
 /// storage errors and structural runtime mismatches.
@@ -172,6 +176,12 @@ pub(crate) fn execute_inner_with_routing<'a>(
             | LogicalPlan::Remove { .. }
             | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
                 "write operators require execute_write(plan, &mut WriterSession, params)"
+                    .to_string(),
+            )),
+
+            LogicalPlan::MultiwayJoin { .. } => Err(ExecError::Runtime(
+                "MultiwayJoin requires the factorised executor; \
+                 set NAMIDB_FACTORIZE=1 (RFC-024)"
                     .to_string(),
             )),
 
@@ -1980,6 +1990,27 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 "write operators require execute_write(plan, &mut WriterSession, params)"
                     .to_string(),
             )),
+
+            LogicalPlan::MultiwayJoin {
+                vars,
+                edges,
+                ordering,
+                factorize_required,
+            } => {
+                if !*factorize_required {
+                    return Err(ExecError::Runtime(
+                        "MultiwayJoin v0 requires factorize_required=true".to_string(),
+                    ));
+                }
+                if outer.is_some() {
+                    return Err(ExecError::Runtime(
+                        "MultiwayJoin v0 cannot run under a correlated subplan; \
+                         detection pass should skip subtrees referenced from Argument"
+                            .to_string(),
+                    ));
+                }
+                execute_multiway_join_factor(vars, edges, ordering, snapshot).await
+            }
         }
     }
     .boxed()
@@ -2214,6 +2245,223 @@ async fn execute_expand_factor(
         arena,
         leaves: out_leaves,
     })
+}
+
+// Worst-case optimal multiway join (RFC-024).
+//
+// Walks `ordering` left to right. At each level, builds the candidate
+// list for the current variable by:
+//
+// - level 0: scan_label over the outer variable's label, with predicates
+//   pushed down to storage.
+// - level >0: leapfrog-intersect the `sorted_partners` lists of every
+//   already-bound variable connected to this one by an `EdgeConstraint`.
+//   Each surviving id is dereferenced via `lookup_node` so we can apply
+//   the label filter and the in-binding predicates before recursing.
+//
+// At the bottom of the descent the executor pushes a single FactorNode
+// under the arena root carrying one Slot per variable. No Row clones
+// in the inner loop — only the final emit allocates.
+fn execute_multiway_join_factor<'a>(
+    vars: &'a [NodeBinding],
+    edges: &'a [EdgeConstraint],
+    ordering: &'a [usize],
+    snapshot: &'a Snapshot<'_>,
+) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
+    async move {
+        namidb_core::profile_scope!("walker::execute_multiway_join_factor");
+        if vars.is_empty() {
+            return Ok(FactorRowSet::singleton_root());
+        }
+        if ordering.len() != vars.len() {
+            return Err(ExecError::Runtime(format!(
+                "MultiwayJoin: ordering length {} does not match vars length {}",
+                ordering.len(),
+                vars.len(),
+            )));
+        }
+        let mut state = MultiwayState {
+            arena: FactorArena::new(),
+            leaves: Vec::new(),
+            bound: vec![None; vars.len()],
+            materialised: vec![None; vars.len()],
+        };
+        descend_multiway(&mut state, 0, vars, edges, ordering, snapshot).await?;
+        Ok(FactorRowSet {
+            arena: state.arena,
+            leaves: state.leaves,
+        })
+    }
+    .boxed()
+}
+
+struct MultiwayState {
+    arena: FactorArena,
+    leaves: Vec<FactorIdx>,
+    bound: Vec<Option<NodeId>>,
+    materialised: Vec<Option<NodeValue>>,
+}
+
+fn descend_multiway<'a>(
+    state: &'a mut MultiwayState,
+    level: usize,
+    vars: &'a [NodeBinding],
+    edges: &'a [EdgeConstraint],
+    ordering: &'a [usize],
+    snapshot: &'a Snapshot<'_>,
+) -> BoxFuture<'a, Result<(), ExecError>> {
+    async move {
+        if level == ordering.len() {
+            // All variables bound — emit one leaf carrying every binding.
+            let root = state.arena.root();
+            let mut slots: Vec<Slot> = Vec::with_capacity(vars.len());
+            for (i, v) in vars.iter().enumerate() {
+                let value = state
+                    .materialised
+                    .get(i)
+                    .and_then(|m| m.clone())
+                    .ok_or_else(|| {
+                        ExecError::Runtime(format!(
+                            "MultiwayJoin: variable `{}` not materialised at leaf level",
+                            v.alias
+                        ))
+                    })?;
+                slots.push(Slot::new(
+                    Arc::<str>::from(v.alias.as_str()),
+                    RuntimeValue::Node(Box::new(value)),
+                ));
+            }
+            let leaf = state.arena.push(root, slots);
+            state.leaves.push(leaf);
+            return Ok(());
+        }
+
+        let var_idx = ordering[level];
+        let var = &vars[var_idx];
+
+        // Gather the (bound_partner, storage_direction, edge_type) tuples
+        // that constrain this variable to the prefix bound so far.
+        let mut sources: Vec<(NodeId, EdgeDirection, &str)> = Vec::new();
+        for e in edges {
+            let (bound_idx, bound_is_from) =
+                if e.from_idx == var_idx && state.bound[e.to_idx].is_some() {
+                    (e.to_idx, false)
+                } else if e.to_idx == var_idx && state.bound[e.from_idx].is_some() {
+                    (e.from_idx, true)
+                } else {
+                    continue;
+                };
+            let dir = relationship_to_edge_direction(e.direction, bound_is_from)?;
+            sources.push((state.bound[bound_idx].unwrap(), dir, e.edge_type.as_str()));
+        }
+
+        if sources.is_empty() {
+            // Level 0: outer scan. Pushes the label predicate to storage.
+            if level != 0 {
+                return Err(ExecError::Runtime(format!(
+                    "MultiwayJoin: variable `{}` at level {} has no edge to a prior variable; \
+                     planner emitted an unconnected ordering",
+                    var.alias, level
+                )));
+            }
+            let label = var.label.as_deref().ok_or_else(|| {
+                ExecError::Runtime(format!(
+                    "MultiwayJoin v0: outer variable `{}` requires a label",
+                    var.alias
+                ))
+            })?;
+            let nodes = snapshot
+                .scan_label_with_predicates_and_projection(label, &var.predicates, None)
+                .await?;
+            for view in nodes {
+                let id = view.id;
+                state.bound[var_idx] = Some(id);
+                state.materialised[var_idx] = Some(NodeValue::from(view));
+                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+            }
+        } else {
+            // Inner level: leapfrog over the partner lists of every edge
+            // that ties this variable to an already-bound one.
+            let mut lists: Vec<Vec<NodeId>> = Vec::with_capacity(sources.len());
+            for (src, dir, edge_type) in &sources {
+                lists.push(snapshot.sorted_partners(edge_type, *src, *dir).await?);
+            }
+            let iters: Vec<SortedSliceIter<'_>> = lists
+                .iter()
+                .map(|l| SortedSliceIter::new(l.as_slice()))
+                .collect();
+            let mut lf = LeapfrogIntersect::new(iters);
+            // Drain into a Vec up front so the borrow of `lists` ends
+            // before the per-candidate await below moves us back to the
+            // executor and would otherwise hold the slice across an await.
+            let mut candidates: Vec<NodeId> = Vec::new();
+            while let Some(k) = lf.key() {
+                candidates.push(k);
+                lf.next();
+            }
+            drop(lf);
+            drop(lists);
+
+            for cand_id in candidates {
+                let view_opt = if let Some(label) = &var.label {
+                    snapshot.lookup_node(label, cand_id).await?
+                } else {
+                    scan_node_for_id(snapshot, cand_id).await?
+                };
+                let view = match view_opt {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if !var.predicates.is_empty() {
+                    let matches = var.predicates.iter().all(|p| {
+                        let val = view.properties.get(p.column());
+                        eval_against_value(p, val)
+                    });
+                    if !matches {
+                        continue;
+                    }
+                }
+                state.bound[var_idx] = Some(cand_id);
+                state.materialised[var_idx] = Some(NodeValue::from(view));
+                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+            }
+        }
+
+        state.bound[var_idx] = None;
+        state.materialised[var_idx] = None;
+        Ok(())
+    }
+    .boxed()
+}
+
+/// Translate the Cypher-side `RelationshipDirection` carried by an
+/// `EdgeConstraint` into the storage-side `EdgeDirection` that
+/// `Snapshot::sorted_partners` expects.
+///
+/// `bound_is_from = true` means the variable already bound at this
+/// step matches the constraint's `from_idx`; the partner we want is
+/// at `to_idx`. The conversion table:
+///
+/// | constraint dir | bound = from | bound = to |
+/// |:-:|:-:|:-:|
+/// | `Right` (`from -> to`) | `Forward` | `Inverse` |
+/// | `Left`  (`from <- to`) | `Inverse` | `Forward` |
+/// | `Both`                 | error in v0 |
+fn relationship_to_edge_direction(
+    dir: RelationshipDirection,
+    bound_is_from: bool,
+) -> Result<EdgeDirection, ExecError> {
+    match (dir, bound_is_from) {
+        (RelationshipDirection::Right, true) => Ok(EdgeDirection::Forward),
+        (RelationshipDirection::Right, false) => Ok(EdgeDirection::Inverse),
+        (RelationshipDirection::Left, true) => Ok(EdgeDirection::Inverse),
+        (RelationshipDirection::Left, false) => Ok(EdgeDirection::Forward),
+        (RelationshipDirection::Both, _) => Err(ExecError::Runtime(
+            "MultiwayJoin v0: undirected edges (`-[]-`) are not supported; \
+             cycle detection pass should canonicalise to Right or Left"
+                .to_string(),
+        )),
+    }
 }
 
 // Cross product of two factorised sets. RFC-017 §3.2.2.
@@ -2744,7 +2992,8 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         | LogicalPlan::SemiApply { .. }
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::Empty
-        | LogicalPlan::Argument { .. } => {}
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::MultiwayJoin { .. } => {}
     }
 
     for child in plan.children() {

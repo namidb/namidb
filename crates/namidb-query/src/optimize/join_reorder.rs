@@ -66,7 +66,10 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         }
 
         // ─── Recurse on every other operator ──────────────────────────
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::NodeScan { .. } => plan,
+        LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::NodeScan { .. }
+        | LogicalPlan::MultiwayJoin { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,
@@ -244,7 +247,7 @@ mod tests {
     use crate::cost::stats::StatsCatalog;
     use crate::parser::ast::{Expression, ExpressionKind, Identifier, PropertyAccess};
     use crate::parser::SourceSpan;
-    
+
     fn span() -> SourceSpan {
         SourceSpan::point(0)
     }
