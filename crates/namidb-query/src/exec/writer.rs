@@ -779,55 +779,45 @@ async fn find_merge_matches(
     // N-hop chain: seed matched rows from the first rel's source node,
     // then extend through each rel in insertion order. `rels` is already
     // in chain order (see `lower_create_pattern_element`).
+    //
+    // Each pattern node can be either:
+    //   * a fresh local Node (entry in `nodes` with label + property
+    //     spec) — scan its label, filter by props, bind on the row;
+    //   * a back-reference to an alias already bound on the outer row
+    //     (e.g. `MATCH (a), (b) MERGE (a)-[:R]->(b)`) — no scan, just
+    //     keep the carried-in NodeValue.
+    let snap = writer.snapshot();
     let first_head_alias = match rels[0] {
         CreateElement::Rel { source_alias, .. } => source_alias.as_str(),
         _ => unreachable!("rels only contains Rel variants"),
     };
-    let (first_head_label, first_head_props) = *nodes.get(first_head_alias).ok_or_else(|| {
-        ExecError::Runtime(format!("MERGE head `{}` not found", first_head_alias))
-    })?;
-
-    let snap = writer.snapshot();
-    let candidates = snap
-        .scan_label(first_head_label)
-        .await
-        .map_err(ExecError::Storage)?;
-
-    let mut matched_rows: Vec<Row> = Vec::new();
-    for view in candidates {
-        let node_val = NodeValue::from(view);
-        if !merge_props_match(first_head_props, &node_val.properties, outer_row, params)? {
-            continue;
-        }
-        let mut new_row = outer_row.clone();
-        new_row.set(
-            first_head_alias.to_string(),
-            RuntimeValue::Node(Box::new(node_val)),
-        );
-        matched_rows.push(new_row);
-    }
+    let mut matched_rows: Vec<Row> =
+        seed_merge_head(first_head_alias, &nodes, outer_row, &snap, params).await?;
 
     for rel in &rels {
-        let (rel_edge_type, rel_direction, rel_props, source_alias, target_alias) = match rel {
-            CreateElement::Rel {
-                edge_type,
-                direction,
-                properties,
-                source_alias,
-                target_alias,
-                ..
-            } => (
-                edge_type.as_str(),
-                *direction,
-                properties.as_slice(),
-                source_alias.as_str(),
-                target_alias.as_str(),
-            ),
-            _ => unreachable!("rels only contains Rel variants"),
-        };
-        let (tail_label, tail_props) = *nodes.get(target_alias).ok_or_else(|| {
-            ExecError::Runtime(format!("MERGE tail `{}` not found", target_alias))
-        })?;
+        let (rel_alias, rel_edge_type, rel_direction, rel_props, source_alias, target_alias) =
+            match rel {
+                CreateElement::Rel {
+                    alias,
+                    edge_type,
+                    direction,
+                    properties,
+                    source_alias,
+                    target_alias,
+                    ..
+                } => (
+                    alias.as_deref(),
+                    edge_type.as_str(),
+                    *direction,
+                    properties.as_slice(),
+                    source_alias.as_str(),
+                    target_alias.as_str(),
+                ),
+                _ => unreachable!("rels only contains Rel variants"),
+            };
+        // Resolve the tail: either a fresh pattern Node or a
+        // back-reference to a binding on the outer row.
+        let tail = MergeTail::resolve(target_alias, &nodes, outer_row)?;
 
         let mut next: Vec<Row> = Vec::new();
         for source_row in matched_rows {
@@ -852,17 +842,29 @@ async fn find_merge_matches(
                     RelationshipDirection::Left => e.src,
                     _ => unreachable!(),
                 };
-                let partner = match snap
-                    .lookup_node(tail_label, partner_id)
-                    .await
-                    .map_err(ExecError::Storage)?
-                {
-                    Some(v) => NodeValue::from(v),
-                    None => continue,
+                let partner_node = match &tail {
+                    MergeTail::Fresh { label, props } => {
+                        let view = match snap
+                            .lookup_node(label, partner_id)
+                            .await
+                            .map_err(ExecError::Storage)?
+                        {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let partner = NodeValue::from(view);
+                        if !merge_props_match(props, &partner.properties, &source_row, params)? {
+                            continue;
+                        }
+                        partner
+                    }
+                    MergeTail::BackReference { node_id, value } => {
+                        if partner_id != *node_id {
+                            continue;
+                        }
+                        (**value).clone()
+                    }
                 };
-                if !merge_props_match(tail_props, &partner.properties, &source_row, params)? {
-                    continue;
-                }
                 let rel_value = RelValue::from(e);
                 if !merge_props_match(rel_props, &rel_value.properties, &source_row, params)? {
                     continue;
@@ -870,14 +872,97 @@ async fn find_merge_matches(
                 let mut new_row = source_row.clone();
                 new_row.set(
                     target_alias.to_string(),
-                    RuntimeValue::Node(Box::new(partner)),
+                    RuntimeValue::Node(Box::new(partner_node)),
                 );
+                if let Some(name) = rel_alias {
+                    new_row.set(name.to_string(), RuntimeValue::Rel(Box::new(rel_value)));
+                }
                 next.push(new_row);
             }
         }
         matched_rows = next;
     }
     Ok(matched_rows)
+}
+
+/// `alias -> (label, declared property entries)` map built once per
+/// MERGE call from the lowered `CreateElement::Node`s. Lives only as
+/// long as `find_merge_matches` borrows the lowered pattern.
+type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a str, &'a [(String, Expression)])>;
+
+/// Seed `find_merge_matches` for an N-hop chain. The "head" alias is
+/// the source of the first rel. If the pattern declares it as a fresh
+/// Node we scan its label; if the caller already bound it on the outer
+/// row (back-reference) we lift that NodeValue verbatim.
+async fn seed_merge_head(
+    head_alias: &str,
+    nodes: &MergeNodeMap<'_>,
+    outer_row: &Row,
+    snap: &namidb_storage::Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    if let Some((head_label, head_props)) = nodes.get(head_alias).copied() {
+        let candidates = snap
+            .scan_label(head_label)
+            .await
+            .map_err(ExecError::Storage)?;
+        let mut out = Vec::new();
+        for view in candidates {
+            let node_val = NodeValue::from(view);
+            if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
+                continue;
+            }
+            let mut new_row = outer_row.clone();
+            new_row.set(
+                head_alias.to_string(),
+                RuntimeValue::Node(Box::new(node_val)),
+            );
+            out.push(new_row);
+        }
+        return Ok(out);
+    }
+    if let Some(RuntimeValue::Node(_)) = outer_row.get(head_alias) {
+        // Back-reference: one match per outer row, carrying the
+        // existing binding through unchanged.
+        return Ok(vec![outer_row.clone()]);
+    }
+    Err(ExecError::Runtime(format!(
+        "MERGE head `{}` not found in pattern or outer scope",
+        head_alias
+    )))
+}
+
+/// Tail-side classification for one rel inside an N-hop MERGE chain:
+/// either a fresh local Node (scan label + match props) or a
+/// back-reference to a NodeValue already bound on the outer row (the
+/// rel must point at exactly that id).
+enum MergeTail<'a> {
+    Fresh {
+        label: &'a str,
+        props: &'a [(String, Expression)],
+    },
+    BackReference {
+        node_id: NodeId,
+        value: Box<NodeValue>,
+    },
+}
+
+impl<'a> MergeTail<'a> {
+    fn resolve(alias: &str, nodes: &MergeNodeMap<'a>, outer_row: &Row) -> Result<Self, ExecError> {
+        if let Some((label, props)) = nodes.get(alias).copied() {
+            return Ok(MergeTail::Fresh { label, props });
+        }
+        if let Some(RuntimeValue::Node(n)) = outer_row.get(alias) {
+            return Ok(MergeTail::BackReference {
+                node_id: n.id,
+                value: n.clone(),
+            });
+        }
+        Err(ExecError::Runtime(format!(
+            "MERGE tail `{}` not found in pattern or outer scope",
+            alias
+        )))
+    }
 }
 
 fn merge_props_match(
