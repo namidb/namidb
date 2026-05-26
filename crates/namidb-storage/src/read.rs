@@ -106,6 +106,23 @@ pub struct EdgeListView {
     pub edges: Vec<EdgeView>,
 }
 
+/// Endpoint labels for an edge type, surfaced by
+/// [`Snapshot::observed_edge_endpoints`]. For edge types that were
+/// declared through `SchemaBuilder` the labels come straight from the
+/// manifest and `inferred` is `false`. For edge types that only exist
+/// because some `CREATE` ran without a prior declaration, the labels
+/// are derived from a sample of the actual edges in the snapshot and
+/// `inferred` is `true`. Either label can still be `None` if no
+/// matching sample edge could be resolved (a tombstoned-only edge type
+/// or a corrupt state — should not happen in practice).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeEndpoint {
+    pub edge_type: String,
+    pub src_label: Option<String>,
+    pub dst_label: Option<String>,
+    pub inferred: bool,
+}
+
 /// Pinned read view of a namespace.
 pub struct Snapshot<'mt> {
     manifest: LoadedManifest,
@@ -508,6 +525,107 @@ impl<'mt> Snapshot<'mt> {
             }
         }
         set.into_iter().collect()
+    }
+
+    /// Endpoint labels for every observable edge type.
+    ///
+    /// Declared edge types (`SchemaBuilder::edge_type(name, src, dst)`)
+    /// come back verbatim from the manifest schema with `inferred = false`.
+    /// Edge types that were only ever created by raw Cypher (no
+    /// `SchemaBuilder`) are missing endpoints in the declared schema;
+    /// for those, sample one live edge from the memtable, resolve its
+    /// endpoint labels, and return them with `inferred = true`.
+    ///
+    /// Sampling is best-effort and cheap: we walk the memtable once to
+    /// build a `NodeId → label` map for memtable-resident nodes, then
+    /// pick the first edge per type and read its endpoints. If the
+    /// sample's endpoints live in SSTs, we fan out one `lookup_node`
+    /// per known label until one resolves. Schema reads are infrequent
+    /// enough that the linear fallback is acceptable.
+    pub async fn observed_edge_endpoints(&self) -> Result<Vec<EdgeEndpoint>> {
+        use std::collections::BTreeMap;
+        let declared = &self.manifest.manifest.schema.edge_types;
+
+        // Build a memtable NodeId → label map once. Cheap (a few
+        // BTreeMap insertions per node) and lets the common case
+        // (newly-created edges live alongside their newly-created
+        // nodes) skip the SST lookup entirely.
+        let mut mem_node_label: BTreeMap<NodeId, String> = BTreeMap::new();
+        for (key, entry) in self.memtable.iter() {
+            if let MemKey::Node { label, id } = key {
+                if matches!(entry.op, MemOp::Upsert(_)) {
+                    mem_node_label.insert(*id, label.clone());
+                }
+            }
+        }
+
+        // Pick one sample edge per observed type, preferring memtable
+        // edges so we can resolve endpoints synchronously through the
+        // map above.
+        let observed = self.observed_edge_types();
+        let mut samples: BTreeMap<String, (NodeId, NodeId)> = BTreeMap::new();
+        for (key, entry) in self.memtable.iter() {
+            if let MemKey::Edge {
+                edge_type,
+                src,
+                dst,
+            } = key
+            {
+                if !matches!(entry.op, MemOp::Upsert(_)) {
+                    continue;
+                }
+                if !declared.contains_key(edge_type) && !samples.contains_key(edge_type) {
+                    samples.insert(edge_type.clone(), (*src, *dst));
+                }
+            }
+        }
+
+        let mut out: Vec<EdgeEndpoint> = Vec::with_capacity(observed.len());
+        for edge_type in observed {
+            if let Some(def) = declared.get(&edge_type) {
+                out.push(EdgeEndpoint {
+                    edge_type,
+                    src_label: Some(def.src_label.clone()),
+                    dst_label: Some(def.dst_label.clone()),
+                    inferred: false,
+                });
+                continue;
+            }
+            let (src_label, dst_label) = match samples.get(&edge_type) {
+                Some((src, dst)) => (
+                    self.find_node_label(*src, &mem_node_label).await?,
+                    self.find_node_label(*dst, &mem_node_label).await?,
+                ),
+                None => (None, None),
+            };
+            out.push(EdgeEndpoint {
+                edge_type,
+                src_label,
+                dst_label,
+                inferred: true,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Resolve the label of `id` by checking the memtable map first,
+    /// then probing each observed label's SSTs in turn. Used only by
+    /// [`Self::observed_edge_endpoints`] to enrich undeclared edge
+    /// types, so a linear scan over labels is acceptable.
+    async fn find_node_label(
+        &self,
+        id: NodeId,
+        mem_node_label: &std::collections::BTreeMap<NodeId, String>,
+    ) -> Result<Option<String>> {
+        if let Some(label) = mem_node_label.get(&id) {
+            return Ok(Some(label.clone()));
+        }
+        for label in self.observed_labels() {
+            if self.lookup_node(&label, id).await?.is_some() {
+                return Ok(Some(label));
+            }
+        }
+        Ok(None)
     }
 
     /// Every node label observable through this snapshot — declared in the
@@ -3536,5 +3654,112 @@ mod tests {
             view.properties.get("name"),
             Some(&Value::Str("Alice".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn observed_edge_endpoints_returns_declared_pairs_first() {
+        let store = make_store();
+        let paths = make_paths("schema-endpoints-declared");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Bake a declared schema into the manifest directly so the
+        // snapshot sees it without going through a writer commit.
+        base.manifest.schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+        let mt = Memtable::new();
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &view, store, paths);
+
+        let endpoints = snap.observed_edge_endpoints().await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        let ep = &endpoints[0];
+        assert_eq!(ep.edge_type, "KNOWS");
+        assert_eq!(ep.src_label.as_deref(), Some("Person"));
+        assert_eq!(ep.dst_label.as_deref(), Some("Person"));
+        assert!(!ep.inferred);
+    }
+
+    #[tokio::test]
+    async fn observed_edge_endpoints_infers_when_schema_is_empty() {
+        let store = make_store();
+        let paths = make_paths("schema-endpoints-inferred");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
+        // Two nodes with distinct labels, one edge that ties them
+        // together, no `SchemaBuilder` ever ran.
+        let person = sorted_node_id(1);
+        let company = sorted_node_id(2);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id: person,
+            },
+            1,
+            MemOp::Upsert(node_payload("Alice", None)),
+        );
+        mt.apply(
+            MemKey::Node {
+                label: "Company".into(),
+                id: company,
+            },
+            2,
+            MemOp::Upsert(node_payload("Acme", None)),
+        );
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "WORKS_AT".into(),
+                src: person,
+                dst: company,
+            },
+            3,
+            MemOp::Upsert(edge_payload()),
+        );
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &view, store, paths);
+
+        let endpoints = snap.observed_edge_endpoints().await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        let ep = &endpoints[0];
+        assert_eq!(ep.edge_type, "WORKS_AT");
+        assert_eq!(ep.src_label.as_deref(), Some("Person"));
+        assert_eq!(ep.dst_label.as_deref(), Some("Company"));
+        assert!(ep.inferred);
+    }
+
+    #[tokio::test]
+    async fn observed_edge_endpoints_handles_orphan_edge_type() {
+        // Edge type observed (tombstone-only memtable entries — no
+        // upsert ever present in this snapshot). Should surface with
+        // None / None rather than panic or skip.
+        let store = make_store();
+        let paths = make_paths("schema-endpoints-orphan");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "GHOST".into(),
+                src: sorted_node_id(10),
+                dst: sorted_node_id(11),
+            },
+            1,
+            MemOp::Tombstone,
+        );
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &view, store, paths);
+
+        let endpoints = snap.observed_edge_endpoints().await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        let ep = &endpoints[0];
+        assert_eq!(ep.edge_type, "GHOST");
+        assert!(ep.src_label.is_none());
+        assert!(ep.dst_label.is_none());
+        assert!(ep.inferred);
     }
 }
