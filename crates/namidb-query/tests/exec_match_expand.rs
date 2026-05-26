@@ -770,3 +770,43 @@ async fn var_length_expand_without_rel_type_crosses_heterogeneous_types() {
         .collect();
     assert_eq!(reached, vec!["Bob".to_string(), "Carol".to_string()]);
 }
+
+#[tokio::test]
+async fn match_anonymous_endpoints_resolves_without_declared_schema() {
+    // B1 / B7 regression: `MATCH ()-[r:T]->()` and `MATCH (a)-[r]->(b)`
+    // used to fall through `scan_node_for_id`, which iterated only
+    // declared labels. Namespaces that never ran `SchemaBuilder` ended
+    // up with an empty label list there, so every neighbour was dropped
+    // and queries returned zero rows. `observed_labels` covers both the
+    // declared schema and labels written into memtable / SSTs.
+    let mut writer = WriterSession::open(store(), paths("exec-anon-endpoints"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    writer
+        .upsert_node("Person", bob, &person("Bob", 25))
+        .unwrap();
+    writer.upsert_edge("KNOWS", alice, bob, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    // Note: no SchemaBuilder. `manifest.schema.labels` stays empty.
+
+    let snapshot = writer.snapshot();
+
+    // Anonymous endpoints with an explicit edge type.
+    let q = parse("MATCH ()-[r:KNOWS]->() RETURN count(r) AS n").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n"), Some(&RuntimeValue::Integer(1)));
+
+    // Fully anonymous expand: no labels, no edge type.
+    let q = parse("MATCH (a)-[r]->(b) RETURN count(r) AS n").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("n"), Some(&RuntimeValue::Integer(1)));
+}
