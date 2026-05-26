@@ -128,6 +128,15 @@ impl From<CoreValue> for RuntimeValue {
             CoreValue::Vec(v) => RuntimeValue::Vector(v),
             CoreValue::Date(d) => RuntimeValue::Date(d),
             CoreValue::DateTime(m) => RuntimeValue::DateTime(m),
+            CoreValue::List(items) => {
+                RuntimeValue::List(items.into_iter().map(RuntimeValue::from).collect())
+            }
+            CoreValue::Map(entries) => RuntimeValue::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, RuntimeValue::from(v)))
+                    .collect(),
+            ),
         }
     }
 }

@@ -577,24 +577,109 @@ async fn merge_multi_hop_creates_then_matches_idempotently() {
 }
 
 #[tokio::test]
-async fn bare_list_literal_still_rejected_without_vector_wrapper() {
-    // Regression guard: `vector()` is the *only* way to persist a
-    // numeric collection. A bare `[…]` literal must keep failing so
-    // users do not silently get a List stored as something else.
+async fn bare_list_literal_now_persists_as_list() {
+    // Previously bare `[v, ...]` literals failed with
+    // "only scalars are storable in v0" because the writer rejected
+    // `RuntimeValue::List`. With Value::List landing in core and
+    // round-tripping through __overflow_json, bare lists now persist
+    // and re-decode as the same shape.
     let mut writer = WriterSession::open(store(), paths("w-bare-list"))
         .await
         .unwrap();
-    let q = parse("CREATE (d:Doc {emb: [0.1, 0.2, 0.3]}) RETURN d").unwrap();
+    let q = parse("CREATE (d:Doc {emb: [0.1, 0.2, 0.3]}) RETURN d.emb AS emb").unwrap();
     let plan = lower(&q).unwrap();
-    let err = execute_write(&plan, &mut writer, &Params::new())
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
         .await
-        .expect_err("bare list literal must not be storable in v0");
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("only scalars are storable"),
-        "unexpected error: {}",
-        msg
-    );
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    match outcome.rows[0].get("emb") {
+        Some(RuntimeValue::List(items)) => {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(
+                &items[0],
+                RuntimeValue::Float(_) | RuntimeValue::Integer(_)
+            ));
+        }
+        other => panic!("expected list, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn create_node_with_list_property_round_trips() {
+    let mut writer = WriterSession::open(store(), paths("w-create-list"))
+        .await
+        .unwrap();
+    // No SchemaBuilder run; `tags` falls into __overflow_json on the
+    // storage side. The new Value::List variant survives the JSON
+    // round-trip and re-materialises as RuntimeValue::List.
+    let q = parse(
+        "CREATE (a:Person {name: 'Ada', tags: ['rust', 'ssh']}) \
+         RETURN a.tags AS tags",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    match outcome.rows[0].get("tags") {
+        Some(RuntimeValue::List(items)) => {
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(&items[0], RuntimeValue::String(s) if s == "rust"),
+                "got {:?}",
+                items[0]
+            );
+        }
+        other => panic!("expected list, got {:?}", other),
+    }
+
+    // Snapshot read goes through the overflow JSON column and must
+    // give back the same list shape.
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    match nodes[0].properties.get("tags") {
+        Some(CoreValue::List(items)) => {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(&items[0], CoreValue::Str(s) if s == "rust"));
+        }
+        other => panic!("expected list, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn create_node_with_map_property_round_trips() {
+    let mut writer = WriterSession::open(store(), paths("w-create-map"))
+        .await
+        .unwrap();
+    let q = parse(
+        "CREATE (a:Doc {title: 'Hello', meta: {source: 'cli', version: 3}}) \
+         RETURN a.meta AS meta",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    match outcome.rows[0].get("meta") {
+        Some(RuntimeValue::Map(m)) => {
+            assert!(matches!(m.get("source"), Some(RuntimeValue::String(s)) if s == "cli"));
+            assert!(matches!(m.get("version"), Some(RuntimeValue::Integer(3))));
+        }
+        other => panic!("expected map, got {:?}", other),
+    }
+
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Doc").await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    match nodes[0].properties.get("meta") {
+        Some(CoreValue::Map(m)) => {
+            assert!(matches!(m.get("source"), Some(CoreValue::Str(s)) if s == "cli"));
+        }
+        other => panic!("expected map, got {:?}", other),
+    }
 }
 
 #[tokio::test]

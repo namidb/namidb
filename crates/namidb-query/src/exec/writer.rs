@@ -1026,8 +1026,25 @@ fn runtime_to_core(v: &RuntimeValue, expr: &Expression) -> Result<CoreValue, Str
         RuntimeValue::Vector(v) => Ok(CoreValue::Vec(v.clone())),
         RuntimeValue::Date(d) => Ok(CoreValue::Date(*d)),
         RuntimeValue::DateTime(m) => Ok(CoreValue::DateTime(*m)),
+        RuntimeValue::List(items) => {
+            // Lists store through the `__overflow_json` stream as a
+            // tagged JSON object; the writer cannot route them into a
+            // declared columnar property yet.
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(runtime_to_core(item, expr)?);
+            }
+            Ok(CoreValue::List(out))
+        }
+        RuntimeValue::Map(entries) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in entries {
+                out.insert(k.clone(), runtime_to_core(v, expr)?);
+            }
+            Ok(CoreValue::Map(out))
+        }
         other => Err(format!(
-            "property value at `{}` is {} — only scalars are storable in v0",
+            "property value at `{}` is {} — only scalars, lists, and string-keyed maps are storable",
             expr,
             other.type_name()
         )),
@@ -1039,44 +1056,48 @@ fn node_runtime_props_to_core(
 ) -> Result<BTreeMap<String, CoreValue>, ExecError> {
     let mut out = BTreeMap::new();
     for (k, v) in props {
-        match v {
-            RuntimeValue::Null => {
-                out.insert(k.clone(), CoreValue::Null);
-            }
-            RuntimeValue::Bool(b) => {
-                out.insert(k.clone(), CoreValue::Bool(*b));
-            }
-            RuntimeValue::Integer(n) => {
-                out.insert(k.clone(), CoreValue::I64(*n));
-            }
-            RuntimeValue::Float(f) => {
-                out.insert(k.clone(), CoreValue::F64(*f));
-            }
-            RuntimeValue::String(s) => {
-                out.insert(k.clone(), CoreValue::Str(s.clone()));
-            }
-            RuntimeValue::Bytes(b) => {
-                out.insert(k.clone(), CoreValue::Bytes(b.clone()));
-            }
-            RuntimeValue::Vector(v) => {
-                out.insert(k.clone(), CoreValue::Vec(v.clone()));
-            }
-            RuntimeValue::Date(d) => {
-                out.insert(k.clone(), CoreValue::Date(*d));
-            }
-            RuntimeValue::DateTime(m) => {
-                out.insert(k.clone(), CoreValue::DateTime(*m));
-            }
-            other => {
-                return Err(ExecError::Runtime(format!(
-                    "property `{}` is {} — non-scalar values cannot round-trip through storage in v0",
-                    k,
-                    other.type_name()
-                )));
-            }
-        }
+        let core = runtime_value_to_core(v).map_err(|msg| {
+            ExecError::Runtime(format!("property `{k}` cannot round-trip: {msg}"))
+        })?;
+        out.insert(k.clone(), core);
     }
     Ok(out)
+}
+
+/// Variant of [`runtime_to_core`] without an `Expression` to anchor
+/// the error to. Used when re-serialising a previously-bound node /
+/// rel's properties back to the writer (SET applied to a property
+/// that came from a Node value).
+fn runtime_value_to_core(v: &RuntimeValue) -> Result<CoreValue, String> {
+    match v {
+        RuntimeValue::Null => Ok(CoreValue::Null),
+        RuntimeValue::Bool(b) => Ok(CoreValue::Bool(*b)),
+        RuntimeValue::Integer(n) => Ok(CoreValue::I64(*n)),
+        RuntimeValue::Float(f) => Ok(CoreValue::F64(*f)),
+        RuntimeValue::String(s) => Ok(CoreValue::Str(s.clone())),
+        RuntimeValue::Bytes(b) => Ok(CoreValue::Bytes(b.clone())),
+        RuntimeValue::Vector(v) => Ok(CoreValue::Vec(v.clone())),
+        RuntimeValue::Date(d) => Ok(CoreValue::Date(*d)),
+        RuntimeValue::DateTime(m) => Ok(CoreValue::DateTime(*m)),
+        RuntimeValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(runtime_value_to_core(item)?);
+            }
+            Ok(CoreValue::List(out))
+        }
+        RuntimeValue::Map(entries) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in entries {
+                out.insert(k.clone(), runtime_value_to_core(v)?);
+            }
+            Ok(CoreValue::Map(out))
+        }
+        other => Err(format!(
+            "{} is not storable (only scalars, lists, and string-keyed maps round-trip)",
+            other.type_name()
+        )),
+    }
 }
 
 #[cfg(test)]

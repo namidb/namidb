@@ -702,6 +702,20 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
                 .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
             dt.into_py(py)
         }
+        Value::List(items) => {
+            let list = PyList::empty_bound(py);
+            for item in items {
+                list.append(value_to_py(py, item)?)?;
+            }
+            list.into_any().unbind()
+        }
+        Value::Map(entries) => {
+            let dict = PyDict::new_bound(py);
+            for (k, val) in entries {
+                dict.set_item(k, value_to_py(py, val)?)?;
+            }
+            dict.into_any().unbind()
+        }
     })
 }
 
