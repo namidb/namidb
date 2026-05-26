@@ -16,8 +16,9 @@ use super::logical::{
 };
 use crate::parser::{
     self as ast, BinaryOp, Clause, Expression, ExpressionKind, Literal, MatchClause, NodePattern,
-    PatternElement, PatternPart, ProjectionItem as AstProjectionItem, QualifiedName, Query,
-    RelationshipPattern, ReturnClause, SingleQuery, SourceSpan, UnaryOp, UnwindClause, WithClause,
+    PatternElement, PatternPart, PatternProperties, ProjectionItem as AstProjectionItem,
+    QualifiedName, Query, RelationshipPattern, ReturnClause, SingleQuery, SourceSpan, UnaryOp,
+    UnwindClause, WithClause,
 };
 
 /// Error returned by [`lower`].
@@ -787,7 +788,14 @@ fn lower_node_pattern_head(
     // Detect inline `{_id: $param}` filter and lower to NodeById.
     // The `id` key is reserved for user properties; only `_id` (the
     // explicit internal-NodeId sigil) triggers the fast point lookup.
-    if let Some(map) = &head.properties {
+    if let Some(PatternProperties::Parameter { span, .. }) = &head.properties {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "$params spread in a MATCH pattern is not supported yet; list the keys explicitly in WHERE",
+            *span,
+        ));
+    }
+    if let Some(PatternProperties::Literal(map)) = &head.properties {
         if let Some(id_expr) = map
             .entries
             .iter()
@@ -934,13 +942,23 @@ fn lower_rel_node(
                 predicate: pred,
             };
         }
-        if let Some(map) = &target.properties {
-            for (key, val) in map.entries.iter() {
-                let pred = build_eq(&target_alias, &key.name, val.clone(), target.span);
-                plan = LogicalPlan::Filter {
-                    input: Box::new(plan),
-                    predicate: pred,
-                };
+        match &target.properties {
+            None => {}
+            Some(PatternProperties::Literal(map)) => {
+                for (key, val) in map.entries.iter() {
+                    let pred = build_eq(&target_alias, &key.name, val.clone(), target.span);
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate: pred,
+                    };
+                }
+            }
+            Some(PatternProperties::Parameter { span, .. }) => {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "$params spread in a MATCH pattern is not supported yet; list the keys explicitly in WHERE",
+                    *span,
+                ));
             }
         }
     }
@@ -1698,14 +1716,7 @@ fn lower_create_pattern_element(
                 rel.span,
             ));
         }
-        let properties = match &rel.properties {
-            Some(map) => map
-                .entries
-                .iter()
-                .map(|(k, v)| (k.name.clone(), v.clone()))
-                .collect(),
-            None => Vec::new(),
-        };
+        let (properties, properties_spread) = lower_pattern_properties(&rel.properties);
         out.push(CreateElement::Rel {
             alias,
             edge_type,
@@ -1713,10 +1724,38 @@ fn lower_create_pattern_element(
             target_alias: target_alias.clone(),
             direction: rel.direction,
             properties,
+            properties_spread,
         });
         source = target_alias;
     }
     Ok(())
+}
+
+/// Convert the parser's optional [`PatternProperties`] into the
+/// `(properties, properties_spread)` pair that `CreateElement` stores.
+/// A literal map fans out into key/value entries; a `$param` reference
+/// becomes the spread expression and entries stay empty. Used by both
+/// node and relationship CREATE paths so the executor sees one shape.
+fn lower_pattern_properties(
+    props: &Option<ast::PatternProperties>,
+) -> (Vec<(String, ast::Expression)>, Option<ast::Expression>) {
+    match props {
+        None => (Vec::new(), None),
+        Some(ast::PatternProperties::Literal(map)) => (
+            map.entries
+                .iter()
+                .map(|(k, v)| (k.name.clone(), v.clone()))
+                .collect(),
+            None,
+        ),
+        Some(ast::PatternProperties::Parameter { name, span }) => (
+            Vec::new(),
+            Some(ast::Expression {
+                kind: ast::ExpressionKind::Parameter(name.clone()),
+                span: *span,
+            }),
+        ),
+    }
 }
 
 fn lower_create_node(
@@ -1758,18 +1797,12 @@ fn lower_create_node(
  ));
         }
     };
-    let properties = match &node.properties {
-        Some(map) => map
-            .entries
-            .iter()
-            .map(|(k, v)| (k.name.clone(), v.clone()))
-            .collect(),
-        None => Vec::new(),
-    };
+    let (properties, properties_spread) = lower_pattern_properties(&node.properties);
     out.push(CreateElement::Node {
         alias: alias.clone(),
         label,
         properties,
+        properties_spread,
     });
     Ok(alias)
 }
@@ -2205,11 +2238,13 @@ mod tests {
                             alias,
                             label,
                             properties,
+                            properties_spread,
                         } => {
                             assert_eq!(alias, "a");
                             assert_eq!(label, "Person");
                             assert_eq!(properties.len(), 1);
                             assert_eq!(properties[0].0, "name");
+                            assert!(properties_spread.is_none());
                         }
                         other => panic!("expected Node, got {:?}", other),
                     }

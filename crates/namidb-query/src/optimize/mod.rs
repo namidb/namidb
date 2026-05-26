@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use crate::cost::StatsCatalog;
 use crate::parser::ast::{
     BinaryOp, CaseBranch, Expression, ExpressionKind, MapLiteral, NodePattern, PatternElement,
-    RelationshipPattern,
+    PatternProperties, RelationshipPattern,
 };
 use crate::parser::SourceSpan;
 use crate::plan::logical::{CreateElement, LogicalPlan, ProjectionItem};
@@ -211,8 +211,8 @@ fn visit_node_pattern(np: &NodePattern, out: &mut BTreeSet<String>) {
     if let Some(b) = &np.binding {
         out.insert(b.name.clone());
     }
-    if let Some(m) = &np.properties {
-        visit_map(m, out);
+    if let Some(p) = &np.properties {
+        visit_pattern_properties(p, out);
     }
 }
 
@@ -220,8 +220,20 @@ fn visit_relationship_pattern(rp: &RelationshipPattern, out: &mut BTreeSet<Strin
     if let Some(b) = &rp.binding {
         out.insert(b.name.clone());
     }
-    if let Some(m) = &rp.properties {
-        visit_map(m, out);
+    if let Some(p) = &rp.properties {
+        visit_pattern_properties(p, out);
+    }
+}
+
+fn visit_pattern_properties(p: &PatternProperties, out: &mut BTreeSet<String>) {
+    match p {
+        PatternProperties::Literal(m) => visit_map(m, out),
+        PatternProperties::Parameter { name, .. } => {
+            // Parameter references don't introduce new free variables;
+            // record nothing. (Free-variable scanning is what `out`
+            // collects.)
+            let _ = name;
+        }
     }
 }
 

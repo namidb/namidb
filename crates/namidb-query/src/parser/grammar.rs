@@ -805,11 +805,7 @@ impl<'src> Parser<'src> {
             None
         };
         let labels = self.parse_label_list()?;
-        let properties = if self.check(&Token::LBrace) {
-            Some(self.parse_map_literal()?)
-        } else {
-            None
-        };
+        let properties = self.parse_pattern_properties()?;
         let rparen = self.expect_in(&Token::RParen, "node pattern")?;
         let end = rparen.span.end;
         Ok(NodePattern {
@@ -818,6 +814,28 @@ impl<'src> Parser<'src> {
             properties,
             span: SourceSpan::new(start, end),
         })
+    }
+
+    /// Parses the properties slot of a node or relationship pattern.
+    /// Returns `None` when the slot is empty, [`PatternProperties::Literal`]
+    /// for an inline `{key: value}` map, and [`PatternProperties::Parameter`]
+    /// for a bare `$name` reference (the bulk-insert idiom).
+    fn parse_pattern_properties(&mut self) -> Result<Option<PatternProperties>, ParseError> {
+        if self.check(&Token::LBrace) {
+            return Ok(Some(PatternProperties::Literal(self.parse_map_literal()?)));
+        }
+        if matches!(self.peek(), Some(Token::Parameter(_))) {
+            let spanned = self.bump().expect("peeked a parameter");
+            let name = match spanned.value {
+                Token::Parameter(n) => n,
+                _ => unreachable!("checked by peek above"),
+            };
+            return Ok(Some(PatternProperties::Parameter {
+                name,
+                span: spanned.span,
+            }));
+        }
+        Ok(None)
     }
 
     fn parse_label_list(&mut self) -> Result<Vec<Identifier>, ParseError> {
@@ -863,9 +881,7 @@ impl<'src> Parser<'src> {
             if let Some(star) = self.eat(&Token::Star) {
                 length = Some(self.parse_relationship_length(star.span)?);
             }
-            if self.check(&Token::LBrace) {
-                properties = Some(self.parse_map_literal()?);
-            }
+            properties = self.parse_pattern_properties()?;
             self.expect_in(&Token::RBracket, "relationship pattern")?;
         }
 
@@ -2053,6 +2069,53 @@ mod tests {
         assert!(
             help.contains("list literal"),
             "help should name the production, was: {help}"
+        );
+    }
+
+    #[test]
+    fn node_pattern_accepts_param_as_properties() {
+        // `CREATE (n:L $params)` parses the param slot as
+        // PatternProperties::Parameter so the executor can apply the
+        // bulk-insert idiom in a single CREATE.
+        let q = ok("CREATE (n:Person $props) RETURN n");
+        let clause = &q.head.clauses[0];
+        let crate::parser::Clause::Create(c) = clause else {
+            panic!("expected Create clause, got {:?}", clause);
+        };
+        let head = &c.patterns[0].element.head;
+        match &head.properties {
+            Some(crate::parser::PatternProperties::Parameter { name, .. }) => {
+                assert_eq!(name, "props");
+            }
+            other => panic!("expected Parameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rel_pattern_accepts_param_as_properties() {
+        let q = ok("CREATE (a:P)-[r:KNOWS $props]->(b:P) RETURN r");
+        let crate::parser::Clause::Create(c) = &q.head.clauses[0] else {
+            panic!("expected Create");
+        };
+        let rel = &c.patterns[0].element.chain[0].0;
+        match &rel.properties {
+            Some(crate::parser::PatternProperties::Parameter { name, .. }) => {
+                assert_eq!(name, "props");
+            }
+            other => panic!("expected Parameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_with_params_spread_rejected_at_lower_with_clear_error() {
+        // Parser accepts the syntax (the production is shared with
+        // CREATE); lower rejects with a pointer to the WHERE escape.
+        let q = crate::parser::parse("MATCH (n:Person $params) RETURN n").unwrap();
+        let err = crate::plan::lower(&q).expect_err("MATCH spread should fail at lower");
+        assert!(
+            err.message.contains("$params"),
+            "lower error should name the feature, got: {}",
+            err.message
         );
     }
 }

@@ -240,10 +240,19 @@ impl fmt::Display for NodePattern {
         for l in &self.labels {
             write!(f, ":{}", l)?;
         }
-        if let Some(m) = &self.properties {
-            write!(f, " {}", m)?;
+        if let Some(p) = &self.properties {
+            write!(f, " {}", p)?;
         }
         f.write_str(")")
+    }
+}
+
+impl fmt::Display for PatternProperties {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PatternProperties::Literal(m) => write!(f, "{}", m),
+            PatternProperties::Parameter { name, .. } => write!(f, "${}", name),
+        }
     }
 }
 
@@ -282,8 +291,8 @@ impl fmt::Display for RelationshipPattern {
                     write!(f, "*{}..{}", len.min, len.max)?;
                 }
             }
-            if let Some(m) = &self.properties {
-                write!(f, " {}", m)?;
+            if let Some(p) = &self.properties {
+                write!(f, " {}", p)?;
             }
             f.write_str("]")?;
         }

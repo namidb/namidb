@@ -342,6 +342,47 @@ fn execute_write_inner<'a>(
 
 // ──────────────────────────── CREATE ─────────────────────────────────
 
+/// Evaluate a `properties_spread` expression and merge its entries
+/// into the `core_props` / `runtime_props` accumulators of a CREATE.
+///
+/// The expression must evaluate to a `Map`; anything else is an error
+/// (most commonly the caller passed `$x` where `$x` is not a map).
+/// `_id` keys are extracted into `explicit_id` rather than treated as
+/// stored properties so the `CREATE (n:L $params)` idiom can still
+/// pin a NodeId through the spread map.
+fn apply_spread_properties(
+    spread_expr: &Expression,
+    row: &Row,
+    params: &Params,
+    core_props: &mut BTreeMap<String, CoreValue>,
+    runtime_props: &mut BTreeMap<String, RuntimeValue>,
+    explicit_id: &mut Option<NodeId>,
+) -> Result<(), ExecError> {
+    let value = evaluate(spread_expr, row, params)?;
+    let map = match value {
+        RuntimeValue::Map(m) => m,
+        other => {
+            return Err(ExecError::Runtime(format!(
+                "properties spread expects a MAP, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    for (k, v) in map {
+        if k == "_id" {
+            *explicit_id = Some(crate::exec::walker::node_id_from_value(
+                &v,
+                spread_expr.span,
+            )?);
+            continue;
+        }
+        let core = runtime_to_core(&v, spread_expr).map_err(ExecError::Runtime)?;
+        core_props.insert(k.clone(), core);
+        runtime_props.insert(k, v);
+    }
+    Ok(())
+}
+
 fn apply_create(
     elements: &[CreateElement],
     mut row: Row,
@@ -355,6 +396,7 @@ fn apply_create(
                 alias,
                 label,
                 properties,
+                properties_spread,
             } => {
                 // Back-reference: don't create if already bound.
                 if row.get(alias).is_some() {
@@ -363,6 +405,20 @@ fn apply_create(
                 let mut core_props = BTreeMap::new();
                 let mut runtime_props = BTreeMap::new();
                 let mut explicit_id: Option<NodeId> = None;
+                // `properties_spread` is the runtime-evaluated map for
+                // the `CREATE (n:L $params)` idiom. Apply it first so
+                // explicit `properties` overwrite collisions, matching
+                // the conventional spread semantics.
+                if let Some(spread_expr) = properties_spread {
+                    apply_spread_properties(
+                        spread_expr,
+                        &row,
+                        params,
+                        &mut core_props,
+                        &mut runtime_props,
+                        &mut explicit_id,
+                    )?;
+                }
                 for (k, expr) in properties {
                     let v = evaluate(expr, &row, params)?;
                     if k == "_id" {
@@ -403,6 +459,7 @@ fn apply_create(
                 target_alias,
                 direction,
                 properties,
+                properties_spread,
             } => {
                 let src_id = expect_node_id(&row, source_alias)?;
                 let dst_id = expect_node_id(&row, target_alias)?;
@@ -417,6 +474,24 @@ fn apply_create(
                 };
                 let mut core_props = BTreeMap::new();
                 let mut runtime_props = BTreeMap::new();
+                if let Some(spread_expr) = properties_spread {
+                    // `_id` only applies to node creates; edges have no
+                    // user-visible id slot.
+                    let mut ignored_id: Option<NodeId> = None;
+                    apply_spread_properties(
+                        spread_expr,
+                        &row,
+                        params,
+                        &mut core_props,
+                        &mut runtime_props,
+                        &mut ignored_id,
+                    )?;
+                    if ignored_id.is_some() {
+                        return Err(ExecError::Runtime(
+                            "_id is not valid on a relationship CREATE".into(),
+                        ));
+                    }
+                }
                 for (k, expr) in properties {
                     let v = evaluate(expr, &row, params)?;
                     let core = runtime_to_core(&v, expr).map_err(ExecError::Runtime)?;
@@ -740,6 +815,7 @@ async fn find_merge_matches(
                 alias,
                 label,
                 properties,
+                properties_spread: _,
             } => {
                 nodes.insert(alias.as_str(), (label.as_str(), properties.as_slice()));
             }
@@ -1143,5 +1219,69 @@ mod tests {
         let snap = writer.snapshot();
         let nodes = snap.scan_label("Person").await.unwrap();
         assert_eq!(nodes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_node_with_params_spread_persists_entries() {
+        use crate::{lower, parse, Params};
+
+        let mut writer = WriterSession::open(store(), paths("write-create-spread"))
+            .await
+            .unwrap();
+        let q = parse("CREATE (a:Person $props) RETURN a").unwrap();
+        let plan = lower(&q).unwrap();
+
+        let mut spread = BTreeMap::new();
+        spread.insert("name".to_string(), RuntimeValue::String("Ada".into()));
+        spread.insert("age".to_string(), RuntimeValue::Integer(36));
+        let mut params = Params::new();
+        params.insert("props".to_string(), RuntimeValue::Map(spread));
+
+        let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+        assert_eq!(outcome.nodes_created, 1);
+        match outcome.rows[0].get("a") {
+            Some(RuntimeValue::Node(n)) => {
+                assert_eq!(n.label, "Person");
+                assert!(matches!(
+                    n.properties.get("name"),
+                    Some(RuntimeValue::String(s)) if s == "Ada"
+                ));
+                assert!(matches!(
+                    n.properties.get("age"),
+                    Some(RuntimeValue::Integer(36))
+                ));
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        let snap = writer.snapshot();
+        let nodes = snap.scan_label("Person").await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        // Stored properties should match what the spread provided.
+        let stored = &nodes[0].properties;
+        assert!(stored.contains_key("name"));
+        assert!(stored.contains_key("age"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_spread_param_that_is_not_a_map() {
+        use crate::{lower, parse, Params};
+
+        let mut writer = WriterSession::open(store(), paths("write-create-spread-bad"))
+            .await
+            .unwrap();
+        let q = parse("CREATE (a:Person $props) RETURN a").unwrap();
+        let plan = lower(&q).unwrap();
+        let mut params = Params::new();
+        params.insert("props".to_string(), RuntimeValue::Integer(7));
+
+        let err = execute_write(&plan, &mut writer, &params)
+            .await
+            .expect_err("non-map spread should fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("MAP"),
+            "expected a clear type error, got: {msg}"
+        );
     }
 }

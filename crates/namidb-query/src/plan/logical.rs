@@ -542,12 +542,19 @@ pub enum AggregateExpr {
 /// `Node` introduces a fresh node bound under `alias`; `Rel` connects
 /// two already-bound aliases via an edge of the given type and
 /// direction. RFC-009 §"Operadores nuevos".
+///
+/// `properties_spread` carries an optional `$param` reference for the
+/// `CREATE (n:L $params)` bulk-insert idiom. When `Some`, the runtime
+/// evaluates the expression to a map and merges its entries into the
+/// node / edge being created. Explicit `properties` win on key
+/// collisions, matching the conventional spread semantics.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CreateElement {
     Node {
         alias: String,
         label: String,
         properties: Vec<(String, Expression)>,
+        properties_spread: Option<Expression>,
     },
     Rel {
         alias: Option<String>,
@@ -556,6 +563,7 @@ pub enum CreateElement {
         target_alias: String,
         direction: RelationshipDirection,
         properties: Vec<(String, Expression)>,
+        properties_spread: Option<Expression>,
     },
 }
 
@@ -751,6 +759,7 @@ mod tests {
             alias: "a".into(),
             label: "Person".into(),
             properties: vec![],
+            properties_spread: None,
         };
         assert_eq!(node.alias(), Some("a"));
         let rel = CreateElement::Rel {
@@ -760,6 +769,7 @@ mod tests {
             target_alias: "b".into(),
             direction: crate::parser::RelationshipDirection::Right,
             properties: vec![],
+            properties_spread: None,
         };
         assert_eq!(rel.alias(), None);
     }
