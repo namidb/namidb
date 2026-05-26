@@ -471,17 +471,32 @@ impl WriterSession {
         let last_lsn = self.pending.last_lsn();
         let records = self.pending.records.len();
 
-        let segment_path = self.wal_store.append_segment(&self.pending).await?;
-
+        // The WAL segment path is fully determined by `seq`, so we can
+        // build the next manifest body before the WAL PUT lands and
+        // pipeline the two writes. That turns the per-commit critical
+        // path from `WAL + manifest body + pointer CAS` (three round
+        // trips) into `max(WAL, manifest body) + pointer CAS` (two).
+        // If the WAL append fails, the body PUT is harmless: the
+        // pointer never moves, the next manifest commit overwrites
+        // the reference, and the janitor sweeps the orphan.
+        let segment_path = self.wal_store.paths().wal_segment(seq);
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.wal_segments.push(WalSegmentDescriptor {
             seq,
             path: segment_path.as_ref().to_string(),
             last_lsn,
         });
+
+        let (wal_result, body_result) = tokio::join!(
+            self.wal_store.append_segment(&self.pending),
+            self.manifest_store
+                .put_body(&self.fence, &self.current, &next),
+        );
+        let _wal_path = wal_result?;
+        let pointer = body_result?;
         let new_current = self
             .manifest_store
-            .commit(&self.fence, &self.current, next)
+            .cas_pointer(&self.fence, &self.current, next, pointer)
             .await?;
 
         // Durability achieved. Drain the queued payloads into the
