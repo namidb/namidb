@@ -34,13 +34,18 @@
 //! untagged [`namidb_core::Value`]), but the WAL envelope only owns
 //! tagged enums and concrete primitives, so bincode is the right tool here.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
 use crate::manifest::Manifest;
 use crate::memtable::{MemKey, MemOp, Memtable};
+use crate::paths::NamespacePaths;
 use crate::wal::WalStore;
 
 /// Serializable mirror of [`MemOp`]. See module docs for the rationale.
@@ -99,6 +104,107 @@ pub struct RecoveredMemtable {
     pub max_lsn: u64,
     /// Number of records actually applied to the memtable.
     pub records_replayed: usize,
+    /// `true` when the cold-start path skipped at least one WAL
+    /// record because a memtable snapshot already covered it.
+    /// Diagnostic only — surfaced for benchmark assertions.
+    pub used_snapshot: bool,
+}
+
+/// Bincode-serialised checkpoint of the memtable, persisted to
+/// `paths.memtable_snapshot()` so a cold-starting writer can skip the
+/// linear WAL replay for everything it covers.
+///
+/// `last_lsn` is the largest LSN already present in `entries`; the
+/// recovery path only re-applies WAL records whose `lsn` is strictly
+/// greater than this value.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemtableSnapshotFile {
+    /// Wire-format version. Bumped if `entries` ever changes shape.
+    pub version: u32,
+    pub last_lsn: u64,
+    pub entries: Vec<MemtableSnapshotEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemtableSnapshotEntry {
+    pub key: MemKey,
+    pub lsn: u64,
+    pub op: WalOp,
+}
+
+const MEMTABLE_SNAPSHOT_VERSION: u32 = 1;
+
+impl MemtableSnapshotFile {
+    /// Build a snapshot file from the current `(MemKey, lsn, MemOp)`
+    /// view of a live memtable. The caller passes the iterator
+    /// directly so the file does not require interior knowledge of
+    /// the memtable representation.
+    pub fn from_iter<I>(last_lsn: u64, iter: I) -> Self
+    where
+        I: IntoIterator<Item = (MemKey, u64, MemOp)>,
+    {
+        let entries = iter
+            .into_iter()
+            .map(|(key, lsn, op)| {
+                let op = match op {
+                    MemOp::Upsert(b) => WalOp::Upsert(b.to_vec()),
+                    MemOp::Tombstone => WalOp::Tombstone,
+                };
+                MemtableSnapshotEntry { key, lsn, op }
+            })
+            .collect();
+        Self {
+            version: MEMTABLE_SNAPSHOT_VERSION,
+            last_lsn,
+            entries,
+        }
+    }
+}
+
+/// Persist `snapshot` to the configured object store path. Uses
+/// `PutMode::Overwrite` so a fresh snapshot replaces the previous
+/// one in a single PUT.
+pub async fn write_memtable_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    snapshot: &MemtableSnapshotFile,
+) -> Result<()> {
+    let bytes = bincode::serialize(snapshot)
+        .map_err(|e| Error::invariant(format!("bincode encode memtable snapshot: {e}")))?;
+    let path = paths.memtable_snapshot();
+    let opts = PutOptions::from(PutMode::Overwrite);
+    store
+        .put_opts(&path, PutPayload::from(bytes), opts)
+        .await
+        .map_err(Error::ObjectStore)?;
+    Ok(())
+}
+
+async fn try_read_memtable_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+) -> Result<Option<MemtableSnapshotFile>> {
+    match store.get(path).await {
+        Ok(get_result) => {
+            let bytes = get_result.bytes().await.map_err(Error::ObjectStore)?;
+            let snap: MemtableSnapshotFile = bincode::deserialize(&bytes)
+                .map_err(|e| Error::invariant(format!("bincode decode memtable snapshot: {e}")))?;
+            if snap.version != MEMTABLE_SNAPSHOT_VERSION {
+                // Future-proofing: a snapshot from a newer engine is
+                // skipped rather than rejected. Callers fall back to
+                // the full WAL replay.
+                debug!(
+                    version = snap.version,
+                    expected = MEMTABLE_SNAPSHOT_VERSION,
+                    "ignoring memtable snapshot with unknown version"
+                );
+                return Ok(None);
+            }
+            Ok(Some(snap))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(other) => Err(Error::ObjectStore(other)),
+    }
 }
 
 /// Replay every WAL segment referenced by `manifest` and return the
@@ -114,9 +220,46 @@ pub async fn recover_memtable(
     manifest: &Manifest,
     wal_store: &WalStore,
 ) -> Result<RecoveredMemtable> {
+    recover_memtable_with_snapshot(manifest, wal_store, None).await
+}
+
+/// Same shape as [`recover_memtable`], plus an optional object-store
+/// handle used to look for a `memtable_snapshot.bin` checkpoint at
+/// `paths.memtable_snapshot()`. If found and its version is supported,
+/// the snapshot is loaded into the memtable and the WAL replay skips
+/// every record whose LSN is already covered.
+pub async fn recover_memtable_with_snapshot(
+    manifest: &Manifest,
+    wal_store: &WalStore,
+    snapshot_store: Option<&Arc<dyn ObjectStore>>,
+) -> Result<RecoveredMemtable> {
     let mut memtable = Memtable::new();
     let mut max_lsn: u64 = 0;
     let mut records_replayed = 0usize;
+
+    // Phase 0: seed from a checkpoint if available.
+    let mut used_snapshot = false;
+    let mut snapshot_floor: u64 = 0;
+    if let Some(store) = snapshot_store {
+        let snap_path = wal_store.paths().memtable_snapshot();
+        if let Some(snap) = try_read_memtable_snapshot(store, &snap_path).await? {
+            debug!(
+                last_lsn = snap.last_lsn,
+                entries = snap.entries.len(),
+                "seeding recovery from memtable snapshot"
+            );
+            for entry in snap.entries {
+                let op = match entry.op {
+                    WalOp::Upsert(v) => MemOp::Upsert(Bytes::from(v)),
+                    WalOp::Tombstone => MemOp::Tombstone,
+                };
+                memtable.apply(entry.key, entry.lsn, op);
+            }
+            max_lsn = max_lsn.max(snap.last_lsn);
+            snapshot_floor = snap.last_lsn;
+            used_snapshot = true;
+        }
+    }
 
     if manifest.wal_segments.is_empty() {
         debug!("manifest has no WAL segments; recovery is a no-op");
@@ -124,6 +267,7 @@ pub async fn recover_memtable(
             memtable,
             max_lsn,
             records_replayed,
+            used_snapshot,
         });
     }
 
@@ -134,6 +278,13 @@ pub async fn recover_memtable(
     segments.sort_by_key(|s| s.seq);
 
     for seg_desc in segments {
+        // Fast path: if every record in this segment is already
+        // covered by the snapshot, skip the GET entirely. WAL records
+        // are LSN-ascending within a segment and the descriptor's
+        // last_lsn is its high-water mark.
+        if seg_desc.last_lsn <= snapshot_floor {
+            continue;
+        }
         let segment = wal_store.read_segment(seg_desc.seq).await?;
         let actual_last_lsn = segment.last_lsn();
         if actual_last_lsn != seg_desc.last_lsn {
@@ -154,6 +305,9 @@ pub async fn recover_memtable(
             });
         }
         for record in segment.records {
+            if record.lsn <= snapshot_floor {
+                continue;
+            }
             let entry = WalEntry::decode(&record.payload)?;
             if entry.lsn != record.lsn {
                 return Err(Error::Corrupted {
@@ -175,6 +329,7 @@ pub async fn recover_memtable(
         memtable,
         max_lsn,
         records_replayed,
+        used_snapshot,
     })
 }
 
@@ -533,5 +688,125 @@ mod tests {
             }
             other => panic!("expected Corrupted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn recover_with_snapshot_short_circuits_covered_segments() {
+        // Layout for the test:
+        //   * snapshot covers LSNs 1..=10 (one Person upsert at LSN 1).
+        //   * WAL segment seq=0 has LSNs 1..=10 (already covered).
+        //   * WAL segment seq=1 has LSN 11 (new record).
+        // Recovery should skip seg 0 entirely, decode only seg 1, and
+        // report `used_snapshot = true`.
+        let store = store();
+        let paths = paths("rec-snap-skip");
+        let wal = WalStore::new(store.clone(), paths.clone());
+
+        // Snapshot file.
+        let snap = MemtableSnapshotFile::from_iter(
+            10,
+            vec![(
+                MemKey::Node {
+                    label: "Person".into(),
+                    id: nid(1),
+                },
+                1,
+                MemOp::Upsert(Bytes::from_static(b"ada-v1")),
+            )],
+        );
+        write_memtable_snapshot(&store, &paths, &snap)
+            .await
+            .unwrap();
+
+        let new_record = WalEntry {
+            key: MemKey::Node {
+                label: "Person".into(),
+                id: nid(2),
+            },
+            op: WalOp::Upsert(b"bob-v1".to_vec()),
+            lsn: 11,
+        }
+        .encode()
+        .unwrap();
+        let mut seg0 = WalSegment::new(0);
+        seg0.push(WalRecord {
+            lsn: 1,
+            payload: WalEntry {
+                key: MemKey::Node {
+                    label: "Person".into(),
+                    id: nid(1),
+                },
+                op: WalOp::Upsert(b"ada-v1".to_vec()),
+                lsn: 1,
+            }
+            .encode()
+            .unwrap(),
+        });
+        wal.append_segment(&seg0).await.unwrap();
+        let mut seg1 = WalSegment::new(1);
+        seg1.push(WalRecord {
+            lsn: 11,
+            payload: new_record,
+        });
+        wal.append_segment(&seg1).await.unwrap();
+
+        let mut manifest = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        manifest.wal_segments.push(WalSegmentDescriptor {
+            seq: 0,
+            path: format!("wal#{}", 0),
+            last_lsn: 1,
+        });
+        manifest.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: format!("wal#{}", 1),
+            last_lsn: 11,
+        });
+
+        let out = recover_memtable_with_snapshot(&manifest, &wal, Some(&store))
+            .await
+            .unwrap();
+        assert!(out.used_snapshot);
+        // Only the LSN-11 record replayed; the LSN-1 record came from
+        // the snapshot.
+        assert_eq!(out.records_replayed, 1);
+        assert_eq!(out.max_lsn, 11);
+        assert!(!out.memtable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recover_without_snapshot_store_falls_back_to_full_replay() {
+        // Same WAL layout as the previous test, but the caller does not
+        // pass a snapshot store. The fast path is bypassed and every
+        // record is replayed.
+        let store = store();
+        let paths = paths("rec-snap-fallback");
+        let wal = WalStore::new(store.clone(), paths);
+
+        let mut seg = WalSegment::new(0);
+        seg.push(WalRecord {
+            lsn: 1,
+            payload: WalEntry {
+                key: MemKey::Node {
+                    label: "Person".into(),
+                    id: nid(1),
+                },
+                op: WalOp::Upsert(b"ada-v1".to_vec()),
+                lsn: 1,
+            }
+            .encode()
+            .unwrap(),
+        });
+        wal.append_segment(&seg).await.unwrap();
+        let mut manifest = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        manifest.wal_segments.push(WalSegmentDescriptor {
+            seq: 0,
+            path: "wal#0".into(),
+            last_lsn: 1,
+        });
+
+        let out = recover_memtable(&manifest, &wal).await.unwrap();
+        assert!(!out.used_snapshot);
+        assert_eq!(out.records_replayed, 1);
+        assert_eq!(out.max_lsn, 1);
     }
 }
