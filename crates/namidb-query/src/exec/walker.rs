@@ -1090,9 +1090,12 @@ async fn scan_node_for_id(
     snapshot: &Snapshot<'_>,
     id: NodeId,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
-    let manifest = snapshot.manifest();
-    let labels: Vec<String> = manifest.manifest.schema.labels.keys().cloned().collect();
-    for label in labels {
+    // `observed_labels` covers the declared schema *and* labels that
+    // were ever written into the memtable or any SST. Without it the
+    // typeless Expand path falls back to declared-only and silently
+    // drops every neighbour for namespaces that skipped `SchemaBuilder`
+    // (the root cause of B1 / B7 — `MATCH ()-[r:T]->()` returning 0).
+    for label in snapshot.observed_labels() {
         if let Some(view) = snapshot.lookup_node(&label, id).await? {
             return Ok(Some(view));
         }
