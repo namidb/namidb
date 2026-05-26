@@ -424,6 +424,11 @@ impl ManifestStore {
     ///
     /// On a lost CAS race we return [`Error::ManifestCommitCas`]; the caller
     /// must reload, fence-check, and retry from a fresh base.
+    ///
+    /// Callers that need to overlap the body PUT with another
+    /// independent object-store write (e.g. the WAL segment that the
+    /// manifest will reference) can instead drive the two phases
+    /// directly through [`Self::put_body`] + [`Self::cas_pointer`].
     #[instrument(
  skip(self, fence, new_manifest, base),
  fields(
@@ -438,6 +443,26 @@ impl ManifestStore {
         base: &LoadedManifest,
         new_manifest: Manifest,
     ) -> Result<LoadedManifest> {
+        let pointer = self.put_body(fence, base, &new_manifest).await?;
+        self.cas_pointer(fence, base, new_manifest, pointer).await
+    }
+
+    /// Phase 1 of [`Self::commit`]: PUT the immutable manifest body.
+    /// Returns the [`ManifestPointer`] the caller will later CAS into
+    /// place via [`Self::cas_pointer`].
+    ///
+    /// Splitting the commit lets `WriterSession::commit_batch`
+    /// pipeline the body PUT against the independent WAL segment PUT;
+    /// in the common case that turns two serial round-trips into one.
+    /// If the WAL append fails after this method succeeded, the body
+    /// stays orphaned but harmless — the pointer never moved, and the
+    /// next manifest version will overwrite the reference.
+    pub async fn put_body(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: &Manifest,
+    ) -> Result<ManifestPointer> {
         fence.assert_alive(base.manifest.epoch)?;
         if new_manifest.version != base.manifest.version + 1 {
             return Err(Error::invariant(format!(
@@ -456,7 +481,7 @@ impl ManifestStore {
         let manifest_path = self.paths.manifest_version(new_manifest.version);
         debug!(path = %manifest_path, "writing immutable manifest body");
         match self
-            .put_create(&manifest_path, serde_json::to_vec(&new_manifest)?.into())
+            .put_create(&manifest_path, serde_json::to_vec(new_manifest)?.into())
             .await
         {
             Ok(_) => {}
@@ -481,11 +506,23 @@ impl ManifestStore {
             Err(other) => return Err(other),
         }
 
-        let pointer = ManifestPointer {
+        Ok(ManifestPointer {
             version: new_manifest.version,
             epoch: new_manifest.epoch,
             manifest_path: manifest_path.as_ref().to_string(),
-        };
+        })
+    }
+
+    /// Phase 2 of [`Self::commit`]: CAS the pointer to point at the
+    /// body previously written by [`Self::put_body`]. Returns the
+    /// freshly-loaded manifest on success.
+    pub async fn cas_pointer(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: Manifest,
+        pointer: ManifestPointer,
+    ) -> Result<LoadedManifest> {
         let opts = PutOptions::from(PutMode::Update(UpdateVersion {
             e_tag: base.pointer_etag.clone(),
             version: base.pointer_version.clone(),
