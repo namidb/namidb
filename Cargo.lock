@@ -2090,6 +2090,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
