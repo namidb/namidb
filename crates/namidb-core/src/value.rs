@@ -4,6 +4,8 @@
 //! to give a friendly Rust-native shape to ad-hoc insertions and to feed the
 //! ingest path before columnarisation.
 
+use std::collections::BTreeMap;
+
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -14,6 +16,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 const TAG_DATE: &str = "$date";
 /// Same idea for [`Value::DateTime`].
 const TAG_DATETIME: &str = "$datetime";
+/// Tag for `Value::List(...)` — keeps the array shape from being
+/// silently re-decoded as `Vec<f32>` and lets the deserializer recover
+/// the heterogeneous element types.
+const TAG_LIST: &str = "$list";
+/// Tag for `Value::Map(...)` — disambiguates from the `{}` shape that
+/// Date / DateTime already use.
+const TAG_MAP: &str = "$map";
 
 /// A single property value. Loose, JSON-ish.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +43,15 @@ pub enum Value {
     /// `Timestamp(Microsecond, UTC)`. Tagged as `{"$datetime": <us>}`
     /// in JSON for the same reason as [`Value::Date`].
     DateTime(i64),
+    /// Heterogeneous list of values. Stored only through
+    /// `__overflow_json` (declared properties stay in their typed
+    /// column); the JSON shape is `{"$list": [v0, v1, ...]}` so a
+    /// plain array can keep round-tripping as `Vec<f32>`.
+    List(Vec<Value>),
+    /// String-keyed map of values. JSON shape is
+    /// `{"$map": {"k": v, ...}}` to keep `{}` reserved for the
+    /// existing date/datetime tags.
+    Map(BTreeMap<String, Value>),
 }
 
 impl Value {
@@ -109,6 +127,16 @@ impl Serialize for Value {
             Value::DateTime(us) => {
                 let mut m = s.serialize_map(Some(1))?;
                 m.serialize_entry(TAG_DATETIME, us)?;
+                m.end()
+            }
+            Value::List(items) => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry(TAG_LIST, items)?;
+                m.end()
+            }
+            Value::Map(entries) => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry(TAG_MAP, entries)?;
                 m.end()
             }
         }
@@ -193,7 +221,24 @@ impl<'de> Deserialize<'de> for Value {
                         }
                         Ok(Value::DateTime(us))
                     }
-                    other => Err(de::Error::unknown_field(other, &[TAG_DATE, TAG_DATETIME])),
+                    TAG_LIST => {
+                        let items: Vec<Value> = map.next_value()?;
+                        if map.next_key::<String>()?.is_some() {
+                            return Err(de::Error::custom("$list map must have exactly one key"));
+                        }
+                        Ok(Value::List(items))
+                    }
+                    TAG_MAP => {
+                        let entries: BTreeMap<String, Value> = map.next_value()?;
+                        if map.next_key::<String>()?.is_some() {
+                            return Err(de::Error::custom("$map map must have exactly one key"));
+                        }
+                        Ok(Value::Map(entries))
+                    }
+                    other => Err(de::Error::unknown_field(
+                        other,
+                        &[TAG_DATE, TAG_DATETIME, TAG_LIST, TAG_MAP],
+                    )),
                 }
             }
         }
@@ -247,5 +292,46 @@ mod tests {
         assert_eq!(s, r#"{"$date":5}"#);
         let s = serde_json::to_string(&Value::DateTime(42)).unwrap();
         assert_eq!(s, r#"{"$datetime":42}"#);
+    }
+
+    #[test]
+    fn value_list_roundtrips_through_json() {
+        let v = Value::List(vec![
+            Value::I64(1),
+            Value::Str("two".into()),
+            Value::Bool(true),
+            Value::List(vec![Value::I64(3), Value::I64(4)]),
+        ]);
+        assert_eq!(round(&v), v);
+        // Ensure the tag is present so a plain array does not
+        // accidentally re-decode this list as `Vec<f32>`.
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.starts_with(r#"{"$list":"#), "got {s}");
+    }
+
+    #[test]
+    fn value_map_roundtrips_through_json() {
+        let mut m = BTreeMap::new();
+        m.insert("name".to_string(), Value::Str("Ada".into()));
+        m.insert("age".to_string(), Value::I64(36));
+        m.insert(
+            "tags".to_string(),
+            Value::List(vec![Value::Str("rust".into())]),
+        );
+        let v = Value::Map(m);
+        assert_eq!(round(&v), v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.starts_with(r#"{"$map":"#), "got {s}");
+    }
+
+    #[test]
+    fn value_plain_array_still_decodes_as_vec() {
+        // Vec<f32> stays untagged so legacy JSON keeps round-tripping
+        // without the `$list` marker. The deserializer's visit_seq
+        // path is exercised by writing a bare array and reading it
+        // back.
+        let json = "[0.5, 1.5, 2.5]";
+        let v: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v, Value::Vec(vec![0.5, 1.5, 2.5]));
     }
 }
