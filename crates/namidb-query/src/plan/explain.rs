@@ -675,6 +675,7 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
             alias,
             label,
             properties,
+            properties_spread,
         } => {
             let _ = write!(out, "({}:{}", alias, label);
             if !properties.is_empty() {
@@ -687,6 +688,9 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
                 }
                 out.push('}');
             }
+            if let Some(spread) = properties_spread {
+                let _ = write!(out, " spread={}", spread);
+            }
             out.push(')');
         }
         CreateElement::Rel {
@@ -696,6 +700,7 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
             target_alias,
             direction,
             properties,
+            properties_spread,
         } => {
             let arrow_l = matches!(direction, RelationshipDirection::Left);
             let arrow_r = matches!(direction, RelationshipDirection::Right);
@@ -714,6 +719,9 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
                     let _ = write!(out, "{}: {}", k, v);
                 }
                 out.push('}');
+            }
+            if let Some(spread) = properties_spread {
+                let _ = write!(out, " spread={}", spread);
             }
             out.push_str(if arrow_r { "]->" } else { "]-" });
             let _ = write!(out, "({})", target_alias);

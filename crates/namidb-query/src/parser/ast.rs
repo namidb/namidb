@@ -287,7 +287,7 @@ pub struct PatternElement {
 pub struct NodePattern {
     pub binding: Option<Identifier>,
     pub labels: Vec<Identifier>,
-    pub properties: Option<MapLiteral>,
+    pub properties: Option<PatternProperties>,
     pub span: SourceSpan,
 }
 
@@ -298,8 +298,31 @@ pub struct RelationshipPattern {
     /// Type alternation, e.g. `:KNOWS|:LIKES`. Empty = no type filter.
     pub types: Vec<Identifier>,
     pub length: Option<RelationshipLength>,
-    pub properties: Option<MapLiteral>,
+    pub properties: Option<PatternProperties>,
     pub span: SourceSpan,
+}
+
+/// Properties section of a [`NodePattern`] / [`RelationshipPattern`].
+///
+/// The classic Cypher form is an inline map: `(n:Person {name: 'a'})`.
+/// We also accept a single `$param` reference, e.g. `(n:Person $props)`,
+/// which is the standard bulk-insert idiom. The runtime is expected to
+/// supply a map value for the parameter; at lower time we cannot know
+/// the keys, so the executor expands the map into properties when it
+/// sees the parameter spread.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PatternProperties {
+    Literal(MapLiteral),
+    Parameter { name: String, span: SourceSpan },
+}
+
+impl PatternProperties {
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            PatternProperties::Literal(m) => m.span,
+            PatternProperties::Parameter { span, .. } => *span,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

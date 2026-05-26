@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::parser::ast::{
     CaseBranch, Expression, ExpressionKind, MapLiteral, NodePattern, PatternElement,
-    RelationshipPattern, UnaryOp,
+    PatternProperties, RelationshipPattern, UnaryOp,
 };
 use crate::plan::logical::{AggregateExpr, CreateElement, LogicalPlan, RemoveOp, SetOp};
 
@@ -456,8 +456,8 @@ fn collect_from_node_pattern(np: &NodePattern, req: &mut RequiredSet) {
         // Pattern binding inside subquery references the alias as a whole.
         req.record_all(&b.name);
     }
-    if let Some(m) = &np.properties {
-        collect_from_map(m, req);
+    if let Some(p) = &np.properties {
+        collect_from_pattern_properties(p, req);
     }
 }
 
@@ -465,8 +465,17 @@ fn collect_from_rel_pattern(rp: &RelationshipPattern, req: &mut RequiredSet) {
     if let Some(b) = &rp.binding {
         req.record_all(&b.name);
     }
-    if let Some(m) = &rp.properties {
-        collect_from_map(m, req);
+    if let Some(p) = &rp.properties {
+        collect_from_pattern_properties(p, req);
+    }
+}
+
+fn collect_from_pattern_properties(p: &PatternProperties, req: &mut RequiredSet) {
+    match p {
+        PatternProperties::Literal(m) => collect_from_map(m, req),
+        PatternProperties::Parameter { .. } => {
+            // `$param` references no variable bindings.
+        }
     }
 }
 
