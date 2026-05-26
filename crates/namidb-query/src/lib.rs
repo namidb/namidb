@@ -21,8 +21,10 @@ pub mod optimize;
 pub mod pagination;
 pub mod parser;
 pub mod plan;
+pub mod profile;
 
 pub use pagination::{next_cursor, paginate_plan, Cursor, CursorError};
+pub use profile::{profile_query_tree, ProfileError};
 
 pub use cost::{
     estimate, BindingMeta, Cardinality, EdgeTypeStats, LabelStats, PropStats, StatsCatalog,
@@ -38,6 +40,7 @@ pub use plan::{
     explain_query_raw_tree_verbose, explain_query_raw_verbose, explain_query_tree,
     explain_query_tree_verbose, explain_query_verbose, explain_tree, explain_tree_verbose,
     explain_verbose, lower, AggregateExpr, ExplainNode, LogicalPlan, LowerError, LowerErrorKind,
+    RuntimeStats,
 };
 
 /// Lower + optimize. The convenience entry point that the executor and

@@ -46,7 +46,26 @@ pub struct ExplainNode {
     /// operator's label / edge type. Lets callers warn the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stats: Option<bool>,
+    /// Real measurements from a PROFILE run. Only populated on the
+    /// root node — the executor is `Vec<Row>`-eager, so per-operator
+    /// timings would require a streaming refactor that is out of
+    /// scope here. Callers comparing `estimated_rows` (estimate) to
+    /// `profile.rows_returned` (actual) get the gap they need today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<RuntimeStats>,
     pub children: Vec<ExplainNode>,
+}
+
+/// Real runtime measurements captured by `profile_query_tree`. Lives
+/// on the root [`ExplainNode`] so the cloud worker can expose a single
+/// PROFILE endpoint without inventing its own shape.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuntimeStats {
+    /// Rows the executor returned to the caller for this query.
+    pub rows_returned: u64,
+    /// Wall-clock elapsed time for the whole query (lower + optimize
+    /// + execute), in microseconds.
+    pub elapsed_us: u64,
 }
 
 /// Render `plan` as an indented tree string. Each operator takes one
@@ -175,6 +194,7 @@ fn node_to_tree(plan: &LogicalPlan) -> ExplainNode {
         estimated_total_work: None,
         join_candidate: None,
         no_stats: None,
+        profile: None,
         children,
     }
 }
@@ -228,6 +248,7 @@ fn node_to_tree_verbose(
         estimated_total_work: None,
         join_candidate,
         no_stats,
+        profile: None,
         children,
     }
 }
