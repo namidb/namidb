@@ -86,6 +86,14 @@ impl NamespacePaths {
         self.join(&["snapshots", &format!("{name}.json")])
     }
 
+    /// Path for the optional bincode-serialised memtable snapshot
+    /// used to speed up cold starts (RFC-pending). When this object
+    /// exists, `recover_memtable` consumes it instead of replaying the
+    /// full WAL segment history.
+    pub fn memtable_snapshot(&self) -> Path {
+        self.join(&["memtable_snapshot.bin"])
+    }
+
     fn join(&self, segments: &[&str]) -> Path {
         let mut buf = String::with_capacity(64);
         if !self.root.is_empty() {
