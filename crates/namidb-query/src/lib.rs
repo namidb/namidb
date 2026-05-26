@@ -31,8 +31,10 @@ pub use exec::{
 pub use optimize::{convert_cross_to_hash, normalize_filters, optimize, predicate_pushdown};
 pub use parser::{parse, ParseError, ParseResult, Query};
 pub use plan::{
-    explain, explain_query, explain_query_raw, explain_query_raw_verbose, explain_query_verbose,
-    explain_verbose, lower, AggregateExpr, LogicalPlan, LowerError, LowerErrorKind,
+    explain, explain_query, explain_query_raw, explain_query_raw_tree,
+    explain_query_raw_tree_verbose, explain_query_raw_verbose, explain_query_tree,
+    explain_query_tree_verbose, explain_query_verbose, explain_tree, explain_tree_verbose,
+    explain_verbose, lower, AggregateExpr, ExplainNode, LogicalPlan, LowerError, LowerErrorKind,
 };
 
 /// Lower + optimize. The convenience entry point that the executor and
