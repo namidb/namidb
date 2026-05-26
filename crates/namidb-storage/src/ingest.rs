@@ -65,8 +65,25 @@ use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
 use crate::paths::NamespacePaths;
 use crate::read::Snapshot;
-use crate::recovery::{recover_memtable, WalEntry, WalOp};
+use crate::recovery::{
+    recover_memtable_with_snapshot, write_memtable_snapshot, MemtableSnapshotFile, WalEntry, WalOp,
+};
 use crate::wal::{WalRecord, WalSegment, WalStore};
+
+/// Default number of commits between automatic memtable snapshots.
+/// Zero disables auto-snapshotting; callers can still drive it manually
+/// via [`WriterSession::write_memtable_snapshot_now`].
+const DEFAULT_AUTO_SNAPSHOT_EVERY: u64 = 0;
+
+/// Parse `NAMIDB_MEMTABLE_SNAPSHOT_EVERY` for the auto-snapshot cadence.
+/// `0` (or unset) disables; any positive value `N` snapshots after
+/// every `N` successful commits.
+fn auto_snapshot_every() -> u64 {
+    std::env::var("NAMIDB_MEMTABLE_SNAPSHOT_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AUTO_SNAPSHOT_EVERY)
+}
 
 /// Outcome of [`WriterSession::commit_batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +138,15 @@ pub struct WriterSession {
     /// Reset on `flush` because a flush bumps the manifest version and
     /// can introduce new nodes.
     property_index_cache: Arc<crate::property_index::PropertyIndexCache>,
+    /// Object store handle kept around so [`Self::commit_batch`] can
+    /// fire the auto-snapshot path without re-deriving it from the
+    /// manifest store. Same `Arc` we hand `Snapshot::new`.
+    store: Arc<dyn ObjectStore>,
+    /// Auto-snapshot cadence resolved at `open` time. Zero disables.
+    auto_snapshot_every: u64,
+    /// Commits ago since the last successful snapshot write. Reset
+    /// when a snapshot lands; bumped by every non-empty `commit_batch`.
+    commits_since_snapshot: u64,
 }
 
 impl std::fmt::Debug for WriterSession {
@@ -145,7 +171,7 @@ impl WriterSession {
     #[instrument(skip(store, paths), fields(namespace = %paths.namespace()))]
     pub async fn open(store: Arc<dyn ObjectStore>, paths: NamespacePaths) -> Result<Self> {
         let manifest_store = ManifestStore::new(store.clone(), paths.clone());
-        let wal_store = WalStore::new(store, paths);
+        let wal_store = WalStore::new(store.clone(), paths);
 
         let (current, fence) = match manifest_store.load_current().await {
             Ok(_) => manifest_store.claim_writer().await?,
@@ -158,7 +184,11 @@ impl WriterSession {
             Err(other) => return Err(other),
         };
 
-        let recovered = recover_memtable(&current.manifest, &wal_store).await?;
+        // Cold-start fast path: if a memtable snapshot is present at
+        // `paths.memtable_snapshot()`, seed the in-process memtable
+        // from it and skip every WAL record it already covers.
+        let recovered =
+            recover_memtable_with_snapshot(&current.manifest, &wal_store, Some(&store)).await?;
         let next_lsn = recovered.max_lsn.saturating_add(1).max(1);
 
         // Pick a WAL seq strictly greater than every segment we can see
@@ -196,6 +226,9 @@ impl WriterSession {
             node_cache,
             sst_cache,
             property_index_cache: Arc::new(crate::property_index::PropertyIndexCache::new()),
+            store,
+            auto_snapshot_every: auto_snapshot_every(),
+            commits_since_snapshot: 0,
         })
     }
 
@@ -515,6 +548,25 @@ impl WriterSession {
         // taking the writer lock. See RFC-021.
         self.refresh_published();
 
+        // Auto-snapshot tick. Best effort: a snapshot is a cache, the
+        // WAL is the source of truth. Log the failure and keep going
+        // so a temporary object-store hiccup never poisons the commit
+        // that just completed.
+        self.commits_since_snapshot = self.commits_since_snapshot.saturating_add(1);
+        if self.auto_snapshot_every > 0 && self.commits_since_snapshot >= self.auto_snapshot_every {
+            match self.write_memtable_snapshot_inner(last_lsn).await {
+                Ok(()) => {
+                    self.commits_since_snapshot = 0;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "memtable snapshot write failed; continuing without it"
+                    );
+                }
+            }
+        }
+
         debug!(
             wal_seq = seq,
             last_lsn,
@@ -528,6 +580,27 @@ impl WriterSession {
             records,
             manifest_version: self.current.manifest.version,
         })
+    }
+
+    /// Persist the current memtable to `paths.memtable_snapshot()` so
+    /// the next cold start can skip the WAL records the snapshot
+    /// already covers. Public so callers that drive the cadence
+    /// themselves (cloud worker policies, CLI maintenance commands)
+    /// can request a snapshot independently of the auto-tick.
+    pub async fn write_memtable_snapshot_now(&mut self) -> Result<()> {
+        let last_lsn = self.next_lsn.saturating_sub(1);
+        self.write_memtable_snapshot_inner(last_lsn).await?;
+        self.commits_since_snapshot = 0;
+        Ok(())
+    }
+
+    async fn write_memtable_snapshot_inner(&self, last_lsn: u64) -> Result<()> {
+        let entries = self
+            .memtable
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.lsn, entry.op.clone()));
+        let snapshot = MemtableSnapshotFile::from_iter(last_lsn, entries);
+        write_memtable_snapshot(&self.store, self.manifest_store.paths(), &snapshot).await
     }
 
     /// Compact every `(kind, scope)` bucket in L0 that holds more than
@@ -632,6 +705,7 @@ mod tests {
         DataType, EdgeTypeDef, LabelDef, NamespaceId, PropertyDef, SchemaBuilder, Value,
     };
     use object_store::memory::InMemory;
+    use object_store::ObjectStoreExt;
 
     use super::*;
 
@@ -1048,5 +1122,44 @@ mod tests {
         }
         // session_b can still ingest cleanly.
         drop(session_b);
+    }
+
+    #[tokio::test]
+    async fn write_memtable_snapshot_now_persists_and_speeds_cold_start() {
+        // Writer 1: upsert + commit + snapshot. Writer 2 (cold start)
+        // must see the data without replaying any WAL records — the
+        // snapshot covers them.
+        let store = make_store();
+        let paths = make_paths("ingest-auto-snap");
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        session.write_memtable_snapshot_now().await.unwrap();
+
+        // The blob lives at the canonical path. Use the store directly
+        // so the test stays storage-agnostic.
+        let head = store.head(&paths.memtable_snapshot()).await.unwrap();
+        assert!(head.size > 0);
+
+        // Cold start: a new writer recovers from the snapshot rather
+        // than the WAL. Data must still be visible.
+        drop(session);
+        let session2 = WriterSession::open(store, paths).await.unwrap();
+        let snap = session2.snapshot();
+        let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
+        assert_eq!(
+            view.properties.get("name"),
+            Some(&Value::Str("Alice".into()))
+        );
+        drop(snap);
+        // next_lsn must continue from the snapshot's last_lsn, not
+        // restart from 1.
+        assert!(session2.next_lsn() > 1);
     }
 }
