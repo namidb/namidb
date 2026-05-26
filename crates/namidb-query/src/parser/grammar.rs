@@ -87,6 +87,19 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Variant of [`expect`] that attaches a `help:` line describing the
+    /// production the parser was in when the token went missing. Lets
+    /// "expected `)`" at the end of `MATCH (a:Person {)` surface as
+    /// "while parsing node pattern" instead of the bare token name.
+    fn expect_in(
+        &mut self,
+        expected: &Token,
+        ctx: &'static str,
+    ) -> Result<Spanned<Token>, ParseError> {
+        self.expect(expected)
+            .map_err(|e| e.with_help(format!("while parsing {ctx}")))
+    }
+
     fn expect_eof(&mut self) -> Result<(), Vec<ParseError>> {
         if let Some(tok) = self.peek() {
             let span = self.peek_span();
@@ -797,7 +810,7 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let rparen = self.expect(&Token::RParen)?;
+        let rparen = self.expect_in(&Token::RParen, "node pattern")?;
         let end = rparen.span.end;
         Ok(NodePattern {
             binding,
@@ -853,7 +866,7 @@ impl<'src> Parser<'src> {
             if self.check(&Token::LBrace) {
                 properties = Some(self.parse_map_literal()?);
             }
-            self.expect(&Token::RBracket)?;
+            self.expect_in(&Token::RBracket, "relationship pattern")?;
         }
 
         let trail_arrow = self.eat(&Token::Arrow);
@@ -980,7 +993,7 @@ impl<'src> Parser<'src> {
                 entries.push(self.parse_map_entry()?);
             }
         }
-        let rbrace = self.expect(&Token::RBrace)?;
+        let rbrace = self.expect_in(&Token::RBrace, "map literal")?;
         Ok(MapLiteral {
             entries,
             span: SourceSpan::new(start, rbrace.span.end),
@@ -1345,7 +1358,7 @@ impl<'src> Parser<'src> {
                     }
                 }
             }
-            let rparen = self.expect(&Token::RParen)?;
+            let rparen = self.expect_in(&Token::RParen, "function call arguments")?;
             let span = SourceSpan::new(span_start, rparen.span.end);
             return Ok(Expression {
                 kind: ExpressionKind::FunctionCall {
@@ -1448,7 +1461,7 @@ impl<'src> Parser<'src> {
                 items.push(self.parse_expression()?);
             }
         }
-        let rbracket = self.expect(&Token::RBracket)?;
+        let rbracket = self.expect_in(&Token::RBracket, "list literal")?;
         let span = SourceSpan::new(lbracket.start, rbracket.span.end);
         Ok(Expression {
             kind: ExpressionKind::List(items),
@@ -1483,7 +1496,7 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let end_tok = self.expect(&Token::End)?;
+        let end_tok = self.expect_in(&Token::End, "CASE expression")?;
         let span = SourceSpan::new(case_span.start, end_tok.span.end);
         Ok(Expression {
             kind: ExpressionKind::Case {
@@ -1984,5 +1997,62 @@ mod tests {
         // make sure that path actually parses.
         let q = ok("MATCH (n:`MATCH`) RETURN n");
         assert_eq!(q.head.clauses.len(), 2);
+    }
+
+    #[test]
+    fn missing_close_paren_in_node_pattern_names_the_production() {
+        let err = first_err("MATCH (n:Person RETURN n");
+        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        let help = err.help.as_deref().expect("expected contextual help");
+        assert!(
+            help.contains("node pattern"),
+            "help should name the production, was: {help}"
+        );
+    }
+
+    #[test]
+    fn missing_close_bracket_in_rel_pattern_names_the_production() {
+        let err = first_err("MATCH (a)-[r:KNOWS-(b) RETURN b");
+        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        let help = err.help.as_deref().expect("expected contextual help");
+        assert!(
+            help.contains("relationship pattern"),
+            "help should name the production, was: {help}"
+        );
+    }
+
+    #[test]
+    fn missing_close_brace_in_map_literal_names_the_production() {
+        let err = first_err("MATCH (n {name: 'a' RETURN n");
+        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        let help = err.help.as_deref().expect("expected contextual help");
+        assert!(
+            help.contains("map literal"),
+            "help should name the production, was: {help}"
+        );
+    }
+
+    #[test]
+    fn missing_close_paren_in_function_call_names_the_production() {
+        let err = first_err("RETURN count(* AS n");
+        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        let help = err.help.as_deref().expect("expected contextual help");
+        assert!(
+            help.contains("function call"),
+            "help should name the production, was: {help}"
+        );
+    }
+
+    #[test]
+    fn missing_close_bracket_in_list_literal_names_the_production() {
+        let err = first_err("RETURN [1, 2, 3");
+        // `[` enters parse_list_or_list_comprehension; an unterminated
+        // list bottoms out in the RBracket expect.
+        assert_eq!(err.code, ErrorCode::UnexpectedEof);
+        let help = err.help.as_deref().expect("expected contextual help");
+        assert!(
+            help.contains("list literal"),
+            "help should name the production, was: {help}"
+        );
     }
 }
