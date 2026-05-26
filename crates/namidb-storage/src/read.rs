@@ -658,6 +658,62 @@ impl<'mt> Snapshot<'mt> {
         set.into_iter().collect()
     }
 
+    /// Observed property names and types for `label`, merging the
+    /// declared `LabelDef` with `PropertyColumnStats` from every node
+    /// SST in scope.
+    ///
+    /// Declared properties always win — their `data_type` is
+    /// authoritative even when the column also has SST stats. For
+    /// labels where every property is declared (the common case) this
+    /// is equivalent to reading `schema.label(name).properties` and
+    /// stopping there.
+    ///
+    /// SST stats are consulted as a fallback for the corner cases
+    /// where the declared schema and the persisted columns drift apart
+    /// (e.g. a schema migration removed a property after some SSTs
+    /// already shipped). All-NULL columns end up out of the returned
+    /// map; the writer never saw a non-null value to record.
+    ///
+    /// What this method does *not* report: properties supplied at
+    /// `CREATE` time without a matching `PropertyDef`. The flush path
+    /// drops those into the `__overflow_json` stream (RFC-002 §2.1)
+    /// rather than into typed columns, so the manifest has no type
+    /// information to surface. Schema-introspection callers that need
+    /// those still have to sample the actual data.
+    pub fn observed_property_types_for_label(
+        &self,
+        label: &str,
+    ) -> std::collections::BTreeMap<String, namidb_core::DataType> {
+        use std::collections::BTreeMap;
+        let mut out: BTreeMap<String, namidb_core::DataType> = BTreeMap::new();
+        if let Some(def) = self.manifest.manifest.schema.labels.get(label) {
+            for prop in &def.properties {
+                out.insert(prop.name.clone(), prop.data_type.clone());
+            }
+        }
+        for sst in &self.manifest.manifest.ssts {
+            if !matches!(sst.kind, SstKind::Nodes) || sst.scope != label {
+                continue;
+            }
+            for stat in &sst.property_stats {
+                // PropertyColumnStats names carry the `prop_` Arrow
+                // prefix; strip it before comparing against the
+                // user-facing property name.
+                let name = stat
+                    .name
+                    .strip_prefix("prop_")
+                    .unwrap_or(stat.name.as_str());
+                if out.contains_key(name) {
+                    continue;
+                }
+                if let Some(dt) = stat.observed_data_type() {
+                    out.insert(name.to_string(), dt);
+                }
+            }
+        }
+        out
+    }
+
     /// Look up a single node by `(label, id)`. Returns `None` for both
     /// "never inserted" and "winning record is a tombstone" outcomes.
     #[instrument(skip(self), fields(label = label, id = %id))]
@@ -3761,5 +3817,131 @@ mod tests {
         assert!(ep.src_label.is_none());
         assert!(ep.dst_label.is_none());
         assert!(ep.inferred);
+    }
+
+    #[tokio::test]
+    async fn observed_property_types_returns_declared_when_no_ssts() {
+        let store = make_store();
+        let paths = make_paths("schema-props-declared-only");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+        let mt = Memtable::new();
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &view, store, paths);
+
+        let props = snap.observed_property_types_for_label("Person");
+        assert_eq!(props.len(), 2);
+        assert_eq!(props.get("name"), Some(&DataType::Utf8));
+        assert_eq!(props.get("age"), Some(&DataType::Int32));
+    }
+
+    #[tokio::test]
+    async fn observed_property_types_falls_back_to_sst_stats_when_schema_drifts() {
+        // Real-world hook: a schema migration removed a property
+        // (`age`) but SSTs from before the migration still ship column
+        // stats for it. The schema-introspection caller wants to know
+        // the column is still observable so it can warn the user, and
+        // the SST stats carry enough type info via min/max to surface
+        // it without opening the parquet body.
+        use crate::manifest::{KindSpecificStats, SstDescriptor, SstKind, SstLevel};
+        use crate::sst::bloom::BloomDescriptor;
+        use crate::sst::stats::{PropertyColumnStats, StatScalar};
+        use chrono::Utc;
+
+        let store = make_store();
+        let paths = make_paths("schema-props-drift");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.schema = SchemaBuilder::new()
+            // Declared schema only knows about `name`.
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+            })
+            .unwrap()
+            .build();
+        // Inject a stale SST descriptor that still reports an `age`
+        // column from before the migration.
+        base.manifest.ssts.push(SstDescriptor {
+            id: Uuid::now_v7(),
+            kind: SstKind::Nodes,
+            scope: "Person".into(),
+            level: SstLevel::L0,
+            path: "stale.parquet".into(),
+            size_bytes: 1,
+            row_count: 1,
+            created_at: Utc::now(),
+            min_key: [0u8; 16],
+            max_key: [0u8; 16],
+            min_lsn: 1,
+            max_lsn: 1,
+            schema_version_min: 1,
+            schema_version_max: 1,
+            property_stats: vec![
+                PropertyColumnStats {
+                    name: "prop_name".into(),
+                    null_count: 0,
+                    min: Some(StatScalar::Utf8("a".into())),
+                    max: Some(StatScalar::Utf8("z".into())),
+                    ndv_estimate: None,
+                },
+                PropertyColumnStats {
+                    name: "prop_age".into(),
+                    null_count: 0,
+                    min: Some(StatScalar::Int32(18)),
+                    max: Some(StatScalar::Int32(90)),
+                    ndv_estimate: None,
+                },
+            ],
+            kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
+            bloom: None::<BloomDescriptor>,
+            unique_property_indices: Vec::new(),
+        });
+        let mt = Memtable::new();
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(base, &view, store, paths);
+
+        let props = snap.observed_property_types_for_label("Person");
+        // Declared property keeps its declared type.
+        assert_eq!(props.get("name"), Some(&DataType::Utf8));
+        // Stale SST-only column surfaces from the recorded scalar.
+        assert_eq!(props.get("age"), Some(&DataType::Int32));
+    }
+
+    #[tokio::test]
+    async fn observed_property_types_declared_overrides_sst_stats() {
+        // Declared properties win even when an SST exists. This
+        // matters for properties whose declared type is wider than the
+        // observed values (e.g. `Int64` declared, `Int32` observed).
+        let store = make_store();
+        let paths = make_paths("schema-props-declared-wins");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+        let alice = sorted_node_id(1);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id: alice,
+            },
+            1,
+            MemOp::Upsert(node_payload("Alice", Some(30))),
+        );
+        let frozen = mt.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &view, store, paths);
+
+        let props = snap.observed_property_types_for_label("Person");
+        // person_label() declares age as Int32. Even though the writer
+        // happens to store it as Int64 in the SST, the declared type
+        // is what surfaces in the schema introspection.
+        assert_eq!(props.get("age"), Some(&DataType::Int32));
     }
 }
