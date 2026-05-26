@@ -948,11 +948,7 @@ enum MergeTail<'a> {
 }
 
 impl<'a> MergeTail<'a> {
-    fn resolve(
-        alias: &str,
-        nodes: &MergeNodeMap<'a>,
-        outer_row: &Row,
-    ) -> Result<Self, ExecError> {
+    fn resolve(alias: &str, nodes: &MergeNodeMap<'a>, outer_row: &Row) -> Result<Self, ExecError> {
         if let Some((label, props)) = nodes.get(alias).copied() {
             return Ok(MergeTail::Fresh { label, props });
         }
