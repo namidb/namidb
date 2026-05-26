@@ -596,3 +596,95 @@ async fn bare_list_literal_still_rejected_without_vector_wrapper() {
         msg
     );
 }
+
+#[tokio::test]
+async fn merge_pattern_property_reads_outer_row_binding() {
+    // UNWIND introduces a row-local alias that the MERGE pattern's
+    // properties expression should read against the current outer row.
+    // Without that wiring the match-or-create decision falls through
+    // and the writer ends up creating one node per call to MERGE.
+    let mut writer = WriterSession::open(store(), paths("w-merge-outer-row"))
+        .await
+        .unwrap();
+    // Seed an existing Ada so the first iteration must MATCH, not CREATE.
+    let setup = parse("CREATE (a:Person {name: 'Ada', age: 36}) RETURN a").unwrap();
+    let plan = lower(&setup).unwrap();
+    execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+
+    let q = parse(
+        "UNWIND ['Ada', 'Bob'] AS who \
+         MERGE (a:Person {name: who}) \
+         RETURN a.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+
+    // Ada already existed, so MERGE should match it. Bob is new, so
+    // MERGE creates exactly one node.
+    assert_eq!(outcome.nodes_created, 1);
+    let names: Vec<&str> = outcome
+        .rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Ada", "Bob"]);
+
+    // Rerunning the same query must be idempotent.
+    let outcome2 = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome2.nodes_created, 0);
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    assert_eq!(nodes.len(), 2);
+}
+
+#[tokio::test]
+async fn merge_rel_over_matched_nodes_is_idempotent() {
+    // MATCH (a), MATCH (b), MERGE (a)-[r:KNOWS]->(b). The MERGE needs
+    // to see the matched a and b on the outer row and decide whether
+    // to create the edge or reuse it.
+    let mut writer = WriterSession::open(store(), paths("w-merge-rel-over-match"))
+        .await
+        .unwrap();
+    let setup = parse(
+        "CREATE (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         RETURN a, b",
+    )
+    .unwrap();
+    let plan = lower(&setup).unwrap();
+    execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+
+    let q = parse(
+        "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) \
+         RETURN r",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome1 = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome1.nodes_created, 0);
+    assert_eq!(outcome1.edges_created, 1);
+
+    // Rerun: edge already exists, MERGE must reuse it.
+    let outcome2 = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome2.nodes_created, 0);
+    assert_eq!(
+        outcome2.edges_created, 0,
+        "second MERGE should not duplicate the edge"
+    );
+}
