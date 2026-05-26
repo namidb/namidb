@@ -32,6 +32,27 @@ impl PropertyColumnStats {
             ndv_estimate: None,
         }
     }
+
+    /// Best-effort `DataType` derived from the recorded min/max scalar.
+    ///
+    /// Returns `None` for an all-NULL column where the writer never
+    /// saw a non-null value to record. Schema-introspection callers
+    /// can fall back to `null` / unknown in that case.
+    pub fn observed_data_type(&self) -> Option<DataType> {
+        let scalar = self.min.as_ref().or(self.max.as_ref())?;
+        Some(match scalar {
+            StatScalar::Bool(_) => DataType::Bool,
+            StatScalar::Int32(_) => DataType::Int32,
+            StatScalar::Int64(_) => DataType::Int64,
+            StatScalar::Float32(_) => DataType::Float32,
+            StatScalar::Float64(_) => DataType::Float64,
+            StatScalar::Utf8(_) => DataType::Utf8,
+            StatScalar::LargeUtf8(_) => DataType::LargeUtf8,
+            StatScalar::Binary(_) => DataType::Binary,
+            StatScalar::Date32(_) => DataType::Date32,
+            StatScalar::TimestampMicrosUtc(_) => DataType::TimestampMicrosUtc,
+        })
+    }
 }
 
 /// Per-type literal stat value, mirroring the cases of `DataType` we expose
