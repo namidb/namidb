@@ -1,11 +1,17 @@
 //! Pretty-printer for [`LogicalPlan`].
 //!
-//! Produces an indented tree representation that humans can read and
-//! tests can assert on. The format is stable enough for `EXPLAIN`-style
-//! output but is not a wire format — RFC future may JSON-encode it for
-//! PROFILE.
+//! Two output shapes:
+//!
+//! * `explain*` — indented tree string, stable enough to assert on in
+//!   tests and to paste into bug reports.
+//! * `explain_tree*` — `ExplainNode` struct (`Serialize`) for callers
+//!   that want to render the plan in their own UI. The crate does not
+//!   depend on `serde_json`; downstreams (e.g. the cloud worker) handle
+//!   the JSON conversion themselves.
 
 use std::fmt::Write;
+
+use serde::Serialize;
 
 use namidb_storage::sst::predicates::ScanPredicate;
 use namidb_storage::sst::stats::StatScalar;
@@ -15,6 +21,33 @@ use super::lower::{lower, LowerError};
 use crate::cost::{estimate, Cardinality, StatsCatalog};
 use crate::optimize::{is_join_candidate, optimize, produced_aliases};
 use crate::parser::{OrderDirection, Query, RelationshipDirection};
+
+/// Structured rendering of a [`LogicalPlan`] node. `summary` is the
+/// same one-line shape that `explain` emits per operator; the optional
+/// fields are populated by the `*_verbose` variants when a cost catalog
+/// is available.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ExplainNode {
+    /// One-line operator description (`NodeScan label=Person alias=a`).
+    pub summary: String,
+    /// Cardinality estimate for this operator. Only populated by the
+    /// verbose tree builders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_rows: Option<u64>,
+    /// Sum of estimates from the root downwards. Populated only on the
+    /// root node of a verbose tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_total_work: Option<u64>,
+    /// `true` when a `Filter` over `CrossProduct` could be turned into a
+    /// hash join by [`crate::optimize::convert_cross_to_hash`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_candidate: Option<bool>,
+    /// `true` when the optimiser had no catalog stats for this
+    /// operator's label / edge type. Lets callers warn the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_stats: Option<bool>,
+    pub children: Vec<ExplainNode>,
+}
 
 /// Render `plan` as an indented tree string. Each operator takes one
 /// line; children are indented by two spaces.
@@ -77,6 +110,126 @@ pub fn explain_query_raw_verbose(
 ) -> Result<String, LowerError> {
     let plan = lower(query)?;
     Ok(explain_verbose(&plan, catalog))
+}
+
+/// Build an [`ExplainNode`] tree from `plan`. Same shape as
+/// [`explain`] but structured — each operator gets its own node so
+/// callers can render the plan in tables, JSON, or whatever wire
+/// format they prefer.
+pub fn explain_tree(plan: &LogicalPlan) -> ExplainNode {
+    node_to_tree(plan)
+}
+
+/// Build a verbose [`ExplainNode`] tree with cardinality estimates,
+/// `join_candidate` flags, and `no_stats` markers. Only the root node
+/// carries `estimated_total_work`.
+pub fn explain_tree_verbose(plan: &LogicalPlan, catalog: &StatsCatalog) -> ExplainNode {
+    let card = estimate(plan, catalog);
+    let mut root = node_to_tree_verbose(plan, &card, catalog);
+    root.estimated_total_work = Some(format_rows(sum_rows(&card)));
+    root
+}
+
+/// Lower `query` and build a structured tree. Convenience wrapper for
+/// the equivalent of `EXPLAIN <query>` returning JSON-friendly data.
+pub fn explain_query_tree(query: &Query) -> Result<ExplainNode, LowerError> {
+    let plan = lower(query)?;
+    Ok(explain_tree(&plan))
+}
+
+/// Lower, optimize, and render a verbose structured tree. The
+/// equivalent of `EXPLAIN VERBOSE <query>` returning data instead of a
+/// formatted string.
+pub fn explain_query_tree_verbose(
+    query: &Query,
+    catalog: &StatsCatalog,
+) -> Result<ExplainNode, LowerError> {
+    let plan = optimize(lower(query)?, catalog);
+    Ok(explain_tree_verbose(&plan, catalog))
+}
+
+/// Lower without the optimiser pipeline and return a structured tree.
+/// Equivalent of `EXPLAIN RAW <query>`.
+pub fn explain_query_raw_tree(query: &Query) -> Result<ExplainNode, LowerError> {
+    let plan = lower(query)?;
+    Ok(explain_tree(&plan))
+}
+
+/// Lower without the optimiser pipeline and return a verbose
+/// structured tree. Equivalent of `EXPLAIN RAW VERBOSE <query>`.
+pub fn explain_query_raw_tree_verbose(
+    query: &Query,
+    catalog: &StatsCatalog,
+) -> Result<ExplainNode, LowerError> {
+    let plan = lower(query)?;
+    Ok(explain_tree_verbose(&plan, catalog))
+}
+
+fn node_to_tree(plan: &LogicalPlan) -> ExplainNode {
+    let mut summary = String::new();
+    write_header(plan, &mut summary);
+    let children = plan.children().iter().map(|c| node_to_tree(c)).collect();
+    ExplainNode {
+        summary,
+        estimated_rows: None,
+        estimated_total_work: None,
+        join_candidate: None,
+        no_stats: None,
+        children,
+    }
+}
+
+fn node_to_tree_verbose(
+    plan: &LogicalPlan,
+    card: &Cardinality,
+    catalog: &StatsCatalog,
+) -> ExplainNode {
+    let mut summary = String::new();
+    write_header(plan, &mut summary);
+    let join_candidate = if let LogicalPlan::Filter { input, predicate } = plan {
+        if let LogicalPlan::CrossProduct { left, right } = input.as_ref() {
+            if is_join_candidate(predicate, &produced_aliases(left), &produced_aliases(right)) {
+                Some(true)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let no_stats = if plan_has_stats(plan, catalog) {
+        None
+    } else {
+        Some(true)
+    };
+    let child_plans = plan.children();
+    let children = child_plans
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let child_card = card
+                .children
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Cardinality {
+                    rows: 0.0,
+                    children: vec![],
+                    bindings: Default::default(),
+                    operator: "?",
+                });
+            node_to_tree_verbose(c, &child_card, catalog)
+        })
+        .collect();
+    ExplainNode {
+        summary,
+        estimated_rows: Some(format_rows(card.rows)),
+        estimated_total_work: None,
+        join_candidate,
+        no_stats,
+        children,
+    }
 }
 
 fn write_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
@@ -998,5 +1151,90 @@ TopN keys=[b DESC] limit=10
         let s = explain(&p);
         assert!(s.contains("Aggregate"));
         assert!(s.contains("count(*)"));
+    }
+
+    #[test]
+    fn explain_tree_returns_structured_nodes() {
+        let scan = LogicalPlan::NodeScan {
+            label: Some("Person".into()),
+            alias: "a".into(),
+            predicates: vec![],
+            projection: None,
+        };
+        let expand = LogicalPlan::Expand {
+            input: Box::new(scan),
+            source: "a".into(),
+            edge_type: Some(vec!["KNOWS".into()]),
+            direction: RelationshipDirection::Right,
+            rel_alias: Some("r".into()),
+            target_alias: "b".into(),
+            target_label: None,
+            length: None,
+            optional: false,
+            back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
+        };
+        let tree = explain_tree(&expand);
+        assert_eq!(
+            tree.summary,
+            "Expand source=a edge_type=KNOWS dir=-> rel=r target=b"
+        );
+        assert_eq!(tree.estimated_rows, None);
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].summary, "NodeScan label=Person alias=a");
+        assert!(tree.children[0].children.is_empty());
+    }
+
+    #[test]
+    fn explain_tree_verbose_carries_estimates() {
+        let cat = micro_catalog();
+        let plan = LogicalPlan::Expand {
+            input: Box::new(LogicalPlan::NodeScan {
+                label: Some("Person".into()),
+                alias: "a".into(),
+                predicates: vec![],
+                projection: None,
+            }),
+            source: "a".into(),
+            edge_type: Some(vec!["KNOWS".into()]),
+            direction: RelationshipDirection::Right,
+            rel_alias: None,
+            target_alias: "b".into(),
+            target_label: Some("Person".into()),
+            length: None,
+            optional: false,
+            back_reference: false,
+            shortest: ShortestMode::None,
+            path_binding: None,
+        };
+        let tree = explain_tree_verbose(&plan, &cat);
+        assert_eq!(tree.estimated_rows, Some(500));
+        assert_eq!(tree.estimated_total_work, Some(600));
+        assert_eq!(tree.no_stats, None);
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].estimated_rows, Some(100));
+        // Only the root carries total_work.
+        assert_eq!(tree.children[0].estimated_total_work, None);
+    }
+
+    #[test]
+    fn explain_tree_verbose_marks_missing_stats() {
+        let cat = StatsCatalog::empty();
+        let plan = LogicalPlan::NodeScan {
+            label: Some("Unknown".into()),
+            alias: "a".into(),
+            predicates: vec![],
+            projection: None,
+        };
+        let tree = explain_tree_verbose(&plan, &cat);
+        assert_eq!(tree.no_stats, Some(true));
+    }
+
+    #[test]
+    fn explain_query_tree_lowers_and_returns_root() {
+        let q = crate::parser::parse("MATCH (a:Person) RETURN a").unwrap();
+        let tree = explain_query_tree(&q).unwrap();
+        assert!(tree.summary.contains("Project"));
     }
 }
