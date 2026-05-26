@@ -18,8 +18,11 @@
 pub mod cost;
 pub mod exec;
 pub mod optimize;
+pub mod pagination;
 pub mod parser;
 pub mod plan;
+
+pub use pagination::{next_cursor, paginate_plan, Cursor, CursorError};
 
 pub use cost::{
     estimate, BindingMeta, Cardinality, EdgeTypeStats, LabelStats, PropStats, StatsCatalog,
