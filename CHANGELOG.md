@@ -21,6 +21,31 @@ below and in the release notes.
 
 ---
 
+## [0.5.1] - 2026-05-27: Value::Bytes JSON round-trip
+
+### Fixed
+
+- **`Value::Bytes` round-trips through `__overflow_json` again.** The
+  serialiser wrote bytes as an untagged JSON array (`[0, 1, 2]`); the
+  deserialiser's `visit_seq` could not tell that apart from a
+  `Vec<f32>` vector and silently turned the blob into a float vector
+  on the way back. The smoke test `test_property_types_roundtrip`
+  caught the regression at release time. Fixed by tagging bytes as
+  `{"$bytes": [0, 1, 2]}` (matching the `$date` / `$datetime` /
+  `$list` / `$map` shapes already in this module). Old SST bodies
+  that still encode bytes untagged keep decoding as `Vec<f32>` —
+  forward compatible, no backfill required.
+
+### Breaking
+
+- (pre-1.0 semver-relax) Newly-written `Value::Bytes` use the tagged
+  JSON wire shape. Downstream services that parsed the bytes-as-array
+  shape directly must accept the tagged form going forward. SST
+  bodies written before 0.5.1 keep working through the legacy
+  untagged path.
+
+---
+
 ## [0.5.0] - 2026-05-26: cloud-readiness sweep
 
 ### Added

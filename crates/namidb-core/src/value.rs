@@ -23,6 +23,13 @@ const TAG_LIST: &str = "$list";
 /// Tag for `Value::Map(...)` — disambiguates from the `{}` shape that
 /// Date / DateTime already use.
 const TAG_MAP: &str = "$map";
+/// Tag for `Value::Bytes(...)`. Without this, `serde_json` encodes
+/// bytes as an untagged number array and the deserialiser's
+/// `visit_seq` cannot tell them apart from a `Vec<f32>` vector,
+/// silently turning `b"\x00\x01\x02"` into `Vec([0.0, 1.0, 2.0])`
+/// on the way back. The tagged form `{"$bytes": [0, 1, 2]}` keeps
+/// the type stable through `__overflow_json`.
+const TAG_BYTES: &str = "$bytes";
 
 /// A single property value. Loose, JSON-ish.
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +124,11 @@ impl Serialize for Value {
             Value::I64(n) => s.serialize_i64(*n),
             Value::F64(f) => s.serialize_f64(*f),
             Value::Str(v) => s.serialize_str(v),
-            Value::Bytes(b) => s.serialize_bytes(b),
+            Value::Bytes(b) => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry(TAG_BYTES, b)?;
+                m.end()
+            }
             Value::Vec(v) => v.serialize(s),
             Value::Date(d) => {
                 let mut m = s.serialize_map(Some(1))?;
@@ -235,9 +246,16 @@ impl<'de> Deserialize<'de> for Value {
                         }
                         Ok(Value::Map(entries))
                     }
+                    TAG_BYTES => {
+                        let bytes: Vec<u8> = map.next_value()?;
+                        if map.next_key::<String>()?.is_some() {
+                            return Err(de::Error::custom("$bytes map must have exactly one key"));
+                        }
+                        Ok(Value::Bytes(bytes))
+                    }
                     other => Err(de::Error::unknown_field(
                         other,
-                        &[TAG_DATE, TAG_DATETIME, TAG_LIST, TAG_MAP],
+                        &[TAG_DATE, TAG_DATETIME, TAG_LIST, TAG_MAP, TAG_BYTES],
                     )),
                 }
             }
@@ -276,6 +294,15 @@ mod tests {
         ] {
             assert_eq!(round(&v), v);
         }
+    }
+
+    #[test]
+    fn value_bytes_roundtrip_through_json() {
+        let v = Value::Bytes(vec![0u8, 1, 2]);
+        let json = serde_json::to_string(&v).unwrap();
+        eprintln!("bytes serialized as: {json}");
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v, "bytes must round-trip; got {back:?}");
     }
 
     #[test]
