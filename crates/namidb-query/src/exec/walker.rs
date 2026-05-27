@@ -131,7 +131,14 @@ pub(crate) fn execute_inner_with_routing<'a>(
     routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
     async move {
-        match plan {
+        // PROFILE hook: when the caller wrapped this `execute` in a
+        // `ProfileCollector` scope, time every operator and stash the
+        // result against its node pointer. The pointer is stable for
+        // the duration of one `execute` because the plan is borrowed
+        // for `'a` and not mutated; `profile_query_tree` consults the
+        // same collector to attribute stats per operator.
+        let profile_start = crate::profile::collector_present().then(std::time::Instant::now);
+        let result = match plan {
             LogicalPlan::Empty => Ok(vec![Row::new()]),
 
             LogicalPlan::Argument { bindings } => {
@@ -606,7 +613,13 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 execute_aggregate(rows, group_by, aggregations, params)
             }
+        };
+        if let Some(start) = profile_start {
+            if let Ok(rows) = &result {
+                crate::profile::record_op(plan, start.elapsed(), rows.len() as u64);
+            }
         }
+        result
     }
     .boxed()
 }
