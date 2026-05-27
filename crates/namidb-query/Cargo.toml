@@ -29,3 +29,4 @@ proptest = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
 chrono = { workspace = true }
+serde_json = { workspace = true }

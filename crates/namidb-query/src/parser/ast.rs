@@ -7,6 +7,8 @@
 //! The shapes follow openCypher 9 with the GQL ISO/IEC 39075:2024 naming
 //! where the two diverge. The v0 subset is declared in RFC-004.
 
+use serde::{Deserialize, Serialize};
+
 use super::error::SourceSpan;
 
 // ────────────────────────────────────────────────────────────────────
@@ -22,7 +24,7 @@ use super::error::SourceSpan;
 /// estimates from the [`StatsCatalog`] (RFC-010).
 ///
 /// [`StatsCatalog`]: crate::cost::StatsCatalog
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Query {
     pub head: SingleQuery,
     pub tail: Vec<UnionPart>,
@@ -36,7 +38,7 @@ pub struct Query {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnionPart {
     pub all: bool,
     pub query: SingleQuery,
@@ -44,7 +46,7 @@ pub struct UnionPart {
 }
 
 /// A linear sequence of clauses sharing one scope chain.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SingleQuery {
     pub clauses: Vec<Clause>,
     pub span: SourceSpan,
@@ -54,7 +56,7 @@ pub struct SingleQuery {
 // Clauses
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Clause {
     Match(MatchClause),
     Return(ReturnClause),
@@ -85,7 +87,7 @@ impl Clause {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MatchClause {
     pub optional: bool,
     pub patterns: Vec<PatternPart>,
@@ -93,7 +95,7 @@ pub struct MatchClause {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReturnClause {
     pub distinct: bool,
     pub items: Vec<ProjectionItem>,
@@ -103,7 +105,7 @@ pub struct ReturnClause {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WithClause {
     pub distinct: bool,
     pub items: Vec<ProjectionItem>,
@@ -117,52 +119,52 @@ pub struct WithClause {
 /// Free-standing `WHERE` is illegal in Cypher — `WHERE` lives inside `MATCH`
 /// or `WITH`. We keep `WhereClause` only to centralise the lowered form once
 /// hits; the parser never emits it directly.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WhereClause {
     pub predicate: Expression,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnwindClause {
     pub list: Expression,
     pub alias: Identifier,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateClause {
     pub patterns: Vec<PatternPart>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergeClause {
     pub pattern: PatternPart,
     pub actions: Vec<MergeAction>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergeAction {
     pub on: MergeTrigger,
     pub sets: Vec<SetItem>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeTrigger {
     Match,
     Create,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SetClause {
     pub items: Vec<SetItem>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SetItem {
     /// `a.prop = value`
     Property {
@@ -201,13 +203,13 @@ impl SetItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RemoveClause {
     pub items: Vec<RemoveItem>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RemoveItem {
     Property(PropertyAccess),
     Labels {
@@ -217,7 +219,7 @@ pub enum RemoveItem {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeleteClause {
     pub detach: bool,
     pub targets: Vec<Expression>,
@@ -228,21 +230,21 @@ pub struct DeleteClause {
 // Projection
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionItem {
     pub expression: Expression,
     pub alias: Option<Identifier>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrderItem {
     pub expression: Expression,
     pub direction: OrderDirection,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderDirection {
     Asc,
     Desc,
@@ -254,7 +256,7 @@ pub enum OrderDirection {
 
 /// A pattern part is one chain `(a)-[r]->(b)-[s]->(c) ...` optionally bound
 /// to a path variable: `p = (a)-[r]->(b)`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PatternPart {
     pub binding: Option<Identifier>,
     pub element: PatternElement,
@@ -267,7 +269,7 @@ pub struct PatternPart {
 }
 
 /// Shortest-path variant a [`PatternPart`] was wrapped in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShortestPathMode {
     /// `shortestPath(...)` — one path per (source, target) pair.
     First,
@@ -276,14 +278,14 @@ pub enum ShortestPathMode {
 }
 
 /// A pattern element starts with a node and alternates relationship→node.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PatternElement {
     pub head: NodePattern,
     pub chain: Vec<(RelationshipPattern, NodePattern)>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodePattern {
     pub binding: Option<Identifier>,
     pub labels: Vec<Identifier>,
@@ -291,7 +293,7 @@ pub struct NodePattern {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RelationshipPattern {
     pub direction: RelationshipDirection,
     pub binding: Option<Identifier>,
@@ -310,7 +312,7 @@ pub struct RelationshipPattern {
 /// supply a map value for the parameter; at lower time we cannot know
 /// the keys, so the executor expands the map into properties when it
 /// sees the parameter spread.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PatternProperties {
     Literal(MapLiteral),
     Parameter { name: String, span: SourceSpan },
@@ -325,7 +327,7 @@ impl PatternProperties {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationshipDirection {
     /// `-->`
     Right,
@@ -337,7 +339,7 @@ pub enum RelationshipDirection {
 
 /// `*1..3` — variable-length range. Bounds are inclusive; both required by
 /// RFC-004 (no unbounded `*` or `*1..`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationshipLength {
     pub min: u32,
     pub max: u32,
@@ -347,13 +349,13 @@ pub struct RelationshipLength {
 // Expressions
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Expression {
     pub kind: ExpressionKind,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ExpressionKind {
     Literal(Literal),
     Variable(Identifier),
@@ -414,21 +416,21 @@ pub enum ExpressionKind {
     Star,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PropertyAccess {
     pub target: Expression,
     pub key: Identifier,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaseBranch {
     pub when: Expression,
     pub then: Expression,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ListComprehension {
     pub variable: Identifier,
     pub list: Expression,
@@ -437,7 +439,7 @@ pub struct ListComprehension {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PatternComprehension {
     pub binding: Option<Identifier>,
     pub pattern: PatternElement,
@@ -446,7 +448,7 @@ pub struct PatternComprehension {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
     Integer(i64),
     Float(f64),
@@ -455,19 +457,19 @@ pub enum Literal {
     Null,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapLiteral {
     pub entries: Vec<(Identifier, Expression)>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Neg,
     Not,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -487,7 +489,7 @@ pub enum BinaryOp {
     RegexMatch,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringOp {
     StartsWith,
     EndsWith,
@@ -498,7 +500,7 @@ pub enum StringOp {
 // Identifier
 // ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Identifier {
     pub name: String,
     pub span: SourceSpan,
@@ -527,7 +529,7 @@ impl Identifier {
 /// A name with optional namespace, e.g. `count`, `date.truncate`. Used for
 /// function calls. v0 keeps the namespace open-ended; the grammar only
 /// recognises `name` and `name.name`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QualifiedName {
     pub segments: Vec<Identifier>,
     pub span: SourceSpan,
