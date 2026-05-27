@@ -24,7 +24,10 @@ pub mod plan;
 pub mod plan_cache;
 pub mod profile;
 
-pub use pagination::{next_cursor, paginate_plan, Cursor, CursorError};
+pub use pagination::{
+    next_cursor, next_cursor_keyset, paginate_plan, paginate_plan_keyset, Cursor, CursorError,
+    CursorKeyset,
+};
 pub use plan_cache::{parse_lower_optimize, query_text_hash, PlanError};
 pub use profile::{profile_query_tree, ProfileError};
 
