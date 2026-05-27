@@ -13,6 +13,162 @@ below and in the release notes.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Breaking
+
+---
+
+## [0.5.0] - 2026-05-26: cloud-readiness sweep
+
+### Added
+
+- **`profile_query_tree` with per-operator runtime stats.** PROFILE
+  now reports `rows_returned` and `elapsed_us` on every operator in
+  the returned `ExplainNode`, not only the root. Plumbed through a
+  `ProfileCollector` scoped on `tokio::task_local!` so a plain
+  `execute` (no scope) keeps its baseline cost. Times are inclusive
+  (parent includes children). Per-op `attribute_profiles` walks the
+  plan and explain trees in lockstep, keying by stable `LogicalPlan`
+  pointer.
+- **`profile.rs` module** exposing `ProfileCollector`,
+  `profile_query_tree`, `ProfileError`, plus `RuntimeStats` on
+  `ExplainNode` (`Option<RuntimeStats>` field, `#[serde(skip)]` when
+  absent so existing EXPLAIN JSON payloads stay byte-compatible).
+- **Structured `ExplainNode` tree** alongside the existing string
+  renderer (`explain_tree`, `explain_tree_verbose`,
+  `explain_query_tree*`). The cloud worker / CLI consume the
+  `Serialize` shape directly without depending on `serde_json` from
+  this crate.
+- **`pagination.rs`: offset cursors (`v1`).** `Cursor`, `CursorError`,
+  `paginate_plan`, `next_cursor`. Wire shape `v1:<decimal-skip>`.
+  Wraps the plan in a `TopN { skip, limit }` and is the
+  zero-assumptions default the dashboard's paginated tables hit.
+- **`pagination.rs`: keyset cursors (`v2`).** `CursorKeyset` with
+  `encode` / `decode`, `paginate_plan_keyset`, `next_cursor_keyset`.
+  Rewrites the plan into `WHERE alias._id > cursor.last_id ORDER BY
+  alias._id ASC LIMIT page_size` so deep pages stay flat in cost.
+  Plan-hash mismatch must reject the request — documented as caller
+  contract.
+- **`plan_cache.rs`: plan-cache helpers.** `query_text_hash` produces
+  a stable xxh3-64 fingerprint of a Cypher query with whitespace
+  normalised. `parse_lower_optimize(text, catalog)` is the one-shot
+  entry point the cache wraps. Cache key layout the caller is
+  expected to wire up: `format!("{ENGINE_VERSION}:{hash}")`.
+- **`LogicalPlan` + AST: `Serialize` / `Deserialize` derives.**
+  Every node (LogicalPlan, AggregateExpr, CreateElement, SetOp,
+  RemoveOp, ShortestMode, OrderKey, Expression, Literal, MapLiteral,
+  PatternProperties, NodePattern, RelationshipPattern, …) plus
+  `SourceSpan` and storage `ScanPredicate` derive serde. Cross-process
+  plan caches (Redis, R2, Supabase) can round-trip a cached plan
+  byte-for-byte.
+- **`Snapshot::observed_edge_endpoints`.** For declared edge types
+  the endpoints come straight from `EdgeTypeDef`. For undeclared
+  types we sample one upserted edge per type and resolve its
+  endpoint labels via the memtable's `NodeId → label` map with a
+  `lookup_node` fallback for SST-resident endpoints. Carries an
+  `inferred` flag.
+- **`Snapshot::observed_property_types_for_label`** + new
+  `PropertyColumnStats::observed_data_type`. Merges the declared
+  `LabelDef` with SST `PropertyColumnStats` so the schema response
+  reports property types even when the namespace skipped
+  `SchemaBuilder`.
+- **`Value::List(Vec<Value>)` and `Value::Map(BTreeMap<String, Value>)`**
+  in `namidb-core`. JSON-tagged as `{"$list": [...]}` and `{"$map":
+  {...}}` so the typing survives a `__overflow_json` round-trip and
+  bare JSON arrays keep decoding as `Vec<f32>`. The executor accepts
+  list and map runtime values; declared columns stay scalar-only
+  (separate RFC).
+- **`CREATE (n:L $params)`: parameter-as-map property spread.** New
+  `PatternProperties` enum on `NodePattern` / `RelationshipPattern`
+  (`Literal` | `Parameter`). `CreateElement` grows a
+  `properties_spread: Option<Expression>` the executor merges into
+  the new node / edge at runtime. Explicit literal entries still
+  win on key collisions. MATCH / MERGE patterns accept the syntax
+  too but lower rejects them today with a clear pointer to the
+  WHERE alternative.
+- **`expect_in(token, ctx)` helper in the parser** + contextual
+  `help:` line on six closing-token sites (node pattern,
+  relationship pattern, map literal, function call arguments, list
+  literal, `CASE` expression). `E001` payloads now say "while parsing
+  node pattern" instead of the bare token name.
+- **`Cursor`'s namespace got namesake structured `ExplainNode`
+  variants** (`explain_query_raw_tree`, `explain_query_raw_tree_verbose`)
+  so callers can render the pre-optimise plan in the same shape as
+  the optimised one.
+- **`MemtableSnapshotFile` cold-start fast path** +
+  `WriterSession::write_memtable_snapshot_now()` and the
+  `NAMIDB_MEMTABLE_SNAPSHOT_EVERY` env var. The writer auto-writes
+  the bincode snapshot every N commits when the env var is set; a
+  cold-starting writer always tries the snapshot path before WAL
+  replay. Best-effort: failed snapshot writes log and continue.
+
+### Changed
+
+- **`commit_batch` pipelines the WAL append with the manifest body
+  PUT.** `ManifestStore::commit` split into `put_body` +
+  `cas_pointer`; `WriterSession::commit_batch` runs the WAL append
+  and the manifest body PUT under `tokio::join!`, then `cas_pointer`
+  once both are durable. Critical path drops from three round-trips
+  to two (`max(WAL, body) + CAS`).
+- **`scan_node_for_id` consults `observed_labels`** instead of the
+  declared label map only. The typeless Expand path no longer
+  silently drops every neighbour for namespaces that skipped
+  `SchemaBuilder`.
+- **MERGE `find_merge_matches` accepts back-references on both sides.**
+  `MATCH (a), (b) MERGE (a)-[r:KNOWS]->(b)` now succeeds instead of
+  erroring with "MERGE head `a` not found"; the rel binding (`r`) is
+  populated on the resulting row too. The matcher classifies each
+  pattern position as `Fresh` (scan + filter) vs `BackReference`
+  (constrain by existing NodeId) and chooses accordingly.
+
+### Fixed
+
+- **`MATCH ()-[r:T]->()` and `MATCH (a)-[r]->(b)` return their edges.**
+  `scan_node_for_id` walked the declared label map and dropped every
+  neighbour when the namespace had no `SchemaBuilder`, returning 0
+  rows. `observed_labels` covers the same surface as
+  `resolve_edge_types` already does on the edge-type side.
+- **MERGE pattern accepts back-referenced sources / tails.** See the
+  *Changed* entry above; tracked as the same bug from two angles.
+- **`CREATE (n:L $params)` works.** The parser accepted only literal
+  `{...}` maps; the lowerer rejected anything else. New
+  `PatternProperties` enum + `properties_spread` field through the
+  pipeline.
+- **Parse errors name the production.** "expected `)`, found `RETURN`"
+  now ships a `help: while parsing node pattern` line; same for
+  relationship pattern, map literal, function call arguments, list
+  literal, and `CASE`.
+- **Schema response carries edge endpoints / property types.** The
+  cloud worker can answer `/schema` without falling back to a
+  client-side sample. (Engine side; cloud handler picks this up
+  separately.)
+- **`Value::List` / `Value::Map` storable.** "only scalars are
+  storable in v0" stops being a wall for tag-style lists and
+  metadata maps.
+- **`__overflow_json` round-trips list + map values.** The serde
+  visitor learned `$list` / `$map` tags so a stored value comes back
+  as the same `Value` variant it went in as.
+
+### Breaking
+
+- (pre-1.0 semver-relax) `Value` and `LogicalPlan` are wider:
+  exhaustive matches downstream need new arms for the new variants
+  (`Value::List`, `Value::Map`, `LogicalPlan::Merge`'s
+  `properties_spread` field on `CreateElement::Node/Rel`).
+- `NodePattern.properties` and `RelationshipPattern.properties`
+  changed from `Option<MapLiteral>` to `Option<PatternProperties>`.
+  External AST consumers must add the new enum arms.
+
+### Earlier in this release window (previously in `[Unreleased]`)
+
+The items below landed between 0.4.1 and the 0.5.0 tag and were
+already in `main` ahead of this session; they ride along in 0.5.0.
+
+#### Added
+
 - **Worst-case optimal join via leapfrog triejoin (RFC-024).** Cyclic
   Cypher patterns that used to expand as a chain of binary `HashJoin`
   / `Expand` operators now fold into a single `LogicalPlan::
@@ -149,11 +305,11 @@ below and in the release notes.
   connects the official `neo4j` PyPI driver to a running
   `namidb-server` and verifies a CREATE / MATCH round-trip end to end.
 
-### Changed
+#### Changed
 - `namidb_server::Config` gained `bolt_listen: Option<SocketAddr>`.
   When unset the server stays HTTP-only (the previous behaviour).
 
-### Fixed
+#### Fixed
 - **WCOJ leaf-multiplicity matches binary per-path semantics.**
   Before, `MultiwayJoin` emitted one row per `(a, b, c, ...)` tuple
   regardless of how many type combinations or parallel edges
@@ -173,7 +329,7 @@ below and in the release notes.
   into a `chrono::DateTime<Utc>` so the caller gets a real
   `datetime.date` / `datetime.datetime` from pyo3.
 
-### Breaking
+#### Breaking
 - (none) — Bolt is opt-in. Existing `Config` construction sites need
   to add `bolt_listen: None` for source compatibility.
 
