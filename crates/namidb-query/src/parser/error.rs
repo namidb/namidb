@@ -4,8 +4,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Byte-range in the source string. Half-open `[start, end)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Carries `Serialize` + `Deserialize` so the lowered `LogicalPlan`,
+/// which threads `SourceSpan` through every expression for diagnostic
+/// spans, can round-trip through a cross-process plan cache without
+/// stripping the source coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start: usize,
     pub end: usize,

@@ -3,12 +3,13 @@
 //! See [`docs/rfc/008-logical-plan-ir.md`](../../../../docs/rfc/008-logical-plan-ir.md).
 
 use namidb_storage::sst::predicates::ScanPredicate;
+use serde::{Deserialize, Serialize};
 
 use crate::parser::{Expression, OrderDirection, RelationshipDirection, RelationshipLength};
 
 /// Shortest-path variant attached to [`LogicalPlan::Expand`]. See
 /// RFC-023.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ShortestMode {
     /// Regular variable-length traversal — emit every reachable
     /// row.
@@ -25,7 +26,7 @@ pub enum ShortestMode {
 
 /// Tree of relational/graph operators produced by lowering the AST and
 /// consumed by the executor. See RFC-008.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LogicalPlan {
     /// Scan all nodes carrying `label`. `predicates` is the list of
     /// single-column conjunctive predicates pushed by `optimize`
@@ -333,7 +334,7 @@ pub enum LogicalPlan {
 /// (RFC-024). Carries the alias the executor binds, the optional
 /// label that scopes its NodeScan, and any predicates harvested from
 /// `Filter` nodes the detection pass folded into the join.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeBinding {
     pub alias: String,
     pub label: Option<String>,
@@ -352,7 +353,7 @@ pub struct NodeBinding {
 /// would be `O(observed_types * deg)` and the cost model has no way
 /// to bound it. Cypher alternation `[:A|:B|:C]` populates the vector
 /// with all listed types in source order.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EdgeConstraint {
     pub from_idx: usize,
     pub to_idx: usize,
@@ -485,7 +486,7 @@ impl LogicalPlan {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionItem {
     pub expression: Expression,
     pub alias: String,
@@ -497,20 +498,20 @@ pub struct ProjectionItem {
 /// compute the hash key; `probe_side` is evaluated on each probe row
 /// to look up matches. Each expression references only aliases
 /// produced by its respective subtree.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JoinKey {
     pub build_side: Expression,
     pub probe_side: Expression,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrderKey {
     pub expression: Expression,
     pub direction: OrderDirection,
 }
 
 /// Aggregate function applied inside an `Aggregate` operator.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AggregateExpr {
     /// `count(*)` if `arg = None`; `count(expr)` otherwise.
     Count {
@@ -548,7 +549,7 @@ pub enum AggregateExpr {
 /// evaluates the expression to a map and merges its entries into the
 /// node / edge being created. Explicit `properties` win on key
 /// collisions, matching the conventional spread semantics.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CreateElement {
     Node {
         alias: String,
@@ -577,7 +578,7 @@ impl CreateElement {
 }
 
 /// One `SET` operation. RFC-009 §"Operadores nuevos".
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SetOp {
     Property {
         target_alias: String,
@@ -610,7 +611,7 @@ impl SetOp {
 }
 
 /// One `REMOVE` operation. RFC-009 §"Operadores nuevos".
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RemoveOp {
     Property {
         target_alias: String,

@@ -2085,6 +2085,7 @@ dependencies = [
  "object_store 0.13.2",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-test",

@@ -170,4 +170,36 @@ mod tests {
             .expect_err("garbage must not plan");
         assert!(matches!(err, PlanError::Parse(_)));
     }
+
+    #[test]
+    fn logical_plan_round_trips_through_serde_json() {
+        // The new `Serialize` / `Deserialize` derives on LogicalPlan
+        // (and every type it transitively contains) let the cloud
+        // worker stash a plan in a cross-process cache (Redis, R2,
+        // Supabase) and recover it bit-for-bit on a hit. This test
+        // pins that contract.
+        let plan = parse_lower_optimize(
+            "MATCH (a:Person) WHERE a.age >= 18 RETURN a.name AS name ORDER BY name LIMIT 10",
+            &StatsCatalog::empty(),
+        )
+        .expect("a representative plan");
+        let json = serde_json::to_string(&plan).expect("plan serializes");
+        let back: LogicalPlan = serde_json::from_str(&json).expect("plan deserializes");
+        assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn logical_plan_round_trips_with_create_clause() {
+        // CREATE plans carry CreateElement / SetOp / RemoveOp; the
+        // round-trip must cover those variants too, not just the
+        // read-only operators above.
+        let plan = parse_lower_optimize(
+            "CREATE (a:Person {name: 'Ada'}) RETURN a",
+            &StatsCatalog::empty(),
+        )
+        .expect("a create plan");
+        let json = serde_json::to_string(&plan).expect("create plan serializes");
+        let back: LogicalPlan = serde_json::from_str(&json).expect("create plan deserializes");
+        assert_eq!(plan, back);
+    }
 }

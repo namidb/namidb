@@ -16,6 +16,8 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 use namidb_core::Value;
 
 use super::stats::{PropertyColumnStats, StatScalar};
@@ -23,7 +25,7 @@ use super::stats::{PropertyColumnStats, StatScalar};
 /// A single-column predicate pushable to the SST reader. Each variant
 /// references a property column by its declared name (not by Parquet
 /// leaf path); the reader resolves the leaf index at scan time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScanPredicate {
     /// `column == value`.
     Eq { column: String, value: StatScalar },
