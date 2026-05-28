@@ -26,7 +26,7 @@ use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
     StatsCatalog, WriteOutcome,
 };
-use namidb_storage::{SnapshotCell, WriterSession};
+use namidb_storage::{Manifest, SnapshotCell, WriterSession};
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -42,6 +42,10 @@ pub struct Config {
     pub bolt_listen: Option<std::net::SocketAddr>,
 }
 
+/// `(manifest_version, catalog)` memoised behind a mutex and shared across
+/// cloned [`AppState`]s. `None` until the first read query builds it.
+type CatalogCache = Arc<std::sync::Mutex<Option<(u64, Arc<StatsCatalog>)>>>;
+
 /// Shared application state — one `WriterSession` (single-writer
 /// invariant) plus the auth token reference and a [`SnapshotCell`]
 /// readers consume to serve reads in parallel without taking the
@@ -50,6 +54,11 @@ pub struct Config {
 pub struct AppState {
     pub writer: Arc<Mutex<WriterSession>>,
     pub snapshot: Arc<SnapshotCell>,
+    /// Memoised optimizer stats, keyed by manifest version. Building the
+    /// catalog is `O(ssts)`; without this every read query rebuilt it from
+    /// scratch. Shared across cloned `AppState`s (the router clones it per
+    /// request) via the inner `Arc`, so all handlers hit one cache.
+    catalog_cache: CatalogCache,
     auth_token: Option<Arc<str>>,
     namespace: String,
 }
@@ -60,9 +69,27 @@ impl AppState {
         Self {
             writer: Arc::new(Mutex::new(writer)),
             snapshot,
+            catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             auth_token: auth_token.map(Arc::from),
             namespace,
         }
+    }
+
+    /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
+    /// version and reused across queries until the next write bumps the
+    /// version. Every commit advances `manifest.version`, so a version
+    /// match is sufficient for validity — a stale catalog is never served.
+    pub(crate) fn catalog_for(&self, manifest: &Manifest) -> Arc<StatsCatalog> {
+        let version = manifest.version;
+        let mut slot = self.catalog_cache.lock().expect("catalog cache poisoned");
+        if let Some((cached_version, catalog)) = slot.as_ref() {
+            if *cached_version == version {
+                return Arc::clone(catalog);
+            }
+        }
+        let catalog = Arc::new(StatsCatalog::from_manifest(manifest));
+        *slot = Some((version, Arc::clone(&catalog)));
+        catalog
     }
 }
 
@@ -301,7 +328,7 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
     // Plan against the latest published snapshot — no writer lock yet.
     let owned = state.snapshot.load();
     let plan = {
-        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
+        let catalog = state.catalog_for(&owned.manifest().manifest);
         match build_plan(&parsed, &catalog) {
             Ok(p) => p,
             Err(e) => {
@@ -536,6 +563,32 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, auth_token.map(|s| s.to_string()), "test".into());
         build_router(state)
+    }
+
+    #[tokio::test]
+    async fn catalog_cache_reuses_until_version_changes() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test-catalog-cache").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into());
+
+        let m0 = state.snapshot.load().manifest().manifest.clone();
+        let c1 = state.catalog_for(&m0);
+        let c2 = state.catalog_for(&m0);
+        assert!(
+            Arc::ptr_eq(&c1, &c2),
+            "same manifest version must reuse the cached catalog"
+        );
+
+        // A higher version forces a rebuild (a distinct Arc), then caches it.
+        let mut m1 = m0.clone();
+        m1.version += 1;
+        let c3 = state.catalog_for(&m1);
+        assert!(
+            !Arc::ptr_eq(&c1, &c3),
+            "a new manifest version must rebuild the catalog"
+        );
+        let c4 = state.catalog_for(&m1);
+        assert!(Arc::ptr_eq(&c3, &c4));
     }
 
     #[tokio::test]

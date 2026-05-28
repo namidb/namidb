@@ -15,7 +15,7 @@ use namidb_bolt::{
 };
 use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, ExecError, LowerError,
-    Params, ParseError, StatsCatalog,
+    Params, ParseError,
 };
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -54,7 +54,7 @@ impl Backend for ServerBackend {
         };
         // Plan against the latest published snapshot — no writer lock.
         let owned = self.state.snapshot.load();
-        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
+        let catalog = self.state.catalog_for(&owned.manifest().manifest);
         let plan = build_plan(&parsed, &catalog).map_err(map_lower_err)?;
 
         if plan.contains_write() {
