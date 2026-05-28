@@ -60,7 +60,7 @@ use crate::compact::{compact_l0_to_l1, CompactionOutcome};
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
-use crate::manifest::{LoadedManifest, ManifestStore, WalSegmentDescriptor};
+use crate::manifest::{LoadedManifest, Manifest, ManifestStore, WalSegmentDescriptor};
 use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
 use crate::paths::NamespacePaths;
@@ -147,6 +147,14 @@ pub struct WriterSession {
     /// Commits ago since the last successful snapshot write. Reset
     /// when a snapshot lands; bumped by every non-empty `commit_batch`.
     commits_since_snapshot: u64,
+    /// Set when a `commit_batch` retry hits a terminal error it cannot
+    /// resolve in-session (an orphan-WAL collision whose re-seq retry
+    /// still loses the manifest CAS). The single-writer contract is to
+    /// drop the session and reopen on a terminal commit error; this flag
+    /// enforces it in code so a contract-violating re-entry issues no
+    /// further object-store writes and mints no new orphan segments.
+    /// Only a fresh [`Self::open`] clears it.
+    poisoned: bool,
 }
 
 impl std::fmt::Debug for WriterSession {
@@ -229,6 +237,7 @@ impl WriterSession {
             store,
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
+            poisoned: false,
         })
     }
 
@@ -477,30 +486,47 @@ impl WriterSession {
     ///
     /// ## Failure modes
     ///
-    /// - PUT failure / WAL seq collision → returns the error; the
-    /// pending batch is preserved and the writer can retry. The
-    /// pending WAL `seq` is unchanged so a retry hits the same
-    /// object path; a successful retry by another writer with the
-    /// same `seq` is impossible because [`crate::wal::WalStore::append_segment`]
-    /// uses `PutMode::Create`.
-    /// - Manifest CAS loss → returns `ManifestCommitCas`. The segment
-    /// is durable in object storage but the manifest does not yet
-    /// reference it. Caller must reload the manifest and retry; a
-    /// later `claim_writer` either fences this session (in which
-    /// case the orphan segment is collected by the janitor) or
-    /// succeeds at which point the segment becomes reachable again.
-    /// For the single-writer model the simpler answer is for
-    /// the caller to drop the session.
+    /// - Transient PUT failure → returns the error; the pending batch is
+    /// preserved and the writer can retry. The pending WAL `seq` is
+    /// unchanged so a retry hits the same object path.
+    /// - WAL seq collision (`PutMode::Create` → `AlreadyExists` →
+    /// [`Error::Precondition`]) means an orphan segment already sits at
+    /// our `seq`: either our own from a prior attempt whose commit failed
+    /// after the WAL PUT, or one injected externally. We re-pick a seq
+    /// strictly above every segment now visible and retry the commit
+    /// ONCE, body-first. The retry recovers only when the manifest body
+    /// at `base+1` is still free (i.e. the prior attempt's body PUT had
+    /// failed); otherwise it terminates with `ManifestCommitCas`. A
+    /// terminal retry failure poisons the session (see [`Self::open`]).
+    /// - Manifest CAS loss → returns `ManifestCommitCas`. The segment is
+    /// durable in object storage but the manifest does not yet reference
+    /// it; the janitor sweeps the orphan. For the single-writer model the
+    /// answer is for the caller to drop the session and reopen, at which
+    /// point [`Self::open`]'s defensive `list_segments` picks a fresh seq.
+    ///
+    /// Callers must treat BOTH `Precondition` and `ManifestCommitCas` from
+    /// this method as "drop the session and reopen". No data is lost: the
+    /// memtable is untouched until the pointer CAS lands, so a failed
+    /// commit never ACKs records it did not make durable and referenced.
     #[instrument(skip(self), fields(
  manifest_version = self.current.manifest.version,
  pending = self.pending.records.len(),
  ))]
     pub async fn commit_batch(&mut self) -> Result<CommitOutcome> {
+        // A terminal commit failure poisons the session: the single-writer
+        // contract is to drop it and reopen. Enforce that here so a
+        // contract-violating retry issues no further object-store writes
+        // and mints no new orphan segments.
+        if self.poisoned {
+            return Err(Error::precondition(
+                "writer session poisoned by a prior terminal commit failure; drop and reopen",
+            ));
+        }
         if self.pending.is_empty() {
             return Ok(CommitOutcome::Empty);
         }
 
-        let seq = self.pending.seq;
+        let base_seq = self.pending.seq;
         let last_lsn = self.pending.last_lsn();
         let records = self.pending.records.len();
 
@@ -512,25 +538,57 @@ impl WriterSession {
         // If the WAL append fails, the body PUT is harmless: the
         // pointer never moves, the next manifest commit overwrites
         // the reference, and the janitor sweeps the orphan.
-        let segment_path = self.wal_store.paths().wal_segment(seq);
-        let mut next = self.current.manifest.next_version(self.fence.writer_id);
-        next.wal_segments.push(WalSegmentDescriptor {
-            seq,
-            path: segment_path.as_ref().to_string(),
-            last_lsn,
-        });
+        let next = self.build_next(base_seq, last_lsn);
 
         let (wal_result, body_result) = tokio::join!(
             self.wal_store.append_segment(&self.pending),
             self.manifest_store
                 .put_body(&self.fence, &self.current, &next),
         );
-        let _wal_path = wal_result?;
-        let pointer = body_result?;
-        let new_current = self
-            .manifest_store
-            .cas_pointer(&self.fence, &self.current, next, pointer)
-            .await?;
+
+        // Inspect `wal_result` by value WITHOUT `?` so an orphan-WAL
+        // `Precondition` routes to the retry instead of propagating.
+        let (committed_seq, new_current) = match wal_result {
+            Ok(_) => {
+                let pointer = body_result?;
+                let new_current = self
+                    .manifest_store
+                    .cas_pointer(&self.fence, &self.current, next, pointer)
+                    .await?;
+                (base_seq, new_current)
+            }
+            Err(Error::Precondition(_)) => {
+                // Orphan segment already occupies `base_seq`. The body PUT
+                // above may or may not have landed; we discard its result
+                // and rebuild from scratch at a fresh seq. Re-pick a seq
+                // strictly above every segment now visible (same rule as
+                // `open`) and retry the commit ONCE, body-first so the
+                // common "base+1 already taken" case fails fast as
+                // `ManifestCommitCas` without minting a new WAL orphan.
+                let _ = body_result;
+                let listed = self.wal_store.list_segments().await?;
+                let fresh = listed
+                    .last()
+                    .map(|r| r.seq.saturating_add(1))
+                    .unwrap_or(base_seq.saturating_add(1));
+                // Re-seq the in-memory segment in place; records are
+                // preserved because only `seq` changes.
+                self.pending.seq = fresh;
+                let next = self.build_next(fresh, last_lsn);
+                match self.commit_body_first(next).await {
+                    Ok(new_current) => (fresh, new_current),
+                    Err(err) => {
+                        // Terminal: restore the original seq so a
+                        // contract-violating re-entry mints no new orphan,
+                        // and poison the session.
+                        self.pending.seq = base_seq;
+                        self.poisoned = true;
+                        return Err(err);
+                    }
+                }
+            }
+            Err(other) => return Err(other),
+        };
 
         // Durability achieved. Drain the queued payloads into the
         // memtable in LSN order (they are already in insertion order
@@ -539,10 +597,10 @@ impl WriterSession {
         for (key, lsn, op) in drained {
             self.memtable.apply(key, lsn, op);
         }
-        self.pending = WalSegment::new(seq.saturating_add(1));
+        self.pending = WalSegment::new(committed_seq.saturating_add(1));
 
         self.current = new_current;
-        self.next_wal_seq = seq.saturating_add(1);
+        self.next_wal_seq = committed_seq.saturating_add(1);
         // Publish the new memtable snapshot so subsequent reads (HTTP,
         // Bolt, embedded) pick up the just-committed records without
         // taking the writer lock. See RFC-021.
@@ -568,18 +626,50 @@ impl WriterSession {
         }
 
         debug!(
-            wal_seq = seq,
+            wal_seq = committed_seq,
             last_lsn,
             manifest_version = self.current.manifest.version,
             "commit_batch sealed"
         );
 
         Ok(CommitOutcome::Committed {
-            wal_seq: seq,
+            wal_seq: committed_seq,
             last_lsn,
             records,
             manifest_version: self.current.manifest.version,
         })
+    }
+
+    /// Build the next manifest version that records the pending WAL
+    /// segment at `seq`. Always derived from `self.current` (unchanged on
+    /// a failed commit attempt), so the resulting version is `base + 1`
+    /// and carries exactly one fresh `wal_segments` descriptor at `seq`.
+    fn build_next(&self, seq: u64, last_lsn: u64) -> Manifest {
+        let segment_path = self.wal_store.paths().wal_segment(seq);
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.wal_segments.push(WalSegmentDescriptor {
+            seq,
+            path: segment_path.as_ref().to_string(),
+            last_lsn,
+        });
+        next
+    }
+
+    /// Sequential commit used by the orphan-WAL retry: PUT the manifest
+    /// body FIRST, then the WAL segment, then CAS the pointer. Body-first
+    /// ordering means the common "manifest body `base+1` already exists"
+    /// case fails fast as `ManifestCommitCas` before we ever PUT a WAL
+    /// segment, so a doomed retry mints no new orphan WAL at `fresh`.
+    /// `self.pending.seq` must already point at the fresh seq.
+    async fn commit_body_first(&self, next: Manifest) -> Result<LoadedManifest> {
+        let pointer = self
+            .manifest_store
+            .put_body(&self.fence, &self.current, &next)
+            .await?;
+        self.wal_store.append_segment(&self.pending).await?;
+        self.manifest_store
+            .cas_pointer(&self.fence, &self.current, next, pointer)
+            .await
     }
 
     /// Persist the current memtable to `paths.memtable_snapshot()` so
@@ -990,6 +1080,238 @@ mod tests {
             }
             other => panic!("expected Committed, got {other:?}"),
         }
+    }
+
+    /// `ObjectStore` wrapper that fails the next `put_opts` whose key
+    /// contains a configured substring, exactly once, with a transient
+    /// (non-`AlreadyExists`) error. Used to simulate a crash in the
+    /// narrow window between the WAL PUT and the manifest body PUT.
+    #[derive(Debug)]
+    struct FaultStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_next_put_on: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FaultStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                fail_next_put_on: std::sync::Mutex::new(None),
+            }
+        }
+        fn fail_next_put_containing(&self, needle: &str) {
+            *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
+        }
+    }
+
+    impl std::fmt::Display for FaultStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FaultStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let hit = {
+                let mut guard = self.fail_next_put_on.lock().unwrap();
+                match guard.as_deref() {
+                    Some(needle) if location.as_ref().contains(needle) => {
+                        *guard = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if hit {
+                return Err(object_store::Error::Generic {
+                    store: "FaultStore",
+                    source: "injected transient put failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_batch_reseqs_and_recovers_when_base_plus_one_is_free() {
+        // An orphan WAL sits at the seq this session picked, AND the
+        // attempt-0 manifest body PUT fails transiently (so version
+        // base+1 stays free). Fix D must re-seq past the orphan and
+        // complete the commit at the fresh seq, in the same call.
+        let fault = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = fault.clone();
+        let paths = make_paths("ingest-orphan-recover");
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+
+        // Orphan at seq=1 (the seq a fresh bootstrap picks).
+        let wal_store = WalStore::new(store.clone(), paths.clone());
+        let mut orphan = WalSegment::new(1);
+        orphan.push(WalRecord {
+            lsn: 1,
+            payload: WalEntry {
+                key: MemKey::Node {
+                    label: "Person".into(),
+                    id: sorted_node_id(99),
+                },
+                op: WalOp::Upsert(b"ghost".to_vec()),
+                lsn: 1,
+            }
+            .encode()
+            .unwrap(),
+        });
+        wal_store.append_segment(&orphan).await.unwrap();
+
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+
+        // Make attempt-0's body PUT (manifest v1) fail once so base+1
+        // is free when the retry re-runs put_body.
+        let v1 = paths.manifest_version(1);
+        fault.fail_next_put_containing(v1.as_ref());
+
+        let out = session.commit_batch().await.unwrap();
+        match out {
+            CommitOutcome::Committed { wal_seq, .. } => {
+                assert_eq!(
+                    wal_seq, 2,
+                    "Fix D must re-seq past the orphan and commit at 2"
+                );
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        // The committed manifest references ONLY the fresh seq, never the
+        // orphan seq (rebuilding `next` from scratch, not appending).
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+        assert_eq!(session.current.manifest.wal_segments[0].seq, 2);
+
+        // The real record is durable and visible.
+        let snap = session.snapshot();
+        let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
+        assert_eq!(view.lsn, 1);
+    }
+
+    #[tokio::test]
+    async fn commit_batch_orphan_collision_becomes_clean_terminal_cas_and_poisons() {
+        // An orphan WAL sits at the session's seq and attempt-0's body
+        // PUT succeeds (occupying base+1). The retry cannot reuse base+1,
+        // so it terminates with a clean ManifestCommitCas (NOT a bare
+        // Precondition), restores the original seq, and poisons the
+        // session so a contract-violating re-entry writes nothing.
+        let store = make_store();
+        let paths = make_paths("ingest-orphan-terminal");
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+
+        let wal_store = WalStore::new(store.clone(), paths.clone());
+        let mut orphan = WalSegment::new(1);
+        orphan.push(WalRecord {
+            lsn: 1,
+            payload: WalEntry {
+                key: MemKey::Node {
+                    label: "Person".into(),
+                    id: sorted_node_id(99),
+                },
+                op: WalOp::Upsert(b"ghost".to_vec()),
+                lsn: 1,
+            }
+            .encode()
+            .unwrap(),
+        });
+        wal_store.append_segment(&orphan).await.unwrap();
+
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+
+        let err = session.commit_batch().await.unwrap_err();
+        assert!(
+            matches!(err, Error::ManifestCommitCas { .. }),
+            "orphan collision with an occupied base+1 must surface as a clean terminal CAS, got {err:?}"
+        );
+
+        // MUST-FIX 3: the original seq is restored.
+        assert_eq!(session.pending.seq, 1);
+
+        // MUST-FIX 4: the session is poisoned; a re-entry short-circuits.
+        match session.commit_batch().await.unwrap_err() {
+            Error::Precondition(msg) => {
+                assert!(
+                    msg.contains("poisoned"),
+                    "expected poison message, got {msg}"
+                )
+            }
+            other => panic!("expected poisoned Precondition, got {other:?}"),
+        }
+
+        // Nothing was applied to the memtable: the batch never ACKed.
+        let snap = session.snapshot();
+        assert!(snap.lookup_node("Person", alice).await.unwrap().is_none());
     }
 
     #[tokio::test]
