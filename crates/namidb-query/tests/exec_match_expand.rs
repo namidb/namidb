@@ -810,3 +810,88 @@ async fn match_anonymous_endpoints_resolves_without_declared_schema() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("n"), Some(&RuntimeValue::Integer(1)));
 }
+
+fn has_edge_type_count(plan: &namidb_query::LogicalPlan) -> bool {
+    matches!(plan, namidb_query::LogicalPlan::EdgeTypeCount { .. })
+        || plan.children().iter().any(|c| has_edge_type_count(c))
+}
+
+#[tokio::test]
+async fn global_edge_type_count_pushdown_matches_nodescan_path() {
+    use namidb_query::{parse_lower_optimize, StatsCatalog};
+
+    // KNOWS + Person schema so the first batch can flush into SSTs; the
+    // count must merge those with the still-in-memtable second batch.
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![
+                PropertyDef::new("name", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("age", DataType::Int32, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "KNOWS".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            properties: vec![],
+        })
+        .unwrap()
+        .build();
+
+    let mut writer = WriterSession::open(store(), paths("exec-edge-count-e2e"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    let carol = NodeId::new();
+    let dave = NodeId::new();
+    for (id, name, age) in [
+        (alice, "Alice", 30),
+        (bob, "Bob", 25),
+        (carol, "Carol", 41),
+        (dave, "Dave", 19),
+    ] {
+        writer
+            .upsert_node("Person", id, &person(name, age))
+            .unwrap();
+    }
+    // Batch 1 → flushed into SSTs: 4 KNOWS edges.
+    for (s, d) in [(alice, bob), (alice, carol), (bob, carol), (dave, alice)] {
+        writer.upsert_edge("KNOWS", s, d, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    // Batch 2 → live memtable (not flushed): add one, tombstone one.
+    writer.upsert_edge("KNOWS", carol, dave, &edge()).unwrap();
+    writer.tombstone_edge("KNOWS", alice, bob).unwrap();
+    writer.commit_batch().await.unwrap();
+
+    // Live KNOWS edges: alice→carol, bob→carol, dave→alice, carol→dave = 4
+    // (alice→bob tombstoned). Exercises the SST + memtable + tombstone merge.
+    let snapshot = writer.snapshot();
+    let query = "MATCH ()-[r:KNOWS]->() RETURN count(r) AS n";
+
+    // Optimized: the pushdown must fire (EdgeTypeCount, no NodeScan).
+    let optimized = parse_lower_optimize(query, &StatsCatalog::empty()).unwrap();
+    assert!(
+        has_edge_type_count(&optimized),
+        "the global edge count must push down to EdgeTypeCount"
+    );
+    let pushed = execute(&optimized, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(pushed.len(), 1);
+    assert_eq!(pushed[0].get("n"), Some(&RuntimeValue::Integer(4)));
+
+    // Gold standard: identical to the un-optimized NodeScan + Expand path.
+    let raw = lower(&parse(query).unwrap()).unwrap();
+    let raw_rows = execute(&raw, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(
+        raw_rows[0].get("n"),
+        pushed[0].get("n"),
+        "EdgeTypeCount must match the NodeScan+Expand count exactly"
+    );
+}

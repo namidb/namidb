@@ -514,6 +514,14 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
         LogicalPlan::Empty => {
             out.push_str("Empty");
         }
+        LogicalPlan::EdgeTypeCount { edge_types, output } => {
+            let _ = write!(
+                out,
+                "EdgeTypeCount types=[{}] => {}",
+                edge_types.join("|"),
+                output
+            );
+        }
         LogicalPlan::CrossProduct { .. } => {
             out.push_str("CrossProduct");
         }

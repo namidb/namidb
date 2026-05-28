@@ -24,7 +24,10 @@ pub fn predicate_pushdown(plan: LogicalPlan) -> LogicalPlan {
 fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
     match plan {
         // ─── leaves: materialise pending above and stop ───────────────
-        LogicalPlan::Empty | LogicalPlan::Argument { .. } | LogicalPlan::MultiwayJoin { .. } => {
+        LogicalPlan::Empty
+        | LogicalPlan::Argument { .. }
+        | LogicalPlan::MultiwayJoin { .. }
+        | LogicalPlan::EdgeTypeCount { .. } => {
             // The detection pass folds predicates over participating
             // variables into `NodeBinding.predicates` before emitting,
             // so by the time this pass reaches a MultiwayJoin there

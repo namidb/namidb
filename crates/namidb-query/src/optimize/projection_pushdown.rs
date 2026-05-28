@@ -211,7 +211,7 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             collect_from_plan(input, req);
             collect_from_plan(subplan, req);
         }
-        LogicalPlan::Argument { .. } | LogicalPlan::Empty => {}
+        LogicalPlan::Argument { .. } | LogicalPlan::Empty | LogicalPlan::EdgeTypeCount { .. } => {}
         LogicalPlan::MultiwayJoin { vars, .. } => {
             // The executor reads `id` for every variable to drive the
             // leapfrog trie. Predicates on those variables are folded
@@ -672,9 +672,10 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             projection,
             alias,
         },
-        LogicalPlan::Argument { .. } | LogicalPlan::Empty | LogicalPlan::MultiwayJoin { .. } => {
-            plan
-        }
+        LogicalPlan::Argument { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::MultiwayJoin { .. }
+        | LogicalPlan::EdgeTypeCount { .. } => plan,
         LogicalPlan::Create { input, elements } => LogicalPlan::Create {
             input: Box::new(rewrite(*input, req)),
             elements,

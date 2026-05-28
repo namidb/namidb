@@ -257,6 +257,12 @@ fn execute_write_inner<'a>(
                 crate::exec::walker::execute_inner(plan, &snap, params, None).await
             }
 
+            LogicalPlan::EdgeTypeCount { .. } => {
+                // Read-only leaf: delegate to the post-write snapshot reader.
+                let snap = writer.snapshot();
+                crate::exec::walker::execute_inner(plan, &snap, params, None).await
+            }
+
             // ─── NodeById can have a write-bearing input (e.g. CREATE
             // ... WITH p MATCH (f:Person {id: $fid}) ...). Recurse on
             // the input via execute_write_inner so writes commit, then

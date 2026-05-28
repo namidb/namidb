@@ -64,6 +64,14 @@ pub fn estimate(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
 fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
     match plan {
         LogicalPlan::Empty => leaf(plan, 1.0, BTreeMap::new()),
+        // A direct edge-type count emits exactly one row (the count),
+        // binding `output`. It replaced a global Aggregate, which is
+        // also single-row, so the estimate is unchanged at this node.
+        LogicalPlan::EdgeTypeCount { output, .. } => {
+            let mut b = BTreeMap::new();
+            b.insert(output.clone(), BindingMeta::default());
+            leaf(plan, 1.0, b)
+        }
         LogicalPlan::Argument { bindings } => {
             let mut b = BTreeMap::new();
             for name in bindings {

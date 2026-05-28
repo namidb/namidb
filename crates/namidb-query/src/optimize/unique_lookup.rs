@@ -72,7 +72,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         LogicalPlan::Empty
         | LogicalPlan::Argument { .. }
         | LogicalPlan::NodeScan { .. }
-        | LogicalPlan::MultiwayJoin { .. } => plan,
+        | LogicalPlan::MultiwayJoin { .. }
+        | LogicalPlan::EdgeTypeCount { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

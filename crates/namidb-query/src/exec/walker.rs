@@ -613,6 +613,21 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 execute_aggregate(rows, group_by, aggregations, params)
             }
+
+            LogicalPlan::EdgeTypeCount { edge_types, output } => {
+                // Sum the live edge count of each listed type. Every edge
+                // belongs to exactly one type, so per-type counts are
+                // disjoint — no cross-type dedup. This reads only the edge
+                // index of each type, skipping the NodeScan + Expand the
+                // `edge_count_pushdown` pass replaced.
+                let mut total: i64 = 0;
+                for et in edge_types {
+                    total += snapshot.count_edge_type(et).await? as i64;
+                }
+                Ok(vec![
+                    Row::new().with(output.clone(), RuntimeValue::Integer(total))
+                ])
+            }
         };
         if let Some(start) = profile_start {
             if let Ok(rows) = &result {
@@ -2013,6 +2028,12 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     .to_string(),
             )),
 
+            LogicalPlan::EdgeTypeCount { .. } => Err(ExecError::Runtime(
+                "EdgeTypeCount is a non-factorised leaf and cannot appear inside a \
+                 factorised (MultiwayJoin) plan"
+                    .to_string(),
+            )),
+
             LogicalPlan::MultiwayJoin {
                 vars,
                 edges,
@@ -3120,7 +3141,8 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::Empty
         | LogicalPlan::Argument { .. }
-        | LogicalPlan::MultiwayJoin { .. } => {}
+        | LogicalPlan::MultiwayJoin { .. }
+        | LogicalPlan::EdgeTypeCount { .. } => {}
     }
 
     for child in plan.children() {

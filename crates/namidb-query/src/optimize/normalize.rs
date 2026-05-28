@@ -23,7 +23,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::NodeScan { .. }
         | LogicalPlan::Empty
         | LogicalPlan::Argument { .. }
-        | LogicalPlan::MultiwayJoin { .. } => plan,
+        | LogicalPlan::MultiwayJoin { .. }
+        | LogicalPlan::EdgeTypeCount { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

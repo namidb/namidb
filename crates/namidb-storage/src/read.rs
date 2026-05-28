@@ -1404,6 +1404,60 @@ impl<'mt> Snapshot<'mt> {
         Ok(latest.into_values().filter_map(|(_, v)| v).collect())
     }
 
+    /// Count the live edges of `edge_type` visible at this snapshot.
+    ///
+    /// Same memtable + forward-SST merge as [`Self::scan_edge_type`]
+    /// (last-writer-wins by LSN, tombstones pruned) but it never decodes
+    /// edge property streams — it only tracks `(src, dst)` liveness. A
+    /// global edge count is therefore `O(edges_of_type)` with no per-edge
+    /// property decode and, crucially, no scan over every node. This is the
+    /// primitive the query optimizer's edge-type-count pushdown calls in
+    /// place of `NodeScan + Expand + Aggregate`.
+    #[instrument(skip(self), fields(edge_type = edge_type))]
+    pub async fn count_edge_type(&self, edge_type: &str) -> Result<u64> {
+        // (src, dst) -> (winning_lsn, is_live). Mirrors scan_edge_type's
+        // merge exactly, minus the EdgeView materialisation.
+        let mut latest: BTreeMap<(NodeId, NodeId), (u64, bool)> = BTreeMap::new();
+
+        // 1. Memtable.
+        for (mk, entry) in self.memtable.iter() {
+            let MemKey::Edge {
+                edge_type: et,
+                src,
+                dst,
+            } = mk
+            else {
+                continue;
+            };
+            if et != edge_type {
+                continue;
+            }
+            let live = !matches!(entry.op, MemOp::Tombstone);
+            update_edge_count_winner(&mut latest, (*src, *dst), entry.lsn, live);
+        }
+
+        // 2. Forward SSTs only — the inverse partner duplicates the same
+        // (src, dst, lsn) tuples. No property decode: scan_all_edges yields
+        // key/partner/lsn/tombstone, which is all a count needs.
+        for &idx in self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::EdgesFwd, edge_type)
+        {
+            let desc = &self.manifest.manifest.ssts[idx];
+            let body = self.get_sst_body(desc).await?;
+            let reader = EdgeSstReader::open(body)?;
+            let rows = reader.scan_all_edges()?;
+            for row in &rows {
+                let src = NodeId::from_uuid(Uuid::from_bytes(row.key_id));
+                let dst = NodeId::from_uuid(Uuid::from_bytes(row.partner_id));
+                update_edge_count_winner(&mut latest, (src, dst), row.lsn, !row.tombstone);
+            }
+        }
+
+        Ok(latest.into_values().filter(|(_, live)| *live).count() as u64)
+    }
+
     /// Inverse edges into `dst` along `edge_type` (in-edges).
     #[instrument(skip(self), fields(edge_type = edge_type, dst = %dst))]
     pub async fn in_edges(&self, edge_type: &str, dst: NodeId) -> Result<EdgeListView> {
@@ -2092,6 +2146,23 @@ fn update_edge_winner(
         Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
         _ => {
             map.insert(key, (lsn, view));
+        }
+    }
+}
+
+/// `update_edge_winner` for the count path: tracks `(lsn, is_live)` only,
+/// no `EdgeView`. Same last-writer-wins semantics (`existing >= lsn`
+/// keeps the existing winner) so a count agrees with `scan_edge_type`.
+fn update_edge_count_winner(
+    map: &mut BTreeMap<(NodeId, NodeId), (u64, bool)>,
+    key: (NodeId, NodeId),
+    lsn: u64,
+    live: bool,
+) {
+    match map.get(&key) {
+        Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
+        _ => {
+            map.insert(key, (lsn, live));
         }
     }
 }
@@ -2871,6 +2942,79 @@ mod tests {
         // bob's edge tombstoned, only carol remains.
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].dst, carol);
+    }
+
+    #[tokio::test]
+    async fn count_edge_type_matches_scan_after_memtable_sst_merge() {
+        let store = make_store();
+        let paths = make_paths("read-edges-count");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+
+        // Flush two edges: alice→bob (LSN 10) and alice→dave (LSN 11).
+        let mut mt_flush = Memtable::new();
+        for (dst, lsn) in [(bob, 10u64), (dave, 11)] {
+            mt_flush.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst,
+                },
+                lsn,
+                MemOp::Upsert(edge_payload()),
+            );
+        }
+        let frozen = mt_flush.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        // Live memtable: add alice→carol (LSN 15), tombstone alice→bob (LSN 20).
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: carol,
+            },
+            15,
+            MemOp::Upsert(edge_payload()),
+        );
+        live.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            20,
+            MemOp::Tombstone,
+        );
+
+        let live_view = live.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &live_view, store, paths);
+
+        // Live KNOWS edges after the merge: alice→dave (SST) + alice→carol
+        // (memtable); alice→bob is tombstoned. So 2.
+        let count = snap.count_edge_type("KNOWS").await.unwrap();
+        assert_eq!(count, 2);
+        // It must agree with the materialising scan, the source of truth.
+        let scanned = snap.scan_edge_type("KNOWS").await.unwrap();
+        assert_eq!(count, scanned.len() as u64);
+
+        // An unknown edge type counts zero.
+        assert_eq!(snap.count_edge_type("FOLLOWS").await.unwrap(), 0);
     }
 
     #[tokio::test]

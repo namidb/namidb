@@ -328,6 +328,26 @@ pub enum LogicalPlan {
         /// flat-path WCOJ.
         factorize_required: bool,
     },
+
+    /// Direct global count of edges by type, bypassing `NodeScan +
+    /// Expand`. Emitted by the `edge_count_pushdown` optimiser pass when
+    /// it detects a global `count(*)` / `count(r)` (no GROUP BY) over a
+    /// directed, single-hop, unfiltered `Expand` of one or more edge
+    /// types whose source is an unfiltered `NodeScan`. The executor sums
+    /// [`namidb_storage::read::Snapshot::count_edge_type`] over
+    /// `edge_types` (each edge belongs to exactly one type, so the
+    /// per-type counts are disjoint) and emits a single row binding
+    /// `output` to the total.
+    ///
+    /// A leaf in [`Self::children`]: it drives its own reads.
+    EdgeTypeCount {
+        /// One or more edge types to count (alternation `[:A|:B]` lists
+        /// every branch). Never empty.
+        edge_types: Vec<String>,
+        /// Output column the count is bound to — the alias of the
+        /// aggregation this pass replaced (`count(r) AS n` ⇒ `"n"`).
+        output: String,
+    },
 }
 
 /// One participating variable in a [`LogicalPlan::MultiwayJoin`]
@@ -369,7 +389,8 @@ impl LogicalPlan {
             LogicalPlan::NodeScan { .. }
             | LogicalPlan::Empty
             | LogicalPlan::Argument { .. }
-            | LogicalPlan::MultiwayJoin { .. } => {
+            | LogicalPlan::MultiwayJoin { .. }
+            | LogicalPlan::EdgeTypeCount { .. } => {
                 vec![]
             }
             LogicalPlan::NodeById { input, .. }
@@ -482,6 +503,7 @@ impl LogicalPlan {
                 }
             }
             LogicalPlan::MultiwayJoin { .. } => "MultiwayJoin",
+            LogicalPlan::EdgeTypeCount { .. } => "EdgeTypeCount",
         }
     }
 }

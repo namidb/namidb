@@ -27,6 +27,7 @@ use crate::parser::SourceSpan;
 use crate::plan::logical::{CreateElement, LogicalPlan, ProjectionItem};
 
 pub mod decorrelation;
+pub mod edge_count_pushdown;
 pub mod join_conversion;
 pub mod join_reorder;
 pub mod multiway_join;
@@ -37,6 +38,7 @@ pub mod pushdown;
 pub mod unique_lookup;
 
 pub use decorrelation::convert_semi_apply_to_hash_semi_join;
+pub use edge_count_pushdown::apply_edge_count_pushdown;
 pub use join_conversion::convert_cross_to_hash;
 pub use join_reorder::reorder_joins;
 pub use multiway_join::{detect_multiway_join, wcoj_enabled};
@@ -57,6 +59,13 @@ const MAX_FIXPOINT_ROUNDS: usize = 8;
 /// rewrites (join reorder) can be added without breaking
 /// signatures.
 pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
+    // Edge-type-count pushdown: a global count over a directed, single-hop,
+    // unfiltered typed Expand reads the edge index directly instead of
+    // scanning every node and expanding. One-shot and structural, so run it
+    // once up front on the freshly-lowered shape (before predicate /
+    // projection pushdown reshape the NodeScan); downstream passes treat the
+    // resulting EdgeTypeCount as an opaque leaf.
+    let plan = apply_edge_count_pushdown(plan);
     let mut current = plan;
     for _ in 0..MAX_FIXPOINT_ROUNDS {
         // RFC-pending: unique-property lookup rewrite runs FIRST so the
@@ -253,6 +262,9 @@ pub(crate) fn produced_aliases(plan: &LogicalPlan) -> BTreeSet<String> {
 fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     match plan {
         LogicalPlan::Empty => {}
+        LogicalPlan::EdgeTypeCount { output, .. } => {
+            out.insert(output.clone());
+        }
         LogicalPlan::Argument { bindings } => {
             for b in bindings {
                 out.insert(b.clone());
