@@ -159,7 +159,11 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          python -m pip install pytest pytest-asyncio pandas polars
+          # polars 1.41.x SIGABRTs on the macos-14 / py3.12 runner during the
+          # async cypher test (1.40.1 was fine on 2026-05-27); cap below 1.41
+          # until the upstream regression clears. pip still picks the best
+          # 1.40.x per (OS, python) in the matrix.
+          python -m pip install pytest pytest-asyncio pandas 'polars<1.41'
           python -m pytest crates/namidb-py/tests -v
 
   # ── PyPI publish (only on tag push, OIDC trusted publisher) ────────────
