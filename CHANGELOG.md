@@ -21,6 +21,48 @@ below and in the release notes.
 
 ---
 
+## [0.6.0] - 2026-05-28: edge-type-count pushdown + orphan-segment durability
+
+### Added
+
+- **Edge-type-count pushdown.** A global `count(*)` / `count(r)` over a
+  directed, single-hop, unfiltered typed expand
+  (`MATCH ()-[r:T]->() RETURN count(r)`) is now answered straight from the
+  edge index via a new `EdgeTypeCount` operator, skipping the `NodeScan` +
+  `Expand` over every node. The rewrite is conservative: a labelled or
+  predicated source, a target label, an undirected, variable-length,
+  optional, or `shortestPath` expand, an untyped edge, `GROUP BY`, or a
+  count over anything but the relationship binding all fall back to the
+  ordinary plan. `EXPLAIN` renders the operator.
+- **`Snapshot::count_edge_type`.** Counts live edges of a type by merging
+  the memtable and forward SSTs (last-writer-wins, tombstones pruned)
+  without decoding edge property streams.
+
+### Changed
+
+- **The server caches the optimizer `StatsCatalog` per manifest version**
+  instead of rebuilding it on every read query. Every commit bumps the
+  version, so a version match is enough to keep the cache valid.
+
+### Fixed
+
+- **Intra-session orphan WAL recovery.** When a prior commit left a WAL
+  segment durable but failed before the manifest commit, an in-session
+  retry of `commit_batch` no longer wedges on a repeated `Precondition`.
+  It re-picks a fresh seq and retries once, recovering when the manifest
+  body slot is still free and otherwise terminating with a clean
+  `ManifestCommitCas` that poisons the session for a drop-and-reopen.
+- **`claim_writer` no longer hangs on an orphan manifest body.** A body
+  written at `version + 1` whose pointer CAS failed transiently used to
+  spin `claim_writer` forever. It now bounds the stall and returns the new
+  `OrphanManifestBody` error.
+
+### Breaking
+
+- None.
+
+---
+
 ## [0.5.1] - 2026-05-27: Value::Bytes JSON round-trip
 
 ### Fixed
