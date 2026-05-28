@@ -46,6 +46,21 @@ pub enum Error {
     #[error("writer fenced: local epoch {mine}, current epoch {current}")]
     Fenced { mine: u64, current: u64 },
 
+    /// `claim_writer` kept losing the manifest CAS to a body that already
+    /// exists at `version` while the pointer never advanced to it — the
+    /// signature of an orphan manifest body left by a writer that wrote
+    /// the body but crashed before the pointer CAS (e.g. a transient
+    /// error in `cas_pointer`). Nobody can supersede that version under
+    /// `PutMode::Create`, so the namespace cannot be claimed until the
+    /// orphan at `manifest/v{version}.json` is removed. Distinct from
+    /// `ManifestCommitCas` (a live race that resolves on retry) so callers
+    /// and operators can tell a recoverable race from a stuck namespace.
+    #[error(
+        "orphan manifest body blocks claim: a body exists at version {version} \
+         but the pointer never advanced to it"
+    )]
+    OrphanManifestBody { version: u64 },
+
     /// A CRC or schema check on a stored artefact failed.
     #[error("corrupted artefact at {path}: {detail}")]
     Corrupted { path: String, detail: String },

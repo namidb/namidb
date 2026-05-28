@@ -577,6 +577,19 @@ impl ManifestStore {
     /// that the caller should hold for the lifetime of its writer session.
     #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn claim_writer(&self) -> Result<(LoadedManifest, WriterFence)> {
+        // A genuine concurrent claim resolves quickly: the winner advances
+        // the pointer, so a reloaded base sees a higher version within a
+        // couple of rounds and we make progress. A CAS loss where the
+        // pointer NEVER advances is the signature of an orphan manifest
+        // body at `base.version + 1` — a writer wrote the body via
+        // `PutMode::Create` but crashed before the pointer CAS (e.g. a
+        // transient error in `cas_pointer`). Nobody can supersede that
+        // version under `Create`, so an unbounded loop would spin forever.
+        // Bound the *stall* (consecutive CAS losses at the same pointer
+        // version) and surface a distinct terminal error instead of hanging.
+        const MAX_STALLED_ROUNDS: usize = 8;
+        let mut stalled_rounds = 0usize;
+        let mut last_version: Option<u64> = None;
         loop {
             let base = self.load_current().await?;
             let mut new_manifest = base.manifest.next_version(Uuid::now_v7());
@@ -592,7 +605,21 @@ impl ManifestStore {
             match self.commit(&pretend, &base, new_manifest).await {
                 Ok(loaded) => return Ok((loaded, fence)),
                 Err(Error::ManifestCommitCas { .. }) => {
-                    // Someone else moved the pointer; reload and retry.
+                    // Reload and retry only while we keep making progress
+                    // (the pointer version advances). If it stalls at the
+                    // same version, we are colliding with an orphan body
+                    // and must stop rather than loop forever.
+                    if last_version == Some(base.pointer.version) {
+                        stalled_rounds += 1;
+                        if stalled_rounds >= MAX_STALLED_ROUNDS {
+                            return Err(Error::OrphanManifestBody {
+                                version: base.pointer.version.saturating_add(1),
+                            });
+                        }
+                    } else {
+                        last_version = Some(base.pointer.version);
+                        stalled_rounds = 0;
+                    }
                     continue;
                 }
                 Err(other) => return Err(other),
@@ -807,6 +834,44 @@ mod tests {
                 assert_eq!(current, loaded.manifest.epoch.as_u64());
             }
             other => panic!("expected Fenced, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_writer_surfaces_orphan_manifest_body_instead_of_hanging() {
+        // Reproduce the partial-commit window: a writer wrote the manifest
+        // body at version 1 via PutMode::Create but never advanced the
+        // pointer (e.g. a transient, non-Precondition error in cas_pointer).
+        // The body at v1 is now a durable orphan with the pointer stuck at
+        // v0. Without a stall bound, claim_writer would spin forever (Create
+        // at v1 -> AlreadyExists -> ManifestCommitCas -> reload still v0 ->
+        // repeat). It must instead terminate with a distinct error.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let w = Uuid::now_v7();
+        let base = ms.bootstrap(w).await.unwrap();
+        assert_eq!(base.manifest.version, 0);
+
+        // Plant the orphan body at v1, pointer left at v0.
+        let orphan = base.manifest.next_version(Uuid::now_v7());
+        assert_eq!(orphan.version, 1);
+        store
+            .put_opts(
+                &paths.manifest_version(1),
+                PutPayload::from(serde_json::to_vec(&orphan).unwrap()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+
+        // Must terminate (not hang) and surface OrphanManifestBody.
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ms.claim_writer())
+            .await
+            .expect("claim_writer must not hang on an orphan manifest body")
+            .unwrap_err();
+        match err {
+            Error::OrphanManifestBody { version } => assert_eq!(version, 1),
+            other => panic!("expected OrphanManifestBody, got {other:?}"),
         }
     }
 
