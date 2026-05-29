@@ -591,10 +591,18 @@ impl<'mt> Snapshot<'mt> {
                 });
                 continue;
             }
-            let (src_label, dst_label) = match samples.get(&edge_type) {
+            // Prefer the memtable sample (freshest, resolved synchronously);
+            // fall back to a forward-SST sample when the live memtable holds
+            // no edge of this type — the common case for a bulk-loaded
+            // namespace whose edges have already been flushed.
+            let sample = match samples.get(&edge_type) {
+                Some(pair) => Some(*pair),
+                None => self.first_sst_edge(&edge_type).await?,
+            };
+            let (src_label, dst_label) = match sample {
                 Some((src, dst)) => (
-                    self.find_node_label(*src, &mem_node_label).await?,
-                    self.find_node_label(*dst, &mem_node_label).await?,
+                    self.find_node_label(src, &mem_node_label).await?,
+                    self.find_node_label(dst, &mem_node_label).await?,
                 ),
                 None => (None, None),
             };
@@ -606,6 +614,36 @@ impl<'mt> Snapshot<'mt> {
             });
         }
         Ok(out)
+    }
+
+    /// Sample one live `(src, dst)` edge of `edge_type` from the forward
+    /// SSTs. Used by [`Self::observed_edge_endpoints`] when the live
+    /// memtable carries no edge of the type — the common case for a
+    /// bulk-loaded namespace whose edges were flushed to SSTs. Reads the
+    /// key columns of forward-SST descriptors in manifest order and
+    /// returns the first non-tombstone row; `None` if every forward SST is
+    /// empty / all-tombstone. Property streams are never decoded, and we
+    /// stop at the first match, so the cost is bounded by one SST's key
+    /// section — acceptable for an infrequent schema read.
+    async fn first_sst_edge(&self, edge_type: &str) -> Result<Option<(NodeId, NodeId)>> {
+        for &idx in self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::EdgesFwd, edge_type)
+        {
+            let desc = &self.manifest.manifest.ssts[idx];
+            let body = self.get_sst_body(desc).await?;
+            let reader = EdgeSstReader::open(body)?;
+            for row in reader.scan_all_edges()? {
+                if row.tombstone {
+                    continue;
+                }
+                let src = NodeId::from_uuid(Uuid::from_bytes(row.key_id));
+                let dst = NodeId::from_uuid(Uuid::from_bytes(row.partner_id));
+                return Ok(Some((src, dst)));
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve the label of `id` by checking the memtable map first,
@@ -3927,6 +3965,79 @@ mod tests {
         assert_eq!(endpoints.len(), 1);
         let ep = &endpoints[0];
         assert_eq!(ep.edge_type, "WORKS_AT");
+        assert_eq!(ep.src_label.as_deref(), Some("Person"));
+        assert_eq!(ep.dst_label.as_deref(), Some("Company"));
+        assert!(ep.inferred);
+    }
+
+    #[tokio::test]
+    async fn observed_edge_endpoints_infers_from_flushed_sst() {
+        // Regression: a bulk-loaded namespace flushes its edges into SSTs,
+        // leaving the live memtable empty. Endpoint inference must fall
+        // back to sampling an edge from the forward SST rather than
+        // returning None — otherwise the dashboard's graph explorer cannot
+        // collapse its cartesian probe fan-out for such namespaces.
+        let store = make_store();
+        let paths = make_paths("schema-endpoints-sst");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        // Declare the node labels so the flush writes node SSTs, but leave
+        // the edge type UNDECLARED — that is exactly the case we infer.
+        let company_label = LabelDef {
+            name: "Company".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        };
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .label(company_label)
+            .unwrap()
+            .build();
+
+        let person = sorted_node_id(1);
+        let company = sorted_node_id(2);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id: person,
+            },
+            1,
+            MemOp::Upsert(node_payload("Alice", None)),
+        );
+        mt.apply(
+            MemKey::Node {
+                label: "Company".into(),
+                id: company,
+            },
+            2,
+            MemOp::Upsert(node_payload("Acme", None)),
+        );
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "WORKS_AT".into(),
+                src: person,
+                dst: company,
+            },
+            3,
+            MemOp::Upsert(edge_payload()),
+        );
+        let frozen = mt.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema).await.unwrap();
+
+        // Live memtable empty → inference must read the sample edge from
+        // the forward SST, not the memtable.
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(outcome.committed.clone(), &empty_view, store, paths);
+
+        let endpoints = snap.observed_edge_endpoints().await.unwrap();
+        let ep = endpoints
+            .iter()
+            .find(|e| e.edge_type == "WORKS_AT")
+            .expect("WORKS_AT endpoint present");
         assert_eq!(ep.src_label.as_deref(), Some("Person"));
         assert_eq!(ep.dst_label.as_deref(), Some("Company"));
         assert!(ep.inferred);
