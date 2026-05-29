@@ -326,8 +326,21 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 skip,
                 limit,
             } => {
-                let mut rows =
-                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                // LIMIT-pushdown: with no ORDER BY (keys empty) and a finite
+                // limit, the child only needs its first `skip + limit` rows.
+                // Run it under a row budget (`execute_capped`) so an
+                // Expand/NodeScan can stop early instead of materialising its
+                // full output before we truncate. Any plan shape the budget
+                // can't safely cross falls back to full execution inside
+                // `execute_capped`, so the worst case equals today's
+                // behaviour. The sort/skip/take below are unchanged — they
+                // still truncate the (possibly over-shooting) result exactly.
+                let mut rows = if keys.is_empty() && *limit != u64::MAX {
+                    let cap = (*skip as usize).saturating_add(*limit as usize);
+                    execute_capped(input, snapshot, params, outer, routing, cap).await?
+                } else {
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?
+                };
                 if !keys.is_empty() {
                     sort_rows(&mut rows, keys, params)?;
                 }
@@ -600,6 +613,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                         *length,
                         *back_reference,
                     ),
+                    None,
                 )
                 .await
             }
@@ -639,6 +653,123 @@ pub(crate) fn execute_inner_with_routing<'a>(
     .boxed()
 }
 
+/// Execute `plan` under an order-insensitive row budget `cap`, used ONLY
+/// by the `TopN`-with-empty-keys path (a bare `LIMIT`/`SKIP`, no
+/// `ORDER BY`). It honours the cap in the three operators where a prefix
+/// of the output is a valid prefix of the full result:
+///   * non-`DISTINCT` `Project` — 1:1, order-preserving → pass cap through;
+///   * `Expand` — 1:N, order-preserving → run its own input UNCAPPED (a
+///     zero-edge seed yields no rows and must not starve the budget) and
+///     stop the expansion at a seed boundary once `out.len() >= cap`;
+///   * `NodeScan` — leaf → stop after `cap` rows (counter is global across
+///     labels; predicates are pre-applied so truncation is safe).
+/// EVERY other operator drops, reorders, dedups, expands-by-data, or
+/// aggregates rows, so a prefix would be wrong — the catch-all delegates
+/// to the uncapped [`execute_inner_with_routing`], which makes
+/// "worst case == identical to today" true by construction. The budget is
+/// valid only because no order is imposed; it is dropped the instant any
+/// order-imposing / cardinality-altering operator is crossed (the
+/// catch-all enforces this — nothing not whitelisted keeps the cap).
+fn execute_capped<'a>(
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
+    routing: &'a PlanRouting,
+    cap: usize,
+) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
+    async move {
+        match plan {
+            LogicalPlan::Project {
+                input,
+                items,
+                distinct: false,
+                discard_input_bindings,
+            } => {
+                let rows = execute_capped(input, snapshot, params, outer, routing, cap).await?;
+                project_rows(&rows, items, *discard_input_bindings, params)
+            }
+
+            LogicalPlan::Expand {
+                input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_label,
+                length,
+                optional,
+                back_reference,
+                shortest,
+                path_binding,
+            } => {
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                execute_expand(
+                    rows,
+                    source,
+                    edge_type.as_deref(),
+                    *direction,
+                    rel_alias.as_deref(),
+                    target_alias,
+                    target_label.as_deref(),
+                    *length,
+                    *optional,
+                    *back_reference,
+                    *shortest,
+                    path_binding.as_deref(),
+                    snapshot,
+                    routing.needs_properties(rel_alias.as_deref()),
+                    should_skip_target_materialize(
+                        snapshot,
+                        routing,
+                        target_alias,
+                        edge_type.as_deref(),
+                        *direction,
+                        target_label.as_deref(),
+                        *length,
+                        *back_reference,
+                    ),
+                    Some(cap),
+                )
+                .await
+            }
+
+            LogicalPlan::NodeScan {
+                label,
+                alias,
+                predicates,
+                projection,
+            } => {
+                let labels = resolve_node_labels(snapshot, label.as_deref());
+                let mut rows: Vec<Row> = Vec::new();
+                'scan: for label_name in &labels {
+                    let nodes = snapshot
+                        .scan_label_with_predicates_and_projection(
+                            label_name,
+                            predicates,
+                            projection.as_deref(),
+                        )
+                        .await?;
+                    for n in nodes {
+                        if rows.len() >= cap {
+                            break 'scan;
+                        }
+                        let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
+                        rows.push(Row::new().with(alias.clone(), value));
+                    }
+                }
+                Ok(rows)
+            }
+
+            // Cap unsafe to push through this operator — run it in full.
+            other => execute_inner_with_routing(other, snapshot, params, outer, routing).await,
+        }
+    }
+    .boxed()
+}
+
 // ───────────────────────── Expand ────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -658,6 +789,7 @@ async fn execute_expand(
     snapshot: &Snapshot<'_>,
     want_properties: bool,
     skip_target_materialize: bool,
+    cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
     namidb_core::profile_scope!("walker::execute_expand");
     let edge_types = resolve_edge_types(snapshot, edge_type);
@@ -666,6 +798,16 @@ async fn execute_expand(
 
     let mut out = Vec::new();
     for row in rows {
+        // LIMIT-pushdown budget (set only via `execute_capped`, never on
+        // the normal path). Checked at the seed boundary BEFORE processing
+        // the next input row, so every consumed seed contributes its
+        // COMPLETE edge set and `out` stays an order-preserving prefix of
+        // the uncapped result. `cap == Some(0)` returns empty immediately.
+        if let Some(cap) = cap {
+            if out.len() >= cap {
+                break;
+            }
+        }
         let starting = match row.get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
             _ => {
