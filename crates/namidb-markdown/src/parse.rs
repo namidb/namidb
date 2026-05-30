@@ -14,9 +14,12 @@
 //! - Wikilinks `[[Note]]`, `[[Note|alias]]`, `[[Note#heading]]`,
 //!   `[[Note#^block]]`, `[[folder/Note]]` and embeds `![[Note]]` all resolve
 //!   to the target note's basename and produce one `LINKS_TO` edge.
-//! - Same-note refs (`[[#heading]]`) and links to non-`.md` targets are
-//!   ignored for edge purposes (the latter still normalize like any name).
-//! - Wikilinks inside fenced or inline code are excluded.
+//! - Standard markdown links `[text](note.md)` to a local `.md`/`.markdown`
+//!   file also produce a `LINKS_TO` edge (basename-resolved, percent-decoded).
+//!   External URLs, mail/other schemes, bare anchors and non-markdown files
+//!   are ignored. Markdown image embeds (`![]()`) are not treated as links.
+//! - Same-note refs (`[[#heading]]`) carry no target.
+//! - Links inside fenced or inline code are excluded.
 //! - Frontmatter is parsed as YAML; malformed frontmatter yields no
 //!   properties rather than failing the note.
 //! - Inline `#tags` are NOT collected (only a frontmatter `tags` list, as a
@@ -51,9 +54,10 @@ pub struct ParsedNote {
     /// Path relative to the vault root, `/`-separated.
     pub rel_path: String,
     /// Properties to store on the node: frontmatter plus the engine-owned
-    /// `title`, `path` and `body`.
+    /// `title`, `path`, `body` and `key`.
     pub properties: BTreeMap<String, Value>,
-    /// Normalized keys this note links to, deduplicated, in first-seen order.
+    /// Normalized keys this note links to (via wikilinks and markdown links),
+    /// deduplicated, in first-seen order.
     pub links: Vec<String>,
 }
 
@@ -133,7 +137,7 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     properties.insert("body".to_string(), Value::Str(body.to_string()));
     properties.insert("key".to_string(), Value::Str(key.clone()));
 
-    let links = extract_wikilinks(body);
+    let links = extract_links(body);
 
     ParsedNote {
         id: stable_node_id(&key),
@@ -237,6 +241,125 @@ pub fn extract_wikilinks(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// All note targets a body links to, as normalized keys, deduplicated in
+/// first-seen order. Combines `[[wikilinks]]` with standard markdown links
+/// `[text](note.md)` that point at a local `.md`/`.markdown` file. External
+/// URLs, mail/other schemes, bare anchors and non-note files are ignored.
+pub fn extract_links(body: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for key in extract_wikilinks(body)
+        .into_iter()
+        .chain(extract_markdown_links(body))
+    {
+        if seen.insert(key.clone()) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// Markdown-link targets (`[text](note.md)`) that resolve to a local note, as
+/// normalized keys in document order. Uses the CommonMark parser, so links
+/// inside code are not emitted; images (`![]()`) are not links and are skipped.
+fn extract_markdown_links(body: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let mut out = Vec::new();
+    for event in Parser::new_ext(body, Options::empty()) {
+        if let Event::Start(Tag::Link { dest_url, .. }) = event {
+            if let Some(key) = md_link_target_key(&dest_url) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
+/// Reduce a markdown link destination to a normalized note key, or `None` if it
+/// is not a link to a local `.md`/`.markdown` note (external URL, mail/other
+/// scheme, bare anchor, or non-markdown file).
+fn md_link_target_key(dest: &str) -> Option<String> {
+    let dest = dest.trim();
+    // Empty, same-page anchor, or protocol-relative URL (`//host/...`).
+    if dest.is_empty() || dest.starts_with('#') || dest.starts_with("//") {
+        return None;
+    }
+    // Absolute URL (`http://`, `https://`, ...) — not a note.
+    if dest.contains("://") {
+        return None;
+    }
+    // A URI scheme before the first `:` (RFC-3986:
+    // `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) — `mailto:`, `tel:`, ...
+    if let Some(colon) = dest.find(':') {
+        let scheme = &dest[..colon];
+        if scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            return None;
+        }
+    }
+    // Strip the literal fragment/query, take the basename, then percent-decode
+    // it (decoding last so an encoded `%2F`/`%23` becomes data in the stem
+    // rather than a structural separator we'd split on).
+    let path = dest.split(['#', '?']).next().unwrap_or(dest);
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let decoded = percent_decode(base);
+    let lower = decoded.to_ascii_lowercase();
+    let stem = if lower.ends_with(".md") {
+        &decoded[..decoded.len() - 3]
+    } else if lower.ends_with(".markdown") {
+        &decoded[..decoded.len() - 9]
+    } else {
+        return None; // not a markdown note link
+    };
+    // Any path/scheme separator surviving into the stem (e.g. `1:foo`, or a
+    // decoded `%2F`/`%23`) means this is not a clean single-note name; a real
+    // note key can never contain these, so it would only ever dangle.
+    if stem.contains([':', '/', '\\', '#', '?']) {
+        return None;
+    }
+    let key = normalize_key(stem);
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// Minimal percent-decoder for link destinations (`%20` -> space, etc.).
+/// Leaves malformed escapes untouched.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn wikilink_regex() -> &'static Regex {
@@ -357,6 +480,49 @@ mod tests {
     fn duplicate_links_collapse_preserving_order() {
         let body = "[[B]] then [[A]] then [[b]] again";
         assert_eq!(extract_wikilinks(body), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn markdown_links_to_notes_become_targets() {
+        let body = "See [Alpha](Alpha.md), [Beta](notes/Beta.markdown), \
+                    [spaced](User%20Role.md), [up](../Gamma.md#section).";
+        assert_eq!(
+            extract_markdown_links(body),
+            vec!["alpha", "beta", "user-role", "gamma"]
+        );
+    }
+
+    #[test]
+    fn markdown_non_note_links_are_ignored() {
+        let body = "[site](https://example.com), [mail](mailto:a@b.com), \
+                    [img](pic.png), [anchor](#section), [doc](report.pdf), \
+                    ![embed](Note.md).";
+        // Only real note links count; the image (`![]()`) is not a link.
+        assert!(extract_markdown_links(body).is_empty());
+    }
+
+    #[test]
+    fn markdown_links_reject_scheme_and_structural_garbage() {
+        // None of these reduce to a clean note name, so none must produce an
+        // edge (each would otherwise leave a `:`/`/`/`#` in the key that can
+        // never match a stored note).
+        let body = "[a](//cdn.example.com/x.md) [b](1:foo.md) [c](a-b:thing.md) \
+                    [d](x.y:thing.md) [e](a%2Fb.md) [f](note%23x.md) [g](tel:5550100)";
+        assert!(extract_markdown_links(body).is_empty());
+    }
+
+    #[test]
+    fn markdown_links_in_code_are_ignored() {
+        let body = "Real [Alpha](Alpha.md).\n\n```\n[Fenced](Nope.md)\n```\n\n\
+                    Inline `[Inline](Nope.md)` ignored.";
+        assert_eq!(extract_markdown_links(body), vec!["alpha"]);
+    }
+
+    #[test]
+    fn extract_links_merges_wikilinks_and_markdown_and_dedups() {
+        let body = "[[Alpha]] and [Alpha](Alpha.md) and [Beta](Beta.md) and [[beta]]";
+        // Wikilinks first (in order), then new markdown targets; duplicates drop.
+        assert_eq!(extract_links(body), vec!["alpha", "beta"]);
     }
 
     #[test]

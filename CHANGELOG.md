@@ -13,6 +13,14 @@ below and in the release notes.
 
 ### Added
 
+- **Markdown links as graph edges.** Standard markdown links `[text](note.md)`
+  to a local `.md`/`.markdown` file now produce a `LINKS_TO` edge alongside
+  `[[wikilinks]]`, resolved by basename (percent-decoded). External URLs,
+  mail/other schemes, anchors and non-markdown files are ignored, and a
+  destination that does not reduce to a clean note name is skipped rather than
+  creating a dangling edge. Docs-style vaults (and the repo's own `MEMORY.md`
+  index, which uses `[Title](file.md)`) become fully connected.
+
 ### Changed
 
 ### Fixed
