@@ -21,6 +21,37 @@ below and in the release notes.
 
 ---
 
+## [0.7.0] - 2026-05-30: markdown vault ingest + local MCP server
+
+### Added
+
+- **Markdown vault ingest (`namidb-markdown`).** Load an Obsidian-style
+  vault of `.md` files into a graph: each note becomes a `Note` node,
+  each `[[wikilink]]` a `LINKS_TO` edge, and YAML frontmatter becomes
+  node properties. The raw note body is kept as a `body` property, so the
+  files stay the source of truth and the graph is a derived, rebuildable
+  index. Wikilinks resolve by normalized basename (kebab, snake, and
+  spaces collapse to one key), links inside fenced or inline code are
+  excluded, and node ids are derived with BLAKE3 so re-ingesting a vault
+  is idempotent.
+- **`namidb load-vault` (CLI).** Load a vault into any namespace, with
+  `--store`, `--namespace`, `--label`, and `--edge-type`.
+- **`Client.load_vault` (Python).** Load a vault from the Python client;
+  it commits the load and returns a dict of counts.
+- **Local MCP server (`namidb-mcp`).** A Model Context Protocol server
+  (JSON-RPC 2.0 over stdio) that exposes a namespace to an agent as
+  read-only graph tools: `list_notes`, `get_note`, `backlinks`,
+  `neighbors`, `orphans`, `search`, and a read-only `cypher`. Point it at
+  a loaded namespace or pass `--vault` to load one on startup.
+
+### Changed
+
+### Fixed
+
+### Breaking
+
+---
+
 ## [0.6.0] - 2026-05-28: edge-type-count pushdown + orphan-segment durability
 
 ### Added
