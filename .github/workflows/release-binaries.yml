@@ -38,10 +38,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --bin namidb --bin namidb-mcp
 
+  # On a `v*` tag: ensure the GitHub Release exists before the matrix tries to
+  # upload to it. taiki-e/upload-rust-binary-action does NOT create the
+  # release, and a lightweight tag has none, so without this the upload jobs
+  # fail with "release not found".
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release for this tag (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
   # On a `v*` tag: build release archives per platform and upload to the
-  # release (created if it does not exist yet).
+  # release created above.
   upload:
     name: upload · ${{ matrix.target }}
+    needs: create-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     permissions:
