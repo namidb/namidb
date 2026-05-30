@@ -13,6 +13,18 @@ below and in the release notes.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Breaking
+
+---
+
+## [0.8.0] - 2026-05-30: vault prune, name resolution, and prebuilt binaries
+
+### Added
+
 - **`prune` for vault loads.** Re-loading a vault can now mirror it instead of
   merging: with prune enabled the loader tombstones notes and links the vault
   no longer contains, so the graph stays a faithful, rebuildable index rather
@@ -28,6 +40,9 @@ below and in the release notes.
   workflow builds standalone binaries for Linux (x86_64, aarch64), macOS
   (arm64) and Windows (x86_64) on every `v*` tag and attaches them to the
   GitHub Release, so the CLI and MCP server run without a Rust toolchain.
+- **Offline SST builder and `attach_ssts`.** Build SST files offline (outside a
+  live `WriterSession`) and attach them to a namespace's manifest via
+  `attach_ssts` (RFC-023 tasks 4/5).
 
 ### Changed
 
