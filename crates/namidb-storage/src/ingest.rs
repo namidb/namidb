@@ -197,7 +197,23 @@ impl WriterSession {
         // from it and skip every WAL record it already covers.
         let recovered =
             recover_memtable_with_snapshot(&current.manifest, &wal_store, Some(&store)).await?;
-        let next_lsn = recovered.max_lsn.saturating_add(1).max(1);
+        // Rebase the LSN counter past the highest LSN durably held in any
+        // SST, not just what recovery saw in the WAL + memtable snapshot.
+        // Once a namespace flushes all its WAL into SSTs, `recovered.max_lsn`
+        // drops to 0 — `recover_memtable_with_snapshot` only scans WAL
+        // segments and the snapshot, never `manifest.ssts`. Without this
+        // max, a cold-reopened all-SST namespace would restart at lsn=1 and
+        // the next online write would be silently shadowed by its own older
+        // SST row (reads pick the strictly-higher LSN). The SST high-water
+        // is the true floor for the next LSN.
+        let max_sst_lsn = current
+            .manifest
+            .ssts
+            .iter()
+            .map(|sst| sst.max_lsn)
+            .max()
+            .unwrap_or(0);
+        let next_lsn = recovered.max_lsn.max(max_sst_lsn).saturating_add(1).max(1);
 
         // Pick a WAL seq strictly greater than every segment we can see
         // in the object store, not just those the manifest references.
@@ -994,12 +1010,75 @@ mod tests {
         // The flush cleared the WAL refs, so recovery has nothing to
         // replay and the snapshot still sees Alice via the SST.
         let session2 = WriterSession::open(store, paths).await.unwrap();
-        assert_eq!(session2.next_lsn(), 1, "no WAL refs → counter resets");
+        // The WAL was cleared by the flush, but Alice's row lives in an SST
+        // at lsn=1. The counter must rebase to 2 (past the SST high-water),
+        // NOT reset to 1 — restarting at 1 would let the next online write
+        // collide with / be shadowed by that flushed SST row.
+        assert_eq!(
+            session2.next_lsn(),
+            2,
+            "no WAL refs, but next_lsn must rebase past the flushed SST's max_lsn (1)"
+        );
         let snap = session2.snapshot();
         let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
         assert_eq!(
             view.properties.get("name"),
             Some(&Value::Str("Alice".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_after_flush_rebases_next_lsn_and_online_write_wins() {
+        // Regression for the silent-shadow bug: after a namespace flushes
+        // all its WAL into SSTs and is cold-reopened, the LSN counter must
+        // continue past the SST high-water, and a fresh upsert to an
+        // already-flushed node must WIN rather than be shadowed by its
+        // older SST row.
+        let store = make_store();
+        let paths = make_paths("ingest-lsn-rebase");
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+        session
+            .upsert_node("Person", bob, &node_record("Bob", Some(25)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+        let outcome = session.flush(schema()).await.unwrap();
+        assert!(outcome.committed.manifest.wal_segments.is_empty());
+
+        // The highest LSN (Bob, lsn=2) now lives only in an SST.
+        let max_sst_lsn = outcome
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .map(|sst| sst.max_lsn)
+            .max()
+            .unwrap();
+        assert_eq!(max_sst_lsn, 2);
+
+        // Cold-reopen: next_lsn rebases past the SST high-water (not to 1).
+        let mut session2 = WriterSession::open(store, paths).await.unwrap();
+        assert_eq!(session2.next_lsn(), max_sst_lsn + 1);
+
+        // A fresh upsert to the already-flushed Alice must win.
+        session2
+            .upsert_node("Person", alice, &node_record("Alice2", Some(31)))
+            .unwrap();
+        let _ = session2.commit_batch().await.unwrap();
+        let snap = session2.snapshot();
+        let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
+        assert_eq!(
+            view.properties.get("name"),
+            Some(&Value::Str("Alice2".into())),
+            "online upsert after cold-reopen must win over the flushed SST row"
         );
     }
 
