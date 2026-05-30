@@ -61,6 +61,9 @@ pub struct ParsedNote {
     /// Normalized keys this note links to (via wikilinks and markdown links),
     /// deduplicated, in first-seen order.
     pub links: Vec<String>,
+    /// String tags on this note (frontmatter `tags` strings + inline `#tags`),
+    /// deduplicated. Each becomes a `:Tag` node linked by a `:TAGGED` edge.
+    pub tags: Vec<String>,
 }
 
 /// A parsed vault: every `.md` file under the root, in path order.
@@ -186,6 +189,26 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
 
     let links = extract_links(body);
 
+    // The note's string tags (for `:Tag` nodes), taken from the final `tags`
+    // property so they stay consistent with what is stored/displayed, then
+    // deduplicated (frontmatter may list the same tag twice) in first-seen
+    // order so each note links to a tag at most once.
+    let mut tags: Vec<String> = match properties.get("tags") {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(Value::Str(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    };
+    {
+        let mut seen = HashSet::new();
+        tags.retain(|t| seen.insert(t.clone()));
+    }
+
     ParsedNote {
         id: stable_node_id(&key),
         key,
@@ -193,6 +216,7 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         rel_path: rel_path.to_string(),
         properties,
         links,
+        tags,
     }
 }
 

@@ -5,6 +5,12 @@
 //! matching note) are counted but produce no edge, so every edge endpoint is a
 //! real note and queries like "orphan notes" or "backlinks" stay clean.
 //!
+//! Each distinct string tag on a note becomes a shared `:Tag` node (one per
+//! tag name), linked from the note by a `:TAGGED` edge, so tag-traversal
+//! queries ("notes tagged X", "notes that share a tag") run on the graph.
+//! Tag names are matched as written (case-sensitive), so `Rust` and `rust`
+//! are two distinct tag nodes.
+//!
 //! By default a load is additive (upsert-only): nodes overwrite in place
 //! thanks to deterministic ids, but a note or link removed from the vault is
 //! left behind. Set [`LoadOptions::prune`] to mirror the vault instead: before
@@ -15,10 +21,10 @@
 //! Follows the same cadence contract as the parquet loader: the loader leaves
 //! the final batch pending and the caller decides when to `commit_batch`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use namidb_core::NodeId;
+use namidb_core::{NodeId, Value};
 use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, WriterSession};
 
 use crate::id::stable_node_id;
@@ -26,6 +32,10 @@ use crate::parse::{parse_vault, VaultGraph};
 
 const DEFAULT_LABEL: &str = "Note";
 const DEFAULT_EDGE_TYPE: &str = "LINKS_TO";
+/// Label for tag nodes and the edge type linking a note to its tags. These are
+/// fixed (not configurable) so the tag sub-graph has a stable shape.
+const TAG_LABEL: &str = "Tag";
+const TAG_EDGE_TYPE: &str = "TAGGED";
 /// Rows (nodes + edges) between in-loop commits. Picked to match the parquet
 /// loader's order of magnitude; vaults are small so most loads commit once.
 const DEFAULT_COMMIT_EVERY: usize = 1000;
@@ -40,11 +50,11 @@ pub struct LoadOptions {
     /// Rows allowed to accumulate between `commit_batch` calls. `0` leaves
     /// everything pending for the caller's final flush.
     pub commit_every: usize,
-    /// Mirror the vault instead of merging into it: tombstone every node of
-    /// `label` and every edge of `edge_type` that the vault no longer
-    /// contains. `false` (default) keeps the load additive. Pruning only ever
-    /// touches the configured `label` / `edge_type`, so unrelated data in the
-    /// namespace is left alone.
+    /// Mirror the vault instead of merging into it: tombstone every node and
+    /// edge the vault no longer contains, across the note graph (`label` /
+    /// `edge_type`) and the tag graph (`Tag` / `TAGGED`). `false` (default)
+    /// keeps the load additive. Pruning only touches those labels/types, so
+    /// unrelated data in the namespace is left alone.
     pub prune: bool,
 }
 
@@ -77,6 +87,14 @@ pub struct VaultLoadOutcome {
     /// Stale edges tombstoned because they are no longer in the vault (only
     /// non-zero when [`LoadOptions::prune`] is set).
     pub links_pruned: usize,
+    /// Distinct `:Tag` nodes upserted (the union of all notes' tags).
+    pub tags_loaded: usize,
+    /// `:TAGGED` edges upserted (note -> tag).
+    pub tag_links: usize,
+    /// Stale `:Tag` nodes tombstoned (no longer used by any note; prune only).
+    pub tags_pruned: usize,
+    /// Stale `:TAGGED` edges tombstoned (prune only).
+    pub tag_links_pruned: usize,
     /// `commit_batch` calls fired during the load (excludes the caller's
     /// final flush).
     pub commit_batches: usize,
@@ -124,6 +142,18 @@ pub async fn load_graph(
         }
     }
 
+    // Resolve tags: one shared `:Tag` node per distinct tag name (the union
+    // across notes), and a `:TAGGED` edge from each note to each of its tags.
+    let mut desired_tags: BTreeMap<NodeId, String> = BTreeMap::new();
+    let mut desired_tagged: Vec<(NodeId, NodeId)> = Vec::new();
+    for note in &graph.notes {
+        for tag in &note.tags {
+            let tag_id = tag_node_id(tag);
+            desired_tags.entry(tag_id).or_insert_with(|| tag.clone());
+            desired_tagged.push((note.id, tag_id));
+        }
+    }
+
     let mut outcome = VaultLoadOutcome {
         name_collisions: collisions,
         links_dangling: dangling,
@@ -136,8 +166,18 @@ pub async fn load_graph(
     if opts.prune {
         let desired_nodes: HashSet<NodeId> = graph.notes.iter().map(|n| n.id).collect();
         let desired_edge_set: HashSet<(NodeId, NodeId)> = desired_edges.iter().copied().collect();
+        let desired_tag_set: HashSet<NodeId> = desired_tags.keys().copied().collect();
+        let desired_tagged_set: HashSet<(NodeId, NodeId)> =
+            desired_tagged.iter().copied().collect();
 
-        let (existing_nodes, existing_edges): (Vec<NodeId>, Vec<(NodeId, NodeId)>) = {
+        type IdVec = Vec<NodeId>;
+        type PairVec = Vec<(NodeId, NodeId)>;
+        let (existing_nodes, existing_edges, existing_tags, existing_tagged): (
+            IdVec,
+            PairVec,
+            IdVec,
+            PairVec,
+        ) = {
             let snap = writer.snapshot();
             let nodes = snap
                 .scan_label(&opts.label)
@@ -147,9 +187,19 @@ pub async fn load_graph(
                 .scan_edge_type(&opts.edge_type)
                 .await
                 .map_err(|e| anyhow::anyhow!("scan {} edges: {e}", opts.edge_type))?;
+            let tags = snap
+                .scan_label(TAG_LABEL)
+                .await
+                .map_err(|e| anyhow::anyhow!("scan {TAG_LABEL} nodes: {e}"))?;
+            let tagged = snap
+                .scan_edge_type(TAG_EDGE_TYPE)
+                .await
+                .map_err(|e| anyhow::anyhow!("scan {TAG_EDGE_TYPE} edges: {e}"))?;
             (
                 nodes.iter().map(|n| n.id).collect(),
                 edges.iter().map(|e| (e.src, e.dst)).collect(),
+                tags.iter().map(|n| n.id).collect(),
+                tagged.iter().map(|e| (e.src, e.dst)).collect(),
             )
         };
 
@@ -169,9 +219,25 @@ pub async fn load_graph(
                 maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
             }
         }
+        for id in existing_tags {
+            if !desired_tag_set.contains(&id) {
+                writer.tombstone_node(TAG_LABEL, id)?;
+                outcome.tags_pruned += 1;
+                rows_since_commit += 1;
+                maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+            }
+        }
+        for (src, dst) in existing_tagged {
+            if !desired_tagged_set.contains(&(src, dst)) {
+                writer.tombstone_edge(TAG_EDGE_TYPE, src, dst)?;
+                outcome.tag_links_pruned += 1;
+                rows_since_commit += 1;
+                maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+            }
+        }
     }
 
-    // Upsert the current vault: nodes, then resolved edges.
+    // Upsert the current vault: note nodes, link edges, tag nodes, tag edges.
     for note in &graph.notes {
         let record = NodeWriteRecord {
             properties: note.properties.clone(),
@@ -191,7 +257,33 @@ pub async fn load_graph(
     }
     outcome.links_resolved = desired_edges.len();
 
+    for (tag_id, name) in &desired_tags {
+        let mut props = BTreeMap::new();
+        props.insert("name".to_string(), Value::Str(name.clone()));
+        let record = NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+        };
+        writer.upsert_node(TAG_LABEL, *tag_id, &record)?;
+        outcome.tags_loaded += 1;
+        rows_since_commit += 1;
+        maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+    }
+    for (src, dst) in &desired_tagged {
+        writer.upsert_edge(TAG_EDGE_TYPE, *src, *dst, &edge_record)?;
+        rows_since_commit += 1;
+        maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+    }
+    outcome.tag_links = desired_tagged.len();
+
     Ok(outcome)
+}
+
+/// Stable id for a tag node, namespaced with NUL bytes so a tag never collides
+/// with a note whose key is the same text (note keys derive from filenames and
+/// cannot contain NUL).
+fn tag_node_id(tag: &str) -> NodeId {
+    stable_node_id(&format!("\u{0}tag\u{0}{tag}"))
 }
 
 /// Fire a `commit_batch` once the pending row count reaches the cadence.
@@ -347,5 +439,95 @@ mod tests {
             vec!["Alpha", "Beta"],
             "Beta lingers"
         );
+    }
+
+    async fn tag_names(writer: &WriterSession) -> Vec<String> {
+        let snap = writer.snapshot();
+        let nodes = snap.scan_label("Tag").await.unwrap();
+        let mut names: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| match n.properties.get("name") {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn tags_become_shared_nodes_and_edges() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "---\ntags: [rust, db]\n---\nbody\n");
+        write(dir, "B.md", "uses #rust inline\n");
+
+        let mut writer = open("vault-tags").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Two distinct tags; `rust` is shared by A and B (one node, two edges).
+        assert_eq!(out.tags_loaded, 2);
+        assert_eq!(out.tag_links, 3, "A->rust, A->db, B->rust");
+        assert_eq!(tag_names(&writer).await, vec!["db", "rust"]);
+
+        // "notes tagged rust" is a reverse traversal of the shared tag node.
+        let snap = writer.snapshot();
+        let taggers = snap.in_edges("TAGGED", tag_node_id("rust")).await.unwrap();
+        assert_eq!(taggers.edges.len(), 2, "A and B both tagged rust");
+    }
+
+    #[tokio::test]
+    async fn duplicate_frontmatter_tags_count_once() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "---\ntags: [rust, rust]\n---\nx\n");
+
+        let mut writer = open("vault-duptag").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.tags_loaded, 1);
+        assert_eq!(out.tag_links, 1, "a tag listed twice still links once");
+        let snap = writer.snapshot();
+        assert_eq!(
+            snap.in_edges("TAGGED", tag_node_id("rust"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_removes_unused_tags() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "---\ntags: [rust, db]\n---\nx\n");
+
+        let mut writer = open("vault-tagprune").await;
+        load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert_eq!(tag_names(&writer).await, vec!["db", "rust"]);
+
+        // Drop the `db` tag; reload with prune.
+        write(dir, "A.md", "---\ntags: [rust]\n---\nx\n");
+        let opts = LoadOptions {
+            prune: true,
+            ..Default::default()
+        };
+        let out = load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.tags_pruned, 1, "unused db tag node removed");
+        assert_eq!(out.tag_links_pruned, 1, "A->db edge removed");
+        assert_eq!(tag_names(&writer).await, vec!["rust"]);
     }
 }

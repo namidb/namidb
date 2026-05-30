@@ -376,9 +376,12 @@ impl Client {
     /// from `path` since a previous load are tombstoned, so the graph stays a
     /// faithful index. The default (`prune=False`) is additive.
     ///
-    /// Returns a dict with `notes_loaded`, `links_resolved`,
-    /// `links_dangling`, `name_collisions`, `notes_pruned`, `links_pruned`
-    /// and `commit_batches`.
+    /// Each note's string tags also become shared `:Tag` nodes linked by
+    /// `:TAGGED` edges, so tag traversals run on the graph.
+    ///
+    /// Returns a dict with `notes_loaded`, `links_resolved`, `links_dangling`,
+    /// `name_collisions`, `notes_pruned`, `links_pruned`, `tags_loaded`,
+    /// `tag_links`, `tags_pruned`, `tag_links_pruned` and `commit_batches`.
     #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false))]
     fn load_vault(
         &self,
@@ -413,6 +416,10 @@ impl Client {
         d.set_item("name_collisions", outcome.name_collisions)?;
         d.set_item("notes_pruned", outcome.notes_pruned)?;
         d.set_item("links_pruned", outcome.links_pruned)?;
+        d.set_item("tags_loaded", outcome.tags_loaded)?;
+        d.set_item("tag_links", outcome.tag_links)?;
+        d.set_item("tags_pruned", outcome.tags_pruned)?;
+        d.set_item("tag_links_pruned", outcome.tag_links_pruned)?;
         d.set_item("commit_batches", outcome.commit_batches)?;
         Ok(d.into())
     }

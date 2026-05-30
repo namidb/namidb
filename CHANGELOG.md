@@ -25,6 +25,13 @@ below and in the release notes.
   `#123` is not a tag) are merged with any frontmatter `tags` into one
   deduplicated `tags` list. A frontmatter `tags` value that is not a string or
   list is left untouched, and non-string list items are preserved.
+- **Tags as graph nodes.** Each distinct tag becomes a shared `:Tag` node (one
+  per name, matched case-sensitively), linked from a note by a `:TAGGED` edge,
+  so tag traversals run on the graph: `MATCH (n:Note)-[:TAGGED]->(:Tag
+  {name:$t})` for "notes tagged X", or `(:Note)-[:TAGGED]->(:Tag)<-[:TAGGED]-(o)`
+  for "notes that share a tag". Prune reconciles stale tag nodes and edges too.
+  Exposed via the load outcome (`tags_loaded`, `tag_links`, `tags_pruned`,
+  `tag_links_pruned`) in the CLI and Python client.
 
 ### Changed
 

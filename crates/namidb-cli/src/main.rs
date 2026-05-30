@@ -234,9 +234,13 @@ async fn load_vault_cmd(
     println!("links resolved  : {}", outcome.links_resolved);
     println!("links dangling  : {}", outcome.links_dangling);
     println!("name collisions : {}", outcome.name_collisions);
+    println!("tags loaded     : {}", outcome.tags_loaded);
+    println!("tag links       : {}", outcome.tag_links);
     if prune {
         println!("notes pruned    : {}", outcome.notes_pruned);
         println!("links pruned    : {}", outcome.links_pruned);
+        println!("tags pruned     : {}", outcome.tags_pruned);
+        println!("tag links pruned: {}", outcome.tag_links_pruned);
     }
     println!("{}", "─".repeat(48));
     if store_uri.is_none() {
