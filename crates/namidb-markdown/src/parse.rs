@@ -34,9 +34,10 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::id::{normalize_key, stable_node_id};
 
-/// Property names the storage layer manages itself; we never let frontmatter
-/// write them (the flush path rejects them anyway).
-const RESERVED_PROPS: [&str; 2] = ["tombstone", "lsn"];
+/// Property names frontmatter may not set: `tombstone`/`lsn` are
+/// storage-managed (the flush path rejects them), and `key` is the loader's
+/// own normalized resolution key, set below from the file stem.
+const RESERVED_PROPS: [&str; 3] = ["tombstone", "lsn", "key"];
 
 /// One note, parsed and ready to ingest.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,12 +123,15 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     let key = normalize_key(&title);
 
     // Engine-owned properties. `title` defers to a frontmatter title if the
-    // author set one; `path` and `body` are authoritative.
+    // author set one; `path`, `body` and `key` are authoritative. `key` is the
+    // normalized resolution key, stored so a query can resolve a note by name
+    // (kebab/snake/spaces) without re-implementing the normalization.
     properties
         .entry("title".to_string())
         .or_insert_with(|| Value::Str(title.clone()));
     properties.insert("path".to_string(), Value::Str(rel_path.to_string()));
     properties.insert("body".to_string(), Value::Str(body.to_string()));
+    properties.insert("key".to_string(), Value::Str(key.clone()));
 
     let links = extract_wikilinks(body);
 
@@ -371,6 +375,11 @@ mod tests {
         assert_eq!(
             note.properties.get("path"),
             Some(&Value::Str("dir/User Role.md".into()))
+        );
+        assert_eq!(
+            note.properties.get("key"),
+            Some(&Value::Str("user-role".into())),
+            "normalized key is stored for name resolution"
         );
         assert_eq!(note.links, vec!["project"]);
     }

@@ -132,12 +132,12 @@ impl Server {
             ),
             "backlinks" => {
                 let note = str_arg(args, "note")?;
-                let mut p = Params::new();
-                p.insert("note".to_string(), RuntimeValue::String(note));
+                let (cond, p) = note_match("t", &note);
                 (
-                    "MATCH (src:Note)-[:LINKS_TO]->(t:Note) WHERE t.title = $note OR t.path = $note \
-                     RETURN src.title AS title, src.path AS path"
-                        .to_string(),
+                    format!(
+                        "MATCH (src:Note)-[:LINKS_TO]->(t:Note) WHERE {cond} \
+                         RETURN src.title AS title, src.path AS path"
+                    ),
                     p,
                 )
             }
@@ -150,12 +150,10 @@ impl Server {
                     .and_then(Value::as_u64)
                     .unwrap_or(1)
                     .clamp(1, 5);
-                let mut p = Params::new();
-                p.insert("note".to_string(), RuntimeValue::String(note));
+                let (cond, p) = note_match("s", &note);
                 (
                     format!(
-                        "MATCH (s:Note)-[:LINKS_TO*1..{hops}]-(n:Note) \
-                         WHERE s.title = $note OR s.path = $note \
+                        "MATCH (s:Note)-[:LINKS_TO*1..{hops}]-(n:Note) WHERE {cond} \
                          RETURN DISTINCT n.title AS title, n.path AS path"
                     ),
                     p,
@@ -174,12 +172,15 @@ impl Server {
             }
             "get_note" => {
                 let note = str_arg(args, "note")?;
-                let mut p = Params::new();
-                p.insert("note".to_string(), RuntimeValue::String(note));
+                let (cond, p) = note_match("n", &note);
                 (
-                    "MATCH (n:Note) WHERE n.title = $note OR n.path = $note \
-                     RETURN n.title AS title, n.path AS path, n.body AS body LIMIT 1"
-                        .to_string(),
+                    // ORDER BY before LIMIT 1 so the winner is deterministic
+                    // when more than one note matches the disjunction.
+                    format!(
+                        "MATCH (n:Note) WHERE {cond} \
+                         RETURN n.title AS title, n.path AS path, n.body AS body \
+                         ORDER BY n.path LIMIT 1"
+                    ),
                     p,
                 )
             }
@@ -295,6 +296,28 @@ fn str_arg(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required string argument '{key}'"))
 }
 
+/// Build a `(predicate, params)` pair resolving the note bound as `var` by
+/// name: the normalized key, the exact title, or the path. `var` is a fixed
+/// pattern variable ("t" / "s" / "n"), never user input.
+///
+/// The `key` disjunct is emitted only when the input actually normalizes to a
+/// non-empty key, so an empty or punctuation-only name (which normalizes to
+/// "") can't match a note whose own key is empty (e.g. a file named `-.md`).
+fn note_match(var: &str, note: &str) -> (String, Params) {
+    let key = namidb_markdown::normalize_key(note);
+    let mut p = Params::new();
+    p.insert("note".to_string(), RuntimeValue::String(note.to_string()));
+    if key.is_empty() {
+        (format!("{var}.title = $note OR {var}.path = $note"), p)
+    } else {
+        p.insert("key".to_string(), RuntimeValue::String(key));
+        (
+            format!("{var}.key = $key OR {var}.title = $note OR {var}.path = $note"),
+            p,
+        )
+    }
+}
+
 fn fmt_parse_errs(errs: &[ParseError]) -> String {
     match errs.first() {
         Some(e) => format!("parse error [{:?}]: {} at {}", e.code, e.message, e.span),
@@ -305,7 +328,7 @@ fn fmt_parse_errs(errs: &[ParseError]) -> String {
 fn tool_specs() -> Vec<Value> {
     let note_arg = json!({
         "type": "object",
-        "properties": { "note": { "type": "string", "description": "Note title or path" } },
+        "properties": { "note": { "type": "string", "description": "Note name (file stem), title, or path. The name match ignores case and -/_/space differences, so 'User Role', 'user-role' and 'user_role' all resolve." } },
         "required": ["note"],
     });
     vec![
@@ -330,7 +353,7 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "note": { "type": "string", "description": "Note title or path" },
+                    "note": { "type": "string", "description": "Note name (file stem), title, or path; the name match ignores case and -/_/space differences" },
                     "hops": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Hop distance (default 1)" },
                 },
                 "required": ["note"],
@@ -496,6 +519,55 @@ mod tests {
             .filter_map(|r| r["title"].as_str())
             .collect();
         assert!(n.contains(&"Beta") && n.contains(&"Gamma"));
+    }
+
+    #[tokio::test]
+    async fn tools_resolve_notes_by_normalized_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Snake-cased filename, linked to from another note.
+        write(dir.path(), "user_role.md", "see the founder\n");
+        write(dir.path(), "Project.md", "owned by [[user_role]]\n");
+        let server = Server::open("memory://mcp-resolve").await.unwrap();
+        server.load_vault(dir.path()).await.unwrap();
+
+        // Caller does not know the exact stem: kebab and spaced spellings of
+        // the same name must all resolve to user_role.md.
+        for spelling in ["user_role", "user-role", "User Role"] {
+            let got = call(&server, "get_note", json!({ "note": spelling })).await;
+            let title = got.as_array().unwrap()[0]["title"].as_str().unwrap();
+            assert_eq!(title, "user_role", "{spelling} should resolve");
+
+            let back = call(&server, "backlinks", json!({ "note": spelling })).await;
+            let srcs: Vec<&str> = back
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["title"].as_str())
+                .collect();
+            assert_eq!(srcs, vec!["Project"], "{spelling} backlinks");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_name_does_not_match_empty_key_note() {
+        let dir = tempfile::tempdir().unwrap();
+        // A punctuation-only stem normalizes to an empty key.
+        write(dir.path(), "-.md", "punctuation-only stem\n");
+        write(dir.path(), "Real.md", "a real note\n");
+        let server = Server::open("memory://mcp-emptykey").await.unwrap();
+        server.load_vault(dir.path()).await.unwrap();
+
+        // An empty / whitespace query normalizes to an empty key, which must
+        // NOT fire the key disjunct and match the empty-key note. (A literal
+        // "-" still legitimately matches that note by exact title, so it is
+        // not part of this check.)
+        for name in ["", "   "] {
+            let rows = call(&server, "get_note", json!({ "note": name })).await;
+            assert!(
+                rows.as_array().unwrap().is_empty(),
+                "name {name:?} must not resolve to the empty-key note"
+            );
+        }
     }
 
     #[tokio::test]

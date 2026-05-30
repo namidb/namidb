@@ -19,6 +19,11 @@ below and in the release notes.
   than accumulating stale nodes and edges. Exposed as `LoadOptions::prune`, the
   CLI `--prune` flag, and the Python `Client.load_vault(prune=...)` argument;
   the local MCP server mirrors on load. The default load stays additive.
+- **Resolve notes by name in the MCP server.** The vault loader stores a
+  normalized `key` property on each note, and the `backlinks`, `neighbors` and
+  `get_note` tools now resolve their argument by that key as well as by exact
+  title or path. An agent can address a note as `User Role`, `user-role` or
+  `user_role` regardless of the file stem's casing or separators.
 
 ### Changed
 
