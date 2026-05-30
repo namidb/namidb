@@ -2098,6 +2098,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "namidb-mcp"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "namidb-markdown",
+ "namidb-query",
+ "namidb-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "namidb-py"
 version = "0.6.0"
 dependencies = [

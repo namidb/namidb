@@ -1,0 +1,31 @@
+[package]
+name = "namidb-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Local MCP (Model Context Protocol) server exposing a NamiDB graph namespace over stdio"
+readme = "README.md"
+
+[lib]
+name = "namidb_mcp"
+
+[[bin]]
+name = "namidb-mcp"
+path = "src/bin/namidb-mcp.rs"
+
+[dependencies]
+namidb-storage = { workspace = true }
+namidb-query = { workspace = true }
+namidb-markdown = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

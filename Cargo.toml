@@ -4,6 +4,7 @@ members = [
     "crates/namidb-core",
     "crates/namidb-storage",
     "crates/namidb-markdown",
+    "crates/namidb-mcp",
     "crates/namidb-graph",
     "crates/namidb-query",
     "crates/namidb-cli",
