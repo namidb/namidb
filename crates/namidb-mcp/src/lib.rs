@@ -55,16 +55,20 @@ impl Server {
         })
     }
 
-    /// Load a markdown vault into the namespace before serving. Commits so the
-    /// graph is durable and immediately queryable.
+    /// Load a markdown vault into the namespace before serving. Mirrors the
+    /// vault (prune on) so a restart over a durable store reflects the current
+    /// files instead of accumulating stale notes, then commits so the graph is
+    /// durable and immediately queryable.
     pub async fn load_vault(
         &self,
         dir: &Path,
     ) -> anyhow::Result<namidb_markdown::VaultLoadOutcome> {
+        let opts = namidb_markdown::LoadOptions {
+            prune: true,
+            ..Default::default()
+        };
         let mut guard = self.session.lock().await;
-        let outcome =
-            namidb_markdown::load_vault(dir, &mut guard, &namidb_markdown::LoadOptions::default())
-                .await?;
+        let outcome = namidb_markdown::load_vault(dir, &mut guard, &opts).await?;
         guard.commit_batch().await?;
         Ok(outcome)
     }

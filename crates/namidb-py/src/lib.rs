@@ -372,9 +372,14 @@ impl Client {
     /// `body` property. Unlike `upsert_node` / `upsert_edge`, this commits
     /// the load before returning, so the graph is durable on exit.
     ///
+    /// With `prune=True` the load mirrors the vault: notes and links removed
+    /// from `path` since a previous load are tombstoned, so the graph stays a
+    /// faithful index. The default (`prune=False`) is additive.
+    ///
     /// Returns a dict with `notes_loaded`, `links_resolved`,
-    /// `links_dangling`, `name_collisions` and `commit_batches`.
-    #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000))]
+    /// `links_dangling`, `name_collisions`, `notes_pruned`, `links_pruned`
+    /// and `commit_batches`.
+    #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false))]
     fn load_vault(
         &self,
         py: Python<'_>,
@@ -382,11 +387,13 @@ impl Client {
         label: &str,
         edge_type: &str,
         commit_every: usize,
+        prune: bool,
     ) -> PyResult<Py<PyDict>> {
         let opts = namidb_markdown::LoadOptions {
             label: label.to_string(),
             edge_type: edge_type.to_string(),
             commit_every,
+            prune,
         };
         let dir = std::path::PathBuf::from(path);
         let session = self.session.clone();
@@ -404,6 +411,8 @@ impl Client {
         d.set_item("links_resolved", outcome.links_resolved)?;
         d.set_item("links_dangling", outcome.links_dangling)?;
         d.set_item("name_collisions", outcome.name_collisions)?;
+        d.set_item("notes_pruned", outcome.notes_pruned)?;
+        d.set_item("links_pruned", outcome.links_pruned)?;
         d.set_item("commit_batches", outcome.commit_batches)?;
         Ok(d.into())
     }

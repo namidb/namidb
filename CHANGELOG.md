@@ -13,6 +13,13 @@ below and in the release notes.
 
 ### Added
 
+- **`prune` for vault loads.** Re-loading a vault can now mirror it instead of
+  merging: with prune enabled the loader tombstones notes and links the vault
+  no longer contains, so the graph stays a faithful, rebuildable index rather
+  than accumulating stale nodes and edges. Exposed as `LoadOptions::prune`, the
+  CLI `--prune` flag, and the Python `Client.load_vault(prune=...)` argument;
+  the local MCP server mirrors on load. The default load stays additive.
+
 ### Changed
 
 ### Fixed

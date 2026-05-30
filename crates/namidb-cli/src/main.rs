@@ -112,6 +112,11 @@ enum Cmd {
         /// Edge type for wikilinks.
         #[arg(long, default_value = "LINKS_TO")]
         edge_type: String,
+        /// Mirror the vault: tombstone notes and links no longer present.
+        /// Use when re-loading a vault that changed, so the graph stays a
+        /// faithful index instead of accumulating stale nodes and edges.
+        #[arg(long, default_value_t = false)]
+        prune: bool,
         /// Path to the vault directory.
         path: String,
     },
@@ -175,6 +180,7 @@ fn main() -> anyhow::Result<()> {
             namespace,
             label,
             edge_type,
+            prune,
             path,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -185,6 +191,7 @@ fn main() -> anyhow::Result<()> {
                 &namespace,
                 &label,
                 &edge_type,
+                prune,
                 &path,
             ))?;
         }
@@ -197,6 +204,7 @@ async fn load_vault_cmd(
     namespace: &str,
     label: &str,
     edge_type: &str,
+    prune: bool,
     path: &str,
 ) -> anyhow::Result<()> {
     let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
@@ -214,6 +222,7 @@ async fn load_vault_cmd(
     let opts = LoadOptions {
         label: label.to_string(),
         edge_type: edge_type.to_string(),
+        prune,
         ..Default::default()
     };
     let outcome = load_vault(std::path::Path::new(path), &mut writer, &opts).await?;
@@ -225,6 +234,10 @@ async fn load_vault_cmd(
     println!("links resolved  : {}", outcome.links_resolved);
     println!("links dangling  : {}", outcome.links_dangling);
     println!("name collisions : {}", outcome.name_collisions);
+    if prune {
+        println!("notes pruned    : {}", outcome.notes_pruned);
+        println!("links pruned    : {}", outcome.links_pruned);
+    }
     println!("{}", "─".repeat(48));
     if store_uri.is_none() {
         println!("(in-memory namespace; pass --store <uri> to persist the graph)");
