@@ -4,6 +4,20 @@ A local MCP (Model Context Protocol) server that exposes a NamiDB graph
 namespace to agents like Claude Code over stdio. Instead of grepping flat
 markdown files, the agent gets real graph traversals.
 
+## Install
+
+Download a prebuilt archive for your platform from the
+[Releases page](https://github.com/namidb/namidb/releases) (each `v*` release
+ships `namidb` and `namidb-mcp` for Linux x86_64/aarch64, macOS arm64 and
+Windows x86_64) and put the binaries on your `PATH`. With a Rust toolchain you
+can instead build from source:
+
+```bash
+cargo install --git https://github.com/namidb/namidb namidb-mcp
+```
+
+## Use
+
 Point it at a namespace where a vault was loaded (see `namidb-markdown` or
 `namidb load-vault`), or let it load one on startup:
 

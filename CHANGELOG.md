@@ -24,6 +24,10 @@ below and in the release notes.
   `get_note` tools now resolve their argument by that key as well as by exact
   title or path. An agent can address a note as `User Role`, `user-role` or
   `user_role` regardless of the file stem's casing or separators.
+- **Prebuilt `namidb` and `namidb-mcp` binaries.** A `release-binaries`
+  workflow builds standalone binaries for Linux (x86_64, aarch64), macOS
+  (arm64) and Windows (x86_64) on every `v*` tag and attaches them to the
+  GitHub Release, so the CLI and MCP server run without a Rust toolchain.
 
 ### Changed
 

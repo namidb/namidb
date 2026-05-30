@@ -1,0 +1,69 @@
+# Build the `namidb` CLI and `namidb-mcp` server as prebuilt binaries for
+# each supported (OS, arch) and attach them to the GitHub Release, so a user
+# can run them without a Rust toolchain.
+#
+# Triggers:
+#   * `v*` tag push       → build per-platform archives + upload to the release.
+#   * PR / workflow_dispatch → debug build-check only (catch breakage early,
+#                              no upload).
+#
+# The release build inherits the workspace `[profile.release]` (fat LTO,
+# codegen-units = 1), so per-target builds are slow but compact. The wheels
+# (python-wheels.yml) ship the Python bindings separately; this workflow is
+# only the standalone binaries.
+
+name: release-binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-binaries.yml"
+  workflow_dispatch: {}
+
+jobs:
+  # Fast debug build to catch binary regressions on PRs without paying for the
+  # release LTO build or touching the release.
+  build-check:
+    name: build-check
+    if: github.event_name != 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --bin namidb --bin namidb-mcp
+
+  # On a `v*` tag: build release archives per platform and upload to the
+  # release (created if it does not exist yet).
+  upload:
+    name: upload · ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and upload namidb + namidb-mcp
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: namidb,namidb-mcp
+          target: ${{ matrix.target }}
+          archive: namidb-$tag-$target
+          tar: unix
+          zip: windows
+          include: LICENSE,README.md
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
