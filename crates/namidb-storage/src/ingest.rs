@@ -931,6 +931,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flushed_edge_to_missing_endpoint_is_accepted_and_resolves_lazily() {
+        // Load-bearing invariant for multi-window / multi-shard bulk loads
+        // (RFC-023): an edge may reference an endpoint node not present in the
+        // same batch — or anywhere yet. It must be accepted, survive flush,
+        // and resolve lazily (None) at query time, never be rejected. A future
+        // referential-integrity feature must not silently break this.
+        let store = make_store();
+        let paths = make_paths("ingest-dangling-edge");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        let alice = sorted_node_id(1);
+        let ghost = sorted_node_id(99); // never upserted as a node
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        // Edge to a non-existent endpoint — must be accepted, not rejected.
+        session
+            .upsert_edge("KNOWS", alice, ghost, &edge_record())
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+        let outcome = session.flush(schema()).await.unwrap();
+        assert!(outcome.committed.manifest.wal_segments.is_empty());
+
+        let snap = session.snapshot();
+        // The edge exists and points at the ghost endpoint…
+        let out = snap.out_edges("KNOWS", alice).await.unwrap();
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].dst, ghost);
+        // …but the endpoint node itself does not resolve.
+        assert!(snap.lookup_node("Person", ghost).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn empty_commit_batch_is_noop() {
         let store = make_store();
         let paths = make_paths("ingest-empty");
