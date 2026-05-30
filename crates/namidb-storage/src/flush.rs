@@ -275,6 +275,7 @@ pub async fn flush(
 /// a Node SST and the label declares one or more `unique` properties — each
 /// entry is a `(value_string → NodeId)` map serialised to bincode that the
 /// reader can probe in O(log N) without rescanning the SST body.
+#[derive(Debug)]
 struct PendingSst {
     descriptor: SstDescriptor,
     body_path: Path,
@@ -816,7 +817,7 @@ const MULTIPART_MAX_CONCURRENCY: usize = 8;
 /// (see [`crate::flush`] §"PUT helpers") so collisions are impossible in
 /// practice; the small-PUT branch is kept for bloom side-cars and any
 /// future small body, where the CAS protection is cheap to keep.
-async fn put_object(
+pub(crate) async fn put_object(
     store: std::sync::Arc<dyn ObjectStore>,
     path: &Path,
     body: Bytes,
@@ -1070,6 +1071,279 @@ impl PropertyBuilder {
             PropertyBuilder::FloatVector { builder, .. } => Arc::new(builder.finish()),
             PropertyBuilder::Json(b) => Arc::new(b.finish()),
         }
+    }
+}
+
+// ───────────────────────── Offline SST builder facade (RFC-023) ─────────
+
+/// Public, attach-ready SST builder for offline / out-of-band ingestion
+/// (RFC-023). An import-box binary links `namidb-storage`, builds finished
+/// SSTs from already-minted node ids, and hands them to
+/// [`WriterSession::attach_ssts`](crate::WriterSession::attach_ssts).
+///
+/// This is a CHILD module of `flush`, so it reaches `flush`'s private
+/// builders (`prepare_node_pending`, `build_edge_stream_rows`, …) and the
+/// private `PendingSst` via `super::` with no visibility changes. The public
+/// surface is deliberately narrow — `NodeInput` / `EdgeInput` / `BuiltSst`
+/// plus two build fns — over the engine's already-public `Schema` / `Value`
+/// vocabulary; no internal type (`MemOp`, `NodeRow`, `NodeSstFinish`, …)
+/// crosses the boundary.
+pub mod builder {
+    use std::collections::BTreeMap;
+
+    use bytes::Bytes;
+    use object_store::path::Path;
+
+    use namidb_core::{Schema, Value};
+
+    use crate::error::Result;
+    use crate::manifest::SstDescriptor;
+    use crate::memtable::MemOp;
+    use crate::paths::NamespacePaths;
+    use crate::sst::edges::inverse::transpose_forward_to_inverse;
+    use crate::sst::edges::EdgeDirection;
+
+    use super::{
+        build_edge_stream_rows, prepare_edge_pending, prepare_node_pending,
+        schema_label_or_synthetic, EdgeRow, EdgeWriteRecord, NodeRow, NodeWriteRecord, PendingSst,
+    };
+
+    /// One node to ingest. `id` is the ALREADY-MINTED 16-byte NodeId — the
+    /// deterministic UUIDv5 mint is the cloud seam's job
+    /// (`namidb_cloud_shared::mint`); the builder never sees the natural key.
+    /// `properties` is the decoded property map; the natural-key value lives
+    /// as an ordinary entry (e.g. `{"id": Value::Str("…")}`) and is what the
+    /// unique-property sidecar harvests when the label declares it `unique`.
+    /// Set `tombstone` for a delete marker (`properties` then ignored).
+    #[derive(Debug, Clone)]
+    pub struct NodeInput {
+        /// Already-minted 16-byte NodeId.
+        pub id: [u8; 16],
+        /// Decoded property map (the natural key is a normal entry).
+        pub properties: BTreeMap<String, Value>,
+        /// When true, emit a delete marker instead of an upsert.
+        pub tombstone: bool,
+    }
+
+    /// One edge to ingest. `src` / `dst` are already-minted 16-byte NodeIds.
+    /// `properties` is decoded; the facade routes declared edge-type
+    /// properties into their positional streams and the rest into the
+    /// overflow stream internally.
+    #[derive(Debug, Clone)]
+    pub struct EdgeInput {
+        /// Already-minted source NodeId.
+        pub src: [u8; 16],
+        /// Already-minted destination NodeId.
+        pub dst: [u8; 16],
+        /// Decoded edge property map.
+        pub properties: BTreeMap<String, Value>,
+        /// When true, emit a delete marker instead of an upsert.
+        pub tombstone: bool,
+    }
+
+    /// A finished, attach-ready SST: body + optional bloom + unique-property
+    /// sidecars plus a fully-assembled manifest [`SstDescriptor`]. Opaque —
+    /// the caller gets read-only views;
+    /// [`WriterSession::attach_ssts`](crate::WriterSession::attach_ssts)
+    /// consumes it via the in-crate `into_parts`.
+    #[derive(Debug)]
+    pub struct BuiltSst {
+        inner: PendingSst,
+    }
+
+    impl BuiltSst {
+        /// Highest LSN carried by this SST (the `next_lsn` floor after attach).
+        #[must_use]
+        pub fn max_lsn(&self) -> u64 {
+            self.inner.descriptor.max_lsn
+        }
+        /// Body size in bytes.
+        #[must_use]
+        pub fn size_bytes(&self) -> u64 {
+            self.inner.descriptor.size_bytes
+        }
+        /// Manifest-relative path this SST will occupy.
+        #[must_use]
+        pub fn relative_path(&self) -> &str {
+            &self.inner.descriptor.path
+        }
+        /// Row count (nodes: rows; edges: edge count).
+        #[must_use]
+        pub fn row_count(&self) -> u64 {
+            self.inner.descriptor.row_count
+        }
+
+        /// Hand the PUT bodies + descriptor to `attach_ssts`. Lives here
+        /// because only a descendant of `flush` may read `PendingSst`'s
+        /// private fields.
+        #[allow(clippy::type_complexity)]
+        pub(crate) fn into_parts(
+            self,
+        ) -> (
+            Path,
+            Bytes,
+            Option<(Path, Bytes)>,
+            Vec<(Path, Bytes)>,
+            SstDescriptor,
+        ) {
+            let PendingSst {
+                descriptor,
+                body_path,
+                body,
+                bloom_path,
+                bloom_body,
+                index_sidecars,
+            } = self.inner;
+            let bloom = match (bloom_path, bloom_body) {
+                (Some(p), Some(b)) => Some((p, b)),
+                _ => None,
+            };
+            (body_path, body, bloom, index_sidecars, descriptor)
+        }
+    }
+
+    /// Build ONE node SST (+ a unique-property sidecar per `unique` string
+    /// key) for `label`. The facade OWNS sort + dedup: it sorts `rows` by id
+    /// ascending and, on a duplicate id, keeps the LAST occurrence
+    /// (silent-upsert), then assigns `lsn = sorted position` so the unique
+    /// sidecar's last-write-wins (row order == lsn order) holds. This is the
+    /// contract `NodeSstWriter` (which rejects `nid <= prev`) and the sidecar
+    /// depend on — done here so the import binary cannot get it wrong.
+    ///
+    /// `paths` MUST be the SAME [`NamespacePaths`] the attaching session
+    /// targets. Returns `None` when `rows` is empty.
+    pub fn build_node_sst(
+        paths: &NamespacePaths,
+        schema: &Schema,
+        label: &str,
+        rows: Vec<NodeInput>,
+    ) -> Result<Option<BuiltSst>> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let rows = dedup_keep_last_node(rows);
+        let label_def = schema_label_or_synthetic(schema, label);
+        let node_rows: Vec<NodeRow> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let op = if n.tombstone {
+                    MemOp::Tombstone
+                } else {
+                    MemOp::Upsert(
+                        NodeWriteRecord {
+                            properties: n.properties,
+                            schema_version: 0,
+                        }
+                        .encode()?,
+                    )
+                };
+                Ok(NodeRow {
+                    id: n.id,
+                    lsn: (i as u64) + 1,
+                    op,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let finish = super::build_node_sst(&label_def, &node_rows)?;
+        let pending = prepare_node_pending(paths, label, &label_def, &node_rows, finish)?;
+        Ok(Some(BuiltSst { inner: pending }))
+    }
+
+    /// Build BOTH the forward and inverse CSR SSTs for `edge_type`, owning the
+    /// sort, keep-last dedup (by `(src, dst)`), and monotonic lsn assignment,
+    /// mirroring `flush()`'s edge path. Returns `[]` when `rows` is empty,
+    /// else `[forward, inverse]`.
+    pub fn build_edge_ssts(
+        paths: &NamespacePaths,
+        schema: &Schema,
+        edge_type: &str,
+        rows: Vec<EdgeInput>,
+    ) -> Result<Vec<BuiltSst>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = dedup_keep_last_edge(rows);
+        let edge_def = schema.edge_type(edge_type).cloned();
+        let declared_property_names: Vec<String> = edge_def
+            .as_ref()
+            .map(|d| d.properties.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+
+        let edge_rows: Vec<EdgeRow> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let op = if e.tombstone {
+                    MemOp::Tombstone
+                } else {
+                    MemOp::Upsert(
+                        EdgeWriteRecord {
+                            properties: e.properties,
+                            schema_version: 0,
+                        }
+                        .encode()?,
+                    )
+                };
+                Ok(EdgeRow {
+                    src: e.src,
+                    dst: e.dst,
+                    lsn: (i as u64) + 1,
+                    op,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let forward_rows = build_edge_stream_rows(&edge_rows, &declared_property_names)?;
+        let inverse_rows = transpose_forward_to_inverse(&forward_rows);
+        let fwd = super::build_edge_sst(
+            edge_type,
+            edge_def.as_ref(),
+            &forward_rows,
+            EdgeDirection::Forward,
+        )?;
+        let inv = super::build_edge_sst(
+            edge_type,
+            edge_def.as_ref(),
+            &inverse_rows,
+            EdgeDirection::Inverse,
+        )?;
+        Ok(vec![
+            BuiltSst {
+                inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Forward, fwd),
+            },
+            BuiltSst {
+                inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Inverse, inv),
+            },
+        ])
+    }
+
+    /// Sort by id ascending and keep the LAST input per id (silent-upsert).
+    /// `Vec::dedup_by` keeps the first, so fold explicitly.
+    fn dedup_keep_last_node(mut rows: Vec<NodeInput>) -> Vec<NodeInput> {
+        rows.sort_by_key(|n| n.id);
+        let mut out: Vec<NodeInput> = Vec::with_capacity(rows.len());
+        for n in rows {
+            match out.last_mut() {
+                Some(prev) if prev.id == n.id => *prev = n,
+                _ => out.push(n),
+            }
+        }
+        out
+    }
+
+    /// Sort by `(src, dst)` ascending and keep the LAST input per pair.
+    fn dedup_keep_last_edge(mut rows: Vec<EdgeInput>) -> Vec<EdgeInput> {
+        rows.sort_by_key(|e| (e.src, e.dst));
+        let mut out: Vec<EdgeInput> = Vec::with_capacity(rows.len());
+        for e in rows {
+            match out.last_mut() {
+                Some(prev) if prev.src == e.src && prev.dst == e.dst => *prev = e,
+                _ => out.push(e),
+            }
+        }
+        out
     }
 }
 

@@ -781,6 +781,104 @@ impl WriterSession {
         Ok(outcome)
     }
 
+    /// Attach offline-built SSTs into a FRESH namespace as ONE new manifest
+    /// version (RFC-023). PUTs every body + bloom + unique-property sidecar
+    /// via the size-adaptive uploader, then commits `next_version` with
+    /// `schema` REPLACING the base schema and `.ssts` extended with the built
+    /// descriptors — exactly the "PUT N immutable SSTs, then one CAS" shape
+    /// `flush` already uses, minus the in-process memtable build.
+    ///
+    /// **Fresh-namespace-only.** The schema is a *replace* and the SST set an
+    /// *extend-from-empty*, both safe only on a bootstrap namespace with no
+    /// SSTs and no WAL segments; importing into a populated namespace would
+    /// clobber other labels' schema and orphan their indexes.
+    ///
+    /// Error contract mirrors `flush`/`commit`: [`Error::Fenced`] ⇒ abort and
+    /// drop the session; a lost manifest CAS ⇒ retryable (already-PUT bodies
+    /// are harmless orphans the janitor sweeps).
+    pub async fn attach_ssts(
+        &mut self,
+        built: Vec<crate::flush::builder::BuiltSst>,
+        schema: Schema,
+    ) -> Result<FlushOutcome> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        if !self.current.manifest.ssts.is_empty() || !self.current.manifest.wal_segments.is_empty()
+        {
+            return Err(Error::invariant(
+                "attach_ssts requires a fresh namespace (no SSTs, no WAL segments)",
+            ));
+        }
+        if built.is_empty() {
+            return Ok(FlushOutcome {
+                committed: self.current.clone(),
+                ssts_written: 0,
+                bloom_sidecars_written: 0,
+            });
+        }
+
+        // 1. Decompose every BuiltSst into its PUT bodies + manifest
+        //    descriptor. `into_parts` is the in-crate accessor that reads
+        //    PendingSst's private fields (defined inside flush::builder).
+        let store = self.manifest_store.store().clone();
+        let mut descriptors = Vec::with_capacity(built.len());
+        let mut put_futures: Vec<_> = Vec::with_capacity(built.len() * 2);
+        let mut bloom_count = 0usize;
+        let mut attached_max_lsn = 0u64;
+        for b in built {
+            let (body_path, body, bloom, sidecars, descriptor) = b.into_parts();
+            attached_max_lsn = attached_max_lsn.max(descriptor.max_lsn);
+            let store_ref = store.clone();
+            put_futures.push(Box::pin(async move {
+                crate::flush::put_object(store_ref, &body_path, body).await
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                >);
+            if let Some((bloom_path, bloom_body)) = bloom {
+                bloom_count += 1;
+                let store_ref = store.clone();
+                put_futures.push(Box::pin(async move {
+                    crate::flush::put_object(store_ref, &bloom_path, bloom_body).await
+                }));
+            }
+            for (sidecar_path, sidecar_body) in sidecars {
+                let store_ref = store.clone();
+                put_futures.push(Box::pin(async move {
+                    crate::flush::put_object(store_ref, &sidecar_path, sidecar_body).await
+                }));
+            }
+            descriptors.push(descriptor);
+        }
+        let ssts_written = descriptors.len();
+
+        // 2. I/O phase — concurrent PUTs; first error short-circuits.
+        futures::future::try_join_all(put_futures).await?;
+
+        // 3. Commit phase — one new manifest version (mirrors flush()).
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.schema = schema; // REPLACE (fresh-namespace-only)
+        next.ssts.extend(descriptors); // extend == set on a fresh base
+        next.wal_segments.clear();
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+
+        // 4. Post-commit fixup (mirror flush()) + the PR#40 next_lsn rebase:
+        //    seed past the attached SST high-water so a later online write
+        //    cannot be silently shadowed by an attached row.
+        self.current = committed.clone();
+        self.next_lsn = self.next_lsn.max(attached_max_lsn.saturating_add(1)).max(1);
+        self.refresh_published();
+        self.property_index_cache.reset();
+
+        Ok(FlushOutcome {
+            committed,
+            ssts_written,
+            bloom_sidecars_written: bloom_count,
+        })
+    }
+
     fn alloc_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
         self.next_lsn = self.next_lsn.saturating_add(1);
@@ -1595,5 +1693,183 @@ mod tests {
         // next_lsn must continue from the snapshot's last_lsn, not
         // restart from 1.
         assert!(session2.next_lsn() > 1);
+    }
+
+    // ── Offline SST builder + attach (RFC-023) ──────────────────────────
+
+    #[tokio::test]
+    async fn attach_built_node_sst_is_queryable_on_fresh_namespace() {
+        use crate::flush::builder::{build_node_sst, NodeInput};
+        let store = make_store();
+        let paths = make_paths("attach-nodes");
+
+        let id_bytes = {
+            let mut b = [0u8; 16];
+            b[15] = 1;
+            b
+        };
+        let mut props = BTreeMap::new();
+        props.insert("name".to_string(), Value::Str("Alice".into()));
+        // Build the SST OUT-OF-BAND — no live writer involved.
+        let built = build_node_sst(
+            &paths,
+            &schema(),
+            "Person",
+            vec![NodeInput {
+                id: id_bytes,
+                properties: props,
+                tombstone: false,
+            }],
+        )
+        .unwrap()
+        .expect("non-empty rows yield a BuiltSst");
+
+        // Attach into a FRESH session on the same paths + store.
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        let outcome = session.attach_ssts(vec![built], schema()).await.unwrap();
+        assert_eq!(outcome.ssts_written, 1);
+        assert_eq!(outcome.committed.manifest.ssts.len(), 1);
+        assert!(outcome.committed.manifest.wal_segments.is_empty());
+
+        // The attached node is queryable.
+        let alice = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+        let snap = session.snapshot();
+        let view = snap.lookup_node("Person", alice).await.unwrap().unwrap();
+        assert_eq!(
+            view.properties.get("name"),
+            Some(&Value::Str("Alice".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_into_nonfresh_namespace_is_rejected() {
+        use crate::flush::builder::{build_node_sst, NodeInput};
+        let store = make_store();
+        let paths = make_paths("attach-nonfresh");
+        let mut session = WriterSession::open(store, paths.clone()).await.unwrap();
+        // Make the namespace non-fresh (a committed WAL segment).
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+
+        let built = build_node_sst(
+            &paths,
+            &schema(),
+            "Person",
+            vec![NodeInput {
+                id: [0u8; 16],
+                properties: BTreeMap::new(),
+                tombstone: false,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let err = session
+            .attach_ssts(vec![built], schema())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("fresh"),
+            "expected fresh-namespace guard, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_dedups_duplicate_node_ids_keeping_last() {
+        use crate::flush::builder::{build_node_sst, NodeInput};
+        let store = make_store();
+        let paths = make_paths("attach-dedup");
+        let id = {
+            let mut b = [0u8; 16];
+            b[15] = 7;
+            b
+        };
+        let mk = |name: &str| {
+            let mut p = BTreeMap::new();
+            p.insert("name".to_string(), Value::Str(name.into()));
+            NodeInput {
+                id,
+                properties: p,
+                tombstone: false,
+            }
+        };
+        // Same id twice — "Old" then "New". Keep-LAST ⇒ "New".
+        let built = build_node_sst(&paths, &schema(), "Person", vec![mk("Old"), mk("New")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(built.row_count(), 1, "duplicate ids collapse to one row");
+
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        session.attach_ssts(vec![built], schema()).await.unwrap();
+        let node = NodeId::from_uuid(Uuid::from_bytes(id));
+        let snap = session.snapshot();
+        let view = snap.lookup_node("Person", node).await.unwrap().unwrap();
+        assert_eq!(
+            view.properties.get("name"),
+            Some(&Value::Str("New".into())),
+            "keep-last upsert semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_built_nodes_and_edges_is_traversable() {
+        use crate::flush::builder::{build_edge_ssts, build_node_sst, EdgeInput, NodeInput};
+        let store = make_store();
+        let paths = make_paths("attach-graph");
+        let a = {
+            let mut b = [0u8; 16];
+            b[15] = 1;
+            b
+        };
+        let z = {
+            let mut b = [0u8; 16];
+            b[15] = 2;
+            b
+        };
+        let node = |id: [u8; 16], name: &str| {
+            let mut p = BTreeMap::new();
+            p.insert("name".to_string(), Value::Str(name.into()));
+            NodeInput {
+                id,
+                properties: p,
+                tombstone: false,
+            }
+        };
+        let nodes = build_node_sst(
+            &paths,
+            &schema(),
+            "Person",
+            vec![node(a, "A"), node(z, "Z")],
+        )
+        .unwrap()
+        .unwrap();
+        let edges = build_edge_ssts(
+            &paths,
+            &schema(),
+            "KNOWS",
+            vec![EdgeInput {
+                src: a,
+                dst: z,
+                properties: BTreeMap::new(),
+                tombstone: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 2, "forward + inverse CSR");
+
+        let mut all = vec![nodes];
+        all.extend(edges);
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        let outcome = session.attach_ssts(all, schema()).await.unwrap();
+        assert_eq!(outcome.ssts_written, 3, "1 node + 2 edge SSTs");
+
+        // The graph is traversable: A -KNOWS-> Z.
+        let aid = NodeId::from_uuid(Uuid::from_bytes(a));
+        let zid = NodeId::from_uuid(Uuid::from_bytes(z));
+        let snap = session.snapshot();
+        let out = snap.out_edges("KNOWS", aid).await.unwrap();
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].dst, zid);
     }
 }
