@@ -20,6 +20,11 @@ below and in the release notes.
   destination that does not reduce to a clean note name is skipped rather than
   creating a dangling edge. Docs-style vaults (and the repo's own `MEMORY.md`
   index, which uses `[Title](file.md)`) become fully connected.
+- **Inline `#tags` collected into the `tags` property.** Inline tags in a
+  note body (excluding code, headings and URLs; nested `#area/topic` kept;
+  `#123` is not a tag) are merged with any frontmatter `tags` into one
+  deduplicated `tags` list. A frontmatter `tags` value that is not a string or
+  list is left untouched, and non-string list items are preserved.
 
 ### Changed
 

@@ -22,8 +22,10 @@
 //! - Links inside fenced or inline code are excluded.
 //! - Frontmatter is parsed as YAML; malformed frontmatter yields no
 //!   properties rather than failing the note.
-//! - Inline `#tags` are NOT collected (only a frontmatter `tags` list, as a
-//!   plain property). Heading/block anchors are dropped, not modelled.
+//! - Inline `#tags` and a frontmatter `tags` list are merged into one
+//!   deduplicated `tags` property (nested tags `#area/topic` kept; `#123` with
+//!   no letters is not a tag). Tags are a property, not yet `:Tag` nodes.
+//! - Heading/block anchors are dropped, not modelled.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -136,6 +138,51 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     properties.insert("path".to_string(), Value::Str(rel_path.to_string()));
     properties.insert("body".to_string(), Value::Str(body.to_string()));
     properties.insert("key".to_string(), Value::Str(key.clone()));
+
+    // Fold inline `#tags` into the `tags` property. Only acts when there are
+    // inline tags, and never clobbers a frontmatter `tags` value that is not a
+    // string or list (e.g. a map): an author's value is preserved verbatim.
+    // Tags are kept as written (case-sensitive). Existing list items are kept
+    // as-is (including non-string ones); inline tags are appended unless an
+    // equal string is already present.
+    let inline_tags = extract_tags(body);
+    if !inline_tags.is_empty() {
+        let merged: Option<Value> = match properties.get("tags") {
+            None => Some(Value::List(
+                inline_tags.iter().map(|t| Value::Str(t.clone())).collect(),
+            )),
+            Some(Value::List(items)) => {
+                let present: HashSet<&str> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut merged = items.clone();
+                for tag in &inline_tags {
+                    if !present.contains(tag.as_str()) {
+                        merged.push(Value::Str(tag.clone()));
+                    }
+                }
+                Some(Value::List(merged))
+            }
+            Some(Value::Str(existing)) => {
+                let mut merged = vec![Value::Str(existing.clone())];
+                for tag in &inline_tags {
+                    if tag != existing {
+                        merged.push(Value::Str(tag.clone()));
+                    }
+                }
+                Some(Value::List(merged))
+            }
+            // Map / number / bool / etc: leave the author's value untouched.
+            Some(_) => None,
+        };
+        if let Some(value) = merged {
+            properties.insert("tags".to_string(), value);
+        }
+    }
 
     let links = extract_links(body);
 
@@ -368,6 +415,33 @@ fn wikilink_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(!?)\[\[([^\[\]\r\n]+?)\]\]").expect("valid wikilink regex"))
 }
 
+/// Inline `#tags` in a note body, in first-seen order, deduplicated. Excludes
+/// matches inside code (via [`mask_code`]), requires at least one non-digit
+/// character (so `#123` is not a tag), and keeps nested tags (`#area/topic`).
+fn extract_tags(body: &str) -> Vec<String> {
+    let masked = mask_code(body);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for caps in tag_regex().captures_iter(&masked) {
+        let tag = caps[1].to_string();
+        if seen.insert(tag.clone()) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+fn tag_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Preceded by start-of-text or whitespace (so `#` mid-word, in URLs, or a
+    // heading's `# ` are excluded); then a tag of letters/digits/`_`/`-`/`/`
+    // with at least one non-digit. `\s` matches newlines, covering line starts.
+    RE.get_or_init(|| {
+        Regex::new(r"(?:^|\s)#([\p{L}\p{N}_/-]*[\p{L}_/-][\p{L}\p{N}_/-]*)")
+            .expect("valid tag regex")
+    })
+}
+
 /// Reduce a wikilink's inner text to a normalized note key.
 ///
 /// `Note|alias` -> `note`, `Note#heading` -> `note`, `folder/Note` -> `note`.
@@ -459,6 +533,65 @@ mod tests {
         assert_eq!(
             note.properties.get("body"),
             Some(&Value::Str("body\n".into()))
+        );
+    }
+
+    #[test]
+    fn inline_tags_extracted_excluding_headings_and_code() {
+        let body = "# Heading is not a tag\n\nText with #rust and #area/db, #123 is not.\n\n\
+                    ```\n#fenced\n```\nInline `#code` ignored. URL https://x/#frag too.";
+        assert_eq!(extract_tags(body), vec!["rust", "area/db"]);
+    }
+
+    #[test]
+    fn parse_note_merges_frontmatter_and_inline_tags() {
+        let note = parse_note(
+            "N.md",
+            "---\ntags: [project, rust]\n---\nbody #rust and #new\n",
+        );
+        let tags: Vec<&str> = match note.properties.get("tags") {
+            Some(Value::List(items)) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected a tags list, got {other:?}"),
+        };
+        // Frontmatter first, inline merged, `rust` deduplicated.
+        assert_eq!(tags, vec!["project", "rust", "new"]);
+    }
+
+    #[test]
+    fn no_tags_means_no_tags_property() {
+        let note = parse_note("N.md", "plain body, no hashes\n");
+        assert!(!note.properties.contains_key("tags"));
+    }
+
+    #[test]
+    fn tag_merge_keeps_non_string_frontmatter_list_items() {
+        let note = parse_note("N.md", "---\ntags: [2025, ok]\n---\nbody #rust\n");
+        match note.properties.get("tags") {
+            Some(Value::List(items)) => {
+                assert!(items.contains(&Value::I64(2025)), "numeric item preserved");
+                assert!(items.contains(&Value::Str("ok".into())));
+                assert!(
+                    items.contains(&Value::Str("rust".into())),
+                    "inline appended"
+                );
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_merge_does_not_clobber_unmergeable_frontmatter() {
+        // A map-shaped `tags:` is unusual but must be preserved, not replaced.
+        let note = parse_note("N.md", "---\ntags:\n  weird: 1\n---\nbody #rust\n");
+        assert!(
+            matches!(note.properties.get("tags"), Some(Value::Map(_))),
+            "map-shaped tags preserved verbatim"
         );
     }
 
