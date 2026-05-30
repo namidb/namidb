@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use namidb_core::{id::NamespaceId, value::Value as CoreValue};
+use namidb_markdown::{load_vault, LoadOptions};
 use namidb_query::{
     execute, execute_write, explain_query, explain_query_raw, explain_query_raw_verbose,
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
@@ -88,6 +89,32 @@ enum Cmd {
         /// Cypher source. Wrap multi-word queries in quotes.
         query: String,
     },
+    /// Load an Obsidian-style markdown vault as a graph: each `.md` note
+    /// becomes a `:Note` node, each `[[wikilink]]` a `:LINKS_TO` edge, and
+    /// YAML frontmatter becomes node properties. The note body is kept as a
+    /// `body` property, so the files stay the source of truth and the graph
+    /// is a derived index you can rebuild.
+    ///
+    /// Point `--store` at a durable backend to keep the result; without it
+    /// the load runs against an ephemeral in-memory namespace (useful only to
+    /// check the counts).
+    LoadVault {
+        /// Storage URI (see `run --help` for the scheme reference). Durable
+        /// backends (`file://`, `s3://`, `gs://`, `az://`) persist the graph.
+        #[arg(long)]
+        store: Option<String>,
+        /// Namespace name when `--store` is not supplied.
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+        /// Node label for notes.
+        #[arg(long, default_value = "Note")]
+        label: String,
+        /// Edge type for wikilinks.
+        #[arg(long, default_value = "LINKS_TO")]
+        edge_type: String,
+        /// Path to the vault directory.
+        path: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -143,6 +170,64 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             rt.block_on(run_query(store.as_deref(), &namespace, &query))?;
         }
+        Cmd::LoadVault {
+            store,
+            namespace,
+            label,
+            edge_type,
+            path,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(load_vault_cmd(
+                store.as_deref(),
+                &namespace,
+                &label,
+                &edge_type,
+                &path,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+async fn load_vault_cmd(
+    store_uri: Option<&str>,
+    namespace: &str,
+    label: &str,
+    edge_type: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
+        Some(uri) => parse_uri(uri).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => {
+            let ns = NamespaceId::new(namespace)?;
+            (
+                Arc::new(InMemory::new()),
+                NamespacePaths::new("tenants", ns),
+            )
+        }
+    };
+
+    let mut writer = WriterSession::open(store, paths).await?;
+    let opts = LoadOptions {
+        label: label.to_string(),
+        edge_type: edge_type.to_string(),
+        ..Default::default()
+    };
+    let outcome = load_vault(std::path::Path::new(path), &mut writer, &opts).await?;
+    // Flush the tail the loader leaves pending so the graph is durable.
+    writer.commit_batch().await?;
+
+    println!("{}", "─".repeat(48));
+    println!("notes loaded    : {}", outcome.notes_loaded);
+    println!("links resolved  : {}", outcome.links_resolved);
+    println!("links dangling  : {}", outcome.links_dangling);
+    println!("name collisions : {}", outcome.name_collisions);
+    println!("{}", "─".repeat(48));
+    if store_uri.is_none() {
+        println!("(in-memory namespace; pass --store <uri> to persist the graph)");
     }
     Ok(())
 }

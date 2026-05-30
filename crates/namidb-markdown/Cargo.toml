@@ -1,28 +1,26 @@
 [package]
-name = "namidb-cli"
+name = "namidb-markdown"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Command-line interface for NamiDB"
+description = "Ingest an Obsidian-style markdown vault (wikilinks + frontmatter) into NamiDB as a graph"
 readme = "README.md"
-
-[[bin]]
-name = "namidb"
-path = "src/main.rs"
 
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
-namidb-markdown = { workspace = true }
-namidb-query = { workspace = true }
-clap = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-console = { workspace = true }
-indicatif = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+pulldown-cmark = { workspace = true }
+yaml-rust2 = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
 object_store = { workspace = true }
+tempfile = { workspace = true }

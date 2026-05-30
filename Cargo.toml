@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/namidb-core",
     "crates/namidb-storage",
+    "crates/namidb-markdown",
     "crates/namidb-graph",
     "crates/namidb-query",
     "crates/namidb-cli",
@@ -86,6 +87,12 @@ tokio-test = "0.4"
 tempfile = "3.13"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
+# Markdown / vault ingest (isolated to namidb-markdown so the core
+# storage/query crates stay free of these parsers)
+pulldown-cmark = { version = "0.12", default-features = false }
+yaml-rust2 = "0.10"
+regex = "1"
+
 # CLI
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 indicatif = "0.17"
@@ -99,6 +106,7 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 # Local workspace crates
 namidb-core = { path = "crates/namidb-core", version = "0.6.0" }
 namidb-storage = { path = "crates/namidb-storage", version = "0.6.0" }
+namidb-markdown = { path = "crates/namidb-markdown", version = "0.6.0" }
 namidb-graph = { path = "crates/namidb-graph", version = "0.6.0" }
 namidb-query = { path = "crates/namidb-query", version = "0.6.0" }
 namidb-bolt = { path = "crates/namidb-bolt", version = "0.6.0" }

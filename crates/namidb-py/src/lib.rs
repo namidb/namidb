@@ -364,6 +364,50 @@ impl Client {
         build_node_views_table(py, &views, &prop_keys)
     }
 
+    /// Load an Obsidian-style markdown vault into this namespace as a graph.
+    ///
+    /// Each `.md` note under `path` becomes a node (default label `Note`),
+    /// each `[[wikilink]]` an edge (default type `LINKS_TO`), and YAML
+    /// frontmatter becomes node properties; the raw note body is kept as a
+    /// `body` property. Unlike `upsert_node` / `upsert_edge`, this commits
+    /// the load before returning, so the graph is durable on exit.
+    ///
+    /// Returns a dict with `notes_loaded`, `links_resolved`,
+    /// `links_dangling`, `name_collisions` and `commit_batches`.
+    #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000))]
+    fn load_vault(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        label: &str,
+        edge_type: &str,
+        commit_every: usize,
+    ) -> PyResult<Py<PyDict>> {
+        let opts = namidb_markdown::LoadOptions {
+            label: label.to_string(),
+            edge_type: edge_type.to_string(),
+            commit_every,
+        };
+        let dir = std::path::PathBuf::from(path);
+        let session = self.session.clone();
+        let outcome = self.runtime.block_on(async move {
+            let mut guard = session.lock().await;
+            let outcome = namidb_markdown::load_vault(&dir, &mut guard, &opts)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("vault load failed: {e}")))?;
+            guard.commit_batch().await.map_err(map_storage_err)?;
+            Ok::<_, PyErr>(outcome)
+        })?;
+
+        let d = PyDict::new_bound(py);
+        d.set_item("notes_loaded", outcome.notes_loaded)?;
+        d.set_item("links_resolved", outcome.links_resolved)?;
+        d.set_item("links_dangling", outcome.links_dangling)?;
+        d.set_item("name_collisions", outcome.name_collisions)?;
+        d.set_item("commit_batches", outcome.commit_batches)?;
+        Ok(d.into())
+    }
+
     /// Run a Cypher query synchronously and return a [`QueryResult`].
     ///
     /// `params` is an optional `dict[str, Any]` whose values are

@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
+namidb-markdown = { workspace = true }
 namidb-query = { workspace = true }
 tokio = { workspace = true }
 object_store = { workspace = true }
