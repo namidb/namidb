@@ -653,6 +653,7 @@ fn call_scalar_function(
             }
             Ok(RuntimeValue::Null)
         }
+        "range" => range_fn(args, span),
 
         // --- String functions
         "tolower" => single_arg(name, args, span).map(|v| match v {
@@ -667,6 +668,28 @@ fn call_scalar_function(
             RuntimeValue::String(s) => RuntimeValue::String(s.trim().to_string()),
             _ => RuntimeValue::Null,
         }),
+        "ltrim" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.trim_start().to_string()),
+            _ => RuntimeValue::Null,
+        }),
+        "rtrim" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.trim_end().to_string()),
+            _ => RuntimeValue::Null,
+        }),
+        // `reverse` flips a string (by character) or a list.
+        "reverse" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::String(s) => RuntimeValue::String(s.chars().rev().collect()),
+            RuntimeValue::List(mut items) => {
+                items.reverse();
+                RuntimeValue::List(items)
+            }
+            _ => RuntimeValue::Null,
+        }),
+        "left" => str_left_right(args, span, true),
+        "right" => str_left_right(args, span, false),
+        "substring" => str_substring(args, span),
+        "replace" => str_replace(args, span),
+        "split" => str_split(args, span),
         "tostring" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::Null => RuntimeValue::Null,
             other => RuntimeValue::String(runtime_to_string_concat(&other)),
@@ -690,11 +713,42 @@ fn call_scalar_function(
             },
             _ => RuntimeValue::Null,
         }),
+        // `toBoolean`: parse "true"/"false" (any case), pass a Bool through,
+        // and map 0/1; anything else is Null (Cypher `toBooleanOrNull`).
+        "toboolean" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Bool(b) => RuntimeValue::Bool(b),
+            RuntimeValue::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => RuntimeValue::Bool(true),
+                "false" => RuntimeValue::Bool(false),
+                _ => RuntimeValue::Null,
+            },
+            RuntimeValue::Integer(0) => RuntimeValue::Bool(false),
+            RuntimeValue::Integer(1) => RuntimeValue::Bool(true),
+            _ => RuntimeValue::Null,
+        }),
 
         // --- Numeric
         "abs" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::Integer(n) => RuntimeValue::Integer(n.abs()),
             RuntimeValue::Float(f) => RuntimeValue::Float(f.abs()),
+            _ => RuntimeValue::Null,
+        }),
+        // `round`/`floor`/`ceil`/`sqrt` always return a Float, matching
+        // Neo4j; an integer argument is promoted first.
+        "round" => single_arg(name, args, span).map(|v| num_to_float(&v, f64::round)),
+        "floor" => single_arg(name, args, span).map(|v| num_to_float(&v, f64::floor)),
+        "ceil" => single_arg(name, args, span).map(|v| num_to_float(&v, f64::ceil)),
+        "sqrt" => single_arg(name, args, span).map(|v| num_to_float(&v, f64::sqrt)),
+        // `sign` returns -1, 0 or 1 as an Integer.
+        "sign" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Integer(n) => RuntimeValue::Integer(n.signum()),
+            RuntimeValue::Float(f) => RuntimeValue::Integer(if f > 0.0 {
+                1
+            } else if f < 0.0 {
+                -1
+            } else {
+                0
+            }),
             _ => RuntimeValue::Null,
         }),
 
@@ -770,6 +824,197 @@ fn single_arg(
             span,
         )),
     }
+}
+
+/// Coerce a builtin argument that must be an integer. `Null` yields
+/// `Ok(None)` so the caller can propagate Null; a non-integer is an error.
+fn want_int(v: &RuntimeValue, fname: &str, span: SourceSpan) -> Result<Option<i64>, EvalError> {
+    match v {
+        RuntimeValue::Null => Ok(None),
+        RuntimeValue::Integer(n) => Ok(Some(*n)),
+        other => Err(EvalError::new(
+            format!("{} expects an integer, got {}", fname, other.type_name()),
+            span,
+        )),
+    }
+}
+
+/// Apply a float transform, promoting an Integer first; non-numbers -> Null.
+fn num_to_float(v: &RuntimeValue, f: impl Fn(f64) -> f64) -> RuntimeValue {
+    match v {
+        RuntimeValue::Integer(n) => RuntimeValue::Float(f(*n as f64)),
+        RuntimeValue::Float(x) => RuntimeValue::Float(f(*x)),
+        _ => RuntimeValue::Null,
+    }
+}
+
+/// `left(s, n)` / `right(s, n)`: the first / last `n` characters.
+fn str_left_right(
+    args: &[RuntimeValue],
+    span: SourceSpan,
+    left: bool,
+) -> Result<RuntimeValue, EvalError> {
+    let fname = if left {
+        "left(string, length)"
+    } else {
+        "right(string, length)"
+    };
+    let (s, n) = match args {
+        [RuntimeValue::String(s), n] => (s, n),
+        [RuntimeValue::Null, _] => return Ok(RuntimeValue::Null),
+        _ => {
+            return Err(EvalError::new(
+                format!("{} expects a string and an integer", fname),
+                span,
+            ))
+        }
+    };
+    let n = match want_int(n, fname, span)? {
+        Some(n) => n,
+        None => return Ok(RuntimeValue::Null),
+    };
+    if n < 0 {
+        return Err(EvalError::new(
+            format!("{}: length must be non-negative", fname),
+            span,
+        ));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let n = (n as usize).min(chars.len());
+    let out: String = if left {
+        chars[..n].iter().collect()
+    } else {
+        chars[chars.len() - n..].iter().collect()
+    };
+    Ok(RuntimeValue::String(out))
+}
+
+/// `substring(s, start[, length])`: 0-based, by character (Neo4j semantics).
+fn str_substring(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    let fname = "substring(string, start[, length])";
+    let (s, start, len) = match args {
+        [RuntimeValue::String(s), start] => (s, start, None),
+        [RuntimeValue::String(s), start, len] => (s, start, Some(len)),
+        [RuntimeValue::Null, ..] => return Ok(RuntimeValue::Null),
+        _ => {
+            return Err(EvalError::new(
+                format!("{} expects a string and integer offsets", fname),
+                span,
+            ))
+        }
+    };
+    let start = match want_int(start, fname, span)? {
+        Some(n) => n,
+        None => return Ok(RuntimeValue::Null),
+    };
+    if start < 0 {
+        return Err(EvalError::new(
+            format!("{}: start must be non-negative", fname),
+            span,
+        ));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let start = (start as usize).min(chars.len());
+    let end = match len {
+        None => chars.len(),
+        Some(l) => {
+            let l = match want_int(l, fname, span)? {
+                Some(l) => l,
+                None => return Ok(RuntimeValue::Null),
+            };
+            if l < 0 {
+                return Err(EvalError::new(
+                    format!("{}: length must be non-negative", fname),
+                    span,
+                ));
+            }
+            start.saturating_add(l as usize).min(chars.len())
+        }
+    };
+    Ok(RuntimeValue::String(chars[start..end].iter().collect()))
+}
+
+/// `replace(s, search, replacement)`: replace every occurrence.
+fn str_replace(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    match args {
+        [RuntimeValue::String(s), RuntimeValue::String(search), RuntimeValue::String(rep)] => {
+            Ok(RuntimeValue::String(s.replace(search.as_str(), rep)))
+        }
+        [RuntimeValue::Null, _, _] | [_, RuntimeValue::Null, _] | [_, _, RuntimeValue::Null] => {
+            Ok(RuntimeValue::Null)
+        }
+        _ => Err(EvalError::new(
+            "replace(string, search, replacement) expects three strings",
+            span,
+        )),
+    }
+}
+
+/// `split(s, delimiter)`: an empty delimiter splits into characters.
+fn str_split(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    match args {
+        [RuntimeValue::String(s), RuntimeValue::String(delim)] => {
+            let parts: Vec<RuntimeValue> = if delim.is_empty() {
+                s.chars()
+                    .map(|c| RuntimeValue::String(c.to_string()))
+                    .collect()
+            } else {
+                s.split(delim.as_str())
+                    .map(|p| RuntimeValue::String(p.to_string()))
+                    .collect()
+            };
+            Ok(RuntimeValue::List(parts))
+        }
+        [RuntimeValue::Null, _] | [_, RuntimeValue::Null] => Ok(RuntimeValue::Null),
+        _ => Err(EvalError::new(
+            "split(string, delimiter) expects two strings",
+            span,
+        )),
+    }
+}
+
+/// `range(start, end[, step])`: an inclusive integer list (Neo4j semantics).
+fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    let (start, end, step) = match args {
+        [a, b] => (a, b, None),
+        [a, b, c] => (a, b, Some(c)),
+        _ => {
+            return Err(EvalError::new(
+                "range(start, end[, step]) expects two or three integers",
+                span,
+            ))
+        }
+    };
+    let (start, end) = match (
+        want_int(start, "range()", span)?,
+        want_int(end, "range()", span)?,
+    ) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return Ok(RuntimeValue::Null),
+    };
+    let step = match step {
+        None => 1,
+        Some(v) => match want_int(v, "range()", span)? {
+            Some(s) => s,
+            None => return Ok(RuntimeValue::Null),
+        },
+    };
+    if step == 0 {
+        return Err(EvalError::new("range(): step must be non-zero", span));
+    }
+    let mut out = Vec::new();
+    let mut i = start;
+    loop {
+        if (step > 0 && i > end) || (step < 0 && i < end) {
+            break;
+        }
+        out.push(RuntimeValue::Integer(i));
+        match i.checked_add(step) {
+            Some(next) => i = next,
+            None => break,
+        }
+    }
+    Ok(RuntimeValue::List(out))
 }
 
 fn eval_list_comprehension(
@@ -1038,6 +1283,102 @@ mod tests {
             "unexpected message: {}",
             err.message
         );
+    }
+
+    // ─── scalar string / math / list builtins ─────────────────────
+
+    fn s(src: &str) -> RuntimeValue {
+        eval_str(src, &Row::new(), &Params::new())
+    }
+    fn ints(xs: &[i64]) -> RuntimeValue {
+        RuntimeValue::List(xs.iter().map(|n| RuntimeValue::Integer(*n)).collect())
+    }
+    fn strs(xs: &[&str]) -> RuntimeValue {
+        RuntimeValue::List(
+            xs.iter()
+                .map(|x| RuntimeValue::String((*x).into()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn builtin_substring() {
+        assert_eq!(
+            s("substring('hello', 1, 3)"),
+            RuntimeValue::String("ell".into())
+        );
+        assert_eq!(
+            s("substring('hello', 2)"),
+            RuntimeValue::String("llo".into())
+        );
+        // length past the end clamps to the end rather than erroring.
+        assert_eq!(
+            s("substring('hi', 1, 99)"),
+            RuntimeValue::String("i".into())
+        );
+        assert!(s("substring(NULL, 0)").is_null());
+        assert!(eval_expr_err("substring('x', -1)")
+            .message
+            .contains("non-negative"));
+    }
+
+    #[test]
+    fn builtin_left_right() {
+        assert_eq!(s("left('hello', 3)"), RuntimeValue::String("hel".into()));
+        assert_eq!(s("right('hello', 3)"), RuntimeValue::String("llo".into()));
+        // n beyond the length returns the whole string.
+        assert_eq!(s("left('hi', 9)"), RuntimeValue::String("hi".into()));
+    }
+
+    #[test]
+    fn builtin_trims_and_reverse() {
+        assert_eq!(s("ltrim('  hi ')"), RuntimeValue::String("hi ".into()));
+        assert_eq!(s("rtrim(' hi  ')"), RuntimeValue::String(" hi".into()));
+        assert_eq!(s("reverse('abc')"), RuntimeValue::String("cba".into()));
+        assert_eq!(s("reverse([1, 2, 3])"), ints(&[3, 2, 1]));
+    }
+
+    #[test]
+    fn builtin_replace_and_split() {
+        assert_eq!(
+            s("replace('a-b-c', '-', ':')"),
+            RuntimeValue::String("a:b:c".into())
+        );
+        assert_eq!(s("split('a,b,c', ',')"), strs(&["a", "b", "c"]));
+        assert_eq!(s("split('abc', '')"), strs(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn builtin_round_floor_ceil_sqrt() {
+        assert_eq!(s("round(2.4)"), RuntimeValue::Float(2.0));
+        assert_eq!(s("round(2.6)"), RuntimeValue::Float(3.0));
+        assert_eq!(s("floor(2.9)"), RuntimeValue::Float(2.0));
+        assert_eq!(s("ceil(2.1)"), RuntimeValue::Float(3.0));
+        // integer argument is promoted to Float first.
+        assert_eq!(s("sqrt(9)"), RuntimeValue::Float(3.0));
+    }
+
+    #[test]
+    fn builtin_sign() {
+        assert_eq!(s("sign(-5)"), RuntimeValue::Integer(-1));
+        assert_eq!(s("sign(0)"), RuntimeValue::Integer(0));
+        assert_eq!(s("sign(3.2)"), RuntimeValue::Integer(1));
+    }
+
+    #[test]
+    fn builtin_toboolean() {
+        assert_eq!(s("toBoolean('TRUE')"), RuntimeValue::Bool(true));
+        assert_eq!(s("toBoolean('false')"), RuntimeValue::Bool(false));
+        assert_eq!(s("toBoolean(0)"), RuntimeValue::Bool(false));
+        assert!(s("toBoolean('nope')").is_null());
+    }
+
+    #[test]
+    fn builtin_range() {
+        assert_eq!(s("range(0, 3)"), ints(&[0, 1, 2, 3]));
+        assert_eq!(s("range(0, 10, 2)"), ints(&[0, 2, 4, 6, 8, 10]));
+        assert_eq!(s("range(3, 0, -1)"), ints(&[3, 2, 1, 0]));
+        assert!(eval_expr_err("range(0, 5, 0)").message.contains("non-zero"));
     }
 
     #[test]
