@@ -31,7 +31,7 @@ use namidb_core::{NodeId, Value};
 use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, WriterSession};
 
 use crate::id::stable_node_id;
-use crate::parse::{parse_vault, VaultGraph};
+use crate::parse::{parse_vault, ParsedNote, VaultGraph};
 
 const DEFAULT_LABEL: &str = "Note";
 const DEFAULT_EDGE_TYPE: &str = "LINKS_TO";
@@ -120,6 +120,26 @@ pub struct VaultLoadOutcome {
     pub commit_batches: usize,
 }
 
+/// Outcome of an incremental [`sync_vault`]/[`sync_graph`]. Wraps the same
+/// write counts a load reports, plus the change classification that drove the
+/// sync.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VaultSyncOutcome {
+    /// The underlying write counts (edges/tags/prune), as for a load. Its
+    /// `notes_loaded` counts only the note bodies actually (re-)written, so an
+    /// all-unchanged sync writes zero notes.
+    pub load: VaultLoadOutcome,
+    /// Notes new since the last sync.
+    pub notes_added: usize,
+    /// Notes whose content hash changed since the last sync.
+    pub notes_modified: usize,
+    /// Notes left untouched because their content hash was unchanged (no body
+    /// re-write).
+    pub notes_unchanged: usize,
+    /// Notes gone from disk since the last sync.
+    pub notes_deleted: usize,
+}
+
 /// Parse the vault at `dir` and ingest it through `writer`.
 pub async fn load_vault(
     dir: &Path,
@@ -138,6 +158,24 @@ pub async fn load_graph(
     writer: &mut WriterSession,
     opts: &LoadOptions,
 ) -> anyhow::Result<VaultLoadOutcome> {
+    load_graph_inner(graph, writer, opts, None).await
+}
+
+/// Shared write path for both a full load and an incremental sync. `prev_state`
+/// is `None` for a load and `Some` for a sync. In sync mode the vault is always
+/// mirrored (prune on), the existing node ids are read through a column
+/// projection so note bodies are never loaded, and a note whose content hash
+/// matches the prior state is left in place rather than re-written. Everything
+/// else (edge/tag/stub reconcile) is identical to a prune-load, so a sync
+/// converges to the same graph a fresh prune-load of the same disk would.
+async fn load_graph_inner(
+    graph: &VaultGraph,
+    writer: &mut WriterSession,
+    opts: &LoadOptions,
+    prev_state: Option<&VaultState>,
+) -> anyhow::Result<VaultLoadOutcome> {
+    // A sync always mirrors the vault; a plain load prunes only if asked.
+    let prune = opts.prune || prev_state.is_some();
     // The set of normalized keys that exist as real notes, used to tell a
     // resolved link from a dangling one.
     let mut known: HashSet<&str> = HashSet::with_capacity(graph.notes.len());
@@ -211,7 +249,7 @@ pub async fn load_graph(
 
     // Reconcile deletions first, against the last committed state (nothing
     // from this load is pending yet, so the snapshot is accurate).
-    if opts.prune {
+    if prune {
         // Real notes plus any placeholder stubs still referenced this load.
         let desired_nodes: HashSet<NodeId> = graph
             .notes
@@ -237,8 +275,14 @@ pub async fn load_graph(
             PairVec,
         ) = {
             let snap = writer.snapshot();
+            // Only the ids are needed for the deletion diff, so project a
+            // single column rather than materializing note bodies.
             let nodes = snap
-                .scan_label(&opts.label)
+                .scan_label_with_predicates_and_projection(
+                    &opts.label,
+                    &[],
+                    Some(&["key".to_string()]),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("scan {} nodes: {e}", opts.label))?;
             let edges = snap
@@ -308,8 +352,19 @@ pub async fn load_graph(
         }
     }
 
-    // Upsert the current vault: note nodes, link edges, tag nodes, tag edges.
+    // Upsert the current vault's note nodes, then edges, tag nodes and tag
+    // edges. In sync mode a note whose stored content hash still matches is
+    // left in place: its node is already byte-identical, so re-writing the
+    // body would be wasted work (the expensive part of a load).
     for note in &graph.notes {
+        if let Some(prev) = prev_state {
+            if matches!(
+                (prev.get(&note.key), note_hash(note)),
+                (Some(Some(stored)), Some(cur)) if stored.as_str() == cur
+            ) {
+                continue;
+            }
+        }
         let record = NodeWriteRecord {
             properties: note.properties.clone(),
             schema_version: 1,
@@ -380,6 +435,50 @@ pub async fn load_graph(
     outcome.tag_links = desired_tagged.len();
 
     Ok(outcome)
+}
+
+/// Sync an already-parsed [`VaultGraph`] against the prior [`VaultState`],
+/// re-indexing only what changed. Bodies of unchanged notes are not re-written
+/// and note bodies are never loaded to detect deletions, but edges and tags are
+/// reconciled exactly as a prune-load, so the resulting graph is identical to a
+/// fresh prune-load of the same disk state.
+pub async fn sync_graph(
+    graph: &VaultGraph,
+    prev_state: &VaultState,
+    writer: &mut WriterSession,
+    opts: &LoadOptions,
+) -> anyhow::Result<VaultSyncOutcome> {
+    let diff = diff_vault(graph, prev_state);
+    let counts = VaultSyncOutcome {
+        notes_added: diff.added.len(),
+        notes_modified: diff.modified.len(),
+        notes_unchanged: diff.unchanged.len(),
+        notes_deleted: diff.deleted.len(),
+        load: VaultLoadOutcome::default(),
+    };
+    let load = load_graph_inner(graph, writer, opts, Some(prev_state)).await?;
+    Ok(VaultSyncOutcome { load, ..counts })
+}
+
+/// Parse the vault at `dir`, read the prior [`VaultState`] from the graph, and
+/// sync incrementally. The first sync over an empty namespace classifies every
+/// note as added, so it behaves like a full load.
+pub async fn sync_vault(
+    dir: &Path,
+    writer: &mut WriterSession,
+    opts: &LoadOptions,
+) -> anyhow::Result<VaultSyncOutcome> {
+    let prev_state = read_vault_state(writer, &opts.label).await?;
+    let graph = parse_vault(dir)?;
+    sync_graph(&graph, &prev_state, writer, opts).await
+}
+
+/// The stored content hash of a parsed note, if present.
+fn note_hash(note: &ParsedNote) -> Option<&str> {
+    match note.properties.get("content_hash") {
+        Some(Value::Str(s)) => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 /// Stable id for a tag node, namespaced with NUL bytes so a tag never collides
@@ -968,5 +1067,130 @@ mod tests {
             matches!(state.get("a"), Some(Some(_))),
             "A carries a content hash"
         );
+    }
+
+    /// Every node of `label`, as (id, sorted property debug pairs), sorted.
+    /// Captures the full live property set so a comparison is byte-exact.
+    async fn canon_nodes(
+        writer: &WriterSession,
+        label: &str,
+    ) -> Vec<(String, Vec<(String, String)>)> {
+        let snap = writer.snapshot();
+        let mut out: Vec<(String, Vec<(String, String)>)> = snap
+            .scan_label(label)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| {
+                let mut props: Vec<(String, String)> = n
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                    .collect();
+                props.sort();
+                (n.id.to_string(), props)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every live edge of `edge_type` as sorted (src, dst) id pairs.
+    async fn canon_edges(writer: &WriterSession, edge_type: &str) -> Vec<(String, String)> {
+        let snap = writer.snapshot();
+        let mut out: Vec<(String, String)> = snap
+            .scan_edge_type(edge_type)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| (e.src.to_string(), e.dst.to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The correctness contract for incremental sync: after a sync, the graph
+    /// is byte-identical to a fresh prune-load of the same disk state.
+    async fn assert_sync_matches_fresh_load(placeholders: bool) {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        // v1.
+        write(
+            dir,
+            "A.md",
+            "---\ntags: [proj]\n---\nlinks [[B]] embeds ![[C]] and [[Missing]]\n",
+        );
+        write(dir, "B.md", "beta #shared\n");
+        write(dir, "C.md", "gamma #shared\n");
+        write(dir, "D.md", "delta, to be deleted\n");
+        write(dir, "E.md", "echo, unchanged #solo\n");
+
+        let opts = LoadOptions {
+            placeholders,
+            ..Default::default()
+        };
+
+        let mut synced = open(&format!("oracle-sync-{placeholders}")).await;
+        load_vault(dir, &mut synced, &opts).await.unwrap();
+        synced.commit_batch().await.unwrap();
+
+        // Mutate disk to v2: A modified (new tag, new link/embed targets, drops
+        // Missing), C modified (tag change), D deleted, F added; B and E
+        // untouched.
+        write(
+            dir,
+            "A.md",
+            "---\ntags: [proj, more]\n---\nlinks [[E]] embeds ![[B]]\n",
+        );
+        write(dir, "C.md", "gamma #renamed\n");
+        std::fs::remove_file(dir.join("D.md")).unwrap();
+        write(dir, "F.md", "foxtrot [[A]] #shared\n");
+
+        let out = sync_vault(dir, &mut synced, &opts).await.unwrap();
+        synced.commit_batch().await.unwrap();
+
+        assert_eq!(out.notes_added, 1, "F added");
+        assert_eq!(out.notes_modified, 2, "A and C modified");
+        assert_eq!(out.notes_deleted, 1, "D deleted");
+        assert_eq!(out.notes_unchanged, 2, "B and E unchanged");
+        assert_eq!(
+            out.load.notes_loaded, 3,
+            "only A, C and F bodies are (re)written; B and E are skipped"
+        );
+
+        // Fresh prune-load of v2 into a separate writer.
+        let mut fresh = open(&format!("oracle-fresh-{placeholders}")).await;
+        let fresh_opts = LoadOptions {
+            prune: true,
+            placeholders,
+            ..Default::default()
+        };
+        load_vault(dir, &mut fresh, &fresh_opts).await.unwrap();
+        fresh.commit_batch().await.unwrap();
+
+        for label in ["Note", "Tag"] {
+            assert_eq!(
+                canon_nodes(&synced, label).await,
+                canon_nodes(&fresh, label).await,
+                "{label} nodes diverge (placeholders={placeholders})"
+            );
+        }
+        for edge_type in ["LINKS_TO", "EMBEDS", "TAGGED"] {
+            assert_eq!(
+                canon_edges(&synced, edge_type).await,
+                canon_edges(&fresh, edge_type).await,
+                "{edge_type} edges diverge (placeholders={placeholders})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_matches_fresh_prune_load_placeholders_off() {
+        assert_sync_matches_fresh_load(false).await;
+    }
+
+    #[tokio::test]
+    async fn sync_matches_fresh_prune_load_placeholders_on() {
+        assert_sync_matches_fresh_load(true).await;
     }
 }

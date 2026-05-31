@@ -32,5 +32,8 @@ pub mod load;
 pub mod parse;
 
 pub use id::{normalize_key, stable_node_id};
-pub use load::{load_graph, load_vault, LoadOptions, VaultLoadOutcome};
+pub use load::{
+    diff_vault, load_graph, load_vault, read_vault_state, sync_graph, sync_vault, LoadOptions,
+    VaultDiff, VaultLoadOutcome, VaultState, VaultSyncOutcome,
+};
 pub use parse::{parse_note, parse_vault, ParsedNote, VaultGraph};
