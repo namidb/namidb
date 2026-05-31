@@ -24,7 +24,7 @@
 //! Follows the same cadence contract as the parquet loader: the loader leaves
 //! the final batch pending and the caller decides when to `commit_batch`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use namidb_core::{NodeId, Value};
@@ -387,6 +387,90 @@ pub async fn load_graph(
 /// cannot contain NUL).
 fn tag_node_id(tag: &str) -> NodeId {
     stable_node_id(&format!("\u{0}tag\u{0}{tag}"))
+}
+
+/// The last-loaded state for an incremental sync: each real note's stored
+/// `content_hash`, keyed by its normalized key. `None` marks a real note that
+/// predates the hash (loaded before `content_hash` existed); it is treated as
+/// "changed" so the next sync backfills it.
+pub type VaultState = HashMap<String, Option<String>>;
+
+/// Read the last-loaded [`VaultState`] from the graph through a column
+/// projection, so note bodies are never materialized (only `key`, `path` and
+/// `content_hash` columns are read). Placeholder stubs are excluded by their
+/// missing `path`, so a dangling-reference stub is never mistaken for a real
+/// note that a sync would have to delete.
+pub async fn read_vault_state(writer: &WriterSession, label: &str) -> anyhow::Result<VaultState> {
+    let projection = [
+        "key".to_string(),
+        "path".to_string(),
+        "content_hash".to_string(),
+    ];
+    let snap = writer.snapshot();
+    let nodes = snap
+        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
+        .await
+        .map_err(|e| anyhow::anyhow!("scan {label} state: {e}"))?;
+    let mut state = VaultState::with_capacity(nodes.len());
+    for node in &nodes {
+        // A real note has both a key and a path; a stub has a key but no path.
+        let (Some(Value::Str(key)), Some(Value::Str(_path))) =
+            (node.properties.get("key"), node.properties.get("path"))
+        else {
+            continue;
+        };
+        let hash = match node.properties.get("content_hash") {
+            Some(Value::Str(h)) => Some(h.clone()),
+            _ => None,
+        };
+        state.insert(key.clone(), hash);
+    }
+    Ok(state)
+}
+
+/// How a re-parsed vault differs from the last-loaded [`VaultState`]. Indices
+/// point into the parsed graph's `notes`; `deleted` holds the keys of real
+/// notes that are gone from disk.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VaultDiff {
+    /// Notes whose key was not in the previous state.
+    pub added: Vec<usize>,
+    /// Notes whose key was present but whose content hash changed (or was
+    /// missing, e.g. a pre-hash note).
+    pub modified: Vec<usize>,
+    /// Notes whose content hash matched the previous state.
+    pub unchanged: Vec<usize>,
+    /// Keys of real notes that were in the previous state but no longer on disk.
+    pub deleted: Vec<String>,
+}
+
+/// Classify each note in a freshly parsed `graph` against `prev` by comparing
+/// `content_hash`, and find the keys deleted from disk. A note counts as
+/// unchanged only when both the stored and the current hash are present and
+/// equal; anything else (added key, changed hash, missing hash) is re-indexed.
+pub fn diff_vault(graph: &VaultGraph, prev: &VaultState) -> VaultDiff {
+    let mut diff = VaultDiff::default();
+    let mut on_disk: HashSet<&str> = HashSet::with_capacity(graph.notes.len());
+    for (i, note) in graph.notes.iter().enumerate() {
+        on_disk.insert(note.key.as_str());
+        let cur = match note.properties.get("content_hash") {
+            Some(Value::Str(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        match prev.get(&note.key) {
+            None => diff.added.push(i),
+            Some(prev_hash) => match (prev_hash.as_deref(), cur) {
+                (Some(p), Some(c)) if p == c => diff.unchanged.push(i),
+                _ => diff.modified.push(i),
+            },
+        }
+    }
+    for key in prev.keys() {
+        if !on_disk.contains(key.as_str()) {
+            diff.deleted.push(key.clone());
+        }
+    }
+    diff
 }
 
 /// Fire a `commit_batch` once the pending row count reaches the cadence.
@@ -827,5 +911,62 @@ mod tests {
             .unwrap()
             .expect("B survives as a stub");
         assert_eq!(b.properties.get("placeholder"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn diff_classifies_notes_against_prev_state() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "alpha\n");
+        write(dir, "B.md", "beta\n");
+        write(dir, "C.md", "gamma\n");
+        let graph = parse_vault(dir).unwrap();
+
+        let hash_of = |key: &str| -> String {
+            let note = graph.notes.iter().find(|n| n.key == key).unwrap();
+            match note.properties.get("content_hash") {
+                Some(Value::Str(s)) => s.clone(),
+                _ => panic!("note {key} has no content_hash"),
+            }
+        };
+        let mut prev = VaultState::new();
+        prev.insert("a".into(), Some(hash_of("a"))); // unchanged
+        prev.insert("b".into(), Some("stale".into())); // modified (hash differs)
+        prev.insert("d".into(), Some("gone".into())); // deleted (absent on disk)
+                                                      // "c" is absent from prev, so it is added.
+
+        let diff = diff_vault(&graph, &prev);
+        let keys = |idx: &[usize]| -> Vec<String> {
+            idx.iter().map(|&i| graph.notes[i].key.clone()).collect()
+        };
+        assert_eq!(keys(&diff.added), vec!["c"]);
+        assert_eq!(keys(&diff.modified), vec!["b"]);
+        assert_eq!(keys(&diff.unchanged), vec!["a"]);
+        assert_eq!(diff.deleted, vec!["d".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn read_vault_state_excludes_stubs_and_carries_hashes() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "links to [[Missing]]\n");
+
+        let mut writer = open("vault-state").await;
+        let opts = LoadOptions {
+            placeholders: true,
+            ..Default::default()
+        };
+        load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        let state = read_vault_state(&writer, "Note").await.unwrap();
+        // Only the real note A is in the state; the Missing stub is excluded
+        // (no path), and A carries a content hash read via the projection.
+        assert_eq!(state.len(), 1, "stub excluded from state");
+        assert!(!state.contains_key("missing"));
+        assert!(
+            matches!(state.get("a"), Some(Some(_))),
+            "A carries a content hash"
+        );
     }
 }
