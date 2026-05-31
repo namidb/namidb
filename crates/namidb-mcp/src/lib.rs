@@ -31,16 +31,19 @@ use namidb_query::{
     execute, parse as cypher_parse, plan as build_plan, Params, ParseError, Row, RuntimeValue,
     StatsCatalog,
 };
-use namidb_storage::{SstCache, WriterSession};
+use namidb_storage::{SnapshotCell, SstCache, WriterSession};
 
 /// MCP protocol version this server reports at `initialize`.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// A NamiDB-backed MCP server. Holds one writer session (used read-only) and
-/// a shared SST cache.
+/// A NamiDB-backed MCP server. Holds one writer session (the single writer)
+/// behind a mutex, a shared SST cache, and a [`SnapshotCell`] that read queries
+/// serve from without taking the writer lock, so an ongoing vault load or sync
+/// never blocks an agent's reads.
 pub struct Server {
     session: Arc<Mutex<WriterSession>>,
     cache: SstCache,
+    snapshot: Arc<SnapshotCell>,
 }
 
 impl Server {
@@ -50,10 +53,18 @@ impl Server {
         let (store, paths) =
             namidb_storage::parse_uri(store_uri).map_err(|e| anyhow::anyhow!("{e}"))?;
         let session = WriterSession::open(store, paths).await?;
+        let snapshot = Arc::new(SnapshotCell::new(session.owned_snapshot()));
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
             cache: SstCache::new(64 * 1024 * 1024),
+            snapshot,
         })
+    }
+
+    /// Publish the writer's latest committed state so subsequent reads see it.
+    /// Call after every commit (`guard` is the held writer lock).
+    fn publish(&self, guard: &WriterSession) {
+        self.snapshot.store(guard.owned_snapshot());
     }
 
     /// Load a markdown vault into the namespace before serving. Mirrors the
@@ -79,6 +90,7 @@ impl Server {
         let mut guard = self.session.lock().await;
         let outcome = namidb_markdown::load_vault(dir, &mut guard, &opts).await?;
         guard.commit_batch().await?;
+        self.publish(&guard);
         Ok(outcome)
     }
 
@@ -255,13 +267,16 @@ impl Server {
     /// JSON objects. Rejects write plans.
     async fn run_read_query(&self, cypher: &str, params: &Params) -> anyhow::Result<Vec<Value>> {
         let parsed = cypher_parse(cypher).map_err(|errs| anyhow::anyhow!(fmt_parse_errs(&errs)))?;
-        let guard = self.session.lock().await;
-        let catalog = StatsCatalog::from_manifest(&guard.snapshot().manifest().manifest);
+        // Serve from the published snapshot rather than the writer lock, so a
+        // concurrent load/sync (which holds the lock to write) never blocks a
+        // read. The snapshot is a consistent committed view.
+        let owned = self.snapshot.load();
+        let snap = owned.borrow().with_cache(self.cache.clone());
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
         let plan = build_plan(&parsed, &catalog).map_err(|e| anyhow::anyhow!("{e}"))?;
         if plan.contains_write() {
             anyhow::bail!("this MCP server is read-only; write queries are rejected");
         }
-        let snap = guard.snapshot().with_cache(self.cache.clone());
         let rows = execute(&plan, &snap, params)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -775,6 +790,29 @@ mod tests {
         assert!(
             neighbors.as_array().unwrap().is_empty(),
             "a dangling ref must not appear as a neighbor"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_see_the_latest_published_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "alpha\n");
+        let server = Server::open("memory://mcp-publish").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let before = call(&server, "list_notes", json!({})).await;
+        assert_eq!(before.as_array().unwrap().len(), 1, "A visible");
+
+        // Add a note and reload; the lock-free read path must see the new
+        // commit without any explicit refresh, because load_vault republishes.
+        write(dir.path(), "B.md", "beta\n");
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let after = call(&server, "list_notes", json!({})).await;
+        assert_eq!(
+            after.as_array().unwrap().len(),
+            2,
+            "A and B visible after reload"
         );
     }
 
