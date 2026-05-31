@@ -12,7 +12,9 @@
 //! tag name), linked from the note by a `:TAGGED` edge, so tag-traversal
 //! queries ("notes tagged X", "notes that share a tag") run on the graph.
 //! Tag names are matched as written (case-sensitive), so `Rust` and `rust`
-//! are two distinct tag nodes.
+//! are two distinct tag nodes. A nested tag (`area/db`) also gets its ancestor
+//! `:Tag` nodes and a child-to-parent `:SUBTAG_OF` edge per level, so the tag
+//! tree is a real sub-graph (the note stays `:TAGGED` to the leaf it wrote).
 //!
 //! By default a load is additive (upsert-only): nodes overwrite in place
 //! thanks to deterministic ids, but a note or link removed from the vault is
@@ -24,7 +26,7 @@
 //! Follows the same cadence contract as the parquet loader: the loader leaves
 //! the final batch pending and the caller decides when to `commit_batch`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use namidb_core::{NodeId, Value};
@@ -41,6 +43,9 @@ const EMBED_EDGE_TYPE: &str = "EMBEDS";
 /// fixed (not configurable) so the tag sub-graph has a stable shape.
 const TAG_LABEL: &str = "Tag";
 const TAG_EDGE_TYPE: &str = "TAGGED";
+/// Edge type linking a nested tag to its immediate parent (`area/db` ->
+/// `area`), so the tag tree is a real sub-graph: child `:SUBTAG_OF` parent.
+const SUBTAG_EDGE_TYPE: &str = "SUBTAG_OF";
 /// Rows (nodes + edges) between in-loop commits. Picked to match the parquet
 /// loader's order of magnitude; vaults are small so most loads commit once.
 const DEFAULT_COMMIT_EVERY: usize = 1000;
@@ -112,6 +117,10 @@ pub struct VaultLoadOutcome {
     pub tags_pruned: usize,
     /// Stale `:TAGGED` edges tombstoned (prune only).
     pub tag_links_pruned: usize,
+    /// `:SUBTAG_OF` edges upserted (nested tag -> immediate parent).
+    pub subtag_edges: usize,
+    /// Stale `:SUBTAG_OF` edges tombstoned (prune only).
+    pub subtag_edges_pruned: usize,
     /// Placeholder stub nodes upserted for unresolved targets (only non-zero
     /// when [`LoadOptions::placeholders`] is set).
     pub placeholders_created: usize,
@@ -229,13 +238,19 @@ async fn load_graph_inner(
 
     // Resolve tags: one shared `:Tag` node per distinct tag name (the union
     // across notes), and a `:TAGGED` edge from each note to each of its tags.
+    // A nested tag (`area/db`) also materializes its ancestor `:Tag` nodes and
+    // a child-to-parent `:SUBTAG_OF` edge per level, so the tag tree is a real
+    // sub-graph. The note stays `:TAGGED` to the leaf it wrote, not the
+    // ancestors, so `tags_of` reflects what the author typed.
     let mut desired_tags: BTreeMap<NodeId, String> = BTreeMap::new();
     let mut desired_tagged: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut desired_subtags: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
     for note in &graph.notes {
         for tag in &note.tags {
             let tag_id = tag_node_id(tag);
             desired_tags.entry(tag_id).or_insert_with(|| tag.clone());
             desired_tagged.push((note.id, tag_id));
+            register_tag_hierarchy(tag, &mut desired_tags, &mut desired_subtags);
         }
     }
 
@@ -263,17 +278,20 @@ async fn load_graph_inner(
         let desired_tag_set: HashSet<NodeId> = desired_tags.keys().copied().collect();
         let desired_tagged_set: HashSet<(NodeId, NodeId)> =
             desired_tagged.iter().copied().collect();
+        let desired_subtag_set: HashSet<(NodeId, NodeId)> =
+            desired_subtags.iter().copied().collect();
 
         type IdVec = Vec<NodeId>;
         type PairVec = Vec<(NodeId, NodeId)>;
         #[allow(clippy::type_complexity)]
-        let (existing_nodes, existing_edges, existing_embeds, existing_tags, existing_tagged): (
-            IdVec,
-            PairVec,
-            PairVec,
-            IdVec,
-            PairVec,
-        ) = {
+        let (
+            existing_nodes,
+            existing_edges,
+            existing_embeds,
+            existing_tags,
+            existing_tagged,
+            existing_subtags,
+        ): (IdVec, PairVec, PairVec, IdVec, PairVec, PairVec) = {
             let snap = writer.snapshot();
             // Only the ids are needed for the deletion diff, so project a
             // single column rather than materializing note bodies.
@@ -301,12 +319,17 @@ async fn load_graph_inner(
                 .scan_edge_type(TAG_EDGE_TYPE)
                 .await
                 .map_err(|e| anyhow::anyhow!("scan {TAG_EDGE_TYPE} edges: {e}"))?;
+            let subtags = snap
+                .scan_edge_type(SUBTAG_EDGE_TYPE)
+                .await
+                .map_err(|e| anyhow::anyhow!("scan {SUBTAG_EDGE_TYPE} edges: {e}"))?;
             (
                 nodes.iter().map(|n| n.id).collect(),
                 edges.iter().map(|e| (e.src, e.dst)).collect(),
                 embeds.iter().map(|e| (e.src, e.dst)).collect(),
                 tags.iter().map(|n| n.id).collect(),
                 tagged.iter().map(|e| (e.src, e.dst)).collect(),
+                subtags.iter().map(|e| (e.src, e.dst)).collect(),
             )
         };
 
@@ -346,6 +369,14 @@ async fn load_graph_inner(
             if !desired_tagged_set.contains(&(src, dst)) {
                 writer.tombstone_edge(TAG_EDGE_TYPE, src, dst)?;
                 outcome.tag_links_pruned += 1;
+                rows_since_commit += 1;
+                maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+            }
+        }
+        for (src, dst) in existing_subtags {
+            if !desired_subtag_set.contains(&(src, dst)) {
+                writer.tombstone_edge(SUBTAG_EDGE_TYPE, src, dst)?;
+                outcome.subtag_edges_pruned += 1;
                 rows_since_commit += 1;
                 maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
             }
@@ -434,6 +465,13 @@ async fn load_graph_inner(
     }
     outcome.tag_links = desired_tagged.len();
 
+    for (child, parent) in &desired_subtags {
+        writer.upsert_edge(SUBTAG_EDGE_TYPE, *child, *parent, &edge_record)?;
+        rows_since_commit += 1;
+        maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+    }
+    outcome.subtag_edges = desired_subtags.len();
+
     Ok(outcome)
 }
 
@@ -486,6 +524,32 @@ fn note_hash(note: &ParsedNote) -> Option<&str> {
 /// cannot contain NUL).
 fn tag_node_id(tag: &str) -> NodeId {
     stable_node_id(&format!("\u{0}tag\u{0}{tag}"))
+}
+
+/// Register the ancestor tag nodes and child-to-parent `:SUBTAG_OF` edges of a
+/// nested tag. For `area/db/x` this adds nodes `area/db` and `area` and edges
+/// `area/db/x -> area/db` and `area/db -> area`. The leaf node itself is added
+/// by the caller. A non-nested tag (no `/`) contributes nothing.
+fn register_tag_hierarchy(
+    tag: &str,
+    desired_tags: &mut BTreeMap<NodeId, String>,
+    desired_subtags: &mut BTreeSet<(NodeId, NodeId)>,
+) {
+    let mut child = tag;
+    while let Some(slash) = child.rfind('/') {
+        let parent = &child[..slash];
+        // A leading/empty segment (e.g. `/x` or `a//b`) is not a real parent.
+        if parent.is_empty() {
+            break;
+        }
+        let child_id = tag_node_id(child);
+        let parent_id = tag_node_id(parent);
+        desired_tags
+            .entry(parent_id)
+            .or_insert_with(|| parent.to_string());
+        desired_subtags.insert((child_id, parent_id));
+        child = parent;
+    }
 }
 
 /// The last-loaded state for an incremental sync: each real note's stored
@@ -818,6 +882,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_tags_build_a_subtag_hierarchy() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "uses #area/db/x and #area/web\n");
+
+        let mut writer = open("vault-nested-tags").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Distinct tags: the two leaves plus ancestors area/db and area.
+        assert_eq!(out.tags_loaded, 4, "area/db/x, area/web, area/db, area");
+        // area/db/x->area/db, area/db->area, area/web->area.
+        assert_eq!(out.subtag_edges, 3);
+
+        let snap = writer.snapshot();
+        // area has two direct children (incoming SUBTAG_OF).
+        assert_eq!(
+            snap.in_edges("SUBTAG_OF", tag_node_id("area"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            2,
+            "area/db and area/web point at area"
+        );
+        // The note is TAGGED to the leaves it wrote, never the synthetic
+        // ancestors.
+        assert_eq!(
+            snap.in_edges("TAGGED", tag_node_id("area"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            0,
+            "no direct TAGGED to the ancestor area"
+        );
+        assert_eq!(
+            snap.in_edges("TAGGED", tag_node_id("area/db/x"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            1,
+            "A tagged the leaf area/db/x"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_reconciles_the_subtag_hierarchy() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "#area/db and #area/web\n");
+
+        let mut writer = open("vault-nested-prune").await;
+        load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Drop area/web; reload with prune. `area` stays (area/db still uses
+        // it), but area/web and its SUBTAG_OF edge go.
+        write(dir, "A.md", "#area/db only\n");
+        let opts = LoadOptions {
+            prune: true,
+            ..Default::default()
+        };
+        let out = load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.subtag_edges_pruned, 1, "area/web->area removed");
+        let snap = writer.snapshot();
+        assert!(
+            snap.lookup_node("Tag", tag_node_id("area/web"))
+                .await
+                .unwrap()
+                .is_none(),
+            "area/web tag node gone"
+        );
+        assert!(
+            snap.lookup_node("Tag", tag_node_id("area"))
+                .await
+                .unwrap()
+                .is_some(),
+            "area kept, area/db still uses it"
+        );
+        assert_eq!(
+            snap.in_edges("SUBTAG_OF", tag_node_id("area"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            1,
+            "only area/db->area remains"
+        );
+    }
+
+    #[tokio::test]
     async fn embeds_use_a_distinct_edge_type() {
         let vault = TempDir::new().unwrap();
         let dir = vault.path();
@@ -1118,7 +1281,7 @@ mod tests {
         write(
             dir,
             "A.md",
-            "---\ntags: [proj]\n---\nlinks [[B]] embeds ![[C]] and [[Missing]]\n",
+            "---\ntags: [proj]\n---\nlinks [[B]] embeds ![[C]] and [[Missing]] #area/db\n",
         );
         write(dir, "B.md", "beta #shared\n");
         write(dir, "C.md", "gamma #shared\n");
@@ -1140,7 +1303,7 @@ mod tests {
         write(
             dir,
             "A.md",
-            "---\ntags: [proj, more]\n---\nlinks [[E]] embeds ![[B]]\n",
+            "---\ntags: [proj, more]\n---\nlinks [[E]] embeds ![[B]] #area/web\n",
         );
         write(dir, "C.md", "gamma #renamed\n");
         std::fs::remove_file(dir.join("D.md")).unwrap();
@@ -1175,7 +1338,7 @@ mod tests {
                 "{label} nodes diverge (placeholders={placeholders})"
             );
         }
-        for edge_type in ["LINKS_TO", "EMBEDS", "TAGGED"] {
+        for edge_type in ["LINKS_TO", "EMBEDS", "TAGGED", "SUBTAG_OF"] {
             assert_eq!(
                 canon_edges(&synced, edge_type).await,
                 canon_edges(&fresh, edge_type).await,

@@ -264,6 +264,9 @@ async fn load_vault_cmd(
     println!("name collisions : {}", outcome.name_collisions);
     println!("tags loaded     : {}", outcome.tags_loaded);
     println!("tag links       : {}", outcome.tag_links);
+    if outcome.subtag_edges > 0 {
+        println!("subtag edges    : {}", outcome.subtag_edges);
+    }
     if placeholders {
         println!("placeholders    : {}", outcome.placeholders_created);
     }
@@ -273,6 +276,7 @@ async fn load_vault_cmd(
         println!("embeds pruned   : {}", outcome.embeds_pruned);
         println!("tags pruned     : {}", outcome.tags_pruned);
         println!("tag links pruned: {}", outcome.tag_links_pruned);
+        println!("subtag pruned   : {}", outcome.subtag_edges_pruned);
     }
     println!("{}", "─".repeat(48));
     if store_uri.is_none() {

@@ -384,8 +384,8 @@ impl Client {
     /// Returns a dict with `notes_loaded`, `links_resolved`, `links_dangling`,
     /// `embeds_resolved`, `embeds_dangling`, `name_collisions`, `notes_pruned`,
     /// `links_pruned`, `embeds_pruned`, `tags_loaded`, `tag_links`,
-    /// `tags_pruned`, `tag_links_pruned`, `placeholders_created` and
-    /// `commit_batches`.
+    /// `tags_pruned`, `tag_links_pruned`, `subtag_edges`,
+    /// `subtag_edges_pruned`, `placeholders_created` and `commit_batches`.
     #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false, placeholders=false))]
     fn load_vault(
         &self,
@@ -430,6 +430,8 @@ impl Client {
         d.set_item("tag_links", outcome.tag_links)?;
         d.set_item("tags_pruned", outcome.tags_pruned)?;
         d.set_item("tag_links_pruned", outcome.tag_links_pruned)?;
+        d.set_item("subtag_edges", outcome.subtag_edges)?;
+        d.set_item("subtag_edges_pruned", outcome.subtag_edges_pruned)?;
         d.set_item("commit_batches", outcome.commit_batches)?;
         Ok(d.into())
     }
