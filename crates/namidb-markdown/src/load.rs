@@ -841,7 +841,11 @@ mod tests {
         let vault = TempDir::new().unwrap();
         let dir = vault.path();
         // Target is known by two aliases; Source links both.
-        write(dir, "Target.md", "---\naliases: [\"Foo\", \"Bar\"]\n---\nt\n");
+        write(
+            dir,
+            "Target.md",
+            "---\naliases: [\"Foo\", \"Bar\"]\n---\nt\n",
+        );
         write(dir, "Source.md", "see [[Foo]] and [[Bar]]\n");
 
         let mut writer = open("vault-alias-fanin").await;
