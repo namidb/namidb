@@ -43,15 +43,15 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::id::{normalize_key, stable_node_id};
 
-/// The loader's own normalized resolution key, dropped from frontmatter so an
-/// author cannot override it (it is set below from the file stem). The
-/// engine-reserved names (`node_id`/`tombstone`/`lsn` and the `__`/`prop_`
-/// prefixes) are dropped separately via [`is_reserved_property_name`] so this
-/// crate cannot drift from the engine's reserved set. Both are dropped here
-/// because nothing on the write path re-validates property names, so an
-/// injected reserved key would otherwise be stored verbatim and shadow an
-/// engine-managed column.
-const RESERVED_KEY: &str = "key";
+/// The loader's own engine-owned property names, dropped from frontmatter so
+/// an author cannot override them (they are set below: `key` from the file
+/// stem, `content_hash` from the raw bytes). The engine-reserved names
+/// (`node_id`/`tombstone`/`lsn` and the `__`/`prop_` prefixes) are dropped
+/// separately via [`is_reserved_property_name`] so this crate cannot drift
+/// from the engine's reserved set. All are dropped here because nothing on the
+/// write path re-validates property names, so an injected reserved key would
+/// otherwise be stored verbatim and shadow an engine-managed value.
+const RESERVED_KEYS: [&str; 2] = ["key", "content_hash"];
 
 /// One note, parsed and ready to ingest.
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +156,15 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     properties.insert("path".to_string(), Value::Str(rel_path.to_string()));
     properties.insert("body".to_string(), Value::Str(body.to_string()));
     properties.insert("key".to_string(), Value::Str(key.clone()));
+    // Content hash of the raw file bytes (frontmatter + body), so an
+    // incremental sync can tell a changed note from an unchanged one by
+    // comparing this against the stored value without re-parsing. Hash the raw
+    // input rather than just `body` so a frontmatter-only edit (a tag or link
+    // change) still registers as a change.
+    properties.insert(
+        "content_hash".to_string(),
+        Value::Str(blake3::hash(raw.as_bytes()).to_hex().to_string()),
+    );
 
     // Fold inline `#tags` into the `tags` property. Only acts when there are
     // inline tags, and never clobbers a frontmatter `tags` value that is not a
@@ -293,7 +302,7 @@ fn frontmatter_to_props(yaml: &str) -> BTreeMap<String, Value> {
     if let Some(Yaml::Hash(hash)) = docs.first() {
         for (k, v) in hash.iter() {
             let Some(key) = k.as_str() else { continue };
-            if key == RESERVED_KEY || is_reserved_property_name(key) {
+            if RESERVED_KEYS.contains(&key) || is_reserved_property_name(key) {
                 continue;
             }
             if let Some(value) = yaml_to_value(v) {
@@ -678,6 +687,38 @@ mod tests {
         assert_eq!(
             note.properties.get("role"),
             Some(&Value::Str("founder".into()))
+        );
+    }
+
+    #[test]
+    fn content_hash_tracks_raw_bytes_and_is_engine_owned() {
+        // Identical bytes hash identically; the hash is stored for sync.
+        let a = parse_note("N.md", "---\ntags: [x]\n---\nbody\n");
+        let b = parse_note("N.md", "---\ntags: [x]\n---\nbody\n");
+        assert!(
+            matches!(a.properties.get("content_hash"), Some(Value::Str(_))),
+            "content_hash is stored"
+        );
+        assert_eq!(
+            a.properties.get("content_hash"),
+            b.properties.get("content_hash")
+        );
+
+        // A frontmatter-only edit (tag change, body identical) changes the
+        // hash, since we hash the raw bytes and not just the body.
+        let c = parse_note("N.md", "---\ntags: [y]\n---\nbody\n");
+        assert_ne!(
+            a.properties.get("content_hash"),
+            c.properties.get("content_hash"),
+            "a frontmatter edit changes the content hash"
+        );
+
+        // An author cannot inject content_hash via frontmatter.
+        let injected = parse_note("N.md", "---\ncontent_hash: deadbeef\n---\nbody\n");
+        assert_ne!(
+            injected.properties.get("content_hash"),
+            Some(&Value::Str("deadbeef".into())),
+            "frontmatter content_hash is dropped"
         );
     }
 
