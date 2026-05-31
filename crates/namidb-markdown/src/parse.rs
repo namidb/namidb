@@ -22,7 +22,9 @@
 //! - Same-note refs (`[[#heading]]`) carry no target.
 //! - Links inside fenced or inline code are excluded.
 //! - Frontmatter is parsed as YAML; malformed frontmatter yields no
-//!   properties rather than failing the note.
+//!   properties rather than failing the note. A duplicate top-level key (which
+//!   YAML rejects outright) is recovered last-wins instead of dropping every
+//!   key with it.
 //! - Inline `#tags` and a frontmatter `tags` list are merged into one
 //!   deduplicated `tags` property (nested tags `#area/topic` kept; `#123` with
 //!   no letters is not a tag). Tags are a property, not yet `:Tag` nodes.
@@ -273,6 +275,18 @@ pub fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
 fn frontmatter_to_props(yaml: &str) -> BTreeMap<String, Value> {
     let docs = match YamlLoader::load_from_str(yaml) {
         Ok(docs) => docs,
+        // A duplicate top-level key makes yaml_rust2 reject the WHOLE document,
+        // which would silently drop every other (valid) key with it. Recover
+        // the common authoring slip (e.g. two `tags:`) by keeping the last
+        // value for each duplicated top-level key and re-parsing once, the way
+        // editors like Obsidian resolve duplicate properties. Any other
+        // malformed YAML still yields no properties, as documented.
+        Err(e) if e.to_string().contains("duplicated key") => {
+            match YamlLoader::load_from_str(&dedup_top_level_keys(yaml)) {
+                Ok(docs) => docs,
+                Err(_) => return BTreeMap::new(),
+            }
+        }
         Err(_) => return BTreeMap::new(),
     };
     let mut props = BTreeMap::new();
@@ -288,6 +302,64 @@ fn frontmatter_to_props(yaml: &str) -> BTreeMap<String, Value> {
         }
     }
     props
+}
+
+/// Best-effort recovery for frontmatter rejected because a top-level key is
+/// duplicated. Splits the document into top-level entries (a column-0 `key:`
+/// line plus its indented continuation lines) and keeps only the LAST entry
+/// for each key, preserving order otherwise. Only the top level is considered;
+/// nested duplicates and exotic (quoted/complex) keys are left to the strict
+/// re-parse, which drops to no properties if it still fails, so this never
+/// makes a note that already parsed worse.
+fn dedup_top_level_keys(yaml: &str) -> String {
+    // Group lines: a new group begins at each top-level `key:` line; every
+    // other line (indented, blank, comment, list item) attaches to the
+    // current group.
+    let mut groups: Vec<(Option<String>, String)> = Vec::new();
+    for line in yaml.split_inclusive('\n') {
+        match top_level_key(line) {
+            Some(key) => groups.push((Some(key), line.to_string())),
+            None => match groups.last_mut() {
+                Some(group) => group.1.push_str(line),
+                None => groups.push((None, line.to_string())),
+            },
+        }
+    }
+    // Index of the last group carrying each key; earlier duplicates are dropped.
+    let mut last: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, (key, _)) in groups.iter().enumerate() {
+        if let Some(k) = key {
+            last.insert(k.as_str(), i);
+        }
+    }
+    let mut out = String::with_capacity(yaml.len());
+    for (i, (key, text)) in groups.iter().enumerate() {
+        let earlier_dup = key.as_deref().is_some_and(|k| last.get(k) != Some(&i));
+        if !earlier_dup {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// The simple key of a top-level `key: ...` line (column 0, unquoted), or
+/// `None` if the line is not a top-level mapping entry (indented, blank, a
+/// comment, a list item, or with no `key:` separator). `:` only counts as a
+/// separator when it ends the line or is followed by whitespace, so a scalar
+/// like `https://x` is not mistaken for a key.
+fn top_level_key(line: &str) -> Option<String> {
+    let first = line.chars().next()?;
+    if first.is_whitespace() || first == '#' || first == '-' {
+        return None;
+    }
+    let content = line.trim_end_matches(['\n', '\r']);
+    let colon = content.find(':')?;
+    let after = &content[colon + 1..];
+    if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let key = content[..colon].trim();
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 fn yaml_to_value(y: &Yaml) -> Option<Value> {
@@ -642,6 +714,55 @@ mod tests {
         assert_eq!(
             note.properties.get("body"),
             Some(&Value::Str("body\n".into()))
+        );
+        // Genuinely broken YAML (not a duplicate key) still drops to no
+        // user properties, so the recovery path stays scoped.
+        assert!(!note.properties.contains_key("role"));
+    }
+
+    #[test]
+    fn duplicate_top_level_key_recovers_last_wins_not_total_loss() {
+        // A doubled `tags:` makes yaml_rust2 reject the whole document; without
+        // recovery `title` and `role` would vanish too. Recovery keeps the last
+        // `tags` (flow style here) and preserves the sibling keys.
+        let note = parse_note(
+            "N.md",
+            "---\ntitle: Kept\nrole: founder\ntags: [a]\ntags: [b, c]\n---\nbody\n",
+        );
+        assert_eq!(
+            note.properties.get("title"),
+            Some(&Value::Str("Kept".into()))
+        );
+        assert_eq!(
+            note.properties.get("role"),
+            Some(&Value::Str("founder".into()))
+        );
+        assert_eq!(
+            note.properties.get("tags"),
+            Some(&Value::List(vec![
+                Value::Str("b".into()),
+                Value::Str("c".into())
+            ])),
+            "last duplicate wins"
+        );
+    }
+
+    #[test]
+    fn duplicate_top_level_key_recovers_block_style_value() {
+        // The block (indented list) form is the common Obsidian style: the
+        // grouping must attach the indented items to their key and still drop
+        // the earlier duplicate.
+        let note = parse_note(
+            "N.md",
+            "---\ntags:\n  - a\nrole: x\ntags:\n  - b\n  - c\n---\nbody\n",
+        );
+        assert_eq!(note.properties.get("role"), Some(&Value::Str("x".into())));
+        assert_eq!(
+            note.properties.get("tags"),
+            Some(&Value::List(vec![
+                Value::Str("b".into()),
+                Value::Str("c".into())
+            ]))
         );
     }
 
