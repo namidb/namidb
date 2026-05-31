@@ -5,8 +5,9 @@
 //! instead of grepping flat files. Pointed at a namespace where a markdown
 //! vault was loaded (see `namidb-markdown` / `namidb load-vault`), it exposes
 //! read-only tools: list/get notes, backlinks, neighbors, orphans, full-text
-//! substring search, tag tools (list tags, notes by tag, tags of a note), and
-//! an escape-hatch read-only `cypher` tool.
+//! substring search, tag tools (list tags, notes by tag including nested
+//! children, tags of a note, subtags of a tag), and an escape-hatch read-only
+//! `cypher` tool.
 //!
 //! This is the single-user local server. Multi-tenant hosting belongs in the
 //! cloud layer and must be weighed against the license's anti-DBaaS grant.
@@ -303,10 +304,33 @@ impl Server {
                 // Tags are stored without the leading '#'; accept it either way.
                 let tag = raw.strip_prefix('#').unwrap_or(&raw).to_string();
                 let mut p = Params::new();
+                p.insert(
+                    "prefix".to_string(),
+                    RuntimeValue::String(format!("{tag}/")),
+                );
                 p.insert("tag".to_string(), RuntimeValue::String(tag));
                 (
-                    "MATCH (n:Note)-[:TAGGED]->(t:Tag) WHERE t.name = $tag \
-                     RETURN n.title AS title, n.path AS path ORDER BY n.title"
+                    // The tag itself plus anything nested under it: `area` also
+                    // returns notes tagged `area/db`, matched by name prefix.
+                    // DISTINCT because a note tagged both `area` and `area/db`
+                    // would otherwise be listed twice.
+                    "MATCH (n:Note)-[:TAGGED]->(t:Tag) \
+                     WHERE t.name = $tag OR t.name STARTS WITH $prefix \
+                     RETURN DISTINCT n.title AS title, n.path AS path ORDER BY n.title"
+                        .to_string(),
+                    p,
+                )
+            }
+            "subtags" => {
+                let raw = str_arg(args, "tag")?;
+                let tag = raw.strip_prefix('#').unwrap_or(&raw).to_string();
+                let mut p = Params::new();
+                p.insert("tag".to_string(), RuntimeValue::String(tag));
+                (
+                    // Immediate child tags of the given tag (incoming
+                    // `:SUBTAG_OF`), so an agent can walk the tag tree.
+                    "MATCH (child:Tag)-[:SUBTAG_OF]->(t:Tag) WHERE t.name = $tag \
+                     RETURN child.name AS tag ORDER BY child.name"
                         .to_string(),
                     p,
                 )
@@ -521,10 +545,19 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "notes_by_tag",
-            "description": "Notes carrying the given tag (incoming `:TAGGED` edges). Tag names are matched exactly (case-sensitive).",
+            "description": "Notes carrying the given tag or any tag nested under it, so `area` also returns notes tagged `area/db`. Tag names are case-sensitive.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "tag": { "type": "string", "description": "Exact tag name (without '#')" } },
+                "properties": { "tag": { "type": "string", "description": "Tag name (without '#'); matches the tag and its nested children" } },
+                "required": ["tag"],
+            },
+        }),
+        json!({
+            "name": "subtags",
+            "description": "Immediate child tags of the given tag in the nested-tag tree (incoming `:SUBTAG_OF` edges), e.g. `area` -> `area/db`, `area/web`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "tag": { "type": "string", "description": "Parent tag name (without '#')" } },
                 "required": ["tag"],
             },
         }),
@@ -539,7 +572,7 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "cypher",
-            "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:EMBEDS`/`:TAGGED`). Write queries are rejected.",
+            "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:EMBEDS`/`:TAGGED`/`:SUBTAG_OF`). Write queries are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "query": { "type": "string", "description": "A read-only Cypher query" } },
@@ -647,7 +680,7 @@ mod tests {
         let init = server.dispatch("initialize", &Value::Null).await.unwrap();
         assert_eq!(init["protocolVersion"], json!(PROTOCOL_VERSION));
         let list = server.dispatch("tools/list", &Value::Null).await.unwrap();
-        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 11);
     }
 
     #[tokio::test]
@@ -687,6 +720,40 @@ mod tests {
             .filter_map(|r| r["tag"].as_str().map(str::to_string))
             .collect();
         assert_eq!(a_tags, vec!["db", "rust"], "A's tags, sorted");
+    }
+
+    #[tokio::test]
+    async fn nested_tags_query_by_parent_and_list_subtags() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "#area/db inline\n");
+        write(dir.path(), "B.md", "#area/web inline\n");
+        write(dir.path(), "C.md", "#area directly\n");
+        write(dir.path(), "D.md", "#other unrelated\n");
+        let server = Server::open("memory://mcp-nested-tags").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        // notes_by_tag("area") returns the note tagged #area directly plus the
+        // ones tagged the nested #area/db and #area/web, but not #other.
+        let by_area = call(&server, "notes_by_tag", json!({ "tag": "area" })).await;
+        let mut titles: Vec<&str> = by_area
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["A", "B", "C"], "direct + nested, not #other");
+
+        // subtags("area") lists the immediate children of the tag tree.
+        let subs = call(&server, "subtags", json!({ "tag": "area" })).await;
+        let mut names: Vec<&str> = subs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["tag"].as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["area/db", "area/web"]);
     }
 
     #[tokio::test]
