@@ -39,7 +39,10 @@ MATCH (:Note {path: $path})-[:TAGGED]->(:Tag)<-[:TAGGED]-(o:Note) RETURN DISTINC
 This is a deliberate v1 subset, not a faithful Obsidian clone. It covers
 wikilink variants (`[[a]]`, `[[a|alias]]`, `[[a#heading]]`, `[[a^block]]`,
 `[[dir/a]]`), embeds (`![[a]]`), markdown links to local `.md`/`.markdown`
-files, inline and frontmatter `#tags`, and code-fence exclusion. It does not
-model heading/block anchors as separate targets, placeholder nodes for dangling
-links, or write-back to `.md`. Names resolve by normalized basename, so
-`[[User Role]]`, `[[user-role]]` and `user_role.md` collapse to one note.
+files, inline and frontmatter `#tags`, and code-fence exclusion. Dangling
+references can optionally become placeholder stub nodes (`LoadOptions::placeholders`
+/ `--placeholders` / `placeholders=True`), marked `placeholder: true`; querying
+`MATCH (n:Note) WHERE n.placeholder = true` lists unresolved references. It does
+not model heading/block anchors as separate targets or write-back to `.md`.
+Names resolve by normalized basename, so `[[User Role]]`, `[[user-role]]` and
+`user_role.md` collapse to one note.

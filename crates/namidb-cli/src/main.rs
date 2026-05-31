@@ -117,6 +117,10 @@ enum Cmd {
         /// faithful index instead of accumulating stale nodes and edges.
         #[arg(long, default_value_t = false)]
         prune: bool,
+        /// Create stub `:Note` nodes for links/embeds whose target does not
+        /// exist, so unresolved references show up in the graph.
+        #[arg(long, default_value_t = false)]
+        placeholders: bool,
         /// Path to the vault directory.
         path: String,
     },
@@ -181,6 +185,7 @@ fn main() -> anyhow::Result<()> {
             label,
             edge_type,
             prune,
+            placeholders,
             path,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -192,6 +197,7 @@ fn main() -> anyhow::Result<()> {
                 &label,
                 &edge_type,
                 prune,
+                placeholders,
                 &path,
             ))?;
         }
@@ -199,12 +205,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_vault_cmd(
     store_uri: Option<&str>,
     namespace: &str,
     label: &str,
     edge_type: &str,
     prune: bool,
+    placeholders: bool,
     path: &str,
 ) -> anyhow::Result<()> {
     let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
@@ -223,6 +231,7 @@ async fn load_vault_cmd(
         label: label.to_string(),
         edge_type: edge_type.to_string(),
         prune,
+        placeholders,
         ..Default::default()
     };
     let outcome = load_vault(std::path::Path::new(path), &mut writer, &opts).await?;
@@ -238,6 +247,9 @@ async fn load_vault_cmd(
     println!("name collisions : {}", outcome.name_collisions);
     println!("tags loaded     : {}", outcome.tags_loaded);
     println!("tag links       : {}", outcome.tag_links);
+    if placeholders {
+        println!("placeholders    : {}", outcome.placeholders_created);
+    }
     if prune {
         println!("notes pruned    : {}", outcome.notes_pruned);
         println!("links pruned    : {}", outcome.links_pruned);

@@ -43,6 +43,15 @@ below and in the release notes.
   references (an embedder is a backlink, an embed-only note is not an orphan).
   The load outcome gains `embeds_resolved`, `embeds_dangling` and
   `embeds_pruned`, surfaced in the CLI and Python client.
+- **Placeholder nodes for unresolved references (opt-in).** With
+  `--placeholders` (CLI) / `placeholders=True` (Python) /
+  `LoadOptions::placeholders`, a link or embed whose target has no real note
+  gets a stub `:Note` (`placeholder: true`, no `path`/`body`) and a real edge,
+  so unresolved references show in the graph like Obsidian. The stub's id is
+  the one the real note would have, so creating that note later upserts over
+  the stub. Prune keeps stubs that are still referenced and tombstones the
+  rest. The load outcome gains `placeholders_created`. Default off, so existing
+  behavior (count dangling, no node) is unchanged.
 
 ### Changed
 

@@ -377,13 +377,16 @@ impl Client {
     /// faithful index. The default (`prune=False`) is additive.
     ///
     /// Each note's string tags also become shared `:Tag` nodes linked by
-    /// `:TAGGED` edges, so tag traversals run on the graph.
+    /// `:TAGGED` edges, so tag traversals run on the graph. With
+    /// `placeholders=True`, links/embeds whose target has no real note get a
+    /// stub `:Note` (`placeholder: true`) so unresolved references show up.
     ///
     /// Returns a dict with `notes_loaded`, `links_resolved`, `links_dangling`,
     /// `embeds_resolved`, `embeds_dangling`, `name_collisions`, `notes_pruned`,
     /// `links_pruned`, `embeds_pruned`, `tags_loaded`, `tag_links`,
-    /// `tags_pruned`, `tag_links_pruned` and `commit_batches`.
-    #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false))]
+    /// `tags_pruned`, `tag_links_pruned`, `placeholders_created` and
+    /// `commit_batches`.
+    #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false, placeholders=false))]
     fn load_vault(
         &self,
         py: Python<'_>,
@@ -392,12 +395,14 @@ impl Client {
         edge_type: &str,
         commit_every: usize,
         prune: bool,
+        placeholders: bool,
     ) -> PyResult<Py<PyDict>> {
         let opts = namidb_markdown::LoadOptions {
             label: label.to_string(),
             edge_type: edge_type.to_string(),
             commit_every,
             prune,
+            placeholders,
         };
         let dir = std::path::PathBuf::from(path);
         let session = self.session.clone();
@@ -420,6 +425,7 @@ impl Client {
         d.set_item("notes_pruned", outcome.notes_pruned)?;
         d.set_item("links_pruned", outcome.links_pruned)?;
         d.set_item("embeds_pruned", outcome.embeds_pruned)?;
+        d.set_item("placeholders_created", outcome.placeholders_created)?;
         d.set_item("tags_loaded", outcome.tags_loaded)?;
         d.set_item("tag_links", outcome.tag_links)?;
         d.set_item("tags_pruned", outcome.tags_pruned)?;

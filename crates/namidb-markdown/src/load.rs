@@ -2,9 +2,11 @@
 //!
 //! Each note becomes a node (default label `Note`); each resolved link becomes
 //! a `LINKS_TO` edge and each resolved embed (`![[X]]`) a distinct `EMBEDS`
-//! edge. Dangling targets (no matching note) are counted but produce no edge,
-//! so every edge endpoint is a real note and queries like "orphan notes" or
-//! "backlinks" stay clean.
+//! edge. Dangling targets (no matching note) are counted and, by default,
+//! produce no edge so every edge endpoint is a real note. With
+//! [`LoadOptions::placeholders`] a dangling target instead gets a stub `:Note`
+//! node (`placeholder: true`, no `path`/`body`) and a real edge to it, so
+//! unresolved references appear in the graph like Obsidian's graph view.
 //!
 //! Each distinct string tag on a note becomes a shared `:Tag` node (one per
 //! tag name), linked from the note by a `:TAGGED` edge, so tag-traversal
@@ -59,6 +61,10 @@ pub struct LoadOptions {
     /// (default) keeps the load additive. Pruning only touches those
     /// labels/types, so unrelated data in the namespace is left alone.
     pub prune: bool,
+    /// Create stub `:Note` nodes (marked `placeholder: true`) for links/embeds
+    /// whose target has no real note, so unresolved references show up in the
+    /// graph like Obsidian's graph view. `false` (default) just counts them.
+    pub placeholders: bool,
 }
 
 impl Default for LoadOptions {
@@ -68,6 +74,7 @@ impl Default for LoadOptions {
             edge_type: DEFAULT_EDGE_TYPE.to_string(),
             commit_every: DEFAULT_COMMIT_EVERY,
             prune: false,
+            placeholders: false,
         }
     }
 }
@@ -105,6 +112,9 @@ pub struct VaultLoadOutcome {
     pub tags_pruned: usize,
     /// Stale `:TAGGED` edges tombstoned (prune only).
     pub tag_links_pruned: usize,
+    /// Placeholder stub nodes upserted for unresolved targets (only non-zero
+    /// when [`LoadOptions::placeholders`] is set).
+    pub placeholders_created: usize,
     /// `commit_batch` calls fired during the load (excludes the caller's
     /// final flush).
     pub commit_batches: usize,
@@ -139,24 +149,42 @@ pub async fn load_graph(
     }
 
     // Resolve links and embeds once: the edge lists the vault wants, plus
-    // counts of targets that point nowhere.
+    // counts of targets that point nowhere. With `placeholders`, a dangling
+    // target also gets a stub `:Note` node (keyed the same as the real note
+    // would be, so creating that note later just upserts over the stub) and a
+    // real edge to it, so the graph shows unresolved references like Obsidian.
     let mut desired_edges: Vec<(NodeId, NodeId)> = Vec::new();
     let mut desired_embed_edges: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut desired_placeholders: BTreeMap<NodeId, String> = BTreeMap::new();
     let mut dangling = 0usize;
     let mut embeds_dangling = 0usize;
     for note in &graph.notes {
         for target in &note.links {
+            let tid = stable_node_id(target);
             if known.contains(target.as_str()) {
-                desired_edges.push((note.id, stable_node_id(target)));
+                desired_edges.push((note.id, tid));
             } else {
                 dangling += 1;
+                if opts.placeholders {
+                    desired_edges.push((note.id, tid));
+                    desired_placeholders
+                        .entry(tid)
+                        .or_insert_with(|| target.clone());
+                }
             }
         }
         for target in &note.embeds {
+            let tid = stable_node_id(target);
             if known.contains(target.as_str()) {
-                desired_embed_edges.push((note.id, stable_node_id(target)));
+                desired_embed_edges.push((note.id, tid));
             } else {
                 embeds_dangling += 1;
+                if opts.placeholders {
+                    desired_embed_edges.push((note.id, tid));
+                    desired_placeholders
+                        .entry(tid)
+                        .or_insert_with(|| target.clone());
+                }
             }
         }
     }
@@ -184,7 +212,13 @@ pub async fn load_graph(
     // Reconcile deletions first, against the last committed state (nothing
     // from this load is pending yet, so the snapshot is accurate).
     if opts.prune {
-        let desired_nodes: HashSet<NodeId> = graph.notes.iter().map(|n| n.id).collect();
+        // Real notes plus any placeholder stubs still referenced this load.
+        let desired_nodes: HashSet<NodeId> = graph
+            .notes
+            .iter()
+            .map(|n| n.id)
+            .chain(desired_placeholders.keys().copied())
+            .collect();
         let desired_edge_set: HashSet<(NodeId, NodeId)> = desired_edges.iter().copied().collect();
         let desired_embed_set: HashSet<(NodeId, NodeId)> =
             desired_embed_edges.iter().copied().collect();
@@ -286,20 +320,45 @@ pub async fn load_graph(
         maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
     }
 
+    // Stub `:Note` nodes for unresolved targets (only when `placeholders` is
+    // on). Marked `placeholder: true` and without `path`/`body`; creating the
+    // real note later upserts over the stub (same label + id).
+    for (id, name) in &desired_placeholders {
+        let mut props = BTreeMap::new();
+        props.insert("key".to_string(), Value::Str(name.clone()));
+        props.insert("title".to_string(), Value::Str(name.clone()));
+        props.insert("placeholder".to_string(), Value::Bool(true));
+        let record = NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+        };
+        writer.upsert_node(opts.label.clone(), *id, &record)?;
+        outcome.placeholders_created += 1;
+        rows_since_commit += 1;
+        maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+    }
+
     let edge_record = EdgeWriteRecord::default();
     for (src, dst) in &desired_edges {
         writer.upsert_edge(opts.edge_type.clone(), *src, *dst, &edge_record)?;
         rows_since_commit += 1;
         maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
     }
-    outcome.links_resolved = desired_edges.len();
+    // desired_edges holds real-note edges plus, when placeholders is on, one
+    // edge per dangling link; subtract those to count only real resolutions.
+    outcome.links_resolved = desired_edges.len() - if opts.placeholders { dangling } else { 0 };
 
     for (src, dst) in &desired_embed_edges {
         writer.upsert_edge(EMBED_EDGE_TYPE, *src, *dst, &edge_record)?;
         rows_since_commit += 1;
         maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
     }
-    outcome.embeds_resolved = desired_embed_edges.len();
+    outcome.embeds_resolved = desired_embed_edges.len()
+        - if opts.placeholders {
+            embeds_dangling
+        } else {
+            0
+        };
 
     for (tag_id, name) in &desired_tags {
         let mut props = BTreeMap::new();
@@ -635,5 +694,138 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn placeholders_materialize_unresolved_targets() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "links to [[Missing]] and embeds ![[Gone]]\n");
+
+        let mut writer = open("vault-ph").await;
+        let opts = LoadOptions {
+            placeholders: true,
+            ..Default::default()
+        };
+        let out = load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.links_resolved, 0, "no real link targets");
+        assert_eq!(out.links_dangling, 1);
+        assert_eq!(out.embeds_dangling, 1);
+        assert_eq!(out.placeholders_created, 2, "Missing + Gone stubs");
+
+        let snap = writer.snapshot();
+        let missing = snap
+            .lookup_node("Note", stable_node_id("missing"))
+            .await
+            .unwrap()
+            .expect("placeholder node exists");
+        assert_eq!(
+            missing.properties.get("placeholder"),
+            Some(&Value::Bool(true))
+        );
+        assert!(!missing.properties.contains_key("path"), "stub has no path");
+        // The dangling link became a real edge to the stub.
+        let back = snap
+            .in_edges("LINKS_TO", stable_node_id("missing"))
+            .await
+            .unwrap();
+        assert_eq!(back.edges.len(), 1, "A -> Missing placeholder");
+    }
+
+    #[tokio::test]
+    async fn default_off_makes_no_placeholder_node() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "[[Missing]]\n");
+
+        let mut writer = open("vault-noph").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.links_dangling, 1);
+        assert_eq!(out.placeholders_created, 0);
+        let snap = writer.snapshot();
+        assert!(
+            snap.lookup_node("Note", stable_node_id("missing"))
+                .await
+                .unwrap()
+                .is_none(),
+            "no stub by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_is_promoted_when_the_real_note_appears() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "[[Missing]]\n");
+
+        let mut writer = open("vault-phpromote").await;
+        let opts = LoadOptions {
+            placeholders: true,
+            ..Default::default()
+        };
+        load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Create the previously-missing note; reload with prune.
+        write(dir, "Missing.md", "now real\n");
+        let opts2 = LoadOptions {
+            placeholders: true,
+            prune: true,
+            ..Default::default()
+        };
+        load_vault(dir, &mut writer, &opts2).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Same id, so the stub is upserted into a real note (path set, mark gone).
+        let snap = writer.snapshot();
+        let m = snap
+            .lookup_node("Note", stable_node_id("missing"))
+            .await
+            .unwrap()
+            .expect("note exists");
+        assert_eq!(
+            m.properties.get("placeholder"),
+            None,
+            "promoted to real note"
+        );
+        assert!(m.properties.contains_key("path"), "real note has a path");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_still_linked_note_leaves_a_stub_under_prune() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "[[B]]\n");
+        write(dir, "B.md", "b\n");
+
+        let mut writer = open("vault-phdel").await;
+        let opts = LoadOptions {
+            placeholders: true,
+            prune: true,
+            ..Default::default()
+        };
+        load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Delete B but keep A's link to it: the reference is now unresolved, so
+        // B should survive prune as a placeholder stub (intended semantics).
+        std::fs::remove_file(dir.join("B.md")).unwrap();
+        let out = load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.placeholders_created, 1, "B becomes a stub");
+        let snap = writer.snapshot();
+        let b = snap
+            .lookup_node("Note", stable_node_id("b"))
+            .await
+            .unwrap()
+            .expect("B survives as a stub");
+        assert_eq!(b.properties.get("placeholder"), Some(&Value::Bool(true)));
     }
 }
