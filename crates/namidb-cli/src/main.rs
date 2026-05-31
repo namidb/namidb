@@ -262,6 +262,9 @@ async fn load_vault_cmd(
     println!("embeds resolved : {}", outcome.embeds_resolved);
     println!("embeds dangling : {}", outcome.embeds_dangling);
     println!("name collisions : {}", outcome.name_collisions);
+    if outcome.aliases_registered > 0 {
+        println!("aliases         : {}", outcome.aliases_registered);
+    }
     println!("tags loaded     : {}", outcome.tags_loaded);
     println!("tag links       : {}", outcome.tag_links);
     if outcome.subtag_edges > 0 {

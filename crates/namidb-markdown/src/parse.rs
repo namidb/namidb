@@ -22,6 +22,8 @@
 //! - A frontmatter property whose value *is* a `[[Note]]` wikilink (or a list
 //!   of them, e.g. `up: "[[Parent]]"`) also produces a `LINKS_TO` edge. A value
 //!   that merely contains `[[...]]` inside prose or code does not.
+//! - A frontmatter `aliases` list registers alternate names: a `[[Alias]]`
+//!   anywhere resolves to the note that declares it (the loader resolves it).
 //! - Same-note refs (`[[#heading]]`) carry no target.
 //! - Links inside fenced or inline code are excluded.
 //! - Frontmatter is parsed as YAML; malformed frontmatter yields no
@@ -80,6 +82,9 @@ pub struct ParsedNote {
     /// String tags on this note (frontmatter `tags` strings + inline `#tags`),
     /// deduplicated. Each becomes a `:Tag` node linked by a `:TAGGED` edge.
     pub tags: Vec<String>,
+    /// Normalized alias keys from the frontmatter `aliases` property,
+    /// deduplicated. A `[[alias]]` elsewhere resolves to this note.
+    pub aliases: Vec<String>,
 }
 
 /// A parsed vault: every `.md` file under the root, in path order.
@@ -252,6 +257,8 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         tags.retain(|t| seen.insert(t.clone()));
     }
 
+    let aliases = extract_aliases(&properties);
+
     ParsedNote {
         id: stable_node_id(&key),
         key,
@@ -261,6 +268,7 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         links,
         embeds,
         tags,
+        aliases,
     }
 }
 
@@ -503,11 +511,15 @@ fn extract_frontmatter_links(props: &BTreeMap<String, Value>) -> Vec<String> {
         }
     };
     for (name, value) in props {
-        // Skip the engine-owned/special properties: `tags` is its own concern,
-        // and `title`/`path`/`body` are display/content fields the loader sets,
-        // not link fields, so a `title: "[[X]]"` must not forge an edge. (`key`
-        // and `content_hash` were already dropped by `frontmatter_to_props`.)
-        if matches!(name.as_str(), "tags" | "title" | "path" | "body") {
+        // Skip the engine-owned/special properties: `tags`/`aliases` are their
+        // own concerns, and `title`/`path`/`body` are display/content fields the
+        // loader sets, not link fields, so a `title: "[[X]]"` must not forge an
+        // edge. (`key`/`content_hash` were already dropped by
+        // `frontmatter_to_props`.)
+        if matches!(
+            name.as_str(),
+            "tags" | "aliases" | "title" | "path" | "body"
+        ) {
             continue;
         }
         match value {
@@ -521,6 +533,33 @@ fn extract_frontmatter_links(props: &BTreeMap<String, Value>) -> Vec<String> {
             }
             _ => {}
         }
+    }
+    out
+}
+
+/// Normalized alias keys from the frontmatter `aliases` property (a string or a
+/// string list), deduplicated in first-seen order. Each alias is normalized the
+/// same way a link target is, so `[[U-R]]` (an alias `U-R`) resolves to the
+/// note that declares it. Non-string values are ignored.
+fn extract_aliases(props: &BTreeMap<String, Value>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut add = |s: &str| {
+        let key = normalize_key(s);
+        if !key.is_empty() && seen.insert(key.clone()) {
+            out.push(key);
+        }
+    };
+    match props.get("aliases") {
+        Some(Value::Str(s)) => add(s),
+        Some(Value::List(items)) => {
+            for item in items {
+                if let Value::Str(s) = item {
+                    add(s);
+                }
+            }
+        }
+        _ => {}
     }
     out
 }
@@ -1064,6 +1103,21 @@ mod tests {
             "---\ntitle: Plain\ntags: [a, b]\ncount: 3\n---\nno links here\n",
         );
         assert!(note.links.is_empty(), "no wikilinks anywhere");
+    }
+
+    #[test]
+    fn aliases_are_extracted_and_normalized() {
+        // A list of aliases, normalized the same way link targets are.
+        let note = parse_note(
+            "User Role.md",
+            "---\naliases: [\"U-R\", \"The User\"]\n---\nbody\n",
+        );
+        assert_eq!(note.aliases, vec!["u-r", "the-user"]);
+        // A single string alias also works.
+        let solo = parse_note("N.md", "---\naliases: Solo\n---\nbody\n");
+        assert_eq!(solo.aliases, vec!["solo"]);
+        // No `aliases` property -> none.
+        assert!(parse_note("N.md", "plain\n").aliases.is_empty());
     }
 
     #[test]

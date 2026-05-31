@@ -2,7 +2,9 @@
 //!
 //! Each note becomes a node (default label `Note`); each resolved link becomes
 //! a `LINKS_TO` edge and each resolved embed (`![[X]]`) a distinct `EMBEDS`
-//! edge. Dangling targets (no matching note) are counted and, by default,
+//! edge. A link/embed target resolves by note key or by a frontmatter `aliases`
+//! entry (a real note key wins over an alias). Dangling targets (no matching
+//! note or alias) are counted and, by default,
 //! produce no edge so every edge endpoint is a real note. With
 //! [`LoadOptions::placeholders`] a dangling target instead gets a stub `:Note`
 //! node (`placeholder: true`, no `path`/`body`) and a real edge to it, so
@@ -102,6 +104,9 @@ pub struct VaultLoadOutcome {
     /// Notes whose normalized key collided with an earlier note (last write
     /// wins; surfaced so silent overwrites are visible).
     pub name_collisions: usize,
+    /// Distinct frontmatter aliases registered as resolvable names (excludes
+    /// aliases shadowed by a real note key or by an earlier alias).
+    pub aliases_registered: usize,
     /// Stale nodes tombstoned because they are no longer in the vault (only
     /// non-zero when [`LoadOptions::prune`] is set).
     pub notes_pruned: usize,
@@ -195,6 +200,25 @@ async fn load_graph_inner(
         }
     }
 
+    // Frontmatter aliases: a `[[Alias]]` resolves to the note that declares the
+    // alias. A real note key always wins over an alias, and the first note (in
+    // path order) to declare an alias wins a clash, so resolution is
+    // deterministic.
+    let mut alias_map: HashMap<&str, NodeId> = HashMap::new();
+    let mut aliases_registered = 0usize;
+    for note in &graph.notes {
+        for alias in &note.aliases {
+            if known.contains(alias.as_str()) {
+                continue; // a real note already owns this name
+            }
+            if let std::collections::hash_map::Entry::Vacant(slot) = alias_map.entry(alias.as_str())
+            {
+                slot.insert(note.id);
+                aliases_registered += 1;
+            }
+        }
+    }
+
     // Resolve links and embeds once: the edge lists the vault wants, plus
     // counts of targets that point nowhere. With `placeholders`, a dangling
     // target also gets a stub `:Note` node (keyed the same as the real note
@@ -207,12 +231,14 @@ async fn load_graph_inner(
     let mut embeds_dangling = 0usize;
     for note in &graph.notes {
         for target in &note.links {
-            let tid = stable_node_id(target);
             if known.contains(target.as_str()) {
-                desired_edges.push((note.id, tid));
+                desired_edges.push((note.id, stable_node_id(target)));
+            } else if let Some(&dst) = alias_map.get(target.as_str()) {
+                desired_edges.push((note.id, dst)); // resolved via an alias
             } else {
                 dangling += 1;
                 if opts.placeholders {
+                    let tid = stable_node_id(target);
                     desired_edges.push((note.id, tid));
                     desired_placeholders
                         .entry(tid)
@@ -221,12 +247,14 @@ async fn load_graph_inner(
             }
         }
         for target in &note.embeds {
-            let tid = stable_node_id(target);
             if known.contains(target.as_str()) {
-                desired_embed_edges.push((note.id, tid));
+                desired_embed_edges.push((note.id, stable_node_id(target)));
+            } else if let Some(&dst) = alias_map.get(target.as_str()) {
+                desired_embed_edges.push((note.id, dst)); // resolved via an alias
             } else {
                 embeds_dangling += 1;
                 if opts.placeholders {
+                    let tid = stable_node_id(target);
                     desired_embed_edges.push((note.id, tid));
                     desired_placeholders
                         .entry(tid)
@@ -235,6 +263,13 @@ async fn load_graph_inner(
             }
         }
     }
+
+    // Two distinct link targets can resolve to the same note (e.g. a note
+    // linked by two of its aliases, or by both its real name and an alias),
+    // producing duplicate edge pairs. Dedup so each edge is written and counted
+    // once; the dangling-stub count is unaffected (stub targets are distinct).
+    dedup_pairs(&mut desired_edges);
+    dedup_pairs(&mut desired_embed_edges);
 
     // Resolve tags: one shared `:Tag` node per distinct tag name (the union
     // across notes), and a `:TAGGED` edge from each note to each of its tags.
@@ -256,6 +291,7 @@ async fn load_graph_inner(
 
     let mut outcome = VaultLoadOutcome {
         name_collisions: collisions,
+        aliases_registered,
         links_dangling: dangling,
         embeds_dangling,
         ..Default::default()
@@ -519,6 +555,13 @@ fn note_hash(note: &ParsedNote) -> Option<&str> {
     }
 }
 
+/// Drop duplicate `(src, dst)` pairs in place, preserving first-seen order, so
+/// an edge that several link targets resolve to is written and counted once.
+fn dedup_pairs(pairs: &mut Vec<(NodeId, NodeId)>) {
+    let mut seen = HashSet::new();
+    pairs.retain(|pair| seen.insert(*pair));
+}
+
 /// Stable id for a tag node, namespaced with NUL bytes so a tag never collides
 /// with a note whose key is the same text (note keys derive from filenames and
 /// cannot contain NUL).
@@ -750,6 +793,103 @@ mod tests {
             .unwrap();
         assert_eq!(edges.edges.len(), 1);
         assert_eq!(edges.edges[0].dst, stable_node_id("parent"));
+    }
+
+    #[tokio::test]
+    async fn frontmatter_aliases_resolve_links() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(
+            dir,
+            "User Role.md",
+            "---\naliases: [\"U-R\"]\n---\nthe role\n",
+        );
+        write(
+            dir,
+            "Project X.md",
+            "---\naliases: [\"px\"]\n---\nthe project\n",
+        );
+        write(dir, "Other.md", "see [[U-R]] and [[px]] and [[Nope]]\n");
+
+        let mut writer = open("vault-alias").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.aliases_registered, 2, "U-R and px");
+        // The two aliases resolve to their real notes; Nope dangles.
+        assert_eq!(out.links_resolved, 2);
+        assert_eq!(out.links_dangling, 1, "Nope");
+        let snap = writer.snapshot();
+        let mut dsts: Vec<_> = snap
+            .out_edges("LINKS_TO", stable_node_id("other"))
+            .await
+            .unwrap()
+            .edges
+            .iter()
+            .map(|e| e.dst)
+            .collect();
+        dsts.sort();
+        let mut want = vec![stable_node_id("user-role"), stable_node_id("project-x")];
+        want.sort();
+        assert_eq!(dsts, want, "aliases resolve to the real notes");
+    }
+
+    #[tokio::test]
+    async fn two_aliases_of_one_note_make_a_single_edge() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        // Target is known by two aliases; Source links both.
+        write(dir, "Target.md", "---\naliases: [\"Foo\", \"Bar\"]\n---\nt\n");
+        write(dir, "Source.md", "see [[Foo]] and [[Bar]]\n");
+
+        let mut writer = open("vault-alias-fanin").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Both aliases collapse to one edge, counted once.
+        assert_eq!(out.links_resolved, 1, "one physical edge, counted once");
+        let snap = writer.snapshot();
+        let edges = snap
+            .out_edges("LINKS_TO", stable_node_id("source"))
+            .await
+            .unwrap();
+        assert_eq!(edges.edges.len(), 1);
+        assert_eq!(edges.edges[0].dst, stable_node_id("target"));
+    }
+
+    #[tokio::test]
+    async fn a_real_note_key_wins_over_an_alias() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "Foo.md", "the real foo\n");
+        write(
+            dir,
+            "Bar.md",
+            "---\naliases: [\"Foo\"]\n---\nbar aliases foo\n",
+        );
+        write(dir, "Link.md", "see [[Foo]]\n");
+
+        let mut writer = open("vault-alias-shadow").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(
+            out.aliases_registered, 0,
+            "alias Foo shadowed by the real note"
+        );
+        let snap = writer.snapshot();
+        let edges = snap
+            .out_edges("LINKS_TO", stable_node_id("link"))
+            .await
+            .unwrap();
+        assert_eq!(edges.edges.len(), 1);
+        assert_eq!(edges.edges[0].dst, stable_node_id("foo"), "real Foo wins");
     }
 
     #[tokio::test]

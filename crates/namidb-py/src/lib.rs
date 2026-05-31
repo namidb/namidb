@@ -382,10 +382,11 @@ impl Client {
     /// stub `:Note` (`placeholder: true`) so unresolved references show up.
     ///
     /// Returns a dict with `notes_loaded`, `links_resolved`, `links_dangling`,
-    /// `embeds_resolved`, `embeds_dangling`, `name_collisions`, `notes_pruned`,
-    /// `links_pruned`, `embeds_pruned`, `tags_loaded`, `tag_links`,
-    /// `tags_pruned`, `tag_links_pruned`, `subtag_edges`,
-    /// `subtag_edges_pruned`, `placeholders_created` and `commit_batches`.
+    /// `embeds_resolved`, `embeds_dangling`, `name_collisions`,
+    /// `aliases_registered`, `notes_pruned`, `links_pruned`, `embeds_pruned`,
+    /// `tags_loaded`, `tag_links`, `tags_pruned`, `tag_links_pruned`,
+    /// `subtag_edges`, `subtag_edges_pruned`, `placeholders_created` and
+    /// `commit_batches`.
     #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false, placeholders=false))]
     fn load_vault(
         &self,
@@ -422,6 +423,7 @@ impl Client {
         d.set_item("embeds_resolved", outcome.embeds_resolved)?;
         d.set_item("embeds_dangling", outcome.embeds_dangling)?;
         d.set_item("name_collisions", outcome.name_collisions)?;
+        d.set_item("aliases_registered", outcome.aliases_registered)?;
         d.set_item("notes_pruned", outcome.notes_pruned)?;
         d.set_item("links_pruned", outcome.links_pruned)?;
         d.set_item("embeds_pruned", outcome.embeds_pruned)?;

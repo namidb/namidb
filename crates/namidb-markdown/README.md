@@ -47,4 +47,6 @@ references can optionally become placeholder stub nodes (`LoadOptions::placehold
 not model heading/block anchors as separate targets or write-back to `.md`.
 Names resolve by normalized basename, so `[[User Role]]`, `[[user-role]]` and
 `user_role.md` collapse to one note. Common Latin diacritics fold to their base
-letter, so `[[Matías]]` resolves to `matias.md`.
+letter, so `[[Matías]]` resolves to `matias.md`. A note's frontmatter `aliases`
+register alternate names, so `[[U-R]]` resolves to a note aliased `U-R` (a real
+note name always wins over an alias).
