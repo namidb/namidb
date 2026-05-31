@@ -60,12 +60,20 @@ impl Server {
     /// vault (prune on) so a restart over a durable store reflects the current
     /// files instead of accumulating stale notes, then commits so the graph is
     /// durable and immediately queryable.
+    ///
+    /// `placeholders` matches the CLI/Python flag of the same name: when set,
+    /// links and embeds to a missing note become stub `:Note` nodes (marked
+    /// `placeholder: true`) so unresolved references show in the graph. The
+    /// note-listing tools keep these stubs out of their results; the `cypher`
+    /// tool can still reach them via `WHERE n.placeholder = true`.
     pub async fn load_vault(
         &self,
         dir: &Path,
+        placeholders: bool,
     ) -> anyhow::Result<namidb_markdown::VaultLoadOutcome> {
         let opts = namidb_markdown::LoadOptions {
             prune: true,
+            placeholders,
             ..Default::default()
         };
         let mut guard = self.session.lock().await;
@@ -519,7 +527,7 @@ mod tests {
         // An island: no links in or out, so it is the sole orphan.
         write(dir.path(), "Delta.md", "an isolated note with no links\n");
         let server = Server::open("memory://mcp-test").await.unwrap();
-        let outcome = server.load_vault(dir.path()).await.unwrap();
+        let outcome = server.load_vault(dir.path(), false).await.unwrap();
         assert_eq!(outcome.notes_loaded, 4);
         // Keep the tempdir alive until after the load.
         drop(dir);
@@ -550,7 +558,7 @@ mod tests {
         write(dir.path(), "A.md", "---\ntags: [rust, db]\n---\nbody\n");
         write(dir.path(), "B.md", "uses #rust inline\n");
         let server = Server::open("memory://mcp-tagtools").await.unwrap();
-        server.load_vault(dir.path()).await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
 
         let tags: Vec<String> = call(&server, "list_tags", json!({}))
             .await
@@ -625,7 +633,7 @@ mod tests {
         write(dir.path(), "user_role.md", "see the founder\n");
         write(dir.path(), "Project.md", "owned by [[user_role]]\n");
         let server = Server::open("memory://mcp-resolve").await.unwrap();
-        server.load_vault(dir.path()).await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
 
         // Caller does not know the exact stem: kebab and spaced spellings of
         // the same name must all resolve to user_role.md.
@@ -652,7 +660,7 @@ mod tests {
         write(dir.path(), "-.md", "punctuation-only stem\n");
         write(dir.path(), "Real.md", "a real note\n");
         let server = Server::open("memory://mcp-emptykey").await.unwrap();
-        server.load_vault(dir.path()).await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
 
         // An empty / whitespace query normalizes to an empty key, which must
         // NOT fire the key disjunct and match the empty-key note. (A literal
@@ -675,7 +683,7 @@ mod tests {
         // C both links AND embeds B: two parallel edges, must list once.
         write(dir.path(), "C.md", "link [[B]] and embed ![[B]]\n");
         let server = Server::open("memory://mcp-embed").await.unwrap();
-        server.load_vault(dir.path()).await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
 
         // Backlinks of B span both edge types; an embedder counts, and a node
         // that both links and embeds B appears exactly once (DISTINCT).
@@ -692,6 +700,30 @@ mod tests {
             vec!["A", "C"],
             "embedder counts; dual link+embed once"
         );
+    }
+
+    #[tokio::test]
+    async fn placeholders_flag_creates_stub_reachable_via_cypher() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[Missing]]\n");
+        let server = Server::open("memory://mcp-ph-flag").await.unwrap();
+        let outcome = server.load_vault(dir.path(), true).await.unwrap();
+        assert_eq!(outcome.placeholders_created, 1, "Missing stub created");
+
+        // The escape-hatch cypher tool can still reach the stub.
+        let stubs = call(
+            &server,
+            "cypher",
+            json!({ "query": "MATCH (n:Note) WHERE n.placeholder = true RETURN n.title AS title" }),
+        )
+        .await;
+        let titles: Vec<&str> = stubs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert_eq!(titles, vec!["missing"], "stub reachable via cypher");
     }
 
     #[tokio::test]

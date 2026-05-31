@@ -17,6 +17,11 @@ struct Args {
     /// Optional markdown vault to load into the namespace before serving.
     #[arg(long)]
     vault: Option<String>,
+    /// Create stub `:Note` nodes for links/embeds whose target does not exist,
+    /// so unresolved references show up in the graph. Matches `load-vault
+    /// --placeholders`. Only meaningful with `--vault`.
+    #[arg(long, default_value_t = false)]
+    placeholders: bool,
 }
 
 #[tokio::main]
@@ -33,10 +38,15 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let server = namidb_mcp::Server::open(&args.store).await?;
     if let Some(vault) = args.vault.as_deref() {
-        let outcome = server.load_vault(std::path::Path::new(vault)).await?;
+        let outcome = server
+            .load_vault(std::path::Path::new(vault), args.placeholders)
+            .await?;
         eprintln!(
-            "loaded vault: {} notes, {} links ({} dangling)",
-            outcome.notes_loaded, outcome.links_resolved, outcome.links_dangling
+            "loaded vault: {} notes, {} links ({} dangling), {} placeholders",
+            outcome.notes_loaded,
+            outcome.links_resolved,
+            outcome.links_dangling,
+            outcome.placeholders_created
         );
     }
     namidb_mcp::serve_stdio(server).await
