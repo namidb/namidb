@@ -13,6 +13,18 @@ below and in the release notes.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Breaking
+
+---
+
+## [0.9.0] - 2026-05-30: Obsidian fidelity (markdown links, tags, embeds, placeholders)
+
+### Added
+
 - **Markdown links as graph edges.** Standard markdown links `[text](note.md)`
   to a local `.md`/`.markdown` file now produce a `LINKS_TO` edge alongside
   `[[wikilinks]]`, resolved by basename (percent-decoded). External URLs,
