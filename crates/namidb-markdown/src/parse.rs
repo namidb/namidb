@@ -503,7 +503,11 @@ fn extract_frontmatter_links(props: &BTreeMap<String, Value>) -> Vec<String> {
         }
     };
     for (name, value) in props {
-        if name == "tags" {
+        // Skip the engine-owned/special properties: `tags` is its own concern,
+        // and `title`/`path`/`body` are display/content fields the loader sets,
+        // not link fields, so a `title: "[[X]]"` must not forge an edge. (`key`
+        // and `content_hash` were already dropped by `frontmatter_to_props`.)
+        if matches!(name.as_str(), "tags" | "title" | "path" | "body") {
             continue;
         }
         match value {
@@ -1040,6 +1044,17 @@ mod tests {
         // A wikilink-shaped tag stays a tag and does not also become a link.
         let note = parse_note("N.md", "---\ntags: \"[[meta]]\"\n---\nbody\n");
         assert!(note.links.is_empty(), "the tags property is not scanned");
+    }
+
+    #[test]
+    fn frontmatter_engine_owned_keys_are_not_link_sources() {
+        // A wikilink in `title`/`path`/`body` (display/content fields the loader
+        // owns) must not forge a phantom edge; only real link fields count.
+        let note = parse_note(
+            "N.md",
+            "---\ntitle: \"[[Foo]]\"\nbody: \"[[Bar]]\"\nup: \"[[Real]]\"\n---\nplain\n",
+        );
+        assert_eq!(note.links, vec!["real"], "only `up` is a link field");
     }
 
     #[test]
