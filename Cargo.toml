@@ -100,7 +100,7 @@ indicatif = "0.17"
 console = "0.15"
 
 # HTTP server (later)
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
