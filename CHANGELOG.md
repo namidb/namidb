@@ -21,6 +21,90 @@ below and in the release notes.
 
 ---
 
+## [0.10.0] - 2026-05-31: Live incremental sync (--watch, frontmatter links and aliases, nested tags)
+
+### Added
+
+- **Incremental vault sync.** `sync_vault`/`sync_graph` parse the vault, read
+  the prior `content_hash` state through a column projection, and re-index only
+  what changed. Unchanged notes are not re-written and their bodies are never
+  loaded; edges and tags are reconciled exactly as a prune-load. The contract is
+  asserted directly: after a sync the graph is byte-identical to a fresh
+  prune-load of the same disk state, across add/modify/delete/unchanged with
+  link, embed and tag changes, with placeholders on and off. `VaultSyncOutcome`
+  reports the change counts.
+- **Live `--watch` in the CLI and MCP server.** `namidb load-vault --watch
+  <dir>` does an initial mirrored sync, then watches the vault (debounced 400ms)
+  and re-syncs on every change until Ctrl-C, so the graph stays a live index.
+  The MCP server gains `--watch` (requires `--vault`): a background task
+  re-syncs incrementally on each change and republishes the snapshot, so agent
+  reads keep flowing while the graph updates under them. A missed or coalesced
+  filesystem event never desyncs the graph, because each sync re-walks and
+  re-hashes the vault rather than trusting the event.
+- **Nested tags as a `:SUBTAG_OF` hierarchy.** A nested tag like `#area/db` now
+  materializes its ancestor `:Tag` nodes (`area`) and a child-to-parent
+  `:SUBTAG_OF` edge per level, so the tag tree is a real sub-graph an agent can
+  traverse. The note stays `:TAGGED` to the leaf it wrote. Prune and the
+  incremental sync reconcile `:SUBTAG_OF` like the other edge types. The load
+  outcome gains `subtag_edges` and `subtag_edges_pruned` (surfaced in the CLI
+  and Python).
+- **MCP tag-tree queries.** `notes_by_tag` now returns notes carrying the tag or
+  any tag nested under it (`area` also returns notes tagged `area/db`), matched
+  by name prefix. A new `subtags` tool lists a tag's immediate children via the
+  `:SUBTAG_OF` edges, so an agent can walk the tag tree. The `cypher` tool
+  description and the tool list note `:SUBTAG_OF`.
+- **Frontmatter wikilinks as `LINKS_TO` edges.** A frontmatter property whose
+  value is wholly a `[[Note]]` wikilink (or a list of them, for example `up:
+  "[[Parent]]"`) now produces a `LINKS_TO` edge alongside body links, the way
+  Obsidian links frontmatter properties. A value that merely contains `[[...]]`
+  inside prose or a code snippet does not grow a spurious edge, and the `tags`
+  property is never scanned.
+- **Frontmatter `aliases` resolve links.** A note's `aliases` list now registers
+  alternate names, so `[[U-R]]` anywhere resolves to the note aliased "U-R"
+  instead of dangling. A real note key always wins over an alias, and the first
+  note in path order wins an alias clash. Resolution covers links and embeds.
+  The load outcome gains `aliases_registered` (surfaced in the CLI and Python).
+
+### Changed
+
+- **Latin diacritics folded in note-name resolution.** Note-name matching now
+  folds the Latin-1 accented letters to their base (`á` to `a`, `ñ` to `n`, `ü`
+  to `u`, and so on) before lowercasing, so `[[Matías]]` resolves to
+  `matias.md` and accented and unaccented spellings collapse to one note, which
+  is what a Spanish or Western European vault needs. ASCII names are unaffected.
+- **MCP reads serve from a published snapshot.** Read queries no longer take the
+  writer lock for the whole `execute()`; the server holds an
+  `Arc<SnapshotCell>`, publishes the committed state after each commit, and
+  serves reads from that snapshot without the lock. A vault load or sync no
+  longer blocks every agent read for its duration. No behavior change for reads.
+
+### Fixed
+
+- **Duplicate-key frontmatter no longer drops the whole note.** A doubled
+  top-level key (for example two `tags:`) made the YAML parser reject the entire
+  document, silently dropping the note's title, role and everything else.
+  Recovery is now scoped to exactly that error: regroup by top-level key, keep
+  the last value (the way Obsidian resolves duplicates), and re-parse once. Any
+  other malformed YAML still yields no properties, and a note that already
+  parsed is never affected.
+- **Non-string frontmatter `title` is kept as a string** instead of being
+  coerced or dropped.
+- **Engine-reserved frontmatter keys are dropped on ingest**, so a vault cannot
+  overwrite the engine's own node properties.
+- **Engine-owned frontmatter keys are not scanned for links**, so the body
+  property the engine adds is never double-scanned for wikilinks.
+- **The `placeholders` flag is exposed on the MCP loader** to match the CLI and
+  Python loaders, and placeholder stubs are kept out of the note-listing tools.
+
+### Breaking
+
+- **Notes with accented names get a new `NodeId`.** Because a note's id derives
+  from its normalized (now diacritics-folded) key, a vault that was indexed
+  before this release must be reloaded or synced to rebuild the index. ASCII-only
+  vaults are unaffected.
+
+---
+
 ## [0.9.0] - 2026-05-30: Obsidian fidelity (markdown links, tags, embeds, placeholders)
 
 ### Added
