@@ -37,7 +37,7 @@ blake3 = { workspace = true }
 fs2 = { workspace = true }
 url = { workspace = true }
 anyhow = { workspace = true }
-arrow-ipc = "55"
+arrow-ipc = "58"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
