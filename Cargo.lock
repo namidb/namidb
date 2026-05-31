@@ -2243,6 +2243,7 @@ dependencies = [
  "namidb-storage",
  "object_store 0.13.2",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",

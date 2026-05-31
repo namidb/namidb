@@ -6,6 +6,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use regex::Regex;
+
 use super::row::Row;
 use super::value::RuntimeValue;
 use crate::parser::{BinaryOp, Expression, ExpressionKind, Literal, SourceSpan, StringOp, UnaryOp};
@@ -322,12 +324,7 @@ fn eval_binary(
                 BinaryOp::Gt => order_cmp(a, b, |o| o == Ordering::Greater),
                 BinaryOp::Le => order_cmp(a, b, |o| o != Ordering::Greater),
                 BinaryOp::Ge => order_cmp(a, b, |o| o != Ordering::Less),
-                BinaryOp::RegexMatch => {
-                    // Naïve: real regex engine arrives with the runtime
-                    // function library expansion. For now do substring
-                    // match — sufficient for tests, flagged as TODO.
-                    Ok(eval_string_test(StringOp::Contains, a, b))
-                }
+                BinaryOp::RegexMatch => regex_match(a, b, span),
                 BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => unreachable!(),
             }
         }
@@ -550,6 +547,31 @@ fn eval_string_test(op: StringOp, a: &RuntimeValue, b: &RuntimeValue) -> Runtime
         }),
         _ => RuntimeValue::Null,
     }
+}
+
+/// Cypher `=~`: whole-string regular-expression match, following Neo4j
+/// semantics where the pattern must match the *entire* string (like Java's
+/// `String.matches`), not a substring. The pattern is anchored with
+/// `^(?:…)$` so a top-level alternation (`a|b`) still binds under both
+/// anchors; redundant user anchors are harmless. Returns Null when either
+/// operand is not a string, and raises an error for an invalid pattern
+/// rather than silently matching nothing.
+fn regex_match(
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
+) -> Result<RuntimeValue, EvalError> {
+    let (subject, pattern) = match (a, b) {
+        (RuntimeValue::String(s), RuntimeValue::String(p)) => (s, p),
+        _ => return Ok(RuntimeValue::Null),
+    };
+    let re = Regex::new(&format!("^(?:{})$", pattern)).map_err(|e| {
+        EvalError::new(
+            format!("invalid regular expression `{}`: {}", pattern, e),
+            span,
+        )
+    })?;
+    Ok(RuntimeValue::Bool(re.is_match(subject)))
 }
 
 fn call_scalar_function(
@@ -946,6 +968,76 @@ mod tests {
             &Params::new(),
         );
         assert_eq!(r, RuntimeValue::String("b".into()));
+    }
+
+    // ─── `=~` regex match (Neo4j whole-string semantics) ──────────
+
+    #[test]
+    fn regex_match_is_whole_string_not_substring() {
+        // The regression: `=~` used to be substring `contains`, so this
+        // bare-substring pattern wrongly matched. It must now be false.
+        assert_eq!(
+            eval_str("'hello' =~ 'ell'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+        // A pattern that spans the whole string matches.
+        assert_eq!(
+            eval_str("'hello' =~ 'h.*o'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            eval_str("'hello' =~ 'hello'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn regex_match_classes_and_quantifiers() {
+        assert_eq!(
+            eval_str("'abc123' =~ '[a-z]+[0-9]+'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            eval_str("'abc' =~ '[0-9]+'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn regex_match_alternation_is_anchored() {
+        // `^(?:cat|dog)$`: a top-level alternation binds under both anchors.
+        assert_eq!(
+            eval_str("'cat' =~ 'cat|dog'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+        // Trailing char fails because the match must cover the whole string.
+        assert_eq!(
+            eval_str("'cats' =~ 'cat|dog'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn regex_match_inline_case_insensitive_flag() {
+        assert_eq!(
+            eval_str("'HELLO' =~ '(?i)hello'", &Row::new(), &Params::new()),
+            RuntimeValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn regex_match_non_string_operand_is_null() {
+        assert!(eval_str("123 =~ '1'", &Row::new(), &Params::new()).is_null());
+    }
+
+    #[test]
+    fn regex_match_invalid_pattern_errors() {
+        let err = eval_expr_err("'x' =~ '['");
+        assert!(
+            err.message.contains("invalid regular expression"),
+            "unexpected message: {}",
+            err.message
+        );
     }
 
     #[test]
