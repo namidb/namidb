@@ -49,6 +49,9 @@ All read-only.
 - `neighbors {note, hops?}` - notes within N hops (undirected, default 1, max 5)
 - `orphans` - notes with no links in or out
 - `search {text}` - notes whose title or body contains a substring
+- `list_tags` - every tag in the graph
+- `notes_by_tag {tag}` - notes carrying a tag (exact, case-sensitive)
+- `tags_of {note}` - a note's tags
 - `cypher {query}` - run an arbitrary read-only Cypher query
 
 This is the single-user local server. Multi-tenant hosting belongs in the

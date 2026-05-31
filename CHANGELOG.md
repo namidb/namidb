@@ -32,6 +32,10 @@ below and in the release notes.
   for "notes that share a tag". Prune reconciles stale tag nodes and edges too.
   Exposed via the load outcome (`tags_loaded`, `tag_links`, `tags_pruned`,
   `tag_links_pruned`) in the CLI and Python client.
+- **MCP tag tools.** The local MCP server gains `list_tags`, `notes_by_tag`
+  (accepts the tag with or without a leading `#`) and `tags_of`, so an agent
+  can traverse the tag graph without writing Cypher. The `cypher` tool's
+  description now names the `:Note`/`:Tag` and `:LINKS_TO`/`:TAGGED` schema.
 
 ### Changed
 

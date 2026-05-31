@@ -5,7 +5,8 @@
 //! instead of grepping flat files. Pointed at a namespace where a markdown
 //! vault was loaded (see `namidb-markdown` / `namidb load-vault`), it exposes
 //! read-only tools: list/get notes, backlinks, neighbors, orphans, full-text
-//! substring search, and an escape-hatch read-only `cypher` tool.
+//! substring search, tag tools (list tags, notes by tag, tags of a note), and
+//! an escape-hatch read-only `cypher` tool.
 //!
 //! This is the single-user local server. Multi-tenant hosting belongs in the
 //! cloud layer and must be weighed against the license's anti-DBaaS grant.
@@ -180,6 +181,34 @@ impl Server {
                         "MATCH (n:Note) WHERE {cond} \
                          RETURN n.title AS title, n.path AS path, n.body AS body \
                          ORDER BY n.path LIMIT 1"
+                    ),
+                    p,
+                )
+            }
+            "list_tags" => (
+                "MATCH (t:Tag) RETURN t.name AS tag ORDER BY t.name LIMIT 500".to_string(),
+                Params::new(),
+            ),
+            "notes_by_tag" => {
+                let raw = str_arg(args, "tag")?;
+                // Tags are stored without the leading '#'; accept it either way.
+                let tag = raw.strip_prefix('#').unwrap_or(&raw).to_string();
+                let mut p = Params::new();
+                p.insert("tag".to_string(), RuntimeValue::String(tag));
+                (
+                    "MATCH (n:Note)-[:TAGGED]->(t:Tag) WHERE t.name = $tag \
+                     RETURN n.title AS title, n.path AS path ORDER BY n.title"
+                        .to_string(),
+                    p,
+                )
+            }
+            "tags_of" => {
+                let note = str_arg(args, "note")?;
+                let (cond, p) = note_match("n", &note);
+                (
+                    format!(
+                        "MATCH (n:Note)-[:TAGGED]->(t:Tag) WHERE {cond} \
+                         RETURN DISTINCT t.name AS tag ORDER BY t.name"
                     ),
                     p,
                 )
@@ -374,8 +403,31 @@ fn tool_specs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "list_tags",
+            "description": "List all tags in the graph (the `:Tag` nodes), up to 500.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
+            "name": "notes_by_tag",
+            "description": "Notes carrying the given tag (incoming `:TAGGED` edges). Tag names are matched exactly (case-sensitive).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "tag": { "type": "string", "description": "Exact tag name (without '#')" } },
+                "required": ["tag"],
+            },
+        }),
+        json!({
+            "name": "tags_of",
+            "description": "Tags on the given note (outgoing `:TAGGED` edges).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "note": { "type": "string", "description": "Note name (file stem), title, or path" } },
+                "required": ["note"],
+            },
+        }),
+        json!({
             "name": "cypher",
-            "description": "Run an arbitrary read-only Cypher query against the graph. Write queries are rejected.",
+            "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:TAGGED`). Write queries are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "query": { "type": "string", "description": "A read-only Cypher query" } },
@@ -483,7 +535,46 @@ mod tests {
         let init = server.dispatch("initialize", &Value::Null).await.unwrap();
         assert_eq!(init["protocolVersion"], json!(PROTOCOL_VERSION));
         let list = server.dispatch("tools/list", &Value::Null).await.unwrap();
-        assert_eq!(list["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn tag_tools_query_the_tag_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "---\ntags: [rust, db]\n---\nbody\n");
+        write(dir.path(), "B.md", "uses #rust inline\n");
+        let server = Server::open("memory://mcp-tagtools").await.unwrap();
+        server.load_vault(dir.path()).await.unwrap();
+
+        let tags: Vec<String> = call(&server, "list_tags", json!({}))
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["tag"].as_str().map(str::to_string))
+            .collect();
+        assert!(tags.contains(&"rust".to_string()) && tags.contains(&"db".to_string()));
+
+        // A leading '#' on the query is accepted (tags store without it).
+        for query in ["rust", "#rust"] {
+            let tagged: Vec<String> = call(&server, "notes_by_tag", json!({ "tag": query }))
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["title"].as_str().map(str::to_string))
+                .collect();
+            assert_eq!(tagged, vec!["A", "B"], "{query} -> both notes tagged rust");
+        }
+
+        let a_tags: Vec<String> = call(&server, "tags_of", json!({ "note": "A" }))
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["tag"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(a_tags, vec!["db", "rust"], "A's tags, sorted");
     }
 
     #[tokio::test]
