@@ -45,4 +45,5 @@ references can optionally become placeholder stub nodes (`LoadOptions::placehold
 `MATCH (n:Note) WHERE n.placeholder = true` lists unresolved references. It does
 not model heading/block anchors as separate targets or write-back to `.md`.
 Names resolve by normalized basename, so `[[User Role]]`, `[[user-role]]` and
-`user_role.md` collapse to one note.
+`user_role.md` collapse to one note. Common Latin diacritics fold to their base
+letter, so `[[Matías]]` resolves to `matias.md`.
