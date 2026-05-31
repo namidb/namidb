@@ -34,16 +34,22 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use namidb_core::schema::is_reserved_property_name;
 use namidb_core::{NodeId, Value};
 use regex::Regex;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::id::{normalize_key, stable_node_id};
 
-/// Property names frontmatter may not set: `tombstone`/`lsn` are
-/// storage-managed (the flush path rejects them), and `key` is the loader's
-/// own normalized resolution key, set below from the file stem.
-const RESERVED_PROPS: [&str; 3] = ["tombstone", "lsn", "key"];
+/// The loader's own normalized resolution key, dropped from frontmatter so an
+/// author cannot override it (it is set below from the file stem). The
+/// engine-reserved names (`node_id`/`tombstone`/`lsn` and the `__`/`prop_`
+/// prefixes) are dropped separately via [`is_reserved_property_name`] so this
+/// crate cannot drift from the engine's reserved set. Both are dropped here
+/// because nothing on the write path re-validates property names, so an
+/// injected reserved key would otherwise be stored verbatim and shadow an
+/// engine-managed column.
+const RESERVED_KEY: &str = "key";
 
 /// One note, parsed and ready to ingest.
 #[derive(Debug, Clone, PartialEq)]
@@ -270,7 +276,7 @@ fn frontmatter_to_props(yaml: &str) -> BTreeMap<String, Value> {
     if let Some(Yaml::Hash(hash)) = docs.first() {
         for (k, v) in hash.iter() {
             let Some(key) = k.as_str() else { continue };
-            if RESERVED_PROPS.contains(&key) {
+            if key == RESERVED_KEY || is_reserved_property_name(key) {
                 continue;
             }
             if let Some(value) = yaml_to_value(v) {
@@ -570,6 +576,33 @@ mod tests {
                 Value::Str("a".into()),
                 Value::Str("b".into())
             ]))
+        );
+    }
+
+    #[test]
+    fn reserved_property_names_are_dropped_from_frontmatter() {
+        // Engine-reserved bare names and the `__`/`prop_` prefixes, plus the
+        // loader's own `key`, must never be stored from frontmatter: nothing
+        // re-validates names on the write path, so an injected reserved key
+        // would otherwise shadow an engine-managed column.
+        let note = parse_note(
+            "N.md",
+            "---\nnode_id: 999\ntombstone: true\nlsn: 7\nkey: hijack\n\
+             __x: 1\nprop_y: 2\nrole: founder\n---\nbody\n",
+        );
+        for reserved in ["node_id", "tombstone", "lsn", "__x", "prop_y"] {
+            assert!(
+                !note.properties.contains_key(reserved),
+                "reserved `{reserved}` must not be stored from frontmatter"
+            );
+        }
+        // `key` is the engine-owned resolution key (the stem), not the
+        // frontmatter's `hijack` value.
+        assert_eq!(note.properties.get("key"), Some(&Value::Str("n".into())));
+        // A normal property still passes through.
+        assert_eq!(
+            note.properties.get("role"),
+            Some(&Value::Str("founder".into()))
         );
     }
 

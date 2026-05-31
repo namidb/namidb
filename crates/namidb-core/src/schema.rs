@@ -132,6 +132,16 @@ impl From<PropertyDef> for PropertyDefRepr {
 /// Kept exported so other crates can share the canonical list.
 pub const RESERVED_PROPERTY_NAMES: &[&str] = &["node_id", "tombstone", "lsn"];
 
+/// Whether `name` is reserved by the engine and so cannot be stored as a
+/// property: the `__`/`prop_` prefixes the SST layer manages, or one of the
+/// bare names in [`RESERVED_PROPERTY_NAMES`]. Exported so loaders that build
+/// property maps without going through [`PropertyDef::new`] (e.g. the markdown
+/// vault loader) can drop these without re-deriving the list and drifting from
+/// the engine's own `validate_property_name`.
+pub fn is_reserved_property_name(name: &str) -> bool {
+    name.starts_with("__") || name.starts_with("prop_") || RESERVED_PROPERTY_NAMES.contains(&name)
+}
+
 impl PropertyDef {
     /// Construct a validated [`PropertyDef`].
     ///
@@ -289,6 +299,20 @@ impl SchemaBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_reserved_property_name_matches_the_validator() {
+        // The exported predicate must agree with `validate_property_name`'s
+        // reject set so loaders that use it cannot drift from the engine.
+        for reserved in ["node_id", "tombstone", "lsn", "__internal", "prop_x"] {
+            assert!(is_reserved_property_name(reserved));
+            assert!(validate_property_name(reserved).is_err());
+        }
+        for ok in ["name", "title", "key", "body", "role"] {
+            assert!(!is_reserved_property_name(ok));
+            assert!(validate_property_name(ok).is_ok());
+        }
+    }
 
     fn person_label() -> LabelDef {
         LabelDef {
