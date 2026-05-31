@@ -26,3 +26,5 @@ anyhow = { workspace = true }
 console = { workspace = true }
 indicatif = { workspace = true }
 object_store = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use namidb_core::{id::NamespaceId, value::Value as CoreValue};
-use namidb_markdown::{load_vault, LoadOptions};
+use namidb_markdown::{load_vault, sync_vault, LoadOptions};
 use namidb_query::{
     execute, execute_write, explain_query, explain_query_raw, explain_query_raw_verbose,
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
@@ -121,6 +121,11 @@ enum Cmd {
         /// exist, so unresolved references show up in the graph.
         #[arg(long, default_value_t = false)]
         placeholders: bool,
+        /// Watch the vault and re-sync incrementally on every change, keeping
+        /// the graph live until interrupted (Ctrl-C). A watch always mirrors
+        /// the vault, so `--prune` is implied.
+        #[arg(long, default_value_t = false)]
+        watch: bool,
         /// Path to the vault directory.
         path: String,
     },
@@ -186,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             edge_type,
             prune,
             placeholders,
+            watch,
             path,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -198,6 +204,7 @@ fn main() -> anyhow::Result<()> {
                 &edge_type,
                 prune,
                 placeholders,
+                watch,
                 &path,
             ))?;
         }
@@ -213,6 +220,7 @@ async fn load_vault_cmd(
     edge_type: &str,
     prune: bool,
     placeholders: bool,
+    watch: bool,
     path: &str,
 ) -> anyhow::Result<()> {
     let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
@@ -230,10 +238,19 @@ async fn load_vault_cmd(
     let opts = LoadOptions {
         label: label.to_string(),
         edge_type: edge_type.to_string(),
-        prune,
+        // A watch mirrors the vault on every sync, so prune is implied.
+        prune: prune || watch,
         placeholders,
         ..Default::default()
     };
+
+    if watch {
+        if store_uri.is_none() {
+            eprintln!("(in-memory namespace; a watch is only useful with --store <uri> to persist the graph)");
+        }
+        return watch_vault_cmd(std::path::Path::new(path), &mut writer, &opts).await;
+    }
+
     let outcome = load_vault(std::path::Path::new(path), &mut writer, &opts).await?;
     // Flush the tail the loader leaves pending so the graph is durable.
     writer.commit_batch().await?;
@@ -260,6 +277,76 @@ async fn load_vault_cmd(
     println!("{}", "─".repeat(48));
     if store_uri.is_none() {
         println!("(in-memory namespace; pass --store <uri> to persist the graph)");
+    }
+    Ok(())
+}
+
+/// Do an initial mirrored sync, then watch `dir` and re-sync on every debounced
+/// change until Ctrl-C, so the graph stays a live index of the vault.
+async fn watch_vault_cmd(
+    dir: &std::path::Path,
+    writer: &mut WriterSession,
+    opts: &LoadOptions,
+) -> anyhow::Result<()> {
+    use notify::{RecursiveMode, Watcher};
+    use notify_debouncer_full::new_debouncer;
+    use std::time::Duration;
+
+    // Initial sync: over an empty namespace every note classifies as added, so
+    // this behaves like a full load; over a populated store it reconciles
+    // whatever already exists, including offline edits made while not watching.
+    let out = sync_vault(dir, writer, opts).await?;
+    writer.commit_batch().await?;
+    eprintln!(
+        "synced {}: +{} ~{} -{} ={} (links {}, tags {})",
+        dir.display(),
+        out.notes_added,
+        out.notes_modified,
+        out.notes_deleted,
+        out.notes_unchanged,
+        out.load.links_resolved,
+        out.load.tags_loaded,
+    );
+
+    // The debouncer runs the OS watcher on its own thread and coalesces a burst
+    // of edits (editors write-then-rename, multi-file paste) into one batch.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(400), None, move |res| {
+        let _ = tx.send(res);
+    })
+    .map_err(|e| anyhow::anyhow!("watcher: {e}"))?;
+    debouncer
+        .watcher()
+        .watch(dir, RecursiveMode::Recursive)
+        .map_err(|e| anyhow::anyhow!("watch {}: {e}", dir.display()))?;
+
+    eprintln!("watching {} for changes (Ctrl-C to stop)", dir.display());
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                // The batch is only a trigger: sync re-walks and re-hashes the
+                // vault, so event paths are never trusted for correctness.
+                Some(Ok(_batch)) => {
+                    let out = sync_vault(dir, writer, opts).await?;
+                    writer.commit_batch().await?;
+                    if out.notes_added + out.notes_modified + out.notes_deleted > 0 {
+                        eprintln!(
+                            "sync: +{} ~{} -{} ={}",
+                            out.notes_added,
+                            out.notes_modified,
+                            out.notes_deleted,
+                            out.notes_unchanged,
+                        );
+                    }
+                }
+                Some(Err(errs)) => eprintln!("watch error: {errs:?}"),
+                None => break,
+            },
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("stopping watch");
+                break;
+            }
+        }
     }
     Ok(())
 }
