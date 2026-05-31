@@ -19,6 +19,9 @@
 //!   file also produce a `LINKS_TO` edge (basename-resolved, percent-decoded).
 //!   External URLs, mail/other schemes, bare anchors and non-markdown files
 //!   are ignored. Markdown image embeds (`![]()`) are not treated as links.
+//! - A frontmatter property whose value *is* a `[[Note]]` wikilink (or a list
+//!   of them, e.g. `up: "[[Parent]]"`) also produces a `LINKS_TO` edge. A value
+//!   that merely contains `[[...]]` inside prose or code does not.
 //! - Same-note refs (`[[#heading]]`) carry no target.
 //! - Links inside fenced or inline code are excluded.
 //! - Frontmatter is parsed as YAML; malformed frontmatter yields no
@@ -67,8 +70,9 @@ pub struct ParsedNote {
     /// Properties to store on the node: frontmatter plus the engine-owned
     /// `title`, `path`, `body` and `key`.
     pub properties: BTreeMap<String, Value>,
-    /// Normalized keys this note links to (non-embed wikilinks + markdown
-    /// links), deduplicated, in first-seen order. Becomes `:LINKS_TO` edges.
+    /// Normalized keys this note links to (non-embed body wikilinks + markdown
+    /// links + whole-value frontmatter wikilinks), deduplicated, body links
+    /// first. Becomes `:LINKS_TO` edges.
     pub links: Vec<String>,
     /// Normalized keys this note embeds (`![[X]]`), deduplicated. Becomes
     /// `:EMBEDS` edges, kept separate from links.
@@ -139,6 +143,11 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         Some(yaml) => frontmatter_to_props(yaml),
         None => BTreeMap::new(),
     };
+
+    // Capture wikilinks living in frontmatter values now, while `properties`
+    // holds only frontmatter keys, so the engine-owned `body` (added below) is
+    // not re-scanned and double-counted.
+    let frontmatter_links = extract_frontmatter_links(&properties);
 
     let title = note_title(rel_path);
     let key = normalize_key(&title);
@@ -211,7 +220,16 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         }
     }
 
-    let links = extract_links(body);
+    // Body links first (in document order), then any frontmatter links not
+    // already present, so both kinds become `LINKS_TO` edges with the body's
+    // ordering preserved.
+    let mut links = extract_links(body);
+    let mut seen: HashSet<String> = links.iter().cloned().collect();
+    for key in frontmatter_links {
+        if seen.insert(key.clone()) {
+            links.push(key);
+        }
+    }
     let embeds = extract_embeds(body);
 
     // The note's string tags (for `:Tag` nodes), taken from the final `tags`
@@ -451,6 +469,56 @@ pub fn extract_links(body: &str) -> Vec<String> {
 /// first-seen order.
 pub fn extract_embeds(body: &str) -> Vec<String> {
     classify_wikilinks(body).1
+}
+
+/// A frontmatter property value that *is* a single `[[wikilink]]`, reduced to
+/// its normalized key. The whole (trimmed) value must be one plain wikilink, so
+/// a prose or code value that merely contains `[[...]]` (a description, a code
+/// snippet like `arr[[i]]`) does not become a spurious edge. Embeds (`![[X]]`)
+/// and aliases/anchors are handled by [`link_target_key`].
+fn frontmatter_link_target(value: &str) -> Option<String> {
+    let inner = value.trim().strip_prefix("[[")?.strip_suffix("]]")?;
+    // Reject anything but a lone wikilink: nested/adjacent brackets or newlines
+    // mean this is not a clean single link target.
+    if inner.contains("[[") || inner.contains("]]") || inner.contains(['\r', '\n']) {
+        return None;
+    }
+    link_target_key(inner)
+}
+
+/// Wikilink targets found in frontmatter property values, as normalized keys in
+/// first-seen order. Obsidian treats a property whose value is a `[[note]]` as a
+/// link, so these become `LINKS_TO` edges alongside body links. Only string and
+/// string-list values are scanned, and only values that are wholly one wikilink
+/// count (see [`frontmatter_link_target`]). The `tags` property is skipped: a
+/// tag is never a link target.
+fn extract_frontmatter_links(props: &BTreeMap<String, Value>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let add = |s: &str, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+        if let Some(key) = frontmatter_link_target(s) {
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    };
+    for (name, value) in props {
+        if name == "tags" {
+            continue;
+        }
+        match value {
+            Value::Str(s) => add(s, &mut seen, &mut out),
+            Value::List(items) => {
+                for item in items {
+                    if let Value::Str(s) = item {
+                        add(s, &mut seen, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Markdown-link targets (`[text](note.md)`) that resolve to a local note, as
@@ -936,6 +1004,51 @@ mod tests {
         let body = "[[Alpha]] and [Alpha](Alpha.md) and [Beta](Beta.md) and [[beta]]";
         // Wikilinks first (in order), then new markdown targets; duplicates drop.
         assert_eq!(extract_links(body), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn frontmatter_wikilinks_become_links() {
+        let note = parse_note(
+            "N.md",
+            "---\nup: \"[[Parent]]\"\nrelated:\n  - \"[[Alpha]]\"\n  - \"[[Beta]]\"\n\
+             note: \"see ![[Embed]] here\"\n---\nbody links [[Alpha]] and [[Gamma]]\n",
+        );
+        // Body links keep their document order and come first.
+        assert_eq!(note.links[0], "alpha");
+        assert_eq!(note.links[1], "gamma");
+        // Frontmatter links are added, deduped against the body (alpha once).
+        let mut all = note.links.clone();
+        all.sort();
+        assert_eq!(all, vec!["alpha", "beta", "gamma", "parent"]);
+        // An embed in a frontmatter value is neither a link nor an embed.
+        assert!(!note.embeds.contains(&"embed".to_string()));
+    }
+
+    #[test]
+    fn frontmatter_links_require_a_whole_wikilink_value() {
+        // A value that only *contains* `[[...]]` inside prose or code is not a
+        // link, so descriptions and code snippets do not grow spurious edges.
+        let note = parse_note(
+            "N.md",
+            "---\ndescription: \"use [[foo]] syntax\"\nexample: \"arr[[0]][[1]]\"\n---\nbody\n",
+        );
+        assert!(note.links.is_empty(), "prose/code values are not links");
+    }
+
+    #[test]
+    fn frontmatter_tags_are_never_link_targets() {
+        // A wikilink-shaped tag stays a tag and does not also become a link.
+        let note = parse_note("N.md", "---\ntags: \"[[meta]]\"\n---\nbody\n");
+        assert!(note.links.is_empty(), "the tags property is not scanned");
+    }
+
+    #[test]
+    fn frontmatter_without_wikilinks_adds_no_links() {
+        let note = parse_note(
+            "N.md",
+            "---\ntitle: Plain\ntags: [a, b]\ncount: 3\n---\nno links here\n",
+        );
+        assert!(note.links.is_empty(), "no wikilinks anywhere");
     }
 
     #[test]

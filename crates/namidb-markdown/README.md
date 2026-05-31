@@ -38,8 +38,9 @@ MATCH (:Note {path: $path})-[:TAGGED]->(:Tag)<-[:TAGGED]-(o:Note) RETURN DISTINC
 
 This is a deliberate v1 subset, not a faithful Obsidian clone. It covers
 wikilink variants (`[[a]]`, `[[a|alias]]`, `[[a#heading]]`, `[[a^block]]`,
-`[[dir/a]]`), embeds (`![[a]]`), markdown links to local `.md`/`.markdown`
-files, inline and frontmatter `#tags`, and code-fence exclusion. Dangling
+`[[dir/a]]`) in the body and as whole frontmatter property values, embeds (`![[a]]`),
+markdown links to local `.md`/`.markdown` files, inline and frontmatter `#tags`
+(nested tags become a `:SUBTAG_OF` tree), and code-fence exclusion. Dangling
 references can optionally become placeholder stub nodes (`LoadOptions::placeholders`
 / `--placeholders` / `placeholders=True`), marked `placeholder: true`; querying
 `MATCH (n:Note) WHERE n.placeholder = true` lists unresolved references. It does

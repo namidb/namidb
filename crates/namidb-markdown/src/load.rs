@@ -725,6 +725,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontmatter_links_become_edges() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        // A wikilink in a frontmatter property, not in the body.
+        write(
+            dir,
+            "Child.md",
+            "---\nup: \"[[Parent]]\"\n---\njust a child\n",
+        );
+        write(dir, "Parent.md", "the parent\n");
+
+        let mut writer = open("vault-fmlink").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.links_resolved, 1, "Child -> Parent via frontmatter");
+        let snap = writer.snapshot();
+        let edges = snap
+            .out_edges("LINKS_TO", stable_node_id("child"))
+            .await
+            .unwrap();
+        assert_eq!(edges.edges.len(), 1);
+        assert_eq!(edges.edges[0].dst, stable_node_id("parent"));
+    }
+
+    #[tokio::test]
     async fn prune_mirrors_the_vault_on_reingest() {
         let vault = TempDir::new().unwrap();
         let dir = vault.path();
