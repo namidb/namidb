@@ -233,12 +233,15 @@ async fn load_vault_cmd(
     println!("notes loaded    : {}", outcome.notes_loaded);
     println!("links resolved  : {}", outcome.links_resolved);
     println!("links dangling  : {}", outcome.links_dangling);
+    println!("embeds resolved : {}", outcome.embeds_resolved);
+    println!("embeds dangling : {}", outcome.embeds_dangling);
     println!("name collisions : {}", outcome.name_collisions);
     println!("tags loaded     : {}", outcome.tags_loaded);
     println!("tag links       : {}", outcome.tag_links);
     if prune {
         println!("notes pruned    : {}", outcome.notes_pruned);
         println!("links pruned    : {}", outcome.links_pruned);
+        println!("embeds pruned   : {}", outcome.embeds_pruned);
         println!("tags pruned     : {}", outcome.tags_pruned);
         println!("tag links pruned: {}", outcome.tag_links_pruned);
     }

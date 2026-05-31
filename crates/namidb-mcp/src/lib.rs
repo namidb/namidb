@@ -126,7 +126,9 @@ impl Server {
                 Params::new(),
             ),
             "orphans" => (
-                "MATCH (n:Note) WHERE NOT EXISTS((n)-[:LINKS_TO]-()) \
+                // A note is an orphan only if nothing links to or embeds it
+                // (and it links/embeds nothing), so span both edge types.
+                "MATCH (n:Note) WHERE NOT EXISTS((n)-[:LINKS_TO|:EMBEDS]-()) \
                  RETURN n.title AS title, n.path AS path"
                     .to_string(),
                 Params::new(),
@@ -135,9 +137,13 @@ impl Server {
                 let note = str_arg(args, "note")?;
                 let (cond, p) = note_match("t", &note);
                 (
+                    // Embeds are references too, so backlinks span both types.
+                    // DISTINCT because alternation keeps per-edge multiplicity:
+                    // a note that both links and embeds the target has two
+                    // parallel edges and would otherwise be listed twice.
                     format!(
-                        "MATCH (src:Note)-[:LINKS_TO]->(t:Note) WHERE {cond} \
-                         RETURN src.title AS title, src.path AS path"
+                        "MATCH (src:Note)-[:LINKS_TO|:EMBEDS]->(t:Note) WHERE {cond} \
+                         RETURN DISTINCT src.title AS title, src.path AS path"
                     ),
                     p,
                 )
@@ -154,7 +160,7 @@ impl Server {
                 let (cond, p) = note_match("s", &note);
                 (
                     format!(
-                        "MATCH (s:Note)-[:LINKS_TO*1..{hops}]-(n:Note) WHERE {cond} \
+                        "MATCH (s:Note)-[:LINKS_TO|:EMBEDS*1..{hops}]-(n:Note) WHERE {cond} \
                          RETURN DISTINCT n.title AS title, n.path AS path"
                     ),
                     p,
@@ -373,12 +379,12 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "backlinks",
-            "description": "Notes that link TO the given note (incoming LINKS_TO edges).",
+            "description": "Notes that link to or embed the given note (incoming :LINKS_TO or :EMBEDS edges).",
             "inputSchema": note_arg,
         }),
         json!({
             "name": "neighbors",
-            "description": "Notes within N hops of the given note (undirected, default 1, max 5).",
+            "description": "Notes within N hops of the given note via links or embeds (undirected, default 1, max 5).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -390,7 +396,7 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "orphans",
-            "description": "Notes with no links in or out.",
+            "description": "Notes with no links or embeds in or out.",
             "inputSchema": { "type": "object", "properties": {} },
         }),
         json!({
@@ -427,7 +433,7 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "cypher",
-            "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:TAGGED`). Write queries are rejected.",
+            "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:EMBEDS`/`:TAGGED`). Write queries are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "query": { "type": "string", "description": "A read-only Cypher query" } },
@@ -659,6 +665,33 @@ mod tests {
                 "name {name:?} must not resolve to the empty-key note"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn backlinks_include_embedders() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "embeds ![[B]]\n");
+        write(dir.path(), "B.md", "b\n");
+        // C both links AND embeds B: two parallel edges, must list once.
+        write(dir.path(), "C.md", "link [[B]] and embed ![[B]]\n");
+        let server = Server::open("memory://mcp-embed").await.unwrap();
+        server.load_vault(dir.path()).await.unwrap();
+
+        // Backlinks of B span both edge types; an embedder counts, and a node
+        // that both links and embeds B appears exactly once (DISTINCT).
+        let back = call(&server, "backlinks", json!({ "note": "B" })).await;
+        let mut srcs: Vec<&str> = back
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        srcs.sort();
+        assert_eq!(
+            srcs,
+            vec!["A", "C"],
+            "embedder counts; dual link+embed once"
+        );
     }
 
     #[tokio::test]

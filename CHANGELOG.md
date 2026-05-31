@@ -36,6 +36,13 @@ below and in the release notes.
   (accepts the tag with or without a leading `#`) and `tags_of`, so an agent
   can traverse the tag graph without writing Cypher. The `cypher` tool's
   description now names the `:Note`/`:Tag` and `:LINKS_TO`/`:TAGGED` schema.
+- **Embeds as a distinct edge type.** An embed `![[note]]` now produces an
+  `EMBEDS` edge instead of `LINKS_TO`, so "what does this note embed" is its
+  own relation. Reference traversals span both: the MCP `backlinks`, `neighbors`
+  and `orphans` tools now match `[:LINKS_TO|:EMBEDS]`, so embeds still count as
+  references (an embedder is a backlink, an embed-only note is not an orphan).
+  The load outcome gains `embeds_resolved`, `embeds_dangling` and
+  `embeds_pruned`, surfaced in the CLI and Python client.
 
 ### Changed
 

@@ -12,8 +12,9 @@
 //! faithful clone:
 //!
 //! - Wikilinks `[[Note]]`, `[[Note|alias]]`, `[[Note#heading]]`,
-//!   `[[Note#^block]]`, `[[folder/Note]]` and embeds `![[Note]]` all resolve
-//!   to the target note's basename and produce one `LINKS_TO` edge.
+//!   `[[Note#^block]]`, `[[folder/Note]]` resolve to the target note's basename
+//!   and produce a `LINKS_TO` edge. Embeds `![[Note]]` resolve the same way but
+//!   produce a distinct `EMBEDS` edge instead.
 //! - Standard markdown links `[text](note.md)` to a local `.md`/`.markdown`
 //!   file also produce a `LINKS_TO` edge (basename-resolved, percent-decoded).
 //!   External URLs, mail/other schemes, bare anchors and non-markdown files
@@ -58,9 +59,12 @@ pub struct ParsedNote {
     /// Properties to store on the node: frontmatter plus the engine-owned
     /// `title`, `path`, `body` and `key`.
     pub properties: BTreeMap<String, Value>,
-    /// Normalized keys this note links to (via wikilinks and markdown links),
-    /// deduplicated, in first-seen order.
+    /// Normalized keys this note links to (non-embed wikilinks + markdown
+    /// links), deduplicated, in first-seen order. Becomes `:LINKS_TO` edges.
     pub links: Vec<String>,
+    /// Normalized keys this note embeds (`![[X]]`), deduplicated. Becomes
+    /// `:EMBEDS` edges, kept separate from links.
+    pub embeds: Vec<String>,
     /// String tags on this note (frontmatter `tags` strings + inline `#tags`),
     /// deduplicated. Each becomes a `:Tag` node linked by a `:TAGGED` edge.
     pub tags: Vec<String>,
@@ -188,6 +192,7 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     }
 
     let links = extract_links(body);
+    let embeds = extract_embeds(body);
 
     // The note's string tags (for `:Tag` nodes), taken from the final `tags`
     // property so they stay consistent with what is stored/displayed, then
@@ -216,6 +221,7 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
         rel_path: rel_path.to_string(),
         properties,
         links,
+        embeds,
         tags,
     }
 }
@@ -314,22 +320,47 @@ pub fn extract_wikilinks(body: &str) -> Vec<String> {
     out
 }
 
-/// All note targets a body links to, as normalized keys, deduplicated in
-/// first-seen order. Combines `[[wikilinks]]` with standard markdown links
-/// `[text](note.md)` that point at a local `.md`/`.markdown` file. External
+/// Split wikilink targets into `(links, embeds)` by the `!` embed marker, each
+/// deduplicated in first-seen order. `[[X]]` is a link, `![[X]]` an embed; a
+/// target both linked and embedded in the same note appears in both lists.
+fn classify_wikilinks(body: &str) -> (Vec<String>, Vec<String>) {
+    let masked = mask_code(body);
+    let (mut links, mut embeds) = (Vec::new(), Vec::new());
+    let (mut seen_links, mut seen_embeds) = (HashSet::new(), HashSet::new());
+    for caps in wikilink_regex().captures_iter(&masked) {
+        if let Some(key) = link_target_key(&caps[2]) {
+            if caps[1].is_empty() {
+                if seen_links.insert(key.clone()) {
+                    links.push(key);
+                }
+            } else if seen_embeds.insert(key.clone()) {
+                embeds.push(key);
+            }
+        }
+    }
+    (links, embeds)
+}
+
+/// Note targets a body links to (not embeds), as normalized keys, deduplicated
+/// in first-seen order. Combines non-embed `[[wikilinks]]` with standard
+/// markdown links `[text](note.md)` to a local `.md`/`.markdown` file. External
 /// URLs, mail/other schemes, bare anchors and non-note files are ignored.
 pub fn extract_links(body: &str) -> Vec<String> {
+    let (links, _embeds) = classify_wikilinks(body);
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for key in extract_wikilinks(body)
-        .into_iter()
-        .chain(extract_markdown_links(body))
-    {
+    for key in links.into_iter().chain(extract_markdown_links(body)) {
         if seen.insert(key.clone()) {
             out.push(key);
         }
     }
     out
+}
+
+/// Note targets a body embeds (`![[X]]`), as normalized keys, deduplicated in
+/// first-seen order.
+pub fn extract_embeds(body: &str) -> Vec<String> {
+    classify_wikilinks(body).1
 }
 
 /// Markdown-link targets (`[text](note.md)`) that resolve to a local note, as
@@ -624,6 +655,15 @@ mod tests {
         let body = "Links: [[Alpha]], [[Beta|the beta]], [[Gamma#section]], [[notes/Delta]], ![[Epsilon]] and [[#self]].";
         let links = extract_wikilinks(body);
         assert_eq!(links, vec!["alpha", "beta", "gamma", "delta", "epsilon"]);
+    }
+
+    #[test]
+    fn embeds_are_separated_from_links() {
+        let body = "link [[A]], embed ![[B]], md [C](C.md), embed-md image ![](D.md)";
+        // Links: non-embed wikilink A + markdown link C. Image (`![]()`) is not
+        // a note link. Embed B goes to embeds only.
+        assert_eq!(extract_links(body), vec!["a", "c"]);
+        assert_eq!(extract_embeds(body), vec!["b"]);
     }
 
     #[test]

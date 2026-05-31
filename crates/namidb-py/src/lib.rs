@@ -380,8 +380,9 @@ impl Client {
     /// `:TAGGED` edges, so tag traversals run on the graph.
     ///
     /// Returns a dict with `notes_loaded`, `links_resolved`, `links_dangling`,
-    /// `name_collisions`, `notes_pruned`, `links_pruned`, `tags_loaded`,
-    /// `tag_links`, `tags_pruned`, `tag_links_pruned` and `commit_batches`.
+    /// `embeds_resolved`, `embeds_dangling`, `name_collisions`, `notes_pruned`,
+    /// `links_pruned`, `embeds_pruned`, `tags_loaded`, `tag_links`,
+    /// `tags_pruned`, `tag_links_pruned` and `commit_batches`.
     #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false))]
     fn load_vault(
         &self,
@@ -413,9 +414,12 @@ impl Client {
         d.set_item("notes_loaded", outcome.notes_loaded)?;
         d.set_item("links_resolved", outcome.links_resolved)?;
         d.set_item("links_dangling", outcome.links_dangling)?;
+        d.set_item("embeds_resolved", outcome.embeds_resolved)?;
+        d.set_item("embeds_dangling", outcome.embeds_dangling)?;
         d.set_item("name_collisions", outcome.name_collisions)?;
         d.set_item("notes_pruned", outcome.notes_pruned)?;
         d.set_item("links_pruned", outcome.links_pruned)?;
+        d.set_item("embeds_pruned", outcome.embeds_pruned)?;
         d.set_item("tags_loaded", outcome.tags_loaded)?;
         d.set_item("tag_links", outcome.tag_links)?;
         d.set_item("tags_pruned", outcome.tags_pruned)?;

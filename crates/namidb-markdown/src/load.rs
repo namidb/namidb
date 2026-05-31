@@ -1,9 +1,10 @@
 //! Ingest a parsed vault into a [`WriterSession`] as a graph.
 //!
-//! Each note becomes a node (default label `Note`); each resolved wikilink
-//! becomes an edge (default type `LINKS_TO`). Dangling links (targets with no
-//! matching note) are counted but produce no edge, so every edge endpoint is a
-//! real note and queries like "orphan notes" or "backlinks" stay clean.
+//! Each note becomes a node (default label `Note`); each resolved link becomes
+//! a `LINKS_TO` edge and each resolved embed (`![[X]]`) a distinct `EMBEDS`
+//! edge. Dangling targets (no matching note) are counted but produce no edge,
+//! so every edge endpoint is a real note and queries like "orphan notes" or
+//! "backlinks" stay clean.
 //!
 //! Each distinct string tag on a note becomes a shared `:Tag` node (one per
 //! tag name), linked from the note by a `:TAGGED` edge, so tag-traversal
@@ -32,6 +33,8 @@ use crate::parse::{parse_vault, VaultGraph};
 
 const DEFAULT_LABEL: &str = "Note";
 const DEFAULT_EDGE_TYPE: &str = "LINKS_TO";
+/// Edge type for note embeds (`![[X]]`), kept distinct from `LINKS_TO`. Fixed.
+const EMBED_EDGE_TYPE: &str = "EMBEDS";
 /// Label for tag nodes and the edge type linking a note to its tags. These are
 /// fixed (not configurable) so the tag sub-graph has a stable shape.
 const TAG_LABEL: &str = "Tag";
@@ -52,9 +55,9 @@ pub struct LoadOptions {
     pub commit_every: usize,
     /// Mirror the vault instead of merging into it: tombstone every node and
     /// edge the vault no longer contains, across the note graph (`label` /
-    /// `edge_type`) and the tag graph (`Tag` / `TAGGED`). `false` (default)
-    /// keeps the load additive. Pruning only touches those labels/types, so
-    /// unrelated data in the namespace is left alone.
+    /// `edge_type` / `EMBEDS`) and the tag graph (`Tag` / `TAGGED`). `false`
+    /// (default) keeps the load additive. Pruning only touches those
+    /// labels/types, so unrelated data in the namespace is left alone.
     pub prune: bool,
 }
 
@@ -74,19 +77,26 @@ impl Default for LoadOptions {
 pub struct VaultLoadOutcome {
     /// Notes upserted as nodes.
     pub notes_loaded: usize,
-    /// Wikilinks that resolved to a known note and produced an edge.
+    /// Non-embed wikilinks/markdown links that resolved to a known note and
+    /// produced a `LINKS_TO` edge.
     pub links_resolved: usize,
-    /// Wikilinks whose target was not a known note (no edge written).
+    /// Link targets that were not a known note (no edge written).
     pub links_dangling: usize,
+    /// Embeds (`![[X]]`) that resolved to a known note and produced an
+    /// `EMBEDS` edge.
+    pub embeds_resolved: usize,
+    /// Embed targets that were not a known note (no edge written).
+    pub embeds_dangling: usize,
     /// Notes whose normalized key collided with an earlier note (last write
     /// wins; surfaced so silent overwrites are visible).
     pub name_collisions: usize,
     /// Stale nodes tombstoned because they are no longer in the vault (only
     /// non-zero when [`LoadOptions::prune`] is set).
     pub notes_pruned: usize,
-    /// Stale edges tombstoned because they are no longer in the vault (only
-    /// non-zero when [`LoadOptions::prune`] is set).
+    /// Stale `LINKS_TO` edges tombstoned (prune only).
     pub links_pruned: usize,
+    /// Stale `EMBEDS` edges tombstoned (prune only).
+    pub embeds_pruned: usize,
     /// Distinct `:Tag` nodes upserted (the union of all notes' tags).
     pub tags_loaded: usize,
     /// `:TAGGED` edges upserted (note -> tag).
@@ -128,16 +138,25 @@ pub async fn load_graph(
         }
     }
 
-    // Resolve every wikilink once: the edge list the vault wants, plus a count
-    // of links that point nowhere.
+    // Resolve links and embeds once: the edge lists the vault wants, plus
+    // counts of targets that point nowhere.
     let mut desired_edges: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut desired_embed_edges: Vec<(NodeId, NodeId)> = Vec::new();
     let mut dangling = 0usize;
+    let mut embeds_dangling = 0usize;
     for note in &graph.notes {
         for target in &note.links {
             if known.contains(target.as_str()) {
                 desired_edges.push((note.id, stable_node_id(target)));
             } else {
                 dangling += 1;
+            }
+        }
+        for target in &note.embeds {
+            if known.contains(target.as_str()) {
+                desired_embed_edges.push((note.id, stable_node_id(target)));
+            } else {
+                embeds_dangling += 1;
             }
         }
     }
@@ -157,6 +176,7 @@ pub async fn load_graph(
     let mut outcome = VaultLoadOutcome {
         name_collisions: collisions,
         links_dangling: dangling,
+        embeds_dangling,
         ..Default::default()
     };
     let mut rows_since_commit = 0usize;
@@ -166,14 +186,18 @@ pub async fn load_graph(
     if opts.prune {
         let desired_nodes: HashSet<NodeId> = graph.notes.iter().map(|n| n.id).collect();
         let desired_edge_set: HashSet<(NodeId, NodeId)> = desired_edges.iter().copied().collect();
+        let desired_embed_set: HashSet<(NodeId, NodeId)> =
+            desired_embed_edges.iter().copied().collect();
         let desired_tag_set: HashSet<NodeId> = desired_tags.keys().copied().collect();
         let desired_tagged_set: HashSet<(NodeId, NodeId)> =
             desired_tagged.iter().copied().collect();
 
         type IdVec = Vec<NodeId>;
         type PairVec = Vec<(NodeId, NodeId)>;
-        let (existing_nodes, existing_edges, existing_tags, existing_tagged): (
+        #[allow(clippy::type_complexity)]
+        let (existing_nodes, existing_edges, existing_embeds, existing_tags, existing_tagged): (
             IdVec,
+            PairVec,
             PairVec,
             IdVec,
             PairVec,
@@ -187,6 +211,10 @@ pub async fn load_graph(
                 .scan_edge_type(&opts.edge_type)
                 .await
                 .map_err(|e| anyhow::anyhow!("scan {} edges: {e}", opts.edge_type))?;
+            let embeds = snap
+                .scan_edge_type(EMBED_EDGE_TYPE)
+                .await
+                .map_err(|e| anyhow::anyhow!("scan {EMBED_EDGE_TYPE} edges: {e}"))?;
             let tags = snap
                 .scan_label(TAG_LABEL)
                 .await
@@ -198,6 +226,7 @@ pub async fn load_graph(
             (
                 nodes.iter().map(|n| n.id).collect(),
                 edges.iter().map(|e| (e.src, e.dst)).collect(),
+                embeds.iter().map(|e| (e.src, e.dst)).collect(),
                 tags.iter().map(|n| n.id).collect(),
                 tagged.iter().map(|e| (e.src, e.dst)).collect(),
             )
@@ -215,6 +244,14 @@ pub async fn load_graph(
             if !desired_edge_set.contains(&(src, dst)) {
                 writer.tombstone_edge(opts.edge_type.clone(), src, dst)?;
                 outcome.links_pruned += 1;
+                rows_since_commit += 1;
+                maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+            }
+        }
+        for (src, dst) in existing_embeds {
+            if !desired_embed_set.contains(&(src, dst)) {
+                writer.tombstone_edge(EMBED_EDGE_TYPE, src, dst)?;
+                outcome.embeds_pruned += 1;
                 rows_since_commit += 1;
                 maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
             }
@@ -256,6 +293,13 @@ pub async fn load_graph(
         maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
     }
     outcome.links_resolved = desired_edges.len();
+
+    for (src, dst) in &desired_embed_edges {
+        writer.upsert_edge(EMBED_EDGE_TYPE, *src, *dst, &edge_record)?;
+        rows_since_commit += 1;
+        maybe_commit(writer, opts, &mut rows_since_commit, &mut outcome).await?;
+    }
+    outcome.embeds_resolved = desired_embed_edges.len();
 
     for (tag_id, name) in &desired_tags {
         let mut props = BTreeMap::new();
@@ -529,5 +573,67 @@ mod tests {
         assert_eq!(out.tags_pruned, 1, "unused db tag node removed");
         assert_eq!(out.tag_links_pruned, 1, "A->db edge removed");
         assert_eq!(tag_names(&writer).await, vec!["rust"]);
+    }
+
+    #[tokio::test]
+    async fn embeds_use_a_distinct_edge_type() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "link [[B]] and embed ![[C]]\n");
+        write(dir, "B.md", "b\n");
+        write(dir, "C.md", "c\n");
+
+        let mut writer = open("vault-embeds").await;
+        let out = load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.links_resolved, 1, "A->B is a LINKS_TO");
+        assert_eq!(out.embeds_resolved, 1, "A->C is an EMBEDS");
+
+        let snap = writer.snapshot();
+        let a = stable_node_id("a");
+        let links = snap.out_edges("LINKS_TO", a).await.unwrap();
+        assert_eq!(links.edges.len(), 1);
+        assert_eq!(links.edges[0].dst, stable_node_id("b"));
+        let embeds = snap.out_edges("EMBEDS", a).await.unwrap();
+        assert_eq!(embeds.edges.len(), 1);
+        assert_eq!(embeds.edges[0].dst, stable_node_id("c"));
+    }
+
+    #[tokio::test]
+    async fn prune_removes_stale_embeds() {
+        let vault = TempDir::new().unwrap();
+        let dir = vault.path();
+        write(dir, "A.md", "embed ![[B]]\n");
+        write(dir, "B.md", "b\n");
+
+        let mut writer = open("vault-embedprune").await;
+        load_vault(dir, &mut writer, &LoadOptions::default())
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Drop the embed; reload with prune.
+        write(dir, "A.md", "no embed now\n");
+        let opts = LoadOptions {
+            prune: true,
+            ..Default::default()
+        };
+        let out = load_vault(dir, &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        assert_eq!(out.embeds_resolved, 0);
+        assert_eq!(out.embeds_pruned, 1, "stale A->B embed tombstoned");
+        let snap = writer.snapshot();
+        assert_eq!(
+            snap.out_edges("EMBEDS", stable_node_id("a"))
+                .await
+                .unwrap()
+                .edges
+                .len(),
+            0
+        );
     }
 }
