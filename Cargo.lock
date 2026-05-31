@@ -2203,6 +2203,8 @@ dependencies = [
  "namidb-markdown",
  "namidb-query",
  "namidb-storage",
+ "notify",
+ "notify-debouncer-full",
  "serde",
  "serde_json",
  "tempfile",

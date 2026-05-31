@@ -26,6 +26,8 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

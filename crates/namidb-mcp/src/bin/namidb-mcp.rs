@@ -22,6 +22,10 @@ struct Args {
     /// --placeholders`. Only meaningful with `--vault`.
     #[arg(long, default_value_t = false)]
     placeholders: bool,
+    /// Keep the graph live: after the initial load, watch the vault and
+    /// re-sync incrementally on every change while serving. Requires `--vault`.
+    #[arg(long, default_value_t = false, requires = "vault")]
+    watch: bool,
 }
 
 #[tokio::main]
@@ -48,6 +52,10 @@ async fn main() -> anyhow::Result<()> {
             outcome.links_dangling,
             outcome.placeholders_created
         );
+        if args.watch {
+            server.watch_vault(std::path::Path::new(vault), args.placeholders)?;
+            eprintln!("watching {vault} for changes (graph stays live while serving)");
+        }
     }
     namidb_mcp::serve_stdio(server).await
 }

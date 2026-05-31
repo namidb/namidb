@@ -94,6 +94,76 @@ impl Server {
         Ok(outcome)
     }
 
+    /// Spawn a background task that watches `dir` and keeps the graph synced
+    /// with it, so an agent's queries reflect edits made while the server runs.
+    /// Returns immediately; the task runs until the process exits. Each change
+    /// takes the writer lock only for its incremental sync and commit, then
+    /// republishes the snapshot, so reads (which never take that lock) keep
+    /// serving throughout. The debounced batch is only a trigger: the sync
+    /// re-walks and re-hashes, so a missed or coalesced event never desyncs the
+    /// graph.
+    pub fn watch_vault(&self, dir: &Path, placeholders: bool) -> anyhow::Result<()> {
+        use notify::{RecursiveMode, Watcher};
+        use notify_debouncer_full::new_debouncer;
+        use std::time::Duration;
+
+        let session = self.session.clone();
+        let snapshot = self.snapshot.clone();
+        let dir = dir.to_path_buf();
+        let opts = namidb_markdown::LoadOptions {
+            prune: true,
+            placeholders,
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut debouncer = new_debouncer(Duration::from_millis(400), None, move |res| {
+            let _ = tx.send(res);
+        })
+        .map_err(|e| anyhow::anyhow!("watcher: {e}"))?;
+        debouncer
+            .watcher()
+            .watch(&dir, RecursiveMode::Recursive)
+            .map_err(|e| anyhow::anyhow!("watch {}: {e}", dir.display()))?;
+
+        tokio::spawn(async move {
+            // Keep the debouncer alive for the lifetime of the task; dropping it
+            // stops the watch.
+            let _debouncer = debouncer;
+            while let Some(event) = rx.recv().await {
+                let batch = match event {
+                    Ok(batch) => batch,
+                    Err(errs) => {
+                        eprintln!("watch error: {errs:?}");
+                        continue;
+                    }
+                };
+                let _ = batch; // advisory only; the sync re-walks the vault
+                let mut guard = session.lock().await;
+                let out = match namidb_markdown::sync_vault(&dir, &mut guard, &opts).await {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("watch sync failed: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = guard.commit_batch().await {
+                    eprintln!("watch sync commit failed: {e}");
+                    continue;
+                }
+                snapshot.store(guard.owned_snapshot());
+                drop(guard);
+                if out.notes_added + out.notes_modified + out.notes_deleted > 0 {
+                    eprintln!(
+                        "watch sync: +{} ~{} -{} ={}",
+                        out.notes_added, out.notes_modified, out.notes_deleted, out.notes_unchanged,
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Handle one JSON-RPC method and return its `result` value, or an
     /// [`RpcError`]. Notifications (methods under `notifications/`) return
     /// `Ok(Value::Null)`; the caller drops the value because notifications
