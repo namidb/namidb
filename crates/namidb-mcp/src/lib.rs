@@ -129,7 +129,11 @@ impl Server {
     async fn call_tool(&self, name: &str, args: &Value) -> Result<String, String> {
         let (cypher, params): (String, Params) = match name {
             "list_notes" => (
-                "MATCH (n:Note) RETURN n.title AS title, n.path AS path ORDER BY n.title LIMIT 500"
+                // `placeholder IS NULL` keeps unresolved-reference stubs (which
+                // have no path/body) out of the real-note listing; the `cypher`
+                // tool can still reach them via `WHERE n.placeholder = true`.
+                "MATCH (n:Note) WHERE n.placeholder IS NULL \
+                 RETURN n.title AS title, n.path AS path ORDER BY n.title LIMIT 500"
                     .to_string(),
                 Params::new(),
             ),
@@ -167,8 +171,11 @@ impl Server {
                     .clamp(1, 5);
                 let (cond, p) = note_match("s", &note);
                 (
+                    // Exclude placeholder stubs from the returned neighbors so a
+                    // dangling `[[ref]]` does not surface as a pathless note.
                     format!(
-                        "MATCH (s:Note)-[:LINKS_TO|:EMBEDS*1..{hops}]-(n:Note) WHERE {cond} \
+                        "MATCH (s:Note)-[:LINKS_TO|:EMBEDS*1..{hops}]-(n:Note) \
+                         WHERE ({cond}) AND n.placeholder IS NULL \
                          RETURN DISTINCT n.title AS title, n.path AS path"
                     ),
                     p,
@@ -179,7 +186,11 @@ impl Server {
                 let mut p = Params::new();
                 p.insert("text".to_string(), RuntimeValue::String(text));
                 (
-                    "MATCH (n:Note) WHERE n.body CONTAINS $text OR n.title CONTAINS $text \
+                    // Stubs have no body and a kebab-cased title; keep them out
+                    // of search hits.
+                    "MATCH (n:Note) \
+                     WHERE (n.body CONTAINS $text OR n.title CONTAINS $text) \
+                       AND n.placeholder IS NULL \
                      RETURN n.title AS title, n.path AS path LIMIT 100"
                         .to_string(),
                     p,
@@ -190,9 +201,11 @@ impl Server {
                 let (cond, p) = note_match("n", &note);
                 (
                     // ORDER BY before LIMIT 1 so the winner is deterministic
-                    // when more than one note matches the disjunction.
+                    // when more than one note matches the disjunction. The
+                    // placeholder guard means a get_note on an unresolved
+                    // reference returns nothing rather than a pathless stub.
                     format!(
-                        "MATCH (n:Note) WHERE {cond} \
+                        "MATCH (n:Note) WHERE ({cond}) AND n.placeholder IS NULL \
                          RETURN n.title AS title, n.path AS path, n.body AS body \
                          ORDER BY n.path LIMIT 1"
                     ),
@@ -724,6 +737,45 @@ mod tests {
             .filter_map(|r| r["title"].as_str())
             .collect();
         assert_eq!(titles, vec!["missing"], "stub reachable via cypher");
+    }
+
+    #[tokio::test]
+    async fn note_listing_tools_hide_placeholder_stubs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[Missing]]\n");
+        let server = Server::open("memory://mcp-ph-guard").await.unwrap();
+        server.load_vault(dir.path(), true).await.unwrap();
+
+        // list_notes shows only the real note, not the `missing` stub.
+        let notes = call(&server, "list_notes", json!({})).await;
+        let listed: Vec<&str> = notes
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert_eq!(listed, vec!["A"], "stub excluded from list_notes");
+
+        // get_note on the unresolved reference returns nothing, not a stub.
+        let got = call(&server, "get_note", json!({ "note": "Missing" })).await;
+        assert!(
+            got.as_array().unwrap().is_empty(),
+            "get_note must not return a placeholder stub"
+        );
+
+        // search on the stub's own (kebab) title finds nothing.
+        let hits = call(&server, "search", json!({ "text": "missing" })).await;
+        assert!(
+            hits.as_array().unwrap().is_empty(),
+            "search must not surface a placeholder stub"
+        );
+
+        // neighbors of A excludes the pathless stub.
+        let neighbors = call(&server, "neighbors", json!({ "note": "A" })).await;
+        assert!(
+            neighbors.as_array().unwrap().is_empty(),
+            "a dangling ref must not appear as a neighbor"
+        );
     }
 
     #[tokio::test]
