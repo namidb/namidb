@@ -141,13 +141,16 @@ pub fn parse_note(rel_path: &str, raw: &str) -> ParsedNote {
     let title = note_title(rel_path);
     let key = normalize_key(&title);
 
-    // Engine-owned properties. `title` defers to a frontmatter title if the
-    // author set one; `path`, `body` and `key` are authoritative. `key` is the
-    // normalized resolution key, stored so a query can resolve a note by name
-    // (kebab/snake/spaces) without re-implementing the normalization.
-    properties
-        .entry("title".to_string())
-        .or_insert_with(|| Value::Str(title.clone()));
+    // Engine-owned properties. `title` defers to a frontmatter title only if
+    // the author set one *as a string*; a non-string `title:` (e.g. a bare
+    // `title: 2025` that YAML types as an integer) falls back to the file stem
+    // so `title` is always a string and readers can `as_str()` it. `path`,
+    // `body` and `key` are authoritative. `key` is the normalized resolution
+    // key, stored so a query can resolve a note by name (kebab/snake/spaces)
+    // without re-implementing the normalization.
+    if !matches!(properties.get("title"), Some(Value::Str(_))) {
+        properties.insert("title".to_string(), Value::Str(title.clone()));
+    }
     properties.insert("path".to_string(), Value::Str(rel_path.to_string()));
     properties.insert("body".to_string(), Value::Str(body.to_string()));
     properties.insert("key".to_string(), Value::Str(key.clone()));
@@ -603,6 +606,24 @@ mod tests {
         assert_eq!(
             note.properties.get("role"),
             Some(&Value::Str("founder".into()))
+        );
+    }
+
+    #[test]
+    fn non_string_frontmatter_title_falls_back_to_stem() {
+        // A bare `title: 2025` types as an integer in YAML; storing it would
+        // break readers that expect `title` to be a string, so fall back to
+        // the file stem.
+        let note = parse_note("My Note.md", "---\ntitle: 2025\n---\nbody\n");
+        assert_eq!(
+            note.properties.get("title"),
+            Some(&Value::Str("My Note".into()))
+        );
+        // A string frontmatter title is still honored.
+        let custom = parse_note("My Note.md", "---\ntitle: Custom\n---\nbody\n");
+        assert_eq!(
+            custom.properties.get("title"),
+            Some(&Value::Str("Custom".into()))
         );
     }
 
