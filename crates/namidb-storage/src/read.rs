@@ -4221,6 +4221,7 @@ mod tests {
             bloom: Some(bloom_desc),
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         };
 
         let empty = Memtable::new();
@@ -4245,6 +4246,7 @@ mod tests {
             bloom: None,
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
             ..descriptor.clone()
         };
         assert!(snap
@@ -4573,6 +4575,7 @@ mod tests {
             bloom: None::<BloomDescriptor>,
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         });
         let mt = Memtable::new();
         let view = mt.snapshot_view();

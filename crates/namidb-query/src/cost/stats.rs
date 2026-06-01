@@ -584,6 +584,7 @@ mod tests {
             bloom: None,
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         }
     }
 
@@ -619,6 +620,7 @@ mod tests {
             bloom: None,
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         }
     }
 
@@ -652,6 +654,7 @@ mod tests {
             schema,
             ssts: vec![],
             wal_segments: vec![],
+            label_dict: Default::default(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").expect("Person seeded");
@@ -693,6 +696,7 @@ mod tests {
             schema,
             ssts: vec![sst1, sst2],
             wal_segments: vec![],
+            label_dict: Default::default(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").unwrap();
@@ -745,6 +749,7 @@ mod tests {
             schema,
             ssts: vec![fwd, inv],
             wal_segments: vec![],
+            label_dict: Default::default(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let k = cat.edge_type("KNOWS").unwrap();
@@ -775,6 +780,7 @@ mod tests {
             schema: Schema::empty(),
             ssts: vec![sst],
             wal_segments: vec![],
+            label_dict: Default::default(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let u = cat.label("Unknown").unwrap();
@@ -800,6 +806,7 @@ mod tests {
             schema,
             ssts: vec![],
             wal_segments: vec![],
+            label_dict: Default::default(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let names: Vec<_> = cat.label_names().collect();

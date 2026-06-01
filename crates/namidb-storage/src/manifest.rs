@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-use namidb_core::Schema;
+use namidb_core::{LabelDictionary, Schema};
 
 use crate::error::{Error, Result};
 use crate::fence::{Epoch, WriterFence};
@@ -57,6 +57,14 @@ pub struct Manifest {
     /// flushed into SSTs yet).
     #[serde(default)]
     pub wal_segments: Vec<WalSegmentDescriptor>,
+    /// Namespace-wide dictionary mapping every label name to a stable,
+    /// compact [`LabelId`](namidb_core::LabelId). A multi-label node carries
+    /// its labels on-row as packed `LabelId`s; this is the source of truth
+    /// that resolves them back to names. Append-only, cloned forward on every
+    /// commit. Empty for older manifests (`serde(default)` round-trips them
+    /// unchanged).
+    #[serde(default)]
+    pub label_dict: LabelDictionary,
 }
 
 impl Manifest {
@@ -70,6 +78,7 @@ impl Manifest {
             schema: Schema::empty(),
             ssts: Vec::new(),
             wal_segments: Vec::new(),
+            label_dict: LabelDictionary::new(),
         }
     }
 
@@ -85,6 +94,7 @@ impl Manifest {
             schema: self.schema.clone(),
             ssts: self.ssts.clone(),
             wal_segments: self.wal_segments.clone(),
+            label_dict: self.label_dict.clone(),
         }
     }
 }
@@ -214,6 +224,15 @@ pub struct SstDescriptor {
     // SSTs and older manifests (`serde(default)`).
     #[serde(default)]
     pub equality_property_indices: Vec<EqualityIndexDescriptor>,
+    // Label-index side-car pointer (multi-label nodes). Once node SSTs stop
+    // being partitioned by label, `scan_label(L)` can no longer just read the
+    // SSTs whose scope is `L`; instead each node SST ships one sidecar mapping
+    // `LabelId → posting list of NodeIds` so the reader can union across SSTs
+    // and confirm by id. `None` for edge SSTs and for legacy single-label node
+    // SSTs (whose `scope` still names their one label); `serde(default)` keeps
+    // older manifests loading unchanged.
+    #[serde(default)]
+    pub label_index: Option<LabelIndexDescriptor>,
 }
 
 /// Side-car pointer for a single `(SST, unique property)` pair. The
@@ -252,6 +271,27 @@ pub struct EqualityIndexDescriptor {
     pub size_bytes: u64,
     /// Number of distinct values in the sidecar (posting-list keys).
     pub distinct_values: u64,
+}
+
+/// Side-car pointer for a node SST's label index. The sidecar body is a
+/// bincode-serialised `BTreeMap<u32, Vec<[u8; 16]>>` — a posting list of
+/// NodeIds per [`LabelId`](namidb_core::LabelId), with both the keys and each
+/// posting list sorted. It replaces the old "the SST partition IS the label
+/// index" arrangement once a single node SST spans every label: the reader
+/// resolves `scan_label(L)` by unioning the posting lists for `L`'s id across
+/// all node SSTs (plus the memtable) and confirming each candidate by id.
+/// Tombstones contribute nothing; last-LSN-wins at confirm time handles
+/// removal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelIndexDescriptor {
+    /// Object-store path relative to the namespace prefix.
+    pub path: String,
+    /// On-disk size of the sidecar body.
+    pub size_bytes: u64,
+    /// Number of distinct labels (posting-list keys) in the sidecar.
+    pub label_count: u64,
+    /// Total number of `(label, NodeId)` postings across every key.
+    pub posting_count: u64,
 }
 
 /// JSON serde helper: `[u8; 16]` ↔ base64-standard string.
@@ -953,6 +993,7 @@ mod tests {
             }),
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         }
     }
 
@@ -985,6 +1026,7 @@ mod tests {
             bloom: None, // small SST → no side-car
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            label_index: None,
         }
     }
 
@@ -1032,6 +1074,32 @@ mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         let back: Manifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn manifest_without_multilabel_fields_loads_with_defaults() {
+        // Back-compat contract of the inert prep step: a manifest written
+        // before multi-label has no top-level `label_dict`, and its SST
+        // descriptors have no `label_index`. Both must default cleanly (empty
+        // dict / None) via `serde(default)` so existing namespaces keep
+        // loading unchanged.
+        let mut m = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        m.ssts.push(sample_node_descriptor());
+        let mut value = serde_json::to_value(&m).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("label_dict");
+        for sst in obj["ssts"].as_array_mut().unwrap() {
+            sst.as_object_mut().unwrap().remove("label_index");
+        }
+        let back: Manifest = serde_json::from_value(value).unwrap();
+        assert!(
+            back.label_dict.is_empty(),
+            "missing label_dict must default empty"
+        );
+        assert!(
+            back.ssts[0].label_index.is_none(),
+            "missing label_index must default to None"
+        );
     }
 
     #[test]
