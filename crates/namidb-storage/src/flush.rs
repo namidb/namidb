@@ -606,6 +606,7 @@ fn prepare_node_pending(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
+        label_index: None,
     };
 
     Ok(PendingSst {
@@ -823,6 +824,7 @@ fn prepare_edge_pending(
         bloom: bloom_descriptor,
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
+        label_index: None,
     };
 
     PendingSst {

@@ -511,6 +511,7 @@ async fn put_node_sst_l1(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
+        label_index: None,
     };
     Ok((descriptor, wrote_bloom))
 }
@@ -577,6 +578,7 @@ async fn put_edge_sst_l1(
         bloom: bloom_descriptor,
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
+        label_index: None,
     };
     Ok((descriptor, wrote_bloom))
 }
