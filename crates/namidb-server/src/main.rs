@@ -43,6 +43,36 @@ struct Cli {
     )]
     flush_interval: Duration,
 
+    /// Interval at which the background maintenance task compacts L0 SSTs
+    /// (collapsing each bucket to a single L1 SST to keep read
+    /// amplification bounded) and then sweeps orphaned SST bodies. Set to
+    /// `0s` to disable maintenance entirely.
+    #[arg(
+        long,
+        env = "NAMIDB_COMPACTION_INTERVAL",
+        default_value = "300s",
+        value_parser = humantime::parse_duration,
+    )]
+    compaction_interval: Duration,
+
+    /// Minimum age an orphaned SST body must reach before the sweep may
+    /// delete it. This is the only guard against removing a file a slow
+    /// reader's pinned snapshot still references, so keep it comfortably
+    /// above the longest expected query/snapshot lifetime.
+    #[arg(
+        long,
+        env = "NAMIDB_SWEEP_MIN_AGE",
+        default_value = "24h",
+        value_parser = humantime::parse_duration,
+    )]
+    sweep_min_age: Duration,
+
+    /// Actually delete orphaned SST bodies during the sweep. Off by
+    /// default: the sweep runs as a dry-run and only logs what it would
+    /// free, so an operator can review the volume before opting in.
+    #[arg(long, env = "NAMIDB_SWEEP_DELETE", default_value_t = false)]
+    sweep_delete: bool,
+
     /// Address for the Bolt protocol listener (Neo4j driver
     /// compatibility). When omitted the protocol is off and the
     /// server is HTTP-only. The canonical Bolt port is 7687.
@@ -64,6 +94,9 @@ fn main() -> anyhow::Result<()> {
         listen: cli.listen,
         auth_token: cli.auth_token,
         flush_interval: cli.flush_interval,
+        compaction_interval: cli.compaction_interval,
+        sweep_min_age: cli.sweep_min_age,
+        sweep_delete: cli.sweep_delete,
         bolt_listen: cli.bolt_listen,
     };
 

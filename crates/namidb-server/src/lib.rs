@@ -27,7 +27,7 @@ use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
     StatsCatalog, WriteOutcome,
 };
-use namidb_storage::{Manifest, SnapshotCell, WriterSession};
+use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -39,6 +39,16 @@ pub struct Config {
     /// long random secret.
     pub auth_token: Option<String>,
     pub flush_interval: Duration,
+    /// Interval for the background maintenance task (L0->L1 compaction +
+    /// orphan sweep). `Duration::ZERO` disables it.
+    pub compaction_interval: Duration,
+    /// Minimum age before the orphan sweep may delete an unreferenced SST
+    /// body — the sole guard against deleting a file a slow reader's pinned
+    /// snapshot still references.
+    pub sweep_min_age: Duration,
+    /// When `false` the orphan sweep is a dry-run (logs what it would free
+    /// without deleting). Operators opt in after reviewing the volume.
+    pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
 }
@@ -131,6 +141,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         store = %config.store_uri,
         "opening namespace"
     );
+    // A `ManifestStore` for the background orphan sweep, which loads the
+    // committed manifest itself without the writer lock. Built from the
+    // same `(store, paths)` before `open` consumes them.
+    let maint_manifest_store = ManifestStore::new(store.clone(), paths.clone());
     let writer = WriterSession::open(store, paths).await?;
 
     let state = AppState::new(writer, config.auth_token.clone(), namespace);
@@ -149,6 +163,62 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 match w.flush(schema).await {
                     Ok(_) => state_for_flush.snapshot.store(w.owned_snapshot()),
                     Err(e) => error!(error = %e, "periodic flush failed"),
+                }
+            }
+        });
+    }
+
+    // Periodic background maintenance: compact L0 SSTs to L1 (bounds read
+    // amplification), then sweep orphaned SST bodies left behind by
+    // compaction. Compaction is a writer mutation, so it goes through the
+    // ONE writer lock — never a second `WriterSession`, which would bump the
+    // epoch and fence the foreground writer. The sweep takes no lock (it
+    // reads the committed manifest itself) and is gated to a dry-run by
+    // default; `sweep_min_age` is the only thing keeping it from deleting a
+    // body a slow reader's pinned snapshot still references.
+    if config.compaction_interval > Duration::ZERO {
+        let state_for_maint = state.clone();
+        let interval = config.compaction_interval;
+        let sweep_min_age = config.sweep_min_age;
+        let sweep_delete = config.sweep_delete;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // first tick fires immediately; skip.
+            loop {
+                tick.tick().await;
+                // Compaction under the writer lock. `compact_l0` self-no-ops
+                // below 2 L0 SSTs per bucket, so an idle tick is cheap and
+                // does not commit. Republish only when it actually merged,
+                // so reads pick up the new L1 SST and release the removed L0
+                // descriptors.
+                {
+                    let mut w = state_for_maint.writer.lock().await;
+                    let schema = w.snapshot().manifest().manifest.schema.clone();
+                    match w.compact_l0(&schema).await {
+                        Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                            state_for_maint.snapshot.store(w.owned_snapshot());
+                            info!(
+                                removed = outcome.source_ssts_removed,
+                                written = outcome.new_ssts_written,
+                                "compacted L0 into L1"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => error!(error = %e, "periodic compaction failed"),
+                    }
+                }
+                // Orphan sweep — no writer lock. `max_level = 1` because the
+                // engine only produces L0 + L1 today.
+                match sweep_orphans(&maint_manifest_store, sweep_min_age, 1, sweep_delete).await {
+                    Ok(report) if report.orphans_found > 0 => info!(
+                        found = report.orphans_found,
+                        deleted = report.orphans_deleted,
+                        bytes_freed = report.bytes_freed,
+                        dry_run = !sweep_delete,
+                        "orphan sweep"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => error!(error = %e, "orphan sweep failed"),
                 }
             }
         });
