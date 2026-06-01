@@ -43,7 +43,7 @@
 //! relevant for selective predicate push-down rather than
 //! correctness.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
@@ -80,10 +80,15 @@ use crate::sst::nodes::{
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
 /// Projection of a node row materialised by the read path.
+///
+/// A node carries a *set* of labels. Today the set always has exactly one
+/// member (the SST scope it was read from); multi-label nodes will populate it
+/// from the on-row label column in a later step. Storing a set now lets the
+/// query layer match `(n:A:B)` as set-membership without another type flip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeView {
     pub id: NodeId,
-    pub label: String,
+    pub labels: BTreeSet<String>,
     pub properties: BTreeMap<String, Value>,
     pub lsn: u64,
     pub schema_version: u64,
@@ -1449,7 +1454,7 @@ impl<'mt> Snapshot<'mt> {
                     }
                     let view = NodeView {
                         id: row_id,
-                        label: label.to_string(),
+                        labels: BTreeSet::from([label.to_string()]),
                         properties,
                         lsn,
                         schema_version: sv_col.value(row),
@@ -2339,7 +2344,7 @@ fn node_view_from_payload(
     let rec = NodeWriteRecord::decode(payload)?;
     Ok(NodeView {
         id,
-        label,
+        labels: BTreeSet::from([label]),
         properties: rec.properties,
         lsn,
         schema_version: rec.schema_version,
@@ -2441,7 +2446,7 @@ fn find_node_row_in_batches(
                 lsn,
                 Some(NodeView {
                     id: target,
-                    label: label.to_string(),
+                    labels: BTreeSet::from([label.to_string()]),
                     properties,
                     lsn,
                     schema_version,
@@ -2524,7 +2529,7 @@ fn batch_harvest_node_rows(
                 let id = NodeId::from_uuid(Uuid::from_bytes(row_id));
                 Some(NodeView {
                     id,
-                    label: label.to_string(),
+                    labels: BTreeSet::from([label.to_string()]),
                     properties,
                     lsn,
                     schema_version,

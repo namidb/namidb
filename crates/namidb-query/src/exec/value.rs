@@ -89,9 +89,13 @@ pub struct RelValue {
 
 impl From<NodeView> for NodeValue {
     fn from(v: NodeView) -> Self {
+        // NodeValue is still single-label here; collapse the set to its
+        // representative (lowest) label. The NodeValue multi-label flip is a
+        // later step in the series.
+        let label = v.labels.into_iter().next().unwrap_or_default();
         NodeValue {
             id: v.id,
-            label: v.label,
+            label,
             properties: v
                 .properties
                 .into_iter()

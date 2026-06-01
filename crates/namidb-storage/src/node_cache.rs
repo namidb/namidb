@@ -205,7 +205,7 @@ impl NodeViewCache {
     }
 }
 
-/// Conservative size estimate for a [`CachedNodeView`]. Counts label +
+/// Conservative size estimate for a [`CachedNodeView`]. Counts labels +
 /// property name + per-value allowance + invariant overhead. Used for
 /// budget accounting — exact tracking would require deep `Value` walks
 /// which are not worth it.
@@ -218,14 +218,14 @@ fn approx_size(view: &CachedNodeView) -> usize {
                 .keys()
                 .map(|k| k.capacity() + 64) // 64 = rough Value enum size
                 .sum();
-            v.label.capacity() + prop_bytes + 128
+            v.labels.iter().map(|l| l.capacity()).sum::<usize>() + prop_bytes + 128
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use namidb_core::Value;
     use uuid::Uuid;
@@ -243,7 +243,7 @@ mod tests {
         props.insert("name".to_string(), Value::Str(name.into()));
         NodeView {
             id: nid(1),
-            label: "Person".into(),
+            labels: BTreeSet::from(["Person".to_string()]),
             properties: props,
             lsn: 10,
             schema_version: 1,
