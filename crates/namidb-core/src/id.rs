@@ -1,7 +1,11 @@
-//! Identifier types: [`NodeId`], [`EdgeId`], [`NamespaceId`].
+//! Identifier types: [`NodeId`], [`EdgeId`], [`NamespaceId`], plus the small
+//! interned [`LabelId`].
 //!
-//! Identifiers are 128-bit ULIDs (encoded as UUIDv7) — they sort by creation
-//! time, which the storage layer exploits for LSM key ordering.
+//! [`NodeId`] and [`EdgeId`] are 128-bit ULIDs (encoded as UUIDv7) — they sort
+//! by creation time, which the storage layer exploits for LSM key ordering.
+//! [`LabelId`] is a different beast: a compact `u32` handed out by a
+//! [`LabelDictionary`](crate::schema::LabelDictionary) so a node's set of labels
+//! can ride on-row as a packed `List<UInt32>` instead of a list of strings.
 
 use std::fmt;
 use std::str::FromStr;
@@ -106,6 +110,34 @@ impl FromStr for EdgeId {
     }
 }
 
+/// Compact, stable identifier for a node label.
+///
+/// Unlike [`NodeId`]/[`EdgeId`], a `LabelId` is not a ULID: it is a small
+/// `u32` minted by a [`LabelDictionary`](crate::schema::LabelDictionary), which
+/// assigns ids in first-seen order and never reuses them. That stability is
+/// what lets the storage layer carry a node's label set on-row as a packed
+/// `List<UInt32>` and the query layer intersect label sets without touching
+/// strings: a `LabelId` minted in one manifest commit means the same label in
+/// every later one.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LabelId(pub u32);
+
+impl LabelId {
+    pub fn new(raw: u32) -> Self {
+        LabelId(raw)
+    }
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for LabelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Identifier of a tenant namespace.
 ///
 /// A namespace is the unit of multi-tenancy: one namespace == one logical
@@ -188,6 +220,23 @@ mod tests {
         // UUIDv7's first 48 bits are millisecond timestamp → strictly
         // ordered for samples >1ms apart.
         assert!(a < b, "{a} should sort before {b}");
+    }
+
+    #[test]
+    fn label_id_serializes_transparently() {
+        // `#[serde(transparent)]` means a LabelId is just its number on the
+        // wire — that's the contract the on-row `List<UInt32>` relies on.
+        let id = LabelId::new(7);
+        assert_eq!(serde_json::to_string(&id).unwrap(), "7");
+        let back: LabelId = serde_json::from_str("7").unwrap();
+        assert_eq!(back, id);
+        assert_eq!(id.get(), 7);
+    }
+
+    #[test]
+    fn label_id_orders_by_value() {
+        assert!(LabelId::new(0) < LabelId::new(1));
+        assert_eq!(LabelId::new(42).to_string(), "42");
     }
 
     #[test]
