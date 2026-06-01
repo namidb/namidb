@@ -332,9 +332,9 @@ fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
             .and_then(|l| catalog.label(l))
             .map(|l| l.node_count > 0)
             .unwrap_or(false),
-        LogicalPlan::NodeById { label, .. } => label.as_deref().map_or(true, |l| {
-            catalog.label(l).map(|x| x.node_count > 0).unwrap_or(false)
-        }),
+        LogicalPlan::NodeById { label, .. } => label
+            .as_deref()
+            .is_none_or(|l| catalog.label(l).map(|x| x.node_count > 0).unwrap_or(false)),
         LogicalPlan::NodeByPropertyValue { label, .. } => catalog
             .label(label)
             .map(|l| l.node_count > 0)
