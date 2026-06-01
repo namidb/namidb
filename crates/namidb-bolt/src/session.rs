@@ -134,6 +134,38 @@ pub trait Backend: Send + Sync {
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError>;
 
+    /// Begin an explicit transaction. Subsequent [`Backend::run_in_tx`]
+    /// calls stage into it; [`Backend::commit_tx`] makes them durable and
+    /// [`Backend::rollback_tx`] discards them. The default is a no-op so a
+    /// backend without transaction support keeps working (its in-tx writes
+    /// just behave like auto-commit).
+    async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Execute one statement inside the open explicit transaction. The
+    /// default delegates to [`Backend::run`] (auto-commit), which is the
+    /// pre-transaction behaviour for backends that do not override it.
+    async fn run_in_tx(
+        &self,
+        cypher: &str,
+        params: Params,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run(cypher, params).await
+    }
+
+    /// Commit the open explicit transaction, making its staged statements
+    /// durable. Default is a no-op.
+    async fn commit_tx(&self) -> std::result::Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// Roll back the open explicit transaction, discarding its staged
+    /// statements. Default is a no-op.
+    async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Optional override for the manifest version reported as the
     /// bookmark after COMMIT. Default returns `None` and the session
     /// emits no bookmark.
@@ -155,6 +187,12 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// closing `SUCCESS` after PULL/DISCARD. `None` while no stream
     /// is active.
     pending_statement_type: Option<StatementType>,
+    /// While an explicit transaction is open the backend holds the writer
+    /// lock, so an idle client would pin it indefinitely. When set, a read
+    /// that blocks longer than this with a transaction open rolls the
+    /// transaction back (releasing the writer) and fails it. `None` (the
+    /// default) keeps the legacy unbounded behaviour for test backends.
+    tx_idle_timeout: Option<std::time::Duration>,
 }
 
 impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
@@ -167,7 +205,15 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             state: State::Negotiation,
             version: None,
             pending_statement_type: None,
+            tx_idle_timeout: None,
         }
+    }
+
+    /// Set the idle timeout applied while an explicit transaction is open.
+    /// `None` disables it (a transaction may stay open indefinitely).
+    pub fn with_tx_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.tx_idle_timeout = timeout;
+        self
     }
 
     /// Run the session to completion. Returns once the client sends
@@ -184,7 +230,31 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             } else {
                 POST_AUTH_MESSAGE_BYTES
             };
-            let body = match read_message(&mut self.socket, max).await {
+            // Bound how long the writer lock is pinned by an open
+            // transaction: if the client idles past `tx_idle_timeout` while
+            // in a transaction, roll it back to release the writer and fail
+            // the transaction.
+            let in_tx = matches!(self.state, State::TxReady | State::TxStreaming);
+            let idle = self.tx_idle_timeout;
+            let read = read_message(&mut self.socket, max);
+            let read_result = match (idle, in_tx) {
+                (Some(t), true) => match tokio::time::timeout(t, read).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        let _ = self.backend.rollback_tx().await;
+                        self.state = State::Failed;
+                        self.write_failure(
+                            "Neo.TransientError.Transaction.LockClientStopped",
+                            "transaction idle timeout; rolled back to release the writer"
+                                .to_string(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                },
+                _ => read.await,
+            };
+            let body = match read_result {
                 Ok(b) => b,
                 Err(BoltError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("bolt connection closed by client");
@@ -235,12 +305,20 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn handle(&mut self, req: Request, element_mode: ElementIdMode) -> Result<()> {
-        // RESET always recovers; GOODBYE always ends.
+        // RESET always recovers; GOODBYE always ends. Either one while a
+        // transaction is open must roll it back so its staged writes are
+        // discarded (and the writer it holds is released).
         if matches!(req, Request::Reset) {
+            if matches!(self.state, State::TxReady | State::TxStreaming) {
+                let _ = self.backend.rollback_tx().await;
+            }
             self.state = State::Ready;
             return self.write_response(Response::success_empty()).await;
         }
         if matches!(req, Request::Goodbye) {
+            if matches!(self.state, State::TxReady | State::TxStreaming) {
+                let _ = self.backend.rollback_tx().await;
+            }
             self.state = State::Defunct;
             return Ok(());
         }
@@ -320,10 +398,16 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 params,
                 extra: _,
             } => self.execute_run(&cypher, params, element_mode, false).await,
-            Request::Begin(_) => {
-                self.state = State::TxReady;
-                self.write_response(Response::success_empty()).await
-            }
+            Request::Begin(_) => match self.backend.begin_tx().await {
+                Ok(()) => {
+                    self.state = State::TxReady;
+                    self.write_response(Response::success_empty()).await
+                }
+                Err(e) => {
+                    self.state = State::Failed;
+                    self.write_failure(e.code(), e.message().to_string()).await
+                }
+            },
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
                 self.state = State::Authentication;
@@ -353,10 +437,16 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 extra: _,
             } => self.execute_run(&cypher, params, element_mode, true).await,
             Request::Commit => self.commit(element_mode).await,
-            Request::Rollback => {
-                self.state = State::Ready;
-                self.write_response(Response::success_empty()).await
-            }
+            Request::Rollback => match self.backend.rollback_tx().await {
+                Ok(()) => {
+                    self.state = State::Ready;
+                    self.write_response(Response::success_empty()).await
+                }
+                Err(e) => {
+                    self.state = State::Failed;
+                    self.write_failure(e.code(), e.message().to_string()).await
+                }
+            },
             _ => self.invalid_state("unexpected message in TX_READY").await,
         }
     }
@@ -401,8 +491,15 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         inside_tx: bool,
     ) -> Result<()> {
         let params = params_from_bolt_map(&bolt_params);
-        let _ = params.clone(); // explicit clone to avoid moves later
-        let outcome = match self.backend.run(cypher, params).await {
+        // Inside an explicit transaction the statement stages into the open
+        // tx (committed at COMMIT, discarded at ROLLBACK); a bare RUN
+        // auto-commits.
+        let run_result = if inside_tx {
+            self.backend.run_in_tx(cypher, params).await
+        } else {
+            self.backend.run(cypher, params).await
+        };
+        let outcome = match run_result {
             Ok(o) => o,
             Err(e) => {
                 self.state = State::Failed;
@@ -448,6 +545,13 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn commit(&mut self, _element_mode: ElementIdMode) -> Result<()> {
+        // Make the transaction's staged statements durable. A failure here
+        // (e.g. a lost manifest CAS) is the abort surface; surface it as a
+        // FAILURE and the client retries.
+        if let Err(e) = self.backend.commit_tx().await {
+            self.state = State::Failed;
+            return self.write_failure(e.code(), e.message().to_string()).await;
+        }
         let mut meta = BTreeMap::new();
         if let Some(bm) = self.backend.current_bookmark().await {
             meta.insert("bookmark".into(), Value::String(bm));
