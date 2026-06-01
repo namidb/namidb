@@ -22,4 +22,4 @@ pub use leapfrog::{LeapfrogIntersect, MergeSortedUnion, OrdIterator, SortedSlice
 pub use row::Row;
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{execute, execute_factor_path, execute_flat_path, ExecError};
-pub use writer::{execute_write, WriteOutcome};
+pub use writer::{execute_write, execute_write_staged, WriteOutcome};

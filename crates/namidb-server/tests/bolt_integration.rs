@@ -228,6 +228,80 @@ async fn goodbye(stream: &mut TcpStream) {
     send_msg(stream, &pack(&bye)).await;
 }
 
+async fn begin(stream: &mut TcpStream) {
+    let msg = Value::Struct {
+        tag: struct_tag::BEGIN,
+        fields: vec![Value::Map(BTreeMap::new())],
+    };
+    send_msg(stream, &pack(&msg)).await;
+    match recv_msg(stream).await {
+        Response::Success(_) => {}
+        other => panic!("BEGIN expected SUCCESS, got {other:?}"),
+    }
+}
+
+async fn commit(stream: &mut TcpStream) {
+    let msg = Value::Struct {
+        tag: struct_tag::COMMIT,
+        fields: vec![],
+    };
+    send_msg(stream, &pack(&msg)).await;
+    match recv_msg(stream).await {
+        Response::Success(_) => {}
+        other => panic!("COMMIT expected SUCCESS, got {other:?}"),
+    }
+}
+
+async fn rollback(stream: &mut TcpStream) {
+    let msg = Value::Struct {
+        tag: struct_tag::ROLLBACK,
+        fields: vec![],
+    };
+    send_msg(stream, &pack(&msg)).await;
+    match recv_msg(stream).await {
+        Response::Success(_) => {}
+        other => panic!("ROLLBACK expected SUCCESS, got {other:?}"),
+    }
+}
+
+/// Boot a server on ephemeral ports and return the bound Bolt address plus
+/// the server task handle. Mirrors the boilerplate in the older tests.
+async fn boot_bolt(
+    ns: &str,
+    tx_timeout: Duration,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+
+    let config = namidb_server::Config {
+        store_uri: format!("memory://{ns}"),
+        listen: http_addr,
+        auth_token: Some("test-token".into()),
+        flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
+        bolt_listen: Some(bolt_addr),
+        bolt_tx_timeout: tx_timeout,
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = namidb_server::run(config).await {
+            eprintln!("server exited: {e}");
+        }
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(bolt_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (bolt_addr, task)
+}
+
 #[tokio::test]
 async fn bolt_create_then_match_roundtrip() {
     // Bind on an ephemeral port.
@@ -253,6 +327,7 @@ async fn bolt_create_then_match_roundtrip() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_tx_timeout: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -320,6 +395,7 @@ async fn bolt_bad_token_yields_failure() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_tx_timeout: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -451,6 +527,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_tx_timeout: Duration::ZERO,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;
@@ -553,6 +630,140 @@ async fn bolt_memgraph_introspection_populates_schema() {
     server_task.abort();
 }
 
+#[tokio::test]
+async fn bolt_rollback_discards_write() {
+    let (bolt_addr, task) = boot_bolt("bolt-tx-rollback", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    begin(&mut stream).await;
+    // The write executes and returns its row inside the transaction.
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "CREATE (a:Person {name: 'Zoe'}) RETURN a.name AS name",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Zoe".into())));
+
+    rollback(&mut stream).await;
+
+    // After ROLLBACK the write must be gone (this is what was broken: the
+    // per-RUN commit made it durable before ROLLBACK was ever seen).
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "MATCH (p:Person {name: 'Zoe'}) RETURN p.name AS name",
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "ROLLBACK must discard the write, got {rows:?}"
+    );
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_commit_persists_write() {
+    let (bolt_addr, task) = boot_bolt("bolt-tx-commit", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    begin(&mut stream).await;
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "CREATE (a:Person {name: 'Yan'}) RETURN a.name AS name",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    commit(&mut stream).await;
+
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "MATCH (p:Person {name: 'Yan'}) RETURN p.name AS name",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "COMMIT must persist the write");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Yan".into())));
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_multi_statement_commit_is_atomic() {
+    let (bolt_addr, task) = boot_bolt("bolt-tx-multi", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    // Two statements in one transaction, then commit: both must land.
+    begin(&mut stream).await;
+    pull_all(&mut stream, "CREATE (a:Person {name: 'Ann'})").await;
+    pull_all(&mut stream, "CREATE (a:Person {name: 'Ben'})").await;
+    commit(&mut stream).await;
+
+    let (_f, rows) = pull_all(&mut stream, "MATCH (p:Person) RETURN p.name AS name").await;
+    assert_eq!(rows.len(), 2, "both committed creates must be visible");
+
+    // A third create rolled back must NOT appear, and must not disturb the
+    // two committed rows.
+    begin(&mut stream).await;
+    pull_all(&mut stream, "CREATE (a:Person {name: 'Cara'})").await;
+    rollback(&mut stream).await;
+
+    let (_f, rows) = pull_all(&mut stream, "MATCH (p:Person) RETURN p.name AS name").await;
+    assert_eq!(rows.len(), 2, "rolled-back create must not appear");
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_idle_transaction_times_out_and_releases_writer() {
+    // A short idle timeout keeps the test fast.
+    let (bolt_addr, task) = boot_bolt("bolt-tx-timeout", Duration::from_millis(300)).await;
+
+    // Connection A: open a transaction, stage a write, then go idle. The
+    // server must roll it back (releasing the writer) and fail it.
+    let mut a = TcpStream::connect(bolt_addr).await.expect("connect a");
+    handshake(&mut a).await;
+    hello_and_logon(&mut a, "test-token").await;
+    begin(&mut a).await;
+    pull_all(&mut a, "CREATE (p:Person {name: 'Idle'})").await;
+    let timed_out = recv_msg(&mut a).await;
+    assert!(
+        matches!(timed_out, Response::Failure(_)),
+        "an idle open transaction should be failed by the server, got {timed_out:?}"
+    );
+
+    // Connection B: a WRITE must succeed — if A still held the writer lock
+    // this would block forever — and only B's node exists (A's was rolled
+    // back).
+    let mut b = TcpStream::connect(bolt_addr).await.expect("connect b");
+    handshake(&mut b).await;
+    hello_and_logon(&mut b, "test-token").await;
+    pull_all(&mut b, "CREATE (p:Person {name: 'After'})").await;
+    let (_f, rows) = pull_all(&mut b, "MATCH (p:Person) RETURN p.name AS name").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the post-timeout write should exist, got {rows:?}"
+    );
+    assert_eq!(rows[0].get("name"), Some(&Value::String("After".into())));
+
+    goodbye(&mut b).await;
+    a.shutdown().await.ok();
+    b.shutdown().await.ok();
+    task.abort();
+}
+
 /// Run a statement and return the metadata of its closing `SUCCESS`
 /// (after a single PULL) — e.g. to inspect the write `stats` map.
 async fn run_capture_close(stream: &mut TcpStream, cypher: &str) -> BTreeMap<String, Value> {
@@ -591,34 +802,7 @@ async fn run_capture_close(stream: &mut TcpStream, cypher: &str) -> BTreeMap<Str
 async fn bolt_neo4j_type_introspection_and_counters() {
     // The Neo4j connection type fires db.*, apoc.meta.* and SHOW, uses
     // elementId(), and expects write counters in the closing SUCCESS.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
-
-    let config = namidb_server::Config {
-        store_uri: "memory://bolt-neo4j".into(),
-        listen: http_addr,
-        auth_token: Some("test-token".into()),
-        flush_interval: Duration::ZERO,
-        compaction_interval: Duration::ZERO,
-        sweep_min_age: Duration::ZERO,
-        sweep_delete: false,
-        bolt_listen: Some(bolt_addr),
-    };
-    let server_task = tokio::spawn(async move {
-        let _ = namidb_server::run(config).await;
-    });
-    for _ in 0..50 {
-        if TcpStream::connect(bolt_addr).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
+    let (bolt_addr, task) = boot_bolt("bolt-neo4j", Duration::ZERO).await;
     let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
     handshake(&mut stream).await;
     hello_and_logon(&mut stream, "test-token").await;
@@ -704,5 +888,5 @@ async fn bolt_neo4j_type_introspection_and_counters() {
 
     goodbye(&mut stream).await;
     stream.shutdown().await.ok();
-    server_task.abort();
+    task.abort();
 }

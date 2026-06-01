@@ -78,6 +78,18 @@ struct Cli {
     /// server is HTTP-only. The canonical Bolt port is 7687.
     #[arg(long, env = "NAMIDB_BOLT_LISTEN")]
     bolt_listen: Option<std::net::SocketAddr>,
+
+    /// Idle timeout for an open Bolt explicit transaction. The writer lock
+    /// is held for the life of a transaction, so an idle client would pin
+    /// it; after this long without a message the transaction is rolled back
+    /// and failed. Set to `0s` to allow transactions to stay open forever.
+    #[arg(
+        long,
+        env = "NAMIDB_BOLT_TX_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    bolt_tx_timeout: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -98,6 +110,7 @@ fn main() -> anyhow::Result<()> {
         sweep_min_age: cli.sweep_min_age,
         sweep_delete: cli.sweep_delete,
         bolt_listen: cli.bolt_listen,
+        bolt_tx_timeout: cli.bolt_tx_timeout,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

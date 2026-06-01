@@ -51,6 +51,11 @@ pub struct Config {
     pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
+    /// Idle timeout for an open Bolt explicit transaction. While a
+    /// transaction is open the writer lock is held, so an idle client would
+    /// pin it; after this long without a message the transaction is rolled
+    /// back and failed. `Duration::ZERO` disables the timeout.
+    pub bolt_tx_timeout: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -230,8 +235,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(bolt_addr) = config.bolt_listen {
         let bolt_state = state.clone();
         let bolt_auth = state.auth_token.clone();
+        let tx_timeout = config.bolt_tx_timeout;
         tokio::spawn(async move {
-            if let Err(e) = bolt::serve(bolt_state, bolt_addr, bolt_auth).await {
+            if let Err(e) = bolt::serve(bolt_state, bolt_addr, bolt_auth, tx_timeout).await {
                 error!(error = %e, "bolt listener exited");
             }
         });
