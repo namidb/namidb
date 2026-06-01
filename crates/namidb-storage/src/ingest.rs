@@ -309,6 +309,21 @@ impl WriterSession {
         self.pending.records.len()
     }
 
+    /// Drop the uncommitted batch without making it durable, returning the
+    /// number of mutations discarded. Used to roll back an explicit
+    /// transaction. Safe because staged writes only touch `pending` /
+    /// `pending_payloads` (queued) and never the memtable until
+    /// `commit_batch` drains them after the manifest CAS, so there is
+    /// nothing durable or in-memory to unwind. The WAL sequence is reused
+    /// (the discarded segment was never persisted); a skipped `next_lsn` is
+    /// harmless (reads always pick the strictly-higher LSN).
+    pub fn discard_batch(&mut self) -> usize {
+        let discarded = self.pending.records.len();
+        self.pending = WalSegment::new(self.pending.seq);
+        self.pending_payloads.clear();
+        discarded
+    }
+
     /// Every edge type known to this writer — declared in the manifest
     /// schema, present in the current memtable, or persisted in at
     /// least one SST descriptor. Used by the query executor's
@@ -1117,6 +1132,47 @@ mod tests {
         let out_edges = snap.out_edges("KNOWS", alice).await.unwrap();
         assert_eq!(out_edges.edges.len(), 1);
         assert_eq!(out_edges.edges[0].dst, bob);
+    }
+
+    #[tokio::test]
+    async fn discard_batch_drops_uncommitted_writes() {
+        let store = make_store();
+        let paths = make_paths("ingest-discard");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        assert_eq!(session.pending_len(), 2);
+
+        assert_eq!(session.discard_batch(), 2);
+        assert_eq!(session.pending_len(), 0);
+
+        // The discarded ops never reached the memtable, so a commit now is a
+        // no-op and nothing is visible.
+        assert_eq!(session.commit_batch().await.unwrap(), CommitOutcome::Empty);
+        let snap = session.snapshot();
+        assert!(snap
+            .lookup_node("Person", sorted_node_id(1))
+            .await
+            .unwrap()
+            .is_none());
+
+        // The session is still usable: a fresh write commits and persists.
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("Cara", Some(20)))
+            .unwrap();
+        let out = session.commit_batch().await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { records: 1, .. }));
+        let snap = session.snapshot();
+        assert!(snap
+            .lookup_node("Person", sorted_node_id(3))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

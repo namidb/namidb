@@ -44,18 +44,37 @@ pub struct WriteOutcome {
     pub properties_set: u64,
 }
 
-/// Execute `plan` against `writer`. Reads pin a snapshot per read
-/// sub-plan; writes go through `writer.upsert_*` / `tombstone_*`. At the
-/// end, `writer.commit_batch()` makes every mutation durable.
-pub async fn execute_write(
+/// Execute `plan` against `writer`, staging its mutations into the
+/// writer's pending batch but NOT committing. The caller must then either
+/// `writer.commit_batch()` to make the batch durable or
+/// `writer.discard_batch()` to roll it back. Used by explicit Bolt
+/// transactions, which stage several statements and commit once at COMMIT.
+/// The RETURN rows are computed during the apply, so they are available
+/// before the commit; like [`execute_write`] there is no
+/// read-your-own-writes (a later read sub-plan sees the pre-call snapshot).
+pub async fn execute_write_staged(
     plan: &LogicalPlan,
     writer: &mut WriterSession,
     params: &Params,
 ) -> Result<WriteOutcome, ExecError> {
     let mut outcome = WriteOutcome::default();
     let rows = execute_write_inner(plan, writer, params, &mut outcome).await?;
-    writer.commit_batch().await.map_err(ExecError::Storage)?;
     outcome.rows = rows;
+    Ok(outcome)
+}
+
+/// Execute `plan` against `writer` and commit. Auto-commit mode: each call
+/// is its own transaction. Reads pin a snapshot per read sub-plan; writes
+/// go through `writer.upsert_*` / `tombstone_*` and `writer.commit_batch()`
+/// makes them durable. For a multi-statement explicit transaction use
+/// [`execute_write_staged`] and commit once at the end.
+pub async fn execute_write(
+    plan: &LogicalPlan,
+    writer: &mut WriterSession,
+    params: &Params,
+) -> Result<WriteOutcome, ExecError> {
+    let outcome = execute_write_staged(plan, writer, params).await?;
+    writer.commit_batch().await.map_err(ExecError::Storage)?;
     Ok(outcome)
 }
 
