@@ -47,14 +47,16 @@ pub enum LogicalPlan {
         projection: Option<Vec<String>>,
     },
 
-    /// Point-lookup by id. Lowering emits this when the AST contains an
-    /// inline filter `{id: <expr>}` on a node pattern. The id expression
-    /// is evaluated against each row produced by `input` (typically
-    /// `Empty` for queries that start with the lookup, or a populated
-    /// plan when the lookup follows UNWIND / WITH).
+    /// Point-lookup by id. Lowering emits this for an inline `{_id: <expr>}`
+    /// filter on a node pattern, and `optimize::unique_lookup` emits it for
+    /// `WHERE elementId(n) = <expr>` / `WHERE id(n) = <expr>`. The id
+    /// expression is evaluated against each row from `input` (typically
+    /// `Empty`). `label = Some(L)` scopes the lookup to one column family;
+    /// `label = None` (the unlabelled `MATCH (n) WHERE elementId(n) = ...`
+    /// shape a GUI fetch uses) fans out across every observed label.
     NodeById {
         input: Box<LogicalPlan>,
-        label: String,
+        label: Option<String>,
         alias: String,
         id: Expression,
     },

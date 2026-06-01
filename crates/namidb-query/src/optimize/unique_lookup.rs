@@ -1,6 +1,11 @@
-//! Rewrite `Filter(predicate = a.<prop> == <literal>)` over
-//! `NodeScan(label = L)` into `NodeByPropertyValue` whenever `<prop>`
-//! is declared `unique` in the schema (see `PropertyDef::unique`).
+//! Point-lookup rewrites over `Filter(... , NodeScan(...))`:
+//!
+//! - `a.<prop> == <literal>` → `NodeByPropertyValue` when `<prop>` is
+//!   declared `unique` in the schema (see `PropertyDef::unique`).
+//! - `elementId(a) == <expr>` / `id(a) == <expr>` → `NodeById` (a UUID
+//!   point lookup), with or without a label on the scan. This is what
+//!   turns a GUI's `MATCH (n) WHERE elementId(n) = $id` node fetch and
+//!   expand from a full scan into a direct lookup.
 //!
 //! Triggers a point lookup in place of a full label scan + filter for
 //! the LDBC SNB anchor pattern `MATCH (p:Person {id: 'literal'})`,
@@ -58,6 +63,29 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                                 value: value_expr,
                             };
                         }
+                    }
+                }
+            }
+            // `WHERE elementId(n) = <v>` / `WHERE id(n) = <v>` over a bare
+            // scan becomes a NodeById point lookup by UUID — scoped to the
+            // scan's label when it has one, or fanned across observed labels
+            // when it doesn't (the unlabelled `MATCH (n) WHERE elementId(n)
+            // = $id` shape a GUI fetch/expand uses). Avoids a full scan.
+            if let LogicalPlan::NodeScan {
+                label,
+                alias,
+                predicates,
+                projection,
+            } = input.as_ref()
+            {
+                if predicates.is_empty() && projection.is_none() {
+                    if let Some(value_expr) = extract_eq_on_node_id(&predicate, alias) {
+                        return LogicalPlan::NodeById {
+                            input: Box::new(LogicalPlan::Empty),
+                            label: label.clone(),
+                            alias: alias.clone(),
+                            id: value_expr,
+                        };
                     }
                 }
             }
@@ -286,4 +314,41 @@ fn property_on_alias(expr: &Expression, alias: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Match `elementId(<alias>) == <value>` or `id(<alias>) == <value>`
+/// (either argument order) and return the value expression. Both
+/// functions yield a node's UUID string, which `node_id_from_value`
+/// parses back into a `NodeId` at execution time.
+fn extract_eq_on_node_id(expr: &Expression, scan_alias: &str) -> Option<Expression> {
+    use crate::parser::ast::BinaryOp;
+    let ExpressionKind::Binary { op, left, right } = &expr.kind else {
+        return None;
+    };
+    if !matches!(op, BinaryOp::Eq) {
+        return None;
+    }
+    if is_node_id_call(left, scan_alias) {
+        return Some((**right).clone());
+    }
+    if is_node_id_call(right, scan_alias) {
+        return Some((**left).clone());
+    }
+    None
+}
+
+/// `elementId(<alias>)` or `id(<alias>)` — a single-argument call of
+/// either function on the scan's own variable.
+fn is_node_id_call(expr: &Expression, alias: &str) -> bool {
+    let ExpressionKind::FunctionCall { name, args, .. } = &expr.kind else {
+        return false;
+    };
+    if args.len() != 1 {
+        return false;
+    }
+    let fname = name.joined().to_ascii_lowercase();
+    if fname != "elementid" && fname != "id" {
+        return false;
+    }
+    matches!(&args[0].kind, ExpressionKind::Variable(id) if id.name == alias)
 }

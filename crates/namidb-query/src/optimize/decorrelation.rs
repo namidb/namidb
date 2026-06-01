@@ -143,8 +143,11 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             label,
             input,
             ..
+        } => {
+            collect_outer_labels(input, out);
+            out.insert(alias.clone(), label.clone());
         }
-        | LogicalPlan::NodeByPropertyValue {
+        LogicalPlan::NodeByPropertyValue {
             alias,
             label,
             input,

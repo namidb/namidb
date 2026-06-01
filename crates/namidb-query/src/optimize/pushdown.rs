@@ -1145,7 +1145,7 @@ mod tests {
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::NodeById {
                 input: Box::new(LogicalPlan::Empty),
-                label: "Person".into(),
+                label: Some("Person".into()),
                 alias: "a".into(),
                 id: int(1),
             }),
@@ -1165,7 +1165,7 @@ mod tests {
                 input: Box::new(LogicalPlan::Argument {
                     bindings: vec!["b".into()],
                 }),
-                label: "Person".into(),
+                label: Some("Person".into()),
                 alias: "a".into(),
                 id: int(1),
             }),
