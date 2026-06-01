@@ -537,12 +537,14 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(rewrite(*input, req)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,

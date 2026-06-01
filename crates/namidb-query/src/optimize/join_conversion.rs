@@ -51,12 +51,14 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(convert_cross_to_hash(*input, catalog)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,
@@ -409,6 +411,7 @@ mod tests {
                 max: Some(StatScalar::Utf8("Zoe".into())),
                 ndv: Some(ndv),
                 unique: false,
+                indexed: false,
             },
         );
         props.insert(
@@ -420,6 +423,7 @@ mod tests {
                 max: Some(StatScalar::Int64(99)),
                 ndv: Some(ndv),
                 unique: false,
+                indexed: false,
             },
         );
         cat.__test_insert_label(LabelStats {
@@ -592,6 +596,7 @@ mod tests {
                         max: None,
                         ndv: Some(10),
                         unique: false,
+                        indexed: false,
                     },
                 );
                 m
@@ -611,6 +616,7 @@ mod tests {
                         max: None,
                         ndv: Some(1000),
                         unique: false,
+                        indexed: false,
                     },
                 );
                 m

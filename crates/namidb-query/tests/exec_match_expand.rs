@@ -14,7 +14,7 @@ use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSes
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute, lower, parse, Params, RuntimeValue};
+use namidb_query::{execute, explain, lower, optimize, parse, Params, RuntimeValue, StatsCatalog};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -47,6 +47,28 @@ fn person(name: &str, age: i32) -> NodeWriteRecord {
     let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
     props.insert("name".into(), CoreValue::Str(name.into()));
     props.insert("age".into(), CoreValue::I64(age as i64));
+    NodeWriteRecord {
+        properties: props,
+        schema_version: 1,
+    }
+}
+
+fn indexed_city_label() -> LabelDef {
+    LabelDef {
+        name: "Person".into(),
+        properties: vec![
+            PropertyDef::new("name", DataType::Utf8, false).unwrap(),
+            PropertyDef::new("city", DataType::Utf8, true)
+                .unwrap()
+                .with_indexed(true),
+        ],
+    }
+}
+
+fn person_city(name: &str, city: &str) -> NodeWriteRecord {
+    let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+    props.insert("name".into(), CoreValue::Str(name.into()));
+    props.insert("city".into(), CoreValue::Str(city.into()));
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
@@ -979,4 +1001,58 @@ async fn element_id_filter_lowers_to_point_lookup() {
         }
         other => panic!("expected the looked-up node, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn indexed_property_match_uses_index_and_returns_all_matches() {
+    // End-to-end: an equality MATCH on a non-unique `indexed` property is
+    // rewritten by the optimizer into the index lookup and the executor
+    // fans out one row per match.
+    let mut writer = WriterSession::open(store(), paths("exec-eqidx"))
+        .await
+        .unwrap();
+    let ids: [NodeId; 3] = std::array::from_fn(|_| NodeId::new());
+    let names = ["Ann", "Bob", "Cy"];
+    let cities = ["LA", "LA", "NYC"];
+    for ((id, name), city) in ids.iter().zip(names).zip(cities) {
+        writer
+            .upsert_node("Person", *id, &person_city(name, city))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    // Flush with the indexed schema so the equality sidecar and the schema
+    // (with `city` indexed) both land in the manifest.
+    let schema = SchemaBuilder::new()
+        .label(indexed_city_label())
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // The catalog (built from the manifest) sees `city` as indexed, so the
+    // optimizer rewrites the filter into the index lookup rather than a
+    // full label scan.
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let q = parse("MATCH (p:Person {city: 'LA'}) RETURN p.name AS name").unwrap();
+    let plan = optimize(lower(&q).unwrap(), &catalog);
+    let rendered = explain(&plan);
+    assert!(
+        rendered.contains("NodeByPropertyValue"),
+        "expected the index lookup in the optimized plan, got:\n{rendered}"
+    );
+
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let mut got: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["Ann".to_string(), "Bob".to_string()],
+        "both LA persons must come back, not the NYC one"
+    );
 }

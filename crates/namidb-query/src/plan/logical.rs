@@ -75,6 +75,11 @@ pub enum LogicalPlan {
         alias: String,
         property: String,
         value: Expression,
+        /// `false`: a *unique* property — at most one match, resolved
+        /// through the unique sidecar (point lookup). `true`: a non-unique
+        /// `indexed` property — fan out one row per match, resolved through
+        /// the equality posting-list sidecar.
+        multi: bool,
     },
 
     /// Expand `source` across an edge to produce `target_alias`.

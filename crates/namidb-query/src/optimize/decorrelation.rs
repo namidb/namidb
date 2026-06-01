@@ -242,12 +242,14 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(replace_argument(*input, x, label)),
             label: l,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,
@@ -325,12 +327,14 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,

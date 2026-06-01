@@ -542,6 +542,7 @@ mod tests {
                 max: Some(StatScalar::Int64(max)),
                 ndv,
                 unique: false,
+                indexed: false,
             },
         );
         LabelStats {

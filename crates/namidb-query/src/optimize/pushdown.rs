@@ -99,6 +99,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => {
             let mut introduced = BTreeSet::new();
             introduced.insert(alias.clone());
@@ -111,6 +112,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
                     alias,
                     property,
                     value,
+                    multi,
                 },
                 stay,
             )

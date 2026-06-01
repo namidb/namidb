@@ -300,13 +300,32 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 alias,
                 property,
                 value,
+                multi,
             } => {
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
-                    if let Some(view) =
+                    if *multi {
+                        // Non-unique indexed property: fan out one row per
+                        // matching node.
+                        for view in lookup_nodes_by_property_via_scan(
+                            snapshot,
+                            label,
+                            property,
+                            &lookup_val,
+                        )
+                        .await?
+                        {
+                            let mut new_row = row.clone();
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    } else if let Some(view) =
                         lookup_node_by_property_via_scan(snapshot, label, property, &lookup_val)
                             .await?
                     {
@@ -1707,6 +1726,38 @@ pub(crate) async fn lookup_node_by_property_via_scan(
     Ok(candidates.into_iter().next())
 }
 
+/// Multi-match variant of [`lookup_node_by_property_via_scan`] for a
+/// non-unique `indexed` property: returns every node carrying `value`. A
+/// String key resolves through the equality posting-list sidecar; other
+/// scalar types fall back to a full label scan filtered by exact value
+/// (no typed sidecar yet).
+pub(crate) async fn lookup_nodes_by_property_via_scan(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    property: &str,
+    value: &RuntimeValue,
+) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    if let RuntimeValue::String(s) = value {
+        return snapshot
+            .lookup_nodes_by_property(label, property, s)
+            .await
+            .map_err(ExecError::Storage);
+    }
+    let all = snapshot
+        .scan_label(label)
+        .await
+        .map_err(ExecError::Storage)?;
+    Ok(all
+        .into_iter()
+        .filter(|view| {
+            view.properties
+                .get(property)
+                .map(|cv| RuntimeValue::from(cv.clone()) == *value)
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
 // ────────────────────────── Factor path ────────────────────────
 //
 // `execute_factor_inner` mirrors `execute_inner` but operates on
@@ -1812,6 +1863,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 alias,
                 property,
                 value,
+                multi,
             } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
@@ -1823,7 +1875,22 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 for leaf in input_set.leaves {
                     let row = arena_view.materialize(leaf, None);
                     let lookup_val = evaluate(value, &row, params)?;
-                    if let Some(view) =
+                    if *multi {
+                        for view in lookup_nodes_by_property_via_scan(
+                            snapshot,
+                            label,
+                            property,
+                            &lookup_val,
+                        )
+                        .await?
+                        {
+                            let slot = Slot {
+                                name: alias_arc.clone(),
+                                value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            };
+                            out_leaves.push(next_arena.push(leaf, vec![slot]));
+                        }
+                    } else if let Some(view) =
                         lookup_node_by_property_via_scan(snapshot, label, property, &lookup_val)
                             .await?
                     {

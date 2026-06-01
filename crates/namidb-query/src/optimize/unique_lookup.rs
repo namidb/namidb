@@ -49,18 +49,22 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             {
                 if predicates.is_empty() && projection.is_none() {
                     if let Some((prop, value_expr)) = extract_eq_on_prop(&predicate, alias) {
-                        if catalog
-                            .label(label)
-                            .and_then(|l| l.properties.get(&prop))
-                            .map(|p| p.unique)
-                            .unwrap_or(false)
-                        {
+                        let pstats = catalog.label(label).and_then(|l| l.properties.get(&prop));
+                        let is_unique = pstats.map(|p| p.unique).unwrap_or(false);
+                        // A non-unique `indexed` property resolves through the
+                        // equality posting-list sidecar and may match many
+                        // nodes (`multi`). No cost gate yet: `ndv` is unseeded
+                        // so the index always wins the fallback estimate; a
+                        // selectivity gate is a follow-up.
+                        let is_indexed = pstats.map(|p| p.indexed && !p.unique).unwrap_or(false);
+                        if is_unique || is_indexed {
                             return LogicalPlan::NodeByPropertyValue {
                                 input: Box::new(LogicalPlan::Empty),
                                 label: label.clone(),
                                 alias: alias.clone(),
                                 property: prop,
                                 value: value_expr,
+                                multi: is_indexed,
                             };
                         }
                     }
@@ -119,12 +123,14 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(rewrite(*input, catalog)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,
@@ -351,4 +357,79 @@ fn is_node_id_call(expr: &Expression, alias: &str) -> bool {
         return false;
     }
     matches!(&args[0].kind, ExpressionKind::Variable(id) if id.name == alias)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::{LabelStats, PropStats, StatsCatalog};
+    use crate::parser::parse;
+    use crate::plan::lower;
+    use std::collections::BTreeMap;
+
+    fn catalog_with_city(unique: bool, indexed: bool) -> StatsCatalog {
+        let mut cat = StatsCatalog::empty();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "city".to_string(),
+            PropStats {
+                unique,
+                indexed,
+                ..Default::default()
+            },
+        );
+        cat.__test_insert_label(LabelStats {
+            name: "Person".into(),
+            node_count: 1000,
+            properties: props,
+        });
+        cat
+    }
+
+    /// `multi` of the first `NodeByPropertyValue` in the plan, if any.
+    fn find_lookup(plan: &LogicalPlan) -> Option<bool> {
+        if let LogicalPlan::NodeByPropertyValue { multi, .. } = plan {
+            return Some(*multi);
+        }
+        plan.children().into_iter().find_map(find_lookup)
+    }
+
+    fn rewrite_query(q: &str, cat: &StatsCatalog) -> LogicalPlan {
+        let parsed = parse(q).unwrap();
+        let plan = lower(&parsed).unwrap();
+        apply_unique_property_lookup(plan, cat)
+    }
+
+    #[test]
+    fn indexed_non_unique_property_emits_multi_index_lookup() {
+        let cat = catalog_with_city(false, true);
+        let plan = rewrite_query("MATCH (p:Person {city: 'LA'}) RETURN p", &cat);
+        assert_eq!(
+            find_lookup(&plan),
+            Some(true),
+            "an indexed non-unique property should emit a multi index lookup"
+        );
+    }
+
+    #[test]
+    fn unique_property_emits_point_lookup() {
+        let cat = catalog_with_city(true, false);
+        let plan = rewrite_query("MATCH (p:Person {city: 'LA'}) RETURN p", &cat);
+        assert_eq!(
+            find_lookup(&plan),
+            Some(false),
+            "a unique property should stay a single point lookup"
+        );
+    }
+
+    #[test]
+    fn unindexed_property_stays_a_scan() {
+        let cat = catalog_with_city(false, false);
+        let plan = rewrite_query("MATCH (p:Person {city: 'LA'}) RETURN p", &cat);
+        assert_eq!(
+            find_lookup(&plan),
+            None,
+            "an un-indexed property must keep the full scan + filter"
+        );
+    }
 }

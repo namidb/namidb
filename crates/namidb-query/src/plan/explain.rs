@@ -1041,6 +1041,7 @@ TopN keys=[b DESC] limit=10
             max: Some(StatScalar::Int64(99)),
             ndv: Some(50),
             unique: false,
+            indexed: false,
         };
         let mut props = std::collections::BTreeMap::new();
         props.insert("age".into(), age);
@@ -1121,6 +1122,7 @@ TopN keys=[b DESC] limit=10
             max: None,
             ndv: Some(1000),
             unique: false,
+            indexed: false,
         };
         props.insert("age".into(), age);
         cat.__test_insert_label(crate::cost::stats::LabelStats {
