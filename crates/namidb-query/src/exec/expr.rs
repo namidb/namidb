@@ -578,6 +578,18 @@ fn call_scalar_function(
             RuntimeValue::Rel(r) => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
             _ => RuntimeValue::Null,
         }),
+        // `elementId()` returns the exact id string the Bolt layer emits
+        // as `element_id`, so a GUI's `WHERE elementId(x) = $id` (G.V()'s
+        // node/edge fetch and expand) round-trips. Nodes: the UUID;
+        // relationships: the synthetic `<type>-<src>-><dst>` form. These
+        // mirror `uuid_to_bolt_ids` / `synthetic_edge_id` in namidb-bolt.
+        "elementid" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Node(n) => RuntimeValue::String(n.id.to_string()),
+            RuntimeValue::Rel(r) => {
+                RuntimeValue::String(format!("{}-{}->{}", r.edge_type, r.src.0, r.dst.0))
+            }
+            _ => RuntimeValue::Null,
+        }),
         "labels" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::Node(n) => {
                 RuntimeValue::List(vec![RuntimeValue::String(n.label.clone())])
