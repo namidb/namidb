@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::logical::{
-    AggregateExpr, CreateElement, LogicalPlan, OrderKey, ProjectionItem, RemoveOp, SetOp,
+    AggregateExpr, CreateElement, LogicalPlan, OrderKey, ProjectionItem, RemoveOp, RowCount, SetOp,
     ShortestMode,
 };
 use crate::parser::{
@@ -1150,8 +1150,8 @@ fn lower_projection(
             direction: k.direction,
         })
         .collect();
-    let skip_val = optional_literal_u64(skip)?;
-    let limit_val = optional_literal_u64(limit)?.unwrap_or(u64::MAX);
+    let skip_rc = optional_row_count(skip)?.unwrap_or(RowCount::Const(0));
+    let limit_rc = optional_row_count(limit)?.unwrap_or(RowCount::Const(u64::MAX));
 
     // Build the Project items. For group-key items under aggregation
     // the alias already lives on the row, so we project `Variable(alias)`.
@@ -1183,12 +1183,15 @@ fn lower_projection(
         })
         .collect();
 
-    if !order_keys.is_empty() || skip_val.is_some() || limit_val != u64::MAX {
+    if !order_keys.is_empty()
+        || skip_rc != RowCount::Const(0)
+        || limit_rc != RowCount::Const(u64::MAX)
+    {
         plan = LogicalPlan::TopN {
             input: Box::new(plan),
             keys: order_keys,
-            skip: skip_val.unwrap_or(0),
-            limit: limit_val,
+            skip: skip_rc,
+            limit: limit_rc,
         };
     }
 
@@ -1536,24 +1539,24 @@ fn expand_star_items(
     Ok(out)
 }
 
-fn optional_literal_u64(expr: &Option<Expression>) -> Result<Option<u64>, LowerError> {
+fn optional_row_count(expr: &Option<Expression>) -> Result<Option<RowCount>, LowerError> {
     match expr {
         None => Ok(None),
         Some(e) => match &e.kind {
-            ExpressionKind::Literal(Literal::Integer(n)) if *n >= 0 => Ok(Some(*n as u64)),
+            ExpressionKind::Literal(Literal::Integer(n)) if *n >= 0 => {
+                Ok(Some(RowCount::Const(*n as u64)))
+            }
             ExpressionKind::Literal(Literal::Integer(_)) => Err(LowerError::new(
                 LowerErrorKind::InvalidPattern,
-                "SKIP / LIMIT must be a non-negative integer literal in v0",
+                "SKIP / LIMIT must be a non-negative integer literal or a $parameter",
                 e.span,
             )),
-            ExpressionKind::Parameter(_) => Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "parameterised SKIP / LIMIT are not yet supported",
-                e.span,
-            )),
+            // A `$param` is carried into the plan by name and resolved at
+            // execution time, so the cached plan is reused across params.
+            ExpressionKind::Parameter(name) => Ok(Some(RowCount::Param(name.clone()))),
             _ => Err(LowerError::new(
                 LowerErrorKind::InvalidPattern,
-                "SKIP / LIMIT must be a literal integer in v0",
+                "SKIP / LIMIT must be a non-negative integer literal or a $parameter",
                 e.span,
             )),
         },
@@ -2179,9 +2182,26 @@ mod tests {
                 LogicalPlan::TopN {
                     keys, skip, limit, ..
                 } => {
-                    assert_eq!(skip, 0);
-                    assert_eq!(limit, 10);
+                    assert_eq!(skip, RowCount::Const(0));
+                    assert_eq!(limit, RowCount::Const(10));
                     assert_eq!(keys.len(), 1);
+                }
+                other => panic!("expected TopN under Project, got {:?}", other),
+            },
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skip_limit_parameters_lower_to_row_count_param() {
+        // `SKIP $s LIMIT $l` carries the param names into the plan (resolved
+        // at execution time), instead of being rejected as it was in v0.
+        let p = lp("MATCH (a:Person) RETURN a SKIP $s LIMIT $l");
+        match p {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::TopN { skip, limit, .. } => {
+                    assert_eq!(skip, RowCount::Param("s".into()));
+                    assert_eq!(limit, RowCount::Param("l".into()));
                 }
                 other => panic!("expected TopN under Project, got {:?}", other),
             },

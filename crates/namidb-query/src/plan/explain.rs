@@ -16,7 +16,7 @@ use serde::Serialize;
 use namidb_storage::sst::predicates::ScanPredicate;
 use namidb_storage::sst::stats::StatScalar;
 
-use super::logical::{AggregateExpr, CreateElement, LogicalPlan, RemoveOp, SetOp};
+use super::logical::{AggregateExpr, CreateElement, LogicalPlan, RemoveOp, RowCount, SetOp};
 use super::lower::{lower, LowerError};
 use crate::cost::{estimate, Cardinality, StatsCatalog};
 use crate::optimize::{is_join_candidate, optimize, produced_aliases};
@@ -495,11 +495,17 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 }
                 out.push(']');
             }
-            if *skip > 0 {
-                let _ = write!(out, " skip={}", skip);
+            if skip.as_const() != Some(0) {
+                let _ = match skip {
+                    RowCount::Const(n) => write!(out, " skip={n}"),
+                    RowCount::Param(p) => write!(out, " skip=${p}"),
+                };
             }
-            if *limit != u64::MAX {
-                let _ = write!(out, " limit={}", limit);
+            if limit.as_const() != Some(u64::MAX) {
+                let _ = match limit {
+                    RowCount::Const(n) => write!(out, " limit={n}"),
+                    RowCount::Param(p) => write!(out, " limit=${p}"),
+                };
             }
         }
         LogicalPlan::Distinct { .. } => {
@@ -987,8 +993,8 @@ mod tests {
                 expression: ident_expr("b"),
                 direction: OrderDirection::Desc,
             }],
-            skip: 0,
-            limit: 10,
+            skip: RowCount::Const(0),
+            limit: RowCount::Const(10),
         };
         let out = explain(&topn);
         let expected = "\

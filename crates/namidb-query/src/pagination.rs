@@ -24,7 +24,7 @@ use crate::parser::{
     BinaryOp, Expression, ExpressionKind, Identifier, Literal, OrderDirection, PropertyAccess,
     SourceSpan,
 };
-use crate::plan::{LogicalPlan, OrderKey};
+use crate::plan::{LogicalPlan, OrderKey, RowCount};
 
 /// Wire-format version for the offset cursor.
 const CURSOR_PREFIX: &str = "v1:";
@@ -105,14 +105,14 @@ pub fn paginate_plan(plan: LogicalPlan, cursor: Option<&Cursor>, page_size: u64)
         LogicalPlan::TopN { input, keys, .. } => LogicalPlan::TopN {
             input,
             keys,
-            skip,
-            limit,
+            skip: RowCount::Const(skip),
+            limit: RowCount::Const(limit),
         },
         other => LogicalPlan::TopN {
             input: Box::new(other),
             keys: Vec::<OrderKey>::new(),
-            skip,
-            limit,
+            skip: RowCount::Const(skip),
+            limit: RowCount::Const(limit),
         },
     }
 }
@@ -243,8 +243,8 @@ pub fn paginate_plan_keyset(
     LogicalPlan::TopN {
         input: Box::new(plan),
         keys: vec![order_key],
-        skip: 0,
-        limit,
+        skip: RowCount::Const(0),
+        limit: RowCount::Const(limit),
     }
 }
 
@@ -322,8 +322,8 @@ mod tests {
             LogicalPlan::TopN {
                 skip, limit, keys, ..
             } => {
-                assert_eq!(skip, 7);
-                assert_eq!(limit, 50);
+                assert_eq!(skip, RowCount::Const(7));
+                assert_eq!(limit, RowCount::Const(50));
                 assert!(keys.is_empty());
             }
             other => panic!("expected TopN, got {:?}", other),
@@ -335,14 +335,14 @@ mod tests {
         let inner = LogicalPlan::TopN {
             input: Box::new(LogicalPlan::Empty),
             keys: vec![],
-            skip: 999,
-            limit: 999,
+            skip: RowCount::Const(999),
+            limit: RowCount::Const(999),
         };
         let plan = paginate_plan(inner, Some(&Cursor::from_skip(10)), 20);
         match plan {
             LogicalPlan::TopN { skip, limit, .. } => {
-                assert_eq!(skip, 10);
-                assert_eq!(limit, 20);
+                assert_eq!(skip, RowCount::Const(10));
+                assert_eq!(limit, RowCount::Const(20));
             }
             other => panic!("expected TopN, got {:?}", other),
         }
@@ -402,8 +402,8 @@ mod tests {
         else {
             panic!("expected TopN at the root");
         };
-        assert_eq!(skip, 0);
-        assert_eq!(limit, 25);
+        assert_eq!(skip, RowCount::Const(0));
+        assert_eq!(limit, RowCount::Const(25));
         assert_eq!(keys.len(), 1);
         assert!(matches!(keys[0].direction, OrderDirection::Asc));
         // Inside the TopN we expect Filter(<a._id > "01J5XY7K"> over input).
@@ -419,7 +419,7 @@ mod tests {
         let LogicalPlan::TopN { input, limit, .. } = plan else {
             panic!("expected TopN at the root");
         };
-        assert_eq!(limit, 50);
+        assert_eq!(limit, RowCount::Const(50));
         // No filter when there is no cursor — input should be the
         // original Empty.
         assert!(matches!(input.as_ref(), LogicalPlan::Empty));

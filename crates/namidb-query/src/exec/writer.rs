@@ -173,19 +173,21 @@ fn execute_write_inner<'a>(
                 skip,
                 limit,
             } => {
+                let skip = crate::exec::walker::resolve_row_count(skip, params, "SKIP")?;
+                let limit = crate::exec::walker::resolve_row_count(limit, params, "LIMIT")?;
                 let mut rows = execute_write_inner(input, writer, params, outcome).await?;
                 if !keys.is_empty() {
                     crate::exec::walker::sort_rows(&mut rows, keys, params)?;
                 }
-                let skip = *skip as usize;
+                let skip = skip as usize;
                 if skip >= rows.len() {
                     return Ok(Vec::new());
                 }
                 let mut iter = rows.into_iter().skip(skip);
-                let take = if *limit == u64::MAX {
+                let take = if limit == u64::MAX {
                     usize::MAX
                 } else {
-                    *limit as usize
+                    limit as usize
                 };
                 let mut out = Vec::with_capacity(take.min(64));
                 for _ in 0..take {

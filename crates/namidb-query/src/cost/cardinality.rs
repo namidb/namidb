@@ -294,11 +294,15 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             limit,
         } => {
             let child = estimate_inner(input, catalog);
-            let after_skip = (child.rows - *skip as f64).max(0.0);
-            let rows = if *limit == u64::MAX {
+            // A `$param` count is unknown at plan time: assume no skip and no
+            // limit so the estimate stays a conservative upper bound.
+            let skip = skip.as_const().unwrap_or(0);
+            let limit = limit.as_const().unwrap_or(u64::MAX);
+            let after_skip = (child.rows - skip as f64).max(0.0);
+            let rows = if limit == u64::MAX {
                 after_skip
             } else {
-                after_skip.min(*limit as f64)
+                after_skip.min(limit as f64)
             };
             let bindings = child.bindings.clone();
             Cardinality {
@@ -887,8 +891,8 @@ mod tests {
     use crate::cost::stats::{LabelStats, PropStats};
     use crate::parser::ast::Identifier;
     use crate::parser::SourceSpan;
-    use crate::plan::logical::AggregateExpr;
     use crate::plan::logical::ShortestMode;
+    use crate::plan::logical::{AggregateExpr, RowCount};
     use namidb_storage::sst::stats::StatScalar;
 
     fn span() -> SourceSpan {
@@ -1072,8 +1076,8 @@ mod tests {
         let plan = LogicalPlan::TopN {
             input: Box::new(person_scan()),
             keys: vec![],
-            skip: 0,
-            limit: 50,
+            skip: RowCount::Const(0),
+            limit: RowCount::Const(50),
         };
         let c = estimate(&plan, &cat);
         assert!((c.rows - 50.0).abs() < 1e-9);
@@ -1085,8 +1089,8 @@ mod tests {
         let plan = LogicalPlan::TopN {
             input: Box::new(person_scan()),
             keys: vec![],
-            skip: 100,
-            limit: 50,
+            skip: RowCount::Const(100),
+            limit: RowCount::Const(50),
         };
         let c = estimate(&plan, &cat);
         assert!((c.rows - 50.0).abs() < 1e-9);
@@ -1154,8 +1158,8 @@ mod tests {
             subplan: Box::new(LogicalPlan::TopN {
                 input: Box::new(person_scan()),
                 keys: vec![],
-                skip: 0,
-                limit: 500,
+                skip: RowCount::Const(0),
+                limit: RowCount::Const(500),
             }),
             negated: false,
         };
@@ -1171,8 +1175,8 @@ mod tests {
             subplan: Box::new(LogicalPlan::TopN {
                 input: Box::new(person_scan()),
                 keys: vec![],
-                skip: 0,
-                limit: 200,
+                skip: RowCount::Const(0),
+                limit: RowCount::Const(200),
             }),
             negated: true,
         };
