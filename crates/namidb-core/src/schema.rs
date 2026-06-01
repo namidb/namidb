@@ -11,6 +11,7 @@ use arrow_schema::{DataType as ArrowDataType, Field};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::id::LabelId;
 
 /// A subset of Arrow's logical type system that maps cleanly to Cypher and to
 /// JSON ingest.
@@ -229,6 +230,90 @@ pub struct LabelDef {
     pub properties: Vec<PropertyDef>,
 }
 
+/// Bidirectional, append-only mapping between label names and compact
+/// [`LabelId`]s.
+///
+/// A node carries its labels on-row as a set of [`LabelId`]s; this dictionary
+/// is the per-namespace source of truth that resolves those ids back to names
+/// and back again. Ids are handed out in first-seen order and never change or
+/// get reused, so a `LabelId` minted in one manifest commit means the same
+/// label in every later one — that stability is what lets the storage layer
+/// store labels as a packed `List<UInt32>` rather than repeating strings.
+///
+/// On the wire the dictionary is just the ordered list of names: a label's id
+/// is its index in that list, and the reverse lookup is rebuilt on load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Vec<String>", into = "Vec<String>")]
+pub struct LabelDictionary {
+    /// `names[i]` is the label carrying `LabelId(i as u32)`. Append-only.
+    names: Vec<String>,
+    /// Reverse index (name -> id). Derived from `names`, never serialised.
+    ids: BTreeMap<String, LabelId>,
+}
+
+impl LabelDictionary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resolve a name to its id, minting a fresh one on first sight.
+    ///
+    /// Idempotent: interning the same name twice yields the same id.
+    pub fn intern(&mut self, name: &str) -> LabelId {
+        if let Some(id) = self.ids.get(name) {
+            return *id;
+        }
+        let id = LabelId(self.names.len() as u32);
+        self.names.push(name.to_string());
+        self.ids.insert(name.to_string(), id);
+        id
+    }
+
+    /// Resolve a name to its id without minting one.
+    pub fn id(&self, name: &str) -> Option<LabelId> {
+        self.ids.get(name).copied()
+    }
+
+    /// Resolve an id back to its label name.
+    pub fn name(&self, id: LabelId) -> Option<&str> {
+        self.names.get(id.0 as usize).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Iterate `(id, name)` pairs in id order.
+    pub fn iter(&self) -> impl Iterator<Item = (LabelId, &str)> {
+        self.names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (LabelId(i as u32), n.as_str()))
+    }
+}
+
+impl From<Vec<String>> for LabelDictionary {
+    fn from(names: Vec<String>) -> Self {
+        // Names persist in id order, so the index is the id. Build the reverse
+        // map keeping the first occurrence should a stale list carry a dup.
+        let mut ids = BTreeMap::new();
+        for (i, name) in names.iter().enumerate() {
+            ids.entry(name.clone()).or_insert(LabelId(i as u32));
+        }
+        LabelDictionary { names, ids }
+    }
+}
+
+impl From<LabelDictionary> for Vec<String> {
+    fn from(dict: LabelDictionary) -> Self {
+        dict.names
+    }
+}
+
 /// Definition of a directed edge type between two labels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeTypeDef {
@@ -434,5 +519,66 @@ mod tests {
         let bad_json = r#"{"name":"node_id","data_type":"Utf8","nullable":false}"#;
         let res: std::result::Result<PropertyDef, _> = serde_json::from_str(bad_json);
         assert!(res.is_err(), "serde must reject reserved property names");
+    }
+
+    #[test]
+    fn label_dictionary_interns_in_first_seen_order() {
+        let mut dict = LabelDictionary::new();
+        assert!(dict.is_empty());
+        let person = dict.intern("Person");
+        let employee = dict.intern("Employee");
+        assert_eq!(person, LabelId::new(0));
+        assert_eq!(employee, LabelId::new(1));
+        // Idempotent: re-interning returns the same id, no new slot.
+        assert_eq!(dict.intern("Person"), person);
+        assert_eq!(dict.len(), 2);
+    }
+
+    #[test]
+    fn label_dictionary_resolves_both_directions() {
+        let mut dict = LabelDictionary::new();
+        let id = dict.intern("Person");
+        assert_eq!(dict.id("Person"), Some(id));
+        assert_eq!(dict.name(id), Some("Person"));
+        assert_eq!(dict.id("Missing"), None);
+        assert_eq!(dict.name(LabelId::new(99)), None);
+    }
+
+    #[test]
+    fn label_dictionary_iterates_in_id_order() {
+        let mut dict = LabelDictionary::new();
+        dict.intern("A");
+        dict.intern("B");
+        dict.intern("C");
+        let pairs: Vec<_> = dict.iter().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (LabelId::new(0), "A"),
+                (LabelId::new(1), "B"),
+                (LabelId::new(2), "C"),
+            ]
+        );
+    }
+
+    #[test]
+    fn label_dictionary_round_trips_and_keeps_ids_stable() {
+        let mut dict = LabelDictionary::new();
+        dict.intern("Person");
+        dict.intern("Employee");
+        dict.intern("Manager");
+
+        // On the wire it's just the ordered name list.
+        let json = serde_json::to_string(&dict).unwrap();
+        assert_eq!(json, r#"["Person","Employee","Manager"]"#);
+
+        let round: LabelDictionary = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, dict);
+        // Ids survive the round-trip, and a re-intern of an existing name
+        // reuses its id rather than appending.
+        assert_eq!(round.id("Employee"), Some(LabelId::new(1)));
+        let mut round = round;
+        assert_eq!(round.intern("Person"), LabelId::new(0));
+        assert_eq!(round.intern("New"), LabelId::new(3));
     }
 }

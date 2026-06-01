@@ -16,6 +16,8 @@ pub mod schema;
 pub mod value;
 
 pub use error::{Error, Result};
-pub use id::{EdgeId, NamespaceId, NodeId};
-pub use schema::{DataType, EdgeTypeDef, LabelDef, PropertyDef, Schema, SchemaBuilder};
+pub use id::{EdgeId, LabelId, NamespaceId, NodeId};
+pub use schema::{
+    DataType, EdgeTypeDef, LabelDef, LabelDictionary, PropertyDef, Schema, SchemaBuilder,
+};
 pub use value::Value;
