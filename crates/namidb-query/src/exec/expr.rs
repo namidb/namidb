@@ -809,6 +809,20 @@ fn call_scalar_function(
             _ => Err(EvalError::new("__label_eq expects (node, string)", span)),
         },
 
+        // `timestamp()` — milliseconds since the Unix epoch. A common
+        // Cypher helper for stamping writes (`SET n.updated = timestamp()`).
+        // Evaluated per call from the wall clock.
+        "timestamp" => {
+            if !args.is_empty() {
+                return Err(EvalError::new("timestamp() takes no arguments", span));
+            }
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Ok(RuntimeValue::Integer(ms))
+        }
+
         _ => Err(EvalError::new(
             format!("function `{}` is not supported in v0", name),
             span,
@@ -1086,6 +1100,16 @@ mod tests {
     fn arith_int_add() {
         let r = eval_str("1 + 2", &Row::new(), &Params::new());
         assert_eq!(r, RuntimeValue::Integer(3));
+    }
+
+    #[test]
+    fn timestamp_returns_epoch_millis() {
+        let r = eval_str("timestamp()", &Row::new(), &Params::new());
+        match r {
+            // Sanity: after 2023-01-01T00:00:00Z in milliseconds.
+            RuntimeValue::Integer(ms) => assert!(ms > 1_672_531_200_000, "too small: {ms}"),
+            other => panic!("timestamp() should be an integer, got {other:?}"),
+        }
     }
 
     #[test]
