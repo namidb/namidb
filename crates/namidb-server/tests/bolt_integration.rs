@@ -366,3 +366,180 @@ async fn bolt_bad_token_yields_failure() {
 
     server_task.abort();
 }
+
+/// Like [`run_pull`], but issues a single `PULL` and drains every
+/// buffered `RECORD` up to the closing `SUCCESS`. Safe for result sets
+/// of any size (including zero rows), where the per-record `PULL` loop
+/// in `run_pull` would over-send.
+async fn pull_all(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<RowMap>) {
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String(cypher.into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(stream, &pack(&run)).await;
+
+    let fields = match recv_msg(stream).await {
+        Response::Success(meta) => match meta.get("fields") {
+            Some(Value::List(items)) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        },
+        other => panic!("expected head SUCCESS, got {other:?}"),
+    };
+
+    let pull = Value::Struct {
+        tag: struct_tag::PULL,
+        fields: vec![Value::Map({
+            let mut m = BTreeMap::new();
+            m.insert("n".into(), Value::Int(-1));
+            m
+        })],
+    };
+    send_msg(stream, &pack(&pull)).await;
+
+    let mut rows: Vec<RowMap> = Vec::new();
+    loop {
+        match recv_msg(stream).await {
+            Response::Record(values) => {
+                let mut row = BTreeMap::new();
+                for (k, v) in fields.iter().cloned().zip(values) {
+                    row.insert(k, v);
+                }
+                rows.push(row);
+            }
+            Response::Success(_) => return (fields, rows),
+            other => panic!("unexpected message draining PULL: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn bolt_memgraph_introspection_populates_schema() {
+    // A Memgraph-flavoured GUI (e.g. G.V()/gdotv) fires schema
+    // procedures on connect. The Cypher parser has no CALL clause, so
+    // the `introspect` shim must answer them from the live snapshot
+    // before the parser would reject them as a syntax error.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+
+    let config = namidb_server::Config {
+        store_uri: "memory://bolt-introspect".into(),
+        listen: http_addr,
+        auth_token: Some("test-token".into()),
+        flush_interval: Duration::ZERO,
+        bolt_listen: Some(bolt_addr),
+    };
+    let server_task = tokio::spawn(async move {
+        let _ = namidb_server::run(config).await;
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(bolt_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    // Seed a small graph with ad-hoc (schemaless) properties and one
+    // edge connecting two distinct labels.
+    pull_all(&mut stream, "CREATE (a:Person {name: 'Alice', age: 30})").await;
+    pull_all(&mut stream, "CREATE (c:Company {name: 'NamiDB'})").await;
+    pull_all(
+        &mut stream,
+        "MATCH (a:Person {name:'Alice'}),(c:Company {name:'NamiDB'}) CREATE (a)-[:WORKS_AT]->(c)",
+    )
+    .await;
+
+    // schema.node_type_properties(): one row per (label, property),
+    // surfacing the sampled schemaless types.
+    let (fields, rows) = pull_all(&mut stream, "CALL schema.node_type_properties() YIELD *").await;
+    assert!(fields.iter().any(|f| f == "nodeLabels"));
+    assert!(fields.iter().any(|f| f == "propertyName"));
+    assert!(fields.iter().any(|f| f == "propertyTypes"));
+    let person_name = rows
+        .iter()
+        .find(|r| {
+            r.get("propertyName") == Some(&Value::String("name".into()))
+                && matches!(
+                    r.get("nodeLabels"),
+                    Some(Value::List(l)) if l.contains(&Value::String("Person".into()))
+                )
+        })
+        .expect("Person.name row present");
+    assert_eq!(
+        person_name.get("propertyTypes"),
+        Some(&Value::String("String".into())),
+    );
+
+    // meta_util.schema(): a single row whose `schema` map carries the
+    // node and relationship lists G.V() renders.
+    let (_f, rows) = pull_all(&mut stream, "CALL meta_util.schema() YIELD *;").await;
+    assert_eq!(rows.len(), 1, "meta_util.schema must return one row");
+    let schema = match rows[0].get("schema") {
+        Some(Value::Map(m)) => m,
+        other => panic!("schema column not a map: {other:?}"),
+    };
+    let nodes = match schema.get("nodes") {
+        Some(Value::List(l)) => l,
+        other => panic!("nodes not a list: {other:?}"),
+    };
+    assert_eq!(nodes.len(), 2, "expected Person + Company node types");
+    let rels = match schema.get("relationships") {
+        Some(Value::List(l)) => l,
+        other => panic!("relationships not a list: {other:?}"),
+    };
+    assert_eq!(rels.len(), 1, "expected one WORKS_AT edge type");
+
+    // The edge's start/end must reference ids that exist in `nodes` so
+    // the client can resolve endpoint labels.
+    let node_ids: std::collections::BTreeSet<i64> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Value::Map(m) => match m.get("id") {
+                Some(Value::Int(i)) => Some(*i),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let rel = match &rels[0] {
+        Value::Map(m) => m,
+        other => panic!("rel not a map: {other:?}"),
+    };
+    for key in ["start", "end"] {
+        match rel.get(key) {
+            Some(Value::Int(i)) => assert!(node_ids.contains(i), "{key} {i} dangling"),
+            other => panic!("{key} not an int: {other:?}"),
+        }
+    }
+    assert_eq!(rel.get("label"), Some(&Value::String("WORKS_AT".into())));
+
+    // rel_type_properties() lists the edge type.
+    let (_f, rows) = pull_all(&mut stream, "CALL schema.rel_type_properties() YIELD *").await;
+    assert!(
+        rows.iter()
+            .any(|r| r.get("relType") == Some(&Value::String(":`WORKS_AT`".into()))),
+        "WORKS_AT not listed by rel_type_properties: {rows:?}"
+    );
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    server_task.abort();
+}

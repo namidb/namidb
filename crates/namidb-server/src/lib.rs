@@ -7,6 +7,7 @@
 //! the end-to-end boot procedure.
 
 pub mod bolt;
+mod introspect;
 
 use std::sync::Arc;
 use std::time::Duration;

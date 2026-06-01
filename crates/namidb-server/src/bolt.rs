@@ -42,6 +42,18 @@ impl Backend for ServerBackend {
         cypher: &str,
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
+        // Memgraph-style schema introspection (gdotv and other Bolt
+        // GUIs) hits procedures the Cypher parser has no `CALL` clause
+        // for. Answer them from the live snapshot before the parser
+        // would reject them as a syntax error. See `crate::introspect`.
+        {
+            let owned = self.state.snapshot.load();
+            let snap = owned.borrow();
+            if let Some(result) = crate::introspect::try_introspect(cypher, &snap).await {
+                return result;
+            }
+        }
+
         let parsed = match cypher_parse(cypher) {
             Ok(p) => p,
             Err(errs) => {
@@ -161,7 +173,17 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(addr = %listen, "namidb bolt listening");
-    let agent = format!("NamiDB/{}", env!("CARGO_PKG_VERSION"));
+    // The HELLO `server` agent must look like a Neo4j build or the
+    // official drivers (and GUIs built on them: gdotv, Neo4j Browser,
+    // Bloom) reject the connection with "Server does not identify as a
+    // genuine Neo4j instance". Memgraph and Amazon Neptune present a
+    // `Neo4j/<version>` agent for exactly this reason; the Bolt endpoint
+    // exists for driver compatibility, so we default to one too.
+    // Override via `NAMIDB_BOLT_SERVER_AGENT` (e.g. to the honest
+    // `NamiDB/<version>` when talking to a lenient client).
+    let agent =
+        std::env::var("NAMIDB_BOLT_SERVER_AGENT").unwrap_or_else(|_| "Neo4j/5.13.0".to_string());
+    info!(server_agent = %agent, "bolt server agent");
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(p) => p,
