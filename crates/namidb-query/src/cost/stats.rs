@@ -578,6 +578,7 @@ mod tests {
             },
             bloom: None,
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         }
     }
 
@@ -612,6 +613,7 @@ mod tests {
             },
             bloom: None,
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         }
     }
 
