@@ -160,13 +160,52 @@ fn require_input(p: Option<LogicalPlan>, span: SourceSpan) -> Result<LogicalPlan
 
 struct LowerCtx {
     bindings: BTreeSet<String>,
+    /// Monotonic source of internal binding names for anonymous path
+    /// elements (see [`LowerCtx::fill_anonymous_path_bindings`]). Never
+    /// reset, so names stay unique across clauses.
+    anon_counter: usize,
 }
 
 impl LowerCtx {
     fn new() -> Self {
         Self {
             bindings: BTreeSet::new(),
+            anon_counter: 0,
         }
+    }
+
+    /// A fresh internal binding name. The leading space can never appear
+    /// in a user-written identifier, so it cannot collide with a real
+    /// binding (and reads as internal if it ever surfaces).
+    fn fresh_anon(&mut self, span: SourceSpan) -> ast::Identifier {
+        let n = self.anon_counter;
+        self.anon_counter += 1;
+        ast::Identifier::new(format!(" anon{n}"), span)
+    }
+
+    /// Return a copy of `elem` with every anonymous head node,
+    /// relationship, and target node given a fresh internal binding.
+    ///
+    /// A *bound* path (`p = ...`) must address each element so
+    /// [`build_path_constructor`] can assemble it. Clients like gdotv
+    /// write path bindings with anonymous elements — `p = ()-[]->()` for
+    /// the default graph view, `p = ()-[r]-()` for edge expansion — which
+    /// would otherwise be rejected. Synthesising bindings makes those
+    /// behave exactly like the explicitly-aliased form.
+    fn fill_anonymous_path_bindings(&mut self, elem: &PatternElement) -> PatternElement {
+        let mut out = elem.clone();
+        if out.head.binding.is_none() {
+            out.head.binding = Some(self.fresh_anon(out.head.span));
+        }
+        for (rel, target) in out.chain.iter_mut() {
+            if rel.binding.is_none() {
+                rel.binding = Some(self.fresh_anon(rel.span));
+            }
+            if target.binding.is_none() {
+                target.binding = Some(self.fresh_anon(target.span));
+            }
+        }
+        out
     }
 
     fn introduce(&mut self, name: &str, span: SourceSpan) -> Result<(), LowerError> {
@@ -526,10 +565,14 @@ fn lower_pattern_part(
         return lower_pattern_element(&part.element, input, optional, shortest, ctx);
     }
     if let Some(path_bind) = &part.binding {
-        validate_path_pattern_v0(&part.element)?;
-        let plan = lower_pattern_element(&part.element, input, optional, shortest, ctx)?;
+        // Anonymous path elements (`p = ()-[]->()`, `p = ()-[r]-()`) get
+        // fresh internal bindings so the path can be assembled; without
+        // this the lower rejects them. See `fill_anonymous_path_bindings`.
+        let element = ctx.fill_anonymous_path_bindings(&part.element);
+        validate_path_pattern_v0(&element)?;
+        let plan = lower_pattern_element(&element, input, optional, shortest, ctx)?;
         ctx.introduce(&path_bind.name, path_bind.span)?;
-        let path_expr = build_path_constructor(&part.element, path_bind.span);
+        let path_expr = build_path_constructor(&element, path_bind.span);
         return Ok(LogicalPlan::Project {
             input: Box::new(plan),
             items: vec![ProjectionItem {
@@ -640,35 +683,15 @@ fn validate_shortest_path_pattern_v0(
 }
 
 fn validate_path_pattern_v0(elem: &PatternElement) -> Result<(), LowerError> {
-    if elem.head.binding.is_none() {
-        return Err(LowerError::new(
-            LowerErrorKind::UnsupportedFeature,
-            "path bindings require the head node to have an explicit alias \
- (e.g. `p = (a:Person)-[r]->(b:Person)`)",
-            elem.head.span,
-        ));
-    }
-    for (rel, target) in &elem.chain {
+    // Anonymous elements are filled with internal bindings before this
+    // runs (see `fill_anonymous_path_bindings`), so the only path-binding
+    // shape still unsupported in v0 is variable-length.
+    for (rel, _target) in &elem.chain {
         if rel.length.is_some() {
             return Err(LowerError::new(
                 LowerErrorKind::UnsupportedFeature,
                 "variable-length path bindings (e.g. `p = (a)-[*1..3]->(b)`) are not yet supported",
                 rel.span,
-            ));
-        }
-        if rel.binding.is_none() {
-            return Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "path bindings require every relationship to have an explicit alias \
- (e.g. `-[r:KNOWS]-`)",
-                rel.span,
-            ));
-        }
-        if target.binding.is_none() {
-            return Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "path bindings require every target node to have an explicit alias",
-                target.span,
             ));
         }
     }
