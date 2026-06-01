@@ -281,11 +281,14 @@ fn execute_write_inner<'a>(
                 for row in input_rows {
                     let id_value = evaluate(id, &row, params)?;
                     let node_id = crate::exec::walker::node_id_from_value(&id_value, id.span)?;
-                    if let Some(view) = snap
-                        .lookup_node(label, node_id)
-                        .await
-                        .map_err(ExecError::Storage)?
-                    {
+                    let found = match label {
+                        Some(l) => snap
+                            .lookup_node(l, node_id)
+                            .await
+                            .map_err(ExecError::Storage)?,
+                        None => crate::exec::walker::scan_node_for_id(&snap, node_id).await?,
+                    };
+                    if let Some(view) = found {
                         let mut new_row = row;
                         new_row.set(
                             alias.clone(),

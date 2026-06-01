@@ -124,8 +124,26 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             label,
             alias,
             ..
+        } => {
+            let child = estimate_inner(input, catalog);
+            // Point lookup: each input row triggers at most one hit.
+            let rows = child.rows.min(child.rows.max(1.0));
+            let mut bindings = child.bindings.clone();
+            bindings.insert(
+                alias.clone(),
+                BindingMeta {
+                    label: label.clone(),
+                    ..Default::default()
+                },
+            );
+            Cardinality {
+                rows,
+                bindings,
+                children: vec![child],
+                operator: plan.operator_name(),
+            }
         }
-        | LogicalPlan::NodeByPropertyValue {
+        LogicalPlan::NodeByPropertyValue {
             input,
             label,
             alias,
