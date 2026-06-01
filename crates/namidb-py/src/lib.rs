@@ -796,7 +796,13 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
 fn node_view_to_py<'py>(py: Python<'py>, v: &NodeView) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("id", v.id.to_string())?;
-    d.set_item("label", &v.label)?;
+    // NodeView carries a label set now; emit the representative label to keep
+    // the single-label Python contract until the plural switch later in the
+    // multi-label series.
+    d.set_item(
+        "label",
+        v.labels.iter().next().map(String::as_str).unwrap_or(""),
+    )?;
     d.set_item("lsn", v.lsn)?;
     d.set_item("schema_version", v.schema_version)?;
     let props = PyDict::new_bound(py);
@@ -1065,7 +1071,7 @@ fn build_node_views_table(
 
     let labels = PyList::empty_bound(py);
     for v in views {
-        labels.append(&v.label)?;
+        labels.append(v.labels.iter().next().map(String::as_str).unwrap_or(""))?;
     }
     arrays.append(pyarrow.call_method1("array", (labels,))?)?;
 
