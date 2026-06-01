@@ -548,15 +548,50 @@ async fn path_binding_two_hop_chain() {
 }
 
 #[tokio::test]
-async fn path_binding_rejects_anonymous_rel() {
-    let q = parse("MATCH p = (a:Person)-[:KNOWS]->(b:Person) RETURN p").unwrap();
-    let err = lower(&q).expect_err("expected lowering error");
-    assert!(
-        err.message
-            .contains("relationship to have an explicit alias"),
-        "unexpected message: {}",
-        err.message
-    );
+async fn path_binding_supports_anonymous_elements() {
+    // Clients like gdotv bind paths with anonymous elements:
+    // `p = ()-[]->()` for the default graph view, or an anonymous
+    // relationship between named nodes. The lower fills the anonymous
+    // slots with internal bindings, so the path still materialises
+    // (rather than the old "explicit alias required" rejection).
+    let mut writer = WriterSession::open(store(), paths("exec-anon-path"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Anonymous relationship between named nodes.
+    let q = parse(
+        "MATCH p = (a:Person)-[:KNOWS]->(b:Person) \
+         WHERE a.name = 'Alice' AND b.name = 'Bob' \
+         RETURN p",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_path_node_rel_node(rows[0].get("p"));
+
+    // Fully anonymous path — exactly what gdotv's default query emits.
+    let q = parse("MATCH p = ()-[]->() RETURN p").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert!(!rows.is_empty(), "anonymous path should match edges");
+    for row in &rows {
+        assert_path_node_rel_node(row.get("p"));
+    }
+}
+
+fn assert_path_node_rel_node(value: Option<&RuntimeValue>) {
+    match value {
+        Some(RuntimeValue::Path(items)) => {
+            assert_eq!(items.len(), 3, "path should be node-rel-node");
+            assert!(matches!(items[0], RuntimeValue::Node(_)), "head not a node");
+            assert!(matches!(items[1], RuntimeValue::Rel(_)), "middle not a rel");
+            assert!(matches!(items[2], RuntimeValue::Node(_)), "tail not a node");
+        }
+        other => panic!("expected Path, got {other:?}"),
+    }
 }
 
 #[tokio::test]
