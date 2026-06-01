@@ -249,6 +249,9 @@ async fn bolt_create_then_match_roundtrip() {
         listen: http_addr,
         auth_token: Some("test-token".into()),
         flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
         bolt_listen: Some(bolt_addr),
     };
 
@@ -313,6 +316,9 @@ async fn bolt_bad_token_yields_failure() {
         listen: http_addr,
         auth_token: Some("correct-token".into()),
         flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
         bolt_listen: Some(bolt_addr),
     };
 
@@ -441,6 +447,9 @@ async fn bolt_memgraph_introspection_populates_schema() {
         listen: http_addr,
         auth_token: Some("test-token".into()),
         flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
         bolt_listen: Some(bolt_addr),
     };
     let server_task = tokio::spawn(async move {
