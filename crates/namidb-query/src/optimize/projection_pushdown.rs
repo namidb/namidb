@@ -384,11 +384,6 @@ fn collect_from_expr(expr: &Expression, req: &mut RequiredSet) {
             collect_from_expr(item, req);
             collect_from_expr(list, req);
         }
-        ExpressionKind::Between { target, low, high } => {
-            collect_from_expr(target, req);
-            collect_from_expr(low, req);
-            collect_from_expr(high, req);
-        }
         ExpressionKind::StringTest {
             target, pattern, ..
         } => {

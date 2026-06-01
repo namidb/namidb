@@ -428,11 +428,6 @@ fn reject_nested_pattern_comprehension(expr: &Expression) -> Result<(), LowerErr
             reject_nested_pattern_comprehension(item)?;
             reject_nested_pattern_comprehension(list)
         }
-        ExpressionKind::Between { target, low, high } => {
-            reject_nested_pattern_comprehension(target)?;
-            reject_nested_pattern_comprehension(low)?;
-            reject_nested_pattern_comprehension(high)
-        }
         ExpressionKind::StringTest {
             target, pattern, ..
         } => {
@@ -1359,11 +1354,6 @@ fn walk_extract_agg(expr: &Expression, aggs: &mut Aggregations) -> Result<Expres
             item: Box::new(walk_extract_agg(item, aggs)?),
             list: Box::new(walk_extract_agg(list, aggs)?),
         },
-        Between { target, low, high } => Between {
-            target: Box::new(walk_extract_agg(target, aggs)?),
-            low: Box::new(walk_extract_agg(low, aggs)?),
-            high: Box::new(walk_extract_agg(high, aggs)?),
-        },
         StringTest {
             op,
             target,
@@ -1448,11 +1438,6 @@ fn contains_agg_variable(expr: &Expression) -> bool {
         }
         ExpressionKind::In { item, list } => {
             contains_agg_variable(item) || contains_agg_variable(list)
-        }
-        ExpressionKind::Between { target, low, high } => {
-            contains_agg_variable(target)
-                || contains_agg_variable(low)
-                || contains_agg_variable(high)
         }
         ExpressionKind::StringTest {
             target, pattern, ..
@@ -1984,11 +1969,6 @@ fn check_expression_bindings(expr: &Expression, ctx: &LowerCtx) -> Result<(), Lo
         ExpressionKind::In { item, list } => {
             check_expression_bindings(item, ctx)?;
             check_expression_bindings(list, ctx)
-        }
-        ExpressionKind::Between { target, low, high } => {
-            check_expression_bindings(target, ctx)?;
-            check_expression_bindings(low, ctx)?;
-            check_expression_bindings(high, ctx)
         }
         ExpressionKind::StringTest {
             target, pattern, ..

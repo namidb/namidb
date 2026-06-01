@@ -52,16 +52,6 @@ pub fn try_into_scan_predicate(expr: &Expression, alias: &str) -> Option<ScanPre
         ExpressionKind::Binary { op, left, right } => {
             try_binary_to_predicate(*op, left, right, alias)
         }
-        ExpressionKind::Between { target, low, high } => {
-            let column = property_column_for_alias(target, alias)?;
-            let lo = literal_to_stat_scalar(literal_of(low)?)?;
-            let hi = literal_to_stat_scalar(literal_of(high)?)?;
-            Some(ScanPredicate::Between {
-                column,
-                low: lo,
-                high: hi,
-            })
-        }
         ExpressionKind::IsNull {
             expr: inner,
             negated,
@@ -359,26 +349,6 @@ mod tests {
             Some(ScanPredicate::Eq {
                 column: "name".into(),
                 value: StatScalar::Utf8("Alice".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn between_translates() {
-        let e = Expression {
-            kind: ExpressionKind::Between {
-                target: Box::new(property("a", "age")),
-                low: Box::new(int_lit(20)),
-                high: Box::new(int_lit(40)),
-            },
-            span: span(),
-        };
-        assert_eq!(
-            try_into_scan_predicate(&e, "a"),
-            Some(ScanPredicate::Between {
-                column: "age".into(),
-                low: StatScalar::Int64(20),
-                high: StatScalar::Int64(40),
             })
         );
     }

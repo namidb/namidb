@@ -327,9 +327,6 @@ impl fmt::Display for Expression {
                 write!(f, "({} {} {})", left, binary_op_symbol(*op), right)
             }
             ExpressionKind::In { item, list } => write!(f, "({} IN {})", item, list),
-            ExpressionKind::Between { target, low, high } => {
-                write!(f, "({} BETWEEN {} AND {})", target, low, high)
-            }
             ExpressionKind::StringTest {
                 op,
                 target,

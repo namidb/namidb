@@ -91,14 +91,6 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
             let list_v = evaluate(list, row, params)?;
             Ok(eval_in(&item_v, &list_v))
         }
-        ExpressionKind::Between { target, low, high } => {
-            let t = evaluate(target, row, params)?;
-            let lo = evaluate(low, row, params)?;
-            let hi = evaluate(high, row, params)?;
-            let cmp_lo = eval_binary(BinaryOp::Ge, &t, &lo, span)?;
-            let cmp_hi = eval_binary(BinaryOp::Le, &t, &hi, span)?;
-            eval_binary(BinaryOp::And, &cmp_lo, &cmp_hi, span)
-        }
         ExpressionKind::StringTest {
             op,
             target,

@@ -37,12 +37,6 @@ pub enum ScanPredicate {
     Gt { column: String, value: StatScalar },
     /// `column >= value`.
     GtEq { column: String, value: StatScalar },
-    /// `low <= column <= high` (inclusive both sides).
-    Between {
-        column: String,
-        low: StatScalar,
-        high: StatScalar,
-    },
     /// `column IS NULL`.
     IsNull { column: String },
     /// `column IS NOT NULL`.
@@ -63,7 +57,6 @@ impl ScanPredicate {
             | ScanPredicate::LtEq { column, .. }
             | ScanPredicate::Gt { column, .. }
             | ScanPredicate::GtEq { column, .. }
-            | ScanPredicate::Between { column, .. }
             | ScanPredicate::IsNull { column }
             | ScanPredicate::IsNotNull { column }
             | ScanPredicate::In { column, .. } => column,
@@ -155,34 +148,6 @@ pub fn eval_row_group(predicate: &ScanPredicate, stats: &PropertyColumnStats) ->
             None => MaybePresent,
         },
 
-        P::Between {
-            column: _,
-            low,
-            high,
-        } => {
-            let lower = eval_row_group(
-                &P::GtEq {
-                    column: predicate.column().to_string(),
-                    value: low.clone(),
-                },
-                stats,
-            );
-            if lower == Absent {
-                return Absent;
-            }
-            let upper = eval_row_group(
-                &P::LtEq {
-                    column: predicate.column().to_string(),
-                    value: high.clone(),
-                },
-                stats,
-            );
-            if upper == Absent {
-                return Absent;
-            }
-            MaybePresent
-        }
-
         P::IsNull { .. } => {
             if stats.null_count > 0 {
                 MaybePresent
@@ -200,8 +165,8 @@ pub fn eval_row_group(predicate: &ScanPredicate, stats: &PropertyColumnStats) ->
 
         P::In { values, .. } => {
             // Build the closed interval [min(values), max(values)] and
-            // reuse the Between path. False-positives (a value
-            // inside [low, high] but not in the list) are caught by
+            // prune with a GtEq(min) AND LtEq(max) pair. False-positives (a
+            // value inside [low, high] but not in the list) are caught by
             // the residual Filter the optimizer leaves intact when
             // `In` is partial.
             if values.is_empty() {
@@ -309,15 +274,6 @@ pub fn eval_against_value(predicate: &ScanPredicate, value: Option<&Value>) -> b
         P::GtEq { value: target, .. } => value_cmp(v, target)
             .map(|o| matches!(o, Ordering::Greater | Ordering::Equal))
             .unwrap_or(false),
-        P::Between { low, high, .. } => {
-            let lo_ok = value_cmp(v, low)
-                .map(|o| matches!(o, Ordering::Greater | Ordering::Equal))
-                .unwrap_or(false);
-            let hi_ok = value_cmp(v, high)
-                .map(|o| matches!(o, Ordering::Less | Ordering::Equal))
-                .unwrap_or(false);
-            lo_ok && hi_ok
-        }
         P::In { values, .. } => values.iter().any(|target| {
             value_cmp(v, target)
                 .map(|o| o == Ordering::Equal)
@@ -559,54 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn between_overlap_is_maybe_present() {
-        let s = stats(
-            "age",
-            Some(StatScalar::Int64(10)),
-            Some(StatScalar::Int64(50)),
-            0,
-        );
-        let p = ScanPredicate::Between {
-            column: "age".into(),
-            low: StatScalar::Int64(20),
-            high: StatScalar::Int64(40),
-        };
-        assert_eq!(eval_row_group(&p, &s), RowGroupVerdict::MaybePresent);
-    }
-
-    #[test]
-    fn between_disjoint_above_is_absent() {
-        let s = stats(
-            "age",
-            Some(StatScalar::Int64(10)),
-            Some(StatScalar::Int64(50)),
-            0,
-        );
-        let p = ScanPredicate::Between {
-            column: "age".into(),
-            low: StatScalar::Int64(60),
-            high: StatScalar::Int64(80),
-        };
-        assert_eq!(eval_row_group(&p, &s), RowGroupVerdict::Absent);
-    }
-
-    #[test]
-    fn between_disjoint_below_is_absent() {
-        let s = stats(
-            "age",
-            Some(StatScalar::Int64(10)),
-            Some(StatScalar::Int64(50)),
-            0,
-        );
-        let p = ScanPredicate::Between {
-            column: "age".into(),
-            low: StatScalar::Int64(1),
-            high: StatScalar::Int64(5),
-        };
-        assert_eq!(eval_row_group(&p, &s), RowGroupVerdict::Absent);
-    }
-
-    #[test]
     fn is_null_with_nulls_is_maybe_present() {
         let s = stats(
             "age",
@@ -711,11 +619,6 @@ mod tests {
                 column: "age".into(),
                 value: StatScalar::Int64(5),
             },
-            ScanPredicate::Between {
-                column: "age".into(),
-                low: StatScalar::Int64(1),
-                high: StatScalar::Int64(2),
-            },
         ] {
             assert_eq!(
                 eval_row_group(&p, &s),
@@ -798,20 +701,6 @@ mod tests {
         assert!(eval_against_value(&p, Some(&Value::I64(20))));
         assert!(!eval_against_value(&p, Some(&Value::I64(30))));
         assert!(!eval_against_value(&p, Some(&Value::I64(40))));
-    }
-
-    #[test]
-    fn eval_against_value_between_works() {
-        let p = ScanPredicate::Between {
-            column: "age".into(),
-            low: StatScalar::Int64(20),
-            high: StatScalar::Int64(40),
-        };
-        assert!(eval_against_value(&p, Some(&Value::I64(20))));
-        assert!(eval_against_value(&p, Some(&Value::I64(30))));
-        assert!(eval_against_value(&p, Some(&Value::I64(40))));
-        assert!(!eval_against_value(&p, Some(&Value::I64(50))));
-        assert!(!eval_against_value(&p, Some(&Value::I64(10))));
     }
 
     #[test]
