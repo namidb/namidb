@@ -840,7 +840,7 @@ fn lower_node_pattern_head(
             let inner_input = input.unwrap_or(LogicalPlan::Empty);
             let mut plan = LogicalPlan::NodeById {
                 input: Box::new(inner_input),
-                label: label.to_string(),
+                label: Some(label.to_string()),
                 alias: alias.clone(),
                 id: id_expr,
             };
@@ -2146,7 +2146,7 @@ mod tests {
         match p {
             LogicalPlan::Project { input, .. } => match *input {
                 LogicalPlan::NodeById { label, alias, .. } => {
-                    assert_eq!(label, "Person");
+                    assert_eq!(label.as_deref(), Some("Person"));
                     assert_eq!(alias, "a");
                 }
                 other => panic!("expected NodeById, got {:?}", other),

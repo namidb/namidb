@@ -332,12 +332,13 @@ fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
             .and_then(|l| catalog.label(l))
             .map(|l| l.node_count > 0)
             .unwrap_or(false),
-        LogicalPlan::NodeById { label, .. } | LogicalPlan::NodeByPropertyValue { label, .. } => {
-            catalog
-                .label(label)
-                .map(|l| l.node_count > 0)
-                .unwrap_or(false)
-        }
+        LogicalPlan::NodeById { label, .. } => label
+            .as_deref()
+            .is_none_or(|l| catalog.label(l).map(|x| x.node_count > 0).unwrap_or(false)),
+        LogicalPlan::NodeByPropertyValue { label, .. } => catalog
+            .label(label)
+            .map(|l| l.node_count > 0)
+            .unwrap_or(false),
         LogicalPlan::Expand {
             edge_type: Some(ets),
             ..
@@ -375,7 +376,12 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
         LogicalPlan::NodeById {
             label, alias, id, ..
         } => {
-            let _ = write!(out, "NodeById label={} alias={} id={}", label, alias, id);
+            let label_str = label.as_deref().unwrap_or("*");
+            let _ = write!(
+                out,
+                "NodeById label={} alias={} id={}",
+                label_str, alias, id
+            );
         }
         LogicalPlan::NodeByPropertyValue {
             label,

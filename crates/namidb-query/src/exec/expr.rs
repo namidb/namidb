@@ -578,6 +578,18 @@ fn call_scalar_function(
             RuntimeValue::Rel(r) => RuntimeValue::String(format!("{}:{}", r.src, r.dst)),
             _ => RuntimeValue::Null,
         }),
+        // `elementId()` returns the exact id string the Bolt layer emits
+        // as `element_id`, so a GUI's `WHERE elementId(x) = $id` (G.V()'s
+        // node/edge fetch and expand) round-trips. Nodes: the UUID;
+        // relationships: the synthetic `<type>-<src>-><dst>` form. These
+        // mirror `uuid_to_bolt_ids` / `synthetic_edge_id` in namidb-bolt.
+        "elementid" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Node(n) => RuntimeValue::String(n.id.to_string()),
+            RuntimeValue::Rel(r) => {
+                RuntimeValue::String(format!("{}-{}->{}", r.edge_type, r.src.0, r.dst.0))
+            }
+            _ => RuntimeValue::Null,
+        }),
         "labels" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::Node(n) => {
                 RuntimeValue::List(vec![RuntimeValue::String(n.label.clone())])
@@ -796,6 +808,20 @@ fn call_scalar_function(
             }),
             _ => Err(EvalError::new("__label_eq expects (node, string)", span)),
         },
+
+        // `timestamp()` — milliseconds since the Unix epoch. A common
+        // Cypher helper for stamping writes (`SET n.updated = timestamp()`).
+        // Evaluated per call from the wall clock.
+        "timestamp" => {
+            if !args.is_empty() {
+                return Err(EvalError::new("timestamp() takes no arguments", span));
+            }
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Ok(RuntimeValue::Integer(ms))
+        }
 
         _ => Err(EvalError::new(
             format!("function `{}` is not supported in v0", name),
@@ -1074,6 +1100,16 @@ mod tests {
     fn arith_int_add() {
         let r = eval_str("1 + 2", &Row::new(), &Params::new());
         assert_eq!(r, RuntimeValue::Integer(3));
+    }
+
+    #[test]
+    fn timestamp_returns_epoch_millis() {
+        let r = eval_str("timestamp()", &Row::new(), &Params::new());
+        match r {
+            // Sanity: after 2023-01-01T00:00:00Z in milliseconds.
+            RuntimeValue::Integer(ms) => assert!(ms > 1_672_531_200_000, "too small: {ms}"),
+            other => panic!("timestamp() should be an integer, got {other:?}"),
+        }
     }
 
     #[test]

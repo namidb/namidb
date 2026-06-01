@@ -278,7 +278,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 for row in input_rows {
                     let id_value = evaluate(id, &row, params)?;
                     let node_id = node_id_from_value(&id_value, id.span)?;
-                    if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+                    let found = match label {
+                        Some(l) => snapshot.lookup_node(l, node_id).await?,
+                        None => scan_node_for_id(snapshot, node_id).await?,
+                    };
+                    if let Some(view) = found {
                         let mut new_row = row;
                         new_row.set(
                             alias.clone(),
@@ -1286,7 +1290,7 @@ fn should_skip_target_materialize(
 /// Cypher's `Expand` doesn't carry the target label in v1 (only the
 /// edge type), so we trial-search until storage provides a
 /// label-index for ids.
-async fn scan_node_for_id(
+pub(crate) async fn scan_node_for_id(
     snapshot: &Snapshot<'_>,
     id: NodeId,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
@@ -1784,7 +1788,11 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let row = arena_view.materialize(leaf, None);
                     let id_value = evaluate(id, &row, params)?;
                     let node_id = node_id_from_value(&id_value, id.span)?;
-                    if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+                    let found = match label {
+                        Some(l) => snapshot.lookup_node(l, node_id).await?,
+                        None => scan_node_for_id(snapshot, node_id).await?,
+                    };
+                    if let Some(view) = found {
                         let slot = Slot {
                             name: alias_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),

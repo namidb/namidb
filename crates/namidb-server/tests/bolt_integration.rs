@@ -763,3 +763,130 @@ async fn bolt_idle_transaction_times_out_and_releases_writer() {
     b.shutdown().await.ok();
     task.abort();
 }
+
+/// Run a statement and return the metadata of its closing `SUCCESS`
+/// (after a single PULL) — e.g. to inspect the write `stats` map.
+async fn run_capture_close(stream: &mut TcpStream, cypher: &str) -> BTreeMap<String, Value> {
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String(cypher.into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(stream, &pack(&run)).await;
+    match recv_msg(stream).await {
+        Response::Success(_) => {}
+        other => panic!("expected head SUCCESS, got {other:?}"),
+    }
+    let pull = Value::Struct {
+        tag: struct_tag::PULL,
+        fields: vec![Value::Map({
+            let mut m = BTreeMap::new();
+            m.insert("n".into(), Value::Int(-1));
+            m
+        })],
+    };
+    send_msg(stream, &pack(&pull)).await;
+    loop {
+        match recv_msg(stream).await {
+            Response::Record(_) => {}
+            Response::Success(meta) => return meta,
+            other => panic!("unexpected message capturing close: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn bolt_neo4j_type_introspection_and_counters() {
+    // The Neo4j connection type fires db.*, apoc.meta.* and SHOW, uses
+    // elementId(), and expects write counters in the closing SUCCESS.
+    let (bolt_addr, task) = boot_bolt("bolt-neo4j", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    // A write reports counters in the closing SUCCESS `stats` map.
+    let close = run_capture_close(
+        &mut stream,
+        "CREATE (a:Person {name: 'Alice', age: 30})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    )
+    .await;
+    let stats = match close.get("stats") {
+        Some(Value::Map(m)) => m,
+        other => panic!("write summary has no stats map: {other:?}"),
+    };
+    assert_eq!(stats.get("nodes-created"), Some(&Value::Int(2)));
+    assert_eq!(stats.get("relationships-created"), Some(&Value::Int(1)));
+
+    pull_all(&mut stream, "CREATE (c:Company {name: 'NamiDB'})").await;
+    pull_all(
+        &mut stream,
+        "MATCH (a:Person {name:'Alice'}),(c:Company {name:'NamiDB'}) \
+         CREATE (a)-[:WORKS_AT {role: 'founder'}]->(c)",
+    )
+    .await;
+
+    // db.labels()
+    let (_f, rows) = pull_all(&mut stream, "CALL db.labels()").await;
+    assert!(rows
+        .iter()
+        .any(|r| r.get("label") == Some(&Value::String("Person".into()))));
+
+    // apoc.meta.nodeTypeProperties(): APOC shape, propertyTypes is a list.
+    let (fields, rows) = pull_all(&mut stream, "CALL apoc.meta.nodeTypeProperties()").await;
+    assert!(fields.iter().any(|f| f == "nodeLabels"));
+    let person_name = rows
+        .iter()
+        .find(|r| {
+            r.get("propertyName") == Some(&Value::String("name".into()))
+                && matches!(
+                    r.get("nodeLabels"),
+                    Some(Value::List(l)) if l.contains(&Value::String("Person".into()))
+                )
+        })
+        .expect("Person.name row present");
+    assert!(
+        matches!(person_name.get("propertyTypes"), Some(Value::List(_))),
+        "apoc propertyTypes must be a list, got {:?}",
+        person_name.get("propertyTypes")
+    );
+
+    // apoc.meta.relTypeProperties(): endpoint labels populated.
+    let (_f, rows) = pull_all(&mut stream, "CALL apoc.meta.relTypeProperties()").await;
+    let works = rows
+        .iter()
+        .find(|r| r.get("relType") == Some(&Value::String(":`WORKS_AT`".into())))
+        .expect("WORKS_AT row present");
+    assert!(matches!(
+        works.get("sourceNodeLabels"),
+        Some(Value::List(l)) if l.contains(&Value::String("Person".into()))
+    ));
+    assert!(matches!(
+        works.get("targetNodeLabels"),
+        Some(Value::List(l)) if l.contains(&Value::String("Company".into()))
+    ));
+
+    // SHOW DATABASES resolves the default database name.
+    let (_f, rows) = pull_all(&mut stream, "SHOW DATABASES").await;
+    assert!(rows
+        .iter()
+        .any(|r| r.get("name") == Some(&Value::String("neo4j".into()))));
+
+    // elementId() returns a non-empty id string (G.V() uses it to fetch
+    // and expand nodes/edges).
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "MATCH (n:Person {name:'Alice'}) RETURN elementId(n) AS eid",
+    )
+    .await;
+    assert!(
+        matches!(rows.first().and_then(|r| r.get("eid")), Some(Value::String(s)) if !s.is_empty()),
+        "elementId(n) should be a non-empty string: {rows:?}"
+    );
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}

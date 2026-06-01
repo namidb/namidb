@@ -187,6 +187,9 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// closing `SUCCESS` after PULL/DISCARD. `None` while no stream
     /// is active.
     pending_statement_type: Option<StatementType>,
+    /// Write counters of the in-flight stream, emitted as `stats` in the
+    /// closing `SUCCESS` after PULL/DISCARD. Empty for reads.
+    pending_counters: BTreeMap<String, i64>,
     /// While an explicit transaction is open the backend holds the writer
     /// lock, so an idle client would pin it indefinitely. When set, a read
     /// that blocks longer than this with a transaction open rolls the
@@ -205,6 +208,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             state: State::Negotiation,
             version: None,
             pending_statement_type: None,
+            pending_counters: BTreeMap::new(),
             tx_idle_timeout: None,
         }
     }
@@ -469,6 +473,16 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     .take()
                     .unwrap_or(StatementType::Read);
                 meta.insert("type".into(), Value::String(stype.as_str().into()));
+                // Emit write counters (Neo4j `stats`) so a client shows
+                // "N created / deleted" after a write. Empty for reads.
+                let counters = std::mem::take(&mut self.pending_counters);
+                if !counters.is_empty() {
+                    let stats: BTreeMap<String, Value> = counters
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::Int(v)))
+                        .collect();
+                    meta.insert("stats".into(), Value::Map(stats));
+                }
                 if self.state == State::TxStreaming {
                     self.state = State::TxReady;
                 } else {
@@ -538,6 +552,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             State::Streaming
         };
         self.pending_statement_type = Some(outcome.statement_type);
+        self.pending_counters = outcome.counters;
         // Buffered model: rows already emitted. PULL/DISCARD will
         // observe the streaming state and answer with a closing
         // SUCCESS in handle_in_streaming.

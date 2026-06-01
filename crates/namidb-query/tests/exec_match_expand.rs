@@ -930,3 +930,53 @@ async fn global_edge_type_count_pushdown_matches_nodescan_path() {
         "EdgeTypeCount must match the NodeScan+Expand count exactly"
     );
 }
+
+fn has_node_by_id(plan: &namidb_query::LogicalPlan) -> bool {
+    matches!(plan, namidb_query::LogicalPlan::NodeById { .. })
+        || plan.children().iter().any(|c| has_node_by_id(c))
+}
+
+#[tokio::test]
+async fn element_id_filter_lowers_to_point_lookup() {
+    use namidb_query::{parse_lower_optimize, StatsCatalog};
+
+    let mut writer = WriterSession::open(store(), paths("exec-element-id"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Grab a real node and its element id (the UUID).
+    let any = execute(
+        &lower(&parse("MATCH (p:Person) RETURN p LIMIT 1").unwrap()).unwrap(),
+        &snapshot,
+        &Params::new(),
+    )
+    .await
+    .unwrap();
+    let (eid, name) = match any[0].get("p") {
+        Some(RuntimeValue::Node(n)) => (n.id.to_string(), n.properties.get("name").cloned()),
+        other => panic!("expected a node, got {other:?}"),
+    };
+
+    // Unlabelled `WHERE elementId(v) = '<uuid>'` (the GUI node-fetch shape)
+    // must optimise to a NodeById point lookup rather than a full scan, and
+    // return exactly that node.
+    let query = format!("MATCH (v) WHERE elementId(v) = '{eid}' RETURN v");
+    let optimized = parse_lower_optimize(&query, &StatsCatalog::empty()).unwrap();
+    assert!(
+        has_node_by_id(&optimized),
+        "elementId equality must lower to a NodeById point lookup, got {optimized:?}"
+    );
+    let rows = execute(&optimized, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "point lookup must return exactly the node");
+    match rows[0].get("v") {
+        Some(RuntimeValue::Node(n)) => {
+            assert_eq!(n.id.to_string(), eid);
+            assert_eq!(n.properties.get("name").cloned(), name);
+        }
+        other => panic!("expected the looked-up node, got {other:?}"),
+    }
+}
