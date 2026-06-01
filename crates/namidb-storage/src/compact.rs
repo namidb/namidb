@@ -462,14 +462,28 @@ async fn put_node_sst_l1(
     // path after compaction. Without this, every compaction silently
     // demotes affected queries back to the legacy full label scan
     // (P4.19 only emitted sidecars on flush).
-    let (unique_property_indices, index_sidecars) = crate::flush::prepare_unique_property_sidecars(
-        paths,
-        level.as_u32(),
-        &id,
-        label,
-        label_def,
-        merged_rows,
-    )?;
+    let (unique_property_indices, mut index_sidecars) =
+        crate::flush::prepare_unique_property_sidecars(
+            paths,
+            level.as_u32(),
+            &id,
+            label,
+            label_def,
+            merged_rows,
+        )?;
+    // Re-emit equality-index posting-list sidecars too, rebuilt from the
+    // already-reconciled `merged_rows` (tombstones dropped, highest-lsn per
+    // id), so the L1 sidecar supersedes all the L0 partials.
+    let (equality_property_indices, equality_sidecars) =
+        crate::flush::prepare_equality_property_sidecars(
+            paths,
+            level.as_u32(),
+            &id,
+            label,
+            label_def,
+            merged_rows,
+        )?;
+    index_sidecars.extend(equality_sidecars);
     for (path, body) in &index_sidecars {
         put_create(store, path, body.clone()).await?;
     }
@@ -496,6 +510,7 @@ async fn put_node_sst_l1(
         },
         bloom: bloom_descriptor,
         unique_property_indices,
+        equality_property_indices,
     };
     Ok((descriptor, wrote_bloom))
 }
@@ -561,6 +576,7 @@ async fn put_edge_sst_l1(
         },
         bloom: bloom_descriptor,
         unique_property_indices: Vec::new(),
+        equality_property_indices: Vec::new(),
     };
     Ok((descriptor, wrote_bloom))
 }

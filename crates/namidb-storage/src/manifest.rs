@@ -207,6 +207,13 @@ pub struct SstDescriptor {
     // sidecar emission (`serde(default)` covers backward compatibility).
     #[serde(default)]
     pub unique_property_indices: Vec<UniquePropertyIndexDescriptor>,
+    // Secondary equality-index sidecars for `indexed` (non-unique)
+    // properties. Same idea as `unique_property_indices`, but each value
+    // maps to MANY node ids (a posting list), so the reader unions the
+    // posting lists across SSTs and confirms each candidate. Empty for edge
+    // SSTs and older manifests (`serde(default)`).
+    #[serde(default)]
+    pub equality_property_indices: Vec<EqualityIndexDescriptor>,
 }
 
 /// Side-car pointer for a single `(SST, unique property)` pair. The
@@ -227,6 +234,24 @@ pub struct UniquePropertyIndexDescriptor {
     /// non-tombstone row count modulo nulls; surfaced for diagnostics
     /// and the cache prewarm decision.
     pub entry_count: u64,
+}
+
+/// Side-car pointer for a single `(SST, indexed non-unique property)` pair.
+/// The sidecar body is a bincode-serialised `BTreeMap<String, Vec<NodeId>>`
+/// (a posting list per value, sorted by value string). Unlike the unique
+/// sidecar a value may map to several ids, so the reader unions the lists
+/// across all in-scope SSTs and confirms each candidate against the node's
+/// current value (which also discards tombstoned or value-changed ids).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqualityIndexDescriptor {
+    /// Name of the indexed property this sidecar covers.
+    pub property: String,
+    /// Object-store path relative to the namespace prefix.
+    pub path: String,
+    /// On-disk size of the sidecar body.
+    pub size_bytes: u64,
+    /// Number of distinct values in the sidecar (posting-list keys).
+    pub distinct_values: u64,
 }
 
 /// JSON serde helper: `[u8; 16]` ↔ base64-standard string.
@@ -927,6 +952,7 @@ mod tests {
                 xxhash3_64: 0xDEADBEEFCAFEBABE,
             }),
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         }
     }
 
@@ -958,6 +984,7 @@ mod tests {
             },
             bloom: None, // small SST → no side-car
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         }
     }
 

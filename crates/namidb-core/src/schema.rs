@@ -94,6 +94,16 @@ pub struct PropertyDef {
     /// Defaults to `false` so existing schemas / manifests load
     /// unchanged via the `#[serde(default)]` on the wire repr.
     pub unique: bool,
+    /// When `true`, the flush layer emits a secondary equality-index
+    /// sidecar for this property (value -> the node ids carrying it), so
+    /// `MATCH (a:Label {prop: literal})` can resolve through the index
+    /// instead of a full label scan + filter, even when the value is NOT
+    /// unique. Orthogonal to `unique`: a property may be `indexed` without
+    /// being unique. Like `unique`, it is a planner/storage hint.
+    ///
+    /// Defaults to `false`; the wire repr carries `#[serde(default)]` so
+    /// existing manifests load unchanged.
+    pub indexed: bool,
 }
 
 /// Wire-level representation used only by serde. The public type validates
@@ -106,6 +116,8 @@ struct PropertyDefRepr {
     nullable: bool,
     #[serde(default)]
     unique: bool,
+    #[serde(default)]
+    indexed: bool,
 }
 
 impl TryFrom<PropertyDefRepr> for PropertyDef {
@@ -113,6 +125,7 @@ impl TryFrom<PropertyDefRepr> for PropertyDef {
     fn try_from(r: PropertyDefRepr) -> Result<Self> {
         let mut p = PropertyDef::new(r.name, r.data_type, r.nullable)?;
         p.unique = r.unique;
+        p.indexed = r.indexed;
         Ok(p)
     }
 }
@@ -124,6 +137,7 @@ impl From<PropertyDef> for PropertyDefRepr {
             data_type: p.data_type,
             nullable: p.nullable,
             unique: p.unique,
+            indexed: p.indexed,
         }
     }
 }
@@ -155,6 +169,7 @@ impl PropertyDef {
             data_type,
             nullable,
             unique: false,
+            indexed: false,
         })
     }
 
@@ -166,6 +181,17 @@ impl PropertyDef {
     /// ```
     pub fn with_unique(mut self, unique: bool) -> Self {
         self.unique = unique;
+        self
+    }
+
+    /// Builder method: declare this property as indexed, so the flush layer
+    /// emits a secondary equality-index sidecar for it (non-unique).
+    ///
+    /// ```ignore
+    /// PropertyDef::new("city", DataType::Utf8, true)?.with_indexed(true)
+    /// ```
+    pub fn with_indexed(mut self, indexed: bool) -> Self {
+        self.indexed = indexed;
         self
     }
 
