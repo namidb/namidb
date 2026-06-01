@@ -327,19 +327,37 @@ fn execute_write_inner<'a>(
                 alias,
                 property,
                 value,
+                multi,
             } => {
                 let input_rows = execute_write_inner(input, writer, params, outcome).await?;
                 let snap = writer.snapshot();
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
-                    if let Some(view) = crate::exec::walker::lookup_node_by_property_via_scan(
-                        &snap,
-                        label,
-                        property,
-                        &lookup_val,
-                    )
-                    .await?
+                    if *multi {
+                        for view in crate::exec::walker::lookup_nodes_by_property_via_scan(
+                            &snap,
+                            label,
+                            property,
+                            &lookup_val,
+                        )
+                        .await?
+                        {
+                            let mut new_row = row.clone();
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    } else if let Some(view) =
+                        crate::exec::walker::lookup_node_by_property_via_scan(
+                            &snap,
+                            label,
+                            property,
+                            &lookup_val,
+                        )
+                        .await?
                     {
                         let mut new_row = row;
                         new_row.set(

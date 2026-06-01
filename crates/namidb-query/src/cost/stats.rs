@@ -60,6 +60,10 @@ pub struct PropStats {
     /// reads this to rewrite `Filter(prop = literal)` on top of
     /// `NodeScan(label)` into `NodeByPropertyValue` (point lookup).
     pub unique: bool,
+    /// Mirrors `PropertyDef::indexed` — the optimizer reads this to
+    /// rewrite an equality filter on a non-unique indexed property into a
+    /// `NodeByPropertyValue { multi: true }` index lookup.
+    pub indexed: bool,
 }
 
 /// Per-edge-type aggregate stats.
@@ -140,6 +144,7 @@ impl StatsCatalog {
                     .entry(pd.name.clone())
                     .or_insert_with(|| PropStats {
                         unique: pd.unique,
+                        indexed: pd.indexed,
                         ..Default::default()
                     });
             }

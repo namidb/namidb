@@ -386,12 +386,14 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(rewrite(*input)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,

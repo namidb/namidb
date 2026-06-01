@@ -88,12 +88,14 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             alias,
             property,
             value,
+            multi,
         } => LogicalPlan::NodeByPropertyValue {
             input: Box::new(recurse(*input, catalog)),
             label,
             alias,
             property,
             value,
+            multi,
         },
         LogicalPlan::Expand {
             input,

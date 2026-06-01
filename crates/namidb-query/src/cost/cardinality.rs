@@ -933,6 +933,7 @@ mod tests {
             max: Some(StatScalar::Int64(100)),
             ndv: Some(50),
             unique: false,
+            indexed: false,
         };
         let person = LabelStats {
             name: "Person".into(),
