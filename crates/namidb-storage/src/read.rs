@@ -486,6 +486,131 @@ impl<'mt> Snapshot<'mt> {
         Ok(found)
     }
 
+    /// Resolve `MATCH (a:label {property: value})` for a NON-unique
+    /// `indexed` property through the equality-index sidecars, returning
+    /// every live node carrying that value.
+    ///
+    /// Each in-scope Nodes SST emits a `value → [NodeId, ...]` posting list
+    /// for an `indexed` property. When every in-scope SST carries the
+    /// sidecar we union the posting lists (plus any memtable upserts) into a
+    /// candidate set, then *confirm* each candidate with `lookup_node`: that
+    /// resolves cross-store last-write-wins and tombstones, and we keep only
+    /// nodes whose CURRENT value still equals `value`. Confirmation makes
+    /// the lookup correct even when a node was deleted or had its value
+    /// changed after an older sidecar captured it (both yield a candidate
+    /// that fails the re-check). Falls back to a full label scan when any
+    /// in-scope SST predates the sidecar. String-valued properties only.
+    pub async fn lookup_nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        value: &str,
+    ) -> Result<Vec<NodeView>> {
+        namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property");
+
+        let sst_idxs: Vec<usize> = self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::Nodes, label)
+            .to_vec();
+        let all_have_sidecar = !sst_idxs.is_empty()
+            && sst_idxs.iter().all(|i| {
+                self.manifest.manifest.ssts[*i]
+                    .equality_property_indices
+                    .iter()
+                    .any(|d| d.property == property)
+            });
+
+        // Cold path: a pre-sidecar SST is in scope (or the property was not
+        // `indexed` at flush time). Scan + filter, returning every match.
+        if !all_have_sidecar {
+            let all_nodes = self.scan_label(label).await?;
+            return Ok(all_nodes
+                .into_iter()
+                .filter(|v| {
+                    matches!(v.properties.get(property),
+                        Some(namidb_core::Value::Str(s)) if s == value)
+                })
+                .collect());
+        }
+
+        namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property.sidecar");
+        // Gather candidate ids: memtable upserts carrying `value`, plus the
+        // union of every SST posting list under `value`.
+        let mut candidates: std::collections::BTreeSet<namidb_core::id::NodeId> =
+            std::collections::BTreeSet::new();
+        for (mk, e) in self.memtable.iter() {
+            if let MemKey::Node { label: mlabel, id } = mk {
+                if mlabel != label {
+                    continue;
+                }
+                if let MemOp::Upsert(payload) = &e.op {
+                    let rec = NodeWriteRecord::decode(payload)?;
+                    if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
+                        if s == value {
+                            candidates.insert(*id);
+                        }
+                    }
+                }
+            }
+        }
+        for idx in &sst_idxs {
+            let desc = &self.manifest.manifest.ssts[*idx];
+            let sidecar_desc = desc
+                .equality_property_indices
+                .iter()
+                .find(|d| d.property == property)
+                .expect("all_have_sidecar guard");
+            let absolute = format!(
+                "{}/{}",
+                self.paths.namespace_prefix().as_ref(),
+                sidecar_desc.path
+            );
+            let body = if let Some(b) = self.cache_get(&absolute) {
+                b
+            } else {
+                let object_path = object_store::path::Path::from(absolute.clone());
+                let bytes = self
+                    .store
+                    .get(&object_path)
+                    .await
+                    .map_err(Error::ObjectStore)?
+                    .bytes()
+                    .await
+                    .map_err(Error::ObjectStore)?;
+                if let Some(cache) = &self.cache {
+                    cache.insert(absolute.clone(), bytes.clone());
+                }
+                bytes
+            };
+            let map: std::collections::BTreeMap<String, Vec<[u8; 16]>> =
+                bincode::deserialize(&body)
+                    .map_err(|e| Error::invariant(format!("equality-index bincode decode: {e}")))?;
+            if let Some(ids) = map.get(value) {
+                for id_bytes in ids {
+                    candidates.insert(namidb_core::id::NodeId::from_uuid(Uuid::from_bytes(
+                        *id_bytes,
+                    )));
+                }
+            }
+        }
+
+        // Confirm each candidate against its current value. `lookup_node`
+        // returns None for a tombstoned id and the live view otherwise; we
+        // drop any whose value no longer matches (the value-changed case).
+        let mut out = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            if let Some(view) = self.lookup_node(label, id).await? {
+                if matches!(view.properties.get(property),
+                    Some(namidb_core::Value::Str(s)) if s == value)
+                {
+                    out.push(view);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn manifest(&self) -> &LoadedManifest {
         &self.manifest
     }
@@ -2759,6 +2884,299 @@ mod tests {
         assert_eq!(view.properties.get("age"), Some(&Value::I64(30)));
     }
 
+    // ── secondary equality index (non-unique `indexed` property) ──
+
+    fn indexed_city_label() -> LabelDef {
+        LabelDef {
+            name: "Person".into(),
+            properties: vec![
+                PropertyDef::new("name", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("city", DataType::Utf8, true)
+                    .unwrap()
+                    .with_indexed(true),
+            ],
+        }
+    }
+
+    fn city_payload(name: &str, city: &str) -> Bytes {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        props.insert("name".into(), Value::Str(name.into()));
+        props.insert("city".into(), Value::Str(city.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    async fn flush_batch(
+        ms: &ManifestStore,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        schema: &namidb_core::Schema,
+        rows: Vec<(NodeId, u64, MemOp)>,
+    ) -> LoadedManifest {
+        let mut mt = Memtable::new();
+        for (id, lsn, op) in rows {
+            mt.apply(
+                MemKey::Node {
+                    label: "Person".into(),
+                    id,
+                },
+                lsn,
+                op,
+            );
+        }
+        let frozen = mt.freeze();
+        flush(ms, fence, base, &frozen, schema.clone())
+            .await
+            .unwrap()
+            .committed
+    }
+
+    /// Resolve `city == value` against `committed` (empty live memtable) and
+    /// return the matched names, sorted.
+    async fn lookup_cities(
+        committed: &LoadedManifest,
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+        city: &str,
+    ) -> Vec<String> {
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(committed.clone(), &view, store, paths);
+        let mut names: Vec<String> = snap
+            .lookup_nodes_by_property("Person", "city", city)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|v| match v.properties.get("name") {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn equality_index_returns_all_matching_nodes() {
+        let store = make_store();
+        let paths = make_paths("eqidx-all");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(indexed_city_label())
+            .unwrap()
+            .build();
+
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            vec![
+                (
+                    sorted_node_id(1),
+                    10,
+                    MemOp::Upsert(city_payload("Ann", "LA")),
+                ),
+                (
+                    sorted_node_id(2),
+                    11,
+                    MemOp::Upsert(city_payload("Bob", "LA")),
+                ),
+                (
+                    sorted_node_id(3),
+                    12,
+                    MemOp::Upsert(city_payload("Cy", "NYC")),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            lookup_cities(&committed, store.clone(), paths.clone(), "LA").await,
+            vec!["Ann".to_string(), "Bob".to_string()]
+        );
+        assert_eq!(
+            lookup_cities(&committed, store.clone(), paths.clone(), "NYC").await,
+            vec!["Cy".to_string()]
+        );
+        assert!(lookup_cities(&committed, store, paths, "SF")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn equality_index_drops_tombstoned_candidate() {
+        let store = make_store();
+        let paths = make_paths("eqidx-tomb");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(indexed_city_label())
+            .unwrap()
+            .build();
+
+        // Two LA nodes flushed into one SST (which carries the sidecar).
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            vec![
+                (
+                    sorted_node_id(1),
+                    10,
+                    MemOp::Upsert(city_payload("Ann", "LA")),
+                ),
+                (
+                    sorted_node_id(2),
+                    11,
+                    MemOp::Upsert(city_payload("Bob", "LA")),
+                ),
+            ],
+        )
+        .await;
+
+        // A live-memtable tombstone on Ann: the sidecar still lists her id,
+        // but the confirmation via lookup_node sees the tombstone and drops
+        // her.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id: sorted_node_id(1),
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(committed, &view, store, paths);
+        let rows = snap
+            .lookup_nodes_by_property("Person", "city", "LA")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Ann was tombstoned");
+        assert_eq!(
+            rows[0].properties.get("name"),
+            Some(&Value::Str("Bob".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn equality_index_drops_value_changed_candidate() {
+        // The §4 correctness guard: a node whose indexed value changed must
+        // not be returned under its stale value.
+        let store = make_store();
+        let paths = make_paths("eqidx-changed");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(indexed_city_label())
+            .unwrap()
+            .build();
+
+        // Flush X under "LA" (the sidecar captures X at "LA").
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            vec![(
+                sorted_node_id(1),
+                10,
+                MemOp::Upsert(city_payload("X", "LA")),
+            )],
+        )
+        .await;
+
+        // X moves to "NYC" in the live memtable (newer lsn, not flushed).
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                label: "Person".into(),
+                id: sorted_node_id(1),
+            },
+            20,
+            MemOp::Upsert(city_payload("X", "NYC")),
+        );
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(committed, &view, store, paths);
+
+        // A query for the stale value must NOT return X.
+        let la = snap
+            .lookup_nodes_by_property("Person", "city", "LA")
+            .await
+            .unwrap();
+        assert!(la.is_empty(), "stale 'LA' must not return the moved node");
+        // The current value does.
+        let nyc = snap
+            .lookup_nodes_by_property("Person", "city", "NYC")
+            .await
+            .unwrap();
+        assert_eq!(nyc.len(), 1);
+        assert_eq!(nyc[0].properties.get("name"), Some(&Value::Str("X".into())));
+    }
+
+    #[tokio::test]
+    async fn equality_index_survives_compaction() {
+        let store = make_store();
+        let paths = make_paths("eqidx-compact");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(indexed_city_label())
+            .unwrap()
+            .build();
+
+        // Two separate flushes → two L0 Person SSTs, each with a partial
+        // sidecar.
+        let b1 = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            vec![(
+                sorted_node_id(1),
+                10,
+                MemOp::Upsert(city_payload("Ann", "LA")),
+            )],
+        )
+        .await;
+        let b2 = flush_batch(
+            &ms,
+            &fence,
+            &b1,
+            &schema,
+            vec![(
+                sorted_node_id(2),
+                11,
+                MemOp::Upsert(city_payload("Bob", "LA")),
+            )],
+        )
+        .await;
+
+        // Compact L0 → L1; the rebuilt L1 sidecar must serve the union.
+        let outcome = crate::compact::compact_l0_to_l1(&ms, &fence, &b2, &schema)
+            .await
+            .unwrap();
+        assert!(
+            outcome.source_ssts_removed >= 2,
+            "expected the two L0 Person SSTs to compact"
+        );
+        assert_eq!(
+            lookup_cities(&outcome.committed, store, paths, "LA").await,
+            vec!["Ann".to_string(), "Bob".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn lookup_node_falls_back_to_memtable_when_not_flushed() {
         let store = make_store();
@@ -3802,6 +4220,7 @@ mod tests {
             kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
             bloom: Some(bloom_desc),
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         };
 
         let empty = Memtable::new();
@@ -3825,6 +4244,7 @@ mod tests {
         let no_bloom = SstDescriptor {
             bloom: None,
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
             ..descriptor.clone()
         };
         assert!(snap
@@ -4152,6 +4572,7 @@ mod tests {
             kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
             bloom: None::<BloomDescriptor>,
             unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
         });
         let mt = Memtable::new();
         let view = mt.snapshot_view();

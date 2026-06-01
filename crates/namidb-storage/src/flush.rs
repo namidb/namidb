@@ -573,8 +573,15 @@ fn prepare_node_pending(
     // `unique` property emit a `value_string → NodeId` map serialised to
     // bincode. The reader probes these instead of full-scanning the SST
     // to resolve `MATCH (a:Label {prop: 'X'})`.
-    let (unique_property_indices, index_sidecars) =
+    let (unique_property_indices, mut index_sidecars) =
         prepare_unique_property_sidecars(paths, level.as_u32(), &id, label, label_def, rows)?;
+    // Per-property equality sidecars (RFC-pending): for each declared
+    // `indexed` (non-unique) property emit a `value_string → [NodeId, ...]`
+    // posting map. The reader unions these across SSTs and confirms each
+    // candidate against the node's current value.
+    let (equality_property_indices, equality_sidecars) =
+        prepare_equality_property_sidecars(paths, level.as_u32(), &id, label, label_def, rows)?;
+    index_sidecars.extend(equality_sidecars);
 
     let stats = finish.stats;
     let descriptor = SstDescriptor {
@@ -598,6 +605,7 @@ fn prepare_node_pending(
         },
         bloom: bloom_descriptor,
         unique_property_indices,
+        equality_property_indices,
     };
 
     Ok(PendingSst {
@@ -691,6 +699,74 @@ pub(crate) fn prepare_unique_property_sidecars(
     Ok((descriptors, bodies))
 }
 
+/// Parallel outputs of [`prepare_equality_property_sidecars`].
+type EqualityPropertySidecars = (
+    Vec<crate::manifest::EqualityIndexDescriptor>,
+    Vec<(Path, Bytes)>,
+);
+
+/// For every `PropertyDef::indexed == true`, harvest `value_string ->
+/// [NodeId, ...]` posting lists from `rows` and emit one sidecar per
+/// property. Unlike [`prepare_unique_property_sidecars`] a value maps to
+/// MANY ids, so the reader unions postings across SSTs and confirms each
+/// candidate against the node's current value (which discards tombstoned
+/// or value-changed ids). Same string-only, upsert-only harvesting as the
+/// unique path; non-string values are skipped (typed keys are a follow-up).
+///
+/// `pub(crate)` so `compact.rs` can re-emit the sidecars on L0->L1 merge.
+pub(crate) fn prepare_equality_property_sidecars(
+    paths: &NamespacePaths,
+    level: u32,
+    sst_id: &Uuid,
+    label: &str,
+    label_def: &LabelDef,
+    rows: &[NodeRow],
+) -> Result<EqualityPropertySidecars> {
+    let mut descriptors = Vec::new();
+    let mut bodies = Vec::new();
+    for prop in &label_def.properties {
+        if !prop.indexed {
+            continue;
+        }
+        let mut index: BTreeMap<String, Vec<[u8; 16]>> = BTreeMap::new();
+        for row in rows {
+            if let MemOp::Upsert(payload) = &row.op {
+                let rec = NodeWriteRecord::decode(payload)?;
+                if let Some(Value::Str(s)) = rec.properties.get(&prop.name) {
+                    let ids = index.entry(s.clone()).or_default();
+                    if !ids.contains(&row.id) {
+                        ids.push(row.id);
+                    }
+                }
+            }
+        }
+        if index.is_empty() {
+            continue;
+        }
+        let distinct_values = index.len() as u64;
+        let body_bytes = bincode::serialize(&index)
+            .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?;
+        let body = Bytes::from(body_bytes);
+        let file_name = format!(
+            "{}-{}-{}.eqidx_{}.bin",
+            uuid_path_id(sst_id),
+            SstKind::Nodes.path_tag(),
+            label,
+            prop.name,
+        );
+        let object_path = paths.sst_object(level, &file_name);
+        let relative = relative_sst_path(level, &file_name);
+        descriptors.push(crate::manifest::EqualityIndexDescriptor {
+            property: prop.name.clone(),
+            path: relative,
+            size_bytes: body.len() as u64,
+            distinct_values,
+        });
+        bodies.push((object_path, body));
+    }
+    Ok((descriptors, bodies))
+}
+
 fn prepare_edge_pending(
     paths: &NamespacePaths,
     edge_type: &str,
@@ -746,6 +822,7 @@ fn prepare_edge_pending(
         },
         bloom: bloom_descriptor,
         unique_property_indices: Vec::new(),
+        equality_property_indices: Vec::new(),
     };
 
     PendingSst {
