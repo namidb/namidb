@@ -147,13 +147,13 @@ pub enum LogicalPlan {
         aggregations: Vec<(String, AggregateExpr)>,
     },
 
-    /// Sort + skip + limit fused. Pure sort: `skip=0, limit=u64::MAX`.
-    /// Pure limit: `keys.is_empty()`.
+    /// Sort + skip + limit fused. Pure sort: `skip=Const(0),
+    /// limit=Const(u64::MAX)`. Pure limit: `keys.is_empty()`.
     TopN {
         input: Box<LogicalPlan>,
         keys: Vec<OrderKey>,
-        skip: u64,
-        limit: u64,
+        skip: RowCount,
+        limit: RowCount,
     },
 
     /// Distinct across every visible binding.
@@ -530,6 +530,30 @@ pub struct JoinKey {
 pub struct OrderKey {
     pub expression: Expression,
     pub direction: OrderDirection,
+}
+
+/// A `SKIP` / `LIMIT` row count: a plan-time constant, or a `$param`
+/// resolved at execution time. The param *name* is part of the plan (not
+/// its value), so a cached plan is reused across parameter sets and only
+/// the executor reads the bound value. Optimizations that need the concrete
+/// count (e.g. limit pushdown) must treat `Param` conservatively as
+/// "unknown" via [`RowCount::as_const`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RowCount {
+    Const(u64),
+    Param(String),
+}
+
+impl RowCount {
+    /// The count when it is known at plan time. `Param` returns `None`, so a
+    /// caller that needs a numeric bound falls back to a conservative
+    /// default (`0` for a skip, "unbounded" for a limit).
+    pub fn as_const(&self) -> Option<u64> {
+        match self {
+            RowCount::Const(n) => Some(*n),
+            RowCount::Param(_) => None,
+        }
+    }
 }
 
 /// Aggregate function applied inside an `Aggregate` operator.

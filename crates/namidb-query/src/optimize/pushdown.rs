@@ -544,7 +544,7 @@ mod tests {
     use crate::parser::ast::{BinaryOp, Identifier, Literal, RelationshipDirection};
     use crate::parser::SourceSpan;
     use crate::plan::logical::ShortestMode;
-    use crate::plan::logical::{AggregateExpr, ProjectionItem};
+    use crate::plan::logical::{AggregateExpr, ProjectionItem, RowCount};
 
     fn span() -> SourceSpan {
         SourceSpan::point(0)
@@ -843,8 +843,8 @@ mod tests {
             input: Box::new(LogicalPlan::TopN {
                 input: Box::new(scan("Person", "a")),
                 keys: vec![],
-                skip: 0,
-                limit: 10,
+                skip: RowCount::Const(0),
+                limit: RowCount::Const(10),
             }),
             predicate: pred,
         };

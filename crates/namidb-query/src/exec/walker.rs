@@ -25,7 +25,7 @@ use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
 use crate::parser::{Expression, RelationshipDirection, SourceSpan};
 use crate::plan::logical::{
-    AggregateExpr, EdgeConstraint, LogicalPlan, NodeBinding, OrderKey, ProjectionItem,
+    AggregateExpr, EdgeConstraint, LogicalPlan, NodeBinding, OrderKey, ProjectionItem, RowCount,
 };
 
 /// Top-level error produced by the executor. Wraps `EvalError`,
@@ -58,6 +58,32 @@ impl From<EvalError> for ExecError {
 impl From<namidb_storage::Error> for ExecError {
     fn from(e: namidb_storage::Error) -> Self {
         ExecError::Storage(e)
+    }
+}
+
+/// Resolve a `SKIP` / `LIMIT` [`RowCount`] to a concrete `u64` at execution
+/// time. A `$param` must bind to a non-negative integer; `what` names the
+/// clause (`"SKIP"` / `"LIMIT"`) for the error message.
+pub(crate) fn resolve_row_count(
+    rc: &RowCount,
+    params: &Params,
+    what: &str,
+) -> Result<u64, ExecError> {
+    match rc {
+        RowCount::Const(n) => Ok(*n),
+        RowCount::Param(name) => match params.get(name) {
+            Some(RuntimeValue::Integer(n)) if *n >= 0 => Ok(*n as u64),
+            Some(RuntimeValue::Integer(_)) => Err(ExecError::Runtime(format!(
+                "{what} parameter `${name}` must be non-negative"
+            ))),
+            Some(other) => Err(ExecError::Runtime(format!(
+                "{what} parameter `${name}` must be an integer, got {}",
+                other.type_name()
+            ))),
+            None => Err(ExecError::Runtime(format!(
+                "{what} parameter `${name}` not provided"
+            ))),
+        },
     }
 }
 
@@ -326,6 +352,10 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 skip,
                 limit,
             } => {
+                // Resolve `$param` SKIP/LIMIT against the bound params before
+                // anything reads them numerically.
+                let skip = resolve_row_count(skip, params, "SKIP")?;
+                let limit = resolve_row_count(limit, params, "LIMIT")?;
                 // LIMIT-pushdown: with no ORDER BY (keys empty) and a finite
                 // limit, the child only needs its first `skip + limit` rows.
                 // Run it under a row budget (`execute_capped`) so an
@@ -335,8 +365,8 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 // `execute_capped`, so the worst case equals today's
                 // behaviour. The sort/skip/take below are unchanged — they
                 // still truncate the (possibly over-shooting) result exactly.
-                let mut rows = if keys.is_empty() && *limit != u64::MAX {
-                    let cap = (*skip as usize).saturating_add(*limit as usize);
+                let mut rows = if keys.is_empty() && limit != u64::MAX {
+                    let cap = (skip as usize).saturating_add(limit as usize);
                     execute_capped(input, snapshot, params, outer, routing, cap).await?
                 } else {
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?
@@ -344,15 +374,15 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 if !keys.is_empty() {
                     sort_rows(&mut rows, keys, params)?;
                 }
-                let skip = *skip as usize;
+                let skip = skip as usize;
                 if skip >= rows.len() {
                     return Ok(Vec::new());
                 }
                 let mut iter = rows.into_iter().skip(skip);
-                let take = if *limit == u64::MAX {
+                let take = if limit == u64::MAX {
                     usize::MAX
                 } else {
-                    *limit as usize
+                    limit as usize
                 };
                 let mut out = Vec::with_capacity(take.min(64));
                 for _ in 0..take {
@@ -1962,20 +1992,22 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // 3. Materialise the full row only for the `skip..skip+limit`
                 // window — 20 materialisations for `LIMIT 20`
                 // regardless of input cardinality.
+                let skip = resolve_row_count(skip, params, "SKIP")?;
+                let limit = resolve_row_count(limit, params, "LIMIT")?;
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
 
                 // Empty keys: stable order, just skip+take + materialise.
                 if keys.is_empty() {
-                    let skip = *skip as usize;
+                    let skip = skip as usize;
                     if skip >= input_set.cardinality() {
                         return Ok(FactorRowSet::from_flat(Vec::new()));
                     }
-                    let take = if *limit == u64::MAX {
+                    let take = if limit == u64::MAX {
                         usize::MAX
                     } else {
-                        *limit as usize
+                        limit as usize
                     };
                     let rows: Vec<Row> = input_set
                         .leaves
@@ -2012,14 +2044,14 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
 
                 keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
 
-                let skip = *skip as usize;
+                let skip = skip as usize;
                 if skip >= keyed.len() {
                     return Ok(FactorRowSet::from_flat(Vec::new()));
                 }
-                let take = if *limit == u64::MAX {
+                let take = if limit == u64::MAX {
                     usize::MAX
                 } else {
-                    *limit as usize
+                    limit as usize
                 };
                 let rows: Vec<Row> = keyed
                     .into_iter()

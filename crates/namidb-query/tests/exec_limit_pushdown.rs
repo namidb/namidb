@@ -220,3 +220,67 @@ async fn multi_hop_expand_under_limit_is_correct() {
     );
     assert_eq!(capped_pairs, &full_pairs[..3]);
 }
+
+#[tokio::test]
+async fn param_skip_limit_resolves_per_execution_on_one_plan() {
+    // Lower ONCE, then execute the same plan with different params: the
+    // window must follow the params. This proves the plan carries the
+    // `$param` by name (so a cached plan is reused across parameter sets)
+    // rather than baking a value at plan time.
+    let mut writer = WriterSession::open(store(), paths("lp-param-reuse"))
+        .await
+        .unwrap();
+    build_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let full = pairs(
+        &run(
+            "lp-param-full",
+            &format!("MATCH (a:User)-[r:RATED]->(b:Movie) {PAIR_RETURN}"),
+        )
+        .await,
+    );
+
+    let q = parse(&format!(
+        "MATCH (a:User)-[r:RATED]->(b:Movie) {PAIR_RETURN} SKIP $s LIMIT $l"
+    ))
+    .unwrap();
+    let plan = lower(&q).unwrap();
+
+    let mut p1 = Params::new();
+    p1.insert("s".into(), RuntimeValue::Integer(1));
+    p1.insert("l".into(), RuntimeValue::Integer(2));
+    let win1 = pairs(&execute_flat_path(&plan, &snapshot, &p1).await.unwrap());
+    assert_eq!(win1, &full[1..3], "first params -> rows [1,3)");
+
+    let mut p2 = Params::new();
+    p2.insert("s".into(), RuntimeValue::Integer(3));
+    p2.insert("l".into(), RuntimeValue::Integer(2));
+    let win2 = pairs(&execute_flat_path(&plan, &snapshot, &p2).await.unwrap());
+    assert_eq!(
+        win2,
+        &full[3..5],
+        "second params -> rows [3,5) on the SAME plan"
+    );
+}
+
+#[tokio::test]
+async fn param_limit_not_provided_errors() {
+    let mut writer = WriterSession::open(store(), paths("lp-param-missing"))
+        .await
+        .unwrap();
+    build_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let q = parse(&format!(
+        "MATCH (a:User)-[r:RATED]->(b:Movie) {PAIR_RETURN} LIMIT $l"
+    ))
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let err = execute_flat_path(&plan, &snapshot, &Params::new())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("not provided"),
+        "expected a missing-parameter error, got: {err}"
+    );
+}
