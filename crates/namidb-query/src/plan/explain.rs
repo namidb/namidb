@@ -831,13 +831,6 @@ fn format_scan_predicate(p: &ScanPredicate, alias: &str) -> String {
         ScanPredicate::GtEq { column, value } => {
             format!("{alias}.{column} >= {}", format_stat_scalar(value))
         }
-        ScanPredicate::Between { column, low, high } => {
-            format!(
-                "{alias}.{column} BETWEEN {} AND {}",
-                format_stat_scalar(low),
-                format_stat_scalar(high)
-            )
-        }
         ScanPredicate::IsNull { column } => format!("{alias}.{column} IS NULL"),
         ScanPredicate::IsNotNull { column } => format!("{alias}.{column} IS NOT NULL"),
         ScanPredicate::In { column, values } => {

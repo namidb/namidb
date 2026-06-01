@@ -11,7 +11,6 @@
 //! |-------------------------------|---------|
 //! | `prop = literal` (no NDV) | 0.10 |
 //! | `prop < / > literal` | 0.33 |
-//! | `BETWEEN` | 0.25 |
 //! | `IS NULL` | 0.05 |
 //! | `STARTS WITH` / `CONTAINS` | 0.10 |
 //! | unknown | 0.50 |
@@ -51,7 +50,6 @@ impl<'a> BindingStats<'a> {
 
 const FALLBACK_EQ: f64 = 0.10;
 const FALLBACK_RANGE: f64 = 0.33;
-const FALLBACK_BETWEEN: f64 = 0.25;
 const FALLBACK_IS_NULL: f64 = 0.05;
 const FALLBACK_STRING_TEST: f64 = 0.10;
 const FALLBACK_UNKNOWN: f64 = 0.50;
@@ -119,8 +117,7 @@ fn sel_inner(expr: &Expression, bindings: &BindingStats<'_>) -> f64 {
             }
         }
 
-        // ─── BETWEEN / IN / string tests ───────────────────────────────
-        ExpressionKind::Between { target, low, high } => sel_between(target, low, high, bindings),
+        // ─── IN / string tests ─────────────────────────────────────────
         ExpressionKind::In { item, list } => sel_in(item, list, bindings),
         ExpressionKind::StringTest { .. } => FALLBACK_STRING_TEST,
 
@@ -251,25 +248,6 @@ fn range_selectivity(op: BinaryOp, lit: &StatScalar, ps: &PropStats) -> Option<f
         BinaryOp::Gt | BinaryOp::Ge => 1.0 - below,
         _ => FALLBACK_RANGE,
     })
-}
-
-fn sel_between(
-    target: &Expression,
-    low: &Expression,
-    high: &Expression,
-    bindings: &BindingStats<'_>,
-) -> f64 {
-    // Decompose to (target >= low) AND (target <= high) then estimate.
-    if let Some((alias, prop)) = property_access(target) {
-        if let (Some(ll), Some(hl)) = (literal_from_expr(low), literal_from_expr(high)) {
-            if let Some(ps) = bindings.prop_stats(&alias, &prop) {
-                let a = sel_comparison_on_stats(BinaryOp::Ge, ps, &ll);
-                let b = sel_comparison_on_stats(BinaryOp::Le, ps, &hl);
-                return a * b;
-            }
-        }
-    }
-    FALLBACK_BETWEEN
 }
 
 fn sel_in(item: &Expression, list: &Expression, bindings: &BindingStats<'_>) -> f64 {
@@ -425,14 +403,6 @@ pub fn scan_predicate_to_expression(
             lit(stat_to_literal(value)),
             span,
         ),
-        P::Between { column, low, high } => Expression {
-            kind: ExpressionKind::Between {
-                target: Box::new(prop(column)),
-                low: Box::new(lit(stat_to_literal(low))),
-                high: Box::new(lit(stat_to_literal(high))),
-            },
-            span,
-        },
         P::IsNull { column } => Expression {
             kind: ExpressionKind::IsNull {
                 expr: Box::new(prop(column)),
@@ -626,23 +596,6 @@ mod tests {
         let expr = binary(BinaryOp::Lt, lit_int(75), prop_access("a", "age"));
         let s = selectivity(&expr, &b);
         assert!((s - 0.25).abs() < 1e-12);
-    }
-
-    #[test]
-    fn between_decomposes_to_two_ranges() {
-        let stats = label_with_age_stats(0, 100, 0, 1000, None);
-        let b = BindingStats::empty().with("a", &stats);
-        let expr = Expression {
-            kind: ExpressionKind::Between {
-                target: Box::new(prop_access("a", "age")),
-                low: Box::new(lit_int(25)),
-                high: Box::new(lit_int(75)),
-            },
-            span: span(),
-        };
-        let s = selectivity(&expr, &b);
-        // (age >= 25) → 0.75; (age <= 75) → 0.75; AND → 0.5625.
-        assert!((s - 0.5625).abs() < 1e-12);
     }
 
     #[test]

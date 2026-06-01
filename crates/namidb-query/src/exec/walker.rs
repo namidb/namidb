@@ -3071,11 +3071,6 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
             collect_referenced_variables(item, out);
             collect_referenced_variables(list, out);
         }
-        ExpressionKind::Between { target, low, high } => {
-            collect_referenced_variables(target, out);
-            collect_referenced_variables(low, out);
-            collect_referenced_variables(high, out);
-        }
         ExpressionKind::StringTest {
             target, pattern, ..
         } => {

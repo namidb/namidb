@@ -144,11 +144,6 @@ fn visit_expression(expr: &Expression, out: &mut BTreeSet<String>) {
             visit_expression(item, out);
             visit_expression(list, out);
         }
-        ExpressionKind::Between { target, low, high } => {
-            visit_expression(target, out);
-            visit_expression(low, out);
-            visit_expression(high, out);
-        }
         ExpressionKind::StringTest {
             target, pattern, ..
         } => {
