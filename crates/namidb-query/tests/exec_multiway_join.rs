@@ -34,6 +34,7 @@ fn person(name: &str) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        ..Default::default()
     }
 }
 

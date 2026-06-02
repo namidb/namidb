@@ -42,6 +42,7 @@ async fn seed_person(writer: &mut WriterSession, first: &str, last: &str, age: i
             &NodeWriteRecord {
                 properties: p,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -60,6 +61,7 @@ async fn seed_message(writer: &mut WriterSession, content: &str, creation_date: 
             &NodeWriteRecord {
                 properties: p,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();

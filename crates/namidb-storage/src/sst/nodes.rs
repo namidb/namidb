@@ -67,6 +67,11 @@ pub const COL_LSN: &str = "lsn";
 pub const OVERFLOW_JSON: &str = "__overflow_json";
 /// Always-present column carrying the schema version this row was written under.
 pub const SCHEMA_VERSION: &str = "__schema_version";
+/// Always-present column carrying the node's label set as a `List<UInt32>` of
+/// [`LabelId`](namidb_core::LabelId) values (multi-label nodes). Legacy
+/// single-label SSTs predate this column; [`NodeSstReader::open`] tolerates its
+/// absence and the read path then derives the label set from the SST scope.
+pub const COL_LABELS: &str = "__labels";
 
 /// Tuning knobs for `NodeSstWriter`.
 #[derive(Debug, Clone)]
@@ -95,8 +100,13 @@ impl Default for NodeSstWriterOptions {
 }
 
 /// Build the canonical Arrow schema for a node label.
+///
+/// Column order: `node_id, tombstone, lsn, __labels, prop_*, __overflow_json,
+/// __schema_version`. Production node SSTs are built with an empty `LabelDef`
+/// (no `prop_*` columns; every property rides in `__overflow_json`), but the
+/// schema stays parameterised so the writer/reader remain general.
 pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
-    let mut fields = Vec::with_capacity(label.properties.len() + 5);
+    let mut fields = Vec::with_capacity(label.properties.len() + 6);
     fields.push(Field::new(
         COL_NODE_ID,
         ArrowDataType::FixedSizeBinary(16),
@@ -104,6 +114,13 @@ pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
     ));
     fields.push(Field::new(COL_TOMBSTONE, ArrowDataType::Boolean, false));
     fields.push(Field::new(COL_LSN, ArrowDataType::UInt64, false));
+    fields.push(Field::new(
+        COL_LABELS,
+        // `item` nullable matches what `ListBuilder<UInt32Builder>` emits, so
+        // the built RecordBatch's column type equals this field exactly.
+        ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::UInt32, true))),
+        false,
+    ));
     for p in &label.properties {
         fields.push(prop_field(p));
     }

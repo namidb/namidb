@@ -50,6 +50,7 @@ fn person(name: &str, age: i32) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        ..Default::default()
     }
 }
 
@@ -72,6 +73,7 @@ fn person_city(name: &str, city: &str) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        ..Default::default()
     }
 }
 
@@ -685,6 +687,7 @@ async fn match_without_label_scans_every_observed_label() {
             &NodeWriteRecord {
                 properties: post_props,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();

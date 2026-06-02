@@ -101,6 +101,7 @@ fn person(first: &str, last: &str, age: i32) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: p,
         schema_version: 1,
+        ..Default::default()
     }
 }
 
@@ -111,6 +112,7 @@ fn message(content: &str, creation_date: i64) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: p,
         schema_version: 1,
+        ..Default::default()
     }
 }
 

@@ -74,6 +74,7 @@ fn person(name: &str) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: p,
         schema_version: 1,
+        ..Default::default()
     }
 }
 

@@ -52,7 +52,7 @@ use object_store::ObjectStore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{NodeId, Schema};
+use namidb_core::{LabelDictionary, NodeId, Schema};
 
 use crate::adjacency::{adjacency_budget_bytes, adjacency_enabled, AdjacencyCache};
 use crate::cache::{sst_cache_budget_bytes, sst_cache_enabled, SstCache};
@@ -155,6 +155,10 @@ pub struct WriterSession {
     /// further object-store writes and mints no new orphan segments.
     /// Only a fresh [`Self::open`] clears it.
     poisoned: bool,
+    /// Namespace label dictionary. Seeded from the manifest at `open` and
+    /// extended as `upsert_node*` interns new label names; stamped onto every
+    /// committed manifest so a node's on-row `LabelId`s always resolve to names.
+    label_dict: LabelDictionary,
 }
 
 impl std::fmt::Debug for WriterSession {
@@ -239,6 +243,7 @@ impl WriterSession {
             manifest_store,
             wal_store,
             fence,
+            label_dict: current.manifest.label_dict.clone(),
             current,
             memtable: recovered.memtable,
             published_memtable,
@@ -399,19 +404,43 @@ impl WriterSession {
         snap
     }
 
-    /// Queue a node upsert. Allocates an LSN and appends the entry to
-    /// the pending WAL batch. Returns the LSN.
+    /// Queue a single-label node upsert. Convenience wrapper over
+    /// [`upsert_node_with_labels`](Self::upsert_node_with_labels); kept so the
+    /// many single-label call sites stay unchanged.
     pub fn upsert_node(
         &mut self,
         label: impl Into<String>,
         id: NodeId,
         record: &NodeWriteRecord,
     ) -> Result<u64> {
+        self.upsert_node_with_labels(std::iter::once(label.into()), id, record)
+    }
+
+    /// Queue a node upsert carrying a full label set. Allocates an LSN, interns
+    /// every label name into the namespace dictionary, stamps the resulting
+    /// (sorted, deduped) [`LabelId`](namidb_core::LabelId) values onto the
+    /// record, keys the row by `id` alone, and appends to the pending WAL
+    /// batch. Returns the LSN.
+    pub fn upsert_node_with_labels<I>(
+        &mut self,
+        labels: I,
+        id: NodeId,
+        record: &NodeWriteRecord,
+    ) -> Result<u64>
+    where
+        I: IntoIterator<Item = String>,
+    {
         let lsn = self.alloc_lsn();
-        let key = MemKey::Node {
-            label: label.into(),
-            id,
-        };
+        let mut label_ids: Vec<u32> = labels
+            .into_iter()
+            .map(|name| self.label_dict.intern(&name).get())
+            .collect();
+        label_ids.sort_unstable();
+        label_ids.dedup();
+
+        let mut record = record.clone();
+        record.labels = label_ids;
+        let key = MemKey::Node { id };
         let payload = record.encode()?;
         let entry = WalEntry {
             key: key.clone(),
@@ -422,13 +451,12 @@ impl WriterSession {
         Ok(lsn)
     }
 
-    /// Queue a node tombstone. Returns the LSN.
-    pub fn tombstone_node(&mut self, label: impl Into<String>, id: NodeId) -> Result<u64> {
+    /// Queue a node tombstone. Keyed by `id` alone: a tombstone removes the node
+    /// from every label scan regardless of which labels it carried, so the
+    /// `label` argument is vestigial (kept for call-site compatibility).
+    pub fn tombstone_node(&mut self, _label: impl Into<String>, id: NodeId) -> Result<u64> {
         let lsn = self.alloc_lsn();
-        let key = MemKey::Node {
-            label: label.into(),
-            id,
-        };
+        let key = MemKey::Node { id };
         let entry = WalEntry {
             key: key.clone(),
             op: WalOp::Tombstone,
@@ -678,6 +706,8 @@ impl WriterSession {
     fn build_next(&self, seq: u64, last_lsn: u64) -> Manifest {
         let segment_path = self.wal_store.paths().wal_segment(seq);
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        // Persist any label names interned since the last commit.
+        next.label_dict = self.label_dict.clone();
         next.wal_segments.push(WalSegmentDescriptor {
             seq,
             path: segment_path.as_ref().to_string(),
@@ -872,6 +902,7 @@ impl WriterSession {
         // 3. Commit phase — one new manifest version (mirrors flush()).
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema; // REPLACE (fresh-namespace-only)
+        next.label_dict = self.label_dict.clone();
         next.ssts.extend(descriptors); // extend == set on a fresh base
         next.wal_segments.clear();
         let committed = self
@@ -970,6 +1001,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
     }
 
@@ -1322,7 +1354,6 @@ mod tests {
             lsn: 1,
             payload: WalEntry {
                 key: MemKey::Node {
-                    label: "Person".into(),
                     id: sorted_node_id(99),
                 },
                 op: WalOp::Upsert(b"ghost".to_vec()),
@@ -1476,7 +1507,6 @@ mod tests {
             lsn: 1,
             payload: WalEntry {
                 key: MemKey::Node {
-                    label: "Person".into(),
                     id: sorted_node_id(99),
                 },
                 op: WalOp::Upsert(b"ghost".to_vec()),
@@ -1539,7 +1569,6 @@ mod tests {
             lsn: 1,
             payload: WalEntry {
                 key: MemKey::Node {
-                    label: "Person".into(),
                     id: sorted_node_id(99),
                 },
                 op: WalOp::Upsert(b"ghost".to_vec()),

@@ -197,6 +197,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
         .encode()
         .unwrap()
@@ -218,14 +219,7 @@ mod tests {
         lsn: u64,
     ) -> crate::manifest::LoadedManifest {
         let mut mt = Memtable::new();
-        mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id,
-            },
-            lsn,
-            MemOp::Upsert(node_payload(name)),
-        );
+        mt.apply(MemKey::Node { id }, lsn, MemOp::Upsert(node_payload(name)));
         let frozen = mt.freeze();
         flush(ms, fence, base, &frozen, schema.clone())
             .await

@@ -26,12 +26,16 @@ use serde::{Deserialize, Serialize};
 
 use namidb_core::NodeId;
 
-/// Key into the memtable. Sorts by (kind, label/type, id, …) so iteration
-/// produces SST-friendly runs per scope.
+/// Key into the memtable.
+///
+/// Nodes are keyed by `id` alone (id-primary): a node's label set rides in the
+/// value (the encoded `NodeWriteRecord`), not the key, so the same id is one
+/// row regardless of how many labels it carries. Edges still key by
+/// `(edge_type, src, dst)`. Node keys sort before edge keys (variant order),
+/// and within nodes by `id`, which keeps flush output id-ascending for free.
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum MemKey {
     Node {
-        label: String,
         id: NodeId,
     },
     Edge {
@@ -42,15 +46,17 @@ pub enum MemKey {
 }
 
 impl MemKey {
+    /// Scope string used by the flush/manifest layer. Nodes are no longer
+    /// partitioned by label, so their scope is empty; edges scope by type.
     pub fn scope(&self) -> &str {
         match self {
-            MemKey::Node { label, .. } => label,
+            MemKey::Node { .. } => "",
             MemKey::Edge { edge_type, .. } => edge_type,
         }
     }
     fn approx_bytes(&self) -> usize {
         match self {
-            MemKey::Node { label, .. } => label.len() + 16,
+            MemKey::Node { .. } => 16,
             MemKey::Edge { edge_type, .. } => edge_type.len() + 32,
         }
     }
@@ -132,22 +138,18 @@ impl Memtable {
         self.inner.iter()
     }
 
-    /// Iterate entries restricted to a single label.
-    pub fn iter_label<'a>(
-        &'a self,
-        label: &'a str,
-    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+    /// Iterate every node entry (all `MemKey::Node`) in id order. Nodes sort
+    /// before edges and the read path filters by decoding each value's label
+    /// set, since the label is no longer in the key.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
         let start = MemKey::Node {
-            label: label.to_string(),
             id: NodeId::from_uuid(uuid::Uuid::nil()),
         };
         let end = MemKey::Node {
-            label: label.to_string(),
             id: NodeId::from_uuid(uuid::Uuid::max()),
         };
         self.inner
             .range((Bound::Included(start), Bound::Included(end)))
-            .filter(move |(k, _)| matches!(k, MemKey::Node { label: l, .. } if l == label))
     }
 
     /// Iterate entries restricted to a single edge type.
@@ -190,7 +192,7 @@ impl Memtable {
 ///
 /// Built by [`Memtable::snapshot_view`] and shared across concurrent
 /// readers via `Arc`. Exposes the same read API a `&Memtable` did
-/// (`iter`, `get`, `iter_label`, `iter_edge_type`), with no mutation
+/// (`iter`, `get`, `iter_nodes`, `iter_edge_type`), with no mutation
 /// surface. See RFC-021.
 #[derive(Debug, Default, Clone)]
 pub struct MemtableSnapshot {
@@ -219,21 +221,17 @@ impl MemtableSnapshot {
         self.inner.iter()
     }
 
-    pub fn iter_label<'a>(
-        &'a self,
-        label: &'a str,
-    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+    /// Iterate every node entry (all `MemKey::Node`) in id order. The read
+    /// path decodes each value's label set to filter by label.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
         let start = MemKey::Node {
-            label: label.to_string(),
             id: NodeId::from_uuid(uuid::Uuid::nil()),
         };
         let end = MemKey::Node {
-            label: label.to_string(),
             id: NodeId::from_uuid(uuid::Uuid::max()),
         };
         self.inner
             .range((Bound::Included(start), Bound::Included(end)))
-            .filter(move |(k, _)| matches!(k, MemKey::Node { label: l, .. } if l == label))
     }
 
     pub fn iter_edge_type<'a>(
@@ -280,10 +278,7 @@ mod tests {
     #[test]
     fn upsert_replaces_previous_value() {
         let mut mt = Memtable::new();
-        let key = MemKey::Node {
-            label: "Person".into(),
-            id: nid(1),
-        };
+        let key = MemKey::Node { id: nid(1) };
         let prev = mt.apply(key.clone(), 1, MemOp::Upsert(Bytes::from_static(b"v1")));
         assert!(prev.is_none());
 
@@ -303,10 +298,7 @@ mod tests {
     #[test]
     fn tombstone_overrides_upsert() {
         let mut mt = Memtable::new();
-        let key = MemKey::Node {
-            label: "Person".into(),
-            id: nid(1),
-        };
+        let key = MemKey::Node { id: nid(1) };
         mt.apply(key.clone(), 1, MemOp::Upsert(Bytes::from_static(b"v1")));
         mt.apply(key.clone(), 2, MemOp::Tombstone);
         assert_eq!(mt.get(&key).unwrap().op, MemOp::Tombstone);
@@ -315,10 +307,7 @@ mod tests {
     #[test]
     fn bytes_estimate_tracks_replacements_and_deletes() {
         let mut mt = Memtable::new();
-        let key = MemKey::Node {
-            label: "Person".into(),
-            id: nid(1),
-        };
+        let key = MemKey::Node { id: nid(1) };
         mt.apply(key.clone(), 1, MemOp::Upsert(Bytes::from_static(b"v1")));
         let after_first = mt.bytes_estimate();
         mt.apply(
@@ -337,18 +326,9 @@ mod tests {
     fn iter_yields_keys_in_order() {
         let mut mt = Memtable::new();
         let keys = [
-            MemKey::Node {
-                label: "Person".into(),
-                id: nid(3),
-            },
-            MemKey::Node {
-                label: "Person".into(),
-                id: nid(1),
-            },
-            MemKey::Node {
-                label: "Person".into(),
-                id: nid(2),
-            },
+            MemKey::Node { id: nid(3) },
+            MemKey::Node { id: nid(1) },
+            MemKey::Node { id: nid(2) },
         ];
         for (i, k) in keys.iter().enumerate() {
             mt.apply(k.clone(), i as u64, MemOp::Upsert(Bytes::from_static(b"x")));
@@ -364,21 +344,15 @@ mod tests {
     }
 
     #[test]
-    fn iter_label_scopes_correctly() {
+    fn iter_nodes_and_edge_type_scope_correctly() {
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: nid(1),
-            },
+            MemKey::Node { id: nid(1) },
             1,
             MemOp::Upsert(Bytes::from_static(b"a")),
         );
         mt.apply(
-            MemKey::Node {
-                label: "Company".into(),
-                id: nid(2),
-            },
+            MemKey::Node { id: nid(2) },
             2,
             MemOp::Upsert(Bytes::from_static(b"b")),
         );
@@ -392,9 +366,9 @@ mod tests {
             MemOp::Upsert(Bytes::from_static(b"c")),
         );
 
-        assert_eq!(mt.iter_label("Person").count(), 1);
-        assert_eq!(mt.iter_label("Company").count(), 1);
-        assert_eq!(mt.iter_label("Unknown").count(), 0);
+        // Nodes are no longer scoped by label in the key; iter_nodes yields
+        // every node entry regardless of label (two distinct ids inserted).
+        assert_eq!(mt.iter_nodes().count(), 2);
         assert_eq!(mt.iter_edge_type("KNOWS").count(), 1);
         assert_eq!(mt.iter_edge_type("OTHER").count(), 0);
     }
@@ -404,10 +378,7 @@ mod tests {
         let mut mt = Memtable::new();
         for i in 0..5 {
             mt.apply(
-                MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(i),
-                },
+                MemKey::Node { id: nid(i) },
                 i as u64,
                 MemOp::Upsert(Bytes::from_static(b"x")),
             );

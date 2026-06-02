@@ -54,7 +54,6 @@ async fn bootstrap_then_first_write_cycle() {
         });
         memtable.apply(
             MemKey::Node {
-                label: "Person".into(),
                 id: namidb_core::NodeId::new(),
             },
             next_lsn,

@@ -793,6 +793,35 @@ impl DescriptorIndex {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// All node-SST descriptor indices across every scope: the id-primary
+    /// partition (`scope = ""`) plus any legacy per-label scopes. Now that
+    /// nodes are not partitioned by label, the read path scans the union and
+    /// filters by each row's decoded label set.
+    pub fn node_descriptors(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .buckets
+            .iter()
+            .filter(|((kind, _), _)| *kind == SstKind::Nodes)
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Node-SST candidate indices whose `(min_key, max_key)` straddles
+    /// `target`, across every node scope. The scope-agnostic analogue of
+    /// [`lookup_candidates`] for id-primary point lookups.
+    pub fn node_candidates(&self, ssts: &[SstDescriptor], target: &[u8; 16]) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (kind, scope) in self.buckets.keys() {
+            if *kind != SstKind::Nodes {
+                continue;
+            }
+            out.extend(self.lookup_candidates(ssts, SstKind::Nodes, scope, target));
+        }
+        out
+    }
 }
 
 #[cfg(test)]

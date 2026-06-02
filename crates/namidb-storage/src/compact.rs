@@ -35,7 +35,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeBinaryArray, ListArray, StringArray, UInt32Array, UInt64Array,
+};
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::path::Path;
@@ -59,8 +61,8 @@ use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::writer::{EdgeRecord, EdgeSstFinish};
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
-    prop_column_name, NodeSstFinish, NodeSstReader, COL_LSN, COL_NODE_ID, COL_TOMBSTONE,
-    OVERFLOW_JSON, SCHEMA_VERSION,
+    prop_column_name, NodeSstFinish, NodeSstReader, COL_LABELS, COL_LSN, COL_NODE_ID,
+    COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 
 /// Outcome of [`compact_l0_to_l1`].
@@ -343,6 +345,10 @@ fn extract_node_rows_from_reader(
             let payload = NodeWriteRecord {
                 properties,
                 schema_version,
+                // Preserve the on-row label set (raw LabelIds) so the merged L1
+                // SST keeps it. Legacy SSTs have no __labels column and yield an
+                // empty set; their L1 stays scope-typed and reads via fallback.
+                labels: raw_labels_from_batch(&batch, row),
             }
             .encode()?;
             out.push(NodeRow {
@@ -353,6 +359,27 @@ fn extract_node_rows_from_reader(
         }
     }
     Ok(out)
+}
+
+/// Read a node row's `__labels` column as raw `LabelId` values. Empty when the
+/// SST predates the column (legacy single-label).
+fn raw_labels_from_batch(batch: &arrow_array::RecordBatch, row: usize) -> Vec<u32> {
+    let Some(list) = batch
+        .column_by_name(COL_LABELS)
+        .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+    else {
+        return Vec::new();
+    };
+    if list.is_null(row) {
+        return Vec::new();
+    }
+    match list.value(row).as_any().downcast_ref::<UInt32Array>() {
+        Some(a) => (0..a.len())
+            .filter(|&i| !a.is_null(i))
+            .map(|i| a.value(i))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 fn compact_edge_ssts(
@@ -702,6 +729,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
         .encode()
         .unwrap()
@@ -733,10 +761,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt1 = Memtable::new();
         mt1.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -746,10 +771,7 @@ mod tests {
         let bob = sorted_node_id(2);
         let mut mt2 = Memtable::new();
         mt2.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: bob,
-            },
+            MemKey::Node { id: bob },
             20,
             MemOp::Upsert(node_payload("Bob", None)),
         );
@@ -788,10 +810,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -855,10 +874,7 @@ mod tests {
         // L0 SST #1: alice@v1, name=Alice
         let mut mt1 = Memtable::new();
         mt1.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             5,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -868,10 +884,7 @@ mod tests {
         // L0 SST #2: alice@v2, name=Alicia, with a later LSN — it wins.
         let mut mt2 = Memtable::new();
         mt2.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             12,
             MemOp::Upsert(node_payload("Alicia", Some(31))),
         );
@@ -911,10 +924,7 @@ mod tests {
         // L0 SST #1: alice upsert at LSN 5.
         let mut mt1 = Memtable::new();
         mt1.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             5,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -923,14 +933,7 @@ mod tests {
 
         // L0 SST #2: alice tombstone at LSN 9 — wins.
         let mut mt2 = Memtable::new();
-        mt2.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
-            9,
-            MemOp::Tombstone,
-        );
+        mt2.apply(MemKey::Node { id: alice }, 9, MemOp::Tombstone);
         let frozen2 = mt2.freeze();
         let after2 = flush(&ms, &fence, &after1.committed, &frozen2, schema())
             .await

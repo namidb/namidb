@@ -53,6 +53,7 @@ fn person(first: &str, last: &str) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: p,
         schema_version: 1,
+        ..Default::default()
     }
 }
 
@@ -63,6 +64,7 @@ fn post(content: &str, date: i64) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: p,
         schema_version: 1,
+        ..Default::default()
     }
 }
 

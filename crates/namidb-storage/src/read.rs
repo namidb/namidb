@@ -49,8 +49,8 @@ use std::sync::{Arc, Mutex};
 use arrow_array::RecordBatch;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, FixedSizeListArray,
-    Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, UInt64Array,
+    Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, ListArray, StringArray,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use bytes::Bytes;
 use object_store::path::Path;
@@ -58,7 +58,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use tracing::instrument;
 use uuid::Uuid;
 
-use namidb_core::{DataType, LabelDef, NodeId, Value};
+use namidb_core::{DataType, LabelDef, LabelDictionary, LabelId, NodeId, Value};
 
 use crate::adjacency::{
     adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey, EdgeAdjacency,
@@ -74,8 +74,8 @@ use crate::sst::bloom::BloomFilter;
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
-    prop_column_name, targeted_scan_async as node_targeted_scan_async, NodeSstReader, COL_LSN,
-    COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    prop_column_name, targeted_scan_async as node_targeted_scan_async, NodeSstReader, COL_LABELS,
+    COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
@@ -349,11 +349,7 @@ impl<'mt> Snapshot<'mt> {
         // every candidate SST carries the sidecar for `property`, we
         // can resolve the lookup with one bincode decode per SST
         // instead of a full label scan.
-        let sst_idxs: Vec<usize> = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::Nodes, label)
-            .to_vec();
+        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
         let all_have_sidecar = !sst_idxs.is_empty()
             && sst_idxs.iter().all(|i| {
                 self.manifest.manifest.ssts[*i]
@@ -374,21 +370,23 @@ impl<'mt> Snapshot<'mt> {
             // — bounded by memtable size, not the SST.
             let mut winner: Option<(u64, namidb_core::id::NodeId, bool)> = None;
             for (mk, e) in self.memtable.iter() {
-                if let MemKey::Node { label: mlabel, id } = mk {
-                    if mlabel != label {
-                        continue;
-                    }
+                if let MemKey::Node { id } = mk {
                     match &e.op {
                         MemOp::Upsert(payload) => {
                             let rec = NodeWriteRecord::decode(payload)?;
-                            if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
-                                if s == value {
-                                    let bump = winner
-                                        .as_ref()
-                                        .map(|(lsn, _, _)| e.lsn > *lsn)
-                                        .unwrap_or(true);
-                                    if bump {
-                                        winner = Some((e.lsn, *id, false));
+                            if record_carries_label(&rec, label, &self.manifest.manifest.label_dict)
+                            {
+                                if let Some(namidb_core::Value::Str(s)) =
+                                    rec.properties.get(property)
+                                {
+                                    if s == value {
+                                        let bump = winner
+                                            .as_ref()
+                                            .map(|(lsn, _, _)| e.lsn > *lsn)
+                                            .unwrap_or(true);
+                                        if bump {
+                                            winner = Some((e.lsn, *id, false));
+                                        }
                                     }
                                 }
                             }
@@ -513,11 +511,7 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Vec<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property");
 
-        let sst_idxs: Vec<usize> = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::Nodes, label)
-            .to_vec();
+        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
         let all_have_sidecar = !sst_idxs.is_empty()
             && sst_idxs.iter().all(|i| {
                 self.manifest.manifest.ssts[*i]
@@ -545,15 +539,14 @@ impl<'mt> Snapshot<'mt> {
         let mut candidates: std::collections::BTreeSet<namidb_core::id::NodeId> =
             std::collections::BTreeSet::new();
         for (mk, e) in self.memtable.iter() {
-            if let MemKey::Node { label: mlabel, id } = mk {
-                if mlabel != label {
-                    continue;
-                }
+            if let MemKey::Node { id } = mk {
                 if let MemOp::Upsert(payload) = &e.op {
                     let rec = NodeWriteRecord::decode(payload)?;
-                    if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
-                        if s == value {
-                            candidates.insert(*id);
+                    if record_carries_label(&rec, label, &self.manifest.manifest.label_dict) {
+                        if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
+                            if s == value {
+                                candidates.insert(*id);
+                            }
                         }
                     }
                 }
@@ -682,9 +675,16 @@ impl<'mt> Snapshot<'mt> {
         // nodes) skip the SST lookup entirely.
         let mut mem_node_label: BTreeMap<NodeId, String> = BTreeMap::new();
         for (key, entry) in self.memtable.iter() {
-            if let MemKey::Node { label, id } = key {
-                if matches!(entry.op, MemOp::Upsert(_)) {
-                    mem_node_label.insert(*id, label.clone());
+            if let MemKey::Node { id } = key {
+                if let MemOp::Upsert(payload) = &entry.op {
+                    let rec = NodeWriteRecord::decode(payload)?;
+                    if let Some(name) = rec
+                        .labels
+                        .first()
+                        .and_then(|&lid| self.manifest.manifest.label_dict.name(LabelId::new(lid)))
+                    {
+                        mem_node_label.insert(*id, name.to_string());
+                    }
                 }
             }
         }
@@ -813,13 +813,15 @@ impl<'mt> Snapshot<'mt> {
             .keys()
             .cloned()
             .collect();
-        for (key, _) in self.memtable.iter() {
-            if let MemKey::Node { label, .. } = key {
-                set.insert(label.clone());
-            }
+        // The dictionary holds every label name ever interned in this
+        // namespace (memtable writes intern into it before commit).
+        for (_, name) in self.manifest.manifest.label_dict.iter() {
+            set.insert(name.to_string());
         }
+        // Legacy node SSTs still carry their single label as the scope; id-
+        // primary SSTs use an empty scope and contribute nothing here.
         for sst in &self.manifest.manifest.ssts {
-            if matches!(sst.kind, SstKind::Nodes) {
+            if matches!(sst.kind, SstKind::Nodes) && !sst.scope.is_empty() {
                 set.insert(sst.scope.clone());
             }
         }
@@ -917,8 +919,12 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // L3: cold SST walk.
-        let result = self.lookup_node_uncached(label, id).await?;
+        // L3: cold SST walk. Resolve the id-primary record, then keep it only
+        // if it actually carries `label` (the cache slot is per `(label, id)`).
+        let result = self
+            .lookup_node_by_id(id)
+            .await?
+            .filter(|v| v.labels.contains(label));
         // Insert into L1.
         self.node_cache
             .lock()
@@ -1032,17 +1038,15 @@ impl<'mt> Snapshot<'mt> {
         // 1. Memtable: probe each pending id.
         for id_bytes in &pending {
             let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-            if let Some(entry) = self.memtable.get(&MemKey::Node {
-                label: label.to_string(),
-                id,
-            }) {
+            if let Some(entry) = self.memtable.get(&MemKey::Node { id }) {
                 let view = match &entry.op {
                     MemOp::Tombstone => None,
                     MemOp::Upsert(payload) => Some(node_view_from_payload(
                         id,
-                        label.to_string(),
                         entry.lsn,
                         payload,
+                        &self.manifest.manifest.label_dict,
+                        "",
                     )?),
                 };
                 // Inline last-LSN-wins: equivalent to update_node_winner
@@ -1057,24 +1061,10 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // 2. SST pass: iterate every `(Nodes, label)` descriptor exactly
-        // once, decode its body, and harvest every pending id in one
-        // sweep over the record batches.
-        let label_def = self
-            .manifest
-            .manifest
-            .schema
-            .label(label)
-            .cloned()
-            .unwrap_or_else(|| LabelDef {
-                name: label.to_string(),
-                properties: vec![],
-            });
-        let sst_idxs: Vec<usize> = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::Nodes, label)
-            .to_vec();
+        // 2. SST pass: iterate every node descriptor (id-primary partition +
+        // any legacy per-label SSTs) exactly once, decode its body, and harvest
+        // every pending id in one sweep over the record batches.
+        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
         for idx in sst_idxs {
             let desc = &self.manifest.manifest.ssts[idx];
             // Cheap pre-filter: skip the SST if its [min_key, max_key]
@@ -1106,7 +1096,7 @@ impl<'mt> Snapshot<'mt> {
                 b
             } else {
                 let body = self.get_sst_body(desc).await?;
-                let reader = NodeSstReader::open(label_def.clone(), body)?;
+                let reader = NodeSstReader::open(self.label_def_for_node_sst(desc), body)?;
                 let decoded = Arc::new(reader.scan()?);
                 // Re-acquire the lock to insert — last write wins on
                 // a race because both threads decoded identical bytes.
@@ -1116,7 +1106,14 @@ impl<'mt> Snapshot<'mt> {
                     .insert(absolute.clone(), decoded.clone());
                 decoded
             };
-            batch_harvest_node_rows(&batches, &label_def, label, &pending, &mut winners)?;
+            batch_harvest_node_rows(
+                &batches,
+                &self.label_def_for_node_sst(desc),
+                &self.manifest.manifest.label_dict,
+                &desc.scope,
+                &pending,
+                &mut winners,
+            )?;
         }
 
         // 3. Push every (resolved or negative) outcome into the output
@@ -1125,7 +1122,11 @@ impl<'mt> Snapshot<'mt> {
         let manifest_version = self.manifest.manifest.version;
         let mut cache_l1 = self.node_cache.lock().unwrap();
         for id_bytes in &pending {
-            let view = winners.remove(id_bytes).map(|(_, v)| v).unwrap_or(None);
+            let view = winners
+                .remove(id_bytes)
+                .map(|(_, v)| v)
+                .unwrap_or(None)
+                .filter(|v| v.labels.contains(label));
             for &i in &id_to_outputs[id_bytes] {
                 out[i] = view.clone();
             }
@@ -1152,56 +1153,66 @@ impl<'mt> Snapshot<'mt> {
         label: &str,
         id: NodeId,
     ) -> Result<Option<NodeView>> {
-        self.lookup_node_uncached(label, id).await
+        Ok(self
+            .lookup_node_by_id(id)
+            .await?
+            .filter(|v| v.labels.contains(label)))
     }
 
-    async fn lookup_node_uncached(&self, label: &str, id: NodeId) -> Result<Option<NodeView>> {
-        namidb_core::profile_scope!("Snapshot::lookup_node_uncached");
+    /// The `LabelDef` to open a node SST with. Id-primary node SSTs carry
+    /// `scope = ""` and no declared columns (every property in overflow); legacy
+    /// single-label SSTs are still typed by their scope label.
+    fn label_def_for_node_sst(&self, desc: &SstDescriptor) -> LabelDef {
+        if desc.scope.is_empty() {
+            LabelDef {
+                name: String::new(),
+                properties: Vec::new(),
+            }
+        } else {
+            self.manifest
+                .manifest
+                .schema
+                .label(&desc.scope)
+                .cloned()
+                .unwrap_or_else(|| LabelDef {
+                    name: desc.scope.clone(),
+                    properties: Vec::new(),
+                })
+        }
+    }
+
+    /// Id-primary cold lookup: resolve the last-LSN-wins record for `id` across
+    /// the memtable and every node SST (decoding each row's label set), with no
+    /// label scoping. `lookup_node` filters the result by label.
+    async fn lookup_node_by_id(&self, id: NodeId) -> Result<Option<NodeView>> {
+        namidb_core::profile_scope!("Snapshot::lookup_node_by_id");
         let id_bytes = *id.as_bytes();
+        let dict = &self.manifest.manifest.label_dict;
         let mut winner: Option<(u64, Option<NodeView>)> = None;
 
         // 1. Memtable (highest LSN typically).
-        if let Some(entry) = self.memtable.get(&MemKey::Node {
-            label: label.to_string(),
-            id,
-        }) {
+        if let Some(entry) = self.memtable.get(&MemKey::Node { id }) {
             let view = match &entry.op {
                 MemOp::Tombstone => None,
-                MemOp::Upsert(payload) => Some(node_view_from_payload(
-                    id,
-                    label.to_string(),
-                    entry.lsn,
-                    payload,
-                )?),
+                MemOp::Upsert(payload) => {
+                    Some(node_view_from_payload(id, entry.lsn, payload, dict, "")?)
+                }
             };
             winner = Some((entry.lsn, view));
         }
 
-        // 2. SST candidates — pruned via the manifest's sorted-by-min-key
-        // index. The index returns descriptor positions whose
-        // `(min_key, max_key)` already straddles `id_bytes` for
-        // `(Nodes, label)`; we still bloom-probe + body-fetch.
-        let label_def = self
+        // 2. Node SST candidates across every scope (id-primary), pruned by the
+        // per-bucket min/max-key index; still bloom-probed + body-fetched.
+        let candidates = self
             .manifest
-            .manifest
-            .schema
-            .label(label)
-            .cloned()
-            .unwrap_or_else(|| LabelDef {
-                name: label.to_string(),
-                properties: vec![],
-            });
-        let candidates = self.manifest.index.lookup_candidates(
-            &self.manifest.manifest.ssts,
-            SstKind::Nodes,
-            label,
-            &id_bytes,
-        );
+            .index
+            .node_candidates(&self.manifest.manifest.ssts, &id_bytes);
         for idx in candidates {
             let desc = &self.manifest.manifest.ssts[idx];
             if !self.bloom_admits(desc, &id_bytes).await? {
                 continue;
             }
+            let label_def = self.label_def_for_node_sst(desc);
             // Cold-path routing (RFC-003):
             // - Ranged disabled (forced off, or `Auto` below the size
             // threshold): full-body GET via `get_sst_body` —
@@ -1216,12 +1227,12 @@ impl<'mt> Snapshot<'mt> {
             let candidate = if !use_ranged {
                 let body = self.get_sst_body(desc).await?;
                 let reader = NodeSstReader::open(label_def.clone(), body)?;
-                find_node_row(&reader, &label_def, id, label)?
+                find_node_row(&reader, &label_def, id, dict, &desc.scope)?
             } else {
                 let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
                 if let Some(body) = self.cache_get(&absolute) {
                     let reader = NodeSstReader::open(label_def.clone(), body)?;
-                    find_node_row(&reader, &label_def, id, label)?
+                    find_node_row(&reader, &label_def, id, dict, &desc.scope)?
                 } else {
                     // Look up cached parquet metadata first; on hit we
                     // skip the footer + page-index round-trip entirely
@@ -1242,7 +1253,7 @@ impl<'mt> Snapshot<'mt> {
                     if let Some(cache) = &self.cache {
                         cache.insert_metadata(absolute, meta);
                     }
-                    find_node_row_in_batches(&batches, &label_def, id, label)?
+                    find_node_row_in_batches(&batches, &label_def, id, dict, &desc.scope)?
                 }
             };
             if let Some((lsn, view)) = candidate {
@@ -1327,36 +1338,25 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
-        let label_def = self
-            .manifest
-            .manifest
-            .schema
-            .label(label)
-            .cloned()
-            .unwrap_or_else(|| LabelDef {
-                name: label.to_string(),
-                properties: vec![],
-            });
+        let dict = &self.manifest.manifest.label_dict;
 
         // (node_id) → (winning lsn, materialised view or tombstone marker).
+        // Nodes are id-primary: materialise every node across the label-agnostic
+        // memtable + node SSTs and keep only those whose decoded label set
+        // contains `label` (filtered at the end).
         let mut latest: BTreeMap<NodeId, (u64, Option<NodeView>)> = BTreeMap::new();
 
-        // 1. Memtable rows for this label. Apply predicates after
-        // materialising the view; if any predicate evaluates to
-        // false / NULL, drop the view (kept as tombstone-like None
-        // so subsequent SST upserts for the same id are not
-        // spuriously surfaced).
+        // 1. Memtable rows. Apply predicates after materialising the view; a
+        // failing predicate yields a tombstone-like None so a lower-LSN SST row
+        // for the same id is not spuriously surfaced.
         for (mk, entry) in self.memtable.iter() {
-            let MemKey::Node { label: ml, id } = mk else {
+            let MemKey::Node { id } = mk else {
                 continue;
             };
-            if ml != label {
-                continue;
-            }
             let view = match &entry.op {
                 MemOp::Tombstone => None,
                 MemOp::Upsert(payload) => {
-                    let mut v = node_view_from_payload(*id, label.to_string(), entry.lsn, payload)?;
+                    let mut v = node_view_from_payload(*id, entry.lsn, payload, dict, "")?;
                     if !node_view_matches_predicates(&v, predicates) {
                         None
                     } else {
@@ -1374,12 +1374,14 @@ impl<'mt> Snapshot<'mt> {
             update_node_winner(&mut latest, *id, entry.lsn, view);
         }
 
-        // 2. SSTs that scope to `label`, taken straight from the
-        // manifest index so we don't re-scan every descriptor.
-        for &idx in self.manifest.index.scope_descriptors(SstKind::Nodes, label) {
+        // 2. Every node SST: the id-primary partition plus any legacy per-label
+        // SSTs. Each row's label set is decoded from `__labels` (or the scope
+        // for legacy SSTs); the label filter is applied at the end.
+        for idx in self.manifest.index.node_descriptors() {
             let desc = &self.manifest.manifest.ssts[idx];
+            let sst_label_def = self.label_def_for_node_sst(desc);
             let body = self.get_sst_body(desc).await?;
-            let reader = NodeSstReader::open(label_def.clone(), body)?;
+            let reader = NodeSstReader::open(sst_label_def.clone(), body)?;
             // Build the projection set once per SST (declared properties
             // ∩ requested). When `projection.is_none()` we iterate every
             // declared property.
@@ -1419,7 +1421,7 @@ impl<'mt> Snapshot<'mt> {
                         continue;
                     }
                     let mut properties: BTreeMap<String, Value> = BTreeMap::new();
-                    for p in &label_def.properties {
+                    for p in &sst_label_def.properties {
                         // Skip properties not in the projection (when one
                         // is set). Engine columns are still required and
                         // were included by the ProjectionMask.
@@ -1454,7 +1456,7 @@ impl<'mt> Snapshot<'mt> {
                     }
                     let view = NodeView {
                         id: row_id,
-                        labels: BTreeSet::from([label.to_string()]),
+                        labels: decode_node_labels(&batch, row, dict, &desc.scope),
                         properties,
                         lsn,
                         schema_version: sv_col.value(row),
@@ -1474,8 +1476,13 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // 3. Drop tombstones and return in ascending-id order (BTreeMap iter).
-        Ok(latest.into_values().filter_map(|(_, v)| v).collect())
+        // 3. Drop tombstones and rows that don't carry `label`; return in
+        // ascending-id order (BTreeMap iter).
+        Ok(latest
+            .into_values()
+            .filter_map(|(_, v)| v)
+            .filter(|v| v.labels.contains(label))
+            .collect())
     }
 
     /// Materialise every edge row of `edge_type` visible at this snapshot.
@@ -2337,18 +2344,71 @@ fn update_edge_count_winner(
 
 fn node_view_from_payload(
     id: NodeId,
-    label: String,
     lsn: u64,
     payload: &Bytes,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
 ) -> Result<NodeView> {
     let rec = NodeWriteRecord::decode(payload)?;
+    let labels = labels_from_ids(&rec.labels, dict, scope_fallback);
     Ok(NodeView {
         id,
-        labels: BTreeSet::from([label]),
+        labels,
         properties: rec.properties,
         lsn,
         schema_version: rec.schema_version,
     })
+}
+
+/// Whether a decoded record carries `label`, resolving the name via `dict`.
+/// Used to label-filter memtable rows now that the label left the key.
+fn record_carries_label(rec: &NodeWriteRecord, label: &str, dict: &LabelDictionary) -> bool {
+    dict.id(label)
+        .map(|lid| rec.labels.contains(&lid.get()))
+        .unwrap_or(false)
+}
+
+/// Resolve interned `LabelId`s to label names via `dict`. Falls back to a
+/// singleton `{scope_fallback}` when there are no ids (a legacy single-label
+/// record/SST), or to an empty set when the fallback is empty.
+fn labels_from_ids(ids: &[u32], dict: &LabelDictionary, scope_fallback: &str) -> BTreeSet<String> {
+    let mut set: BTreeSet<String> = ids
+        .iter()
+        .filter_map(|&lid| dict.name(LabelId::new(lid)).map(String::from))
+        .collect();
+    if set.is_empty() && !scope_fallback.is_empty() {
+        set.insert(scope_fallback.to_string());
+    }
+    set
+}
+
+/// Decode a node SST row's label set from the `__labels` column, resolving
+/// `LabelId`s via `dict`. Legacy SSTs lack the column; their single label is
+/// the SST scope, supplied as `scope_fallback`.
+fn decode_node_labels(
+    batch: &RecordBatch,
+    row: usize,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
+) -> BTreeSet<String> {
+    let Some(list) = batch
+        .column_by_name(COL_LABELS)
+        .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+    else {
+        return labels_from_ids(&[], dict, scope_fallback);
+    };
+    if list.is_null(row) {
+        return labels_from_ids(&[], dict, scope_fallback);
+    }
+    let values = list.value(row);
+    let ids: Vec<u32> = match values.as_any().downcast_ref::<UInt32Array>() {
+        Some(a) => (0..a.len())
+            .filter(|&i| !a.is_null(i))
+            .map(|i| a.value(i))
+            .collect(),
+        None => Vec::new(),
+    };
+    labels_from_ids(&ids, dict, scope_fallback)
 }
 
 /// 3VL evaluation of a conjunctive predicate list against a single
@@ -2371,11 +2431,12 @@ fn find_node_row(
     reader: &NodeSstReader,
     label_def: &LabelDef,
     target: NodeId,
-    label: &str,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
 ) -> Result<Option<(u64, Option<NodeView>)>> {
     let target_bytes = *target.as_bytes();
     let batches = reader.targeted_scan(&target_bytes)?;
-    find_node_row_in_batches(&batches, label_def, target, label)
+    find_node_row_in_batches(&batches, label_def, target, dict, scope_fallback)
 }
 
 /// Backend-agnostic row search over already-decoded record batches.
@@ -2386,7 +2447,8 @@ fn find_node_row_in_batches(
     batches: &[RecordBatch],
     label_def: &LabelDef,
     target: NodeId,
-    label: &str,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
 ) -> Result<Option<(u64, Option<NodeView>)>> {
     let target_bytes = *target.as_bytes();
     for batch in batches {
@@ -2446,7 +2508,7 @@ fn find_node_row_in_batches(
                 lsn,
                 Some(NodeView {
                     id: target,
-                    labels: BTreeSet::from([label.to_string()]),
+                    labels: decode_node_labels(batch, row, dict, scope_fallback),
                     properties,
                     lsn,
                     schema_version,
@@ -2465,7 +2527,8 @@ fn find_node_row_in_batches(
 fn batch_harvest_node_rows(
     batches: &[RecordBatch],
     label_def: &LabelDef,
-    label: &str,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
     pending: &std::collections::HashSet<[u8; 16]>,
     winners: &mut HashMap<[u8; 16], (u64, Option<NodeView>)>,
 ) -> Result<()> {
@@ -2529,7 +2592,7 @@ fn batch_harvest_node_rows(
                 let id = NodeId::from_uuid(Uuid::from_bytes(row_id));
                 Some(NodeView {
                     id,
-                    labels: BTreeSet::from([label.to_string()]),
+                    labels: decode_node_labels(batch, row, dict, scope_fallback),
                     properties,
                     lsn,
                     schema_version,
@@ -2830,6 +2893,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
         .encode()
         .unwrap()
@@ -2856,10 +2920,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -2910,6 +2971,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
         .encode()
         .unwrap()
@@ -2924,14 +2986,7 @@ mod tests {
     ) -> LoadedManifest {
         let mut mt = Memtable::new();
         for (id, lsn, op) in rows {
-            mt.apply(
-                MemKey::Node {
-                    label: "Person".into(),
-                    id,
-                },
-                lsn,
-                op,
-            );
+            mt.apply(MemKey::Node { id }, lsn, op);
         }
         let frozen = mt.freeze();
         flush(ms, fence, base, &frozen, schema.clone())
@@ -3054,7 +3109,6 @@ mod tests {
         let mut mt = Memtable::new();
         mt.apply(
             MemKey::Node {
-                label: "Person".into(),
                 id: sorted_node_id(1),
             },
             20,
@@ -3105,7 +3159,6 @@ mod tests {
         let mut mt = Memtable::new();
         mt.apply(
             MemKey::Node {
-                label: "Person".into(),
                 id: sorted_node_id(1),
             },
             20,
@@ -3192,10 +3245,7 @@ mod tests {
         let alice = sorted_node_id(2);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             7,
             MemOp::Upsert(node_payload("Alice", Some(28))),
         );
@@ -3240,10 +3290,7 @@ mod tests {
         // Flush an upsert into an SST.
         let mut mt_flush = Memtable::new();
         mt_flush.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -3254,14 +3301,7 @@ mod tests {
 
         // Live memtable now carries a tombstone at LSN 15 (> SST's LSN 10).
         let mut live_mt = Memtable::new();
-        live_mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
-            15,
-            MemOp::Tombstone,
-        );
+        live_mt.apply(MemKey::Node { id: alice }, 15, MemOp::Tombstone);
 
         let live_mt_view = live_mt.snapshot_view();
         let snap = Snapshot::new(outcome.committed.clone(), &live_mt_view, store, paths);
@@ -3733,10 +3773,7 @@ mod tests {
 
         let mut mt1 = Memtable::new();
         mt1.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: id_low,
-            },
+            MemKey::Node { id: id_low },
             1,
             MemOp::Upsert(node_payload("Low", None)),
         );
@@ -3747,10 +3784,7 @@ mod tests {
 
         let mut mt2 = Memtable::new();
         mt2.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: id_high,
-            },
+            MemKey::Node { id: id_high },
             2,
             MemOp::Upsert(node_payload("High", None)),
         );
@@ -3787,10 +3821,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             5,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -4041,10 +4072,7 @@ mod tests {
         let mut mt_flush = Memtable::new();
         for (i, id) in [(1u64, alice), (2, bob), (3, carol)] {
             mt_flush.apply(
-                MemKey::Node {
-                    label: "Person".into(),
-                    id,
-                },
+                MemKey::Node { id },
                 i,
                 MemOp::Upsert(node_payload("X", None)),
             );
@@ -4059,26 +4087,13 @@ mod tests {
         let dave = sorted_node_id(4);
         let mut live = Memtable::new();
         live.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice-updated", Some(99))),
         );
+        live.apply(MemKey::Node { id: bob }, 11, MemOp::Tombstone);
         live.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: bob,
-            },
-            11,
-            MemOp::Tombstone,
-        );
-        live.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: dave,
-            },
+            MemKey::Node { id: dave },
             12,
             MemOp::Upsert(node_payload("Dave", None)),
         );
@@ -4281,10 +4296,7 @@ mod tests {
 
         // Append a WAL segment containing an upsert for Alice.
         let entry = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            key: MemKey::Node { id: alice },
             op: WalOp::Upsert(node_payload("Alice", Some(40)).to_vec()),
             lsn: 30,
         };
@@ -4361,18 +4373,12 @@ mod tests {
         let company = sorted_node_id(2);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: person,
-            },
+            MemKey::Node { id: person },
             1,
             MemOp::Upsert(node_payload("Alice", None)),
         );
         mt.apply(
-            MemKey::Node {
-                label: "Company".into(),
-                id: company,
-            },
+            MemKey::Node { id: company },
             2,
             MemOp::Upsert(node_payload("Acme", None)),
         );
@@ -4427,18 +4433,12 @@ mod tests {
         let company = sorted_node_id(2);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: person,
-            },
+            MemKey::Node { id: person },
             1,
             MemOp::Upsert(node_payload("Alice", None)),
         );
         mt.apply(
-            MemKey::Node {
-                label: "Company".into(),
-                id: company,
-            },
+            MemKey::Node { id: company },
             2,
             MemOp::Upsert(node_payload("Acme", None)),
         );
@@ -4607,10 +4607,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             1,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );

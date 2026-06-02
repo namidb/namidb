@@ -91,6 +91,7 @@ impl Client {
         let record = NodeWriteRecord {
             properties: props,
             schema_version: 0,
+            ..Default::default()
         };
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
@@ -285,6 +286,7 @@ impl Client {
                 let record = NodeWriteRecord {
                     properties: props.clone(),
                     schema_version: 0,
+                    ..Default::default()
                 };
                 guard
                     .upsert_node(&label, *id, &record)
