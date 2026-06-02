@@ -142,7 +142,13 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --find-links dist namidb
+          # Install the LOCAL wheel by path, not by name. A bare
+          # `pip install namidb` (even with --find-links) can resolve to the
+          # PUBLISHED PyPI wheel of the same version (0.11.0) and silently test
+          # that instead of this build — masking any new API in the PR.
+          # Installing the file directly forces the local artifact; deps (e.g.
+          # pyarrow) still resolve from PyPI since the index stays enabled.
+          python -m pip install dist/*.whl
       - name: Smoke (import + Client roundtrip)
         shell: bash
         run: |

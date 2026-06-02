@@ -55,6 +55,37 @@ def test_upsert_uses_last_write_wins(client: tg.Client) -> None:
     assert view["properties"]["age"] == 31
 
 
+# ── multi-label nodes ──────────────────────────────────────────────────
+
+
+def test_upsert_node_with_labels_roundtrip(client: tg.Client) -> None:
+    node_id = _new_uuid()
+    client.upsert_node_with_labels(["Person", "Admin"], node_id, {"name": "Ada"})
+    client.commit()
+    # lookup_node returns the representative `label` plus the full `labels` set.
+    view = client.lookup_node("Person", node_id)
+    assert view is not None
+    assert view["id"] == node_id
+    assert set(view["labels"]) == {"Person", "Admin"}
+    assert view["label"] in {"Person", "Admin"}
+    # The node surfaces under each of its labels individually.
+    assert client.lookup_node("Admin", node_id) is not None
+    assert {n["id"] for n in client.scan_label("Person")} == {node_id}
+    assert {n["id"] for n in client.scan_label("Admin")} == {node_id}
+
+
+def test_scan_label_arrow_carries_labels_column(client: tg.Client) -> None:
+    node_id = _new_uuid()
+    client.upsert_node_with_labels(["Person", "Admin"], node_id, {"name": "Ada"})
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert "labels" in table.column_names  # full set
+    assert "label" in table.column_names  # representative, back-compat
+    labels_col = table.column("labels").to_pylist()
+    assert len(labels_col) == 1
+    assert set(labels_col[0]) == {"Person", "Admin"}
+
+
 # ── tombstone_node ─────────────────────────────────────────────────────
 
 

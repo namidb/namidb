@@ -85,6 +85,17 @@ class Client:
     ) -> None:
         """Stage a single node upsert. `id` must be a UUID string."""
 
+    def upsert_node_with_labels(
+        self,
+        labels: list[str],
+        id: str,
+        properties: dict[str, Any],
+    ) -> None:
+        """Stage a multi-label node upsert. `labels` is the full label
+        set; the node is keyed by `id` alone, so a later upsert with a
+        different set replaces it (last-write-wins). `id` must be a UUID
+        string."""
+
     def tombstone_node(self, label: str, id: str) -> None:
         """Stage a node tombstone."""
 
@@ -140,8 +151,9 @@ class Client:
         label: str,
         id: str,
     ) -> Optional[dict[str, Any]]:
-        """Snapshot-isolated lookup. Returns `{"id", "label",
-        "lsn", "schema_version", "properties"}` or `None`."""
+        """Snapshot-isolated lookup. Returns `{"id", "label", "labels",
+        "lsn", "schema_version", "properties"}` or `None`. `label` is the
+        representative (first) label; `labels` is the full set."""
 
     def out_edges(
         self,
@@ -168,8 +180,9 @@ class Client:
 
     def scan_label_arrow(self, label: str) -> _Table:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`
-        directly. Columns: `id`, `label`, `lsn`, `schema_version`,
-        then the union of property keys (missing keys → null)."""
+        directly. Columns: `id`, `label` (representative), `labels`
+        (full set, list<string>), `lsn`, `schema_version`, then the
+        union of property keys (missing keys -> null)."""
 
     # ── Cypher ─────────────────────────────────────────────────────
 
