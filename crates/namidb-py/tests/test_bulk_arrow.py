@@ -196,8 +196,9 @@ def test_scan_label_arrow_basic(client: tg.Client) -> None:
     assert isinstance(table, pa.Table)
     assert table.num_rows == 3
     # Metadata columns first, then properties in alpha order from BTreeSet.
-    assert table.column_names[:4] == ["id", "label", "lsn", "schema_version"]
-    assert set(table.column_names[4:]) == {"age", "city", "name"}
+    # `labels` (full set) sits next to the representative `label`.
+    assert table.column_names[:5] == ["id", "label", "labels", "lsn", "schema_version"]
+    assert set(table.column_names[5:]) == {"age", "city", "name"}
     # Bob is missing age + city — should land as null.
     rows_by_name = {r["name"]: r for r in table.to_pylist()}
     assert rows_by_name["Bob"]["age"] is None
@@ -210,4 +211,4 @@ def test_scan_label_arrow_empty(client: tg.Client) -> None:
     assert isinstance(table, pa.Table)
     assert table.num_rows == 0
     # Metadata columns are always present even for empty scans.
-    assert table.column_names == ["id", "label", "lsn", "schema_version"]
+    assert table.column_names == ["id", "label", "labels", "lsn", "schema_version"]
