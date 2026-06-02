@@ -391,17 +391,6 @@ fn union_indexed_props(schema: &Schema) -> LabelDef {
     }
 }
 
-/// Lookup the [`LabelDef`] in the schema, or fall back to a synthetic
-/// empty-property label so untyped writes still flow through the path.
-/// Declared properties always win at the SST level; anything else lands in
-/// `__overflow_json` (see RFC-002 §2.1).
-fn schema_label_or_synthetic(schema: &Schema, label: &str) -> LabelDef {
-    schema.label(label).cloned().unwrap_or_else(|| LabelDef {
-        name: label.to_string(),
-        properties: Vec::new(),
-    })
-}
-
 // ── Node SST building ──────────────────────────────────────────────────
 
 pub(crate) fn build_node_sst(label: &LabelDef, rows: &[NodeRow]) -> Result<NodeSstFinish> {
@@ -682,15 +671,20 @@ fn prepare_node_pending(
 /// posting lists come out id-sorted; tombstones contribute nothing
 /// (last-LSN-wins at read time handles removal). Returns `(None, None)` when no
 /// live labelled node is present.
+/// Output of [`prepare_label_index_sidecar`]: the manifest descriptor plus the
+/// `(path, body)` to PUT next to the SST. Aliased to keep clippy's
+/// type-complexity lint happy, mirroring the unique/equality sidecar aliases.
+type LabelIndexSidecar = (
+    Option<crate::manifest::LabelIndexDescriptor>,
+    Option<(Path, Bytes)>,
+);
+
 fn prepare_label_index_sidecar(
     paths: &NamespacePaths,
     level: u32,
     sst_id: &Uuid,
     rows: &[NodeRow],
-) -> Result<(
-    Option<crate::manifest::LabelIndexDescriptor>,
-    Option<(Path, Bytes)>,
-)> {
+) -> Result<LabelIndexSidecar> {
     let mut index: BTreeMap<u32, Vec<[u8; 16]>> = BTreeMap::new();
     for row in rows {
         if let MemOp::Upsert(payload) = &row.op {
