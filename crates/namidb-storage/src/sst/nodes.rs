@@ -526,18 +526,28 @@ impl NodeSstReader {
         // caller requested. When `projection.is_none()` we skip the mask
         // and Parquet reads every leaf.
         let projection_mask = projection.map(|cols| {
-            let mut leaves: Vec<usize> = Vec::with_capacity(cols.len() + 5);
+            let mut leaves: Vec<usize> = Vec::with_capacity(cols.len() + 6);
+            // Match on the leaf column's top-level path component, not its leaf
+            // name: `__labels` is a `List<UInt32>` whose Parquet leaf is named
+            // `element` (path `__labels.list.element`), so a `c.name()` match
+            // would silently miss it — and eliding `__labels` makes
+            // `decode_node_labels` fall back to the (now empty) scope and drop
+            // every row at the label filter under the id-primary layout.
+            let root_of = |c: &parquet::schema::types::ColumnDescriptor| -> Option<String> {
+                c.path().parts().first().cloned()
+            };
             for engine in [
                 COL_NODE_ID,
                 COL_TOMBSTONE,
                 COL_LSN,
                 SCHEMA_VERSION,
                 OVERFLOW_JSON,
+                COL_LABELS,
             ] {
                 if let Some(idx) = schema_descr
                     .columns()
                     .iter()
-                    .position(|c| c.name() == engine)
+                    .position(|c| root_of(c).as_deref() == Some(engine))
                 {
                     leaves.push(idx);
                 }
@@ -1901,6 +1911,13 @@ mod tests {
         assert!(batch.column_by_name(COL_LSN).is_some());
         assert!(batch.column_by_name(SCHEMA_VERSION).is_some());
         assert!(batch.column_by_name(OVERFLOW_JSON).is_some());
+        // `__labels` must survive projection: it is the id-primary source of
+        // truth for a row's label set, and dropping it makes label scans return
+        // nothing (its Parquet leaf is nested, so the mask matches on path root).
+        assert!(
+            batch.column_by_name(COL_LABELS).is_some(),
+            "__labels must always be kept in a projected scan"
+        );
         assert!(batch.column_by_name("prop_age").is_some());
         assert!(
             batch.column_by_name("prop_name").is_none(),

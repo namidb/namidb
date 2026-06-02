@@ -108,6 +108,20 @@ pub async fn sweep_orphans(
         if let Some(b) = &desc.bloom {
             referenced.insert(b.path.clone());
         }
+        // Side-car bodies live in the same `sst/level{N}/` prefix the sweep
+        // scans, so they must be marked live too — otherwise the sweep deletes
+        // unique/equality/label-index side-cars that the current manifest still
+        // references, breaking point lookups and (with the typed-column layout)
+        // label scans.
+        for u in &desc.unique_property_indices {
+            referenced.insert(u.path.clone());
+        }
+        for e in &desc.equality_property_indices {
+            referenced.insert(e.path.clone());
+        }
+        if let Some(li) = &desc.label_index {
+            referenced.insert(li.path.clone());
+        }
     }
 
     let store = manifest_store.store().clone();

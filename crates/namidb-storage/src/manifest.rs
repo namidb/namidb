@@ -292,6 +292,16 @@ pub struct LabelIndexDescriptor {
     pub label_count: u64,
     /// Total number of `(label, NodeId)` postings across every key.
     pub posting_count: u64,
+    /// Live posting count per `LabelId` — the length of each label's posting
+    /// list in the sidecar (tombstones already excluded by the builder). Sorted
+    /// by label id. Now that node SSTs are no longer partitioned by label
+    /// (`scope` is empty), the cost model recovers each label's `node_count` by
+    /// summing these across node SSTs and resolving the id via the manifest's
+    /// `label_dict` — a manifest-only, `O(|ssts|)` derivation that needs no
+    /// sidecar body read. Empty for manifests written before this field existed
+    /// (`serde(default)` round-trips them unchanged).
+    #[serde(default)]
+    pub per_label_counts: Vec<(u32, u64)>,
 }
 
 /// JSON serde helper: `[u8; 16]` ↔ base64-standard string.

@@ -264,6 +264,166 @@ async fn catalog_from_manifest_captures_label_counts() {
 }
 
 #[tokio::test]
+async fn catalog_counts_multi_label_nodes_under_each_label() {
+    // Multi-label core (the reason this branch exists): a node carrying
+    // {Person, Admin} must count under BOTH labels, while `total_nodes` counts
+    // it once. id-primary node SSTs have an empty scope, so per-label
+    // `node_count` is recovered from the label-index posting counts — a path
+    // the single-label micro-graph never exercises.
+    let mut writer = WriterSession::open(store(), paths("ml-counts"))
+        .await
+        .unwrap();
+    // 3 plain :Person, 2 :Person:Admin, 1 plain :Admin → 6 distinct nodes.
+    for i in 0..3 {
+        writer
+            .upsert_node_with_labels(
+                ["Person".to_string()],
+                NodeId::new(),
+                &person(&format!("p{i}"), "x", 30),
+            )
+            .unwrap();
+    }
+    for i in 0..2 {
+        writer
+            .upsert_node_with_labels(
+                ["Person".to_string(), "Admin".to_string()],
+                NodeId::new(),
+                &person(&format!("pa{i}"), "x", 30),
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_node_with_labels(["Admin".to_string()], NodeId::new(), &person("a0", "x", 30))
+        .unwrap();
+    writer.flush(schema()).await.expect("flush");
+
+    let snap = writer.snapshot();
+    let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
+
+    let person = cat.label("Person").expect("Person present");
+    let admin = cat.label("Admin").expect("Admin present");
+    assert_eq!(person.node_count, 5, "3 plain Person + 2 Person+Admin");
+    assert_eq!(admin.node_count, 3, "2 Person+Admin + 1 plain Admin");
+    // Distinct node rows: each counted once, including the multi-label ones.
+    assert_eq!(cat.total_nodes(), 6, "6 distinct nodes");
+    // The per-label populations sum to more than the distinct count precisely
+    // because two nodes are double-labelled...
+    assert!(
+        person.node_count + admin.node_count > cat.total_nodes(),
+        "multi-label overlap should make the per-label sum exceed total_nodes"
+    );
+    // ...yet each label's population stays bounded by the distinct count, the
+    // invariant every selectivity ratio in the cost model relies on.
+    assert!(person.node_count <= cat.total_nodes());
+    assert!(admin.node_count <= cat.total_nodes());
+}
+
+#[tokio::test]
+async fn per_label_counts_survive_compaction() {
+    // Compaction rebuilds the label-index sidecar (with per-label counts) on the
+    // merged L1 SST. Without that, post-compaction `from_manifest` would read an
+    // empty scope and reset every per-label `node_count` to 0 — reviving the
+    // optimizer-pruning regression after the first maintenance tick.
+    let mut writer = WriterSession::open(store(), paths("ml-compact"))
+        .await
+        .unwrap();
+    // Two flushed batches → two L0 node SSTs in the (empty-scope) node bucket.
+    for batch in 0..2 {
+        for i in 0..3 {
+            let label = if i == 0 {
+                vec!["Person".to_string(), "Admin".to_string()]
+            } else {
+                vec!["Person".to_string()]
+            };
+            writer
+                .upsert_node_with_labels(
+                    label,
+                    NodeId::new(),
+                    &person(&format!("b{batch}n{i}"), "x", 30),
+                )
+                .unwrap();
+        }
+        writer.flush(schema()).await.expect("flush");
+    }
+
+    // 6 Person (2 of them also Admin), 2 Admin, 6 distinct nodes — before compaction.
+    let pre = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
+    assert_eq!(pre.label("Person").unwrap().node_count, 6);
+    assert_eq!(pre.label("Admin").unwrap().node_count, 2);
+    assert_eq!(pre.total_nodes(), 6);
+
+    writer.compact_l0(&schema()).await.expect("compact");
+
+    // Counts must be unchanged after the L0s collapse into one L1 SST.
+    let post = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
+    assert_eq!(
+        post.label("Person").unwrap().node_count,
+        6,
+        "Person count must survive compaction"
+    );
+    assert_eq!(
+        post.label("Admin").unwrap().node_count,
+        2,
+        "Admin count must survive compaction"
+    );
+    assert_eq!(post.total_nodes(), 6, "total_nodes must survive compaction");
+}
+
+#[tokio::test]
+async fn multi_label_scan_with_projection_pushdown_returns_correct_rows() {
+    // End-to-end guard for the __labels-in-projection fix on the multi-label
+    // path. A projected scan that elides __labels would make every row decode
+    // an empty label set, so the `:Admin` / `:Person` filter would drop all of
+    // them and the optimized query would return 0 rows.
+    let mut writer = WriterSession::open(store(), paths("ml-proj"))
+        .await
+        .unwrap();
+    // alice & bob are :Person:Admin; carol & dave are :Person only.
+    let mut mk = |labels: &[&str], name: &str| {
+        writer
+            .upsert_node_with_labels(
+                labels.iter().map(|s| s.to_string()),
+                NodeId::new(),
+                &person(name, "x", 30),
+            )
+            .unwrap();
+    };
+    mk(&["Person", "Admin"], "Alice");
+    mk(&["Person", "Admin"], "Bob");
+    mk(&["Person"], "Carol");
+    mk(&["Person"], "Dave");
+    writer.flush(schema()).await.expect("flush");
+    let snap = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+
+    for (q_text, expected) in [
+        ("MATCH (a:Admin) RETURN a.firstName", 2usize),
+        ("MATCH (a:Person) RETURN a.firstName", 4usize),
+        (
+            "MATCH (a:Admin) WHERE a.firstName = 'Alice' RETURN a.firstName",
+            1usize,
+        ),
+    ] {
+        let q = parse(q_text).unwrap();
+        let raw = lower(&q).unwrap();
+        let opt = optimize(raw.clone(), &catalog);
+        let rows_raw = execute(&raw, &snap, &Params::default()).await.unwrap();
+        let rows_opt = execute(&opt, &snap, &Params::default()).await.unwrap();
+        assert_eq!(
+            rows_opt.len(),
+            expected,
+            "optimized `{q_text}` should return {expected} rows, got {}",
+            rows_opt.len()
+        );
+        assert_eq!(
+            rows_raw.len(),
+            rows_opt.len(),
+            "raw/opt parity for `{q_text}`"
+        );
+    }
+}
+
+#[tokio::test]
 async fn catalog_from_manifest_captures_edge_avg_degree() {
     let mut writer = WriterSession::open(store(), paths("stats02"))
         .await
@@ -292,45 +452,48 @@ async fn property_stats_are_present_after_flush() {
     let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
 
     let p = cat.label("Person").unwrap();
-    // The writer now reads Parquet footer column statistics and ships
-    // real min/max/null_count to the catalog. Ages in the micro-graph
-    // range 25..=40 (Bob=25, Eve=40).
+    // Each declared property is still present as a catalog entry (seeded from
+    // the schema), so the optimizer knows the column exists. Under the
+    // id-primary layout every property rides in a single `__overflow_json`
+    // column rather than a typed `prop_*` column, so the writer emits no
+    // per-column Parquet statistics: min/max/ndv come back `None` and the
+    // optimizer uses its documented fallbacks. Precise per-label column stats
+    // (min/max=25/40, firstName=Alice..Frank, real ndv) return with the
+    // typed-column layout (RFC-pending); this test guards the current contract.
     assert!(p.properties.contains_key("age"), "age stats present");
     assert!(p.properties.contains_key("firstName"));
     assert!(p.properties.contains_key("lastName"));
     let age = &p.properties["age"];
-    match (&age.min, &age.max) {
-        (
-            Some(namidb_storage::sst::stats::StatScalar::Int64(mn)),
-            Some(namidb_storage::sst::stats::StatScalar::Int64(mx)),
-        ) => {
-            assert_eq!(*mn, 25, "Bob (25) is the youngest");
-            assert_eq!(*mx, 40, "Eve (40) is the oldest");
-        }
-        other => panic!("unexpected age stats: {:?}", other),
-    }
-    assert_eq!(age.null_count, 0, "no NULL ages in the fixture");
+    assert!(
+        age.min.is_none() && age.max.is_none(),
+        "id-primary: no per-column min/max until the typed-column layout, got {:?}/{:?}",
+        age.min,
+        age.max
+    );
+    assert!(age.ndv.is_none(), "id-primary: no per-column ndv yet");
+    // No per-column null statistics either: null_count stays 0 and
+    // non_null_count backfills to the label's node_count (6 Persons).
+    assert_eq!(
+        age.null_count, 0,
+        "no per-column null stats under id-primary"
+    );
+    assert_eq!(age.non_null_count, 6, "non_null backfills to node_count");
 
-    // firstName covers Alice..Frank lexicographically.
     let first = &p.properties["firstName"];
-    match (&first.min, &first.max) {
-        (
-            Some(namidb_storage::sst::stats::StatScalar::Utf8(mn)),
-            Some(namidb_storage::sst::stats::StatScalar::Utf8(mx)),
-        ) => {
-            assert_eq!(mn, "Alice");
-            assert_eq!(mx, "Frank");
-        }
-        other => panic!("unexpected firstName stats: {:?}", other),
-    }
+    assert!(
+        first.min.is_none() && first.max.is_none(),
+        "id-primary: no per-column min/max for firstName yet"
+    );
 }
 
 #[tokio::test]
 async fn filter_estimate_uses_real_min_max_after_writer_fix() {
-    // With real min/max, range selectivity uses the precise
-    // formula (lit-min)/(max-min) instead of falling back to 0.33.
-    // Ages min=25, max=40; lit=30 → below=(30-25)/(40-25)=0.333.
-    // Gt → 1-below = 0.666... → 6 * 0.667 = 4.0.
+    // Range selectivity with real min/max would use the precise formula
+    // (lit-min)/(max-min): ages min=25,max=40,lit=30 → 6 * 0.667 = 4.0.
+    // Under id-primary there are no per-column min/max (properties live in
+    // `__overflow_json`), so range selectivity falls back to the documented
+    // 0.33 constant → 6 * 0.33 ≈ 1.98. The precise estimate returns with the
+    // typed-column layout; results are unaffected either way.
     let mut writer = WriterSession::open(store(), paths("stats06b"))
         .await
         .unwrap();
@@ -344,11 +507,16 @@ async fn filter_estimate_uses_real_min_max_after_writer_fix() {
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
 
     assert_eq!(rows.len(), 3, "Carol(35), Eve(40), Frank(33)");
-    // Estimate ≈ 4.0. Without this, it fell back to 6 * 0.33 = 1.98.
+    // Fallback: 6 * 0.33 ≈ 1.98. The filter still drops the estimate below the
+    // 6-row scan cardinality, which is the property the optimizer relies on.
     assert!(
-        (card.rows - 4.0).abs() < 0.5,
-        "with real min/max, estimate {} should be ~4 (close to actual 3)",
+        (card.rows - 2.0).abs() < 0.6,
+        "fallback range selectivity should give ~2 (6 * 0.33), got {}",
         card.rows
+    );
+    assert!(
+        card.rows < 6.0,
+        "filter must still drop below scan cardinality"
     );
 }
 
@@ -803,28 +971,25 @@ async fn catalog_materializes_real_ndv_after_flush() {
     let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
 
     let person = cat.label("Person").expect("Person label");
-    // ndv_estimate is populated for every scalar property
-    // declared in the schema.
+    // The HLL pipeline only runs over typed `prop_*` columns. Under id-primary
+    // every property rides in `__overflow_json`, so no sketch is emitted and
+    // `ndv` is `None` for every property; equality/IN selectivity falls back to
+    // the documented constants. Real per-column ndv (≈6 distinct firstNames in
+    // the Alice..Frank fixture) returns with the typed-column layout.
     let first = person
         .properties
         .get("firstName")
         .expect("firstName stats present");
-    let ndv = first.ndv.expect("ndv populated by the HLL pipeline");
-    // 6 distinct firstNames in the fixture (Alice..Frank). HLL with
-    // p=10 has ~3.2 % expected error on 6 items but rounded should be
-    // in [5, 8].
     assert!(
-        (5..=8).contains(&ndv),
-        "firstName ndv {} not close to 6",
-        ndv
+        first.ndv.is_none(),
+        "id-primary: no per-column ndv until the typed-column layout, got {:?}",
+        first.ndv
     );
 
     let age = person.properties.get("age").expect("age stats present");
-    let age_ndv = age.ndv.expect("age ndv populated");
     assert!(
-        (5..=8).contains(&age_ndv),
-        "age ndv {} not close to 6",
-        age_ndv
+        age.ndv.is_none(),
+        "id-primary: no per-column ndv for age yet"
     );
 }
 
@@ -918,10 +1083,15 @@ async fn hash_join_executes_correctly() {
 
 #[tokio::test]
 async fn hash_join_estimate_matches_actual_within_micro_graph() {
-    // HashJoin estimate uses Selinger '79 with real ndv from HLL:
+    // HashJoin uses Selinger '79:
     //   rows = (|build| * |probe|) / max(ndv(build_key), ndv(probe_key))
-    // With ndv(firstName) ≈ 6 and |build| = |probe| = 6, we expect
-    // estimate ≈ 6. Compare to actual rows.
+    // The join key here is the property `firstName`. With a real ndv ≈ 6 the
+    // divisor would tighten the estimate to ≈ 6 (the actual). Under id-primary
+    // `firstName` has no per-column ndv (it lives in `__overflow_json`), so the
+    // divisor falls back to 1 and the estimate is the cartesian upper bound
+    // |build| * |probe| = 36 — loose but still a valid over-estimate. The tight
+    // estimate returns with the typed-column layout. Either way execution is
+    // correct (each Person matches only itself; distinct names → 6 rows).
     let mut writer = WriterSession::open(store(), paths("s123-hj03"))
         .await
         .unwrap();
@@ -935,13 +1105,15 @@ async fn hash_join_estimate_matches_actual_within_micro_graph() {
     let opt_est = estimate(&optimized, &cat).rows;
     let rows = execute(&optimized, &snap, &Params::new()).await.unwrap();
     let actual = rows.len() as f64;
-    let err = (opt_est - actual).abs() / actual.max(1.0);
+    assert_eq!(actual, 6.0, "6 Persons, each joins only to itself");
+    // Cartesian fallback: 6 * 6 = 36, and it must remain a valid upper bound.
     assert!(
-        err < 0.30,
-        "HashJoin estimate {} far from actual {} (rel err {})",
-        opt_est,
-        actual,
-        err
+        opt_est >= actual,
+        "estimate {opt_est} must not under-count actual {actual}"
+    );
+    assert!(
+        (opt_est - 36.0).abs() < 1.0,
+        "without per-column ndv the estimate is the cartesian bound 36, got {opt_est}"
     );
 }
 

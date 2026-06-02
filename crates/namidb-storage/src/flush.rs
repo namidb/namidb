@@ -679,7 +679,7 @@ type LabelIndexSidecar = (
     Option<(Path, Bytes)>,
 );
 
-fn prepare_label_index_sidecar(
+pub(crate) fn prepare_label_index_sidecar(
     paths: &NamespacePaths,
     level: u32,
     sst_id: &Uuid,
@@ -700,8 +700,15 @@ fn prepare_label_index_sidecar(
     if index.is_empty() {
         return Ok((None, None));
     }
+    // `per_label_counts` mirrors each posting list's length so the cost model
+    // can recover per-label `node_count` from the manifest alone (no sidecar
+    // body read); `posting_count` is just their sum.
+    let per_label_counts: Vec<(u32, u64)> = index
+        .iter()
+        .map(|(&lid, ids)| (lid, ids.len() as u64))
+        .collect();
     let label_count = index.len() as u64;
-    let posting_count = index.values().map(|v| v.len() as u64).sum();
+    let posting_count = per_label_counts.iter().map(|(_, c)| *c).sum();
     let body_bytes = bincode::serialize(&index)
         .map_err(|e| Error::invariant(format!("label-index bincode: {e}")))?;
     let body = Bytes::from(body_bytes);
@@ -717,6 +724,7 @@ fn prepare_label_index_sidecar(
         size_bytes: body.len() as u64,
         label_count,
         posting_count,
+        per_label_counts,
     };
     Ok((Some(descriptor), Some((object_path, body))))
 }

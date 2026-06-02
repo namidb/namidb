@@ -49,12 +49,15 @@ async fn flush(state: &namidb_server::AppState) {
     state.snapshot.store(w.owned_snapshot());
 }
 
-fn person_ssts(snap: &OwnedSnapshot, level: SstLevel) -> usize {
+// id-primary node SSTs are no longer partitioned by label (`scope == ""`), so
+// count the whole node bucket at a level. The fixture only writes Person nodes,
+// so this is exactly the count of Person SSTs.
+fn node_ssts(snap: &OwnedSnapshot, level: SstLevel) -> usize {
     snap.manifest()
         .manifest
         .ssts
         .iter()
-        .filter(|d| d.kind == SstKind::Nodes && d.scope == "Person" && d.level == level)
+        .filter(|d| d.kind == SstKind::Nodes && d.level == level)
         .count()
 }
 
@@ -96,9 +99,9 @@ async fn compaction_collapses_l0_and_sweep_reclaims_orphans() {
 
     let before = state.snapshot.load();
     assert!(
-        person_ssts(&before, SstLevel::L0) >= 2,
+        node_ssts(&before, SstLevel::L0) >= 2,
         "expected >= 2 L0 Person SSTs before compaction, got {}",
-        person_ssts(&before, SstLevel::L0)
+        node_ssts(&before, SstLevel::L0)
     );
     assert_eq!(count_persons(&before).await, total, "baseline count");
 
@@ -126,12 +129,12 @@ async fn compaction_collapses_l0_and_sweep_reclaims_orphans() {
 
     let after = state.snapshot.load();
     assert_eq!(
-        person_ssts(&after, SstLevel::L0),
+        node_ssts(&after, SstLevel::L0),
         0,
         "no L0 Person SSTs should remain after compaction"
     );
     assert_eq!(
-        person_ssts(&after, SstLevel(1)),
+        node_ssts(&after, SstLevel(1)),
         1,
         "the bucket should collapse to a single L1 SST"
     );

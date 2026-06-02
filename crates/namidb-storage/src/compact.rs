@@ -511,6 +511,18 @@ async fn put_node_sst_l1(
             merged_rows,
         )?;
     index_sidecars.extend(equality_sidecars);
+    // Rebuild the label-index sidecar from the reconciled rows. id-primary
+    // buckets (scope == "") carry per-row label sets in `merged_rows`, so this
+    // re-emits the `LabelId -> [NodeId]` postings (with per-label counts) the
+    // cost model needs; without it, every compaction would silently reset
+    // per-label `node_count` to 0 and the optimizer would prune non-empty
+    // labels again. Legacy per-label buckets have empty label sets and yield
+    // `None` here, falling back to `scope`-based counting downstream.
+    let (label_index, label_sidecar) =
+        crate::flush::prepare_label_index_sidecar(paths, level.as_u32(), &id, merged_rows)?;
+    if let Some(sidecar) = label_sidecar {
+        index_sidecars.push(sidecar);
+    }
     for (path, body) in &index_sidecars {
         put_create(store, path, body.clone()).await?;
     }
@@ -538,7 +550,7 @@ async fn put_node_sst_l1(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
-        label_index: None,
+        label_index,
     };
     Ok((descriptor, wrote_bloom))
 }
