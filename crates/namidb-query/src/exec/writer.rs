@@ -912,7 +912,7 @@ async fn find_merge_matches(
     // Split the pattern into Nodes (by alias) and Rels (in insertion
     // order). v0 supports either a single Node, or exactly one Rel
     // joining two Nodes.
-    let mut nodes: BTreeMap<&str, (&str, &[(String, Expression)])> = BTreeMap::new();
+    let mut nodes: MergeNodeMap<'_> = BTreeMap::new();
     let mut rels: Vec<&CreateElement> = Vec::new();
     for el in pattern {
         match el {
@@ -922,10 +922,9 @@ async fn find_merge_matches(
                 properties,
                 properties_spread: _,
             } => {
-                // MERGE is single-label (the parser rejects multi-label MERGE),
-                // so the primary label is the one to scan/match on.
-                let label = labels.first().map(String::as_str).unwrap_or("");
-                nodes.insert(alias.as_str(), (label, properties.as_slice()));
+                // Carry the full label set: `MERGE (n:A:B)` matches a node that
+                // carries BOTH labels, and creates one with both on miss.
+                nodes.insert(alias.as_str(), (labels.as_slice(), properties.as_slice()));
             }
             CreateElement::Rel { .. } => rels.push(el),
         }
@@ -938,15 +937,18 @@ async fn find_merge_matches(
                 "MERGE pattern must contain at least one node".into(),
             ));
         }
-        let (head_alias, (head_label, head_props)) = nodes.into_iter().next().expect("len == 1");
+        let (head_alias, (head_labels, head_props)) = nodes.into_iter().next().expect("len == 1");
         let snap = writer.snapshot();
         let candidates = snap
-            .scan_label(head_label)
+            .scan_label(merge_scan_label(head_labels))
             .await
             .map_err(ExecError::Storage)?;
         let mut matched_rows: Vec<Row> = Vec::new();
         for view in candidates {
             let node_val = NodeValue::from(view);
+            if !node_has_all_labels(&node_val, head_labels) {
+                continue;
+            }
             if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
                 continue;
             }
@@ -1027,9 +1029,9 @@ async fn find_merge_matches(
                     _ => unreachable!(),
                 };
                 let partner_node = match &tail {
-                    MergeTail::Fresh { label, props } => {
+                    MergeTail::Fresh { labels, props } => {
                         let view = match snap
-                            .lookup_node(label, partner_id)
+                            .lookup_node(merge_scan_label(labels), partner_id)
                             .await
                             .map_err(ExecError::Storage)?
                         {
@@ -1037,6 +1039,9 @@ async fn find_merge_matches(
                             None => continue,
                         };
                         let partner = NodeValue::from(view);
+                        if !node_has_all_labels(&partner, labels) {
+                            continue;
+                        }
                         if !merge_props_match(props, &partner.properties, &source_row, params)? {
                             continue;
                         }
@@ -1072,7 +1077,20 @@ async fn find_merge_matches(
 /// `alias -> (label, declared property entries)` map built once per
 /// MERGE call from the lowered `CreateElement::Node`s. Lives only as
 /// long as `find_merge_matches` borrows the lowered pattern.
-type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a str, &'a [(String, Expression)])>;
+type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a [String], &'a [(String, Expression)])>;
+
+/// The label a MERGE node scans on (its primary/first); the remaining labels
+/// are confirmed per-candidate by [`node_has_all_labels`]. Empty string when
+/// somehow unlabelled (lowering requires at least one label).
+fn merge_scan_label(labels: &[String]) -> &str {
+    labels.first().map(String::as_str).unwrap_or("")
+}
+
+/// True if `n` carries every label in `required` — the conjunctive set
+/// semantics of `MERGE (n:A:B)` / `MATCH (n:A:B)`.
+fn node_has_all_labels(n: &NodeValue, required: &[String]) -> bool {
+    required.iter().all(|l| n.labels.contains(l))
+}
 
 /// Seed `find_merge_matches` for an N-hop chain. The "head" alias is
 /// the source of the first rel. If the pattern declares it as a fresh
@@ -1085,14 +1103,17 @@ async fn seed_merge_head(
     snap: &namidb_storage::Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    if let Some((head_label, head_props)) = nodes.get(head_alias).copied() {
+    if let Some((head_labels, head_props)) = nodes.get(head_alias).copied() {
         let candidates = snap
-            .scan_label(head_label)
+            .scan_label(merge_scan_label(head_labels))
             .await
             .map_err(ExecError::Storage)?;
         let mut out = Vec::new();
         for view in candidates {
             let node_val = NodeValue::from(view);
+            if !node_has_all_labels(&node_val, head_labels) {
+                continue;
+            }
             if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
                 continue;
             }
@@ -1122,7 +1143,7 @@ async fn seed_merge_head(
 /// rel must point at exactly that id).
 enum MergeTail<'a> {
     Fresh {
-        label: &'a str,
+        labels: &'a [String],
         props: &'a [(String, Expression)],
     },
     BackReference {
@@ -1133,8 +1154,8 @@ enum MergeTail<'a> {
 
 impl<'a> MergeTail<'a> {
     fn resolve(alias: &str, nodes: &MergeNodeMap<'a>, outer_row: &Row) -> Result<Self, ExecError> {
-        if let Some((label, props)) = nodes.get(alias).copied() {
-            return Ok(MergeTail::Fresh { label, props });
+        if let Some((labels, props)) = nodes.get(alias).copied() {
+            return Ok(MergeTail::Fresh { labels, props });
         }
         if let Some(RuntimeValue::Node(n)) = outer_row.get(alias) {
             return Ok(MergeTail::BackReference {

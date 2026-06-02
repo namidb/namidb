@@ -179,6 +179,34 @@ async fn property_update_preserves_label_set() {
 }
 
 #[tokio::test]
+async fn merge_multi_label_matches_or_creates() {
+    let mut writer = WriterSession::open(store(), paths("w-mergeml"))
+        .await
+        .unwrap();
+    // First MERGE creates the :Person:Admin node.
+    let out = write_q(&mut writer, "MERGE (a:Person:Admin {name: 'Ada'}) RETURN a").await;
+    assert_eq!(out.nodes_created, 1);
+    match out.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+    // Second MERGE with the same labels + props matches it — no new node.
+    let out = write_q(&mut writer, "MERGE (a:Person:Admin {name: 'Ada'}) RETURN a").await;
+    assert_eq!(out.nodes_created, 0, "existing :Person:Admin must match");
+
+    // A node carrying only :Person must NOT satisfy MERGE (:Person:Admin): the
+    // conjunction requires :Admin too, so MERGE creates a fresh node.
+    write_q(&mut writer, "CREATE (b:Person {name: 'Bob'})").await;
+    let out = write_q(&mut writer, "MERGE (c:Person:Admin {name: 'Bob'}) RETURN c").await;
+    assert_eq!(
+        out.nodes_created, 1,
+        "Person-only node lacks :Admin, so MERGE must create"
+    );
+}
+
+#[tokio::test]
 async fn match_then_create_relationship() {
     let mut writer = WriterSession::open(store(), paths("w-match-create"))
         .await

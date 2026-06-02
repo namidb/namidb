@@ -488,17 +488,6 @@ impl<'src> Parser<'src> {
         let start = self.peek_span().start;
         self.expect(&Token::Merge)?;
         let pattern = self.parse_pattern_part()?;
-        // RFC-004 drawback 4: MERGE node patterns must carry exactly one label.
-        if let Some(head_labels) = first_node_labels(&pattern.element) {
-            if head_labels > 1 {
-                return Err(ParseError::new(
-                    ErrorCode::MergeMultiLabel,
-                    "MERGE node patterns must have at most one label in v0",
-                    pattern.span,
-                )
-                .with_help("see RFC-004 §Drawbacks 4"));
-            }
-        }
         let mut actions = Vec::new();
         let mut end = pattern.span.end;
         while self.eat(&Token::On).is_some() {
@@ -1547,10 +1536,6 @@ fn has_variable_length(element: &PatternElement) -> bool {
     element.chain.iter().any(|(r, _)| r.length.is_some())
 }
 
-fn first_node_labels(element: &PatternElement) -> Option<usize> {
-    Some(element.head.labels.len())
-}
-
 /// Variant-only equality (ignores embedded data like `Token::Ident("a") == Token::Ident("b")`).
 fn discriminant_eq(a: &Token, b: &Token) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
@@ -1789,9 +1774,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_multi_label_rejected() {
-        let code = err_code("MERGE (a:A:B) RETURN a");
-        assert_eq!(code, ErrorCode::MergeMultiLabel);
+    fn merge_multi_label_parses() {
+        // Multi-label MERGE is now supported: it parses and lowers to a
+        // conjunctive match-or-create over the full label set.
+        let _ = ok("MERGE (a:A:B) RETURN a");
     }
 
     #[test]
