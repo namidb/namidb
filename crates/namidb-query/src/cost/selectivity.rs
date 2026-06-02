@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use namidb_storage::sst::stats::StatScalar;
 
-use super::stats::{LabelStats, PropStats};
+use super::stats::{LabelStats, PropStats, StatsCatalog};
 use crate::parser::ast::{BinaryOp, Expression, ExpressionKind, Literal, StringOp, UnaryOp};
 
 /// Bindings visible to the predicate, mapping alias → label stats. The
@@ -29,6 +29,10 @@ use crate::parser::ast::{BinaryOp, Expression, ExpressionKind, Literal, StringOp
 #[derive(Debug, Default, Clone)]
 pub struct BindingStats<'a> {
     pub by_alias: BTreeMap<String, &'a LabelStats>,
+    /// Optional catalog for rules that need namespace-wide counts not tied to
+    /// a bound alias — currently the secondary-label fraction for `__label_eq`
+    /// (`MATCH (n:A:B)`). `None` falls back to the old defensive behaviour.
+    pub catalog: Option<&'a StatsCatalog>,
 }
 
 impl<'a> BindingStats<'a> {
@@ -38,6 +42,11 @@ impl<'a> BindingStats<'a> {
 
     pub fn with(mut self, alias: impl Into<String>, stats: &'a LabelStats) -> Self {
         self.by_alias.insert(alias.into(), stats);
+        self
+    }
+
+    pub fn with_catalog(mut self, catalog: &'a StatsCatalog) -> Self {
+        self.catalog = Some(catalog);
         self
     }
 
@@ -128,21 +137,46 @@ fn sel_inner(expr: &Expression, bindings: &BindingStats<'_>) -> f64 {
         ExpressionKind::Exists(_) => FALLBACK_UNKNOWN,
 
         // ─── synthetic engine functions ────────────────────────────────
-        ExpressionKind::FunctionCall { name, .. }
+        ExpressionKind::FunctionCall { name, args, .. }
             if name
                 .segments
                 .first()
                 .map(|s| s.name.eq_ignore_ascii_case("__label_eq"))
                 .unwrap_or(false) =>
         {
-            // The lowering already attached a label-aware operator; the
-            // predicate Filter is purely defensive. Treat as 1.0 so it
-            // doesn't multiply downstream estimates by 0.5.
-            1.0
+            sel_label_eq(args, bindings)
         }
 
         // Anything else (function calls, CASE, list/map literals, etc.).
         _ => FALLBACK_UNKNOWN,
+    }
+}
+
+/// Selectivity of a synthetic `__label_eq(alias, "L")` filter: the fraction of
+/// nodes carrying label `L`, approximated as `node_count(L) / total_nodes`
+/// (independence). `MATCH (n:A:B)` scans `A` and applies this for `B`, so the
+/// estimate becomes `node_count(A) * node_count(B)/total_nodes` — an
+/// intersection guess rather than the old `node_count(A)` (which ignored `B`).
+/// Falls back to 1.0 (no shrink) when the catalog or label is unknown.
+fn sel_label_eq(args: &[Expression], bindings: &BindingStats<'_>) -> f64 {
+    let (Some(catalog), Some(label)) = (bindings.catalog, label_literal(args)) else {
+        return 1.0;
+    };
+    let total = catalog.total_nodes();
+    if total == 0 {
+        return 1.0;
+    }
+    match catalog.label(label) {
+        Some(ls) => ls.node_count as f64 / total as f64,
+        None => 1.0,
+    }
+}
+
+/// Pull the label string out of `__label_eq(target, "Label")`'s second arg.
+fn label_literal(args: &[Expression]) -> Option<&str> {
+    match args.get(1).map(|e| &e.kind) {
+        Some(ExpressionKind::Literal(Literal::String(s))) => Some(s.as_str()),
+        _ => None,
     }
 }
 
