@@ -801,7 +801,7 @@ fn make_binding_stats<'a>(
     catalog: &'a StatsCatalog,
     bindings: &BTreeMap<String, BindingMeta>,
 ) -> BindingStats<'a> {
-    let mut bs = BindingStats::empty();
+    let mut bs = BindingStats::empty().with_catalog(catalog);
     for (alias, meta) in bindings {
         if let Some(label) = &meta.label {
             if let Some(ls) = catalog.label(label) {

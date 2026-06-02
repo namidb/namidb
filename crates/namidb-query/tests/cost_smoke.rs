@@ -319,6 +319,57 @@ async fn catalog_counts_multi_label_nodes_under_each_label() {
 }
 
 #[tokio::test]
+async fn multi_label_match_estimate_reflects_intersection() {
+    // 3 plain Person, 2 Person+Admin, 1 plain Admin -> Person=5, Admin=3, total=6.
+    let mut writer = WriterSession::open(store(), paths("ml-est")).await.unwrap();
+    for i in 0..3 {
+        writer
+            .upsert_node_with_labels(
+                ["Person".to_string()],
+                NodeId::new(),
+                &person(&format!("p{i}"), "x", 30),
+            )
+            .unwrap();
+    }
+    for i in 0..2 {
+        writer
+            .upsert_node_with_labels(
+                ["Person".to_string(), "Admin".to_string()],
+                NodeId::new(),
+                &person(&format!("pa{i}"), "x", 30),
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_node_with_labels(["Admin".to_string()], NodeId::new(), &person("a0", "x", 30))
+        .unwrap();
+    writer.flush(schema()).await.expect("flush");
+    let snap = writer.snapshot();
+    let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
+
+    // Optimized plan: NodeScan(Person) + Filter(__label_eq(n, "Admin")).
+    let opt = optimize(
+        lower(&parse("MATCH (n:Person:Admin) RETURN n").unwrap()).unwrap(),
+        &cat,
+    );
+    let card = estimate(&opt, &cat);
+    let rows = execute(&opt, &snap, &Params::new()).await.unwrap();
+
+    assert_eq!(rows.len(), 2, "exactly the 2 Person+Admin nodes match");
+    // node_count(Person) * node_count(Admin)/total = 5 * 3/6 = 2.5, vs the old
+    // estimate of 5.0 that ignored the :Admin constraint entirely.
+    assert!(
+        (card.rows - 2.5).abs() < 0.6,
+        "estimate {} should reflect the Person-and-Admin intersection (~2.5)",
+        card.rows
+    );
+    assert!(
+        card.rows < 5.0,
+        "the :Admin constraint must shrink the estimate below node_count(Person)=5"
+    );
+}
+
+#[tokio::test]
 async fn per_label_counts_survive_compaction() {
     // Compaction rebuilds the label-index sidecar (with per-label counts) on the
     // merged L1 SST. Without that, post-compaction `from_manifest` would read an
