@@ -1329,6 +1329,8 @@ mod tests {
         let mut nid = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
         let mut tomb = BooleanBuilder::with_capacity(rows.len());
         let mut lsn = UInt64Builder::with_capacity(rows.len());
+        let mut labels =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::UInt32Builder::new());
         let mut prop_name = StringBuilder::with_capacity(rows.len(), 32);
         let mut prop_age = arrow_array::builder::Int32Builder::with_capacity(rows.len());
         let mut overflow = StringBuilder::with_capacity(rows.len(), 32);
@@ -1340,6 +1342,7 @@ mod tests {
             nid.append_value(id).unwrap();
             tomb.append_value(*t);
             lsn.append_value(*l);
+            labels.append(true); // empty __labels list for these property tests
             match name_opt {
                 Some(n) => prop_name.append_value(n),
                 None => prop_name.append_null(),
@@ -1359,6 +1362,7 @@ mod tests {
             Arc::new(nid.finish()),
             Arc::new(tomb.finish()),
             Arc::new(lsn.finish()),
+            Arc::new(labels.finish()),
             Arc::new(prop_name.finish()),
             Arc::new(prop_age.finish()),
             Arc::new(overflow.finish()),
