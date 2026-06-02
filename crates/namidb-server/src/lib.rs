@@ -601,7 +601,15 @@ fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
             let mut o = serde_json::Map::new();
             o.insert("_kind".into(), J::String("node".into()));
             o.insert("id".into(), J::String(n.id.to_string()));
-            o.insert("label".into(), J::String(n.label.clone()));
+            // `label` = representative (first) for back-compat; `labels` = set.
+            o.insert(
+                "label".into(),
+                J::String(n.labels.iter().next().cloned().unwrap_or_default()),
+            );
+            o.insert(
+                "labels".into(),
+                J::Array(n.labels.iter().map(|l| J::String(l.clone())).collect()),
+            );
             let props: serde_json::Map<String, J> = n
                 .properties
                 .iter()

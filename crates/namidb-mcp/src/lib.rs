@@ -622,9 +622,11 @@ fn rv_to_json(v: &RuntimeValue) -> Value {
 }
 
 fn node_to_json(n: &NodeValue) -> Value {
+    // `label` = representative (first) for back-compat; `labels` = full set.
     json!({
         "id": n.id.to_string(),
-        "label": n.label,
+        "label": n.labels.iter().next().cloned().unwrap_or_default(),
+        "labels": n.labels.iter().cloned().collect::<Vec<String>>(),
         "properties": props_to_json(&n.properties),
     })
 }

@@ -13,7 +13,8 @@ use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute_write, lower, parse, Params, RuntimeValue};
+use namidb_query::cost::StatsCatalog;
+use namidb_query::{execute, execute_write, lower, optimize, parse, Params, RuntimeValue};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -21,6 +22,12 @@ fn store() -> Arc<dyn ObjectStore> {
 
 fn paths(name: &str) -> NamespacePaths {
     NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+}
+
+/// Lower + execute a write clause against `writer`, returning the outcome.
+async fn write_q(writer: &mut WriterSession, text: &str) -> namidb_query::WriteOutcome {
+    let plan = lower(&parse(text).unwrap()).unwrap();
+    execute_write(&plan, writer, &Params::new()).await.unwrap()
 }
 
 #[tokio::test]
@@ -43,6 +50,211 @@ async fn create_single_node_persists() {
     assert_eq!(
         nodes[0].properties.get("name"),
         Some(&CoreValue::Str("Ada".into()))
+    );
+}
+
+#[tokio::test]
+async fn create_and_match_multi_label_node() {
+    let mut writer = WriterSession::open(store(), paths("w-multilabel"))
+        .await
+        .unwrap();
+    // CREATE a node carrying two labels.
+    let q = parse("CREATE (a:Person:Admin {name: 'Ada'}) RETURN a").unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    // The created node value already carries both labels.
+    match &outcome.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+
+    // Helper: run a read query and return its row count (raw lowering).
+    async fn count(writer: &WriterSession, q_text: &str) -> usize {
+        let snap = writer.snapshot();
+        let plan = lower(&parse(q_text).unwrap()).unwrap();
+        execute(&plan, &snap, &Params::new()).await.unwrap().len()
+    }
+
+    // Visible under each of its labels individually...
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
+    assert_eq!(count(&writer, "MATCH (n:Admin) RETURN n").await, 1);
+    // ...and under the conjunction of both (it carries both).
+    assert_eq!(count(&writer, "MATCH (n:Person:Admin) RETURN n").await, 1);
+    // But NOT under a conjunction that includes a label it lacks.
+    assert_eq!(count(&writer, "MATCH (n:Person:Manager) RETURN n").await, 0);
+
+    // The optimized plan (label_eq cleanup + pushdown) must agree.
+    let snap = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+    let opt = optimize(
+        lower(&parse("MATCH (n:Admin:Person) RETURN n").unwrap()).unwrap(),
+        &catalog,
+    );
+    assert_eq!(execute(&opt, &snap, &Params::new()).await.unwrap().len(), 1);
+
+    // labels(n) returns the full set, sorted (BTreeSet order).
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n:Person:Admin) RETURN labels(n) AS ls").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    match rows[0].get("ls") {
+        Some(RuntimeValue::List(items)) => {
+            let got: Vec<&str> = items
+                .iter()
+                .map(|v| match v {
+                    RuntimeValue::String(s) => s.as_str(),
+                    _ => panic!("non-string label"),
+                })
+                .collect();
+            assert_eq!(got, vec!["Admin", "Person"]);
+        }
+        other => panic!("labels(n) should be a list, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_and_remove_label_mutate_the_set() {
+    let mut writer = WriterSession::open(store(), paths("w-setlabel"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Person {name: 'Ada'})").await;
+
+    // SET adds a label (union).
+    let out = write_q(&mut writer, "MATCH (a:Person) SET a:Admin RETURN a").await;
+    assert_eq!(out.labels_set, 1);
+    match out.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+    // The added label is durable: now matchable under :Admin.
+    {
+        let snap = writer.snapshot();
+        let plan = lower(&parse("MATCH (n:Admin) RETURN n").unwrap()).unwrap();
+        assert_eq!(
+            execute(&plan, &snap, &Params::new()).await.unwrap().len(),
+            1
+        );
+    }
+
+    // REMOVE drops a label (difference); the node stays under its remaining one.
+    let out = write_q(&mut writer, "MATCH (a:Admin) REMOVE a:Person RETURN a").await;
+    assert_eq!(out.labels_set, 1);
+    {
+        let snap = writer.snapshot();
+        let admin = lower(&parse("MATCH (n:Admin) RETURN n").unwrap()).unwrap();
+        let person = lower(&parse("MATCH (n:Person) RETURN n").unwrap()).unwrap();
+        assert_eq!(
+            execute(&admin, &snap, &Params::new()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            execute(&person, &snap, &Params::new()).await.unwrap().len(),
+            0,
+            "Person was removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_update_preserves_label_set() {
+    let mut writer = WriterSession::open(store(), paths("w-propkeeplabels"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Person:Admin {name: 'Ada'})").await;
+    // A property update must NOT collapse the multi-label node to one label.
+    write_q(&mut writer, "MATCH (a:Person) SET a.age = 36 RETURN a").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n:Person:Admin) RETURN n").unwrap()).unwrap();
+    assert_eq!(
+        execute(&plan, &snap, &Params::new()).await.unwrap().len(),
+        1,
+        "both labels must survive a property update"
+    );
+}
+
+#[tokio::test]
+async fn merge_multi_label_matches_or_creates() {
+    let mut writer = WriterSession::open(store(), paths("w-mergeml"))
+        .await
+        .unwrap();
+    // First MERGE creates the :Person:Admin node.
+    let out = write_q(&mut writer, "MERGE (a:Person:Admin {name: 'Ada'}) RETURN a").await;
+    assert_eq!(out.nodes_created, 1);
+    match out.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+    // Second MERGE with the same labels + props matches it — no new node.
+    let out = write_q(&mut writer, "MERGE (a:Person:Admin {name: 'Ada'}) RETURN a").await;
+    assert_eq!(out.nodes_created, 0, "existing :Person:Admin must match");
+
+    // A node carrying only :Person must NOT satisfy MERGE (:Person:Admin): the
+    // conjunction requires :Admin too, so MERGE creates a fresh node.
+    write_q(&mut writer, "CREATE (b:Person {name: 'Bob'})").await;
+    let out = write_q(&mut writer, "MERGE (c:Person:Admin {name: 'Bob'}) RETURN c").await;
+    assert_eq!(
+        out.nodes_created, 1,
+        "Person-only node lacks :Admin, so MERGE must create"
+    );
+}
+
+#[tokio::test]
+async fn multi_label_expand_target_is_conjunctive() {
+    let mut writer = WriterSession::open(store(), paths("w-ml-expand"))
+        .await
+        .unwrap();
+    // h1 -> p1(:Person:Admin); h2 -> p2(:Person only).
+    write_q(
+        &mut writer,
+        "CREATE (h:Hub {k: 1})-[:R]->(p1:Person:Admin {n: 'a'})",
+    )
+    .await;
+    write_q(
+        &mut writer,
+        "CREATE (h:Hub {k: 2})-[:R]->(p2:Person {n: 'b'})",
+    )
+    .await;
+    let snap = writer.snapshot();
+
+    // Non-OPTIONAL multi-label target: only the :Person:Admin neighbour matches.
+    let plan = lower(&parse("MATCH (h:Hub)-[:R]->(b:Person:Admin) RETURN b").unwrap()).unwrap();
+    assert_eq!(
+        execute(&plan, &snap, &Params::new()).await.unwrap().len(),
+        1,
+        "only the :Person:Admin neighbour matches"
+    );
+
+    // OPTIONAL with a multi-label target: both hubs survive. h1 binds its
+    // :Person:Admin neighbour; h2 yields b=NULL because its only neighbour
+    // lacks :Admin (the Expand enforces the full label set, so a partial-label
+    // neighbour is a non-match, not a wrong match).
+    let plan = lower(
+        &parse("MATCH (h:Hub) OPTIONAL MATCH (h)-[:R]->(b:Person:Admin) RETURN h.k AS k, b")
+            .unwrap(),
+    )
+    .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 2, "both hubs preserved by OPTIONAL");
+    let (mut bound, mut nulls) = (0, 0);
+    for r in &rows {
+        match r.get("b") {
+            Some(RuntimeValue::Node(_)) => bound += 1,
+            Some(RuntimeValue::Null) | None => nulls += 1,
+            other => panic!("unexpected b: {other:?}"),
+        }
+    }
+    assert_eq!(bound, 1, "h1's :Person:Admin neighbour binds");
+    assert_eq!(
+        nulls, 1,
+        "h2's :Person-only neighbour is a non-match -> NULL"
     );
 }
 

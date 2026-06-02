@@ -798,13 +798,13 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
 fn node_view_to_py<'py>(py: Python<'py>, v: &NodeView) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("id", v.id.to_string())?;
-    // NodeView carries a label set now; emit the representative label to keep
-    // the single-label Python contract until the plural switch later in the
-    // multi-label series.
+    // `labels` is the full set; `label` stays as the representative (first)
+    // label for backward compatibility with single-label consumers.
     d.set_item(
         "label",
         v.labels.iter().next().map(String::as_str).unwrap_or(""),
     )?;
+    d.set_item("labels", v.labels.iter().cloned().collect::<Vec<String>>())?;
     d.set_item("lsn", v.lsn)?;
     d.set_item("schema_version", v.schema_version)?;
     let props = PyDict::new_bound(py);
@@ -964,7 +964,12 @@ fn node_value_to_py<'py>(py: Python<'py>, n: &NodeValue) -> PyResult<Bound<'py, 
     let d = PyDict::new_bound(py);
     d.set_item("_kind", "node")?;
     d.set_item("id", n.id.to_string())?;
-    d.set_item("label", &n.label)?;
+    // `label` = representative (first) for back-compat; `labels` = full set.
+    d.set_item(
+        "label",
+        n.labels.iter().next().map(String::as_str).unwrap_or(""),
+    )?;
+    d.set_item("labels", n.labels.iter().cloned().collect::<Vec<String>>())?;
     let props = PyDict::new_bound(py);
     for (k, val) in &n.properties {
         props.set_item(k, runtime_value_to_py(py, val)?)?;

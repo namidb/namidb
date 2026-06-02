@@ -632,7 +632,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 direction,
                 rel_alias,
                 target_alias,
-                target_label,
+                target_labels,
                 length,
                 optional,
                 back_reference,
@@ -648,7 +648,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     *direction,
                     rel_alias.as_deref(),
                     target_alias,
-                    target_label.as_deref(),
+                    target_labels,
                     *length,
                     *optional,
                     *back_reference,
@@ -662,7 +662,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                         target_alias,
                         edge_type.as_deref(),
                         *direction,
-                        target_label.as_deref(),
+                        target_labels,
                         *length,
                         *back_reference,
                     ),
@@ -750,7 +750,7 @@ fn execute_capped<'a>(
                 direction,
                 rel_alias,
                 target_alias,
-                target_label,
+                target_labels,
                 length,
                 optional,
                 back_reference,
@@ -766,7 +766,7 @@ fn execute_capped<'a>(
                     *direction,
                     rel_alias.as_deref(),
                     target_alias,
-                    target_label.as_deref(),
+                    target_labels,
                     *length,
                     *optional,
                     *back_reference,
@@ -780,7 +780,7 @@ fn execute_capped<'a>(
                         target_alias,
                         edge_type.as_deref(),
                         *direction,
-                        target_label.as_deref(),
+                        target_labels,
                         *length,
                         *back_reference,
                     ),
@@ -833,7 +833,7 @@ async fn execute_expand(
     direction: RelationshipDirection,
     rel_alias: Option<&str>,
     target_alias: &str,
-    target_label: Option<&str>,
+    target_labels: &[String],
     length: Option<crate::parser::RelationshipLength>,
     optional: bool,
     back_reference: bool,
@@ -971,7 +971,7 @@ async fn execute_expand(
             // of decoding the SST again. We discard the returned `Vec`;
             // the cache is the only side-effect we care about.
             if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
-                if let Some(label) = target_label {
+                if let Some(label) = target_labels.first() {
                     let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
                 }
             }
@@ -991,10 +991,16 @@ async fn execute_expand(
                         // dst_label means no correctness drift vs the
                         // `continue`-on-None branch below.
                         None
-                    } else if let Some(label) = target_label {
+                    } else if let Some(label) = target_labels.first() {
                         match snapshot.lookup_node(label, target_id).await? {
-                            Some(v) => Some(v),
-                            None => continue,
+                            // Conjunctive multi-label: the neighbour must carry
+                            // EVERY listed label. Dropping a partial match here
+                            // feeds the OPTIONAL NULL path (no neighbour matched)
+                            // and, for non-OPTIONAL, simply excludes the edge.
+                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v)
+                            }
+                            _ => continue,
                         }
                     } else {
                         match scan_node_for_id(snapshot, target_id).await? {
@@ -1024,7 +1030,7 @@ async fn execute_expand(
                         } else if skip_target_materialize {
                             Some(NodeValue {
                                 id: target_id,
-                                label: target_label.unwrap_or_default().to_string(),
+                                labels: target_labels.iter().map(|l| l.to_string()).collect(),
                                 properties: std::collections::BTreeMap::new(),
                             })
                         } else {
@@ -1260,7 +1266,7 @@ fn should_skip_target_materialize(
     target_alias: &str,
     edge_type: Option<&[String]>,
     direction: RelationshipDirection,
-    target_label: Option<&str>,
+    target_labels: &[String],
     length: Option<crate::parser::RelationshipLength>,
     back_reference: bool,
 ) -> bool {
@@ -1278,14 +1284,15 @@ fn should_skip_target_materialize(
     let Some(edge_types) = edge_type else {
         return false;
     };
-    let Some(target_label) = target_label else {
-        // Without target_label the legacy path uses `scan_node_for_id`
-        // to confirm the id resolves to *some* node. We could try
-        // harder (e.g. require the schema-declared dst_label to be a
-        // singleton across all edge_types), but the conservative gate
-        // covers IC09 / IC02 already.
+    // Skip is only safe for exactly ONE schema-guaranteed target label: the
+    // optimization synthesises an id-only stub WITHOUT decoding the node, so it
+    // can't confirm extra labels. An unlabelled target (len 0, legacy
+    // `scan_node_for_id` path) and a multi-label target (len > 1, which needs
+    // the conjunctive materialise-and-check) both fall through to the full path.
+    let [target_label] = target_labels else {
         return false;
     };
+    let target_label = target_label.as_str();
     let schema = &snapshot.manifest().manifest.schema;
     // Type alternation `[:A|:B]`: every listed type has to point at the
     // same target label, otherwise we'd silently drop matches where the
@@ -1936,7 +1943,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 direction,
                 rel_alias,
                 target_alias,
-                target_label,
+                target_labels,
                 length,
                 optional,
                 back_reference,
@@ -1953,7 +1960,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     *direction,
                     rel_alias.as_deref(),
                     target_alias,
-                    target_label.as_deref(),
+                    target_labels,
                     *length,
                     *optional,
                     *back_reference,
@@ -1965,7 +1972,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         target_alias,
                         edge_type.as_deref(),
                         *direction,
-                        target_label.as_deref(),
+                        target_labels,
                         *length,
                         *back_reference,
                     ),
@@ -2321,7 +2328,7 @@ async fn execute_expand_factor(
     direction: RelationshipDirection,
     rel_alias: Option<&str>,
     target_alias: &str,
-    target_label: Option<&str>,
+    target_labels: &[String],
     length: Option<crate::parser::RelationshipLength>,
     optional: bool,
     back_reference: bool,
@@ -2444,7 +2451,7 @@ async fn execute_expand_factor(
             }
             // Phase 2: batch prewarm.
             if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
-                if let Some(label) = target_label {
+                if let Some(label) = target_labels.first() {
                     let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
                 }
             }
@@ -2456,10 +2463,16 @@ async fn execute_expand_factor(
                     } else if skip_target_materialize {
                         // Fix #3: transit-only binding, see flat-path comment.
                         None
-                    } else if let Some(label) = target_label {
+                    } else if let Some(label) = target_labels.first() {
                         match snapshot.lookup_node(label, target_id).await? {
-                            Some(v) => Some(v),
-                            None => continue,
+                            // Conjunctive multi-label: the neighbour must carry
+                            // EVERY listed label. Dropping a partial match here
+                            // feeds the OPTIONAL NULL path (no neighbour matched)
+                            // and, for non-OPTIONAL, simply excludes the edge.
+                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v)
+                            }
+                            _ => continue,
                         }
                     } else {
                         match scan_node_for_id(snapshot, target_id).await? {
@@ -2485,7 +2498,7 @@ async fn execute_expand_factor(
                             name: target_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue {
                                 id: target_id,
-                                label: target_label.unwrap_or_default().to_string(),
+                                labels: target_labels.iter().map(|l| l.to_string()).collect(),
                                 properties: std::collections::BTreeMap::new(),
                             })),
                         });

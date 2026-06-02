@@ -100,7 +100,7 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
         direction,
         rel_alias,
         target_alias,
-        target_label,
+        target_labels,
         length,
         optional,
         back_reference: _,
@@ -115,13 +115,17 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
             || !matches!(shortest, crate::plan::logical::ShortestMode::None)
             || path_binding.is_some()
             || matches!(direction, RelationshipDirection::Both)
+            // Multi-label targets need a conjunctive label check the leapfrog
+            // executor does not do (it scans/confirms one label). Fall back to
+            // the regular Expand executor, which enforces the full set.
+            || target_labels.len() > 1
         {
             return None;
         }
         raw_expands.push(RawExpand {
             source: source.clone(),
             target: target_alias.clone(),
-            target_label: target_label.clone(),
+            target_label: target_labels.first().cloned(),
             edge_types: edge_type.as_ref().unwrap().clone(),
             direction: *direction,
         });
@@ -402,7 +406,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -415,7 +419,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -585,7 +589,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: target.into(),
-            target_label: Some(target_label.into()),
+            target_labels: vec![target_label.into()],
             length: None,
             optional: false,
             back_reference,
@@ -687,8 +691,8 @@ mod tests {
     #[test]
     fn missing_target_label_rejected() {
         let mut inner = expand(scan("a", "Person"), "a", "b", "Person", false);
-        if let LogicalPlan::Expand { target_label, .. } = &mut inner {
-            *target_label = None;
+        if let LogicalPlan::Expand { target_labels, .. } = &mut inner {
+            *target_labels = vec![];
         }
         let closed = expand(inner, "b", "a", "Person", true);
         assert!(try_rewrite_chain(&closed).is_none());

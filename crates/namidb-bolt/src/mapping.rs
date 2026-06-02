@@ -88,7 +88,6 @@ pub fn runtime_to_bolt(v: &RuntimeValue, mode: ElementIdMode) -> Value {
 
 fn node_to_bolt(n: &NodeValue, mode: ElementIdMode) -> Value {
     let (legacy_id, element_id) = uuid_to_bolt_ids(n.id.0);
-    let labels = vec![Value::String(n.label.clone())];
     let properties: BTreeMap<String, Value> = n
         .properties
         .iter()
@@ -96,13 +95,8 @@ fn node_to_bolt(n: &NodeValue, mode: ElementIdMode) -> Value {
         .collect();
     let node = Node {
         id: legacy_id,
-        labels: labels
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
+        // Bolt Node carries the full label list (the wire type already does).
+        labels: n.labels.iter().cloned().collect(),
         properties,
         element_id: Some(element_id),
     };
@@ -372,7 +366,7 @@ mod tests {
         let u = Uuid::now_v7();
         let node = NodeValue {
             id: NodeId::from_uuid(u),
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: {
                 let mut m = BTreeMap::new();
                 m.insert("name".into(), RuntimeValue::String("Alice".into()));
@@ -395,7 +389,7 @@ mod tests {
         let u = Uuid::now_v7();
         let node = NodeValue {
             id: NodeId::from_uuid(u),
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: BTreeMap::new(),
         };
         let rt = RuntimeValue::Node(Box::new(node));

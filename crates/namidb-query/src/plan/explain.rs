@@ -714,11 +714,14 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
     match e {
         CreateElement::Node {
             alias,
-            label,
+            labels,
             properties,
             properties_spread,
         } => {
-            let _ = write!(out, "({}:{}", alias, label);
+            let _ = write!(out, "({}", alias);
+            for l in labels {
+                let _ = write!(out, ":{}", l);
+            }
             if !properties.is_empty() {
                 out.push_str(" {");
                 for (i, (k, v)) in properties.iter().enumerate() {
@@ -970,7 +973,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: false,
             back_reference: false,
@@ -1019,7 +1022,7 @@ TopN keys=[b DESC] limit=10
             direction: RelationshipDirection::Both,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: true,
             back_reference: false,
@@ -1078,7 +1081,7 @@ TopN keys=[b DESC] limit=10
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,
@@ -1212,7 +1215,7 @@ TopN keys=[b DESC] limit=10
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: false,
             back_reference: false,
@@ -1245,7 +1248,7 @@ TopN keys=[b DESC] limit=10
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,

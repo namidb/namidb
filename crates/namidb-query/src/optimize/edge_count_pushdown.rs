@@ -103,7 +103,7 @@ fn try_match(plan: &LogicalPlan) -> Option<LogicalPlan> {
         edge_type,
         direction,
         rel_alias,
-        target_label,
+        target_labels,
         length,
         optional,
         back_reference,
@@ -118,7 +118,7 @@ fn try_match(plan: &LogicalPlan) -> Option<LogicalPlan> {
         || *back_reference
         || path_binding.is_some()
         || length.is_some()
-        || target_label.is_some()
+        || !target_labels.is_empty()
         || !matches!(shortest, ShortestMode::None)
     {
         return None;

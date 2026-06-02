@@ -42,6 +42,8 @@ pub struct WriteOutcome {
     pub nodes_deleted: u64,
     pub edges_deleted: u64,
     pub properties_set: u64,
+    /// Labels added (`SET n:L`) or removed (`REMOVE n:L`).
+    pub labels_set: u64,
 }
 
 /// Execute `plan` against `writer`, staging its mutations into the
@@ -442,7 +444,7 @@ fn apply_create(
         match elem {
             CreateElement::Node {
                 alias,
-                label,
+                labels,
                 properties,
                 properties_spread,
             } => {
@@ -491,12 +493,12 @@ fn apply_create(
                     ..Default::default()
                 };
                 writer
-                    .upsert_node(label.clone(), id, &record)
+                    .upsert_node_with_labels(labels.iter().cloned(), id, &record)
                     .map_err(ExecError::Storage)?;
                 outcome.nodes_created += 1;
                 let node_value = NodeValue {
                     id,
-                    label: label.clone(),
+                    labels: labels.iter().cloned().collect(),
                     properties: runtime_props,
                 };
                 row.set(alias.clone(), RuntimeValue::Node(Box::new(node_value)));
@@ -609,8 +611,11 @@ fn apply_set(
                         schema_version: 1,
                         ..Default::default()
                     };
+                    // Preserve the full label set on a property update; the
+                    // node is keyed by id, so re-upserting with one label would
+                    // silently drop the others.
                     writer
-                        .upsert_node(n.label.clone(), n.id, &record)
+                        .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                         .map_err(ExecError::Storage)?;
                     n.properties.insert(key.clone(), new_val);
                     outcome.properties_set += 1;
@@ -651,12 +656,35 @@ fn apply_set(
                 target_alias
             )));
         }
-        SetOp::Labels { target_alias, .. } => {
-            return Err(ExecError::Runtime(format!(
-                "SET {}:Label lands (manifest schema labelset mutation)",
-                target_alias
-            )));
-        }
+        SetOp::Labels {
+            target_alias,
+            labels,
+        } => match row.get(target_alias).cloned() {
+            Some(RuntimeValue::Node(mut n)) => {
+                // Union the new labels into the node's set, then re-upsert
+                // (keyed by id) so the row carries the full set.
+                let added = labels
+                    .iter()
+                    .filter(|l| n.labels.insert((*l).clone()))
+                    .count();
+                let record = NodeWriteRecord {
+                    properties: node_runtime_props_to_core(&n.properties)?,
+                    schema_version: 1,
+                    ..Default::default()
+                };
+                writer
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
+                    .map_err(ExecError::Storage)?;
+                outcome.labels_set += added as u64;
+                row.set(target_alias.clone(), RuntimeValue::Node(n));
+            }
+            other => {
+                return Err(ExecError::Runtime(format!(
+                    "SET {}:Label target must be a Node, got {:?}",
+                    target_alias, other
+                )));
+            }
+        },
     }
     Ok(row)
 }
@@ -691,8 +719,10 @@ fn apply_remove(
                     schema_version: 1,
                     ..Default::default()
                 };
+                // Preserve the full label set on a property removal (node is
+                // keyed by id; a single-label upsert would drop the others).
                 writer
-                    .upsert_node(n.label.clone(), n.id, &record)
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                     .map_err(ExecError::Storage)?;
                 n.properties.remove(key);
                 outcome.properties_set += 1;
@@ -719,12 +749,32 @@ fn apply_remove(
                 )));
             }
         },
-        RemoveOp::Labels { target_alias, .. } => {
-            return Err(ExecError::Runtime(format!(
-                "REMOVE {}:Label lands",
-                target_alias
-            )));
-        }
+        RemoveOp::Labels {
+            target_alias,
+            labels,
+        } => match row.get(target_alias).cloned() {
+            Some(RuntimeValue::Node(mut n)) => {
+                // Set difference, then re-upsert (keyed by id). A node may end
+                // up with zero labels — Cypher permits unlabelled nodes.
+                let removed = labels.iter().filter(|l| n.labels.remove(*l)).count();
+                let record = NodeWriteRecord {
+                    properties: node_runtime_props_to_core(&n.properties)?,
+                    schema_version: 1,
+                    ..Default::default()
+                };
+                writer
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
+                    .map_err(ExecError::Storage)?;
+                outcome.labels_set += removed as u64;
+                row.set(target_alias.clone(), RuntimeValue::Node(n));
+            }
+            other => {
+                return Err(ExecError::Runtime(format!(
+                    "REMOVE {}:Label target must be a Node, got {:?}",
+                    target_alias, other
+                )));
+            }
+        },
     }
     Ok(row)
 }
@@ -746,8 +796,12 @@ async fn apply_delete(
                 if detach {
                     detach_incident_edges(n.id, writer, outcome).await?;
                 }
+                // Tombstone is keyed by id; the label arg is vestigial (a
+                // tombstone removes the node from every label scan). Pass any
+                // carried label for diagnostics.
+                let any_label = n.labels.iter().next().cloned().unwrap_or_default();
                 writer
-                    .tombstone_node(n.label.clone(), n.id)
+                    .tombstone_node(any_label, n.id)
                     .map_err(ExecError::Storage)?;
                 outcome.nodes_deleted += 1;
             }
@@ -858,17 +912,19 @@ async fn find_merge_matches(
     // Split the pattern into Nodes (by alias) and Rels (in insertion
     // order). v0 supports either a single Node, or exactly one Rel
     // joining two Nodes.
-    let mut nodes: BTreeMap<&str, (&str, &[(String, Expression)])> = BTreeMap::new();
+    let mut nodes: MergeNodeMap<'_> = BTreeMap::new();
     let mut rels: Vec<&CreateElement> = Vec::new();
     for el in pattern {
         match el {
             CreateElement::Node {
                 alias,
-                label,
+                labels,
                 properties,
                 properties_spread: _,
             } => {
-                nodes.insert(alias.as_str(), (label.as_str(), properties.as_slice()));
+                // Carry the full label set: `MERGE (n:A:B)` matches a node that
+                // carries BOTH labels, and creates one with both on miss.
+                nodes.insert(alias.as_str(), (labels.as_slice(), properties.as_slice()));
             }
             CreateElement::Rel { .. } => rels.push(el),
         }
@@ -881,15 +937,18 @@ async fn find_merge_matches(
                 "MERGE pattern must contain at least one node".into(),
             ));
         }
-        let (head_alias, (head_label, head_props)) = nodes.into_iter().next().expect("len == 1");
+        let (head_alias, (head_labels, head_props)) = nodes.into_iter().next().expect("len == 1");
         let snap = writer.snapshot();
         let candidates = snap
-            .scan_label(head_label)
+            .scan_label(merge_scan_label(head_labels))
             .await
             .map_err(ExecError::Storage)?;
         let mut matched_rows: Vec<Row> = Vec::new();
         for view in candidates {
             let node_val = NodeValue::from(view);
+            if !node_has_all_labels(&node_val, head_labels) {
+                continue;
+            }
             if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
                 continue;
             }
@@ -970,9 +1029,9 @@ async fn find_merge_matches(
                     _ => unreachable!(),
                 };
                 let partner_node = match &tail {
-                    MergeTail::Fresh { label, props } => {
+                    MergeTail::Fresh { labels, props } => {
                         let view = match snap
-                            .lookup_node(label, partner_id)
+                            .lookup_node(merge_scan_label(labels), partner_id)
                             .await
                             .map_err(ExecError::Storage)?
                         {
@@ -980,6 +1039,9 @@ async fn find_merge_matches(
                             None => continue,
                         };
                         let partner = NodeValue::from(view);
+                        if !node_has_all_labels(&partner, labels) {
+                            continue;
+                        }
                         if !merge_props_match(props, &partner.properties, &source_row, params)? {
                             continue;
                         }
@@ -1015,7 +1077,20 @@ async fn find_merge_matches(
 /// `alias -> (label, declared property entries)` map built once per
 /// MERGE call from the lowered `CreateElement::Node`s. Lives only as
 /// long as `find_merge_matches` borrows the lowered pattern.
-type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a str, &'a [(String, Expression)])>;
+type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a [String], &'a [(String, Expression)])>;
+
+/// The label a MERGE node scans on (its primary/first); the remaining labels
+/// are confirmed per-candidate by [`node_has_all_labels`]. Empty string when
+/// somehow unlabelled (lowering requires at least one label).
+fn merge_scan_label(labels: &[String]) -> &str {
+    labels.first().map(String::as_str).unwrap_or("")
+}
+
+/// True if `n` carries every label in `required` — the conjunctive set
+/// semantics of `MERGE (n:A:B)` / `MATCH (n:A:B)`.
+fn node_has_all_labels(n: &NodeValue, required: &[String]) -> bool {
+    required.iter().all(|l| n.labels.contains(l))
+}
 
 /// Seed `find_merge_matches` for an N-hop chain. The "head" alias is
 /// the source of the first rel. If the pattern declares it as a fresh
@@ -1028,14 +1103,17 @@ async fn seed_merge_head(
     snap: &namidb_storage::Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    if let Some((head_label, head_props)) = nodes.get(head_alias).copied() {
+    if let Some((head_labels, head_props)) = nodes.get(head_alias).copied() {
         let candidates = snap
-            .scan_label(head_label)
+            .scan_label(merge_scan_label(head_labels))
             .await
             .map_err(ExecError::Storage)?;
         let mut out = Vec::new();
         for view in candidates {
             let node_val = NodeValue::from(view);
+            if !node_has_all_labels(&node_val, head_labels) {
+                continue;
+            }
             if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
                 continue;
             }
@@ -1065,7 +1143,7 @@ async fn seed_merge_head(
 /// rel must point at exactly that id).
 enum MergeTail<'a> {
     Fresh {
-        label: &'a str,
+        labels: &'a [String],
         props: &'a [(String, Expression)],
     },
     BackReference {
@@ -1076,8 +1154,8 @@ enum MergeTail<'a> {
 
 impl<'a> MergeTail<'a> {
     fn resolve(alias: &str, nodes: &MergeNodeMap<'a>, outer_row: &Row) -> Result<Self, ExecError> {
-        if let Some((label, props)) = nodes.get(alias).copied() {
-            return Ok(MergeTail::Fresh { label, props });
+        if let Some((labels, props)) = nodes.get(alias).copied() {
+            return Ok(MergeTail::Fresh { labels, props });
         }
         if let Some(RuntimeValue::Node(n)) = outer_row.get(alias) {
             return Ok(MergeTail::BackReference {
@@ -1258,7 +1336,7 @@ mod tests {
         assert_eq!(outcome.rows.len(), 1);
         match outcome.rows[0].get("a") {
             Some(RuntimeValue::Node(n)) => {
-                assert_eq!(n.label, "Person");
+                assert!(n.labels.contains("Person"));
                 match n.properties.get("name") {
                     Some(RuntimeValue::String(s)) => assert_eq!(s, "Ada"),
                     other => panic!("unexpected: {:?}", other),
@@ -1292,7 +1370,7 @@ mod tests {
         assert_eq!(outcome.nodes_created, 1);
         match outcome.rows[0].get("a") {
             Some(RuntimeValue::Node(n)) => {
-                assert_eq!(n.label, "Person");
+                assert!(n.labels.contains("Person"));
                 assert!(matches!(
                     n.properties.get("name"),
                     Some(RuntimeValue::String(s)) if s == "Ada"

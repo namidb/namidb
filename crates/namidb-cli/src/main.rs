@@ -462,10 +462,11 @@ fn format_runtime(v: &RuntimeValue) -> String {
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, format_runtime(v)))
                 .collect();
+            let labels: String = n.labels.iter().map(|l| format!(":{}", l)).collect();
             format!(
-                "({}:{} {{{}}})",
+                "({}{} {{{}}})",
                 &n.id.to_string()[..8],
-                n.label,
+                labels,
                 props.join(", ")
             )
         }

@@ -598,7 +598,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -611,7 +611,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -795,7 +795,8 @@ fn lower_node_pattern_head(
             }));
         }
     }
-    let label = optional_single_label(head)?;
+    let label = optional_primary_label(head);
+    let extra_labels = pattern_extra_labels(head);
     let alias = head
         .binding
         .as_ref()
@@ -852,7 +853,12 @@ fn lower_node_pattern_head(
                 };
             }
             let _ = optional; // OPTIONAL on NodeById not meaningful in v0.
-            return Ok(plan);
+            return Ok(wrap_extra_label_filters(
+                plan,
+                &alias,
+                &extra_labels,
+                head.span,
+            ));
         }
         // Map without `_id`: build NodeScan, join with the carried-in
         // input (e.g. an UNWIND that introduces outer-row bindings the
@@ -877,16 +883,26 @@ fn lower_node_pattern_head(
                 predicate: pred,
             };
         }
-        return Ok(plan);
+        return Ok(wrap_extra_label_filters(
+            plan,
+            &alias,
+            &extra_labels,
+            head.span,
+        ));
     }
 
     let scan = LogicalPlan::NodeScan {
         label: label.map(str::to_string),
-        alias,
+        alias: alias.clone(),
         predicates: vec![],
         projection: None,
     };
-    Ok(combine(input, scan))
+    Ok(wrap_extra_label_filters(
+        combine(input, scan),
+        &alias,
+        &extra_labels,
+        head.span,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -934,7 +950,16 @@ fn lower_rel_node(
         ctx.introduce_or_reuse(&target_alias);
     }
 
-    let target_label = target.labels.first().map(|l| l.name.clone());
+    // The target's full label set is carried on the Expand and enforced
+    // conjunctively inside the executor (the matched neighbour must carry every
+    // listed label). Putting the check inside the Expand is what lets OPTIONAL
+    // MATCH preserve a NULL row when a neighbour carries only some of the
+    // labels — a post-expand filter would instead drop the row.
+    let target_labels = target
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .collect::<Vec<_>>();
     let mut plan = LogicalPlan::Expand {
         input: Box::new(input),
         source,
@@ -942,24 +967,16 @@ fn lower_rel_node(
         direction: rel.direction,
         rel_alias,
         target_alias: target_alias.clone(),
-        target_label: target_label.clone(),
+        target_labels,
         length: rel.length,
         optional,
         back_reference: target_already_bound,
         shortest,
         path_binding: None,
     };
-    // OPTIONAL MATCH must preserve rows where the target is NULL. Label
-    // and property checks are issued via the executor's `target_label`
-    // hint and are folded into the Expand itself when optional.
+    // Property checks on the target still ride as post-expand filters for the
+    // non-OPTIONAL case (label checks are handled by the Expand above).
     if !optional {
-        if let Some(l) = target_label {
-            let pred = build_label_eq(&target_alias, &l, target.span);
-            plan = LogicalPlan::Filter {
-                input: Box::new(plan),
-                predicate: pred,
-            };
-        }
         match &target.properties {
             None => {}
             Some(PatternProperties::Literal(map)) => {
@@ -1006,16 +1023,34 @@ fn previous_source(plan: &LogicalPlan) -> Result<String, LowerError> {
     }
 }
 
-fn optional_single_label(node: &NodePattern) -> Result<Option<&str>, LowerError> {
-    match node.labels.as_slice() {
-        [single] => Ok(Some(&single.name)),
-        [] => Ok(None),
-        _ => Err(LowerError::new(
-            LowerErrorKind::UnsupportedFeature,
-            "multi-label node patterns are not yet supported",
-            node.span,
-        )),
-    }
+/// The pattern's primary label (the first), used as the scan / CF hint.
+/// `MATCH (n:A:B)` scans by `A`; the remaining labels become conjunctive
+/// `__label_eq` filters (see [`wrap_extra_label_filters`]). `None` for an
+/// unlabelled pattern.
+fn optional_primary_label(node: &NodePattern) -> Option<&str> {
+    node.labels.first().map(|l| l.name.as_str())
+}
+
+/// Labels beyond the primary one. `MATCH (n:A:B)` yields `["B"]`; these are
+/// required on top of the primary-label scan (conjunctive set semantics).
+fn pattern_extra_labels(node: &NodePattern) -> Vec<String> {
+    node.labels.iter().skip(1).map(|l| l.name.clone()).collect()
+}
+
+/// Wrap `plan` in a `__label_eq(alias, label)` Filter for each extra label so
+/// a multi-label pattern only keeps nodes carrying ALL of them.
+fn wrap_extra_label_filters(
+    plan: LogicalPlan,
+    alias: &str,
+    extra_labels: &[String],
+    span: SourceSpan,
+) -> LogicalPlan {
+    extra_labels
+        .iter()
+        .fold(plan, |acc, label| LogicalPlan::Filter {
+            input: Box::new(acc),
+            predicate: build_label_eq(alias, label, span),
+        })
 }
 
 fn anonymous_alias(ctx: &LowerCtx) -> String {
@@ -1791,27 +1826,20 @@ fn lower_create_node(
             candidate
         }
     };
-    let label = match node.labels.as_slice() {
-        [single] => single.name.clone(),
+    let labels: Vec<String> = match node.labels.as_slice() {
         [] => {
             return Err(LowerError::new(
                 LowerErrorKind::InvalidPattern,
-                "CREATE node must carry exactly one label",
+                "CREATE node must carry at least one label",
                 node.span,
             ));
         }
-        _ => {
-            return Err(LowerError::new(
- LowerErrorKind::InvalidPattern,
- "CREATE node must carry exactly one label (multi-label CREATE is RFC-004 out-of-scope)",
- node.span,
- ));
-        }
+        ls => ls.iter().map(|l| l.name.clone()).collect(),
     };
     let (properties, properties_spread) = lower_pattern_properties(&node.properties);
     out.push(CreateElement::Node {
         alias: alias.clone(),
-        label,
+        labels,
         properties,
         properties_spread,
     });
@@ -2259,12 +2287,12 @@ mod tests {
                     match &elements[0] {
                         CreateElement::Node {
                             alias,
-                            label,
+                            labels,
                             properties,
                             properties_spread,
                         } => {
                             assert_eq!(alias, "a");
-                            assert_eq!(label, "Person");
+                            assert_eq!(labels.first().map(String::as_str), Some("Person"));
                             assert_eq!(properties.len(), 1);
                             assert_eq!(properties[0].0, "name");
                             assert!(properties_spread.is_none());

@@ -172,7 +172,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             edge_type,
             direction,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             rel_alias,
@@ -197,7 +197,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             bindings.insert(
                 target_alias.clone(),
                 BindingMeta {
-                    label: target_label.clone(),
+                    label: target_labels.first().cloned(),
                     ..Default::default()
                 },
             );
@@ -512,8 +512,8 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             for el in elements {
                 if let Some(a) = el.alias() {
                     let meta = match el {
-                        CreateElement::Node { label, .. } => BindingMeta {
-                            label: Some(label.clone()),
+                        CreateElement::Node { labels, .. } => BindingMeta {
+                            label: labels.first().cloned(),
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {
@@ -537,8 +537,8 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             for el in pattern {
                 if let Some(a) = el.alias() {
                     let meta = match el {
-                        CreateElement::Node { label, .. } => BindingMeta {
-                            label: Some(label.clone()),
+                        CreateElement::Node { labels, .. } => BindingMeta {
+                            label: labels.first().cloned(),
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {
@@ -1050,7 +1050,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "q".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,
@@ -1078,7 +1078,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "q".into(),
-            target_label: None,
+            target_labels: vec![],
             length: Some(crate::parser::ast::RelationshipLength { min: 1, max: 10 }),
             optional: false,
             back_reference: false,

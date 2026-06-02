@@ -970,7 +970,7 @@ mod tests {
         // server-side integration test.
         let _ = NodeValue {
             id: namidb_core::id::NodeId::new(),
-            label: "X".into(),
+            labels: std::iter::once("X".to_string()).collect(),
             properties: BTreeMap::new(),
         };
     }
