@@ -950,6 +950,20 @@ fn lower_rel_node(
         ctx.introduce_or_reuse(&target_alias);
     }
 
+    // A multi-label relationship target needs a conjunctive label check on the
+    // matched node. For a non-OPTIONAL expand we emit that as post-expand
+    // `__label_eq` filters (below). OPTIONAL is different: the check must live
+    // *inside* the expand so a target carrying only some of the labels still
+    // yields a NULL row, but `Expand` only carries the primary label today
+    // (target_labels is a future change threaded through the WCOJ optimizer).
+    // Rather than silently match on the primary label alone, reject it.
+    if optional && target.labels.len() > 1 {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "OPTIONAL MATCH with a multi-label relationship target is not yet supported",
+            target.span,
+        ));
+    }
     let target_label = target.labels.first().map(|l| l.name.clone());
     let mut plan = LogicalPlan::Expand {
         input: Box::new(input),

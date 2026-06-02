@@ -207,6 +207,42 @@ async fn merge_multi_label_matches_or_creates() {
 }
 
 #[tokio::test]
+async fn multi_label_expand_target_is_conjunctive() {
+    let mut writer = WriterSession::open(store(), paths("w-ml-expand"))
+        .await
+        .unwrap();
+    // hub -> p1 (:Person:Admin) and hub -> p2 (:Person only).
+    write_q(
+        &mut writer,
+        "CREATE (h:Hub {k: 1})-[:R]->(p1:Person:Admin {n: 'a'})",
+    )
+    .await;
+    write_q(
+        &mut writer,
+        "MATCH (h:Hub) CREATE (h)-[:R]->(p2:Person {n: 'b'})",
+    )
+    .await;
+    let snap = writer.snapshot();
+    // Non-OPTIONAL multi-label target: only the :Person:Admin neighbour matches.
+    let plan = lower(&parse("MATCH (h:Hub)-[:R]->(b:Person:Admin) RETURN b").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1, "only the :Person:Admin target matches");
+
+    // OPTIONAL MATCH with a multi-label target is rejected (rather than
+    // silently matching on the primary label only and breaking NULL rows).
+    let rejected =
+        lower(&parse("MATCH (h:Hub) OPTIONAL MATCH (h)-[:R]->(b:Person:Admin) RETURN b").unwrap());
+    assert!(
+        rejected.is_err(),
+        "OPTIONAL MATCH with a multi-label expand target must be rejected"
+    );
+
+    // OPTIONAL with a single-label target still lowers fine.
+    let ok = lower(&parse("MATCH (h:Hub) OPTIONAL MATCH (h)-[:R]->(b:Person) RETURN b").unwrap());
+    assert!(ok.is_ok());
+}
+
+#[tokio::test]
 async fn match_then_create_relationship() {
     let mut writer = WriterSession::open(store(), paths("w-match-create"))
         .await
