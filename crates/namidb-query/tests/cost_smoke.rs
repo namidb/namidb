@@ -105,6 +105,20 @@ fn person(first: &str, last: &str, age: i32) -> NodeWriteRecord {
     }
 }
 
+/// A `Person` that sets `firstName`/`lastName` but leaves the declared `age`
+/// property unset — used to exercise null accounting for a declared-but-absent
+/// property.
+fn person_no_age(first: &str, last: &str) -> NodeWriteRecord {
+    let mut p: BTreeMap<String, CoreValue> = BTreeMap::new();
+    p.insert("firstName".into(), CoreValue::Str(first.into()));
+    p.insert("lastName".into(), CoreValue::Str(last.into()));
+    NodeWriteRecord {
+        properties: p,
+        schema_version: 1,
+        ..Default::default()
+    }
+}
+
 fn message(content: &str, creation_date: i64) -> NodeWriteRecord {
     let mut p = BTreeMap::new();
     p.insert("content".into(), CoreValue::Str(content.into()));
@@ -426,6 +440,54 @@ async fn per_label_property_stats_attribute_per_label_and_survive_compaction() {
     ));
 
     // ...and unchanged after L0->L1 compaction rebuilds the sidecar.
+    writer.compact_l0(&schema()).await.expect("compact");
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+}
+
+#[tokio::test]
+async fn declared_property_absent_in_an_sst_counts_as_null_not_present() {
+    // RFC 025 null accounting: a property DECLARED on a label but absent from
+    // every row of a given SST emits no observed accumulator, so without the
+    // schema-seeded null entry the cross-SST merge would leave `null_count = 0`
+    // and the backfill (`non_null = node_count - null_count`) would report the
+    // property as fully present. Here `age` is set in flush 1 and absent in
+    // flush 2; the catalog must report 3 non-null + 2 null, not 5 non-null.
+    let mut writer = WriterSession::open(store(), paths("rfc025-null-absent"))
+        .await
+        .unwrap();
+    // Flush 1: 3 Persons WITH age.
+    for (f, l, age) in [("a", "x", 10), ("b", "x", 20), ("c", "x", 30)] {
+        writer
+            .upsert_node("Person", NodeId::new(), &person(f, l, age))
+            .unwrap();
+    }
+    writer.flush(schema()).await.expect("flush 1");
+    // Flush 2: 2 Persons WITHOUT age (declared, but unset on every row here).
+    for (f, l) in [("d", "x"), ("e", "x")] {
+        writer
+            .upsert_node("Person", NodeId::new(), &person_no_age(f, l))
+            .unwrap();
+    }
+    writer.flush(schema()).await.expect("flush 2");
+
+    let check = |cat: &StatsCatalog| {
+        let person = cat.label("Person").unwrap();
+        assert_eq!(person.node_count, 5, "5 Persons total");
+        let age = &person.properties["age"];
+        assert_eq!(age.non_null_count, 3, "only flush-1 Persons set age");
+        assert_eq!(age.null_count, 2, "flush-2 Persons leave age null");
+        use namidb_storage::sst::stats::StatScalar::Int64;
+        assert_eq!(age.min, Some(Int64(10)));
+        assert_eq!(age.max, Some(Int64(30)));
+    };
+
+    // Cross-SST merge across the two L0 SSTs...
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+    // ...and unchanged after compaction rebuilds the merged sidecar.
     writer.compact_l0(&schema()).await.expect("compact");
     check(&StatsCatalog::from_manifest(
         &writer.snapshot().manifest().manifest,

@@ -60,7 +60,9 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{DataType, EdgeTypeDef, LabelDef, PropertyDef, Schema, Value};
+use namidb_core::{
+    DataType, EdgeTypeDef, LabelDef, LabelDictionary, LabelId, PropertyDef, Schema, Value,
+};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
@@ -203,6 +205,8 @@ pub async fn flush(
             &index_props,
             &node_rows,
             finish,
+            &schema,
+            &base.manifest.label_dict,
         )?);
     }
     for (edge_type, rows) in edge_buckets {
@@ -596,6 +600,8 @@ fn prepare_node_pending(
     label_def: &LabelDef,
     rows: &[NodeRow],
     finish: NodeSstFinish,
+    schema: &Schema,
+    label_dict: &LabelDictionary,
 ) -> Result<PendingSst> {
     let id = Uuid::now_v7();
     let level = SstLevel::L0;
@@ -658,7 +664,7 @@ fn prepare_node_pending(
         unique_property_indices,
         equality_property_indices,
         label_index,
-        per_label_property_stats: compute_per_label_property_stats(rows)?,
+        per_label_property_stats: compute_per_label_property_stats(rows, schema, label_dict)?,
     };
 
     Ok(PendingSst {
@@ -744,6 +750,8 @@ pub(crate) fn prepare_label_index_sidecar(
 /// contribute nothing (only `MemOp::Upsert` rows are folded).
 pub(crate) fn compute_per_label_property_stats(
     rows: &[NodeRow],
+    schema: &Schema,
+    label_dict: &LabelDictionary,
 ) -> Result<Vec<PerLabelPropertyStat>> {
     struct Acc {
         min: Option<StatScalar>,
@@ -782,6 +790,34 @@ pub(crate) fn compute_per_label_property_stats(
                     None => scalar,
                 });
             }
+        }
+    }
+
+    // Seed declared-but-absent properties. A property declared on a label but
+    // null on every row of this SST yields no accumulator above, so it would
+    // emit no entry; the cost model's backfill (`non_null = node_count -
+    // null_count`) then leaves `null_count = 0` and the property reads as fully
+    // non-null. Seeding an empty accumulator for every declared property of a
+    // label present here makes its `null_count` resolve to `live` (all rows
+    // null), which is correct and additive across SSTs. Only labels present in
+    // this SST are seeded; their declared set comes from the schema, resolved
+    // through the label dictionary (an un-resolvable or undeclared label simply
+    // falls back to the observed-only behavior).
+    for &label_id in live_per_label.keys() {
+        let Some(name) = label_dict.name(LabelId(label_id)) else {
+            continue;
+        };
+        let Some(def) = schema.label(name) else {
+            continue;
+        };
+        for prop in &def.properties {
+            accs.entry((label_id, prop.name.clone()))
+                .or_insert_with(|| Acc {
+                    min: None,
+                    max: None,
+                    hll: Hll::new(DEFAULT_PRECISION),
+                    non_null: 0,
+                });
         }
     }
 
@@ -1551,7 +1587,8 @@ pub mod builder {
         };
         let index_props = union_indexed_props(schema);
         let finish = super::build_node_sst(&column_label, &node_rows)?;
-        let pending = prepare_node_pending(paths, &index_props, &node_rows, finish)?;
+        let pending =
+            prepare_node_pending(paths, &index_props, &node_rows, finish, schema, &node_dict)?;
         Ok(Some(BuiltSst {
             inner: pending,
             label_dict: node_dict,
