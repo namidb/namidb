@@ -359,12 +359,37 @@ fn merge_node_sst(
         }
     }
 
-    // Per-column property stats stay keyed by `scope`. Under id-primary every
-    // property rides in one `__overflow_json` column, so `property_stats` is
-    // empty and this is a no-op (min/max/ndv stay `None`, and the optimizer
-    // uses its documented fallbacks); per-label column stats return with the
-    // typed-column layout. Legacy typed-column SSTs still populate their one
-    // label's stats here via `scope`.
+    // Per-(label, property) stats for id-primary node SSTs (RFC 025). The SST
+    // spans many labels with properties in one `__overflow_json` column, so the
+    // typed-column `property_stats` below is empty; these come from a per-label
+    // sidecar computed at flush/compaction. Resolve each label id via the
+    // dictionary and fold min/max/null + the HLL sketch into that label's
+    // PropStats. `non_null_count` backfills from `node_count - null_count`.
+    for s in &sst.per_label_property_stats {
+        let Some(name) = label_dict.name(LabelId(s.label_id)) else {
+            continue;
+        };
+        let entry = labels
+            .entry(name.to_string())
+            .or_insert_with(|| LabelStats {
+                name: name.to_string(),
+                ..Default::default()
+            });
+        let prop = entry.properties.entry(s.property.clone()).or_default();
+        prop.null_count = prop.null_count.saturating_add(s.null_count);
+        prop.min = merge_min(prop.min.take(), s.min.clone());
+        prop.max = merge_max(prop.max.take(), s.max.clone());
+        absorb_hll_sketch(
+            hll_merge,
+            name.to_string(),
+            s.property.clone(),
+            s.ndv_estimate.as_ref(),
+        );
+    }
+
+    // Legacy typed-column SSTs keep their per-column `property_stats` keyed by
+    // `scope` (a single label). Under id-primary `property_stats` is empty and
+    // this loop is a no-op (the RFC-025 sidecar above carries the stats).
     if !sst.property_stats.is_empty() {
         let label = &sst.scope;
         let entry = labels.entry(label.clone()).or_insert_with(|| LabelStats {
@@ -637,6 +662,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         }
     }
 
@@ -673,6 +699,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         }
     }
 

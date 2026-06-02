@@ -4281,6 +4281,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         };
 
         let empty = Memtable::new();
@@ -4306,6 +4307,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
             ..descriptor.clone()
         };
         assert!(snap
@@ -4633,6 +4635,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         });
         let mt = Memtable::new();
         let view = mt.snapshot_view();

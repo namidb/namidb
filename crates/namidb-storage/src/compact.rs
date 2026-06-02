@@ -551,6 +551,9 @@ async fn put_node_sst_l1(
         unique_property_indices,
         equality_property_indices,
         label_index,
+        // Recompute per-(label, property) stats from the merged rows so they
+        // survive L0->L1 the same way the label index does (RFC 025).
+        per_label_property_stats: crate::flush::compute_per_label_property_stats(merged_rows)?,
     };
     Ok((descriptor, wrote_bloom))
 }
@@ -618,6 +621,7 @@ async fn put_edge_sst_l1(
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
         label_index: None,
+        per_label_property_stats: Vec::new(),
     };
     Ok((descriptor, wrote_bloom))
 }
