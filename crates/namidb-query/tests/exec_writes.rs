@@ -13,7 +13,8 @@ use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute_write, lower, parse, Params, RuntimeValue};
+use namidb_query::cost::StatsCatalog;
+use namidb_query::{execute, execute_write, lower, optimize, parse, Params, RuntimeValue};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -21,6 +22,12 @@ fn store() -> Arc<dyn ObjectStore> {
 
 fn paths(name: &str) -> NamespacePaths {
     NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+}
+
+/// Lower + execute a write clause against `writer`, returning the outcome.
+async fn write_q(writer: &mut WriterSession, text: &str) -> namidb_query::WriteOutcome {
+    let plan = lower(&parse(text).unwrap()).unwrap();
+    execute_write(&plan, writer, &Params::new()).await.unwrap()
 }
 
 #[tokio::test]
@@ -43,6 +50,131 @@ async fn create_single_node_persists() {
     assert_eq!(
         nodes[0].properties.get("name"),
         Some(&CoreValue::Str("Ada".into()))
+    );
+}
+
+#[tokio::test]
+async fn create_and_match_multi_label_node() {
+    let mut writer = WriterSession::open(store(), paths("w-multilabel"))
+        .await
+        .unwrap();
+    // CREATE a node carrying two labels.
+    let q = parse("CREATE (a:Person:Admin {name: 'Ada'}) RETURN a").unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    // The created node value already carries both labels.
+    match &outcome.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+
+    // Helper: run a read query and return its row count (raw lowering).
+    async fn count(writer: &WriterSession, q_text: &str) -> usize {
+        let snap = writer.snapshot();
+        let plan = lower(&parse(q_text).unwrap()).unwrap();
+        execute(&plan, &snap, &Params::new()).await.unwrap().len()
+    }
+
+    // Visible under each of its labels individually...
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
+    assert_eq!(count(&writer, "MATCH (n:Admin) RETURN n").await, 1);
+    // ...and under the conjunction of both (it carries both).
+    assert_eq!(count(&writer, "MATCH (n:Person:Admin) RETURN n").await, 1);
+    // But NOT under a conjunction that includes a label it lacks.
+    assert_eq!(count(&writer, "MATCH (n:Person:Manager) RETURN n").await, 0);
+
+    // The optimized plan (label_eq cleanup + pushdown) must agree.
+    let snap = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+    let opt = optimize(
+        lower(&parse("MATCH (n:Admin:Person) RETURN n").unwrap()).unwrap(),
+        &catalog,
+    );
+    assert_eq!(execute(&opt, &snap, &Params::new()).await.unwrap().len(), 1);
+
+    // labels(n) returns the full set, sorted (BTreeSet order).
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n:Person:Admin) RETURN labels(n) AS ls").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    match rows[0].get("ls") {
+        Some(RuntimeValue::List(items)) => {
+            let got: Vec<&str> = items
+                .iter()
+                .map(|v| match v {
+                    RuntimeValue::String(s) => s.as_str(),
+                    _ => panic!("non-string label"),
+                })
+                .collect();
+            assert_eq!(got, vec!["Admin", "Person"]);
+        }
+        other => panic!("labels(n) should be a list, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_and_remove_label_mutate_the_set() {
+    let mut writer = WriterSession::open(store(), paths("w-setlabel"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Person {name: 'Ada'})").await;
+
+    // SET adds a label (union).
+    let out = write_q(&mut writer, "MATCH (a:Person) SET a:Admin RETURN a").await;
+    assert_eq!(out.labels_set, 1);
+    match out.rows[0].get("a") {
+        Some(RuntimeValue::Node(n)) => {
+            assert!(n.labels.contains("Person") && n.labels.contains("Admin"));
+        }
+        other => panic!("expected node, got {other:?}"),
+    }
+    // The added label is durable: now matchable under :Admin.
+    {
+        let snap = writer.snapshot();
+        let plan = lower(&parse("MATCH (n:Admin) RETURN n").unwrap()).unwrap();
+        assert_eq!(
+            execute(&plan, &snap, &Params::new()).await.unwrap().len(),
+            1
+        );
+    }
+
+    // REMOVE drops a label (difference); the node stays under its remaining one.
+    let out = write_q(&mut writer, "MATCH (a:Admin) REMOVE a:Person RETURN a").await;
+    assert_eq!(out.labels_set, 1);
+    {
+        let snap = writer.snapshot();
+        let admin = lower(&parse("MATCH (n:Admin) RETURN n").unwrap()).unwrap();
+        let person = lower(&parse("MATCH (n:Person) RETURN n").unwrap()).unwrap();
+        assert_eq!(
+            execute(&admin, &snap, &Params::new()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            execute(&person, &snap, &Params::new()).await.unwrap().len(),
+            0,
+            "Person was removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_update_preserves_label_set() {
+    let mut writer = WriterSession::open(store(), paths("w-propkeeplabels"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Person:Admin {name: 'Ada'})").await;
+    // A property update must NOT collapse the multi-label node to one label.
+    write_q(&mut writer, "MATCH (a:Person) SET a.age = 36 RETURN a").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n:Person:Admin) RETURN n").unwrap()).unwrap();
+    assert_eq!(
+        execute(&plan, &snap, &Params::new()).await.unwrap().len(),
+        1,
+        "both labels must survive a property update"
     );
 }
 

@@ -606,7 +606,9 @@ pub enum AggregateExpr {
 pub enum CreateElement {
     Node {
         alias: String,
-        label: String,
+        /// Full label set to stamp on the new node (`CREATE (n:A:B)`).
+        /// Non-empty; written in one `upsert_node_with_labels`.
+        labels: Vec<String>,
         properties: Vec<(String, Expression)>,
         properties_spread: Option<Expression>,
     },
@@ -811,7 +813,7 @@ mod tests {
     fn create_element_alias_helper() {
         let node = CreateElement::Node {
             alias: "a".into(),
-            label: "Person".into(),
+            labels: vec!["Person".into()],
             properties: vec![],
             properties_spread: None,
         };

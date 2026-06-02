@@ -512,8 +512,8 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             for el in elements {
                 if let Some(a) = el.alias() {
                     let meta = match el {
-                        CreateElement::Node { label, .. } => BindingMeta {
-                            label: Some(label.clone()),
+                        CreateElement::Node { labels, .. } => BindingMeta {
+                            label: labels.first().cloned(),
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {
@@ -537,8 +537,8 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             for el in pattern {
                 if let Some(a) = el.alias() {
                     let meta = match el {
-                        CreateElement::Node { label, .. } => BindingMeta {
-                            label: Some(label.clone()),
+                        CreateElement::Node { labels, .. } => BindingMeta {
+                            label: labels.first().cloned(),
                             ..Default::default()
                         },
                         CreateElement::Rel { edge_type, .. } => BindingMeta {

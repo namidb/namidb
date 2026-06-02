@@ -591,9 +591,12 @@ fn call_scalar_function(
             _ => RuntimeValue::Null,
         }),
         "labels" => single_arg(name, args, span).map(|v| match v {
-            RuntimeValue::Node(n) => {
-                RuntimeValue::List(vec![RuntimeValue::String(n.label.clone())])
-            }
+            RuntimeValue::Node(n) => RuntimeValue::List(
+                n.labels
+                    .iter()
+                    .map(|l| RuntimeValue::String(l.clone()))
+                    .collect(),
+            ),
             _ => RuntimeValue::Null,
         }),
         "type" => single_arg(name, args, span).map(|v| match v {
@@ -801,8 +804,11 @@ fn call_scalar_function(
         // --- Lowering helpers (internal)
         "__path" => Ok(RuntimeValue::Path(args.to_vec())),
         "__label_eq" => match args {
+            // Label-membership test: `MATCH (n:A:B)` lowers to one
+            // `__label_eq(n, "A")` per label, ANDed together. A node carrying
+            // the label set {A, B, ...} passes iff it contains the asked label.
             [target, RuntimeValue::String(label)] => Ok(match target {
-                RuntimeValue::Node(n) => RuntimeValue::Bool(&n.label == label),
+                RuntimeValue::Node(n) => RuntimeValue::Bool(n.labels.contains(label)),
                 RuntimeValue::Null => RuntimeValue::Null,
                 _ => RuntimeValue::Bool(false),
             }),
@@ -1182,7 +1188,7 @@ mod tests {
         props.insert("name".into(), RuntimeValue::String("Ada".into()));
         let node = RuntimeValue::Node(Box::new(NodeValue {
             id: namidb_core::id::NodeId::new(),
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: props,
         }));
         let row = row_with(&[("a", node)]);
@@ -1488,7 +1494,7 @@ mod tests {
         let id = namidb_core::id::NodeId::new();
         let node = RuntimeValue::Node(Box::new(NodeValue {
             id,
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: BTreeMap::new(),
         }));
         let row = row_with(&[("a", node)]);
@@ -1506,7 +1512,7 @@ mod tests {
         props.insert("id".into(), RuntimeValue::String("external-42".into()));
         let node = RuntimeValue::Node(Box::new(NodeValue {
             id,
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: props,
         }));
         let row = row_with(&[("a", node)]);
@@ -1520,7 +1526,7 @@ mod tests {
         // fall back to the internal NodeId.
         let node = RuntimeValue::Node(Box::new(NodeValue {
             id: namidb_core::id::NodeId::new(),
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: BTreeMap::new(),
         }));
         let row = row_with(&[("a", node)]);
@@ -1532,7 +1538,7 @@ mod tests {
     fn label_eq_internal_function() {
         let node = RuntimeValue::Node(Box::new(NodeValue {
             id: namidb_core::id::NodeId::new(),
-            label: "Person".into(),
+            labels: std::iter::once("Person".to_string()).collect(),
             properties: BTreeMap::new(),
         }));
         let row = row_with(&[("a", node)]);

@@ -4,7 +4,7 @@
 //! needs lists, maps, nodes and relationships as first-class. See
 //! RFC-008 §"Tipo runtime: RuntimeValue".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use namidb_core::id::NodeId;
 use namidb_core::value::Value as CoreValue;
@@ -75,7 +75,11 @@ impl RuntimeValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeValue {
     pub id: NodeId,
-    pub label: String,
+    /// Full label set the node carries. A node may have zero or more labels;
+    /// `MATCH (n:A:B)` requires all listed labels to be present, `labels(n)`
+    /// returns the whole set, and the writer round-trips it via
+    /// `upsert_node_with_labels`.
+    pub labels: BTreeSet<String>,
     pub properties: BTreeMap<String, RuntimeValue>,
 }
 
@@ -89,13 +93,9 @@ pub struct RelValue {
 
 impl From<NodeView> for NodeValue {
     fn from(v: NodeView) -> Self {
-        // NodeValue is still single-label here; collapse the set to its
-        // representative (lowest) label. The NodeValue multi-label flip is a
-        // later step in the series.
-        let label = v.labels.into_iter().next().unwrap_or_default();
         NodeValue {
             id: v.id,
-            label,
+            labels: v.labels,
             properties: v
                 .properties
                 .into_iter()

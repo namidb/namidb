@@ -42,6 +42,8 @@ pub struct WriteOutcome {
     pub nodes_deleted: u64,
     pub edges_deleted: u64,
     pub properties_set: u64,
+    /// Labels added (`SET n:L`) or removed (`REMOVE n:L`).
+    pub labels_set: u64,
 }
 
 /// Execute `plan` against `writer`, staging its mutations into the
@@ -442,7 +444,7 @@ fn apply_create(
         match elem {
             CreateElement::Node {
                 alias,
-                label,
+                labels,
                 properties,
                 properties_spread,
             } => {
@@ -491,12 +493,12 @@ fn apply_create(
                     ..Default::default()
                 };
                 writer
-                    .upsert_node(label.clone(), id, &record)
+                    .upsert_node_with_labels(labels.iter().cloned(), id, &record)
                     .map_err(ExecError::Storage)?;
                 outcome.nodes_created += 1;
                 let node_value = NodeValue {
                     id,
-                    label: label.clone(),
+                    labels: labels.iter().cloned().collect(),
                     properties: runtime_props,
                 };
                 row.set(alias.clone(), RuntimeValue::Node(Box::new(node_value)));
@@ -609,8 +611,11 @@ fn apply_set(
                         schema_version: 1,
                         ..Default::default()
                     };
+                    // Preserve the full label set on a property update; the
+                    // node is keyed by id, so re-upserting with one label would
+                    // silently drop the others.
                     writer
-                        .upsert_node(n.label.clone(), n.id, &record)
+                        .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                         .map_err(ExecError::Storage)?;
                     n.properties.insert(key.clone(), new_val);
                     outcome.properties_set += 1;
@@ -651,12 +656,35 @@ fn apply_set(
                 target_alias
             )));
         }
-        SetOp::Labels { target_alias, .. } => {
-            return Err(ExecError::Runtime(format!(
-                "SET {}:Label lands (manifest schema labelset mutation)",
-                target_alias
-            )));
-        }
+        SetOp::Labels {
+            target_alias,
+            labels,
+        } => match row.get(target_alias).cloned() {
+            Some(RuntimeValue::Node(mut n)) => {
+                // Union the new labels into the node's set, then re-upsert
+                // (keyed by id) so the row carries the full set.
+                let added = labels
+                    .iter()
+                    .filter(|l| n.labels.insert((*l).clone()))
+                    .count();
+                let record = NodeWriteRecord {
+                    properties: node_runtime_props_to_core(&n.properties)?,
+                    schema_version: 1,
+                    ..Default::default()
+                };
+                writer
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
+                    .map_err(ExecError::Storage)?;
+                outcome.labels_set += added as u64;
+                row.set(target_alias.clone(), RuntimeValue::Node(n));
+            }
+            other => {
+                return Err(ExecError::Runtime(format!(
+                    "SET {}:Label target must be a Node, got {:?}",
+                    target_alias, other
+                )));
+            }
+        },
     }
     Ok(row)
 }
@@ -691,8 +719,10 @@ fn apply_remove(
                     schema_version: 1,
                     ..Default::default()
                 };
+                // Preserve the full label set on a property removal (node is
+                // keyed by id; a single-label upsert would drop the others).
                 writer
-                    .upsert_node(n.label.clone(), n.id, &record)
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                     .map_err(ExecError::Storage)?;
                 n.properties.remove(key);
                 outcome.properties_set += 1;
@@ -719,12 +749,32 @@ fn apply_remove(
                 )));
             }
         },
-        RemoveOp::Labels { target_alias, .. } => {
-            return Err(ExecError::Runtime(format!(
-                "REMOVE {}:Label lands",
-                target_alias
-            )));
-        }
+        RemoveOp::Labels {
+            target_alias,
+            labels,
+        } => match row.get(target_alias).cloned() {
+            Some(RuntimeValue::Node(mut n)) => {
+                // Set difference, then re-upsert (keyed by id). A node may end
+                // up with zero labels — Cypher permits unlabelled nodes.
+                let removed = labels.iter().filter(|l| n.labels.remove(*l)).count();
+                let record = NodeWriteRecord {
+                    properties: node_runtime_props_to_core(&n.properties)?,
+                    schema_version: 1,
+                    ..Default::default()
+                };
+                writer
+                    .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
+                    .map_err(ExecError::Storage)?;
+                outcome.labels_set += removed as u64;
+                row.set(target_alias.clone(), RuntimeValue::Node(n));
+            }
+            other => {
+                return Err(ExecError::Runtime(format!(
+                    "REMOVE {}:Label target must be a Node, got {:?}",
+                    target_alias, other
+                )));
+            }
+        },
     }
     Ok(row)
 }
@@ -746,8 +796,12 @@ async fn apply_delete(
                 if detach {
                     detach_incident_edges(n.id, writer, outcome).await?;
                 }
+                // Tombstone is keyed by id; the label arg is vestigial (a
+                // tombstone removes the node from every label scan). Pass any
+                // carried label for diagnostics.
+                let any_label = n.labels.iter().next().cloned().unwrap_or_default();
                 writer
-                    .tombstone_node(n.label.clone(), n.id)
+                    .tombstone_node(any_label, n.id)
                     .map_err(ExecError::Storage)?;
                 outcome.nodes_deleted += 1;
             }
@@ -864,11 +918,14 @@ async fn find_merge_matches(
         match el {
             CreateElement::Node {
                 alias,
-                label,
+                labels,
                 properties,
                 properties_spread: _,
             } => {
-                nodes.insert(alias.as_str(), (label.as_str(), properties.as_slice()));
+                // MERGE is single-label (the parser rejects multi-label MERGE),
+                // so the primary label is the one to scan/match on.
+                let label = labels.first().map(String::as_str).unwrap_or("");
+                nodes.insert(alias.as_str(), (label, properties.as_slice()));
             }
             CreateElement::Rel { .. } => rels.push(el),
         }
@@ -1258,7 +1315,7 @@ mod tests {
         assert_eq!(outcome.rows.len(), 1);
         match outcome.rows[0].get("a") {
             Some(RuntimeValue::Node(n)) => {
-                assert_eq!(n.label, "Person");
+                assert!(n.labels.contains("Person"));
                 match n.properties.get("name") {
                     Some(RuntimeValue::String(s)) => assert_eq!(s, "Ada"),
                     other => panic!("unexpected: {:?}", other),
@@ -1292,7 +1349,7 @@ mod tests {
         assert_eq!(outcome.nodes_created, 1);
         match outcome.rows[0].get("a") {
             Some(RuntimeValue::Node(n)) => {
-                assert_eq!(n.label, "Person");
+                assert!(n.labels.contains("Person"));
                 assert!(matches!(
                     n.properties.get("name"),
                     Some(RuntimeValue::String(s)) if s == "Ada"

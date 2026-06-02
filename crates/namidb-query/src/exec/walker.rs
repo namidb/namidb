@@ -1024,7 +1024,7 @@ async fn execute_expand(
                         } else if skip_target_materialize {
                             Some(NodeValue {
                                 id: target_id,
-                                label: target_label.unwrap_or_default().to_string(),
+                                labels: target_label.into_iter().map(|l| l.to_string()).collect(),
                                 properties: std::collections::BTreeMap::new(),
                             })
                         } else {
@@ -2485,7 +2485,7 @@ async fn execute_expand_factor(
                             name: target_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue {
                                 id: target_id,
-                                label: target_label.unwrap_or_default().to_string(),
+                                labels: target_label.into_iter().map(|l| l.to_string()).collect(),
                                 properties: std::collections::BTreeMap::new(),
                             })),
                         });

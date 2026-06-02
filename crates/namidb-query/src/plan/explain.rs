@@ -714,11 +714,14 @@ fn write_create_element(e: &CreateElement, out: &mut String) {
     match e {
         CreateElement::Node {
             alias,
-            label,
+            labels,
             properties,
             properties_spread,
         } => {
-            let _ = write!(out, "({}:{}", alias, label);
+            let _ = write!(out, "({}", alias);
+            for l in labels {
+                let _ = write!(out, ":{}", l);
+            }
             if !properties.is_empty() {
                 out.push_str(" {");
                 for (i, (k, v)) in properties.iter().enumerate() {
