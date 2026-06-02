@@ -1252,7 +1252,7 @@ fn extract_byte_array(
     }
 }
 
-fn min_scalar(a: StatScalar, b: StatScalar) -> StatScalar {
+pub(crate) fn min_scalar(a: StatScalar, b: StatScalar) -> StatScalar {
     if scalar_lt(&a, &b) {
         a
     } else {
@@ -1260,7 +1260,7 @@ fn min_scalar(a: StatScalar, b: StatScalar) -> StatScalar {
     }
 }
 
-fn max_scalar(a: StatScalar, b: StatScalar) -> StatScalar {
+pub(crate) fn max_scalar(a: StatScalar, b: StatScalar) -> StatScalar {
     if scalar_lt(&a, &b) {
         b
     } else {

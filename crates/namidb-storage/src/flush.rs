@@ -60,12 +60,15 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{DataType, EdgeTypeDef, LabelDef, PropertyDef, Schema, Value};
+use namidb_core::{
+    DataType, EdgeTypeDef, LabelDef, LabelDictionary, LabelId, PropertyDef, Schema, Value,
+};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::manifest::{
-    KindSpecificStats, LoadedManifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
+    KindSpecificStats, LoadedManifest, ManifestStore, PerLabelPropertyStat, SstDescriptor, SstKind,
+    SstLevel,
 };
 use crate::memtable::{FrozenMemtable, MemKey, MemOp};
 use crate::paths::NamespacePaths;
@@ -75,7 +78,11 @@ use crate::sst::edges::writer::{
     EdgeRecord as EdgeStreamRow, EdgeSstFinish, EdgeSstWriter, EdgeSstWriterOptions,
 };
 use crate::sst::edges::EdgeDirection;
-use crate::sst::nodes::{node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions};
+use crate::sst::hll::{Hll, DEFAULT_PRECISION};
+use crate::sst::nodes::{
+    max_scalar, min_scalar, node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions,
+};
+use crate::sst::stats::StatScalar;
 
 // ── Wire-level records ─────────────────────────────────────────────────
 
@@ -198,6 +205,8 @@ pub async fn flush(
             &index_props,
             &node_rows,
             finish,
+            &schema,
+            &base.manifest.label_dict,
         )?);
     }
     for (edge_type, rows) in edge_buckets {
@@ -591,6 +600,8 @@ fn prepare_node_pending(
     label_def: &LabelDef,
     rows: &[NodeRow],
     finish: NodeSstFinish,
+    schema: &Schema,
+    label_dict: &LabelDictionary,
 ) -> Result<PendingSst> {
     let id = Uuid::now_v7();
     let level = SstLevel::L0;
@@ -653,6 +664,7 @@ fn prepare_node_pending(
         unique_property_indices,
         equality_property_indices,
         label_index,
+        per_label_property_stats: compute_per_label_property_stats(rows, schema, label_dict)?,
     };
 
     Ok(PendingSst {
@@ -727,6 +739,124 @@ pub(crate) fn prepare_label_index_sidecar(
         per_label_counts,
     };
     Ok((Some(descriptor), Some((object_path, body))))
+}
+
+/// Compute per-(label, property) statistics for an id-primary node SST
+/// (RFC 025). Walks the reconciled rows, and for every label a row carries,
+/// folds each scalar property value into a `(LabelId, property)` accumulator:
+/// min/max, an HLL for ndv, and a non-null count. `null_count` is then the
+/// label's live-row count minus the non-null count (a property absent / null /
+/// non-scalar on a row carrying the label counts as null). Tombstones
+/// contribute nothing (only `MemOp::Upsert` rows are folded).
+pub(crate) fn compute_per_label_property_stats(
+    rows: &[NodeRow],
+    schema: &Schema,
+    label_dict: &LabelDictionary,
+) -> Result<Vec<PerLabelPropertyStat>> {
+    struct Acc {
+        min: Option<StatScalar>,
+        max: Option<StatScalar>,
+        hll: Hll,
+        non_null: u64,
+    }
+    let mut accs: BTreeMap<(u32, String), Acc> = BTreeMap::new();
+    let mut live_per_label: BTreeMap<u32, u64> = BTreeMap::new();
+
+    for row in rows {
+        let MemOp::Upsert(payload) = &row.op else {
+            continue;
+        };
+        let rec = NodeWriteRecord::decode(payload)?;
+        for &lid in &rec.labels {
+            *live_per_label.entry(lid).or_default() += 1;
+            for (name, value) in &rec.properties {
+                let Some(scalar) = value_to_stat_scalar(value) else {
+                    continue;
+                };
+                let acc = accs.entry((lid, name.clone())).or_insert_with(|| Acc {
+                    min: None,
+                    max: None,
+                    hll: Hll::new(DEFAULT_PRECISION),
+                    non_null: 0,
+                });
+                acc.non_null += 1;
+                acc.hll.add_scalar(&scalar);
+                acc.min = Some(match acc.min.take() {
+                    Some(prev) => min_scalar(prev, scalar.clone()),
+                    None => scalar.clone(),
+                });
+                acc.max = Some(match acc.max.take() {
+                    Some(prev) => max_scalar(prev, scalar),
+                    None => scalar,
+                });
+            }
+        }
+    }
+
+    // Seed declared-but-absent properties. A property declared on a label but
+    // null on every row of this SST yields no accumulator above, so it would
+    // emit no entry; the cost model's backfill (`non_null = node_count -
+    // null_count`) then leaves `null_count = 0` and the property reads as fully
+    // non-null. Seeding an empty accumulator for every declared property of a
+    // label present here makes its `null_count` resolve to `live` (all rows
+    // null), which is correct and additive across SSTs. Only labels present in
+    // this SST are seeded; their declared set comes from the schema, resolved
+    // through the label dictionary (an un-resolvable or undeclared label simply
+    // falls back to the observed-only behavior).
+    for &label_id in live_per_label.keys() {
+        let Some(name) = label_dict.name(LabelId(label_id)) else {
+            continue;
+        };
+        let Some(def) = schema.label(name) else {
+            continue;
+        };
+        for prop in &def.properties {
+            accs.entry((label_id, prop.name.clone()))
+                .or_insert_with(|| Acc {
+                    min: None,
+                    max: None,
+                    hll: Hll::new(DEFAULT_PRECISION),
+                    non_null: 0,
+                });
+        }
+    }
+
+    let mut out = Vec::with_capacity(accs.len());
+    for ((label_id, property), acc) in accs {
+        let live = live_per_label
+            .get(&label_id)
+            .copied()
+            .unwrap_or(acc.non_null);
+        out.push(PerLabelPropertyStat {
+            label_id,
+            property,
+            null_count: live.saturating_sub(acc.non_null),
+            min: acc.min,
+            max: acc.max,
+            ndv_estimate: if acc.hll.is_empty() {
+                None
+            } else {
+                Some(acc.hll.to_sketch_bytes())
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Map a core [`Value`] to the [`StatScalar`] the optimizer's min/max/ndv
+/// machinery understands. Returns `None` for non-scalar values (null, vector,
+/// list, map) which carry no useful per-column statistic.
+fn value_to_stat_scalar(v: &Value) -> Option<StatScalar> {
+    match v {
+        Value::Bool(b) => Some(StatScalar::Bool(*b)),
+        Value::I64(i) => Some(StatScalar::Int64(*i)),
+        Value::F64(f) => Some(StatScalar::Float64(*f)),
+        Value::Str(s) => Some(StatScalar::Utf8(s.clone())),
+        Value::Bytes(b) => Some(StatScalar::Binary(b.clone())),
+        Value::Date(d) => Some(StatScalar::Date32(*d)),
+        Value::DateTime(m) => Some(StatScalar::TimestampMicrosUtc(*m)),
+        Value::Null | Value::Vec(_) | Value::List(_) | Value::Map(_) => None,
+    }
 }
 
 /// Parallel outputs of [`prepare_unique_property_sidecars`]: the
@@ -935,6 +1065,7 @@ fn prepare_edge_pending(
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
         label_index: None,
+        per_label_property_stats: Vec::new(),
     };
 
     PendingSst {
@@ -1456,7 +1587,8 @@ pub mod builder {
         };
         let index_props = union_indexed_props(schema);
         let finish = super::build_node_sst(&column_label, &node_rows)?;
-        let pending = prepare_node_pending(paths, &index_props, &node_rows, finish)?;
+        let pending =
+            prepare_node_pending(paths, &index_props, &node_rows, finish, schema, &node_dict)?;
         Ok(Some(BuiltSst {
             inner: pending,
             label_dict: node_dict,

@@ -45,7 +45,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload}
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{LabelDef, Schema, Value};
+use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
@@ -151,6 +151,8 @@ pub async fn compact_l0_to_l1(
             &label_def,
             &merged_rows,
             finish,
+            schema,
+            &base.manifest.label_dict,
         )
         .await?;
         if wrote_bloom {
@@ -450,6 +452,10 @@ fn compact_edge_ssts(
 
 // ── PUT helpers (L1 variants) ───────────────────────────────────────────
 
+// `schema` + `label_dict` join the existing five to seed per-label property
+// stats for declared-but-absent properties during the L0->L1 rebuild; the
+// params are all distinct and bundling them would not aid readability.
+#[allow(clippy::too_many_arguments)]
 async fn put_node_sst_l1(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
@@ -457,6 +463,8 @@ async fn put_node_sst_l1(
     label_def: &LabelDef,
     merged_rows: &[NodeRow],
     finish: NodeSstFinish,
+    schema: &Schema,
+    label_dict: &LabelDictionary,
 ) -> Result<(SstDescriptor, bool)> {
     let id = Uuid::now_v7();
     let level = SstLevel(1);
@@ -551,6 +559,13 @@ async fn put_node_sst_l1(
         unique_property_indices,
         equality_property_indices,
         label_index,
+        // Recompute per-(label, property) stats from the merged rows so they
+        // survive L0->L1 the same way the label index does (RFC 025).
+        per_label_property_stats: crate::flush::compute_per_label_property_stats(
+            merged_rows,
+            schema,
+            label_dict,
+        )?,
     };
     Ok((descriptor, wrote_bloom))
 }
@@ -618,6 +633,7 @@ async fn put_edge_sst_l1(
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
         label_index: None,
+        per_label_property_stats: Vec::new(),
     };
     Ok((descriptor, wrote_bloom))
 }

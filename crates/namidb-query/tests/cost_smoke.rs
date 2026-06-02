@@ -105,6 +105,20 @@ fn person(first: &str, last: &str, age: i32) -> NodeWriteRecord {
     }
 }
 
+/// A `Person` that sets `firstName`/`lastName` but leaves the declared `age`
+/// property unset — used to exercise null accounting for a declared-but-absent
+/// property.
+fn person_no_age(first: &str, last: &str) -> NodeWriteRecord {
+    let mut p: BTreeMap<String, CoreValue> = BTreeMap::new();
+    p.insert("firstName".into(), CoreValue::Str(first.into()));
+    p.insert("lastName".into(), CoreValue::Str(last.into()));
+    NodeWriteRecord {
+        properties: p,
+        schema_version: 1,
+        ..Default::default()
+    }
+}
+
 fn message(content: &str, creation_date: i64) -> NodeWriteRecord {
     let mut p = BTreeMap::new();
     p.insert("content".into(), CoreValue::Str(content.into()));
@@ -370,6 +384,117 @@ async fn multi_label_match_estimate_reflects_intersection() {
 }
 
 #[tokio::test]
+async fn per_label_property_stats_attribute_per_label_and_survive_compaction() {
+    // RFC 025: a property on a multi-label node contributes to EVERY one of its
+    // labels' stats. Two flushes (two L0 SSTs) exercise the cross-SST merge,
+    // then compaction must preserve the merged stats.
+    let mut writer = WriterSession::open(store(), paths("rfc025-stats"))
+        .await
+        .unwrap();
+    // Flush 1: 2 plain Person (age 10, 20) + 1 Person+Admin (age 100).
+    writer
+        .upsert_node_with_labels(["Person".to_string()], NodeId::new(), &person("a", "x", 10))
+        .unwrap();
+    writer
+        .upsert_node_with_labels(["Person".to_string()], NodeId::new(), &person("b", "x", 20))
+        .unwrap();
+    writer
+        .upsert_node_with_labels(
+            ["Person".to_string(), "Admin".to_string()],
+            NodeId::new(),
+            &person("c", "x", 100),
+        )
+        .unwrap();
+    writer.flush(schema()).await.expect("flush 1");
+    // Flush 2: 1 plain Person (age 30) + 1 Person+Admin (age 200).
+    writer
+        .upsert_node_with_labels(["Person".to_string()], NodeId::new(), &person("d", "x", 30))
+        .unwrap();
+    writer
+        .upsert_node_with_labels(
+            ["Person".to_string(), "Admin".to_string()],
+            NodeId::new(),
+            &person("e", "x", 200),
+        )
+        .unwrap();
+    writer.flush(schema()).await.expect("flush 2");
+
+    let check = |cat: &StatsCatalog| {
+        // Person.age spans all 5 (10,20,100,30,200); Admin.age only the 2
+        // Person+Admin nodes (100, 200) — the multi-label nodes' age is folded
+        // into BOTH labels.
+        let person_age = &cat.label("Person").unwrap().properties["age"];
+        let admin_age = &cat.label("Admin").unwrap().properties["age"];
+        use namidb_storage::sst::stats::StatScalar::Int64;
+        assert_eq!(person_age.min, Some(Int64(10)), "Person.age min over all 5");
+        assert_eq!(person_age.max, Some(Int64(200)));
+        assert_eq!(person_age.non_null_count, 5);
+        assert_eq!(admin_age.min, Some(Int64(100)), "Admin.age min over the 2");
+        assert_eq!(admin_age.max, Some(Int64(200)));
+        assert_eq!(admin_age.non_null_count, 2);
+    };
+
+    // Across the two L0 SSTs (cross-SST merge).
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+
+    // ...and unchanged after L0->L1 compaction rebuilds the sidecar.
+    writer.compact_l0(&schema()).await.expect("compact");
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+}
+
+#[tokio::test]
+async fn declared_property_absent_in_an_sst_counts_as_null_not_present() {
+    // RFC 025 null accounting: a property DECLARED on a label but absent from
+    // every row of a given SST emits no observed accumulator, so without the
+    // schema-seeded null entry the cross-SST merge would leave `null_count = 0`
+    // and the backfill (`non_null = node_count - null_count`) would report the
+    // property as fully present. Here `age` is set in flush 1 and absent in
+    // flush 2; the catalog must report 3 non-null + 2 null, not 5 non-null.
+    let mut writer = WriterSession::open(store(), paths("rfc025-null-absent"))
+        .await
+        .unwrap();
+    // Flush 1: 3 Persons WITH age.
+    for (f, l, age) in [("a", "x", 10), ("b", "x", 20), ("c", "x", 30)] {
+        writer
+            .upsert_node("Person", NodeId::new(), &person(f, l, age))
+            .unwrap();
+    }
+    writer.flush(schema()).await.expect("flush 1");
+    // Flush 2: 2 Persons WITHOUT age (declared, but unset on every row here).
+    for (f, l) in [("d", "x"), ("e", "x")] {
+        writer
+            .upsert_node("Person", NodeId::new(), &person_no_age(f, l))
+            .unwrap();
+    }
+    writer.flush(schema()).await.expect("flush 2");
+
+    let check = |cat: &StatsCatalog| {
+        let person = cat.label("Person").unwrap();
+        assert_eq!(person.node_count, 5, "5 Persons total");
+        let age = &person.properties["age"];
+        assert_eq!(age.non_null_count, 3, "only flush-1 Persons set age");
+        assert_eq!(age.null_count, 2, "flush-2 Persons leave age null");
+        use namidb_storage::sst::stats::StatScalar::Int64;
+        assert_eq!(age.min, Some(Int64(10)));
+        assert_eq!(age.max, Some(Int64(30)));
+    };
+
+    // Cross-SST merge across the two L0 SSTs...
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+    // ...and unchanged after compaction rebuilds the merged sidecar.
+    writer.compact_l0(&schema()).await.expect("compact");
+    check(&StatsCatalog::from_manifest(
+        &writer.snapshot().manifest().manifest,
+    ));
+}
+
+#[tokio::test]
 async fn per_label_counts_survive_compaction() {
     // Compaction rebuilds the label-index sidecar (with per-label counts) on the
     // merged L1 SST. Without that, post-compaction `from_manifest` would read an
@@ -503,48 +628,46 @@ async fn property_stats_are_present_after_flush() {
     let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
 
     let p = cat.label("Person").unwrap();
-    // Each declared property is still present as a catalog entry (seeded from
-    // the schema), so the optimizer knows the column exists. Under the
-    // id-primary layout every property rides in a single `__overflow_json`
-    // column rather than a typed `prop_*` column, so the writer emits no
-    // per-column Parquet statistics: min/max/ndv come back `None` and the
-    // optimizer uses its documented fallbacks. Precise per-label column stats
-    // (min/max=25/40, firstName=Alice..Frank, real ndv) return with the
-    // typed-column layout (RFC-pending); this test guards the current contract.
+    // RFC 025: the per-(label, property) sidecar restores real min/max/null
+    // under id-primary. Properties live in `__overflow_json`, but flush walks
+    // the rows grouped by label and records the stats. Ages range 25..=40
+    // (Bob=25, Eve=40); firstName covers Alice..Frank lexicographically.
     assert!(p.properties.contains_key("age"), "age stats present");
     assert!(p.properties.contains_key("firstName"));
     assert!(p.properties.contains_key("lastName"));
     let age = &p.properties["age"];
-    assert!(
-        age.min.is_none() && age.max.is_none(),
-        "id-primary: no per-column min/max until the typed-column layout, got {:?}/{:?}",
-        age.min,
-        age.max
-    );
-    assert!(age.ndv.is_none(), "id-primary: no per-column ndv yet");
-    // No per-column null statistics either: null_count stays 0 and
-    // non_null_count backfills to the label's node_count (6 Persons).
-    assert_eq!(
-        age.null_count, 0,
-        "no per-column null stats under id-primary"
-    );
-    assert_eq!(age.non_null_count, 6, "non_null backfills to node_count");
+    match (&age.min, &age.max) {
+        (
+            Some(namidb_storage::sst::stats::StatScalar::Int64(mn)),
+            Some(namidb_storage::sst::stats::StatScalar::Int64(mx)),
+        ) => {
+            assert_eq!(*mn, 25, "Bob (25) is the youngest");
+            assert_eq!(*mx, 40, "Eve (40) is the oldest");
+        }
+        other => panic!("unexpected age stats: {:?}", other),
+    }
+    assert_eq!(age.null_count, 0, "no NULL ages in the fixture");
+    assert_eq!(age.non_null_count, 6, "6 Persons, all with an age");
 
     let first = &p.properties["firstName"];
-    assert!(
-        first.min.is_none() && first.max.is_none(),
-        "id-primary: no per-column min/max for firstName yet"
-    );
+    match (&first.min, &first.max) {
+        (
+            Some(namidb_storage::sst::stats::StatScalar::Utf8(mn)),
+            Some(namidb_storage::sst::stats::StatScalar::Utf8(mx)),
+        ) => {
+            assert_eq!(mn, "Alice");
+            assert_eq!(mx, "Frank");
+        }
+        other => panic!("unexpected firstName stats: {:?}", other),
+    }
 }
 
 #[tokio::test]
 async fn filter_estimate_uses_real_min_max_after_writer_fix() {
-    // Range selectivity with real min/max would use the precise formula
-    // (lit-min)/(max-min): ages min=25,max=40,lit=30 → 6 * 0.667 = 4.0.
-    // Under id-primary there are no per-column min/max (properties live in
-    // `__overflow_json`), so range selectivity falls back to the documented
-    // 0.33 constant → 6 * 0.33 ≈ 1.98. The precise estimate returns with the
-    // typed-column layout; results are unaffected either way.
+    // RFC 025 restores real min/max under id-primary, so range selectivity
+    // uses the precise formula (lit-min)/(max-min): ages min=25, max=40,
+    // lit=30 -> below=(30-25)/(40-25)=0.333; Gt -> 1-below=0.667 -> 6 * 0.667
+    // = 4.0 (vs the 6 * 0.33 = 1.98 fallback when min/max are unknown).
     let mut writer = WriterSession::open(store(), paths("stats06b"))
         .await
         .unwrap();
@@ -558,16 +681,11 @@ async fn filter_estimate_uses_real_min_max_after_writer_fix() {
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
 
     assert_eq!(rows.len(), 3, "Carol(35), Eve(40), Frank(33)");
-    // Fallback: 6 * 0.33 ≈ 1.98. The filter still drops the estimate below the
-    // 6-row scan cardinality, which is the property the optimizer relies on.
+    // Precise estimate ~4.0 (close to the actual 3); the fallback would be 1.98.
     assert!(
-        (card.rows - 2.0).abs() < 0.6,
-        "fallback range selectivity should give ~2 (6 * 0.33), got {}",
+        (card.rows - 4.0).abs() < 0.5,
+        "with real min/max the estimate {} should be ~4 (close to actual 3)",
         card.rows
-    );
-    assert!(
-        card.rows < 6.0,
-        "filter must still drop below scan cardinality"
     );
 }
 
@@ -1022,25 +1140,29 @@ async fn catalog_materializes_real_ndv_after_flush() {
     let cat = StatsCatalog::from_manifest(&snap.manifest().manifest);
 
     let person = cat.label("Person").expect("Person label");
-    // The HLL pipeline only runs over typed `prop_*` columns. Under id-primary
-    // every property rides in `__overflow_json`, so no sketch is emitted and
-    // `ndv` is `None` for every property; equality/IN selectivity falls back to
-    // the documented constants. Real per-column ndv (≈6 distinct firstNames in
-    // the Alice..Frank fixture) returns with the typed-column layout.
+    // RFC 025: the per-(label, property) sidecar feeds an HLL per (label, prop)
+    // at flush, so `ndv` is populated under id-primary. 6 distinct firstNames
+    // and 6 distinct ages in the fixture; HLL at the default precision rounds
+    // into [5, 8].
     let first = person
         .properties
         .get("firstName")
         .expect("firstName stats present");
+    let ndv = first
+        .ndv
+        .expect("ndv populated by the per-label HLL sidecar");
     assert!(
-        first.ndv.is_none(),
-        "id-primary: no per-column ndv until the typed-column layout, got {:?}",
-        first.ndv
+        (5..=8).contains(&ndv),
+        "firstName ndv {} not close to 6",
+        ndv
     );
 
     let age = person.properties.get("age").expect("age stats present");
+    let age_ndv = age.ndv.expect("age ndv populated");
     assert!(
-        age.ndv.is_none(),
-        "id-primary: no per-column ndv for age yet"
+        (5..=8).contains(&age_ndv),
+        "age ndv {} not close to 6",
+        age_ndv
     );
 }
 
@@ -1136,13 +1258,9 @@ async fn hash_join_executes_correctly() {
 async fn hash_join_estimate_matches_actual_within_micro_graph() {
     // HashJoin uses Selinger '79:
     //   rows = (|build| * |probe|) / max(ndv(build_key), ndv(probe_key))
-    // The join key here is the property `firstName`. With a real ndv ≈ 6 the
-    // divisor would tighten the estimate to ≈ 6 (the actual). Under id-primary
-    // `firstName` has no per-column ndv (it lives in `__overflow_json`), so the
-    // divisor falls back to 1 and the estimate is the cartesian upper bound
-    // |build| * |probe| = 36 — loose but still a valid over-estimate. The tight
-    // estimate returns with the typed-column layout. Either way execution is
-    // correct (each Person matches only itself; distinct names → 6 rows).
+    // The join key is the property `firstName`. RFC 025 restores its real ndv
+    // (~6) under id-primary, so the divisor tightens the estimate to ~6 (the
+    // actual), instead of the cartesian 36 it would be with no per-column ndv.
     let mut writer = WriterSession::open(store(), paths("s123-hj03"))
         .await
         .unwrap();
@@ -1157,14 +1275,13 @@ async fn hash_join_estimate_matches_actual_within_micro_graph() {
     let rows = execute(&optimized, &snap, &Params::new()).await.unwrap();
     let actual = rows.len() as f64;
     assert_eq!(actual, 6.0, "6 Persons, each joins only to itself");
-    // Cartesian fallback: 6 * 6 = 36, and it must remain a valid upper bound.
+    let err = (opt_est - actual).abs() / actual.max(1.0);
     assert!(
-        opt_est >= actual,
-        "estimate {opt_est} must not under-count actual {actual}"
-    );
-    assert!(
-        (opt_est - 36.0).abs() < 1.0,
-        "without per-column ndv the estimate is the cartesian bound 36, got {opt_est}"
+        err < 0.30,
+        "HashJoin estimate {} far from actual {} (rel err {})",
+        opt_est,
+        actual,
+        err
     );
 }
 

@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::fence::{Epoch, WriterFence};
 use crate::paths::NamespacePaths;
 use crate::sst::bloom::BloomDescriptor;
-use crate::sst::stats::{DegreeHistogram, PropertyColumnStats};
+use crate::sst::stats::{DegreeHistogram, HllSketchBytes, PropertyColumnStats, StatScalar};
 
 /// Top-level versioned manifest. Self-contained snapshot of every artefact
 /// that belongs to the namespace at this version.
@@ -233,6 +233,38 @@ pub struct SstDescriptor {
     // older manifests loading unchanged.
     #[serde(default)]
     pub label_index: Option<LabelIndexDescriptor>,
+
+    // Per-(label, property) statistics for id-primary node SSTs (RFC 025).
+    // Because one node SST spans many labels and every property rides in a
+    // single `__overflow_json` column, the per-column Parquet footer stats that
+    // `property_stats` used to carry no longer exist. These are computed at
+    // flush/compaction by grouping the SST's rows by their label set, and the
+    // cost model folds them into `(label, property)` PropStats. Empty for edge
+    // SSTs, for legacy typed-column SSTs (which still use `property_stats`), and
+    // for manifests written before this field existed (`serde(default)`).
+    #[serde(default)]
+    pub per_label_property_stats: Vec<PerLabelPropertyStat>,
+}
+
+/// One `(label, property)` statistics entry for an id-primary node SST
+/// (RFC 025). `label_id` resolves to a name via the manifest's `label_dict`,
+/// the same dictionary the label-index posting counts use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerLabelPropertyStat {
+    pub label_id: u32,
+    /// Logical property name (no `prop_` prefix).
+    pub property: String,
+    /// Rows carrying this label for which the property is absent / null /
+    /// non-scalar. The cost model derives `non_null_count` as
+    /// `node_count - null_count` after the merge.
+    pub null_count: u64,
+    pub min: Option<StatScalar>,
+    pub max: Option<StatScalar>,
+    /// Serialised HLL sketch of the non-null scalar values; merged across node
+    /// SSTs at read time into `PropStats::ndv`. `None` when no sketchable value
+    /// was observed.
+    #[serde(default)]
+    pub ndv_estimate: Option<HllSketchBytes>,
 }
 
 /// Side-car pointer for a single `(SST, unique property)` pair. The
@@ -1033,6 +1065,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         }
     }
 
@@ -1066,6 +1099,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            per_label_property_stats: Vec::new(),
         }
     }
 
