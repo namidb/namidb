@@ -1281,7 +1281,7 @@ pub mod builder {
     use bytes::Bytes;
     use object_store::path::Path;
 
-    use namidb_core::{Schema, Value};
+    use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
 
     use crate::error::Result;
     use crate::manifest::SstDescriptor;
@@ -1291,8 +1291,8 @@ pub mod builder {
     use crate::sst::edges::EdgeDirection;
 
     use super::{
-        build_edge_stream_rows, prepare_edge_pending, prepare_node_pending,
-        schema_label_or_synthetic, EdgeRow, EdgeWriteRecord, NodeRow, NodeWriteRecord, PendingSst,
+        build_edge_stream_rows, prepare_edge_pending, prepare_node_pending, union_indexed_props,
+        EdgeRow, EdgeWriteRecord, NodeRow, NodeWriteRecord, PendingSst,
     };
 
     /// One node to ingest. `id` is the ALREADY-MINTED 16-byte NodeId — the
@@ -1336,9 +1336,18 @@ pub mod builder {
     #[derive(Debug)]
     pub struct BuiltSst {
         inner: PendingSst,
+        /// Label names this SST's nodes carry (empty for edge SSTs). The
+        /// builder interned them into on-row `LabelId`s; `attach_ssts` re-interns
+        /// the names into the namespace dictionary so those ids resolve.
+        label_dict: LabelDictionary,
     }
 
     impl BuiltSst {
+        /// Label names carried by this SST's nodes (empty for edge SSTs).
+        pub(crate) fn label_names(&self) -> Vec<String> {
+            self.label_dict.iter().map(|(_, n)| n.to_string()).collect()
+        }
+
         /// Highest LSN carried by this SST (the `next_lsn` floor after attach).
         #[must_use]
         pub fn max_lsn(&self) -> u64 {
@@ -1409,7 +1418,10 @@ pub mod builder {
             return Ok(None);
         }
         let rows = dedup_keep_last_node(rows);
-        let label_def = schema_label_or_synthetic(schema, label);
+        // Intern the label so records carry its LabelId; the dict travels with
+        // the BuiltSst and `attach_ssts` installs it in the manifest.
+        let mut node_dict = LabelDictionary::new();
+        let lid = node_dict.intern(label).get();
         let node_rows: Vec<NodeRow> = rows
             .into_iter()
             .enumerate()
@@ -1421,7 +1433,7 @@ pub mod builder {
                         NodeWriteRecord {
                             properties: n.properties,
                             schema_version: 0,
-                            ..Default::default()
+                            labels: vec![lid],
                         }
                         .encode()?,
                     )
@@ -1434,9 +1446,19 @@ pub mod builder {
             })
             .collect::<Result<_>>()?;
 
-        let finish = super::build_node_sst(&label_def, &node_rows)?;
-        let pending = prepare_node_pending(paths, &label_def, &node_rows, finish)?;
-        Ok(Some(BuiltSst { inner: pending }))
+        // Build with the fixed empty-LabelDef layout (matching `flush()`), and
+        // harvest equality sidecars from the schema's indexed properties.
+        let column_label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        let index_props = union_indexed_props(schema);
+        let finish = super::build_node_sst(&column_label, &node_rows)?;
+        let pending = prepare_node_pending(paths, &index_props, &node_rows, finish)?;
+        Ok(Some(BuiltSst {
+            inner: pending,
+            label_dict: node_dict,
+        }))
     }
 
     /// Build BOTH the forward and inverse CSR SSTs for `edge_type`, owning the
@@ -1500,9 +1522,11 @@ pub mod builder {
         Ok(vec![
             BuiltSst {
                 inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Forward, fwd),
+                label_dict: LabelDictionary::new(),
             },
             BuiltSst {
                 inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Inverse, inv),
+                label_dict: LabelDictionary::new(),
             },
         ])
     }
@@ -1746,7 +1770,18 @@ mod tests {
             .paths()
             .sst_object(node_d.level.as_u32(), file_basename(&node_d.path));
         let body = store.get(&abs).await.unwrap().bytes().await.unwrap();
-        let reader = NodeSstReader::open(person_label(), body).unwrap();
+        // Id-primary node SSTs use the fixed layout (an empty `LabelDef`, no
+        // `prop_*` columns; every property rides in `__overflow_json`), so the
+        // reader must be opened with that same empty layout — mirroring the
+        // production read path's `label_def_for_node_sst` for an empty scope.
+        let reader = NodeSstReader::open(
+            LabelDef {
+                name: String::new(),
+                properties: Vec::new(),
+            },
+            body,
+        )
+        .unwrap();
         let batches = reader.scan().unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);

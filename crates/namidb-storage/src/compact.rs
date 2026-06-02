@@ -729,7 +729,9 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
-            ..Default::default()
+            // Single label "Person" -> LabelId(0) on a fresh dict, carried
+            // on-row so the id-primary read path resolves the node to "Person".
+            labels: vec![0],
         }
         .encode()
         .unwrap()
@@ -755,7 +757,10 @@ mod tests {
         let s = store();
         let p = paths("compact-nodes");
         let ms = ManifestStore::new(s.clone(), p.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person" through
+        // both flushes and the L0->L1 compaction (the dict is cloned forward).
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
 
         let alice = sorted_node_id(1);
@@ -866,7 +871,9 @@ mod tests {
         let s = store();
         let p = paths("compact-overlap");
         let ms = ManifestStore::new(s.clone(), p.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
 
         let alice = sorted_node_id(1);

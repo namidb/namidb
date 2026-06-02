@@ -1684,6 +1684,12 @@ mod tests {
         tomb.append_value(false);
         let mut lsn = UInt64Builder::with_capacity(1);
         lsn.append_value(1);
+        // `node_arrow_schema` now carries a `__labels` `List<UInt32>` column at
+        // slot index 3 (between `lsn` and the overflow JSON); emit an empty
+        // label list so the batch matches the schema's field count.
+        let mut labels =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::UInt32Builder::new());
+        labels.append(true);
         let mut overflow = StringBuilder::with_capacity(1, 0);
         overflow.append_null();
         let mut sv = UInt64Builder::with_capacity(1);
@@ -1692,6 +1698,7 @@ mod tests {
             Arc::new(nid.finish()),
             Arc::new(tomb.finish()),
             Arc::new(lsn.finish()),
+            Arc::new(labels.finish()),
             Arc::new(overflow.finish()),
             Arc::new(sv.finish()),
         ];

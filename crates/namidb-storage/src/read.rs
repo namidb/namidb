@@ -2893,7 +2893,25 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
-            ..Default::default()
+            // These tests use the single label "Person", which interns to
+            // LabelId(0) on a fresh dict. Carry it on-row so the id-primary
+            // read path resolves the node to "Person".
+            labels: vec![0],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// Like `node_payload` but carries an explicit interned `LabelId` on-row.
+    /// Used by the multi-label endpoint-inference tests where the two endpoint
+    /// nodes need distinct labels (e.g. "Person" -> 0, "Company" -> 1).
+    fn labeled_node_payload(name: &str, label_id: u32) -> Bytes {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        props.insert("name".into(), Value::Str(name.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            labels: vec![label_id],
         }
         .encode()
         .unwrap()
@@ -2913,7 +2931,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("read-flush");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
@@ -2971,7 +2991,8 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
-            ..Default::default()
+            // Single label "Person" -> LabelId(0) on a fresh dict.
+            labels: vec![0],
         }
         .encode()
         .unwrap()
@@ -3025,7 +3046,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("eqidx-all");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new()
             .label(indexed_city_label())
@@ -3075,7 +3098,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("eqidx-tomb");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new()
             .label(indexed_city_label())
@@ -3134,7 +3159,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("eqidx-changed");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new()
             .label(indexed_city_label())
@@ -3187,7 +3214,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("eqidx-compact");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new()
             .label(indexed_city_label())
@@ -3240,7 +3269,10 @@ mod tests {
         let store = make_store();
         let paths = make_paths("read-mt");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // No flush here: the snapshot reads the live memtable. Seed the dict so
+        // the record's on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
 
         let alice = sorted_node_id(2);
         let mut mt = Memtable::new();
@@ -3764,7 +3796,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("read-prune");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
@@ -3814,7 +3848,9 @@ mod tests {
         let store = make_store();
         let paths = make_paths("read-cache");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
@@ -4061,7 +4097,10 @@ mod tests {
         let store = make_store();
         let paths = make_paths("scan-nodes");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person" for both
+        // the flushed SST rows and the live-memtable rows.
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
         let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
@@ -4289,7 +4328,10 @@ mod tests {
         let paths = make_paths("read-recovery");
         let ms = ManifestStore::new(store.clone(), paths.clone());
         let wal_store = WalStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the recovered record's on-row LabelId(0) resolves to
+        // "Person". `next_version` clones the dict forward into `with_wal`.
+        base.manifest.label_dict.intern("Person");
         let fence = WriterFence::new(base.manifest.epoch);
 
         let alice = sorted_node_id(5);
@@ -4365,7 +4407,11 @@ mod tests {
         let store = make_store();
         let paths = make_paths("schema-endpoints-inferred");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Two distinct labels: "Person" -> LabelId(0), "Company" -> LabelId(1).
+        // Seed the dict so each record's on-row id resolves to its name.
+        base.manifest.label_dict.intern("Person");
+        base.manifest.label_dict.intern("Company");
 
         // Two nodes with distinct labels, one edge that ties them
         // together, no `SchemaBuilder` ever ran.
@@ -4380,7 +4426,7 @@ mod tests {
         mt.apply(
             MemKey::Node { id: company },
             2,
-            MemOp::Upsert(node_payload("Acme", None)),
+            MemOp::Upsert(labeled_node_payload("Acme", 1)),
         );
         mt.apply(
             MemKey::Edge {
@@ -4413,7 +4459,13 @@ mod tests {
         let store = make_store();
         let paths = make_paths("schema-endpoints-sst");
         let ms = ManifestStore::new(store.clone(), paths.clone());
-        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Two distinct labels: "Person" -> LabelId(0), "Company" -> LabelId(1).
+        // Seed the dict so each flushed SST row's on-row id resolves to its
+        // name (`next_version` clones the dict forward into the committed
+        // manifest).
+        base.manifest.label_dict.intern("Person");
+        base.manifest.label_dict.intern("Company");
         let fence = WriterFence::new(base.manifest.epoch);
 
         // Declare the node labels so the flush writes node SSTs, but leave
@@ -4440,7 +4492,7 @@ mod tests {
         mt.apply(
             MemKey::Node { id: company },
             2,
-            MemOp::Upsert(node_payload("Acme", None)),
+            MemOp::Upsert(labeled_node_payload("Acme", 1)),
         );
         mt.apply(
             MemKey::Edge {

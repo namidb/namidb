@@ -870,6 +870,13 @@ impl WriterSession {
         let mut bloom_count = 0usize;
         let mut attached_max_lsn = 0u64;
         for b in built {
+            // Install the SST's label names into the namespace dictionary so the
+            // on-row LabelIds (baked at build time) resolve. Fresh-namespace
+            // attach starts from an empty dict, so a single-label-per-SST batch
+            // keeps id 0 == that label, matching the baked `__labels`.
+            for name in b.label_names() {
+                self.label_dict.intern(&name);
+            }
             let (body_path, body, bloom, sidecars, descriptor) = b.into_parts();
             attached_max_lsn = attached_max_lsn.max(descriptor.max_lsn);
             let store_ref = store.clone();
