@@ -99,10 +99,13 @@ pub enum LogicalPlan {
         direction: RelationshipDirection,
         rel_alias: Option<String>,
         target_alias: String,
-        /// Label declared on the target node pattern, if any. The
-        /// executor uses it to issue `lookup_node(label, id)` directly
-        /// instead of probing every label in the schema.
-        target_label: Option<String>,
+        /// Labels declared on the target node pattern. Empty means no label
+        /// constraint; a non-empty set is CONJUNCTIVE — the matched neighbour
+        /// must carry every listed label (`(a)-[:R]->(b:A:B)`). The executor
+        /// uses the first as the `lookup_node` / CF scan hint and then confirms
+        /// the full set, which lets OPTIONAL MATCH preserve a NULL row when a
+        /// neighbour carries only some of the labels.
+        target_labels: Vec<String>,
         length: Option<RelationshipLength>,
         /// `true` for `OPTIONAL MATCH`: emit a row with `target=NULL`
         /// when no neighbour matches.

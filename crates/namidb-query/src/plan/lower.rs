@@ -598,7 +598,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -611,7 +611,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -950,21 +950,16 @@ fn lower_rel_node(
         ctx.introduce_or_reuse(&target_alias);
     }
 
-    // A multi-label relationship target needs a conjunctive label check on the
-    // matched node. For a non-OPTIONAL expand we emit that as post-expand
-    // `__label_eq` filters (below). OPTIONAL is different: the check must live
-    // *inside* the expand so a target carrying only some of the labels still
-    // yields a NULL row, but `Expand` only carries the primary label today
-    // (target_labels is a future change threaded through the WCOJ optimizer).
-    // Rather than silently match on the primary label alone, reject it.
-    if optional && target.labels.len() > 1 {
-        return Err(LowerError::new(
-            LowerErrorKind::UnsupportedFeature,
-            "OPTIONAL MATCH with a multi-label relationship target is not yet supported",
-            target.span,
-        ));
-    }
-    let target_label = target.labels.first().map(|l| l.name.clone());
+    // The target's full label set is carried on the Expand and enforced
+    // conjunctively inside the executor (the matched neighbour must carry every
+    // listed label). Putting the check inside the Expand is what lets OPTIONAL
+    // MATCH preserve a NULL row when a neighbour carries only some of the
+    // labels — a post-expand filter would instead drop the row.
+    let target_labels = target
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .collect::<Vec<_>>();
     let mut plan = LogicalPlan::Expand {
         input: Box::new(input),
         source,
@@ -972,28 +967,16 @@ fn lower_rel_node(
         direction: rel.direction,
         rel_alias,
         target_alias: target_alias.clone(),
-        target_label: target_label.clone(),
+        target_labels,
         length: rel.length,
         optional,
         back_reference: target_already_bound,
         shortest,
         path_binding: None,
     };
-    // OPTIONAL MATCH must preserve rows where the target is NULL. Label
-    // and property checks are issued via the executor's `target_label`
-    // hint and are folded into the Expand itself when optional.
+    // Property checks on the target still ride as post-expand filters for the
+    // non-OPTIONAL case (label checks are handled by the Expand above).
     if !optional {
-        // One label filter per target label: `(a)-[:R]->(b:A:B)` requires the
-        // target to carry every listed label. The optimizer folds the primary
-        // one into the Expand's `target_label` hint; any extras stay as
-        // post-expand `__label_eq` filters.
-        for l in target.labels.iter().map(|l| l.name.as_str()) {
-            let pred = build_label_eq(&target_alias, l, target.span);
-            plan = LogicalPlan::Filter {
-                input: Box::new(plan),
-                predicate: pred,
-            };
-        }
         match &target.properties {
             None => {}
             Some(PatternProperties::Literal(map)) => {

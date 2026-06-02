@@ -159,12 +159,12 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
         LogicalPlan::Expand {
             input,
             target_alias,
-            target_label,
+            target_labels,
             rel_alias: _,
             ..
         } => {
             collect_outer_labels(input, out);
-            out.insert(target_alias.clone(), target_label.clone());
+            out.insert(target_alias.clone(), target_labels.first().cloned());
         }
         _ => {
             for c in plan.children() {
@@ -258,7 +258,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -271,7 +271,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -343,7 +343,7 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -356,7 +356,7 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -534,7 +534,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: target.into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,

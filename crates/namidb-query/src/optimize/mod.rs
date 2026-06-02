@@ -678,7 +678,7 @@ mod tests {
             direction: crate::parser::RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: false,
             back_reference: false,

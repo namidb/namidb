@@ -58,7 +58,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -71,7 +71,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             direction,
             rel_alias,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             back_reference,
@@ -225,15 +225,19 @@ fn apply_filter_rules(input: LogicalPlan, predicate: Expression) -> LogicalPlan 
     ) {
         return input;
     }
-    // Rule 4: drop synthetic __label_eq when the child Expand declares the
-    // same target_label.
+    // Rule 4: drop a synthetic __label_eq when the child Expand already
+    // enforces that target label (the Expand checks its full label set
+    // internally, so the defensive filter is redundant).
     if let LogicalPlan::Expand {
         target_alias,
-        target_label: Some(label),
+        target_labels,
         ..
     } = &input
     {
-        if is_synthetic_label_eq(&predicate, target_alias, label) {
+        if target_labels
+            .iter()
+            .any(|label| is_synthetic_label_eq(&predicate, target_alias, label))
+        {
             return input;
         }
     }
@@ -407,7 +411,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,
@@ -446,7 +450,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,
@@ -485,7 +489,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: false,
             back_reference: false,
@@ -515,7 +519,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: None,
+            target_labels: vec![],
             length: None,
             optional: false,
             back_reference: false,
@@ -590,7 +594,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "b".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,

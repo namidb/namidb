@@ -172,7 +172,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             edge_type,
             direction,
             target_alias,
-            target_label,
+            target_labels,
             length,
             optional,
             rel_alias,
@@ -197,7 +197,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             bindings.insert(
                 target_alias.clone(),
                 BindingMeta {
-                    label: target_label.clone(),
+                    label: target_labels.first().cloned(),
                     ..Default::default()
                 },
             );
@@ -1050,7 +1050,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: Some("r".into()),
             target_alias: "q".into(),
-            target_label: Some("Person".into()),
+            target_labels: vec!["Person".into()],
             length: None,
             optional: false,
             back_reference: false,
@@ -1078,7 +1078,7 @@ mod tests {
             direction: RelationshipDirection::Right,
             rel_alias: None,
             target_alias: "q".into(),
-            target_label: None,
+            target_labels: vec![],
             length: Some(crate::parser::ast::RelationshipLength { min: 1, max: 10 }),
             optional: false,
             back_reference: false,
