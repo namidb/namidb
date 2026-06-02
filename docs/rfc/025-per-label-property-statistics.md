@@ -1,10 +1,10 @@
 # RFC 025: Per-label property statistics under id-primary
 
-**Status:** draft
+**Status:** accepted
 **Author(s):** Matías Fonseca <matias.fonseca@fonlescompany.com>
 **Created:** 2026-06-02
 **Updated:** 2026-06-02
-**Implements:** (pending)
+**Implements:** Phase 1 (per-label stats sidecar) in progress; Phase 2 (typed union columns) deferred to a follow-up RFC
 **Supersedes:** (none)
 
 ## Summary
