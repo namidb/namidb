@@ -13,7 +13,7 @@
 //! Acknowledgement to the client happens **after** the segment PUT returns
 //! success — at that point the records are durable.
 //!
-//! ## Binary format (v0)
+//! ## Binary format
 //!
 //! ```text
 //! Segment ::= Header Records+ Footer
@@ -23,8 +23,18 @@
 //! ```
 //!
 //! All integers are little-endian. CRC32 uses the IEEE polynomial via
-//! [`crc32fast`]. `version = 0` for now; bumping it is a breaking change
-//! and requires a new manifest schema field.
+//! [`crc32fast`].
+//!
+//! ### Versioning
+//!
+//! `version = 1` marks the multi-label era: the *framing* above is unchanged
+//! from v0, but record payloads now carry a node label set
+//! ([`NodeWriteRecord::labels`](crate::flush::NodeWriteRecord)). The header is
+//! self-describing, so decode reads every version up to the one this build
+//! writes (v0 segments still recover unchanged) and rejects only a *newer*
+//! version it cannot understand. The point of the bump is the other
+//! direction: an older binary will now refuse a v1 segment outright instead of
+//! silently dropping the labels field its JSON decoder doesn't know about.
 
 use std::sync::Arc;
 
@@ -38,7 +48,10 @@ use crate::paths::NamespacePaths;
 
 const MAGIC_HEADER: &[u8; 4] = b"TGWL";
 const MAGIC_FOOTER: &[u8; 4] = b"TGEL";
-const FORMAT_VERSION: u16 = 0;
+/// Version stamped into every segment this build writes (see module docs).
+/// v1 = multi-label era. The framing is identical across versions, so decode
+/// accepts anything `<= FORMAT_VERSION`.
+const FORMAT_VERSION: u16 = 1;
 
 /// A single WAL record. `lsn` is assigned by the writer monotonically and
 /// becomes the durable order of operations within a namespace.
@@ -156,10 +169,15 @@ impl WalSegment {
             });
         }
         let version = cursor.get_u16_le();
-        if version != FORMAT_VERSION {
+        // The framing is identical across versions and payloads are
+        // self-describing, so any version up to ours is readable; only a
+        // future, newer version is not.
+        if version > FORMAT_VERSION {
             return Err(Error::Corrupted {
                 path: format!("wal#{seq}"),
-                detail: format!("unsupported WAL format version {version}"),
+                detail: format!(
+                    "WAL format version {version} is newer than supported {FORMAT_VERSION}"
+                ),
             });
         }
         let _reserved = cursor.get_u16_le();
@@ -366,6 +384,43 @@ mod tests {
         let back = WalSegment::decode(7, bytes).unwrap();
         assert_eq!(back.seq, 7);
         assert_eq!(back.records, seg.records);
+    }
+
+    /// Patch the `version` field (u16 LE at offset 4) of an encoded segment
+    /// to `v`, fixing up the footer CRC so only the version differs.
+    fn reversion(seg: &WalSegment, v: u16) -> Bytes {
+        let mut bytes = seg.encode().to_vec();
+        bytes[4..6].copy_from_slice(&v.to_le_bytes());
+        let body_len = bytes.len() - 8; // header + records (footer is magic + crc)
+        let crc = crc32fast::hash(&bytes[..body_len]);
+        let len = bytes.len();
+        bytes[len - 4..].copy_from_slice(&crc.to_le_bytes());
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn decode_accepts_legacy_v0_segment() {
+        // A pre-multi-label (v0) WAL must still recover under the current build:
+        // bumping the write version may not break recovery of existing logs.
+        let mut seg = WalSegment::new(9);
+        seg.push(rec(1, "legacy"));
+        seg.push(rec(2, "single-label"));
+        let back = WalSegment::decode(9, reversion(&seg, 0)).unwrap();
+        assert_eq!(back.records, seg.records, "v0 WAL must still decode");
+    }
+
+    #[test]
+    fn decode_rejects_future_version() {
+        // A segment written by a newer build is not readable; fail loudly.
+        let mut seg = WalSegment::new(10);
+        seg.push(rec(1, "from the future"));
+        let err = WalSegment::decode(10, reversion(&seg, FORMAT_VERSION + 1)).unwrap_err();
+        match err {
+            Error::Corrupted { detail, .. } => {
+                assert!(detail.contains("newer"), "unexpected detail: {detail}")
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
     }
 
     #[test]
