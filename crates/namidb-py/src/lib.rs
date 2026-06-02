@@ -102,6 +102,31 @@ impl Client {
         Ok(())
     }
 
+    /// Stage a multi-label node upsert into the current batch. `labels` is the
+    /// full label set the node carries; the node is keyed by `id` alone, so a
+    /// later upsert with a different set replaces it (last-write-wins).
+    fn upsert_node_with_labels(
+        &self,
+        labels: Vec<String>,
+        id: &str,
+        properties: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        let id = parse_node_id(id)?;
+        let props = py_dict_to_value_map(properties)?;
+        let record = NodeWriteRecord {
+            properties: props,
+            schema_version: 0,
+            ..Default::default()
+        };
+        self.runtime.block_on(async {
+            let mut session = self.session.lock().await;
+            session
+                .upsert_node_with_labels(labels, id, &record)
+                .map_err(map_storage_err)
+        })?;
+        Ok(())
+    }
+
     /// Stage a node tombstone into the current batch.
     fn tombstone_node(&self, label: &str, id: &str) -> PyResult<()> {
         let id = parse_node_id(id)?;
@@ -1065,6 +1090,7 @@ fn build_node_views_table(
     let mut all_names: Vec<String> = vec![
         "id".to_string(),
         "label".to_string(),
+        "labels".to_string(),
         "lsn".to_string(),
         "schema_version".to_string(),
     ];
@@ -1076,11 +1102,23 @@ fn build_node_views_table(
     }
     arrays.append(pyarrow.call_method1("array", (ids,))?)?;
 
+    // `label` (representative, back-compat) and `labels` (full set as a
+    // list<string> column) sit side by side.
     let labels = PyList::empty_bound(py);
     for v in views {
         labels.append(v.labels.iter().next().map(String::as_str).unwrap_or(""))?;
     }
     arrays.append(pyarrow.call_method1("array", (labels,))?)?;
+
+    let label_lists = PyList::empty_bound(py);
+    for v in views {
+        let inner = PyList::empty_bound(py);
+        for l in &v.labels {
+            inner.append(l.as_str())?;
+        }
+        label_lists.append(inner)?;
+    }
+    arrays.append(pyarrow.call_method1("array", (label_lists,))?)?;
 
     let lsns = PyList::empty_bound(py);
     for v in views {
