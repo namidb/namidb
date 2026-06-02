@@ -34,7 +34,7 @@ futures = "0.3"
 
 # Filesystem watching (the `--watch` live-sync path; binary crates only)
 notify = "6"
-notify-debouncer-full = "0.3"
+notify-debouncer-full = "0.7"
 
 # Object storage (S3 / GCS / Azure / Local / Memory)
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
