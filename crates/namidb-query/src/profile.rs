@@ -188,6 +188,7 @@ mod tests {
                 &NodeWriteRecord {
                     properties: p,
                     schema_version: 1,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -246,6 +247,7 @@ mod tests {
                     &NodeWriteRecord {
                         properties: p,
                         schema_version: 1,
+                        ..Default::default()
                     },
                 )
                 .unwrap();

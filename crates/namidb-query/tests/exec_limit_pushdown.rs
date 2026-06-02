@@ -34,6 +34,7 @@ fn node_with(prop: &str, v: i64) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        ..Default::default()
     }
 }
 

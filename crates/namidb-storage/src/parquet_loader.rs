@@ -196,6 +196,7 @@ fn ingest_batch(
         let record = NodeWriteRecord {
             properties,
             schema_version: 1,
+            ..Default::default()
         };
         writer.upsert_node(label, id, &record)?;
         outcome.rows_loaded += 1;

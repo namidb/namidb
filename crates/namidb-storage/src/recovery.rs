@@ -365,10 +365,7 @@ mod tests {
     #[test]
     fn wal_entry_round_trip_upsert() {
         let entry = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: nid(1),
-            },
+            key: MemKey::Node { id: nid(1) },
             op: WalOp::Upsert(b"payload-bytes".to_vec()),
             lsn: 7,
         };
@@ -395,10 +392,7 @@ mod tests {
 
     #[test]
     fn from_apply_converts_memop() {
-        let key = MemKey::Node {
-            label: "Person".into(),
-            id: nid(3),
-        };
+        let key = MemKey::Node { id: nid(3) };
         let upsert = MemOp::Upsert(Bytes::from_static(b"x"));
         let entry = WalEntry::from_apply(key.clone(), 5, &upsert);
         match entry.op {
@@ -436,26 +430,17 @@ mod tests {
         let bob_id = nid(2);
 
         let e1 = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: alice_id,
-            },
+            key: MemKey::Node { id: alice_id },
             op: WalOp::Upsert(b"alice-v1".to_vec()),
             lsn: 10,
         };
         let e2 = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: bob_id,
-            },
+            key: MemKey::Node { id: bob_id },
             op: WalOp::Upsert(b"bob-v1".to_vec()),
             lsn: 11,
         };
         let e3 = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: alice_id,
-            },
+            key: MemKey::Node { id: alice_id },
             op: WalOp::Tombstone,
             lsn: 12,
         };
@@ -481,19 +466,13 @@ mod tests {
         assert_eq!(out.memtable.len(), 2);
 
         // Alice's last op was the tombstone.
-        let alice_key = MemKey::Node {
-            label: "Person".into(),
-            id: alice_id,
-        };
+        let alice_key = MemKey::Node { id: alice_id };
         let alice = out.memtable.get(&alice_key).unwrap();
         assert_eq!(alice.lsn, 12);
         assert_eq!(alice.op, MemOp::Tombstone);
 
         // Bob is still an upsert.
-        let bob_key = MemKey::Node {
-            label: "Person".into(),
-            id: bob_id,
-        };
+        let bob_key = MemKey::Node { id: bob_id };
         let bob = out.memtable.get(&bob_key).unwrap();
         assert_eq!(bob.lsn, 11);
         match &bob.op {
@@ -515,10 +494,7 @@ mod tests {
         // not strictly increasing with seq to prove we trust seq order
         // and the Memtable's "last write wins" semantics, not a sort
         // by LSN.)
-        let key = MemKey::Node {
-            label: "Person".into(),
-            id: nid(7),
-        };
+        let key = MemKey::Node { id: nid(7) };
 
         let mut seg_first = WalSegment::new(1);
         seg_first.push(WalRecord {
@@ -579,10 +555,7 @@ mod tests {
         seg.push(WalRecord {
             lsn: 1,
             payload: WalEntry {
-                key: MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(9),
-                },
+                key: MemKey::Node { id: nid(9) },
                 op: WalOp::Upsert(b"x".to_vec()),
                 lsn: 999,
             }
@@ -621,10 +594,7 @@ mod tests {
         seg.push(WalRecord {
             lsn: 10,
             payload: WalEntry {
-                key: MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(1),
-                },
+                key: MemKey::Node { id: nid(1) },
                 op: WalOp::Upsert(b"x".to_vec()),
                 lsn: 10,
             }
@@ -660,10 +630,7 @@ mod tests {
         seg.push(WalRecord {
             lsn: 100,
             payload: WalEntry {
-                key: MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(1),
-                },
+                key: MemKey::Node { id: nid(1) },
                 op: WalOp::Tombstone,
                 lsn: 100,
             }
@@ -706,10 +673,7 @@ mod tests {
         let snap = MemtableSnapshotFile::from_iter(
             10,
             vec![(
-                MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(1),
-                },
+                MemKey::Node { id: nid(1) },
                 1,
                 MemOp::Upsert(Bytes::from_static(b"ada-v1")),
             )],
@@ -719,10 +683,7 @@ mod tests {
             .unwrap();
 
         let new_record = WalEntry {
-            key: MemKey::Node {
-                label: "Person".into(),
-                id: nid(2),
-            },
+            key: MemKey::Node { id: nid(2) },
             op: WalOp::Upsert(b"bob-v1".to_vec()),
             lsn: 11,
         }
@@ -732,10 +693,7 @@ mod tests {
         seg0.push(WalRecord {
             lsn: 1,
             payload: WalEntry {
-                key: MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(1),
-                },
+                key: MemKey::Node { id: nid(1) },
                 op: WalOp::Upsert(b"ada-v1".to_vec()),
                 lsn: 1,
             }
@@ -786,10 +744,7 @@ mod tests {
         seg.push(WalRecord {
             lsn: 1,
             payload: WalEntry {
-                key: MemKey::Node {
-                    label: "Person".into(),
-                    id: nid(1),
-                },
+                key: MemKey::Node { id: nid(1) },
                 op: WalOp::Upsert(b"ada-v1".to_vec()),
                 lsn: 1,
             }

@@ -67,6 +67,11 @@ pub const COL_LSN: &str = "lsn";
 pub const OVERFLOW_JSON: &str = "__overflow_json";
 /// Always-present column carrying the schema version this row was written under.
 pub const SCHEMA_VERSION: &str = "__schema_version";
+/// Always-present column carrying the node's label set as a `List<UInt32>` of
+/// [`LabelId`](namidb_core::LabelId) values (multi-label nodes). Legacy
+/// single-label SSTs predate this column; [`NodeSstReader::open`] tolerates its
+/// absence and the read path then derives the label set from the SST scope.
+pub const COL_LABELS: &str = "__labels";
 
 /// Tuning knobs for `NodeSstWriter`.
 #[derive(Debug, Clone)]
@@ -95,8 +100,13 @@ impl Default for NodeSstWriterOptions {
 }
 
 /// Build the canonical Arrow schema for a node label.
+///
+/// Column order: `node_id, tombstone, lsn, __labels, prop_*, __overflow_json,
+/// __schema_version`. Production node SSTs are built with an empty `LabelDef`
+/// (no `prop_*` columns; every property rides in `__overflow_json`), but the
+/// schema stays parameterised so the writer/reader remain general.
 pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
-    let mut fields = Vec::with_capacity(label.properties.len() + 5);
+    let mut fields = Vec::with_capacity(label.properties.len() + 6);
     fields.push(Field::new(
         COL_NODE_ID,
         ArrowDataType::FixedSizeBinary(16),
@@ -104,6 +114,13 @@ pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
     ));
     fields.push(Field::new(COL_TOMBSTONE, ArrowDataType::Boolean, false));
     fields.push(Field::new(COL_LSN, ArrowDataType::UInt64, false));
+    fields.push(Field::new(
+        COL_LABELS,
+        // `item` nullable matches what `ListBuilder<UInt32Builder>` emits, so
+        // the built RecordBatch's column type equals this field exactly.
+        ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::UInt32, true))),
+        false,
+    ));
     for p in &label.properties {
         fields.push(prop_field(p));
     }
@@ -509,18 +526,28 @@ impl NodeSstReader {
         // caller requested. When `projection.is_none()` we skip the mask
         // and Parquet reads every leaf.
         let projection_mask = projection.map(|cols| {
-            let mut leaves: Vec<usize> = Vec::with_capacity(cols.len() + 5);
+            let mut leaves: Vec<usize> = Vec::with_capacity(cols.len() + 6);
+            // Match on the leaf column's top-level path component, not its leaf
+            // name: `__labels` is a `List<UInt32>` whose Parquet leaf is named
+            // `element` (path `__labels.list.element`), so a `c.name()` match
+            // would silently miss it — and eliding `__labels` makes
+            // `decode_node_labels` fall back to the (now empty) scope and drop
+            // every row at the label filter under the id-primary layout.
+            let root_of = |c: &parquet::schema::types::ColumnDescriptor| -> Option<String> {
+                c.path().parts().first().cloned()
+            };
             for engine in [
                 COL_NODE_ID,
                 COL_TOMBSTONE,
                 COL_LSN,
                 SCHEMA_VERSION,
                 OVERFLOW_JSON,
+                COL_LABELS,
             ] {
                 if let Some(idx) = schema_descr
                     .columns()
                     .iter()
-                    .position(|c| c.name() == engine)
+                    .position(|c| root_of(c).as_deref() == Some(engine))
                 {
                     leaves.push(idx);
                 }
@@ -1312,6 +1339,8 @@ mod tests {
         let mut nid = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
         let mut tomb = BooleanBuilder::with_capacity(rows.len());
         let mut lsn = UInt64Builder::with_capacity(rows.len());
+        let mut labels =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::UInt32Builder::new());
         let mut prop_name = StringBuilder::with_capacity(rows.len(), 32);
         let mut prop_age = arrow_array::builder::Int32Builder::with_capacity(rows.len());
         let mut overflow = StringBuilder::with_capacity(rows.len(), 32);
@@ -1323,6 +1352,7 @@ mod tests {
             nid.append_value(id).unwrap();
             tomb.append_value(*t);
             lsn.append_value(*l);
+            labels.append(true); // empty __labels list for these property tests
             match name_opt {
                 Some(n) => prop_name.append_value(n),
                 None => prop_name.append_null(),
@@ -1342,6 +1372,7 @@ mod tests {
             Arc::new(nid.finish()),
             Arc::new(tomb.finish()),
             Arc::new(lsn.finish()),
+            Arc::new(labels.finish()),
             Arc::new(prop_name.finish()),
             Arc::new(prop_age.finish()),
             Arc::new(overflow.finish()),
@@ -1663,6 +1694,12 @@ mod tests {
         tomb.append_value(false);
         let mut lsn = UInt64Builder::with_capacity(1);
         lsn.append_value(1);
+        // `node_arrow_schema` now carries a `__labels` `List<UInt32>` column at
+        // slot index 3 (between `lsn` and the overflow JSON); emit an empty
+        // label list so the batch matches the schema's field count.
+        let mut labels =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::UInt32Builder::new());
+        labels.append(true);
         let mut overflow = StringBuilder::with_capacity(1, 0);
         overflow.append_null();
         let mut sv = UInt64Builder::with_capacity(1);
@@ -1671,6 +1708,7 @@ mod tests {
             Arc::new(nid.finish()),
             Arc::new(tomb.finish()),
             Arc::new(lsn.finish()),
+            Arc::new(labels.finish()),
             Arc::new(overflow.finish()),
             Arc::new(sv.finish()),
         ];
@@ -1873,6 +1911,13 @@ mod tests {
         assert!(batch.column_by_name(COL_LSN).is_some());
         assert!(batch.column_by_name(SCHEMA_VERSION).is_some());
         assert!(batch.column_by_name(OVERFLOW_JSON).is_some());
+        // `__labels` must survive projection: it is the id-primary source of
+        // truth for a row's label set, and dropping it makes label scans return
+        // nothing (its Parquet leaf is nested, so the mask matches on path root).
+        assert!(
+            batch.column_by_name(COL_LABELS).is_some(),
+            "__labels must always be kept in a projected scan"
+        );
         assert!(batch.column_by_name("prop_age").is_some());
         assert!(
             batch.column_by_name("prop_name").is_none(),

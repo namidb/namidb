@@ -435,6 +435,7 @@ async fn load_graph_inner(
         let record = NodeWriteRecord {
             properties: note.properties.clone(),
             schema_version: 1,
+            ..Default::default()
         };
         writer.upsert_node(opts.label.clone(), note.id, &record)?;
         outcome.notes_loaded += 1;
@@ -453,6 +454,7 @@ async fn load_graph_inner(
         let record = NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         };
         writer.upsert_node(opts.label.clone(), *id, &record)?;
         outcome.placeholders_created += 1;
@@ -488,6 +490,7 @@ async fn load_graph_inner(
         let record = NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         };
         writer.upsert_node(TAG_LABEL, *tag_id, &record)?;
         outcome.tags_loaded += 1;

@@ -47,8 +47,8 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, FixedSizeListBuilder,
-    Float32Builder, Float64Builder, Int32Builder, Int64Builder, LargeStringBuilder, StringBuilder,
-    TimestampMicrosecondBuilder, UInt64Builder,
+    Float32Builder, Float64Builder, Int32Builder, Int64Builder, LargeStringBuilder, ListBuilder,
+    StringBuilder, TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
@@ -87,6 +87,13 @@ pub struct NodeWriteRecord {
     pub properties: BTreeMap<String, Value>,
     #[serde(default)]
     pub schema_version: u64,
+    /// The node's label set as interned [`LabelId`](namidb_core::LabelId)
+    /// values, sorted and deduped. Carried in the value (not the key) so the
+    /// id-primary memtable/SST keep one row per id regardless of label count.
+    /// Empty for older payloads (`serde(default)`); the read path then falls
+    /// back to the SST scope for legacy single-label data.
+    #[serde(default)]
+    pub labels: Vec<u32>,
 }
 
 impl NodeWriteRecord {
@@ -160,7 +167,7 @@ pub async fn flush(
         });
     }
 
-    let (node_buckets, edge_buckets) = bucket_by_scope(frozen);
+    let (node_rows, edge_buckets) = bucket_nodes_and_edges(frozen);
 
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths();
@@ -170,11 +177,27 @@ pub async fn flush(
     // threads here; this is the same work as before, just decoupled
     // from the I/O.
     let mut pendings: Vec<PendingSst> = Vec::new();
-    for (label, rows) in node_buckets {
-        let label_def = schema_label_or_synthetic(&schema, &label);
-        let finish = build_node_sst(&label_def, &rows)?;
+    // Nodes: one identity-partitioned SST spanning every label, built with an
+    // empty LabelDef (fixed layout — no prop_* columns; every property rides in
+    // __overflow_json), plus a label->node-ids sidecar so `scan_label` resolves
+    // without per-label partitions.
+    if !node_rows.is_empty() {
+        // Columns: fixed layout, built from an empty LabelDef (no prop_*
+        // columns; every property rides in __overflow_json).
+        let column_label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        // Equality-index sidecars are harvested from the record values keyed by
+        // the schema's `indexed` properties, so the secondary index (the
+        // non-unique equality index) survives the id-primary move.
+        let index_props = union_indexed_props(&schema);
+        let finish = build_node_sst(&column_label, &node_rows)?;
         pendings.push(prepare_node_pending(
-            paths, &label, &label_def, &rows, finish,
+            paths,
+            &index_props,
+            &node_rows,
+            finish,
         )?);
     }
     for (edge_type, rows) in edge_buckets {
@@ -305,21 +328,20 @@ pub(crate) struct EdgeRow {
     pub(crate) op: MemOp,
 }
 
-/// Convert the frozen memtable into ordered, per-scope buckets. Memtable
-/// iteration order (BTreeMap) guarantees the rows in each bucket are
-/// already sorted by `node_id` (nodes) or `(src, dst)` (edges).
-fn bucket_by_scope(
+/// Convert the frozen memtable into ordered buckets. Nodes are id-primary, so
+/// they collapse into ONE bucket spanning every label (a node's label set
+/// rides in its value); memtable order (BTreeMap, nodes sort before edges and
+/// by id within nodes) keeps that bucket node_id-ascending for free. Edges
+/// still bucket by type, already sorted by `(src, dst)`.
+fn bucket_nodes_and_edges(
     frozen: &FrozenMemtable,
-) -> (
-    BTreeMap<String, Vec<NodeRow>>,
-    BTreeMap<String, Vec<EdgeRow>>,
-) {
-    let mut nodes: BTreeMap<String, Vec<NodeRow>> = BTreeMap::new();
+) -> (Vec<NodeRow>, BTreeMap<String, Vec<EdgeRow>>) {
+    let mut nodes: Vec<NodeRow> = Vec::new();
     let mut edges: BTreeMap<String, Vec<EdgeRow>> = BTreeMap::new();
     for (k, e) in frozen.iter() {
         match k {
-            MemKey::Node { label, id } => {
-                nodes.entry(label.clone()).or_default().push(NodeRow {
+            MemKey::Node { id } => {
+                nodes.push(NodeRow {
                     id: *id.as_bytes(),
                     lsn: e.lsn,
                     op: e.op.clone(),
@@ -342,15 +364,31 @@ fn bucket_by_scope(
     (nodes, edges)
 }
 
-/// Lookup the [`LabelDef`] in the schema, or fall back to a synthetic
-/// empty-property label so untyped writes still flow through the path.
-/// Declared properties always win at the SST level; anything else lands in
-/// `__overflow_json` (see RFC-002 §2.1).
-fn schema_label_or_synthetic(schema: &Schema, label: &str) -> LabelDef {
-    schema.label(label).cloned().unwrap_or_else(|| LabelDef {
-        name: label.to_string(),
-        properties: Vec::new(),
-    })
+/// Union of every `indexed` property across all schema labels, as a synthetic
+/// `LabelDef` used ONLY to harvest a node SST's equality-index sidecars (the
+/// columns themselves are built from an empty `LabelDef`). The equality index
+/// is rebuilt from the record values, so it survives the id-primary move.
+///
+/// `unique` is intentionally cleared: a single-value unique sidecar cannot
+/// represent per-label uniqueness across a multi-label SST, so unique-property
+/// lookups fall back to a (correct) scan rather than risk a false negative.
+fn union_indexed_props(schema: &Schema) -> LabelDef {
+    let mut by_name: BTreeMap<String, PropertyDef> = BTreeMap::new();
+    for label in schema.labels.values() {
+        for p in &label.properties {
+            if p.indexed {
+                by_name.entry(p.name.clone()).or_insert_with(|| {
+                    let mut p = p.clone();
+                    p.unique = false;
+                    p
+                });
+            }
+        }
+    }
+    LabelDef {
+        name: String::new(),
+        properties: by_name.into_values().collect(),
+    }
 }
 
 // ── Node SST building ──────────────────────────────────────────────────
@@ -379,6 +417,7 @@ fn build_node_record_batch(
     let mut node_id_b = FixedSizeBinaryBuilder::with_capacity(n, 16);
     let mut tomb_b = BooleanBuilder::with_capacity(n);
     let mut lsn_b = UInt64Builder::with_capacity(n);
+    let mut labels_b = ListBuilder::new(UInt32Builder::new());
     let mut prop_builders: Vec<PropertyBuilder> = label
         .properties
         .iter()
@@ -398,6 +437,10 @@ fn build_node_record_batch(
                 let rec = NodeWriteRecord::decode(bytes)?;
                 tomb_b.append_value(false);
                 lsn_b.append_value(row.lsn);
+                for &lid in &rec.labels {
+                    labels_b.values().append_value(lid);
+                }
+                labels_b.append(true);
 
                 for (idx, p) in label.properties.iter().enumerate() {
                     let value = rec.properties.get(&p.name);
@@ -420,6 +463,7 @@ fn build_node_record_batch(
             MemOp::Tombstone => {
                 tomb_b.append_value(true);
                 lsn_b.append_value(row.lsn);
+                labels_b.append(true); // empty label list on a tombstone row
                 for b in &mut prop_builders {
                     b.append_null();
                 }
@@ -433,6 +477,7 @@ fn build_node_record_batch(
     columns.push(Arc::new(node_id_b.finish()));
     columns.push(Arc::new(tomb_b.finish()));
     columns.push(Arc::new(lsn_b.finish()));
+    columns.push(Arc::new(labels_b.finish()));
     for b in &mut prop_builders {
         columns.push(b.finish());
     }
@@ -543,7 +588,6 @@ pub(crate) fn build_edge_sst(
 
 fn prepare_node_pending(
     paths: &NamespacePaths,
-    label: &str,
     label_def: &LabelDef,
     rows: &[NodeRow],
     finish: NodeSstFinish,
@@ -551,10 +595,9 @@ fn prepare_node_pending(
     let id = Uuid::now_v7();
     let level = SstLevel::L0;
     let file_name = format!(
-        "{}-{}-{}.parquet",
+        "{}-{}.parquet",
         uuid_path_id(&id),
-        SstKind::Nodes.path_tag(),
-        label
+        SstKind::Nodes.path_tag()
     );
     let body_path = paths.sst_object(level.as_u32(), &file_name);
     let relative_path = relative_sst_path(level.as_u32(), &file_name);
@@ -565,29 +608,32 @@ fn prepare_node_pending(
         level.as_u32(),
         &id,
         SstKind::Nodes.path_tag(),
-        label,
+        "",
         finish.bloom,
     );
 
-    // Per-property unique sidecars (RFC-pending): for each declared
-    // `unique` property emit a `value_string → NodeId` map serialised to
-    // bincode. The reader probes these instead of full-scanning the SST
-    // to resolve `MATCH (a:Label {prop: 'X'})`.
+    // Node SSTs are no longer partitioned by label and are built with an empty
+    // LabelDef, so the declared-property sidecars harvest nothing; the calls
+    // stay wired for symmetry and a future typed-column layout.
     let (unique_property_indices, mut index_sidecars) =
-        prepare_unique_property_sidecars(paths, level.as_u32(), &id, label, label_def, rows)?;
-    // Per-property equality sidecars (RFC-pending): for each declared
-    // `indexed` (non-unique) property emit a `value_string → [NodeId, ...]`
-    // posting map. The reader unions these across SSTs and confirms each
-    // candidate against the node's current value.
+        prepare_unique_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
     let (equality_property_indices, equality_sidecars) =
-        prepare_equality_property_sidecars(paths, level.as_u32(), &id, label, label_def, rows)?;
+        prepare_equality_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
     index_sidecars.extend(equality_sidecars);
+
+    // The label index (`LabelId -> [NodeId, ...]`) replaces "the SST partition
+    // IS the label index" now that one node SST spans every label.
+    let (label_index, label_sidecar) =
+        prepare_label_index_sidecar(paths, level.as_u32(), &id, rows)?;
+    if let Some(sidecar) = label_sidecar {
+        index_sidecars.push(sidecar);
+    }
 
     let stats = finish.stats;
     let descriptor = SstDescriptor {
         id,
         kind: SstKind::Nodes,
-        scope: label.to_string(),
+        scope: String::new(),
         level,
         path: relative_path,
         size_bytes: body_len,
@@ -606,7 +652,7 @@ fn prepare_node_pending(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
-        label_index: None,
+        label_index,
     };
 
     Ok(PendingSst {
@@ -617,6 +663,70 @@ fn prepare_node_pending(
         bloom_body,
         index_sidecars,
     })
+}
+
+/// Build the per-SST label index sidecar: `LabelId -> [NodeId, ...]` posting
+/// lists, bincode-serialised, mirroring the equality-index sidecar. Walks
+/// `rows` (already id-ascending) decoding each upsert's label set, so the
+/// posting lists come out id-sorted; tombstones contribute nothing
+/// (last-LSN-wins at read time handles removal). Returns `(None, None)` when no
+/// live labelled node is present.
+/// Output of [`prepare_label_index_sidecar`]: the manifest descriptor plus the
+/// `(path, body)` to PUT next to the SST. Aliased to keep clippy's
+/// type-complexity lint happy, mirroring the unique/equality sidecar aliases.
+type LabelIndexSidecar = (
+    Option<crate::manifest::LabelIndexDescriptor>,
+    Option<(Path, Bytes)>,
+);
+
+pub(crate) fn prepare_label_index_sidecar(
+    paths: &NamespacePaths,
+    level: u32,
+    sst_id: &Uuid,
+    rows: &[NodeRow],
+) -> Result<LabelIndexSidecar> {
+    let mut index: BTreeMap<u32, Vec<[u8; 16]>> = BTreeMap::new();
+    for row in rows {
+        if let MemOp::Upsert(payload) = &row.op {
+            let rec = NodeWriteRecord::decode(payload)?;
+            for &lid in &rec.labels {
+                let ids = index.entry(lid).or_default();
+                if !ids.contains(&row.id) {
+                    ids.push(row.id);
+                }
+            }
+        }
+    }
+    if index.is_empty() {
+        return Ok((None, None));
+    }
+    // `per_label_counts` mirrors each posting list's length so the cost model
+    // can recover per-label `node_count` from the manifest alone (no sidecar
+    // body read); `posting_count` is just their sum.
+    let per_label_counts: Vec<(u32, u64)> = index
+        .iter()
+        .map(|(&lid, ids)| (lid, ids.len() as u64))
+        .collect();
+    let label_count = index.len() as u64;
+    let posting_count = per_label_counts.iter().map(|(_, c)| *c).sum();
+    let body_bytes = bincode::serialize(&index)
+        .map_err(|e| Error::invariant(format!("label-index bincode: {e}")))?;
+    let body = Bytes::from(body_bytes);
+    let file_name = format!(
+        "{}-{}.labelidx.bin",
+        uuid_path_id(sst_id),
+        SstKind::Nodes.path_tag()
+    );
+    let object_path = paths.sst_object(level, &file_name);
+    let relative = relative_sst_path(level, &file_name);
+    let descriptor = crate::manifest::LabelIndexDescriptor {
+        path: relative,
+        size_bytes: body.len() as u64,
+        label_count,
+        posting_count,
+        per_label_counts,
+    };
+    Ok((Some(descriptor), Some((object_path, body))))
 }
 
 /// Parallel outputs of [`prepare_unique_property_sidecars`]: the
@@ -1173,7 +1283,7 @@ pub mod builder {
     use bytes::Bytes;
     use object_store::path::Path;
 
-    use namidb_core::{Schema, Value};
+    use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
 
     use crate::error::Result;
     use crate::manifest::SstDescriptor;
@@ -1183,8 +1293,8 @@ pub mod builder {
     use crate::sst::edges::EdgeDirection;
 
     use super::{
-        build_edge_stream_rows, prepare_edge_pending, prepare_node_pending,
-        schema_label_or_synthetic, EdgeRow, EdgeWriteRecord, NodeRow, NodeWriteRecord, PendingSst,
+        build_edge_stream_rows, prepare_edge_pending, prepare_node_pending, union_indexed_props,
+        EdgeRow, EdgeWriteRecord, NodeRow, NodeWriteRecord, PendingSst,
     };
 
     /// One node to ingest. `id` is the ALREADY-MINTED 16-byte NodeId — the
@@ -1228,9 +1338,18 @@ pub mod builder {
     #[derive(Debug)]
     pub struct BuiltSst {
         inner: PendingSst,
+        /// Label names this SST's nodes carry (empty for edge SSTs). The
+        /// builder interned them into on-row `LabelId`s; `attach_ssts` re-interns
+        /// the names into the namespace dictionary so those ids resolve.
+        label_dict: LabelDictionary,
     }
 
     impl BuiltSst {
+        /// Label names carried by this SST's nodes (empty for edge SSTs).
+        pub(crate) fn label_names(&self) -> Vec<String> {
+            self.label_dict.iter().map(|(_, n)| n.to_string()).collect()
+        }
+
         /// Highest LSN carried by this SST (the `next_lsn` floor after attach).
         #[must_use]
         pub fn max_lsn(&self) -> u64 {
@@ -1301,7 +1420,10 @@ pub mod builder {
             return Ok(None);
         }
         let rows = dedup_keep_last_node(rows);
-        let label_def = schema_label_or_synthetic(schema, label);
+        // Intern the label so records carry its LabelId; the dict travels with
+        // the BuiltSst and `attach_ssts` installs it in the manifest.
+        let mut node_dict = LabelDictionary::new();
+        let lid = node_dict.intern(label).get();
         let node_rows: Vec<NodeRow> = rows
             .into_iter()
             .enumerate()
@@ -1313,6 +1435,7 @@ pub mod builder {
                         NodeWriteRecord {
                             properties: n.properties,
                             schema_version: 0,
+                            labels: vec![lid],
                         }
                         .encode()?,
                     )
@@ -1325,9 +1448,19 @@ pub mod builder {
             })
             .collect::<Result<_>>()?;
 
-        let finish = super::build_node_sst(&label_def, &node_rows)?;
-        let pending = prepare_node_pending(paths, label, &label_def, &node_rows, finish)?;
-        Ok(Some(BuiltSst { inner: pending }))
+        // Build with the fixed empty-LabelDef layout (matching `flush()`), and
+        // harvest equality sidecars from the schema's indexed properties.
+        let column_label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        let index_props = union_indexed_props(schema);
+        let finish = super::build_node_sst(&column_label, &node_rows)?;
+        let pending = prepare_node_pending(paths, &index_props, &node_rows, finish)?;
+        Ok(Some(BuiltSst {
+            inner: pending,
+            label_dict: node_dict,
+        }))
     }
 
     /// Build BOTH the forward and inverse CSR SSTs for `edge_type`, owning the
@@ -1391,9 +1524,11 @@ pub mod builder {
         Ok(vec![
             BuiltSst {
                 inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Forward, fwd),
+                label_dict: LabelDictionary::new(),
             },
             BuiltSst {
                 inner: prepare_edge_pending(paths, edge_type, EdgeDirection::Inverse, inv),
+                label_dict: LabelDictionary::new(),
             },
         ])
     }
@@ -1478,6 +1613,7 @@ mod tests {
         NodeWriteRecord {
             properties: props,
             schema_version: 1,
+            ..Default::default()
         }
         .encode()
         .unwrap()
@@ -1512,6 +1648,7 @@ mod tests {
         let r = NodeWriteRecord {
             properties: props,
             schema_version: 7,
+            ..Default::default()
         };
         let bytes = r.encode().unwrap();
         let back = NodeWriteRecord::decode(&bytes).unwrap();
@@ -1569,29 +1706,16 @@ mod tests {
 
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: bob,
-            },
+            MemKey::Node { id: bob },
             11,
             MemOp::Upsert(node_payload("Bob", None)),
         );
-        mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: carol,
-            },
-            12,
-            MemOp::Tombstone,
-        );
+        mt.apply(MemKey::Node { id: carol }, 12, MemOp::Tombstone);
         mt.apply(
             MemKey::Edge {
                 edge_type: "KNOWS".into(),
@@ -1648,7 +1772,18 @@ mod tests {
             .paths()
             .sst_object(node_d.level.as_u32(), file_basename(&node_d.path));
         let body = store.get(&abs).await.unwrap().bytes().await.unwrap();
-        let reader = NodeSstReader::open(person_label(), body).unwrap();
+        // Id-primary node SSTs use the fixed layout (an empty `LabelDef`, no
+        // `prop_*` columns; every property rides in `__overflow_json`), so the
+        // reader must be opened with that same empty layout — mirroring the
+        // production read path's `label_def_for_node_sst` for an empty scope.
+        let reader = NodeSstReader::open(
+            LabelDef {
+                name: String::new(),
+                properties: Vec::new(),
+            },
+            body,
+        )
+        .unwrap();
         let batches = reader.scan().unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
@@ -1715,10 +1850,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );
@@ -1751,10 +1883,7 @@ mod tests {
         let alice = sorted_node_id(1);
         let mut mt = Memtable::new();
         mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id: alice,
-            },
+            MemKey::Node { id: alice },
             10,
             MemOp::Upsert(node_payload("Alice", Some(30))),
         );

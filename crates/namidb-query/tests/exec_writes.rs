@@ -65,6 +65,7 @@ async fn match_then_create_relationship() {
             &NodeWriteRecord {
                 properties: p_alice,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -75,6 +76,7 @@ async fn match_then_create_relationship() {
             &NodeWriteRecord {
                 properties: p_bob,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -119,6 +121,7 @@ async fn two_match_clauses_then_create_relationship() {
             &NodeWriteRecord {
                 properties: p_alice,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -129,6 +132,7 @@ async fn two_match_clauses_then_create_relationship() {
             &NodeWriteRecord {
                 properties: p_bob,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -166,6 +170,7 @@ async fn set_property_round_trips() {
             &NodeWriteRecord {
                 properties: p,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -203,6 +208,7 @@ async fn remove_property() {
             &NodeWriteRecord {
                 properties: p,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -237,6 +243,7 @@ async fn detach_delete_removes_node_and_edges() {
             &NodeWriteRecord {
                 properties: BTreeMap::new(),
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -247,6 +254,7 @@ async fn detach_delete_removes_node_and_edges() {
             &NodeWriteRecord {
                 properties: BTreeMap::new(),
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -293,6 +301,7 @@ async fn merge_match_path_runs_on_match_sets() {
             &NodeWriteRecord {
                 properties: p,
                 schema_version: 1,
+                ..Default::default()
             },
         )
         .unwrap();

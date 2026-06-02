@@ -488,6 +488,7 @@ fn apply_create(
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
+                    ..Default::default()
                 };
                 writer
                     .upsert_node(label.clone(), id, &record)
@@ -606,6 +607,7 @@ fn apply_set(
                     let record = NodeWriteRecord {
                         properties: core_props,
                         schema_version: 1,
+                        ..Default::default()
                     };
                     writer
                         .upsert_node(n.label.clone(), n.id, &record)
@@ -687,6 +689,7 @@ fn apply_remove(
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
+                    ..Default::default()
                 };
                 writer
                     .upsert_node(n.label.clone(), n.id, &record)

@@ -168,6 +168,7 @@ fn load_persons(writer: &mut WriterSession, path: &Path) -> Result<()> {
             &NodeWriteRecord {
                 properties: props,
                 schema_version: 1,
+                ..Default::default()
             },
         )?;
     }
@@ -197,6 +198,7 @@ fn load_posts(writer: &mut WriterSession, path: &Path) -> Result<()> {
             &NodeWriteRecord {
                 properties: props,
                 schema_version: 1,
+                ..Default::default()
             },
         )?;
     }
@@ -226,6 +228,7 @@ fn load_comments(writer: &mut WriterSession, path: &Path) -> Result<()> {
             &NodeWriteRecord {
                 properties: props,
                 schema_version: 1,
+                ..Default::default()
             },
         )?;
     }

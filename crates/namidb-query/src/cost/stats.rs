@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use namidb_core::Schema;
+use namidb_core::{LabelDictionary, LabelId, Schema};
 use namidb_storage::manifest::KindSpecificStats;
 use namidb_storage::sst::hll::Hll;
 use namidb_storage::sst::stats::{HllSketchBytes, StatScalar};
@@ -176,6 +176,7 @@ impl StatsCatalog {
                 SstKind::Nodes => merge_node_sst(
                     sst,
                     &m.schema,
+                    &m.label_dict,
                     &mut labels,
                     &mut total_nodes,
                     &mut hll_merge,
@@ -303,46 +304,97 @@ impl StatsCatalog {
 fn merge_node_sst(
     sst: &SstDescriptor,
     schema: &Schema,
+    label_dict: &LabelDictionary,
     labels: &mut BTreeMap<String, LabelStats>,
     total_nodes: &mut u64,
     hll_merge: &mut BTreeMap<(String, String), HllMerge>,
 ) {
-    let label = &sst.scope;
     let tombstones = match sst.kind_specific {
         KindSpecificStats::Nodes { tombstone_count } => tombstone_count,
         _ => 0,
     };
     let live = sst.row_count.saturating_sub(tombstones);
-    let entry = labels.entry(label.clone()).or_insert_with(|| LabelStats {
-        name: label.clone(),
-        ..Default::default()
-    });
-    entry.node_count = entry.node_count.saturating_add(live);
+    // `total_nodes` is the distinct node-row count (one row per node) — a
+    // multi-label node counts once here even though it appears under each of
+    // its labels below. This keeps `node_count(L) <= total_nodes` for every L.
     *total_nodes = total_nodes.saturating_add(live);
 
-    for col in &sst.property_stats {
-        let logical_name = strip_prop_prefix(&col.name).to_string();
-        // Some columns are emitted under the schema-declared name; the
-        // declared LabelDef is authoritative for whether the property
-        // is known. We still ingest unknown columns to keep the
-        // optimizer robust against schemaless ingest.
-        let _declared = schema.label(label).map(|l| {
-            l.properties
-                .iter()
-                .any(|p| p.name == logical_name || col.name == format!("prop_{}", p.name))
+    // Per-label `node_count`. id-primary node SSTs are no longer partitioned by
+    // label (`scope == ""`); they carry per-label live counts in the
+    // label-index sidecar descriptor, keyed by `LabelId`. Sum those across SSTs,
+    // resolving each id through the namespace dictionary. Legacy single-label
+    // SSTs predate the sidecar (`label_index == None`) and name their one label
+    // in `scope`, so attribute `live` there.
+    match sst.label_index.as_ref() {
+        Some(li) if !li.per_label_counts.is_empty() => {
+            for &(lid, count) in &li.per_label_counts {
+                let Some(name) = label_dict.name(LabelId(lid)) else {
+                    // Id absent from the dictionary (corrupt/forward-version
+                    // manifest): we can't name the label, so skip rather than
+                    // bucket it under a wrong name.
+                    continue;
+                };
+                let entry = labels
+                    .entry(name.to_string())
+                    .or_insert_with(|| LabelStats {
+                        name: name.to_string(),
+                        ..Default::default()
+                    });
+                entry.node_count = entry.node_count.saturating_add(count);
+            }
+        }
+        _ => {
+            // Legacy single-label SSTs (and the brief pre-release window where
+            // id-primary SSTs shipped a label index without `per_label_counts`)
+            // land here. For a named scope this is exact; for an empty scope the
+            // count is parked under "" until the next flush/compaction rewrites
+            // the descriptor with `per_label_counts`. Only matters for in-flight
+            // dev data on this branch — no released manifest has an empty scope.
+            let label = &sst.scope;
+            let entry = labels.entry(label.clone()).or_insert_with(|| LabelStats {
+                name: label.clone(),
+                ..Default::default()
+            });
+            entry.node_count = entry.node_count.saturating_add(live);
+        }
+    }
+
+    // Per-column property stats stay keyed by `scope`. Under id-primary every
+    // property rides in one `__overflow_json` column, so `property_stats` is
+    // empty and this is a no-op (min/max/ndv stay `None`, and the optimizer
+    // uses its documented fallbacks); per-label column stats return with the
+    // typed-column layout. Legacy typed-column SSTs still populate their one
+    // label's stats here via `scope`.
+    if !sst.property_stats.is_empty() {
+        let label = &sst.scope;
+        let entry = labels.entry(label.clone()).or_insert_with(|| LabelStats {
+            name: label.clone(),
+            ..Default::default()
         });
+        for col in &sst.property_stats {
+            let logical_name = strip_prop_prefix(&col.name).to_string();
+            // Some columns are emitted under the schema-declared name; the
+            // declared LabelDef is authoritative for whether the property
+            // is known. We still ingest unknown columns to keep the
+            // optimizer robust against schemaless ingest.
+            let _declared = schema.label(label).map(|l| {
+                l.properties
+                    .iter()
+                    .any(|p| p.name == logical_name || col.name == format!("prop_{}", p.name))
+            });
 
-        let prop = entry.properties.entry(logical_name.clone()).or_default();
-        prop.null_count = prop.null_count.saturating_add(col.null_count);
-        prop.min = merge_min(prop.min.take(), col.min.clone());
-        prop.max = merge_max(prop.max.take(), col.max.clone());
+            let prop = entry.properties.entry(logical_name.clone()).or_default();
+            prop.null_count = prop.null_count.saturating_add(col.null_count);
+            prop.min = merge_min(prop.min.take(), col.min.clone());
+            prop.max = merge_max(prop.max.take(), col.max.clone());
 
-        absorb_hll_sketch(
-            hll_merge,
-            label.clone(),
-            logical_name,
-            col.ndv_estimate.as_ref(),
-        );
+            absorb_hll_sketch(
+                hll_merge,
+                label.clone(),
+                logical_name,
+                col.ndv_estimate.as_ref(),
+            );
+        }
     }
 }
 

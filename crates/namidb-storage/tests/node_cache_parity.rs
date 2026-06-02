@@ -40,6 +40,7 @@ fn node_payload(name: &str) -> Bytes {
             .into_iter()
             .collect(),
         schema_version: 1,
+        ..Default::default()
     }
     .encode()
     .unwrap()
@@ -65,14 +66,7 @@ async fn parity_pure_sst_nodes() {
 
     let mut mt = Memtable::new();
     for (lsn, id, name) in [(10u64, alice, "Alice"), (11, bob, "Bob")] {
-        mt.apply(
-            MemKey::Node {
-                label: "Person".into(),
-                id,
-            },
-            lsn,
-            MemOp::Upsert(node_payload(name)),
-        );
+        mt.apply(MemKey::Node { id }, lsn, MemOp::Upsert(node_payload(name)));
     }
     let frozen = mt.freeze();
     let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
@@ -119,10 +113,7 @@ async fn parity_with_tombstone_caches_negative() {
     // Flush alice@LSN10.
     let mut mt = Memtable::new();
     mt.apply(
-        MemKey::Node {
-            label: "Person".into(),
-            id: alice,
-        },
+        MemKey::Node { id: alice },
         10,
         MemOp::Upsert(node_payload("Alice")),
     );
@@ -133,14 +124,7 @@ async fn parity_with_tombstone_caches_negative() {
 
     // Live memtable tombstone @ LSN 20 > SST 10.
     let mut live = Memtable::new();
-    live.apply(
-        MemKey::Node {
-            label: "Person".into(),
-            id: alice,
-        },
-        20,
-        MemOp::Tombstone,
-    );
+    live.apply(MemKey::Node { id: alice }, 20, MemOp::Tombstone);
 
     let cache = Arc::new(NodeViewCache::new(1024 * 1024));
     let live_view = live.snapshot_view();
@@ -180,10 +164,7 @@ async fn cache_reuses_across_snapshots_of_same_manifest_version() {
 
     let mut mt = Memtable::new();
     mt.apply(
-        MemKey::Node {
-            label: "Person".into(),
-            id: alice,
-        },
+        MemKey::Node { id: alice },
         10,
         MemOp::Upsert(node_payload("Alice")),
     );
@@ -243,10 +224,7 @@ async fn l1_hit_short_circuits_before_l2() {
 
     let mut mt = Memtable::new();
     mt.apply(
-        MemKey::Node {
-            label: "Person".into(),
-            id: alice,
-        },
+        MemKey::Node { id: alice },
         10,
         MemOp::Upsert(node_payload("Alice")),
     );
