@@ -210,6 +210,15 @@ pub trait Backend: Send + Sync {
     async fn current_bookmark(&self) -> Option<String> {
         None
     }
+
+    /// Called when the client issues LOGOFF, returning the connection to the
+    /// unauthenticated state. The default is a no-op. An embedder that binds
+    /// per-connection identity to its [`Backend`] out of band — e.g. a cloud
+    /// edge that resolved an API key to a tenant at LOGON via a custom
+    /// [`Authenticator`] — overrides this to drop that identity, so a
+    /// subsequent RESET (which returns the connection to `Ready`) cannot
+    /// resume executing as the logged-off principal.
+    async fn logoff(&self) {}
 }
 
 /// One Bolt connection. Created once per `accept()` and driven to
@@ -452,6 +461,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             },
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
+                // Drop any per-connection identity the embedder bound out of
+                // band, then return to the unauthenticated state. Without the
+                // first step, a later RESET (any-state → Ready) would let the
+                // connection keep executing as the logged-off principal.
+                self.backend.logoff().await;
                 self.state = State::Authentication;
                 self.write_response(Response::success_empty()).await
             }
@@ -750,6 +764,102 @@ mod tests {
             auth,
             backend,
         )
+    }
+
+    /// LOGOFF must invoke `Backend::logoff()` so an embedder can drop the
+    /// per-connection identity it bound out of band — otherwise a later RESET
+    /// (any-state → Ready) would let the connection keep executing as the
+    /// logged-off principal. Regression test for that auth-state bypass.
+    #[tokio::test]
+    async fn logoff_invokes_backend_logoff_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LogoffBackend {
+            logged_off: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl Backend for LogoffBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                Ok(RunOutcome::default())
+            }
+            async fn logoff(&self) {
+                self.logged_off.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-conn".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(LogoffBackend {
+                logged_off: flag.clone(),
+            }),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        // HELLO + LOGON (open auth).
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("scheme".into(), Value::String("none".into()));
+                    m
+                })],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        assert!(!flag.load(Ordering::SeqCst), "logoff not called before LOGOFF");
+
+        // LOGOFF must ack AND invoke the hook.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGOFF,
+                fields: vec![],
+            }),
+        )
+        .await;
+        let resp = read_msg(&mut client).await;
+        assert!(matches!(decode_response(&resp), Response::Success(_)), "LOGOFF acked");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "LOGOFF must invoke Backend::logoff()"
+        );
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        let _ = task.await.unwrap();
     }
 
     async fn send_handshake<W: AsyncWriteExt + Unpin>(w: &mut W) {
