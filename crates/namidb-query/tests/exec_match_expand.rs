@@ -548,6 +548,58 @@ async fn path_binding_two_hop_chain() {
 }
 
 #[tokio::test]
+async fn var_length_path_binding_materialises_variable_trails() {
+    // gdotv-style "show paths up to N hops": a path binding over a
+    // variable-length relationship. The lower routes this through the walker's
+    // trail materialisation (the same path the executor uses for shortestPath),
+    // so each match returns a real Path whose length tracks the hop count —
+    // rather than the old "variable-length path bindings are not yet supported"
+    // rejection.
+    let mut writer = WriterSession::open(store(), paths("exec-varlen-path"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH p = (a:Person)-[:KNOWS*1..2]->(b:Person) \
+         WHERE a.name = 'Alice' \
+         RETURN p",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert!(!rows.is_empty(), "expected variable-length paths from Alice");
+    let mut lengths = std::collections::BTreeSet::new();
+    for row in &rows {
+        match row.get("p") {
+            // The trail alternates Node, Rel, Node, ... so a valid path has an
+            // odd item count >= 3 (one hop).
+            Some(RuntimeValue::Path(items)) => {
+                assert!(
+                    items.len() >= 3 && items.len() % 2 == 1,
+                    "unexpected trail shape: {} items",
+                    items.len()
+                );
+                lengths.insert(items.len());
+            }
+            other => panic!("expected Path, got {:?}", other),
+        }
+    }
+    // `*1..2` from Alice yields both 1-hop (3-item) and 2-hop (5-item) trails.
+    assert!(
+        lengths.contains(&3),
+        "expected a 1-hop path (3 items), got {:?}",
+        lengths
+    );
+    assert!(
+        lengths.contains(&5),
+        "expected a 2-hop path (5 items), got {:?}",
+        lengths
+    );
+}
+
+#[tokio::test]
 async fn path_binding_supports_anonymous_elements() {
     // Clients like gdotv bind paths with anonymous elements:
     // `p = ()-[]->()` for the default graph view, or an anonymous
