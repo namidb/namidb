@@ -39,7 +39,7 @@ use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as OsResult, UpdateVersion,
+    Result as OsResult, UpdateVersion, UploadPart,
 };
 
 /// Filesystem-backed `ObjectStore` with the conditional-write semantics
@@ -100,6 +100,14 @@ impl LocalFileObjectStore {
     /// Root directory on disk. Useful for tests and operational tooling.
     pub fn root(&self) -> &std::path::Path {
         &self.root
+    }
+
+    /// Map an object-store key to its on-disk path under `root`. Relies on
+    /// the 1:1 key->path layout `LocalFileSystem` uses for the safe ASCII
+    /// keys NamiDB writes (digits, `-`, `_`, `.`, `/`); it does not attempt
+    /// the percent-encoding `LocalFileSystem` applies to exotic keys.
+    fn fs_path(&self, location: &Path) -> PathBuf {
+        self.root.join(location.as_ref())
     }
 
     /// Acquire the namespace-wide CAS lock for the duration of the
@@ -204,6 +212,70 @@ fn is_internal_path(p: &Path) -> bool {
     p.as_ref().starts_with(INTERNAL_DIR)
 }
 
+/// The [`object_store::Error::Generic`] this store uses for IO and task
+/// join failures.
+fn generic_err(e: impl std::error::Error + Send + Sync + 'static) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "LocalFileObjectStore",
+        source: Box::new(e),
+    }
+}
+
+/// fsync `fs_path` and its parent directory so a published write survives
+/// an OS crash or power loss. `LocalFileSystem` publishes via tmp+rename
+/// but never fsyncs. A file that is gone (a delete or a racing overwrite
+/// moved it) is treated as already durable.
+async fn fsync_published(fs_path: PathBuf) -> OsResult<()> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        match std::fs::File::open(&fs_path) {
+            Ok(f) => f.sync_all()?,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        // fsync the parent directory so the rename (the new directory
+        // entry) is durable. POSIX-only: std offers no portable directory
+        // fsync on Windows, where the file `sync_all` above is the knob.
+        #[cfg(unix)]
+        if let Some(parent) = fs_path.parent() {
+            match std::fs::File::open(parent) {
+                Ok(dir) => dir.sync_all()?,
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(generic_err)?
+    .map_err(generic_err)
+}
+
+/// Wraps a [`MultipartUpload`] so `complete()` fsyncs the published file
+/// (and its parent directory) before returning, giving local multipart
+/// writes the same crash-durability as the single-PUT path in `put_opts`.
+#[derive(Debug)]
+struct FsyncMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    fs_path: PathBuf,
+}
+
+#[async_trait]
+impl MultipartUpload for FsyncMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> OsResult<PutResult> {
+        let result = self.inner.complete().await?;
+        fsync_published(self.fs_path.clone()).await?;
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> OsResult<()> {
+        self.inner.abort().await
+    }
+}
+
 #[async_trait]
 impl ObjectStore for LocalFileObjectStore {
     async fn put_opts(
@@ -212,12 +284,20 @@ impl ObjectStore for LocalFileObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
-        match opts.mode.clone() {
-            PutMode::Update(uv) => self.put_with_cas(location, payload, uv, opts).await,
+        let result = match opts.mode.clone() {
+            PutMode::Update(uv) => self.put_with_cas(location, payload, uv, opts).await?,
             // Create + Overwrite both supported by LocalFileSystem; CAS
             // is not involved so we forward.
-            _ => self.inner.put_opts(location, payload, opts).await,
-        }
+            _ => self.inner.put_opts(location, payload, opts).await?,
+        };
+        // LocalFileSystem publishes via tmp+rename but never fsyncs, so a
+        // PUT this method just reported as durable could still be lost on an
+        // OS crash or power loss. Flush the file and its parent directory
+        // before returning: the local-backend equivalent of S3
+        // durability-on-ack. This covers the whole commit path — WAL
+        // segment, manifest body, and the pointer CAS all go through here.
+        fsync_published(self.fs_path(location)).await?;
+        Ok(result)
     }
 
     async fn put_multipart_opts(
@@ -225,7 +305,13 @@ impl ObjectStore for LocalFileObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
+        // Large SST bodies upload multipart, bypassing put_opts; wrap the
+        // upload so its `complete()` fsyncs the published file too.
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(FsyncMultipartUpload {
+            inner,
+            fs_path: self.fs_path(location),
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
@@ -290,6 +376,25 @@ mod tests {
         let s: Arc<dyn ObjectStore> = Arc::new(LocalFileObjectStore::new(dir).unwrap());
         let paths = NamespacePaths::new("", NamespaceId::new("acme").unwrap());
         (s, paths)
+    }
+
+    #[tokio::test]
+    async fn put_maps_to_on_disk_path_and_round_trips() {
+        // Guards the key->path mapping that `fsync_published` relies on: a
+        // PUT lands at root.join(key), reads back, and the fsync in
+        // `put_opts` does not error on the commit-path key shape.
+        let dir = tempdir().unwrap();
+        let s = LocalFileObjectStore::new(dir.path()).unwrap();
+        let p = Path::from("wal/0000000001.wal");
+        s.put_opts(
+            &p,
+            PutPayload::from(Bytes::from_static(b"durable")),
+            PutOptions::from(PutMode::Create),
+        )
+        .await
+        .unwrap();
+        let on_disk = dir.path().join("wal").join("0000000001.wal");
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"durable");
     }
 
     #[tokio::test]
