@@ -17,6 +17,15 @@ below and in the release notes.
 
 ### Fixed
 
+- Read-your-own-writes within a statement and an open transaction
+  (RFC-026, node overlay). A read sub-plan that runs after a write in the
+  same statement or transaction now sees the staged rows, so `CREATE` then
+  `MATCH`, `MERGE` after `CREATE`, and duplicate detection inside one
+  uncommitted batch all return the right result instead of reading the
+  pre-call committed snapshot. Reads outside a write context are
+  unchanged. Staged edges are not yet visible to traversals; that is a
+  follow-up.
+
 ### Breaking
 
 ---

@@ -4,7 +4,7 @@
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05
-**Implements:** (pending)
+**Implements:** node overlay (v1) landed; edge overlay pending (Q1)
 **Supersedes:** none
 
 ## Summary

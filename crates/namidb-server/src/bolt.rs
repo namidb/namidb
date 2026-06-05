@@ -128,9 +128,10 @@ impl Backend for ServerBackend {
         cypher: &str,
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
-        // Introspection and reads run against the published snapshot, same
-        // as auto-commit — an in-tx read does NOT see the tx's own staged
-        // writes (no read-your-own-writes; documented limitation).
+        // Introspection runs against the published snapshot (schema only).
+        // Data reads, below, run against the transaction's own writer with
+        // its staged batch overlaid, so an in-tx read sees the tx's own
+        // staged writes (read-your-own-writes, RFC-026).
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -173,7 +174,15 @@ impl Backend for ServerBackend {
             tx.staged = true;
             Ok(write_run_outcome(outcome))
         } else {
-            let snap = owned.borrow();
+            // Read against the transaction's own writer so the staged batch
+            // is visible (RFC-026). The writer pins the committed state at
+            // tx-begin (no commit happens mid-tx while we hold the lock) and
+            // overlays everything statements 1..N-1 staged.
+            let mut slot = self.tx.lock().await;
+            let tx = slot
+                .as_mut()
+                .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
+            let snap = tx.writer.overlay_snapshot();
             let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }

@@ -404,6 +404,59 @@ impl WriterSession {
         snap
     }
 
+    /// Read-your-own-writes snapshot (RFC-026): the committed
+    /// [`snapshot`](Self::snapshot) with this writer's staged-but-
+    /// uncommitted batch overlaid on top, so a read sub-plan that runs
+    /// after a `CREATE`/`MERGE`/`SET`/`DELETE` in the same statement or
+    /// transaction sees the staged work. Reads outside a write context
+    /// keep using [`snapshot`](Self::snapshot); there is nothing staged
+    /// for them to see.
+    ///
+    /// When nothing is staged this is exactly [`snapshot`](Self::snapshot)
+    /// (same caches, no overlay), so a write statement's first read before
+    /// any mutation pays nothing.
+    ///
+    /// The overlay is built from `pending_payloads`, so it reflects exactly
+    /// what [`commit_batch`](Self::commit_batch) would make durable. The
+    /// cross-snapshot NodeView and property-index caches are deliberately
+    /// NOT attached: they are keyed by manifest version and shared across
+    /// sessions, so caching a staged (uncommitted) row in them would leak
+    /// it to a concurrent reader pinned at the same version. The immutable
+    /// SST/adjacency body caches are safe to keep.
+    pub fn overlay_snapshot(&self) -> Snapshot<'_> {
+        if self.pending_payloads.is_empty() {
+            return self.snapshot();
+        }
+        // Materialise the staged batch as a second memtable. `apply` in
+        // pending (LSN-ascending) order leaves each key at its highest-LSN
+        // op, exactly as `commit_batch` would drain it into the live
+        // memtable.
+        let mut staged = Memtable::new();
+        for (key, lsn, op) in &self.pending_payloads {
+            staged.apply(key.clone(), *lsn, op.clone());
+        }
+        // Resolve labels through the writer's live dictionary, not the
+        // committed manifest's: a node staged in this batch may carry a
+        // label name first interned in the same batch, which the committed
+        // `current.manifest.label_dict` does not know about yet. The live
+        // dict is a superset, so committed labels still resolve.
+        let mut current = self.current.clone();
+        current.manifest.label_dict = self.label_dict.clone();
+        let mut snap = Snapshot::new(
+            current,
+            &self.published_memtable,
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths().clone(),
+        );
+        if let Some(cache) = &self.sst_cache {
+            snap = snap.with_cache(cache.clone());
+        }
+        if let Some(cache) = &self.adjacency_cache {
+            snap = snap.with_adjacency_cache(cache.clone());
+        }
+        snap.with_overlay(staged.snapshot_view())
+    }
+
     /// Schema of the current manifest version. The write path consults it to
     /// enforce declared constraints (e.g. unique properties) before staging
     /// a mutation.
@@ -1094,6 +1147,66 @@ mod tests {
             view.properties.get("name"),
             Some(&Value::Str("Alice".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn overlay_snapshot_sees_staged_batch_but_plain_snapshot_does_not() {
+        // RFC-026 read-your-own-writes at the storage layer: a writer's
+        // staged-but-uncommitted batch is visible through `overlay_snapshot`
+        // (a staged upsert appears, a staged tombstone hides a committed
+        // row) while `snapshot` keeps showing only committed state.
+        let store = make_store();
+        let paths = make_paths("ingest-overlay");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        // Commit Alice so there is committed state to overlay on top of.
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        // Stage Bob (create) and a tombstone of Alice (delete), no commit.
+        let bob = sorted_node_id(2);
+        session
+            .upsert_node("Person", bob, &node_record("Bob", Some(40)))
+            .unwrap();
+        session.tombstone_node("Person", alice).unwrap();
+
+        // Plain snapshot: committed only — Alice visible, Bob not.
+        let committed = session.snapshot();
+        assert!(committed
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(committed
+            .lookup_node("Person", bob)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(committed.scan_label("Person").await.unwrap().len(), 1);
+        drop(committed);
+
+        // Overlay snapshot: Bob is visible; Alice is hidden by the staged
+        // tombstone; the label scan reflects exactly the staged batch.
+        let overlay = session.overlay_snapshot();
+        assert!(overlay.lookup_node("Person", bob).await.unwrap().is_some());
+        assert!(overlay
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_none());
+        let scanned = overlay.scan_label("Person").await.unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].id, bob);
+        drop(overlay);
+
+        // Nothing staged: overlay_snapshot collapses to the committed view.
+        session.discard_batch();
+        let after = session.overlay_snapshot();
+        assert!(after.lookup_node("Person", alice).await.unwrap().is_some());
+        assert!(after.lookup_node("Person", bob).await.unwrap().is_none());
     }
 
     #[tokio::test]
