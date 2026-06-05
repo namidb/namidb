@@ -30,7 +30,8 @@ pub use handshake::{Version, SUPPORTED_VERSIONS};
 pub use mapping::{bolt_to_runtime, params_from_bolt_map, runtime_to_bolt, ElementIdMode};
 pub use message::{Request, Response};
 pub use session::{
-    AuthPolicy, Backend, BackendError, RunOutcome, ServerInfo, Session, StatementType,
+    AuthPolicy, Authenticator, Backend, BackendError, RunOutcome, ServerInfo, Session,
+    StatementType,
 };
 pub use state::State;
 pub use value::{struct_tag, Node, Relationship, Value};
