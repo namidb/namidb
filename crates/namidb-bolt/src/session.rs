@@ -245,6 +245,13 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// transaction back (releasing the writer) and fails it. `None` (the
     /// default) keeps the legacy unbounded behaviour for test backends.
     tx_idle_timeout: Option<std::time::Duration>,
+    /// Whether this session has completed authentication (the v5 HELLO +
+    /// LOGON handshake, or the v4 HELLO that carries auth). RESET only
+    /// recovers a session to READY once this is set: before auth a RESET
+    /// must not grant READY, or a client could skip HELLO/LOGON entirely
+    /// (handshake -> RESET -> RUN). LOGOFF clears it, forcing a fresh LOGON
+    /// before any further work.
+    authenticated: bool,
 }
 
 impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
@@ -259,6 +266,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             pending_statement_type: None,
             pending_counters: BTreeMap::new(),
             tx_idle_timeout: None,
+            authenticated: false,
         }
     }
 
@@ -358,10 +366,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn handle(&mut self, req: Request, element_mode: ElementIdMode) -> Result<()> {
-        // RESET always recovers; GOODBYE always ends. Either one while a
-        // transaction is open must roll it back so its staged writes are
-        // discarded (and the writer it holds is released).
-        if matches!(req, Request::Reset) {
+        // RESET recovers a session to READY, but only once it has
+        // authenticated. Before auth (CONNECTED/AUTHENTICATION) a RESET must
+        // not grant READY, or a client could skip HELLO/LOGON entirely
+        // (handshake -> RESET -> RUN). When unauthenticated it falls through
+        // to the per-state handlers below, which reject it. GOODBYE always
+        // ends. Either one while a transaction is open rolls it back so its
+        // staged writes are discarded (and the writer it holds is released).
+        if matches!(req, Request::Reset) && self.authenticated {
             if matches!(self.state, State::TxReady | State::TxStreaming) {
                 let _ = self.backend.rollback_tx().await;
             }
@@ -424,6 +436,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     .write_failure("Neo.ClientError.Security.Unauthorized", e)
                     .await;
             }
+            self.authenticated = true;
             self.state = State::Ready;
             self.write_response(Response::Success(meta)).await?;
         }
@@ -440,6 +453,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 .write_failure("Neo.ClientError.Security.Unauthorized", e)
                 .await;
         }
+        self.authenticated = true;
         self.state = State::Ready;
         self.write_response(Response::success_empty()).await
     }
@@ -464,10 +478,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
                 // Drop any per-connection identity the embedder bound out of
-                // band, then return to the unauthenticated state. Without the
-                // first step, a later RESET (any-state → Ready) would let the
-                // connection keep executing as the logged-off principal.
+                // band, then return to the unauthenticated state. Clearing
+                // `authenticated` is what makes a later RESET refuse to recover
+                // to Ready until a fresh LOGON re-authenticates.
                 self.backend.logoff().await;
+                self.authenticated = false;
                 self.state = State::Authentication;
                 self.write_response(Response::success_empty()).await
             }
@@ -1104,6 +1119,127 @@ mod tests {
             }),
         )
         .await;
+        drop(client);
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_before_auth_does_not_bypass_authentication() {
+        // A client that completes the handshake but never sends HELLO/LOGON
+        // must not reach READY (and run queries) by sending RESET. Before the
+        // fix, RESET was handled ahead of the per-state dispatch and jumped
+        // unconditionally to READY (handshake -> RESET -> RUN bypass).
+        let (mut client, server) = duplex(16 * 1024);
+        let session = fixture_session(
+            server,
+            RunOutcome::default(),
+            AuthPolicy::Token(Arc::from("correct-token")),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        // RESET straight after the handshake, with no HELLO/LOGON.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RESET,
+                fields: vec![],
+            }),
+        )
+        .await;
+        // Must be rejected, not answered with SUCCESS (a SUCCESS would mean
+        // the session reached READY unauthenticated).
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Failure(meta) => assert_eq!(
+                meta.get("code"),
+                Some(&Value::String("Neo.ClientError.Request.Invalid".into())),
+                "pre-auth RESET must fail as an invalid request"
+            ),
+            other => panic!("expected FAILURE for pre-auth RESET, got {:?}", other),
+        }
+
+        // And a RUN must still be refused (IGNORED after the failure),
+        // proving no query executes on an unauthenticated connection.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RUN,
+                fields: vec![
+                    Value::String("RETURN 1".into()),
+                    Value::Map(BTreeMap::new()),
+                    Value::Map(BTreeMap::new()),
+                ],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Ignored
+        ));
+
+        drop(client);
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_after_auth_recovers_to_ready() {
+        // RESET on an authenticated session still recovers to READY: the fix
+        // gates pre-auth RESET only, it must not break the normal recovery.
+        let (mut client, server) = duplex(16 * 1024);
+        let session = fixture_session(
+            server,
+            RunOutcome::default(),
+            AuthPolicy::Token(Arc::from("correct-token")),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("scheme".into(), Value::String("basic".into()));
+                    m.insert("credentials".into(), Value::String("correct-token".into()));
+                    m
+                })],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        // RESET on the authenticated session returns SUCCESS.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RESET,
+                fields: vec![],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
         drop(client);
         let _ = task.await.unwrap();
     }
