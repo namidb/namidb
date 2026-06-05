@@ -270,14 +270,20 @@ fn map_lower_err(e: LowerError) -> BackendError {
 }
 
 fn map_exec_err(e: ExecError) -> BackendError {
-    // ExecError today is opaque from outside the crate; format and
-    // bucket as either an eval or a storage error based on a
-    // best-effort substring match.
-    let text = format!("{e}");
-    if text.contains("storage") || text.contains("manifest") {
-        BackendError::Storage(text)
-    } else {
-        BackendError::Eval(text)
+    match e {
+        // A constraint violation has its own Neo4j error class so drivers
+        // can distinguish it from an ordinary evaluation error.
+        ExecError::Constraint(m) => BackendError::Constraint(m),
+        // The rest are opaque from outside the crate; format and bucket as
+        // either an eval or a storage error on a best-effort substring match.
+        other => {
+            let text = format!("{other}");
+            if text.contains("storage") || text.contains("manifest") {
+                BackendError::Storage(text)
+            } else {
+                BackendError::Eval(text)
+            }
+        }
     }
 }
 

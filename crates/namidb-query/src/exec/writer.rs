@@ -93,7 +93,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let new_row = apply_create(elements, row, writer, params, outcome)?;
+                    let new_row = apply_create(elements, row, writer, params, outcome).await?;
                     out.push(new_row);
                 }
                 Ok(out)
@@ -433,7 +433,53 @@ fn apply_spread_properties(
     Ok(())
 }
 
-fn apply_create(
+/// Enforce declared unique constraints for a node about to be created.
+/// Each label's unique string-valued properties are checked against the
+/// committed snapshot through the property index (O(1) on the warm path).
+/// Returns [`ExecError::Constraint`] on the first duplicate. Non-string
+/// unique properties are not checked (the property index keys on strings);
+/// nor are duplicates staged within the same uncommitted batch (that needs
+/// read-your-own-writes).
+async fn enforce_unique_on_create(
+    writer: &WriterSession,
+    labels: &[String],
+    core_props: &BTreeMap<String, CoreValue>,
+) -> Result<(), ExecError> {
+    // Collect the (label, property, value) checks first so the borrow of the
+    // schema is released before we take a snapshot.
+    let checks: Vec<(&str, &str, &str)> = {
+        let schema = writer.schema();
+        let mut checks = Vec::new();
+        for label in labels {
+            if let Some(def) = schema.label(label) {
+                for prop in &def.properties {
+                    if prop.unique {
+                        if let Some(CoreValue::Str(v)) = core_props.get(&prop.name) {
+                            checks.push((label.as_str(), prop.name.as_str(), v.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        checks
+    };
+    for (label, prop, value) in checks {
+        let snap = writer.snapshot();
+        let existing = snap
+            .lookup_node_by_property(label, prop, value)
+            .await
+            .map_err(ExecError::Storage)?;
+        drop(snap);
+        if existing.is_some() {
+            return Err(ExecError::Constraint(format!(
+                "{label}.{prop} = {value:?} already exists (unique constraint)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn apply_create(
     elements: &[CreateElement],
     mut row: Row,
     writer: &mut WriterSession,
@@ -487,6 +533,11 @@ fn apply_create(
                     Some(id) => id,
                     None => NodeId::new(),
                 };
+                // Enforce declared unique constraints against the committed
+                // snapshot before staging the node. Note: duplicates staged
+                // within the same uncommitted statement/transaction are not
+                // caught yet (needs read-your-own-writes).
+                enforce_unique_on_create(writer, labels, &core_props).await?;
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
@@ -885,7 +936,7 @@ async fn apply_merge(
         Ok(out)
     } else {
         // Create branch.
-        let created = apply_create(pattern, row, writer, params, outcome)?;
+        let created = apply_create(pattern, row, writer, params, outcome).await?;
         let mut created = created;
         for op in on_create_sets {
             created = apply_set(op, created, writer, params, outcome)?;
@@ -1390,6 +1441,51 @@ mod tests {
         let stored = &nodes[0].properties;
         assert!(stored.contains_key("name"));
         assert!(stored.contains_key("age"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_duplicate_unique_property() {
+        use crate::{lower, parse, Params};
+        use namidb_core::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+
+        let mut writer = WriterSession::open(store(), paths("write-unique"))
+            .await
+            .unwrap();
+
+        // Create Ada, then flush a schema that declares Person.name unique.
+        // The flush persists Ada and records the schema on the manifest, so
+        // the next CREATE checks against the committed snapshot.
+        let q = parse("CREATE (a:Person {name: 'Ada'}) RETURN a").unwrap();
+        execute_write(&lower(&q).unwrap(), &mut writer, &Params::new())
+            .await
+            .unwrap();
+
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, true)
+                    .unwrap()
+                    .with_unique(true)],
+            })
+            .unwrap()
+            .build();
+        writer.flush(schema).await.unwrap();
+
+        // A second Ada must be rejected as a unique-constraint violation.
+        let dup = parse("CREATE (b:Person {name: 'Ada'}) RETURN b").unwrap();
+        let err = execute_write(&lower(&dup).unwrap(), &mut writer, &Params::new())
+            .await
+            .expect_err("duplicate unique value must be rejected");
+        assert!(
+            matches!(err, ExecError::Constraint(_)),
+            "expected a constraint violation, got: {err:?}"
+        );
+
+        // A different name still succeeds (no false positive).
+        let ok = parse("CREATE (c:Person {name: 'Bob'}) RETURN c").unwrap();
+        execute_write(&lower(&ok).unwrap(), &mut writer, &Params::new())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
