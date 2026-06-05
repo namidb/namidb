@@ -159,9 +159,17 @@ impl Backend for ServerBackend {
             let tx = slot
                 .as_mut()
                 .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
-            let outcome = execute_write_staged(&plan, &mut tx.writer, &params)
-                .await
-                .map_err(map_exec_err)?;
+            let outcome = match execute_write_staged(&plan, &mut tx.writer, &params).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A failed statement aborts the transaction. Drop whatever
+                    // it (or an earlier statement) staged so a stray COMMIT
+                    // cannot seal a partial write; the session moves to FAILED
+                    // and the client must ROLLBACK / RESET.
+                    tx.writer.discard_batch();
+                    return Err(map_exec_err(e));
+                }
+            };
             tx.staged = true;
             Ok(write_run_outcome(outcome))
         } else {
@@ -186,10 +194,10 @@ impl Backend for ServerBackend {
     async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
         let mut slot = self.tx.lock().await;
         if let Some(mut tx) = slot.take() {
-            if tx.staged {
-                tx.writer.discard_batch();
-            }
-            // Dropping `tx` releases the writer lock.
+            // Always discard: a statement that failed before `staged` was set
+            // can still have left mutations in the pending batch. Discarding
+            // an empty batch is a no-op. Dropping `tx` releases the writer.
+            tx.writer.discard_batch();
         }
         Ok(())
     }
