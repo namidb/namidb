@@ -79,6 +79,8 @@ pub enum ErrorCode {
     UnexpectedEof,
     /// E011 — duplicate aliasing within the same projection scope.
     DuplicateAlias,
+    /// E012 — expression nesting exceeded the parser's recursion limit.
+    RecursionLimit,
 }
 
 impl ErrorCode {
@@ -96,6 +98,7 @@ impl ErrorCode {
             Self::InvalidEscape => "E009",
             Self::UnexpectedEof => "E010",
             Self::DuplicateAlias => "E011",
+            Self::RecursionLimit => "E012",
         }
     }
 }
