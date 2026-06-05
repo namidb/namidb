@@ -35,6 +35,9 @@ pub enum ExecError {
     Eval(EvalError),
     Storage(namidb_storage::Error),
     Runtime(String),
+    /// A declared schema constraint (e.g. a unique property) was violated by
+    /// a write. Maps to `Neo.ClientError.Schema.ConstraintValidationFailed`.
+    Constraint(String),
 }
 
 impl fmt::Display for ExecError {
@@ -43,6 +46,7 @@ impl fmt::Display for ExecError {
             ExecError::Eval(e) => write!(f, "{}", e),
             ExecError::Storage(e) => write!(f, "storage: {}", e),
             ExecError::Runtime(m) => write!(f, "runtime: {}", m),
+            ExecError::Constraint(m) => write!(f, "constraint violation: {}", m),
         }
     }
 }

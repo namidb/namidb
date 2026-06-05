@@ -131,6 +131,8 @@ pub enum BackendError {
     Eval(String),
     /// Storage error.
     Storage(String),
+    /// A declared schema constraint (e.g. a unique property) was violated.
+    Constraint(String),
     /// Anything else.
     Other(String),
 }
@@ -143,6 +145,7 @@ impl BackendError {
             BackendError::Unsupported(_) => "Neo.ClientError.Statement.NotSupported",
             BackendError::Eval(_) => "Neo.ClientError.Statement.ArgumentError",
             BackendError::Storage(_) => "Neo.TransientError.General.DatabaseUnavailable",
+            BackendError::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
             BackendError::Other(_) => "Neo.DatabaseError.General.UnknownError",
         }
     }
@@ -154,6 +157,7 @@ impl BackendError {
             | BackendError::Unsupported(s)
             | BackendError::Eval(s)
             | BackendError::Storage(s)
+            | BackendError::Constraint(s)
             | BackendError::Other(s) => s,
         }
     }

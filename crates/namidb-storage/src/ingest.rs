@@ -404,6 +404,13 @@ impl WriterSession {
         snap
     }
 
+    /// Schema of the current manifest version. The write path consults it to
+    /// enforce declared constraints (e.g. unique properties) before staging
+    /// a mutation.
+    pub fn schema(&self) -> &namidb_core::Schema {
+        &self.current.manifest.schema
+    }
+
     /// Queue a single-label node upsert. Convenience wrapper over
     /// [`upsert_node_with_labels`](Self::upsert_node_with_labels); kept so the
     /// many single-label call sites stay unchanged.
