@@ -32,14 +32,52 @@ pub struct ServerInfo {
     pub connection_id: String,
 }
 
+/// Pluggable LOGON / HELLO authenticator.
+///
+/// Lets an embedder (e.g. the NamiDB cloud gateway) verify Bolt credentials
+/// against an external source instead of the built-in [`AuthPolicy::Open`] /
+/// [`AuthPolicy::Token`] schemes. The session calls [`authenticate`] with the
+/// auth map carried by HELLO (Bolt 4.x) or LOGON (Bolt 5.x) — `scheme`,
+/// `principal`, `credentials`. Returning `Err(message)` fails the connection
+/// with `Neo.ClientError.Security.Unauthorized` (the message reaches the
+/// client); `Ok(())` authenticates it.
+///
+/// Any per-connection context the authenticator establishes (the resolved
+/// principal, the target namespace, …) is shared with the paired [`Backend`]
+/// out of band — the embedder constructs both per connection.
+///
+/// [`authenticate`]: Authenticator::authenticate
+#[async_trait]
+pub trait Authenticator: Send + Sync {
+    /// Authenticate a connection from its HELLO/LOGON auth map.
+    async fn authenticate(
+        &self,
+        auth: &BTreeMap<String, Value>,
+    ) -> std::result::Result<(), String>;
+}
+
 /// Auth policy applied to LOGON.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AuthPolicy {
     /// Accept any LOGON. Mirrors the REST server's "no auth" mode.
     Open,
     /// Accept `basic` or `bearer` schemes whose credentials match
     /// this token (constant-time compare). Anything else fails.
     Token(Arc<str>),
+    /// Delegate authentication to a custom [`Authenticator`] — e.g. the
+    /// cloud gateway verifying an API key against the control plane.
+    Custom(Arc<dyn Authenticator>),
+}
+
+impl std::fmt::Debug for AuthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthPolicy::Open => f.write_str("AuthPolicy::Open"),
+            // Never print the token material.
+            AuthPolicy::Token(_) => f.write_str("AuthPolicy::Token(***)"),
+            AuthPolicy::Custom(_) => f.write_str("AuthPolicy::Custom(..)"),
+        }
+    }
 }
 
 /// What [`Backend::run`] returns. Streamed result production lives
@@ -172,6 +210,15 @@ pub trait Backend: Send + Sync {
     async fn current_bookmark(&self) -> Option<String> {
         None
     }
+
+    /// Called when the client issues LOGOFF, returning the connection to the
+    /// unauthenticated state. The default is a no-op. An embedder that binds
+    /// per-connection identity to its [`Backend`] out of band — e.g. a cloud
+    /// edge that resolved an API key to a tenant at LOGON via a custom
+    /// [`Authenticator`] — overrides this to drop that identity, so a
+    /// subsequent RESET (which returns the connection to `Ready`) cannot
+    /// resume executing as the logged-off principal.
+    async fn logoff(&self) {}
 }
 
 /// One Bolt connection. Created once per `accept()` and driven to
@@ -369,7 +416,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             self.write_response(Response::Success(meta)).await?;
         } else {
             // v4 HELLO carries scheme/principal/credentials.
-            if let Err(e) = self.authenticate(&extra) {
+            if let Err(e) = self.authenticate(&extra).await {
                 self.state = State::Failed;
                 return self
                     .write_failure("Neo.ClientError.Security.Unauthorized", e)
@@ -385,7 +432,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         let Request::Logon(extra) = req else {
             return self.invalid_state("LOGON required").await;
         };
-        if let Err(e) = self.authenticate(&extra) {
+        if let Err(e) = self.authenticate(&extra).await {
             self.state = State::Failed;
             return self
                 .write_failure("Neo.ClientError.Security.Unauthorized", e)
@@ -414,6 +461,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             },
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
+                // Drop any per-connection identity the embedder bound out of
+                // band, then return to the unauthenticated state. Without the
+                // first step, a later RESET (any-state → Ready) would let the
+                // connection keep executing as the logged-off principal.
+                self.backend.logoff().await;
                 self.state = State::Authentication;
                 self.write_response(Response::success_empty()).await
             }
@@ -602,7 +654,15 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         self.write_response(Response::Success(meta)).await
     }
 
-    fn authenticate(&self, extra: &BTreeMap<String, Value>) -> std::result::Result<(), String> {
+    async fn authenticate(
+        &self,
+        extra: &BTreeMap<String, Value>,
+    ) -> std::result::Result<(), String> {
+        // A custom authenticator owns the whole decision and receives the
+        // full auth map (scheme / principal / credentials).
+        if let AuthPolicy::Custom(authenticator) = &self.auth {
+            return authenticator.authenticate(extra).await;
+        }
         let scheme = extra
             .get("scheme")
             .and_then(|v| match v {
@@ -704,6 +764,102 @@ mod tests {
             auth,
             backend,
         )
+    }
+
+    /// LOGOFF must invoke `Backend::logoff()` so an embedder can drop the
+    /// per-connection identity it bound out of band — otherwise a later RESET
+    /// (any-state → Ready) would let the connection keep executing as the
+    /// logged-off principal. Regression test for that auth-state bypass.
+    #[tokio::test]
+    async fn logoff_invokes_backend_logoff_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LogoffBackend {
+            logged_off: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl Backend for LogoffBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                Ok(RunOutcome::default())
+            }
+            async fn logoff(&self) {
+                self.logged_off.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-conn".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(LogoffBackend {
+                logged_off: flag.clone(),
+            }),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        // HELLO + LOGON (open auth).
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("scheme".into(), Value::String("none".into()));
+                    m
+                })],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        assert!(!flag.load(Ordering::SeqCst), "logoff not called before LOGOFF");
+
+        // LOGOFF must ack AND invoke the hook.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGOFF,
+                fields: vec![],
+            }),
+        )
+        .await;
+        let resp = read_msg(&mut client).await;
+        assert!(matches!(decode_response(&resp), Response::Success(_)), "LOGOFF acked");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "LOGOFF must invoke Backend::logoff()"
+        );
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        let _ = task.await.unwrap();
     }
 
     async fn send_handshake<W: AsyncWriteExt + Unpin>(w: &mut W) {
@@ -973,5 +1129,94 @@ mod tests {
             labels: std::iter::once("X".to_string()).collect(),
             properties: BTreeMap::new(),
         };
+    }
+
+    /// Test authenticator: accept only when `credentials` matches.
+    struct ApiKeyAuth(&'static str);
+
+    #[async_trait]
+    impl Authenticator for ApiKeyAuth {
+        async fn authenticate(
+            &self,
+            auth: &BTreeMap<String, Value>,
+        ) -> std::result::Result<(), String> {
+            match auth.get("credentials") {
+                Some(Value::String(s)) if s == self.0 => Ok(()),
+                _ => Err("invalid api key".into()),
+            }
+        }
+    }
+
+    /// Drive handshake → HELLO (v5) → LOGON with `creds` under `policy`,
+    /// returning the LOGON reply.
+    async fn drive_logon(creds: &str, policy: AuthPolicy) -> Response {
+        let (mut client, server) = duplex(16 * 1024);
+        let session = fixture_session(server, RunOutcome::default(), policy);
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        // v5 HELLO carries no auth; it just moves to Authentication.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        // LOGON carries the credentials the custom authenticator checks.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("scheme".into(), Value::String("basic".into()));
+                    m.insert("credentials".into(), Value::String(creds.into()));
+                    m
+                })],
+            }),
+        )
+        .await;
+        let reply = decode_response(&read_msg(&mut client).await);
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        let _ = task.await.unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn custom_authenticator_accepts_valid_credentials() {
+        let policy = AuthPolicy::Custom(Arc::new(ApiKeyAuth("good-key")));
+        assert!(matches!(
+            drive_logon("good-key", policy).await,
+            Response::Success(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_authenticator_rejects_bad_credentials() {
+        let policy = AuthPolicy::Custom(Arc::new(ApiKeyAuth("good-key")));
+        match drive_logon("wrong", policy).await {
+            Response::Failure(meta) => assert_eq!(
+                meta.get("code"),
+                Some(&Value::String(
+                    "Neo.ClientError.Security.Unauthorized".into()
+                )),
+            ),
+            other => panic!("expected FAILURE, got {other:?}"),
+        }
     }
 }

@@ -569,9 +569,17 @@ fn lower_pattern_part(
         // fresh internal bindings so the path can be assembled; without
         // this the lower rejects them. See `fill_anonymous_path_bindings`.
         let element = ctx.fill_anonymous_path_bindings(&part.element);
-        validate_path_pattern_v0(&element)?;
         let plan = lower_pattern_element(&element, input, optional, shortest, ctx)?;
         ctx.introduce(&path_bind.name, path_bind.span)?;
+        // A variable-length path binding (`p = (a)-[*1..3]->(b)`) can't be
+        // assembled statically — the hop count varies per match. Thread the
+        // name to the Expand so the walker materialises the trail directly,
+        // exactly like shortestPath above: the executor builds the trail
+        // whenever `path_binding` is set (see `materialise_trail` in the
+        // walker), not only in shortestPath mode.
+        if element.chain.iter().any(|(rel, _)| rel.length.is_some()) {
+            return Ok(attach_path_binding(plan, &path_bind.name));
+        }
         let path_expr = build_path_constructor(&element, path_bind.span);
         return Ok(LogicalPlan::Project {
             input: Box::new(plan),
@@ -682,21 +690,6 @@ fn validate_shortest_path_pattern_v0(
     Ok(())
 }
 
-fn validate_path_pattern_v0(elem: &PatternElement) -> Result<(), LowerError> {
-    // Anonymous elements are filled with internal bindings before this
-    // runs (see `fill_anonymous_path_bindings`), so the only path-binding
-    // shape still unsupported in v0 is variable-length.
-    for (rel, _target) in &elem.chain {
-        if rel.length.is_some() {
-            return Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "variable-length path bindings (e.g. `p = (a)-[*1..3]->(b)`) are not yet supported",
-                rel.span,
-            ));
-        }
-    }
-    Ok(())
-}
 
 fn build_path_constructor(elem: &PatternElement, span: SourceSpan) -> Expression {
     let mut args: Vec<Expression> = Vec::with_capacity(1 + 2 * elem.chain.len());
