@@ -664,6 +664,13 @@ impl WriterSession {
         // Bolt, embedded) pick up the just-committed records without
         // taking the writer lock. See RFC-021.
         self.refresh_published();
+        // Invalidate the cross-snapshot property index. A commit adds new
+        // nodes to the live memtable, but a previously warmed value→NodeId
+        // map was frozen against an older snapshot and would otherwise hide
+        // the just-committed records from `lookup_node_by_property`
+        // (read-after-write bug). Subsequent snapshots rebuild on their
+        // first miss. Mirrors the reset in `flush`/`attach_ssts`.
+        self.property_index_cache.reset();
 
         // Auto-snapshot tick. Best effort: a snapshot is a cache, the
         // WAL is the source of truth. Log the failure and keep going
@@ -1123,6 +1130,61 @@ mod tests {
         let out = session.commit_batch().await.unwrap();
         assert_eq!(out, CommitOutcome::Empty);
         assert_eq!(session.manifest_version(), 0);
+    }
+
+    // Regression: a node committed via `commit_batch` (no flush) must be
+    // visible to `lookup_node_by_property` even after the cross-snapshot
+    // property index has been warmed for that (label, property) pair.
+    // Before the fix `commit_batch` did not reset the cache, so a warmed
+    // value→NodeId map (frozen on an older snapshot) hid the just-committed
+    // record and the lookup returned `None` (read-after-write bug).
+    #[tokio::test]
+    async fn commit_batch_resets_property_index_for_read_after_write() {
+        let store = make_store();
+        let paths = make_paths("ingest-ryow-prop-index");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        // Commit Alice.
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+
+        // Warm the property-index cache with a miss on a not-yet-existing
+        // value, freezing the (Person, name) -> {Alice} map.
+        {
+            let snap = session.snapshot();
+            let miss = snap
+                .lookup_node_by_property("Person", "name", "Bob")
+                .await
+                .unwrap();
+            assert!(miss.is_none(), "Bob does not exist yet");
+        }
+
+        // Commit Bob via the normal write path (no flush).
+        let bob = sorted_node_id(2);
+        session
+            .upsert_node("Person", bob, &node_record("Bob", Some(40)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap();
+
+        // Bob must now be visible BOTH to scan and to property lookup.
+        let snap = session.snapshot();
+        let scanned = snap.scan_label("Person").await.unwrap();
+        assert!(
+            scanned.iter().any(|v| v.id == bob),
+            "Bob must be visible to scan_label after commit"
+        );
+        let found = snap
+            .lookup_node_by_property("Person", "name", "Bob")
+            .await
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "Bob committed via commit_batch must be visible to \
+             lookup_node_by_property (property index cache reset on commit)"
+        );
     }
 
     #[tokio::test]

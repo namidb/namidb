@@ -21,6 +21,57 @@ below and in the release notes.
 
 ---
 
+## [0.12.0] - 2026-06-04: multi-label nodes, secondary indexes, per-label stats, pluggable Bolt auth
+
+This release reconciles two lines that forked at 0.11.0 and advanced in
+parallel: the published 0.11.x tags (pluggable Bolt auth, the logoff hook,
+variable-length path bindings) and main (multi-label nodes, the secondary
+equality index, per-label statistics). They are unified here, and releases
+are cut from `main` from now on. The intervening 0.11.0, 0.11.1 and 0.11.2
+tags shipped without changelog entries; their changes are folded below.
+
+### Added
+
+- **Multi-label nodes, end-to-end.** A node carries a set of labels rather
+  than one. New `LabelId`/`LabelDictionary` in the core, an id-primary
+  storage core that keeps the label set per node, Cypher that matches on any
+  subset of labels, intersection-aware cardinality for multi-label `MATCH`,
+  and Python bindings that read and write the label set.
+- **Secondary equality index for non-unique properties.** Indexed properties
+  that are not declared unique now get a value to node-set index (storage
+  half), and the planner uses it for equality predicates instead of scanning.
+- **Per-label property statistics (RFC-025, Phase 1).** Statistics are kept
+  per `(label, property)` so selectivity estimation no longer blends
+  unrelated labels.
+- **Pluggable Bolt authenticator.** Embedders can supply a custom
+  `Authenticator` instead of the built-in open/token schemes, plus a
+  `Backend::logoff` hook so they can drop per-connection identity on `LOGOFF`.
+- **Variable-length path bindings.** `MATCH p = (a)-[*1..2]->(b) RETURN p`
+  now binds the whole path to `p`.
+- **Real Bolt transactions.** `BEGIN`/`COMMIT`/`ROLLBACK` run as genuine
+  multi-statement transactions over the single-writer session.
+- **Background compaction scheduler.** A server task runs L0->L1 compaction
+  and orphan sweep on a tick.
+- **GUI client support.** G.V()/gdotv support (Neo4j connection type, write
+  counters, elementId point lookup) and Memgraph schema-introspection
+  procedures for GUI clients.
+- **Query surface.** `timestamp()` (epoch milliseconds), standard string,
+  math and list scalar builtins, `SKIP`/`LIMIT $parameter` resolution at
+  execution time, and synthesised bindings for anonymous elements in a
+  bound path.
+
+### Fixed
+
+- **Read-after-write through the property index.** `commit_batch` now resets
+  the cross-snapshot property index, the same way `flush` and `attach_ssts`
+  already did. Before this, a node committed without a flush could be
+  invisible to `lookup_node_by_property` once that `(label, property)` pair
+  had been warmed, returning stale or missing rows. Covered by a regression
+  test.
+- Python bindings adapted to the `NodeView` label set.
+
+---
+
 ## [0.10.0] - 2026-05-31: Live incremental sync (--watch, frontmatter links and aliases, nested tags)
 
 ### Added
