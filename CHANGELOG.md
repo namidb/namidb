@@ -28,6 +28,15 @@ below and in the release notes.
 
 ### Changed
 
+- Orphan sweep is now reference-counted and snapshot-horizon aware
+  (RFC-027), and enabled by default. It keeps every object referenced by
+  any manifest version from the retention horizon (the oldest version a
+  live reader is pinned to) up to current, then deletes the rest, so it
+  reclaims compaction inputs and failed-commit orphans without a
+  wall-clock guess and can never delete a body a live reader still needs.
+  `min_age` stays as a small secondary guard for the body-PUT-then-CAS
+  race; `NAMIDB_SWEEP_DELETE=false` keeps a dry-run available.
+
 ### Fixed
 
 - Read-your-own-writes within a statement and an open transaction
@@ -40,6 +49,11 @@ below and in the release notes.
   follow-up.
 
 ### Breaking
+
+- The orphan sweep deletes by default (`NAMIDB_SWEEP_DELETE` now defaults
+  to `true`); the retention horizon makes that safe. Set it to `false` to
+  keep the previous dry-run behaviour. The `namidb_storage::sweep_orphans`
+  function gained a `retention_horizon` parameter.
 
 ---
 

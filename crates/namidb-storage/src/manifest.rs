@@ -491,6 +491,19 @@ impl ManifestStore {
         ))
     }
 
+    /// Load a specific historical manifest version's immutable body
+    /// (`manifest/v{version}.json`). Manifest bodies are written once per
+    /// commit / flush / compaction and never mutated, so every version from
+    /// genesis to current is readable. The horizon-aware sweep uses this to
+    /// union the live object set across every retained version.
+    pub async fn load_manifest_at(&self, version: u64) -> Result<Manifest> {
+        let path = self.paths.manifest_version(version);
+        let res = self.store.get(&path).await?;
+        let body = res.bytes().await?;
+        let manifest: Manifest = serde_json::from_slice(&body)?;
+        Ok(manifest)
+    }
+
     /// Read `current.json`, then read the manifest it points at.
     #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn load_current(&self) -> Result<LoadedManifest> {

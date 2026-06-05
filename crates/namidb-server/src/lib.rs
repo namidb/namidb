@@ -46,8 +46,10 @@ pub struct Config {
     /// body — the sole guard against deleting a file a slow reader's pinned
     /// snapshot still references.
     pub sweep_min_age: Duration,
-    /// When `false` the orphan sweep is a dry-run (logs what it would free
-    /// without deleting). Operators opt in after reviewing the volume.
+    /// When `true` (the default) the orphan sweep deletes unreferenced SST
+    /// bodies; the retention horizon (RFC-027) makes that safe by
+    /// construction. Set `false` for a dry-run that only logs what it would
+    /// free.
     pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
@@ -224,9 +226,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // compaction. Compaction is a writer mutation, so it goes through the
     // ONE writer lock — never a second `WriterSession`, which would bump the
     // epoch and fence the foreground writer. The sweep takes no lock (it
-    // reads the committed manifest itself) and is gated to a dry-run by
-    // default; `sweep_min_age` is the only thing keeping it from deleting a
-    // body a slow reader's pinned snapshot still references.
+    // reads the committed manifest itself); the retention horizon (RFC-027)
+    // is what keeps it from deleting a body a slow reader's pinned snapshot
+    // still references, so it is safe to enable by default.
     if config.compaction_interval > Duration::ZERO {
         let state_for_maint = state.clone();
         let interval = config.compaction_interval;
@@ -259,8 +261,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     }
                 }
                 // Orphan sweep — no writer lock. `max_level = 1` because the
-                // engine only produces L0 + L1 today.
-                match sweep_orphans(&maint_manifest_store, sweep_min_age, 1, sweep_delete).await {
+                // engine only produces L0 + L1 today. The retention horizon
+                // (RFC-027) is the oldest manifest version any live reader is
+                // pinned to; the sweep keeps every object referenced from the
+                // horizon to current, so it can never delete a body a reader
+                // still needs.
+                let horizon = state_for_maint.snapshot.retention_horizon();
+                match sweep_orphans(
+                    &maint_manifest_store,
+                    horizon,
+                    sweep_min_age,
+                    1,
+                    sweep_delete,
+                )
+                .await
+                {
                     Ok(report) if report.orphans_found > 0 => info!(
                         found = report.orphans_found,
                         deleted = report.orphans_deleted,

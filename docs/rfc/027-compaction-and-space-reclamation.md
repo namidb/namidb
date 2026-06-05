@@ -4,7 +4,7 @@
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05
-**Implements:** (pending)
+**Implements:** P1 (horizon) + P2 (horizon-aware sweep) landed; P3 (version GC), P4 (leveled), P5 (reactive trigger) pending
 **Supersedes:** none
 
 ## Summary

@@ -67,10 +67,17 @@ struct Cli {
     )]
     sweep_min_age: Duration,
 
-    /// Actually delete orphaned SST bodies during the sweep. Off by
-    /// default: the sweep runs as a dry-run and only logs what it would
-    /// free, so an operator can review the volume before opting in.
-    #[arg(long, env = "NAMIDB_SWEEP_DELETE", default_value_t = false)]
+    /// Delete orphaned SST bodies during the sweep. On by default: the
+    /// retention horizon (RFC-027) makes deletion safe by construction (an
+    /// object referenced by no manifest version from the horizon to current
+    /// is unreachable by any reader). Set to `false` for a dry-run that only
+    /// logs what it would free.
+    #[arg(
+        long,
+        env = "NAMIDB_SWEEP_DELETE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
     sweep_delete: bool,
 
     /// Address for the Bolt protocol listener (Neo4j driver
