@@ -690,7 +690,6 @@ fn validate_shortest_path_pattern_v0(
     Ok(())
 }
 
-
 fn build_path_constructor(elem: &PatternElement, span: SourceSpan) -> Expression {
     let mut args: Vec<Expression> = Vec::with_capacity(1 + 2 * elem.chain.len());
     let head_name = elem.head.binding.as_ref().expect("validated").name.clone();

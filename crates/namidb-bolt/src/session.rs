@@ -50,10 +50,8 @@ pub struct ServerInfo {
 #[async_trait]
 pub trait Authenticator: Send + Sync {
     /// Authenticate a connection from its HELLO/LOGON auth map.
-    async fn authenticate(
-        &self,
-        auth: &BTreeMap<String, Value>,
-    ) -> std::result::Result<(), String>;
+    async fn authenticate(&self, auth: &BTreeMap<String, Value>)
+        -> std::result::Result<(), String>;
 }
 
 /// Auth policy applied to LOGON.
@@ -832,7 +830,10 @@ mod tests {
         )
         .await;
         let _ = read_msg(&mut client).await;
-        assert!(!flag.load(Ordering::SeqCst), "logoff not called before LOGOFF");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "logoff not called before LOGOFF"
+        );
 
         // LOGOFF must ack AND invoke the hook.
         write_msg(
@@ -844,7 +845,10 @@ mod tests {
         )
         .await;
         let resp = read_msg(&mut client).await;
-        assert!(matches!(decode_response(&resp), Response::Success(_)), "LOGOFF acked");
+        assert!(
+            matches!(decode_response(&resp), Response::Success(_)),
+            "LOGOFF acked"
+        );
         assert!(
             flag.load(Ordering::SeqCst),
             "LOGOFF must invoke Backend::logoff()"

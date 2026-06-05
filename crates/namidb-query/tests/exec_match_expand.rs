@@ -593,7 +593,10 @@ async fn var_length_path_binding_materialises_variable_trails() {
     .unwrap();
     let plan = lower(&q).unwrap();
     let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
-    assert!(!rows.is_empty(), "expected variable-length paths from Alice");
+    assert!(
+        !rows.is_empty(),
+        "expected variable-length paths from Alice"
+    );
     let mut lengths = std::collections::BTreeSet::new();
     for row in &rows {
         match row.get("p") {
