@@ -113,7 +113,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let new_row = apply_sets(items, row, writer, params, outcome)?;
+                    let new_row = apply_sets(items, row, writer, params, outcome).await?;
                     out.push(new_row);
                 }
                 Ok(out)
@@ -489,6 +489,53 @@ async fn enforce_unique_on_create(
     Ok(())
 }
 
+/// Enforce a unique constraint when SET assigns `value` to `key` on a node.
+/// If `key` is a declared unique property on any of the node's labels and a
+/// different node already holds `value`, reject. Setting the node's own
+/// current value (self-update) is allowed. Only string values are checked,
+/// matching the property index.
+async fn enforce_unique_on_set(
+    writer: &WriterSession,
+    labels: &[String],
+    key: &str,
+    value: &CoreValue,
+    self_id: NodeId,
+) -> Result<(), ExecError> {
+    let CoreValue::Str(v) = value else {
+        return Ok(());
+    };
+    let unique_labels: Vec<String> = {
+        let schema = writer.schema();
+        labels
+            .iter()
+            .filter(|l| {
+                schema.label(l).is_some_and(|d| {
+                    d.properties
+                        .iter()
+                        .any(|p| p.name.as_str() == key && p.unique)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    for label in &unique_labels {
+        let snap = writer.snapshot();
+        let existing = snap
+            .lookup_node_by_property(label, key, v)
+            .await
+            .map_err(ExecError::Storage)?;
+        drop(snap);
+        if let Some(node) = existing {
+            if node.id != self_id {
+                return Err(ExecError::Constraint(format!(
+                    "{label}.{key} = {v:?} already held by another node (unique constraint)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn apply_create(
     elements: &[CreateElement],
     mut row: Row,
@@ -635,7 +682,7 @@ async fn apply_create(
 
 // ──────────────────────────── SET ────────────────────────────────────
 
-fn apply_sets(
+async fn apply_sets(
     items: &[SetOp],
     mut row: Row,
     writer: &mut WriterSession,
@@ -643,12 +690,12 @@ fn apply_sets(
     outcome: &mut WriteOutcome,
 ) -> Result<Row, ExecError> {
     for op in items {
-        row = apply_set(op, row, writer, params, outcome)?;
+        row = apply_set(op, row, writer, params, outcome).await?;
     }
     Ok(row)
 }
 
-fn apply_set(
+async fn apply_set(
     op: &SetOp,
     mut row: Row,
     writer: &mut WriterSession,
@@ -665,6 +712,11 @@ fn apply_set(
             let core = runtime_to_core(&new_val, value).map_err(ExecError::Runtime)?;
             match row.get(target_alias).cloned() {
                 Some(RuntimeValue::Node(mut n)) => {
+                    // Enforce unique constraints if `key` is a declared unique
+                    // property on one of the node's labels. Self-update (setting
+                    // the node's own value) is allowed.
+                    let label_vec: Vec<String> = n.labels.iter().cloned().collect();
+                    enforce_unique_on_set(writer, &label_vec, key, &core, n.id).await?;
                     let mut core_props = node_runtime_props_to_core(&n.properties)?;
                     core_props.insert(key.clone(), core);
                     let record = NodeWriteRecord {
@@ -939,7 +991,7 @@ async fn apply_merge(
         let mut out = Vec::with_capacity(matches.len());
         for mut m_row in matches {
             for op in on_match_sets {
-                m_row = apply_set(op, m_row, writer, params, outcome)?;
+                m_row = apply_set(op, m_row, writer, params, outcome).await?;
             }
             out.push(m_row);
         }
@@ -949,7 +1001,7 @@ async fn apply_merge(
         let created = apply_create(pattern, row, writer, params, outcome).await?;
         let mut created = created;
         for op in on_create_sets {
-            created = apply_set(op, created, writer, params, outcome)?;
+            created = apply_set(op, created, writer, params, outcome).await?;
         }
         Ok(vec![created])
     }
@@ -1534,6 +1586,70 @@ mod tests {
             "a node staged by a failed write must not leak into the next commit"
         );
         assert_eq!(snap.scan_label("Other").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_duplicate_unique_property_but_allows_self() {
+        use crate::{lower, parse, Params};
+        use namidb_core::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+
+        let mut writer = WriterSession::open(store(), paths("write-set-unique"))
+            .await
+            .unwrap();
+
+        for q in [
+            "CREATE (a:Person {name: 'Ada'})",
+            "CREATE (b:Person {name: 'Bob'})",
+        ] {
+            execute_write(
+                &lower(&parse(q).unwrap()).unwrap(),
+                &mut writer,
+                &Params::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, true)
+                    .unwrap()
+                    .with_unique(true)],
+            })
+            .unwrap()
+            .build();
+        writer.flush(schema).await.unwrap();
+
+        // SET Bob.name = 'Ada' collides with Ada: rejected.
+        let dup = "MATCH (b:Person {name: 'Bob'}) SET b.name = 'Ada' RETURN b";
+        let err = execute_write(
+            &lower(&parse(dup).unwrap()).unwrap(),
+            &mut writer,
+            &Params::new(),
+        )
+        .await
+        .expect_err("setting a unique property to an existing value must be rejected");
+        assert!(matches!(err, ExecError::Constraint(_)), "got: {err:?}");
+
+        // SET Ada.name = 'Ada' is a self-update: allowed.
+        let same = "MATCH (a:Person {name: 'Ada'}) SET a.name = 'Ada' RETURN a";
+        execute_write(
+            &lower(&parse(same).unwrap()).unwrap(),
+            &mut writer,
+            &Params::new(),
+        )
+        .await
+        .unwrap();
+
+        // SET Ada.name = 'Alice' to a fresh value: allowed.
+        let fresh = "MATCH (a:Person {name: 'Ada'}) SET a.name = 'Alice' RETURN a";
+        execute_write(
+            &lower(&parse(fresh).unwrap()).unwrap(),
+            &mut writer,
+            &Params::new(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
