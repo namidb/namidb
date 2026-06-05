@@ -75,7 +75,17 @@ pub async fn execute_write(
     writer: &mut WriterSession,
     params: &Params,
 ) -> Result<WriteOutcome, ExecError> {
-    let outcome = execute_write_staged(plan, writer, params).await?;
+    let outcome = match execute_write_staged(plan, writer, params).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The statement failed after staging some mutations into the
+            // pending batch (writers are long-lived and shared, so the
+            // batch outlives this call). Drop them, or the next write on
+            // this writer would seal them with its own commit.
+            writer.discard_batch();
+            return Err(e);
+        }
+    };
     writer.commit_batch().await.map_err(ExecError::Storage)?;
     Ok(outcome)
 }
@@ -1486,6 +1496,44 @@ mod tests {
         execute_write(&lower(&ok).unwrap(), &mut writer, &Params::new())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_write_does_not_leak_into_the_next_commit() {
+        use crate::{lower, parse, Params};
+
+        let mut writer = WriterSession::open(store(), paths("write-discard-on-error"))
+            .await
+            .unwrap();
+
+        // Stages (a:Person) then fails on the second element's non-map
+        // spread. Before the fix the staged Person stayed in the pending
+        // batch of this long-lived writer.
+        let q = parse("CREATE (a:Person {name: 'Ada'}), (b:Ghost $props) RETURN a").unwrap();
+        let plan = lower(&q).unwrap();
+        let mut bad = Params::new();
+        bad.insert("props".to_string(), RuntimeValue::Integer(7));
+        let err = execute_write(&plan, &mut writer, &bad)
+            .await
+            .expect_err("non-map spread should fail the statement");
+        assert!(format!("{err:?}").contains("MAP"));
+
+        // A later, unrelated write commits on the same writer.
+        let q2 = parse("CREATE (c:Other {k: 1}) RETURN c").unwrap();
+        let plan2 = lower(&q2).unwrap();
+        execute_write(&plan2, &mut writer, &Params::new())
+            .await
+            .unwrap();
+
+        // The Person staged by the failed statement must NOT have been
+        // sealed by the second statement's commit.
+        let snap = writer.snapshot();
+        assert_eq!(
+            snap.scan_label("Person").await.unwrap().len(),
+            0,
+            "a node staged by a failed write must not leak into the next commit"
+        );
+        assert_eq!(snap.scan_label("Other").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

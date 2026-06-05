@@ -12,10 +12,23 @@ pub fn parse_query(src: &str, tokens: Vec<Spanned<Token>>) -> ParseResult<Query>
     Ok(q)
 }
 
+/// Cap on expression-nesting recursion. Deeply nested input (thousands of
+/// nested parens / lists / maps) would otherwise overflow the stack and
+/// abort the whole process. Every nested expression construct funnels
+/// through `parse_expr_bp`, and an evaluated expression can be no deeper
+/// than the AST the parser accepted, so this also bounds the
+/// expression-evaluation recursion in `exec::expr`. Real queries nest only
+/// a handful deep; this is generous yet far below the overflow threshold
+/// on a 2 MiB Tokio worker stack (both the parser and the evaluator recurse
+/// to at most this depth).
+const MAX_EXPRESSION_DEPTH: usize = 128;
+
 struct Parser<'src> {
     src: &'src str,
     tokens: Vec<Spanned<Token>>,
     pos: usize,
+    /// Current expression-nesting depth, bounded by [`MAX_EXPRESSION_DEPTH`].
+    depth: usize,
 }
 
 type ReturnTail = (Vec<OrderItem>, Option<Expression>, Option<Expression>);
@@ -26,6 +39,7 @@ impl<'src> Parser<'src> {
             src,
             tokens,
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -1019,6 +1033,26 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expression, ParseError> {
+        // Recursion guard. Every nested expression construct (parens, lists,
+        // maps, CASE, comprehensions, function args, pattern predicates)
+        // reaches its sub-expressions through here, so bounding the depth
+        // here bounds the whole recursive descent — and, since no evaluated
+        // expression is deeper than the parsed AST, the eval recursion too.
+        self.depth += 1;
+        if self.depth > MAX_EXPRESSION_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::new(
+                ErrorCode::RecursionLimit,
+                format!("expression nesting exceeds the limit of {MAX_EXPRESSION_DEPTH}"),
+                self.peek_span(),
+            ));
+        }
+        let result = self.parse_expr_bp_inner(min_bp);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expression, ParseError> {
         let mut lhs = self.parse_unary()?;
 
         loop {
@@ -2021,6 +2055,27 @@ mod tests {
             help.contains("relationship pattern"),
             "help should name the production, was: {help}"
         );
+    }
+
+    #[test]
+    fn deeply_nested_expression_is_rejected_not_crashed() {
+        // Thousands of nested parens must error gracefully rather than
+        // overflow the stack and abort the process. The parser bottoms out
+        // at MAX_EXPRESSION_DEPTH, so it only ever recurses to the limit
+        // regardless of how deep the input goes.
+        let n = 5000;
+        let src = format!("RETURN {}1{}", "(".repeat(n), ")".repeat(n));
+        assert_eq!(err_code(&src), ErrorCode::RecursionLimit);
+    }
+
+    #[test]
+    fn nesting_within_the_limit_still_parses() {
+        // Nesting comfortably under the limit must still parse: proves the
+        // guard does not reject reasonable input and that recursing to near
+        // the limit is itself stack-safe.
+        let n = MAX_EXPRESSION_DEPTH - 8;
+        let src = format!("RETURN {}1{}", "(".repeat(n), ")".repeat(n));
+        let _ = ok(&src);
     }
 
     #[test]
