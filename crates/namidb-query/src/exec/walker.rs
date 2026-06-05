@@ -38,6 +38,10 @@ pub enum ExecError {
     /// A declared schema constraint (e.g. a unique property) was violated by
     /// a write. Maps to `Neo.ClientError.Schema.ConstraintValidationFailed`.
     Constraint(String),
+    /// A read query ran past its wall-clock deadline (the server's
+    /// configured query timeout). Surfaced from the scan / expand loops and
+    /// at operator boundaries; never raised when no deadline is in scope.
+    Timeout,
 }
 
 impl fmt::Display for ExecError {
@@ -47,6 +51,7 @@ impl fmt::Display for ExecError {
             ExecError::Storage(e) => write!(f, "storage: {}", e),
             ExecError::Runtime(m) => write!(f, "runtime: {}", m),
             ExecError::Constraint(m) => write!(f, "constraint violation: {}", m),
+            ExecError::Timeout => write!(f, "query exceeded the configured timeout"),
         }
     }
 }
@@ -110,6 +115,21 @@ pub async fn execute(
     }
 }
 
+/// Like [`execute`], but bounded by an optional wall-clock `deadline`.
+///
+/// The server derives the deadline from its read query timeout. When set,
+/// the executor returns [`ExecError::Timeout`] if a long scan / expand or
+/// the operator dispatch crosses it. `None` is unbounded and behaves
+/// exactly like [`execute`].
+pub async fn execute_with_limits(
+    plan: &LogicalPlan,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<Row>, ExecError> {
+    crate::exec::limits::with_deadline(deadline, execute(plan, snapshot, params)).await
+}
+
 /// Always-flat entry point — bypasses the `NAMIDB_FACTORIZE` env check.
 /// Used by parity tests to compare the two paths side-by-side without
 /// global env mutation.
@@ -161,6 +181,10 @@ pub(crate) fn execute_inner_with_routing<'a>(
     routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
     async move {
+        // Deadline guard (read query timeout): one cheap check per operator
+        // invocation, so a deeply recursive plan is bounded between operators
+        // even before the long scan / expand loops below check it themselves.
+        crate::exec::limits::check_deadline()?;
         // PROFILE hook: when the caller wrapped this `execute` in a
         // `ProfileCollector` scope, time every operator and stash the
         // result against its node pointer. The pointer is stable for
@@ -855,6 +879,9 @@ async fn execute_expand(
 
     let mut out = Vec::new();
     for row in rows {
+        // Deadline guard: a multi-seed (or variable-length) expansion is the
+        // most expensive operator, so bound it at every seed boundary.
+        crate::exec::limits::check_deadline()?;
         // LIMIT-pushdown budget (set only via `execute_capped`, never on
         // the normal path). Checked at the seed boundary BEFORE processing
         // the next input row, so every consumed seed contributes its
@@ -1789,6 +1816,9 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
     routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
     async move {
+        // Deadline guard (read query timeout): one check per factor-path
+        // operator invocation, mirroring the flat path.
+        crate::exec::limits::check_deadline()?;
         match plan {
             // Operators that benefit directly: keep everything factorised.
             LogicalPlan::Empty => Ok(FactorRowSet::singleton_root()),

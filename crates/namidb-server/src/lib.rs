@@ -24,8 +24,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use namidb_query::{
-    execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
-    StatsCatalog, WriteOutcome,
+    execute_with_limits, execute_write, parse as cypher_parse, plan as build_plan, Params,
+    RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
@@ -56,6 +56,11 @@ pub struct Config {
     /// pin it; after this long without a message the transaction is rolled
     /// back and failed. `Duration::ZERO` disables the timeout.
     pub bolt_tx_timeout: Duration,
+    /// Wall-clock deadline for a single read query (HTTP and Bolt, including
+    /// in-transaction reads). A runaway scan or expansion is aborted with a
+    /// timeout error rather than pinning a worker. Writes are bounded by the
+    /// transaction lifecycle, not this. `Duration::ZERO` disables it.
+    pub query_timeout: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -77,6 +82,9 @@ pub struct AppState {
     catalog_cache: CatalogCache,
     auth_token: Option<Arc<str>>,
     namespace: String,
+    /// Per-read-query wall-clock budget. `Duration::ZERO` disables it.
+    /// Defaults to disabled; the server sets it from [`Config`] at boot.
+    query_timeout: Duration,
 }
 
 impl AppState {
@@ -88,7 +96,22 @@ impl AppState {
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             auth_token: auth_token.map(Arc::from),
             namespace,
+            query_timeout: Duration::ZERO,
         }
+    }
+
+    /// Set the per-read-query timeout (builder style). `Duration::ZERO`
+    /// leaves reads unbounded.
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
+    }
+
+    /// Deadline for a read query starting now, or `None` when the timeout
+    /// is disabled. Computed per query so each read gets the full budget.
+    pub(crate) fn query_deadline(&self) -> Option<std::time::Instant> {
+        (self.query_timeout > Duration::ZERO)
+            .then(|| std::time::Instant::now() + self.query_timeout)
     }
 
     /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
@@ -152,7 +175,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let maint_manifest_store = ManifestStore::new(store.clone(), paths.clone());
     let writer = WriterSession::open(store, paths).await?;
 
-    let state = AppState::new(writer, config.auth_token.clone(), namespace);
+    let state = AppState::new(writer, config.auth_token.clone(), namespace)
+        .with_query_timeout(config.query_timeout);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
@@ -449,7 +473,7 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
         let snap = owned.borrow();
-        match execute(&plan, &snap, &params).await {
+        match execute_with_limits(&plan, &snap, &params, state.query_deadline()).await {
             Ok(rows) => {
                 let (columns, rows) = rows_to_json(&rows);
                 Json(CypherResponse {

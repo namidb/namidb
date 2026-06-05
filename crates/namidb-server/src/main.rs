@@ -90,6 +90,18 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     bolt_tx_timeout: Duration,
+
+    /// Wall-clock budget for a single read query (HTTP and Bolt, including
+    /// in-transaction reads). A runaway scan or expansion is aborted with a
+    /// timeout error instead of pinning a worker. Set to `0s` to allow read
+    /// queries to run unbounded.
+    #[arg(
+        long,
+        env = "NAMIDB_QUERY_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    query_timeout: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,6 +123,7 @@ fn main() -> anyhow::Result<()> {
         sweep_delete: cli.sweep_delete,
         bolt_listen: cli.bolt_listen,
         bolt_tx_timeout: cli.bolt_tx_timeout,
+        query_timeout: cli.query_timeout,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

@@ -14,8 +14,8 @@ use namidb_bolt::{
     AuthPolicy, Backend, BackendError, RunOutcome, ServerInfo, Session, StatementType,
 };
 use namidb_query::{
-    execute, execute_write, execute_write_staged, parse as cypher_parse, plan as build_plan,
-    ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
+    execute_with_limits, execute_write, execute_write_staged, parse as cypher_parse,
+    plan as build_plan, ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
 };
 use namidb_storage::WriterSession;
 use tokio::net::TcpListener;
@@ -103,7 +103,9 @@ impl Backend for ServerBackend {
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
             let snap = owned.borrow();
-            let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
+            let rows = execute_with_limits(&plan, &snap, &params, self.state.query_deadline())
+                .await
+                .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }
@@ -183,7 +185,9 @@ impl Backend for ServerBackend {
                 .as_mut()
                 .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
             let snap = tx.writer.overlay_snapshot();
-            let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
+            let rows = execute_with_limits(&plan, &snap, &params, self.state.query_deadline())
+                .await
+                .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }

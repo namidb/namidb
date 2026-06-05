@@ -270,6 +270,15 @@ async fn boot_bolt(
     ns: &str,
     tx_timeout: Duration,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_full(ns, tx_timeout, Duration::ZERO).await
+}
+
+/// Like [`boot_bolt`] but also sets the per-read-query timeout.
+async fn boot_bolt_full(
+    ns: &str,
+    tx_timeout: Duration,
+    query_timeout: Duration,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bolt_addr = listener.local_addr().unwrap();
     drop(listener);
@@ -287,6 +296,7 @@ async fn boot_bolt(
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: tx_timeout,
+        query_timeout,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -328,6 +338,7 @@ async fn bolt_create_then_match_roundtrip() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -396,6 +407,7 @@ async fn bolt_bad_token_yields_failure() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -528,6 +540,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;
@@ -768,6 +781,38 @@ async fn bolt_in_tx_read_sees_own_staged_write() {
 
     commit(&mut stream).await;
     goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_read_query_times_out() {
+    // A 1ns read budget: the deadline (now + 1ns) is already past by the
+    // time the executor reaches its first operator guard, so a read RUN
+    // fails with a timeout instead of returning rows. Planning alone takes
+    // far longer than a nanosecond, so this is deterministic.
+    let (bolt_addr, task) =
+        boot_bolt_full("bolt-qtimeout", Duration::ZERO, Duration::from_nanos(1)).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("MATCH (p:Person) RETURN p".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let resp = recv_msg(&mut stream).await;
+    assert!(
+        matches!(resp, Response::Failure(_)),
+        "a read past its 1ns budget must fail, got {resp:?}"
+    );
+
+    // Session is FAILED after the error; just drop the connection.
     stream.shutdown().await.ok();
     task.abort();
 }

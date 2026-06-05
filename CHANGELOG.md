@@ -13,6 +13,13 @@ below and in the release notes.
 
 ### Added
 
+- Read query timeout (`NAMIDB_QUERY_TIMEOUT` / `--query-timeout`, default
+  `30s`, `0s` disables). A single HTTP or Bolt read, including a read
+  inside an open transaction, is bounded by a wall-clock deadline checked
+  at operator boundaries and inside the scan and expand loops; a query
+  that runs past it aborts with a timeout error instead of pinning a
+  worker. Writes are bounded by the transaction lifecycle, not by this.
+
 ### Changed
 
 ### Fixed

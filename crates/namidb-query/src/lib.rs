@@ -35,8 +35,9 @@ pub use cost::{
     estimate, BindingMeta, Cardinality, EdgeTypeStats, LabelStats, PropStats, StatsCatalog,
 };
 pub use exec::{
-    evaluate, execute, execute_factor_path, execute_flat_path, execute_write, execute_write_staged,
-    factorize_enabled, EvalError, ExecError, Params, Row, RuntimeValue, WriteOutcome,
+    evaluate, execute, execute_factor_path, execute_flat_path, execute_with_limits, execute_write,
+    execute_write_staged, factorize_enabled, EvalError, ExecError, Params, Row, RuntimeValue,
+    WriteOutcome,
 };
 pub use optimize::{convert_cross_to_hash, normalize_filters, optimize, predicate_pushdown};
 pub use parser::{parse, ParseError, ParseResult, Query};
