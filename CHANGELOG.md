@@ -21,7 +21,7 @@ below and in the release notes.
 
 ---
 
-## [0.12.0] - 2026-06-04: multi-label nodes, secondary indexes, per-label stats, pluggable Bolt auth
+## [0.12.0] - 2026-06-05: multi-label nodes, secondary indexes, per-label stats, pluggable Bolt auth, and a hardening pass
 
 This release reconciles two lines that forked at 0.11.0 and advanced in
 parallel: the published 0.11.x tags (pluggable Bolt auth, the logoff hook,
@@ -59,6 +59,11 @@ tags shipped without changelog entries; their changes are folded below.
   math and list scalar builtins, `SKIP`/`LIMIT $parameter` resolution at
   execution time, and synthesised bindings for anonymous elements in a
   bound path.
+- **Unique constraint enforcement on CREATE.** A property declared unique is
+  now enforced on write: creating a node whose unique string property
+  duplicates an existing value is rejected (over Bolt as
+  `Neo.ClientError.Schema.ConstraintValidationFailed`) instead of silently
+  upserting. `MERGE`'s create branch inherits the check.
 
 ### Fixed
 
@@ -68,7 +73,27 @@ tags shipped without changelog entries; their changes are folded below.
   invisible to `lookup_node_by_property` once that `(label, property)` pair
   had been warmed, returning stale or missing rows. Covered by a regression
   test.
+- **Failed writes no longer leak into the next commit.** A write statement
+  that errored after staging some mutations left them in the shared writer's
+  pending batch, where the next write's commit sealed them. The pending batch
+  is now discarded on a staged-execution error and always on ROLLBACK.
+- **Crash durability on the local backend.** Writes through the local
+  filesystem backend now fsync the file and its parent directory (and the
+  multipart path on completion), so a committed write survives an OS crash or
+  power loss. Previously the backend relied on `LocalFileSystem`'s tmp+rename
+  with no fsync, so self-hosted (non-S3) deployments were not crash-safe.
 - Python bindings adapted to the `NodeView` label set.
+
+### Security
+
+- **Bolt RESET no longer bypasses authentication.** A client could complete
+  the handshake and then send `RESET` to reach the READY state without
+  `HELLO`/`LOGON`, running queries unauthenticated even with a token
+  configured. RESET now only recovers an already-authenticated session.
+- **Parser recursion is bounded.** Deeply nested input (thousands of nested
+  parens, lists or maps) could overflow the stack and abort the whole
+  process. Expression nesting past a fixed depth is now rejected with a parse
+  error, which also bounds the expression evaluator.
 
 ---
 

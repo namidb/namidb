@@ -1,6 +1,6 @@
 # RFC 026: Read-your-own-writes within a statement and transaction
 
-**Status:** draft
+**Status:** accepted
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05

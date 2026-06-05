@@ -1,6 +1,6 @@
 # RFC 027: Multi-level compaction, tombstone GC, and safe space reclamation
 
-**Status:** draft
+**Status:** accepted
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05
