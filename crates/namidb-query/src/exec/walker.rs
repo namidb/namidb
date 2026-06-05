@@ -42,6 +42,10 @@ pub enum ExecError {
     /// configured query timeout). Surfaced from the scan / expand loops and
     /// at operator boundaries; never raised when no deadline is in scope.
     Timeout,
+    /// A read query tried to materialise more rows in one operator than the
+    /// server's configured row cap allows. Carries the cap. Never raised
+    /// when no cap is in scope.
+    RowCap(usize),
 }
 
 impl fmt::Display for ExecError {
@@ -52,6 +56,9 @@ impl fmt::Display for ExecError {
             ExecError::Runtime(m) => write!(f, "runtime: {}", m),
             ExecError::Constraint(m) => write!(f, "constraint violation: {}", m),
             ExecError::Timeout => write!(f, "query exceeded the configured timeout"),
+            ExecError::RowCap(cap) => {
+                write!(f, "query exceeded the configured row cap of {cap}")
+            }
         }
     }
 }
@@ -115,19 +122,23 @@ pub async fn execute(
     }
 }
 
-/// Like [`execute`], but bounded by an optional wall-clock `deadline`.
+/// Like [`execute`], but bounded by an optional wall-clock `deadline` and
+/// an optional `row_cap` (the maximum rows any single operator may
+/// materialise).
 ///
-/// The server derives the deadline from its read query timeout. When set,
-/// the executor returns [`ExecError::Timeout`] if a long scan / expand or
-/// the operator dispatch crosses it. `None` is unbounded and behaves
-/// exactly like [`execute`].
+/// The server derives both from its read query timeout and row cap. When
+/// set, the executor returns [`ExecError::Timeout`] if a long scan / expand
+/// or the operator dispatch crosses the deadline, or [`ExecError::RowCap`]
+/// if an operator would exceed the cap. `None`/`None` is unbounded and
+/// behaves exactly like [`execute`].
 pub async fn execute_with_limits(
     plan: &LogicalPlan,
     snapshot: &Snapshot<'_>,
     params: &Params,
     deadline: Option<std::time::Instant>,
+    row_cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
-    crate::exec::limits::with_deadline(deadline, execute(plan, snapshot, params)).await
+    crate::exec::limits::with_limits(deadline, row_cap, execute(plan, snapshot, params)).await
 }
 
 /// Always-flat entry point — bypasses the `NAMIDB_FACTORIZE` env check.
@@ -152,7 +163,9 @@ pub async fn execute_factor_path(
 ) -> Result<Vec<Row>, ExecError> {
     let routing = PlanRouting::analyze(plan);
     let set = execute_factor_inner_with_routing(plan, snapshot, params, None, &routing).await?;
-    Ok(set.materialize_all(None))
+    let rows = set.materialize_all(None);
+    crate::exec::limits::check_row_cap(rows.len())?;
+    Ok(rows)
 }
 
 /// Public wrapper for callers outside `walker.rs` (e.g. `writer.rs`,
@@ -466,6 +479,10 @@ pub(crate) fn execute_inner_with_routing<'a>(
             LogicalPlan::CrossProduct { left, right } => {
                 let l = execute_inner_with_routing(left, snapshot, params, outer, routing).await?;
                 let r = execute_inner_with_routing(right, snapshot, params, outer, routing).await?;
+                // Pre-check the multiplicative size before building the
+                // product Vec, so a runaway cross product aborts instead of
+                // allocating `l.len() * r.len()` rows first.
+                crate::exec::limits::check_row_cap(l.len().saturating_mul(r.len()))?;
                 Ok(cross_product(l, r))
             }
 
@@ -724,6 +741,14 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 ])
             }
         };
+        // Row-cap guard: bound the rows any single operator hands up. This
+        // covers every operator uniformly (NodeScan, Expand, CrossProduct,
+        // HashJoin, Unwind, ...); the most explosive producers also fail
+        // fast before fully materialising (see CrossProduct's pre-check and
+        // the Expand accumulation loop).
+        if let Ok(rows) = &result {
+            crate::exec::limits::check_row_cap(rows.len())?;
+        }
         if let Some(start) = profile_start {
             if let Ok(rows) = &result {
                 crate::profile::record_op(plan, start.elapsed(), rows.len() as u64);
@@ -879,9 +904,11 @@ async fn execute_expand(
 
     let mut out = Vec::new();
     for row in rows {
-        // Deadline guard: a multi-seed (or variable-length) expansion is the
-        // most expensive operator, so bound it at every seed boundary.
+        // Deadline + row-cap guards: a multi-seed (or variable-length)
+        // expansion is the most expensive operator, so bound it at every
+        // seed boundary and fail fast before `out` grows past the cap.
         crate::exec::limits::check_deadline()?;
+        crate::exec::limits::check_row_cap(out.len())?;
         // LIMIT-pushdown budget (set only via `execute_capped`, never on
         // the normal path). Checked at the seed boundary BEFORE processing
         // the next input row, so every consumed seed contributes its
@@ -2019,7 +2046,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     .await?;
                 let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing)
                     .await?;
-                Ok(cross_product_factor(l, r))
+                cross_product_factor(l, r)
             }
 
             LogicalPlan::HashJoin {
@@ -2222,6 +2249,9 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         }
                     }
                 }
+                // UNWIND amplifies each input row into its list, so guard the
+                // output (the flat path is bounded by the per-operator check).
+                crate::exec::limits::check_row_cap(out.len())?;
                 Ok(FactorRowSet::from_flat(out))
             }
 
@@ -2385,6 +2415,11 @@ async fn execute_expand_factor(
     let mut out_leaves: Vec<crate::exec::FactorIdx> = Vec::new();
 
     for parent_leaf in input_leaves {
+        // Deadline + row-cap guards, mirroring the flat `execute_expand`:
+        // a factor-path expansion is just as able to run long or to build
+        // an unbounded arena, so bound it at every seed boundary.
+        crate::exec::limits::check_deadline()?;
+        crate::exec::limits::check_row_cap(out_leaves.len())?;
         // Read the source binding from the chain. lookup_binding walks
         // root-ward without materialising the whole row.
         let starting = match arena.lookup_binding(parent_leaf, source) {
@@ -2920,13 +2955,19 @@ fn relationship_to_edge_direction(
 // independence). Bridge keeps the arena topologically simple — every
 // chain still has one parent — at the cost of materialising the right
 // row once per output leaf.
-fn cross_product_factor(left: FactorRowSet, right: FactorRowSet) -> FactorRowSet {
+fn cross_product_factor(
+    left: FactorRowSet,
+    right: FactorRowSet,
+) -> Result<FactorRowSet, ExecError> {
     if left.leaves.is_empty() || right.leaves.is_empty() {
-        return FactorRowSet {
+        return Ok(FactorRowSet {
             arena: left.arena,
             leaves: Vec::new(),
-        };
+        });
     }
+    // Pre-check the multiplicative size before building, mirroring the flat
+    // path, so a runaway cross product aborts instead of allocating first.
+    crate::exec::limits::check_row_cap(left.leaves.len().saturating_mul(right.leaves.len()))?;
     let FactorRowSet {
         mut arena,
         leaves: left_leaves,
@@ -2952,10 +2993,10 @@ fn cross_product_factor(left: FactorRowSet, right: FactorRowSet) -> FactorRowSet
             out_leaves.push(arena.push(l, slots));
         }
     }
-    FactorRowSet {
+    Ok(FactorRowSet {
         arena,
         leaves: out_leaves,
-    }
+    })
 }
 
 // Hash join: build side materialises to flat (the hash table requires
@@ -2981,6 +3022,7 @@ async fn hash_join_factor(
     let build_set =
         execute_factor_inner_with_routing(build_plan, snapshot, params, outer, routing).await?;
     let build_rows = build_set.materialize_all(None);
+    crate::exec::limits::check_row_cap(build_rows.len())?;
     let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();
     for row in build_rows {
@@ -3076,6 +3118,7 @@ async fn hash_semi_join_factor(
     let inner_set =
         execute_factor_inner_with_routing(inner_plan, snapshot, params, outer, routing).await?;
     let inner_rows = inner_set.materialize_all(None);
+    crate::exec::limits::check_row_cap(inner_rows.len())?;
     let mut key_set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();

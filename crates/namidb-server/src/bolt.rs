@@ -103,9 +103,15 @@ impl Backend for ServerBackend {
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
             let snap = owned.borrow();
-            let rows = execute_with_limits(&plan, &snap, &params, self.state.query_deadline())
-                .await
-                .map_err(map_exec_err)?;
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await
+            .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }
@@ -185,9 +191,15 @@ impl Backend for ServerBackend {
                 .as_mut()
                 .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
             let snap = tx.writer.overlay_snapshot();
-            let rows = execute_with_limits(&plan, &snap, &params, self.state.query_deadline())
-                .await
-                .map_err(map_exec_err)?;
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await
+            .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }

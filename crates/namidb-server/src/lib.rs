@@ -61,6 +61,11 @@ pub struct Config {
     /// timeout error rather than pinning a worker. Writes are bounded by the
     /// transaction lifecycle, not this. `Duration::ZERO` disables it.
     pub query_timeout: Duration,
+    /// Maximum rows a single read-query operator may materialise. A query
+    /// whose operator output would exceed this aborts with a row-cap error
+    /// instead of risking an out-of-memory blow-up (e.g. a cross product).
+    /// `0` disables it.
+    pub query_row_cap: usize,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -85,6 +90,9 @@ pub struct AppState {
     /// Per-read-query wall-clock budget. `Duration::ZERO` disables it.
     /// Defaults to disabled; the server sets it from [`Config`] at boot.
     query_timeout: Duration,
+    /// Per-read-query operator row cap. `0` disables it. Defaults to
+    /// disabled; the server sets it from [`Config`] at boot.
+    query_row_cap: usize,
 }
 
 impl AppState {
@@ -97,6 +105,7 @@ impl AppState {
             auth_token: auth_token.map(Arc::from),
             namespace,
             query_timeout: Duration::ZERO,
+            query_row_cap: 0,
         }
     }
 
@@ -107,11 +116,23 @@ impl AppState {
         self
     }
 
+    /// Set the per-read-query operator row cap (builder style). `0` leaves
+    /// reads uncapped.
+    pub fn with_query_row_cap(mut self, row_cap: usize) -> Self {
+        self.query_row_cap = row_cap;
+        self
+    }
+
     /// Deadline for a read query starting now, or `None` when the timeout
     /// is disabled. Computed per query so each read gets the full budget.
     pub(crate) fn query_deadline(&self) -> Option<std::time::Instant> {
         (self.query_timeout > Duration::ZERO)
             .then(|| std::time::Instant::now() + self.query_timeout)
+    }
+
+    /// Operator row cap for a read query, or `None` when disabled.
+    pub(crate) fn query_row_cap(&self) -> Option<usize> {
+        (self.query_row_cap > 0).then_some(self.query_row_cap)
     }
 
     /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
@@ -176,7 +197,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let writer = WriterSession::open(store, paths).await?;
 
     let state = AppState::new(writer, config.auth_token.clone(), namespace)
-        .with_query_timeout(config.query_timeout);
+        .with_query_timeout(config.query_timeout)
+        .with_query_row_cap(config.query_row_cap);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
@@ -473,7 +495,15 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
         let snap = owned.borrow();
-        match execute_with_limits(&plan, &snap, &params, state.query_deadline()).await {
+        match execute_with_limits(
+            &plan,
+            &snap,
+            &params,
+            state.query_deadline(),
+            state.query_row_cap(),
+        )
+        .await
+        {
             Ok(rows) => {
                 let (columns, rows) = rows_to_json(&rows);
                 Json(CypherResponse {

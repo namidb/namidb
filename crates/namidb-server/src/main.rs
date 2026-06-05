@@ -102,6 +102,13 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     query_timeout: Duration,
+
+    /// Maximum rows a single read-query operator may materialise. A query
+    /// whose operator output would exceed this aborts with a row-cap error
+    /// instead of risking an out-of-memory blow-up. Set to `0` to allow read
+    /// queries to materialise without limit.
+    #[arg(long, env = "NAMIDB_QUERY_ROW_CAP", default_value_t = 0)]
+    query_row_cap: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -124,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         bolt_listen: cli.bolt_listen,
         bolt_tx_timeout: cli.bolt_tx_timeout,
         query_timeout: cli.query_timeout,
+        query_row_cap: cli.query_row_cap,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

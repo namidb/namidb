@@ -297,6 +297,7 @@ async fn boot_bolt_full(
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: tx_timeout,
         query_timeout,
+        query_row_cap: 0,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -339,6 +340,7 @@ async fn bolt_create_then_match_roundtrip() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        query_row_cap: 0,
     };
 
     let server_task = tokio::spawn(async move {
@@ -408,6 +410,7 @@ async fn bolt_bad_token_yields_failure() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        query_row_cap: 0,
     };
 
     let server_task = tokio::spawn(async move {
@@ -541,6 +544,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        query_row_cap: 0,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

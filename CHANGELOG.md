@@ -19,6 +19,12 @@ below and in the release notes.
   at operator boundaries and inside the scan and expand loops; a query
   that runs past it aborts with a timeout error instead of pinning a
   worker. Writes are bounded by the transaction lifecycle, not by this.
+- Read query row cap (`NAMIDB_QUERY_ROW_CAP` / `--query-row-cap`, default
+  `0` = unlimited). Bounds the rows any single read-query operator may
+  materialise; a query whose operator output would exceed the cap aborts
+  with a row-cap error. The multiplicative cross product is rejected
+  before it builds, and a runaway expansion fails fast mid-loop, so a
+  pathological query cannot blow up memory first.
 
 ### Changed
 
