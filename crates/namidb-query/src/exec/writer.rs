@@ -523,7 +523,12 @@ async fn enforce_unique_on_set(
             .collect()
     };
     for label in &unique_labels {
-        let snap = writer.snapshot();
+        // Read-your-own-writes overlay (RFC-026): a SET that follows a
+        // CREATE in the same statement/transaction must see the staged row,
+        // so a duplicate value staged earlier in the batch is caught too,
+        // not just one already committed. Self-update stays allowed via the
+        // `self_id` check below.
+        let snap = writer.overlay_snapshot();
         let existing = snap
             .lookup_node_by_property(label, key, v)
             .await
