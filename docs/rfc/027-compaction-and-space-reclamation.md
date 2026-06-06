@@ -4,7 +4,7 @@
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05
-**Implements:** P1 (horizon) + P2 (horizon-aware sweep) + P3 (tombstone/version GC via full-bucket merge) landed; P4 (leveled), P5 (reactive trigger) pending
+**Implements:** P1 (horizon) + P2 (horizon-aware sweep) + P3 (tombstone/version GC via full-bucket merge) + P5 (reactive L0 trigger + soft write stall) landed; P4 (leveled compaction) deferred — see the follow-up note in Piece 1
 **Supersedes:** none
 
 ## Summary
@@ -76,6 +76,26 @@ The existing L0 to L1 merge becomes the first level transition; the merge
 machinery (`compact_node_ssts`, `compact_edge_ssts`) is reused, with the
 input set chosen by the level picker rather than always "all L0 in the
 bucket."
+
+**Status / follow-up (P4 deferred).** P1, P2, P3 and P5 have landed; P4 is
+deferred. Compaction today is full-bucket (every compaction merges all of a
+bucket's SSTs into one L1), which bounds space and read amplification but
+trades write amplification — it rewrites the whole bucket each time. True
+leveled compaction as described above needs key-range-partitioned SSTs
+(multiple non-overlapping files per level), which the current one-SST-per-
+bucket writer does not produce; that is its own piece of work.
+
+The interim plan for the follow-up is **leveled-lite**: keep one SST per
+`(bucket, level)` across L1..Lk with a per-level size budget
+(`budget(Li) = base * ratio^(i-1)`). Most compactions merge `L0 + L1 -> L1`
+(cheap); a level only cascades down (`Li + Li+1 -> Li+1`) when it exceeds
+its budget, so the large base level is rewritten rarely. Tombstone GC moves
+to "the merge whose output is the deepest occupied level," which is safe
+because the LSM invariant (lower level number holds the newer LSN for a
+key) guarantees any copy in a shallower level is newer and wins at read
+time, so dropping a deepest-level tombstone can never resurrect a row.
+Key-range-partitioned leveled (rewriting only overlapping ranges) is a
+later step on top of that.
 
 ### Piece 2: snapshot-retention horizon
 
