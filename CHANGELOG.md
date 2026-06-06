@@ -28,6 +28,15 @@ below and in the release notes.
 
 ### Changed
 
+- Compaction reclaims tombstones and superseded versions (RFC-027 P3).
+  Each compaction is now full-bucket: it merges a bucket's existing L1
+  with its new L0s into a single L1, so the result is the bucket's only
+  SST at the new version and a key whose newest version is a tombstone (or
+  a fully-deleted node/edge) is dropped entirely instead of carried
+  forever. A reader pinned at an older version still observes the delete
+  through the retained source bodies. This bounds on-disk size for
+  delete- and update-heavy workloads; the cost is a full-bucket rewrite
+  (write amplification), which leveled compaction will later bound.
 - Orphan sweep is now reference-counted and snapshot-horizon aware
   (RFC-027), and enabled by default. It keeps every object referenced by
   any manifest version from the retention horizon (the oldest version a

@@ -1,32 +1,37 @@
-//! Stateless L0 → L1 compaction.
+//! Full-bucket compaction to a single L1.
 //!
 //! Each [`crate::flush::flush`] call appends a new L0 SST per `(kind,
 //! scope)` bucket that had memtable rows. Without compaction, a
 //! namespace's L0 footprint grows monotonically with every batch and
 //! every point lookup pays an `O(L0 count)` candidate-SST scan.
 //!
-//! The compactor groups L0 SSTs by `(kind, scope)`, merges them into a
-//! single L1 SST per bucket, and commits a manifest version that
-//! removes the source descriptors and adds the new ones in a single
-//! CAS. The source SST bodies become orphans in object storage (no
-//! manifest version references them after the commit); a future
-//! janitor sweeps them.
+//! The compactor groups every SST by `(kind, scope)` — the new L0s *and*
+//! the bucket's existing L1 — merges them into a single L1 SST per bucket,
+//! and commits a manifest version that removes the source descriptors and
+//! adds the new one in a single CAS. The source SST bodies become orphans
+//! in object storage (no current manifest version references them after the
+//! commit); the horizon-aware [`crate::janitor::sweep_orphans`] reclaims
+//! them once no pinned reader needs them.
 //!
 //! ## Merge semantics
 //!
-//! Per `(node_id)` (nodes) or `(key_id, partner_id)` (edges): the row
-//! with the highest LSN wins. Tombstones at the winning LSN are
-//! preserved in the L1 SST — has no snapshot-retention policy
-//! so a tombstone might still be load-bearing for a reader pinned at
-//! a manifest version that pre-dates the compaction.
+//! Per `(node_id)` (nodes) or `(key_id, partner_id)` (edges): the row with
+//! the highest LSN wins; lower-LSN versions are dropped. Because the merge
+//! is full-bucket the resulting L1 is the bucket's only SST in the new
+//! version, so a winning **tombstone** shadows nothing and is dropped
+//! entirely (RFC-027 P3) rather than carried forever. A reader pinned at an
+//! older manifest version still observes the delete through the retained
+//! source bodies, never through this L1.
 //!
 //! ## What's deliberately not here
 //!
-//! - Multi-level compaction (L1 → L2, etc.). Only L0 → L1 in v1.
-//! - Background scheduling. The caller invokes [`compact_l0_to_l1`]
-//! manually; auto-trigger lands when the bench shape demands it.
-//! - Range-partitioned compaction (split a bucket into multiple L1
-//! files by key range). Each bucket emits exactly one L1 SST today.
+//! - Multi-level compaction (L1 → L2, etc.) with a size ratio. The bucket
+//! collapses to one L1; leveled compaction to bound write amplification is
+//! RFC-027 P4.
+//! - Background scheduling beyond the periodic maintenance tick; a reactive
+//! L0-count trigger and write stall are RFC-027 P5.
+//! - Range-partitioned compaction (split a bucket into multiple L1 files by
+//! key range). Each bucket emits exactly one L1 SST.
 //!
 //! Declared edge property streams (RFC-002 §3.2.7) are preserved
 //! end-to-end: the compactor reads each declared stream from every
@@ -91,14 +96,20 @@ pub async fn compact_l0_to_l1(
 ) -> Result<CompactionOutcome> {
     fence.assert_alive(base.manifest.epoch)?;
 
-    // Group L0 SSTs by (kind, scope).
+    // Group every SST by (kind, scope) — both L0 and any existing L1.
+    // Including the prior L1 makes each compaction a full-bucket merge: the
+    // resulting L1 is the bucket's only SST in the new manifest version, so
+    // it is authoritative for every key. That is what lets the merge drop
+    // tombstones and superseded versions safely (RFC-027 P3): no other SST
+    // at the new version can hold a live row the tombstone was shadowing,
+    // and a reader pinned at an older version reads the retained source
+    // bodies, not this L1 (the horizon-aware sweep keeps them alive). It
+    // also collapses the bucket back to one L1, bounding the footprint a
+    // pure L0->L1 merge let grow.
     let mut node_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut fwd_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut inv_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     for desc in &base.manifest.ssts {
-        if desc.level != SstLevel::L0 {
-            continue;
-        }
         match desc.kind {
             SstKind::Nodes => node_buckets
                 .entry(desc.scope.clone())
@@ -121,6 +132,24 @@ pub async fn compact_l0_to_l1(
     let mut removed_ids: Vec<Uuid> = Vec::new();
     let mut bloom_count: usize = 0;
 
+    // Node tombstone GC is safe only when the merge is authoritative for
+    // every node key it touches. Nodes are id-primary, so a key can live in
+    // any node SST regardless of scope; if more than one node scope is
+    // present (a legacy per-label SST alongside the id-primary `""` one), a
+    // full-bucket merge of a single scope is NOT authoritative and dropping
+    // a tombstone could resurrect a live row from the other scope. Restrict
+    // node GC to the single-scope case (the id-primary norm). Edges are
+    // keyed within `(edge_type, direction)`, so every edge bucket is
+    // authoritative on its own and GC is always safe there.
+    let node_scopes: HashSet<&str> = base
+        .manifest
+        .ssts
+        .iter()
+        .filter(|d| d.kind == SstKind::Nodes)
+        .map(|d| d.scope.as_str())
+        .collect();
+    let node_gc_safe = node_scopes.len() <= 1;
+
     // Nodes.
     for (label, sources) in node_buckets {
         if sources.len() < 2 {
@@ -135,7 +164,7 @@ pub async fn compact_l0_to_l1(
             let body = get_sst_body(store.as_ref(), paths, desc).await?;
             readers.push(NodeSstReader::open(label_def.clone(), body)?);
         }
-        let (finish, merged_rows) = compact_node_ssts(&label_def, &readers)?;
+        let (finish, merged_rows) = compact_node_ssts(&label_def, &readers, node_gc_safe)?;
         if finish.stats.row_count == 0 {
             // Nothing to write; still mark sources for removal so the
             // bucket truly shrinks.
@@ -267,6 +296,7 @@ async fn compact_and_write_edges(
 fn compact_node_ssts(
     label_def: &LabelDef,
     sources: &[NodeSstReader],
+    gc_tombstones: bool,
 ) -> Result<(NodeSstFinish, Vec<NodeRow>)> {
     let mut rows: Vec<NodeRow> = Vec::new();
     for reader in sources {
@@ -276,6 +306,17 @@ fn compact_node_ssts(
     // dedup_by_key below preserves the winner.
     rows.sort_by(|a, b| a.id.cmp(&b.id).then(b.lsn.cmp(&a.lsn)));
     rows.dedup_by_key(|r| r.id);
+    // Tombstone GC (RFC-027 P3): a key whose winning op is a tombstone has
+    // no live value, and when this merge is authoritative for the node
+    // keyspace (`gc_tombstones`, see the caller) it is the only SST that
+    // could hold the key at the new manifest version, so the tombstone
+    // shadows nothing and is dropped entirely. Readers pinned at older
+    // versions still see the delete through the retained source bodies (the
+    // horizon-aware sweep keeps them). This is what stops a delete-heavy
+    // workload from carrying its tombstones forever.
+    if gc_tombstones {
+        rows.retain(|r| !matches!(r.op, MemOp::Tombstone));
+    }
     let finish = build_node_sst(label_def, &rows)?;
     // Caller (`put_node_sst_l1`) consumes the merged rows to re-emit
     // the unique-property side-cars; without this, post-compaction
@@ -446,6 +487,11 @@ fn compact_edge_ssts(
             .then(b.lsn.cmp(&a.lsn))
     });
     rows.dedup_by_key(|r| (r.key_id, r.partner_id));
+    // Tombstone GC (RFC-027 P3), same reasoning as the node path: a
+    // full-bucket merge is authoritative for the (edge_type, direction)
+    // bucket, so a winning tombstone shadows nothing in the new version and
+    // is dropped. Old readers see the delete through retained source bodies.
+    rows.retain(|r| !r.tombstone);
 
     build_edge_sst(edge_type, edge_def, &rows, direction)
 }
@@ -978,13 +1024,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.source_ssts_removed, 2);
-        assert_eq!(out.new_ssts_written, 1);
+        // RFC-027 P3: the winning op for `alice` is a tombstone, so the
+        // full-bucket merge drops it entirely — the node bucket is now empty
+        // and no L1 SST is written at all (the delete is fully reclaimed).
+        assert_eq!(out.new_ssts_written, 0);
 
         let mt = Memtable::new();
         let mt_view = mt.snapshot_view();
         let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
         let v = snap.lookup_node("Person", alice).await.unwrap();
-        assert!(v.is_none(), "tombstone in L1 must hide the upsert");
+        assert!(v.is_none(), "the deleted node stays absent after GC");
+    }
+
+    #[tokio::test]
+    async fn full_bucket_compaction_gcs_tombstone_arriving_after_l1() {
+        // Steady-state GC: alice+bob land and compact to an L1, then alice is
+        // deleted in a later flush. The next compaction is full-bucket (it
+        // pulls the prior L1 in as a source), so alice's tombstone is GC'd
+        // without resurrecting her, bob survives, and the bucket stays at one
+        // L1. This is the case a pure L0->L1 merge could never reclaim.
+        let s = store();
+        let p = paths("compact-gc-steady");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        // Seed the dict so the on-row LabelId(0) resolves to "Person".
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+
+        // Flush alice (L0 #1) and bob (L0 #2), then compact to one L1.
+        let mut mt1 = Memtable::new();
+        mt1.apply(
+            MemKey::Node { id: alice },
+            1,
+            MemOp::Upsert(node_payload("Alice", Some(30))),
+        );
+        let after1 = flush(&ms, &fence, &base, &mt1.freeze(), schema())
+            .await
+            .unwrap();
+        let mut mt2 = Memtable::new();
+        mt2.apply(
+            MemKey::Node { id: bob },
+            2,
+            MemOp::Upsert(node_payload("Bob", Some(40))),
+        );
+        let after2 = flush(&ms, &fence, &after1.committed, &mt2.freeze(), schema())
+            .await
+            .unwrap();
+        let comp1 = compact_l0_to_l1(&ms, &fence, &after2.committed, &schema())
+            .await
+            .unwrap();
+        assert_eq!(comp1.new_ssts_written, 1, "alice+bob collapse to one L1");
+        let l1_count = comp1
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == SstKind::Nodes)
+            .count();
+        assert_eq!(l1_count, 1);
+
+        // Delete alice in a later flush (L0 #3).
+        let mut mt3 = Memtable::new();
+        mt3.apply(MemKey::Node { id: alice }, 9, MemOp::Tombstone);
+        let after3 = flush(&ms, &fence, &comp1.committed, &mt3.freeze(), schema())
+            .await
+            .unwrap();
+
+        // Full-bucket compaction: prior L1 + the tombstone L0 are both
+        // sources, so alice's tombstone is dropped and bob is kept.
+        let comp2 = compact_l0_to_l1(&ms, &fence, &after3.committed, &schema())
+            .await
+            .unwrap();
+        assert_eq!(
+            comp2.source_ssts_removed, 2,
+            "the prior L1 and the tombstone L0 are both merged"
+        );
+        assert_eq!(comp2.new_ssts_written, 1, "bob remains in one L1");
+        let node_ssts = comp2
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == SstKind::Nodes)
+            .collect::<Vec<_>>();
+        assert_eq!(node_ssts.len(), 1, "bucket stays at one L1");
+        let tombstone_count = match &node_ssts[0].kind_specific {
+            KindSpecificStats::Nodes { tombstone_count } => *tombstone_count,
+            other => panic!("expected node stats, got {other:?}"),
+        };
+        assert_eq!(
+            tombstone_count, 0,
+            "the GC'd tombstone is not carried into the new L1"
+        );
+
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(comp2.committed.clone(), &mt_view, s, p);
+        assert!(
+            snap.lookup_node("Person", alice).await.unwrap().is_none(),
+            "alice stays deleted after GC, not resurrected"
+        );
+        assert!(
+            snap.lookup_node("Person", bob).await.unwrap().is_some(),
+            "bob survives the GC compaction"
+        );
     }
 
     #[tokio::test]
