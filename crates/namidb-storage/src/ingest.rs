@@ -60,7 +60,9 @@ use crate::compact::{compact_l0_to_l1, CompactionOutcome};
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
-use crate::manifest::{LoadedManifest, Manifest, ManifestStore, WalSegmentDescriptor};
+use crate::manifest::{
+    LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, WalSegmentDescriptor,
+};
 use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
 use crate::paths::NamespacePaths;
@@ -307,6 +309,23 @@ impl WriterSession {
     /// Current manifest version visible to this writer.
     pub fn manifest_version(&self) -> u64 {
         self.current.manifest.version
+    }
+
+    /// The largest number of L0 SSTs in any single `(kind, scope)` bucket
+    /// of the current manifest. A point lookup on a bucket pays an
+    /// `O(L0 count)` candidate scan, so this is the worst-case read
+    /// amplification right now. The server uses it to trigger compaction
+    /// reactively (rather than only on the periodic tick) and to apply a
+    /// soft write stall when L0 outpaces compaction (RFC-027 P5).
+    pub fn max_l0_bucket_len(&self) -> usize {
+        let mut counts: std::collections::HashMap<(SstKind, &str), usize> =
+            std::collections::HashMap::new();
+        for sst in &self.current.manifest.ssts {
+            if sst.level == SstLevel::L0 {
+                *counts.entry((sst.kind, sst.scope.as_str())).or_insert(0) += 1;
+            }
+        }
+        counts.values().copied().max().unwrap_or(0)
     }
 
     /// Number of mutations queued and not yet durable.
@@ -1796,6 +1815,36 @@ mod tests {
         // Nothing was applied to the memtable: the batch never ACKed.
         let snap = session.snapshot();
         assert!(snap.lookup_node("Person", alice).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn max_l0_bucket_len_counts_l0_and_drops_after_compaction() {
+        // RFC-027 P5 signal: each flush adds one L0 SST to the node bucket,
+        // so the worst-bucket L0 count grows with flushes and collapses to
+        // zero L0 once compaction folds them into an L1.
+        let store = make_store();
+        let paths = make_paths("ingest-l0-count");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        assert_eq!(session.max_l0_bucket_len(), 0);
+
+        for i in 0..3u8 {
+            session
+                .upsert_node("Person", sorted_node_id(i), &node_record("p", None))
+                .unwrap();
+            session.flush(schema()).await.unwrap();
+        }
+        assert_eq!(
+            session.max_l0_bucket_len(),
+            3,
+            "three flushes leave three L0 SSTs in the node bucket"
+        );
+
+        session.compact_l0(&schema()).await.unwrap();
+        assert_eq!(
+            session.max_l0_bucket_len(),
+            0,
+            "compaction folds the L0 SSTs into an L1, clearing the L0 count"
+        );
     }
 
     #[tokio::test]

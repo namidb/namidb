@@ -25,6 +25,14 @@ below and in the release notes.
   with a row-cap error. The multiplicative cross product is rejected
   before it builds, and a runaway expansion fails fast mid-loop, so a
   pathological query cannot blow up memory first.
+- Reactive compaction trigger and soft write stall (RFC-027 P5).
+  `NAMIDB_COMPACTION_L0_TRIGGER` (default `8`) compacts a bucket as soon
+  as a flush leaves it with that many L0 SSTs, instead of waiting for the
+  periodic compaction tick, so read amplification stays bounded under
+  sustained writes. `NAMIDB_WRITE_STALL_L0` (default `0` = off) with
+  `NAMIDB_WRITE_STALL_DELAY` (default `50ms`) applies backpressure to a
+  committed write when L0 climbs past the threshold, so the writer cannot
+  outrun compaction without bound.
 
 ### Changed
 

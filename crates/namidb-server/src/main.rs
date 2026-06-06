@@ -116,6 +116,29 @@ struct Cli {
     /// queries to materialise without limit.
     #[arg(long, env = "NAMIDB_QUERY_ROW_CAP", default_value_t = 0)]
     query_row_cap: usize,
+
+    /// L0-count high-water mark per bucket that triggers a compaction as
+    /// soon as a flush crosses it, instead of waiting for the periodic
+    /// compaction tick. Bounds read amplification under sustained writes.
+    /// Set to `0` to disable the reactive trigger.
+    #[arg(long, env = "NAMIDB_COMPACTION_L0_TRIGGER", default_value_t = 8)]
+    compaction_l0_trigger: usize,
+
+    /// L0-count per bucket above which a committed write is softly stalled
+    /// by `--write-stall-delay`, so the writer cannot outrun compaction
+    /// without bound. Set to `0` (the default) to disable the stall.
+    #[arg(long, env = "NAMIDB_WRITE_STALL_L0", default_value_t = 0)]
+    write_stall_l0: usize,
+
+    /// Delay applied to a committed write while L0 is above
+    /// `--write-stall-l0`. Ignored when the stall is disabled.
+    #[arg(
+        long,
+        env = "NAMIDB_WRITE_STALL_DELAY",
+        default_value = "50ms",
+        value_parser = humantime::parse_duration,
+    )]
+    write_stall_delay: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -139,6 +162,9 @@ fn main() -> anyhow::Result<()> {
         bolt_tx_timeout: cli.bolt_tx_timeout,
         query_timeout: cli.query_timeout,
         query_row_cap: cli.query_row_cap,
+        compaction_l0_trigger: cli.compaction_l0_trigger,
+        write_stall_l0: cli.write_stall_l0,
+        write_stall_delay: cli.write_stall_delay,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

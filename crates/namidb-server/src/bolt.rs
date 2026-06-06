@@ -97,6 +97,13 @@ impl Backend for ServerBackend {
                 .await
                 .map_err(map_exec_err)?;
             self.state.snapshot.store(writer.owned_snapshot());
+            // Soft write stall (RFC-027 P5): sample under the lock, release,
+            // then back off this request if L0 is piling up.
+            let stall = self.state.write_stall_for(writer.max_l0_bucket_len());
+            drop(writer);
+            if let Some(delay) = stall {
+                tokio::time::sleep(delay).await;
+            }
             Ok(write_run_outcome(outcome))
         } else {
             // Read path: borrow a short-lived `Snapshot` from the owned

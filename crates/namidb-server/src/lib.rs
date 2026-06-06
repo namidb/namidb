@@ -68,6 +68,17 @@ pub struct Config {
     /// instead of risking an out-of-memory blow-up (e.g. a cross product).
     /// `0` disables it.
     pub query_row_cap: usize,
+    /// L0-count high-water mark per bucket that triggers a compaction as
+    /// soon as a flush crosses it, instead of waiting for the periodic
+    /// compaction tick (RFC-027 P5). Keeps read amplification bounded under
+    /// sustained writes. `0` disables the reactive trigger.
+    pub compaction_l0_trigger: usize,
+    /// L0-count per bucket above which writes are softly stalled by
+    /// `write_stall_delay` (RFC-027 P5), so the writer cannot outrun
+    /// compaction without bound. `0` disables the stall.
+    pub write_stall_l0: usize,
+    /// Delay applied to a write when L0 is above `write_stall_l0`.
+    pub write_stall_delay: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -95,6 +106,13 @@ pub struct AppState {
     /// Per-read-query operator row cap. `0` disables it. Defaults to
     /// disabled; the server sets it from [`Config`] at boot.
     query_row_cap: usize,
+    /// Soft write-stall threshold and delay (RFC-027 P5). When the worst
+    /// bucket's L0 count reaches `write_stall_l0` (and it is non-zero), a
+    /// committed write waits `write_stall_delay` before returning, applying
+    /// backpressure so the writer cannot outrun compaction. Defaults to
+    /// disabled; the server sets them from [`Config`] at boot.
+    write_stall_l0: usize,
+    write_stall_delay: Duration,
 }
 
 impl AppState {
@@ -108,7 +126,28 @@ impl AppState {
             namespace,
             query_timeout: Duration::ZERO,
             query_row_cap: 0,
+            write_stall_l0: 0,
+            write_stall_delay: Duration::ZERO,
         }
+    }
+
+    /// Set the soft write-stall threshold and delay (builder style). A
+    /// threshold of `0` leaves writes unstalled.
+    pub fn with_write_stall(mut self, l0_threshold: usize, delay: Duration) -> Self {
+        self.write_stall_l0 = l0_threshold;
+        self.write_stall_delay = delay;
+        self
+    }
+
+    /// If a write should be stalled given the worst bucket's current L0
+    /// count, the delay to apply; otherwise `None`. The caller samples
+    /// `max_l0_bucket_len()` while holding the writer lock, then sleeps
+    /// after releasing it.
+    pub(crate) fn write_stall_for(&self, max_l0: usize) -> Option<Duration> {
+        (self.write_stall_l0 > 0
+            && max_l0 >= self.write_stall_l0
+            && self.write_stall_delay > Duration::ZERO)
+            .then_some(self.write_stall_delay)
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -200,12 +239,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let state = AppState::new(writer, config.auth_token.clone(), namespace)
         .with_query_timeout(config.query_timeout)
-        .with_query_row_cap(config.query_row_cap);
+        .with_query_row_cap(config.query_row_cap)
+        .with_write_stall(config.write_stall_l0, config.write_stall_delay);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
         let state_for_flush = state.clone();
         let interval = config.flush_interval;
+        // Reactive compaction trigger (RFC-027 P5): when a flush leaves a
+        // bucket with >= this many L0 SSTs, compact immediately under the
+        // same writer lock rather than waiting for the periodic compaction
+        // tick, so read amplification does not spike between ticks.
+        let l0_trigger = config.compaction_l0_trigger;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // first tick fires immediately; skip.
@@ -213,8 +258,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 tick.tick().await;
                 let mut w = state_for_flush.writer.lock().await;
                 let schema = w.snapshot().manifest().manifest.schema.clone();
-                match w.flush(schema).await {
-                    Ok(_) => state_for_flush.snapshot.store(w.owned_snapshot()),
+                match w.flush(schema.clone()).await {
+                    Ok(_) => {
+                        state_for_flush.snapshot.store(w.owned_snapshot());
+                        if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
+                            match w.compact_l0(&schema).await {
+                                Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                    state_for_flush.snapshot.store(w.owned_snapshot());
+                                    info!(
+                                        removed = outcome.source_ssts_removed,
+                                        written = outcome.new_ssts_written,
+                                        "reactive compaction (L0 high-water)"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => error!(error = %e, "reactive compaction failed"),
+                            }
+                        }
+                    }
                     Err(e) => error!(error = %e, "periodic flush failed"),
                 }
             }
@@ -483,11 +544,24 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
 
     if plan.contains_write() {
         let mut writer = state.writer.lock().await;
-        match execute_write(&plan, &mut writer, &params).await {
+        let result = execute_write(&plan, &mut writer, &params).await;
+        // Sample the soft write-stall decision while still holding the lock
+        // (RFC-027 P5), then release it and sleep — backpressure applies to
+        // this request, not to the writer mutex other connections need.
+        let stall = if result.is_ok() {
+            // Refresh the published snapshot so subsequent reads see the
+            // just-committed records (RFC-021).
+            state.snapshot.store(writer.owned_snapshot());
+            state.write_stall_for(writer.max_l0_bucket_len())
+        } else {
+            None
+        };
+        drop(writer);
+        if let Some(delay) = stall {
+            tokio::time::sleep(delay).await;
+        }
+        match result {
             Ok(outcome) => {
-                // Refresh the published snapshot so subsequent reads
-                // see the just-committed records (RFC-021).
-                state.snapshot.store(writer.owned_snapshot());
                 let summary = WriteSummary::from(&outcome);
                 let (columns, rows) = rows_to_json(&outcome.rows);
                 Json(CypherResponse {
@@ -743,6 +817,41 @@ mod tests {
         );
         let c4 = state.catalog_for(&m1);
         assert!(Arc::ptr_eq(&c3, &c4));
+    }
+
+    #[tokio::test]
+    async fn write_stall_for_respects_threshold() {
+        // RFC-027 P5 backpressure decision. Disabled by default.
+        let (store, paths) = namidb_storage::parse_uri("memory://test-stall-off").unwrap();
+        let off = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        );
+        assert!(
+            off.write_stall_for(1_000).is_none(),
+            "disabled: never stalls"
+        );
+
+        // Enabled: stall only at or above the threshold.
+        let (store2, paths2) = namidb_storage::parse_uri("memory://test-stall-on").unwrap();
+        let on = AppState::new(
+            WriterSession::open(store2, paths2).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_write_stall(8, Duration::from_millis(50));
+        assert_eq!(on.write_stall_for(7), None, "below threshold");
+        assert_eq!(
+            on.write_stall_for(8),
+            Some(Duration::from_millis(50)),
+            "at threshold"
+        );
+        assert_eq!(
+            on.write_stall_for(99),
+            Some(Duration::from_millis(50)),
+            "above threshold"
+        );
     }
 
     #[tokio::test]
