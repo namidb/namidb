@@ -23,7 +23,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 \
+        ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home namidb
 
@@ -34,5 +34,10 @@ EXPOSE 8080
 
 ENV NAMIDB_LISTEN=0.0.0.0:8080 \
     RUST_LOG=info
+
+# Liveness: /v0/livez takes no lock and reads no namespace state, so a busy
+# engine (a long write or compaction holding the writer lock) still answers.
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/v0/livez || exit 1
 
 ENTRYPOINT ["/usr/local/bin/namidb-server"]
