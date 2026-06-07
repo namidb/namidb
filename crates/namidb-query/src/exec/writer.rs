@@ -447,13 +447,54 @@ fn apply_spread_properties(
     Ok(())
 }
 
-/// Enforce declared unique constraints for a node about to be created.
-/// Each label's unique string-valued properties are checked against the
-/// read-your-own-writes overlay (RFC-026), so a duplicate value staged
-/// earlier in the same uncommitted statement/transaction is caught too,
-/// not just one already committed. Returns [`ExecError::Constraint`] on the
-/// first duplicate. Non-string unique properties are not checked (the
-/// property index keys on strings).
+/// Find a node, other than `exclude`, that already holds `value` for the
+/// declared-unique property `prop` on `label`. The lookup runs against the
+/// read-your-own-writes overlay (RFC-026), so a value staged earlier in the
+/// same uncommitted statement/transaction is seen too.
+///
+/// A string value uses the `O(log N)` property index. Any other type falls
+/// back to a label scan and a typed-value compare, because the persisted
+/// property index keys on strings; this enforces non-string unique
+/// constraints correctly, at a scan's cost per check (a typed index is a
+/// later optimisation).
+async fn find_unique_conflict(
+    writer: &WriterSession,
+    label: &str,
+    prop: &str,
+    value: &CoreValue,
+    exclude: Option<NodeId>,
+) -> Result<Option<NodeId>, ExecError> {
+    let snap = writer.overlay_snapshot();
+    let conflict = match value {
+        CoreValue::Str(v) => snap
+            .lookup_node_by_property(label, prop, v)
+            .await
+            .map_err(ExecError::Storage)?
+            .map(|node| node.id)
+            .filter(|id| Some(*id) != exclude),
+        other => {
+            let mut found = None;
+            for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
+                if Some(node.id) == exclude {
+                    continue;
+                }
+                if node.properties.get(prop) == Some(other) {
+                    found = Some(node.id);
+                    break;
+                }
+            }
+            found
+        }
+    };
+    drop(snap);
+    Ok(conflict)
+}
+
+/// Enforce declared unique constraints for a node about to be created. Each
+/// label's unique properties (of any type) are checked against the
+/// read-your-own-writes overlay (RFC-026), so a duplicate value staged earlier
+/// in the same uncommitted statement/transaction is caught too, not just one
+/// already committed. Returns [`ExecError::Constraint`] on the first duplicate.
 async fn enforce_unique_on_create(
     writer: &WriterSession,
     labels: &[String],
@@ -461,15 +502,15 @@ async fn enforce_unique_on_create(
 ) -> Result<(), ExecError> {
     // Collect the (label, property, value) checks first so the borrow of the
     // schema is released before we take a snapshot.
-    let checks: Vec<(&str, &str, &str)> = {
+    let checks: Vec<(String, String, CoreValue)> = {
         let schema = writer.schema();
         let mut checks = Vec::new();
         for label in labels {
             if let Some(def) = schema.label(label) {
                 for prop in &def.properties {
                     if prop.unique {
-                        if let Some(CoreValue::Str(v)) = core_props.get(&prop.name) {
-                            checks.push((label.as_str(), prop.name.as_str(), v.as_str()));
+                        if let Some(v) = core_props.get(&prop.name) {
+                            checks.push((label.clone(), prop.name.clone(), v.clone()));
                         }
                     }
                 }
@@ -478,13 +519,10 @@ async fn enforce_unique_on_create(
         checks
     };
     for (label, prop, value) in checks {
-        let snap = writer.overlay_snapshot();
-        let existing = snap
-            .lookup_node_by_property(label, prop, value)
-            .await
-            .map_err(ExecError::Storage)?;
-        drop(snap);
-        if existing.is_some() {
+        if find_unique_conflict(writer, &label, &prop, &value, None)
+            .await?
+            .is_some()
+        {
             return Err(ExecError::Constraint(format!(
                 "{label}.{prop} = {value:?} already exists (unique constraint)"
             )));
@@ -496,8 +534,8 @@ async fn enforce_unique_on_create(
 /// Enforce a unique constraint when SET assigns `value` to `key` on a node.
 /// If `key` is a declared unique property on any of the node's labels and a
 /// different node already holds `value`, reject. Setting the node's own
-/// current value (self-update) is allowed. Only string values are checked,
-/// matching the property index.
+/// current value (self-update) is allowed. Values of any type are checked;
+/// see [`find_unique_conflict`] for how string vs non-string is resolved.
 async fn enforce_unique_on_set(
     writer: &WriterSession,
     labels: &[String],
@@ -505,9 +543,6 @@ async fn enforce_unique_on_set(
     value: &CoreValue,
     self_id: NodeId,
 ) -> Result<(), ExecError> {
-    let CoreValue::Str(v) = value else {
-        return Ok(());
-    };
     let unique_labels: Vec<String> = {
         let schema = writer.schema();
         labels
@@ -523,23 +558,17 @@ async fn enforce_unique_on_set(
             .collect()
     };
     for label in &unique_labels {
-        // Read-your-own-writes overlay (RFC-026): a SET that follows a
-        // CREATE in the same statement/transaction must see the staged row,
-        // so a duplicate value staged earlier in the batch is caught too,
-        // not just one already committed. Self-update stays allowed via the
-        // `self_id` check below.
-        let snap = writer.overlay_snapshot();
-        let existing = snap
-            .lookup_node_by_property(label, key, v)
-            .await
-            .map_err(ExecError::Storage)?;
-        drop(snap);
-        if let Some(node) = existing {
-            if node.id != self_id {
-                return Err(ExecError::Constraint(format!(
-                    "{label}.{key} = {v:?} already held by another node (unique constraint)"
-                )));
-            }
+        // Read-your-own-writes overlay (RFC-026): a SET that follows a CREATE
+        // in the same statement/transaction must see the staged row. The
+        // node's own row is excluded via `self_id`, so a self-update (or a
+        // no-op write of the same value) is allowed.
+        if find_unique_conflict(writer, label, key, value, Some(self_id))
+            .await?
+            .is_some()
+        {
+            return Err(ExecError::Constraint(format!(
+                "{label}.{key} = {value:?} already held by another node (unique constraint)"
+            )));
         }
     }
     Ok(())

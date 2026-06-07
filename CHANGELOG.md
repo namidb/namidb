@@ -41,6 +41,17 @@ below and in the release notes.
   where the LSM invariant (a shallower level holds the newer LSN for a key)
   guarantees the dropped tombstone shadows nothing.
 
+### Fixed
+
+- Unique constraints are enforced for non-string properties. A property
+  declared unique is now checked on `CREATE` and `SET` regardless of type,
+  not only for strings: a duplicate integer, float, bool, date or other value
+  is rejected with a constraint error, the same as a duplicate string. String
+  values keep using the `O(log N)` property index; other types fall back to a
+  label scan and a typed-value compare (a typed index is a later
+  optimisation). The check reads through the read-your-own-writes overlay, so
+  an intra-batch duplicate is caught too.
+
 ## [0.13.0] - 2026-06-07: read-your-own-writes for nodes, compaction space reclamation, query timeout and row cap
 
 ### Added
