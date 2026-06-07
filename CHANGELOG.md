@@ -11,8 +11,17 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-07: read-your-own-writes for nodes, compaction space reclamation, query timeout and row cap
+
 ### Added
 
+- Unique constraint enforcement on `SET`. A property declared unique is now
+  enforced when an existing node's value changes through `SET`, not only on
+  `CREATE`: a `SET` that would collide with another node's value for that
+  property is rejected with a constraint-validation error, while rewriting a
+  node's own value (or a no-op write) is allowed. The check reads through the
+  read-your-own-writes overlay, so a value staged earlier in the same
+  uncommitted batch is considered too.
 - Read query timeout (`NAMIDB_QUERY_TIMEOUT` / `--query-timeout`, default
   `30s`, `0s` disables). A single HTTP or Bolt read, including a read
   inside an open transaction, is bounded by a wall-clock deadline checked
@@ -1054,7 +1063,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/namidb/namidb/releases/tag/v0.13.0
 [0.4.1]: https://github.com/namidb/namidb/releases/tag/v0.4.1
 [0.4.0]: https://github.com/namidb/namidb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/namidb/namidb/releases/tag/v0.3.0
