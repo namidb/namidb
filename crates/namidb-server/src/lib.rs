@@ -8,6 +8,7 @@
 
 pub mod bolt;
 mod introspect;
+pub mod metrics;
 pub mod tls;
 
 use std::sync::Arc;
@@ -29,6 +30,8 @@ use namidb_query::{
     RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
+
+use crate::metrics::{Metrics, Protocol, QueryKind};
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -86,6 +89,11 @@ pub struct Config {
     pub tls_cert: Option<std::path::PathBuf>,
     /// PEM private-key file paired with `tls_cert`.
     pub tls_key: Option<std::path::PathBuf>,
+    /// Wall-clock at or above which a query is logged at `warn!` as a slow
+    /// query (the statement text, never its parameters). The Prometheus
+    /// counters and latency histograms at `/v0/metrics` are always on
+    /// regardless of this. `Duration::ZERO` disables the slow-query log.
+    pub slow_query_threshold: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -120,6 +128,11 @@ pub struct AppState {
     /// disabled; the server sets them from [`Config`] at boot.
     write_stall_l0: usize,
     write_stall_delay: Duration,
+    /// Process-wide query metrics, shared across every connection on both
+    /// serving paths. Rendered at `/v0/metrics` and the home of the
+    /// slow-query log. Defaults to a registry with the slow-query log
+    /// disabled; the server sets the threshold from [`Config`] at boot.
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -135,7 +148,16 @@ impl AppState {
             query_row_cap: 0,
             write_stall_l0: 0,
             write_stall_delay: Duration::ZERO,
+            metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
         }
+    }
+
+    /// Set the slow-query threshold (builder style). `Duration::ZERO` leaves
+    /// the slow-query log off. Replaces the metrics registry, so call this at
+    /// boot before any query is served.
+    pub fn with_slow_query_threshold(mut self, threshold: Duration) -> Self {
+        self.metrics = Metrics::new(env!("CARGO_PKG_VERSION"), threshold);
+        self
     }
 
     /// Set the soft write-stall threshold and delay (builder style). A
@@ -202,13 +224,15 @@ impl AppState {
 }
 
 /// Assemble the `axum` router with every public route + auth
-/// middleware. `/v0/livez`, `/v0/health` and `/v0/version` are intentionally
-/// excluded from the auth check (a healthcheck probe carries no token).
+/// middleware. `/v0/livez`, `/v0/health`, `/v0/version` and `/v0/metrics` are
+/// intentionally excluded from the auth check (a healthcheck probe or a
+/// Prometheus scraper carries no token).
 pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
         .route("/v0/livez", get(livez))
         .route("/v0/health", get(health))
-        .route("/v0/version", get(version));
+        .route("/v0/version", get(version))
+        .route("/v0/metrics", get(metrics_handler));
 
     let private = Router::new()
         .route("/v0/cypher", post(cypher))
@@ -248,7 +272,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState::new(writer, config.auth_token.clone(), namespace)
         .with_query_timeout(config.query_timeout)
         .with_query_row_cap(config.query_row_cap)
-        .with_write_stall(config.write_stall_l0, config.write_stall_delay);
+        .with_write_stall(config.write_stall_l0, config.write_stall_delay)
+        .with_slow_query_threshold(config.slow_query_threshold);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
@@ -561,6 +586,19 @@ async fn version() -> impl IntoResponse {
     })
 }
 
+/// Prometheus scrape endpoint. Renders the process query metrics in the text
+/// exposition format. Unauthenticated, like the health probes, so a scraper
+/// needs no bearer token.
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        state.metrics.render(),
+    )
+}
+
 #[derive(Deserialize)]
 struct CypherRequest {
     query: String,
@@ -597,25 +635,62 @@ impl From<&WriteOutcome> for WriteSummary {
     }
 }
 
+/// One executed query, classified for metrics: read vs write (`None` if it
+/// failed before planning), whether it succeeded, the wall-clock it took
+/// (measured up to the end of execution, excluding any write-stall sleep), and
+/// the HTTP response to return.
+struct ObservedQuery {
+    kind: Option<QueryKind>,
+    ok: bool,
+    elapsed: Duration,
+    response: Response,
+}
+
 async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -> Response {
+    // The guard drops at the end of the handler, so the in-flight gauge is
+    // correct even on an early error return.
+    let _in_flight = state.metrics.track_in_flight();
+    let obs = run_cypher(&state, &req).await;
+    state
+        .metrics
+        .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
+    obs.response
+}
+
+/// Run one HTTP Cypher request and classify it for metrics. Mirrors the Bolt
+/// `ServerBackend::run` path; the two do not share a chokepoint, so the
+/// parse/plan/execute logic is intentionally parallel.
+async fn run_cypher(state: &AppState, req: &CypherRequest) -> ObservedQuery {
+    let started = std::time::Instant::now();
+
     let parsed = match cypher_parse(&req.query) {
         Ok(p) => p,
         Err(errs) => {
             let first = &errs[0];
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: format!("parse error: {} at {}", first.message, first.span),
-                }),
-            )
-                .into_response();
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("parse error: {} at {}", first.message, first.span),
+                    }),
+                )
+                    .into_response(),
+            };
         }
     };
 
     let params = match params_from_json(&req.params) {
         Ok(p) => p,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response(),
+            };
         }
     };
 
@@ -626,13 +701,18 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
         match build_plan(&parsed, &catalog) {
             Ok(p) => p,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody {
-                        error: format!("plan error: {e}"),
-                    }),
-                )
-                    .into_response();
+                return ObservedQuery {
+                    kind: None,
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorBody {
+                            error: format!("plan error: {e}"),
+                        }),
+                    )
+                        .into_response(),
+                };
             }
         }
     };
@@ -652,6 +732,10 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
             None
         };
         drop(writer);
+        // Stop the clock before the backpressure sleep: the stall is
+        // intentional throttling, not query cost, so it must not inflate the
+        // latency histogram or trip the slow-query log.
+        let elapsed = started.elapsed();
         if let Some(delay) = stall {
             tokio::time::sleep(delay).await;
         }
@@ -659,51 +743,72 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
             Ok(outcome) => {
                 let summary = WriteSummary::from(&outcome);
                 let (columns, rows) = rows_to_json(&outcome.rows);
-                Json(CypherResponse {
-                    columns,
-                    rows,
-                    write_outcome: Some(summary),
-                })
-                .into_response()
+                ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: true,
+                    elapsed,
+                    response: Json(CypherResponse {
+                        columns,
+                        rows,
+                        write_outcome: Some(summary),
+                    })
+                    .into_response(),
+                }
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: format!("write execution failed: {e}"),
-                }),
-            )
-                .into_response(),
+            Err(e) => ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("write execution failed: {e}"),
+                    }),
+                )
+                    .into_response(),
+            },
         }
     } else {
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
         let snap = owned.borrow();
-        match execute_with_limits(
+        let result = execute_with_limits(
             &plan,
             &snap,
             &params,
             state.query_deadline(),
             state.query_row_cap(),
         )
-        .await
-        {
+        .await;
+        let elapsed = started.elapsed();
+        match result {
             Ok(rows) => {
                 let (columns, rows) = rows_to_json(&rows);
-                Json(CypherResponse {
-                    columns,
-                    rows,
-                    write_outcome: None,
-                })
-                .into_response()
+                ObservedQuery {
+                    kind: Some(QueryKind::Read),
+                    ok: true,
+                    elapsed,
+                    response: Json(CypherResponse {
+                        columns,
+                        rows,
+                        write_outcome: None,
+                    })
+                    .into_response(),
+                }
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    error: format!("read execution failed: {e}"),
-                }),
-            )
-                .into_response(),
+            Err(e) => ObservedQuery {
+                kind: Some(QueryKind::Read),
+                ok: false,
+                elapsed,
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("read execution failed: {e}"),
+                    }),
+                )
+                    .into_response(),
+            },
         }
     }
 }
@@ -1083,6 +1188,79 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], "Alice");
         assert_eq!(rows[0]["age"], 30);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_public_and_renders_prometheus() {
+        // Even with auth set, the scrape carries no bearer token and must
+        // still be served, like the health probes.
+        let app = fixture(Some("secret")).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v0/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content-type was {ct}");
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("namidb_build_info{version="));
+        assert!(text.contains("namidb_queries_total{protocol=\"http\",status=\"ok\"}"));
+        assert!(text.contains("namidb_query_duration_seconds_bucket"));
+    }
+
+    #[tokio::test]
+    async fn cypher_request_increments_query_metrics() {
+        let app = fixture(None).await;
+
+        // One successful read query.
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"query": "MATCH (n) RETURN n"}))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        // The shared metrics registry (Arc on the cloned state) reflects it.
+        let scrape = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v0/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(scrape.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("namidb_queries_total{protocol=\"http\",status=\"ok\"} 1"),
+            "metrics did not count the read query:\n{text}"
+        );
+        assert!(
+            text.contains("namidb_query_duration_seconds_count{protocol=\"http\",kind=\"read\"} 1"),
+            "read histogram did not record the query:\n{text}"
+        );
     }
 
     #[tokio::test]

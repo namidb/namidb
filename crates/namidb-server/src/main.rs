@@ -148,6 +148,18 @@ struct Cli {
     /// PEM private-key file paired with `--tls-cert`.
     #[arg(long, env = "NAMIDB_TLS_KEY")]
     tls_key: Option<std::path::PathBuf>,
+
+    /// Wall-clock at or above which a query is logged at WARN as a slow query
+    /// (the statement text, never its parameters). The Prometheus counters and
+    /// latency histograms at `/v0/metrics` are always on regardless of this.
+    /// Set to `0s` to turn the slow-query log off.
+    #[arg(
+        long,
+        env = "NAMIDB_SLOW_QUERY_THRESHOLD",
+        default_value = "1s",
+        value_parser = humantime::parse_duration,
+    )]
+    slow_query_threshold: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -176,6 +188,7 @@ fn main() -> anyhow::Result<()> {
         write_stall_delay: cli.write_stall_delay,
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,
+        slow_query_threshold: cli.slow_query_threshold,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

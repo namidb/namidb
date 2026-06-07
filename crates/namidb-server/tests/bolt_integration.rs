@@ -303,6 +303,7 @@ async fn boot_bolt_full(
         write_stall_delay: Duration::ZERO,
         tls_cert: None,
         tls_key: None,
+        slow_query_threshold: Duration::ZERO,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -351,6 +352,7 @@ async fn bolt_create_then_match_roundtrip() {
         write_stall_delay: Duration::ZERO,
         tls_cert: None,
         tls_key: None,
+        slow_query_threshold: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -426,6 +428,7 @@ async fn bolt_bad_token_yields_failure() {
         write_stall_delay: Duration::ZERO,
         tls_cert: None,
         tls_key: None,
+        slow_query_threshold: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -565,6 +568,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         write_stall_delay: Duration::ZERO,
         tls_cert: None,
         tls_key: None,
+        slow_query_threshold: Duration::ZERO,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

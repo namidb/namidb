@@ -23,7 +23,18 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::metrics::{Protocol, QueryKind};
 use crate::AppState;
+
+/// One executed Bolt query, classified for metrics: read vs write (`None` if
+/// it failed before planning), the wall-clock it took (up to the end of
+/// execution, excluding any write-stall sleep), and the outcome the protocol
+/// returns to the driver.
+struct RunObservation {
+    kind: Option<QueryKind>,
+    elapsed: std::time::Duration,
+    result: std::result::Result<RunOutcome, BackendError>,
+}
 
 /// In-flight explicit transaction (BEGIN..COMMIT/ROLLBACK). Holds the
 /// global writer lock for the whole transaction so no other writer — nor
@@ -52,6 +63,195 @@ impl ServerBackend {
             tx: Mutex::new(None),
         }
     }
+
+    /// Auto-commit query: parse, plan, and execute against the published
+    /// snapshot (reads) or the writer lock (writes), timing the work for the
+    /// metrics. Mirrors the HTTP `run_cypher`. The stopwatch stops at the end
+    /// of execution, before the optional write-stall sleep, so backpressure is
+    /// not counted as query latency.
+    async fn run_query(&self, cypher: &str, params: Params) -> RunObservation {
+        let started = std::time::Instant::now();
+
+        let parsed = match cypher_parse(cypher) {
+            Ok(p) => p,
+            Err(errs) => {
+                let first = &errs[0];
+                return RunObservation {
+                    kind: None,
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Syntax(format!(
+                        "{} at {}",
+                        first.message, first.span
+                    ))),
+                };
+            }
+        };
+        // Plan against the latest published snapshot — no writer lock.
+        let owned = self.state.snapshot.load();
+        let catalog = self.state.catalog_for(&owned.manifest().manifest);
+        let plan = match build_plan(&parsed, &catalog).map_err(map_lower_err) {
+            Ok(p) => p,
+            Err(e) => {
+                return RunObservation {
+                    kind: None,
+                    elapsed: started.elapsed(),
+                    result: Err(e),
+                };
+            }
+        };
+
+        if plan.contains_write() {
+            // Writes still take the writer lock (single-writer invariant).
+            // On success we refresh the snapshot cell so subsequent reads
+            // see the just-committed records (RFC-021).
+            let mut writer = self.state.writer.lock().await;
+            match execute_write(&plan, &mut writer, &params).await {
+                Ok(outcome) => {
+                    self.state.snapshot.store(writer.owned_snapshot());
+                    // Soft write stall (RFC-027 P5): sample under the lock,
+                    // release, then back off this request if L0 is piling up.
+                    let stall = self.state.write_stall_for(writer.max_l0_bucket_len());
+                    drop(writer);
+                    let elapsed = started.elapsed();
+                    if let Some(delay) = stall {
+                        tokio::time::sleep(delay).await;
+                    }
+                    RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed,
+                        result: Ok(write_run_outcome(outcome)),
+                    }
+                }
+                Err(e) => {
+                    drop(writer);
+                    RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed: started.elapsed(),
+                        result: Err(map_exec_err(e)),
+                    }
+                }
+            }
+        } else {
+            // Read path: borrow a short-lived `Snapshot` from the owned
+            // snapshot; the Arc keeps the underlying memtable alive for
+            // the duration of the query, no writer lock needed.
+            let snap = owned.borrow();
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            RunObservation {
+                kind: Some(QueryKind::Read),
+                elapsed,
+                result: rows.map(read_run_outcome).map_err(map_exec_err),
+            }
+        }
+    }
+
+    /// In-transaction query: stage writes into the held transaction's writer
+    /// (no commit) or read with the staged batch overlaid (RFC-026), timing the
+    /// work for the metrics. Mirrors the auto-commit `run_query`.
+    async fn run_query_in_tx(&self, cypher: &str, params: Params) -> RunObservation {
+        let started = std::time::Instant::now();
+
+        let parsed = match cypher_parse(cypher) {
+            Ok(p) => p,
+            Err(errs) => {
+                let first = &errs[0];
+                return RunObservation {
+                    kind: None,
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Syntax(format!(
+                        "{} at {}",
+                        first.message, first.span
+                    ))),
+                };
+            }
+        };
+        let owned = self.state.snapshot.load();
+        let catalog = self.state.catalog_for(&owned.manifest().manifest);
+        let plan = match build_plan(&parsed, &catalog).map_err(map_lower_err) {
+            Ok(p) => p,
+            Err(e) => {
+                return RunObservation {
+                    kind: None,
+                    elapsed: started.elapsed(),
+                    result: Err(e),
+                };
+            }
+        };
+
+        if plan.contains_write() {
+            // Stage into the transaction's held writer; do NOT commit. The
+            // RETURN rows are computed during the apply, so they stream now.
+            let mut slot = self.tx.lock().await;
+            let tx = match slot.as_mut() {
+                Some(tx) => tx,
+                None => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed: started.elapsed(),
+                        result: Err(BackendError::Other("no open transaction".into())),
+                    };
+                }
+            };
+            let result = match execute_write_staged(&plan, &mut tx.writer, &params).await {
+                Ok(outcome) => {
+                    tx.staged = true;
+                    Ok(write_run_outcome(outcome))
+                }
+                Err(e) => {
+                    // A failed statement aborts the transaction. Drop whatever
+                    // it (or an earlier statement) staged so a stray COMMIT
+                    // cannot seal a partial write; the session moves to FAILED
+                    // and the client must ROLLBACK / RESET.
+                    tx.writer.discard_batch();
+                    Err(map_exec_err(e))
+                }
+            };
+            RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result,
+            }
+        } else {
+            // Read against the transaction's own writer so the staged batch
+            // is visible (RFC-026). The writer pins the committed state at
+            // tx-begin (no commit happens mid-tx while we hold the lock) and
+            // overlays everything statements 1..N-1 staged.
+            let mut slot = self.tx.lock().await;
+            let tx = match slot.as_mut() {
+                Some(tx) => tx,
+                None => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Read),
+                        elapsed: started.elapsed(),
+                        result: Err(BackendError::Other("no open transaction".into())),
+                    };
+                }
+            };
+            let snap = tx.writer.overlay_snapshot();
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            RunObservation {
+                kind: Some(QueryKind::Read),
+                elapsed,
+                result: rows.map(read_run_outcome).map_err(map_exec_err),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -65,6 +265,8 @@ impl Backend for ServerBackend {
         // GUIs) hits procedures the Cypher parser has no `CALL` clause
         // for. Answer them from the live snapshot before the parser
         // would reject them as a syntax error. See `crate::introspect`.
+        // These are schema metadata probes, not user queries, so they are
+        // intentionally not counted toward the query metrics.
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -73,54 +275,16 @@ impl Backend for ServerBackend {
             }
         }
 
-        let parsed = match cypher_parse(cypher) {
-            Ok(p) => p,
-            Err(errs) => {
-                let first = &errs[0];
-                return Err(BackendError::Syntax(format!(
-                    "{} at {}",
-                    first.message, first.span
-                )));
-            }
-        };
-        // Plan against the latest published snapshot — no writer lock.
-        let owned = self.state.snapshot.load();
-        let catalog = self.state.catalog_for(&owned.manifest().manifest);
-        let plan = build_plan(&parsed, &catalog).map_err(map_lower_err)?;
-
-        if plan.contains_write() {
-            // Writes still take the writer lock (single-writer invariant).
-            // On success we refresh the snapshot cell so subsequent reads
-            // see the just-committed records (RFC-021).
-            let mut writer = self.state.writer.lock().await;
-            let outcome = execute_write(&plan, &mut writer, &params)
-                .await
-                .map_err(map_exec_err)?;
-            self.state.snapshot.store(writer.owned_snapshot());
-            // Soft write stall (RFC-027 P5): sample under the lock, release,
-            // then back off this request if L0 is piling up.
-            let stall = self.state.write_stall_for(writer.max_l0_bucket_len());
-            drop(writer);
-            if let Some(delay) = stall {
-                tokio::time::sleep(delay).await;
-            }
-            Ok(write_run_outcome(outcome))
-        } else {
-            // Read path: borrow a short-lived `Snapshot` from the owned
-            // snapshot; the Arc keeps the underlying memtable alive for
-            // the duration of the query, no writer lock needed.
-            let snap = owned.borrow();
-            let rows = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
-            )
-            .await
-            .map_err(map_exec_err)?;
-            Ok(read_run_outcome(rows))
-        }
+        let _in_flight = self.state.metrics.track_in_flight();
+        let obs = self.run_query(cypher, params).await;
+        self.state.metrics.observe_query(
+            Protocol::Bolt,
+            obs.kind,
+            obs.result.is_ok(),
+            obs.elapsed,
+            cypher,
+        );
+        obs.result
     }
 
     async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
@@ -146,7 +310,8 @@ impl Backend for ServerBackend {
         // Introspection runs against the published snapshot (schema only).
         // Data reads, below, run against the transaction's own writer with
         // its staged batch overlaid, so an in-tx read sees the tx's own
-        // staged writes (read-your-own-writes, RFC-026).
+        // staged writes (read-your-own-writes, RFC-026). Introspection is a
+        // schema probe, not a user query, so it is not counted in the metrics.
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -154,61 +319,17 @@ impl Backend for ServerBackend {
                 return result;
             }
         }
-        let parsed = match cypher_parse(cypher) {
-            Ok(p) => p,
-            Err(errs) => {
-                let first = &errs[0];
-                return Err(BackendError::Syntax(format!(
-                    "{} at {}",
-                    first.message, first.span
-                )));
-            }
-        };
-        let owned = self.state.snapshot.load();
-        let catalog = self.state.catalog_for(&owned.manifest().manifest);
-        let plan = build_plan(&parsed, &catalog).map_err(map_lower_err)?;
 
-        if plan.contains_write() {
-            // Stage into the transaction's held writer; do NOT commit. The
-            // RETURN rows are computed during the apply, so they stream now.
-            let mut slot = self.tx.lock().await;
-            let tx = slot
-                .as_mut()
-                .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
-            let outcome = match execute_write_staged(&plan, &mut tx.writer, &params).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    // A failed statement aborts the transaction. Drop whatever
-                    // it (or an earlier statement) staged so a stray COMMIT
-                    // cannot seal a partial write; the session moves to FAILED
-                    // and the client must ROLLBACK / RESET.
-                    tx.writer.discard_batch();
-                    return Err(map_exec_err(e));
-                }
-            };
-            tx.staged = true;
-            Ok(write_run_outcome(outcome))
-        } else {
-            // Read against the transaction's own writer so the staged batch
-            // is visible (RFC-026). The writer pins the committed state at
-            // tx-begin (no commit happens mid-tx while we hold the lock) and
-            // overlays everything statements 1..N-1 staged.
-            let mut slot = self.tx.lock().await;
-            let tx = slot
-                .as_mut()
-                .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
-            let snap = tx.writer.overlay_snapshot();
-            let rows = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
-            )
-            .await
-            .map_err(map_exec_err)?;
-            Ok(read_run_outcome(rows))
-        }
+        let _in_flight = self.state.metrics.track_in_flight();
+        let obs = self.run_query_in_tx(cypher, params).await;
+        self.state.metrics.observe_query(
+            Protocol::Bolt,
+            obs.kind,
+            obs.result.is_ok(),
+            obs.elapsed,
+            cypher,
+        );
+        obs.result
     }
 
     async fn commit_tx(&self) -> std::result::Result<(), BackendError> {
