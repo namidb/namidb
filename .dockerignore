@@ -1,0 +1,6 @@
+# Keep the build context small and the build hermetic. Everything else
+# (source, Cargo manifests, README) is needed by `cargo build`.
+target/
+.git/
+.venv/
+**/.venv/

@@ -341,6 +341,7 @@ pub async fn serve(
     listen: std::net::SocketAddr,
     auth_token: Option<Arc<str>>,
     tx_timeout: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // `Duration::ZERO` disables the per-transaction idle timeout.
     let tx_idle_timeout = (!tx_timeout.is_zero()).then_some(tx_timeout);
@@ -358,11 +359,20 @@ pub async fn serve(
         std::env::var("NAMIDB_BOLT_SERVER_AGENT").unwrap_or_else(|_| "Neo4j/5.13.0".to_string());
     info!(server_agent = %agent, "bolt server agent");
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(p) => p,
-            Err(e) => {
-                error!(error = %e, "bolt accept failed");
-                continue;
+        let (socket, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, "bolt accept failed");
+                    continue;
+                }
+            },
+            // Stop accepting new connections on shutdown (SIGTERM/SIGINT). The
+            // HTTP server drains in parallel; in-flight Bolt sessions finish on
+            // their own tasks.
+            _ = shutdown.wait_for(|stop| *stop) => {
+                info!("shutdown signalled, bolt listener stopping");
+                break;
             }
         };
         if let Err(e) = socket.set_nodelay(true) {
@@ -389,6 +399,7 @@ pub async fn serve(
             }
         });
     }
+    Ok(())
 }
 
 // `ParseError` is included for callers that want a custom Bolt error
