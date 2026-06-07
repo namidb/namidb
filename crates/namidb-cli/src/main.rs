@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use namidb_core::{id::NamespaceId, value::Value as CoreValue};
-use namidb_markdown::{load_vault, sync_vault, HashingEmbedder, LoadOptions};
+use namidb_markdown::{embedder_from_env, load_vault, sync_vault, LoadOptions};
 use namidb_query::{
     execute, execute_write, explain_query, explain_query_raw, explain_query_raw_verbose,
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
@@ -251,8 +251,10 @@ async fn load_vault_cmd(
         // A watch mirrors the vault on every sync, so prune is implied.
         prune: prune || watch,
         placeholders,
-        embedder: embed
-            .then(|| Arc::new(HashingEmbedder::default()) as Arc<dyn namidb_markdown::Embedder>),
+        // `--embed` picks the embedder from the environment: a remote provider
+        // when NAMIDB_EMBED_* is set (with --features remote-embedder), else the
+        // local HashingEmbedder.
+        embedder: embed.then(embedder_from_env),
         ..Default::default()
     };
 

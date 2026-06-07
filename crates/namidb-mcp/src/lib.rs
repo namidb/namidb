@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use namidb_markdown::Embedder;
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute, parse as cypher_parse, plan as build_plan, Params, ParseError, Row, RuntimeValue,
@@ -46,6 +47,11 @@ pub struct Server {
     session: Arc<Mutex<WriterSession>>,
     cache: SstCache,
     snapshot: Arc<SnapshotCell>,
+    /// One embedder for the whole server: it embeds notes on load (document
+    /// side) and the `vector_search` query string (query side), so both live in
+    /// the same vector space. Chosen by `embedder_from_env` (remote when
+    /// configured, else the local hashing embedder).
+    embedder: Arc<dyn Embedder>,
 }
 
 impl Server {
@@ -60,6 +66,7 @@ impl Server {
             session: Arc::new(Mutex::new(session)),
             cache: SstCache::new(64 * 1024 * 1024),
             snapshot,
+            embedder: namidb_markdown::embedder_from_env(),
         })
     }
 
@@ -88,8 +95,9 @@ impl Server {
             prune: true,
             placeholders,
             // Embed notes on load so `vector_search` does semantic KNN over the
-            // vault out of the box (local, deterministic, offline embedder).
-            embedder: Some(Arc::new(namidb_markdown::HashingEmbedder::default())),
+            // vault, using the server's embedder so notes and queries share one
+            // vector space.
+            embedder: Some(self.embedder.clone()),
             ..Default::default()
         };
         let mut guard = self.session.lock().await;
@@ -119,8 +127,9 @@ impl Server {
             prune: true,
             placeholders,
             // Embed notes on load so `vector_search` does semantic KNN over the
-            // vault out of the box (local, deterministic, offline embedder).
-            embedder: Some(Arc::new(namidb_markdown::HashingEmbedder::default())),
+            // vault, using the server's embedder so notes and queries share one
+            // vector space.
+            embedder: Some(self.embedder.clone()),
             ..Default::default()
         };
 
@@ -354,7 +363,7 @@ impl Server {
                 )
             }
             "vector_search" => {
-                let query = vec_arg(args, "query")?;
+                let text = str_arg(args, "query")?;
                 let label = ident_arg(args, "label", "Note")?;
                 let property = ident_arg(args, "property", "embedding")?;
                 // LIMIT takes a literal, so clamp and interpolate `k` rather
@@ -364,8 +373,16 @@ impl Server {
                     .and_then(Value::as_u64)
                     .unwrap_or(10)
                     .clamp(1, 100);
+                // Embed the query text server-side with the same embedder that
+                // indexed the vault, so the query and the stored notes share one
+                // vector space. The embedder tags this as a query (vs document).
+                let vector = self
+                    .embedder
+                    .embed(&text)
+                    .await
+                    .map_err(|e| format!("embedding the query failed: {e}"))?;
                 let mut p = Params::new();
-                p.insert("query".to_string(), RuntimeValue::Vector(query));
+                p.insert("query".to_string(), RuntimeValue::Vector(vector));
                 (
                     // Pre-filter on label + "has an embedding" (and drop
                     // placeholder stubs) narrows the candidate set, then rank by
@@ -497,25 +514,6 @@ fn str_arg(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required string argument '{key}'"))
 }
 
-/// Parse a required numeric-array argument into an `f32` query vector.
-fn vec_arg(args: &Value, key: &str) -> Result<Vec<f32>, String> {
-    let arr = args
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing required array argument '{key}'"))?;
-    if arr.is_empty() {
-        return Err(format!("'{key}' must be a non-empty array of numbers"));
-    }
-    arr.iter()
-        .enumerate()
-        .map(|(i, v)| {
-            v.as_f64()
-                .map(|f| f as f32)
-                .ok_or_else(|| format!("'{key}'[{i}] is not a number"))
-        })
-        .collect()
-}
-
 /// Read an optional identifier argument (a label or property name), falling
 /// back to `default`. Restricted to `[A-Za-z_][A-Za-z0-9_]*` so it can be
 /// interpolated into the query text without opening an injection hole.
@@ -644,11 +642,11 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "vector_search",
-            "description": "Semantic K-nearest-neighbour search: rank nodes by cosine similarity between a stored embedding property and the given query vector. Pass a pre-computed query embedding as `query` (array of floats, same dimension as the stored vectors). Optional: `label` (default \"Note\"), `property` (default \"embedding\"), `k` (default 10, max 100). Returns title, path and score, highest first. Nodes without an embedding are skipped.",
+            "description": "Semantic search: rank notes by meaning, not keywords. Give a natural-language `query`; the server embeds it with the same model used to index the vault and returns the K nearest notes by cosine similarity. Optional: `label` (default \"Note\"), `property` (default \"embedding\"), `k` (default 10, max 100). Returns title, path and score, highest first. Notes without an embedding are skipped (load the vault with embeddings enabled).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "array", "items": { "type": "number" }, "description": "Query embedding (array of floats), same dimension as the stored vectors" },
+                    "query": { "type": "string", "description": "Natural-language search text; embedded server-side" },
                     "label": { "type": "string", "description": "Node label to search (default \"Note\")" },
                     "property": { "type": "string", "description": "Embedding property name (default \"embedding\")" },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" }
@@ -1060,9 +1058,9 @@ mod tests {
 
     #[tokio::test]
     async fn vector_search_ranks_notes_by_embedding_similarity() {
-        use namidb_markdown::{Embedder, HashingEmbedder};
-
-        // The MCP server now embeds notes on load, so KNN works end to end.
+        // The server embeds notes on load AND embeds the query text, both with
+        // the same embedder, so semantic search works end to end: a query about
+        // databases must rank the database note above the recipe.
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
@@ -1077,10 +1075,12 @@ mod tests {
         let server = Server::open("memory://mcp-vsearch").await.unwrap();
         server.load_vault(dir.path(), false).await.unwrap();
 
-        // Build the query vector with the same embedder the loader used, then
-        // ask for the single closest note: the database note, not the recipe.
-        let q = HashingEmbedder::default().embed("graph database storage");
-        let rows = call(&server, "vector_search", json!({ "query": q, "k": 1 })).await;
+        let rows = call(
+            &server,
+            "vector_search",
+            json!({ "query": "graph database storage", "k": 1 }),
+        )
+        .await;
         let titles: Vec<&str> = rows
             .as_array()
             .unwrap()
@@ -1100,7 +1100,7 @@ mod tests {
                 "tools/call",
                 &json!({
                     "name": "vector_search",
-                    "arguments": { "query": [0.1], "label": "Note) RETURN 1 //" }
+                    "arguments": { "query": "hello", "label": "Note) RETURN 1 //" }
                 }),
             )
             .await
@@ -1113,7 +1113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_search_requires_query_array() {
+    async fn vector_search_requires_query_text() {
         let server = server_with_vault().await;
         let res = server
             .dispatch(

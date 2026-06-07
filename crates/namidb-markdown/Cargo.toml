@@ -9,17 +9,29 @@ homepage.workspace = true
 description = "Ingest an Obsidian-style markdown vault (wikilinks + frontmatter) into NamiDB as a graph"
 readme = "README.md"
 
+[features]
+default = []
+# Opt-in remote, API-backed embedders (OpenAI, Voyage, Cohere, Gemini, Jina).
+# Off by default so the base crate stays free of an HTTP/TLS/serde stack.
+remote-embedder = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 blake3 = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 pulldown-cmark = { workspace = true }
 yaml-rust2 = { workspace = true }
 regex = { workspace = true }
+
+# Only compiled with the `remote-embedder` feature.
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 object_store = { workspace = true }

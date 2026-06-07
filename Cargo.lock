@@ -2231,12 +2231,16 @@ name = "namidb-markdown"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "namidb-core",
  "namidb-storage",
  "object_store 0.13.2",
  "pulldown-cmark",
  "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

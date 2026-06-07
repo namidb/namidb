@@ -432,19 +432,39 @@ async fn load_graph_inner(
     // edges. In sync mode a note whose stored content hash still matches is
     // left in place: its node is already byte-identical, so re-writing the
     // body would be wasted work (the expensive part of a load).
-    for note in &graph.notes {
-        if let Some(prev) = prev_state {
-            if matches!(
+    let to_write: Vec<&ParsedNote> = graph
+        .notes
+        .iter()
+        .filter(|note| match prev_state {
+            Some(prev) => !matches!(
                 (prev.get(&note.key), note_hash(note)),
                 (Some(Some(stored)), Some(cur)) if stored.as_str() == cur
-            ) {
-                continue;
-            }
+            ),
+            None => true,
+        })
+        .collect();
+
+    // One batched embedding round-trip for the whole write set, so a remote
+    // embedder issues a single HTTP call (chunked internally) instead of one
+    // per note. In sync mode only changed notes are embedded, so steady-state
+    // cost tracks edits, not vault size. Output is 1:1 with `to_write`.
+    let embeddings: Vec<Option<Vec<f32>>> = match &opts.embedder {
+        Some(embedder) => {
+            let texts: Vec<String> = to_write.iter().map(|n| note_embedding_text(n)).collect();
+            embedder
+                .embed_batch(&texts)
+                .await?
+                .into_iter()
+                .map(Some)
+                .collect()
         }
+        None => vec![None; to_write.len()],
+    };
+
+    for (note, embedding) in to_write.into_iter().zip(embeddings) {
         let mut properties = note.properties.clone();
-        if let Some(embedder) = &opts.embedder {
-            let text = note_embedding_text(note);
-            properties.insert("embedding".to_string(), Value::Vec(embedder.embed(&text)));
+        if let Some(vec) = embedding {
+            properties.insert("embedding".to_string(), Value::Vec(vec));
         }
         let record = NodeWriteRecord {
             properties,
