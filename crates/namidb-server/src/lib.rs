@@ -8,6 +8,7 @@
 
 pub mod bolt;
 mod introspect;
+pub mod tls;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +80,12 @@ pub struct Config {
     pub write_stall_l0: usize,
     /// Delay applied to a write when L0 is above `write_stall_l0`.
     pub write_stall_delay: Duration,
+    /// PEM certificate-chain file enabling TLS on the HTTP and Bolt
+    /// listeners. Must be set together with `tls_key`; when both are `None`
+    /// the server serves plaintext.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private-key file paired with `tls_cert`.
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -364,14 +371,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
+    // TLS on the serving path: when `--tls-cert` / `--tls-key` are set, both
+    // the HTTP server and the Bolt listener speak TLS from one shared config;
+    // otherwise the server stays plaintext.
+    let tls_config = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => Some(tls::load_server_config(cert, key)?),
+        (None, None) => None,
+        _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
+    };
+
     if let Some(bolt_addr) = config.bolt_listen {
         let bolt_state = state.clone();
         let bolt_auth = state.auth_token.clone();
         let tx_timeout = config.bolt_tx_timeout;
         let bolt_shutdown = shutdown_rx.clone();
+        let bolt_tls = tls_config.clone().map(tls::acceptor);
         tokio::spawn(async move {
-            if let Err(e) =
-                bolt::serve(bolt_state, bolt_addr, bolt_auth, tx_timeout, bolt_shutdown).await
+            if let Err(e) = bolt::serve(
+                bolt_state,
+                bolt_addr,
+                bolt_auth,
+                tx_timeout,
+                bolt_shutdown,
+                bolt_tls,
+            )
+            .await
             {
                 error!(error = %e, "bolt listener exited");
             }
@@ -379,16 +403,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     let app = build_router(state);
-
-    let listener = TcpListener::bind(config.listen).await?;
-    info!(addr = %config.listen, "namidb-server listening");
     let mut http_shutdown = shutdown_rx;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = http_shutdown.wait_for(|stop| *stop).await;
-            info!("shutdown signalled, draining HTTP requests…");
-        })
-        .await?;
+
+    match tls_config {
+        Some(server_config) => {
+            // HTTPS via axum-server. Its `Handle` drives the same SIGTERM /
+            // SIGINT drain the plaintext path gets.
+            let handle = axum_server::Handle::new();
+            let drain = handle.clone();
+            tokio::spawn(async move {
+                let _ = http_shutdown.wait_for(|stop| *stop).await;
+                info!("shutdown signalled, draining HTTPS requests…");
+                drain.graceful_shutdown(Some(Duration::from_secs(10)));
+            });
+            let rustls = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
+            info!(addr = %config.listen, "namidb-server listening (TLS)");
+            axum_server::bind_rustls(config.listen, rustls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            let listener = TcpListener::bind(config.listen).await?;
+            info!(addr = %config.listen, "namidb-server listening");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = http_shutdown.wait_for(|stop| *stop).await;
+                    info!("shutdown signalled, draining HTTP requests…");
+                })
+                .await?;
+        }
+    }
     Ok(())
 }
 

@@ -34,6 +34,12 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 humantime = "2"
+# TLS on the serving path (rustls, aligned with the versions already in the
+# lock via reqwest/object_store). `ring` avoids the aws-lc-rs C toolchain.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -41,3 +47,8 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 tokio-test = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
+rcgen = "0.13"
+# Also dev-deps so the TLS integration test (a separate crate) can drive a
+# verifying rustls client; they unify with the versions above.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

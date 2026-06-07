@@ -35,6 +35,15 @@ below and in the release notes.
   `docker stop`, systemd and Kubernetes send), not only on Ctrl-C: a shared
   signal stops the HTTP server and the Bolt listener together. A `Dockerfile`
   ships with a `HEALTHCHECK` targeting `/v0/livez`.
+- TLS on the serving path (`--tls-cert` / `--tls-key`, env `NAMIDB_TLS_CERT` /
+  `NAMIDB_TLS_KEY`). One PEM certificate chain and key enable rustls on both
+  the HTTP REST API (HTTPS, served via `axum-server`) and the Bolt listener
+  (a TLS handshake in front of the same session loop, since the Bolt session
+  is generic over its transport). The `ring` crypto provider is selected
+  explicitly, so the build needs no aws-lc-rs C toolchain. Both `--tls-cert`
+  and `--tls-key` must be set together; with neither the server stays
+  plaintext exactly as before, and the graceful-shutdown drain works on both
+  the TLS and plaintext paths.
 
 ### Changed
 

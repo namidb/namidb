@@ -139,6 +139,15 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     write_stall_delay: Duration,
+
+    /// PEM certificate-chain file. Set together with `--tls-key` to serve the
+    /// HTTP and Bolt listeners over TLS; omit both to serve plaintext.
+    #[arg(long, env = "NAMIDB_TLS_CERT")]
+    tls_cert: Option<std::path::PathBuf>,
+
+    /// PEM private-key file paired with `--tls-cert`.
+    #[arg(long, env = "NAMIDB_TLS_KEY")]
+    tls_key: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -165,6 +174,8 @@ fn main() -> anyhow::Result<()> {
         compaction_l0_trigger: cli.compaction_l0_trigger,
         write_stall_l0: cli.write_stall_l0,
         write_stall_delay: cli.write_stall_delay,
+        tls_cert: cli.tls_cert,
+        tls_key: cli.tls_key,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
