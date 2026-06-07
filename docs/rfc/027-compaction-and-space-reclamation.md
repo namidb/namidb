@@ -3,8 +3,8 @@
 **Status:** accepted
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
-**Updated:** 2026-06-05
-**Implements:** P1 (horizon) + P2 (horizon-aware sweep) + P3 (tombstone/version GC via full-bucket merge) + P5 (reactive L0 trigger + soft write stall) landed; P4 (leveled compaction) deferred — see the follow-up note in Piece 1
+**Updated:** 2026-06-07
+**Implements:** P1 (horizon) + P2 (horizon-aware sweep) + P3 (tombstone/version GC) + P4 (leveled-lite compaction) + P5 (reactive L0 trigger + soft write stall) landed; key-range-partitioned leveled compaction remains a follow-up (see Piece 1)
 **Supersedes:** none
 
 ## Summary
@@ -77,25 +77,28 @@ machinery (`compact_node_ssts`, `compact_edge_ssts`) is reused, with the
 input set chosen by the level picker rather than always "all L0 in the
 bucket."
 
-**Status / follow-up (P4 deferred).** P1, P2, P3 and P5 have landed; P4 is
-deferred. Compaction today is full-bucket (every compaction merges all of a
-bucket's SSTs into one L1), which bounds space and read amplification but
-trades write amplification — it rewrites the whole bucket each time. True
-leveled compaction as described above needs key-range-partitioned SSTs
-(multiple non-overlapping files per level), which the current one-SST-per-
-bucket writer does not produce; that is its own piece of work.
+**Status (P4 landed as leveled-lite).** P1, P2, P3, P5 and P4 (as
+leveled-lite) have landed. The compactor keeps one SST per `(kind, scope,
+level)` across L1..Lk with a per-level byte budget (`budget(Li) = base *
+ratio^(i-1)`, from `NAMIDB_COMPACTION_BASE_BYTES` /
+`NAMIDB_COMPACTION_LEVEL_RATIO`, defaults 8 MiB / 10). L0s drain into L1; a
+merge cascades into a deeper level (`Li + Li+1 -> Li+1`) only when the
+accumulated bytes exceed a level's budget, so the large base levels are
+rewritten rarely. This bounds write amplification while space and read
+amplification stay bounded. Tombstone and superseded-version GC now runs only
+on the merge whose output is the bucket's deepest occupied level, which is
+safe because the LSM invariant (a shallower level holds the newer LSN for a
+key) guarantees any copy in a deeper level is older and loses at read time,
+so dropping a deepest-level tombstone can never resurrect a row.
+`plan_bucket_merge` picks the inputs and output level per bucket;
+`compact_leveled` carries the budgets so the cascade is unit-testable without
+touching process-wide env.
 
-The interim plan for the follow-up is **leveled-lite**: keep one SST per
-`(bucket, level)` across L1..Lk with a per-level size budget
-(`budget(Li) = base * ratio^(i-1)`). Most compactions merge `L0 + L1 -> L1`
-(cheap); a level only cascades down (`Li + Li+1 -> Li+1`) when it exceeds
-its budget, so the large base level is rewritten rarely. Tombstone GC moves
-to "the merge whose output is the deepest occupied level," which is safe
-because the LSM invariant (lower level number holds the newer LSN for a
-key) guarantees any copy in a shallower level is newer and wins at read
-time, so dropping a deepest-level tombstone can never resurrect a row.
-Key-range-partitioned leveled (rewriting only overlapping ranges) is a
-later step on top of that.
+The remaining step is **key-range-partitioned leveled** compaction: multiple
+non-overlapping SSTs per level so a cascade rewrites only the overlapping key
+ranges rather than the whole next level. leveled-lite keeps one SST per
+`(bucket, level)`, so a cascade still rewrites the full next level (rarely,
+gated by the budget); range partitioning is the future refinement on top.
 
 ### Piece 2: snapshot-retention horizon
 
