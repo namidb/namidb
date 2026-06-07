@@ -30,10 +30,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use namidb_core::{NodeId, Value};
 use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, WriterSession};
 
+use crate::embed::Embedder;
 use crate::id::stable_node_id;
 use crate::parse::{parse_vault, ParsedNote, VaultGraph};
 
@@ -72,6 +74,12 @@ pub struct LoadOptions {
     /// whose target has no real note, so unresolved references show up in the
     /// graph like Obsidian's graph view. `false` (default) just counts them.
     pub placeholders: bool,
+    /// Optional text embedder. When set, every (re-)written note gets an
+    /// `embedding` property (a `Value::Vec`) computed from its title + body, so
+    /// `cosine_similarity(...)` queries and the MCP `vector_search` tool have
+    /// vectors to rank. `None` (default) writes no embeddings. A sync only
+    /// re-embeds notes whose content actually changed.
+    pub embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl Default for LoadOptions {
@@ -82,6 +90,7 @@ impl Default for LoadOptions {
             commit_every: DEFAULT_COMMIT_EVERY,
             prune: false,
             placeholders: false,
+            embedder: None,
         }
     }
 }
@@ -432,8 +441,13 @@ async fn load_graph_inner(
                 continue;
             }
         }
+        let mut properties = note.properties.clone();
+        if let Some(embedder) = &opts.embedder {
+            let text = note_embedding_text(note);
+            properties.insert("embedding".to_string(), Value::Vec(embedder.embed(&text)));
+        }
         let record = NodeWriteRecord {
-            properties: note.properties.clone(),
+            properties,
             schema_version: 1,
             ..Default::default()
         };
@@ -555,6 +569,16 @@ fn note_hash(note: &ParsedNote) -> Option<&str> {
     match note.properties.get("content_hash") {
         Some(Value::Str(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// The text an embedder sees for a note: its title, then its body. The title is
+/// included because short notes (and ones reached only by their filename)
+/// otherwise carry too few body tokens to rank well.
+fn note_embedding_text(note: &ParsedNote) -> String {
+    match note.properties.get("body") {
+        Some(Value::Str(body)) if !body.is_empty() => format!("{}\n{}", note.title, body),
+        _ => note.title.clone(),
     }
 }
 

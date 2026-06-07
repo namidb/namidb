@@ -27,10 +27,12 @@
 
 #![warn(rust_2018_idioms)]
 
+pub mod embed;
 pub mod id;
 pub mod load;
 pub mod parse;
 
+pub use embed::{Embedder, HashingEmbedder, DEFAULT_EMBED_DIM};
 pub use id::{normalize_key, stable_node_id};
 pub use load::{
     diff_vault, load_graph, load_vault, read_vault_state, sync_graph, sync_vault, LoadOptions,

@@ -87,6 +87,9 @@ impl Server {
         let opts = namidb_markdown::LoadOptions {
             prune: true,
             placeholders,
+            // Embed notes on load so `vector_search` does semantic KNN over the
+            // vault out of the box (local, deterministic, offline embedder).
+            embedder: Some(Arc::new(namidb_markdown::HashingEmbedder::default())),
             ..Default::default()
         };
         let mut guard = self.session.lock().await;
@@ -115,6 +118,9 @@ impl Server {
         let opts = namidb_markdown::LoadOptions {
             prune: true,
             placeholders,
+            // Embed notes on load so `vector_search` does semantic KNN over the
+            // vault out of the box (local, deterministic, offline embedder).
+            embedder: Some(Arc::new(namidb_markdown::HashingEmbedder::default())),
             ..Default::default()
         };
 
@@ -1053,22 +1059,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_search_runs_and_skips_notes_without_embeddings() {
-        // The markdown vault stores no embeddings, so KNN returns no rows (the
-        // `embedding IS NOT NULL` pre-filter excludes every note), but the tool
-        // must still succeed end to end: array-arg parsing, the $query vector
-        // binding, the cosine_similarity builtin and ORDER BY/LIMIT all wire up.
-        let server = server_with_vault().await;
-        let rows = call(
-            &server,
-            "vector_search",
-            json!({ "query": [0.1, 0.2, 0.3], "k": 5 }),
-        )
-        .await;
-        assert!(
-            rows.as_array().unwrap().is_empty(),
-            "no stored embeddings -> no hits"
+    async fn vector_search_ranks_notes_by_embedding_similarity() {
+        use namidb_markdown::{Embedder, HashingEmbedder};
+
+        // The MCP server now embeds notes on load, so KNN works end to end.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Rust.md",
+            "rust graph database engine on object storage\n",
         );
+        write(
+            dir.path(),
+            "Cooking.md",
+            "banana smoothie recipe with yogurt and honey\n",
+        );
+        let server = Server::open("memory://mcp-vsearch").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        // Build the query vector with the same embedder the loader used, then
+        // ask for the single closest note: the database note, not the recipe.
+        let q = HashingEmbedder::default().embed("graph database storage");
+        let rows = call(&server, "vector_search", json!({ "query": q, "k": 1 })).await;
+        let titles: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert_eq!(titles, vec!["Rust"], "the database note must rank first");
     }
 
     #[tokio::test]

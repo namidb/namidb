@@ -431,6 +431,7 @@ impl Client {
             commit_every,
             prune,
             placeholders,
+            ..Default::default()
         };
         let dir = std::path::PathBuf::from(path);
         let session = self.session.clone();

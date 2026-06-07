@@ -628,6 +628,9 @@ fn call_scalar_function(
             RuntimeValue::String(s) => RuntimeValue::Integer(s.chars().count() as i64),
             RuntimeValue::List(items) => RuntimeValue::Integer(items.len() as i64),
             RuntimeValue::Map(m) => RuntimeValue::Integer(m.len() as i64),
+            // A vector's size is its dimension, so `size(n.embedding)` answers
+            // "how many dimensions" without a dedicated builtin.
+            RuntimeValue::Vector(v) => RuntimeValue::Integer(v.len() as i64),
             // Path is `[Node, Rel, Node, Rel, ..., Node]` so the
             // relationship count is `(len - 1) / 2`. The shortestPath
             // lower fills missing rel/target bindings with NULL,
@@ -1858,5 +1861,10 @@ mod tests {
             "unexpected message: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn builtin_size_of_vector_is_dimension() {
+        assert_eq!(s("size(vector([1.0, 2.0, 3.0]))"), RuntimeValue::Integer(3));
     }
 }

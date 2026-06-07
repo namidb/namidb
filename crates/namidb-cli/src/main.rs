@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use namidb_core::{id::NamespaceId, value::Value as CoreValue};
-use namidb_markdown::{load_vault, sync_vault, LoadOptions};
+use namidb_markdown::{load_vault, sync_vault, HashingEmbedder, LoadOptions};
 use namidb_query::{
     execute, execute_write, explain_query, explain_query_raw, explain_query_raw_verbose,
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
@@ -121,6 +121,12 @@ enum Cmd {
         /// exist, so unresolved references show up in the graph.
         #[arg(long, default_value_t = false)]
         placeholders: bool,
+        /// Compute a text embedding for each note (title + body) and store it as
+        /// an `embedding` property, so `cosine_similarity(...)` queries and the
+        /// MCP `vector_search` tool can rank notes by similarity. Uses a local,
+        /// deterministic, offline embedder.
+        #[arg(long, default_value_t = false)]
+        embed: bool,
         /// Watch the vault and re-sync incrementally on every change, keeping
         /// the graph live until interrupted (Ctrl-C). A watch always mirrors
         /// the vault, so `--prune` is implied.
@@ -191,6 +197,7 @@ fn main() -> anyhow::Result<()> {
             edge_type,
             prune,
             placeholders,
+            embed,
             watch,
             path,
         } => {
@@ -204,6 +211,7 @@ fn main() -> anyhow::Result<()> {
                 &edge_type,
                 prune,
                 placeholders,
+                embed,
                 watch,
                 &path,
             ))?;
@@ -213,6 +221,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn load_vault_cmd(
     store_uri: Option<&str>,
     namespace: &str,
@@ -220,6 +229,7 @@ async fn load_vault_cmd(
     edge_type: &str,
     prune: bool,
     placeholders: bool,
+    embed: bool,
     watch: bool,
     path: &str,
 ) -> anyhow::Result<()> {
@@ -241,6 +251,8 @@ async fn load_vault_cmd(
         // A watch mirrors the vault on every sync, so prune is implied.
         prune: prune || watch,
         placeholders,
+        embedder: embed
+            .then(|| Arc::new(HashingEmbedder::default()) as Arc<dyn namidb_markdown::Embedder>),
         ..Default::default()
     };
 
