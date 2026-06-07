@@ -41,8 +41,10 @@ internet.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET`  | `/v0/health`       | public  | Liveness + manifest version + epoch |
+| `GET`  | `/v0/livez`        | public  | Lock-free liveness (process is up) |
+| `GET`  | `/v0/health`       | public  | Readiness + manifest version + epoch |
 | `GET`  | `/v0/version`      | public  | Server build version |
+| `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush |
 
@@ -144,6 +146,46 @@ fenced via epoch CAS).
 task turns the memtable into L0 SSTs. Set it to `0s` to disable the loop
 and call `POST /v0/admin/flush` from cron or a sidecar instead.
 
+## Metrics and the slow-query log
+
+`GET /v0/metrics` renders the process query metrics in the Prometheus
+text exposition format. It is unauthenticated, like `/v0/livez` and
+`/v0/health`, so a scraper needs no bearer token. When TLS is on it is
+served over HTTPS on the same listener.
+
+```bash
+curl -s http://127.0.0.1:8080/v0/metrics
+```
+
+| Metric | Type | Labels | What it is |
+|---|---|---|---|
+| `namidb_queries_total`          | counter   | `protocol`, `status` | Queries executed, by `http`/`bolt` and `ok`/`error` |
+| `namidb_query_duration_seconds` | histogram | `protocol`, `kind`   | Execution wall-clock, by `http`/`bolt` and `read`/`write` |
+| `namidb_queries_in_flight`      | gauge     |                      | Queries currently executing |
+| `namidb_slow_queries_total`     | counter   |                      | Queries that crossed the slow-query threshold |
+| `namidb_build_info`             | gauge     | `version`            | Always `1`; carries the build version |
+| `namidb_uptime_seconds`         | gauge     |                      | Seconds since the server started |
+
+Duration is measured per query and stops at the end of execution, so the
+optional write-stall backpressure sleep is not counted as query latency.
+Bolt schema-introspection probes (the `CALL` / `SHOW` calls GUIs issue)
+are not counted as queries.
+
+The **slow-query log** is separate from the metrics and controlled by
+`--slow-query-threshold` (env `NAMIDB_SLOW_QUERY_THRESHOLD`, default
+`1s`, set `0s` to disable). Any query at or above that wall-clock is
+logged at `WARN`:
+
+```
+WARN slow query protocol="http" kind="read" status="ok" elapsed_ms=1840 query="MATCH (a:Person)-[:KNOWS*2]-(b) RETURN count(b)"
+```
+
+The statement text is logged truncated; parameters are never logged,
+since they can carry sensitive values. The statement text itself is, so
+a value inlined as a literal in the Cypher source (rather than passed as
+a `$param`) does land in the log, the same as any SQL slow-query log.
+Parameterise sensitive values to keep them out of it.
+
 ## Bolt protocol
 
 Pass `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`) to expose
@@ -177,8 +219,7 @@ design.
 - `/v0/cypher/stream`: NDJSON streaming for large read result sets.
 - `/v0/cypher/arrow`: an Arrow IPC body for zero-copy DataFrame
   ingestion.
-- `/v0/metrics`: Prometheus exposition (counters, latency histogram,
-  cache hit rates).
+- Cache hit-rate gauges on `/v0/metrics` (adjacency, node, SST caches).
 
 See the project [`README`](../../README.md) and [`docs/rfc/`](../../docs/rfc/)
 for engine internals.

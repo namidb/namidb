@@ -44,6 +44,21 @@ below and in the release notes.
   and `--tls-key` must be set together; with neither the server stays
   plaintext exactly as before, and the graceful-shutdown drain works on both
   the TLS and plaintext paths.
+- Prometheus metrics and a slow-query log. A new unauthenticated `GET
+  /v0/metrics` renders the process query metrics in the Prometheus text
+  exposition format: `namidb_queries_total` and `namidb_query_duration_seconds`
+  (a latency histogram), both split by protocol (`http` / `bolt`) and read vs
+  write, plus `namidb_queries_in_flight`, `namidb_slow_queries_total`,
+  `namidb_build_info` and `namidb_uptime_seconds`. The registry is a small
+  hand-rolled set of lock-free atomic counters, so the hot path stays
+  allocation-free and pulls in no new dependency. Both serving paths feed one
+  shared registry, and the stopwatch stops before the optional write-stall
+  sleep, so backpressure is not counted as query latency; Bolt schema
+  introspection probes are not counted as queries. Separately,
+  `--slow-query-threshold` (env `NAMIDB_SLOW_QUERY_THRESHOLD`, default `1s`,
+  `0s` disables) logs any query at or above that wall-clock at WARN with its
+  protocol, kind, status, elapsed and statement text. The statement text only,
+  never its parameters, which can carry sensitive values.
 
 ### Changed
 

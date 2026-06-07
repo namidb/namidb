@@ -12,8 +12,10 @@
 //! [`Metrics::observe_query`] exactly once per query with the protocol, the
 //! read/write kind, whether it succeeded, and the wall-clock it took. When a
 //! query crosses the configured slow-query threshold the same call emits a
-//! structured `warn!` line (the query text, never its parameters, which may
-//! carry sensitive values).
+//! structured `warn!` line. Query parameters are never logged, since they
+//! routinely carry sensitive values. Note the statement text itself is, so a
+//! value inlined as a literal in the Cypher source (rather than passed as a
+//! parameter) does land in the log, the same as every SQL slow-query log.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -100,22 +102,33 @@ impl Histogram {
 
     /// Render the `_bucket`/`_sum`/`_count` lines for one label set. `labels`
     /// is the inner label list without braces, e.g. `protocol="http",kind="read"`.
+    ///
+    /// The fields are independent atomics read without a lock, so a scrape that
+    /// races a live `observe` would otherwise risk `+Inf < _count`, which the
+    /// Prometheus exposition format forbids. We anchor on a single `count`
+    /// read: every bounded bucket's cumulative value is clamped to it and the
+    /// `+Inf` bucket is set equal to it, so the output always satisfies
+    /// `bucket[i] <= bucket[i+1] <= +Inf == _count`. The worst a race can do is
+    /// momentarily under-report a bounded bucket, which the next scrape heals.
     fn render_into(&self, out: &mut String, name: &str, labels: &str) {
         use std::fmt::Write as _;
+        let total = self.count.load(Ordering::Relaxed);
         let mut cumulative: u64 = 0;
         for (i, &bound) in BUCKET_BOUNDS_S.iter().enumerate() {
             cumulative += self.counts[i].load(Ordering::Relaxed);
-            let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{bound}\"}} {cumulative}");
+            // `{bound:?}` keeps the canonical float form (`1.0`, `10.0`), which
+            // is the `le` label every Prometheus client library emits; plain
+            // Display would drop the decimal (`1`, `10`).
+            let _ = writeln!(
+                out,
+                "{name}_bucket{{{labels},le=\"{bound:?}\"}} {}",
+                cumulative.min(total)
+            );
         }
-        cumulative += self.counts[BUCKET_BOUNDS_S.len()].load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {cumulative}");
+        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {total}");
         let sum_s = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let _ = writeln!(out, "{name}_sum{{{labels}}} {sum_s}");
-        let _ = writeln!(
-            out,
-            "{name}_count{{{labels}}} {}",
-            self.count.load(Ordering::Relaxed)
-        );
+        let _ = writeln!(out, "{name}_count{{{labels}}} {total}");
     }
 }
 
@@ -348,7 +361,7 @@ mod tests {
         // The 2ms observation makes le=0.005 cumulative count 2.
         assert!(out.contains("q_bucket{protocol=\"http\",kind=\"read\",le=\"0.005\"} 2"));
         // The 20s observation only shows up in +Inf: 3 total.
-        assert!(out.contains("q_bucket{protocol=\"http\",kind=\"read\",le=\"10\"} 2"));
+        assert!(out.contains("q_bucket{protocol=\"http\",kind=\"read\",le=\"10.0\"} 2"));
         assert!(out.contains("q_bucket{protocol=\"http\",kind=\"read\",le=\"+Inf\"} 3"));
         assert!(out.contains("q_count{protocol=\"http\",kind=\"read\"} 3"));
     }

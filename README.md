@@ -79,7 +79,7 @@ The engine is the same whether you run it as a library inside your app, as a Rus
 
 It's the same engine across all three. Server and Embedded write to an identical bucket layout, so you can open an embedded notebook against the exact `s3://...` URI a `namidb-server` daemon is serving.
 
-NamiDB is pre-1.0 and alpha: the engine has run inside LESAI for about a year, but it has no external production users yet, several production concerns are still in progress (metrics, broad authz), and it is not yet a drop-in for critical data. Run it over a bucket you own, keep backups (`aws s3 sync`), and treat 0.x as the moving target it is.
+NamiDB is pre-1.0 and alpha: the engine has run inside LESAI for about a year, but it has no external production users yet, several production concerns are still in progress (broad authz, backup/restore), and it is not yet a drop-in for critical data. Run it over a bucket you own, keep backups (`aws s3 sync`), and treat 0.x as the moving target it is.
 
 <br />
 
@@ -95,7 +95,7 @@ NamiDB is pre-1.0 and alpha: the engine has run inside LESAI for about a year, b
 - **Six storage backends.** `memory://`, `file://` (with `flock`-based CAS), `s3://` (AWS S3, R2, MinIO, Tigris, LocalStack), `gs://`, `az://`.
 - **Python bindings.** `pip install namidb`. abi3 wheels for Linux (x86_64 and aarch64), macOS (arm64) and Windows (x86_64), with an sdist fallback everywhere else. Sync and async (`acypher`). Arrow, pandas and polars output.
 - **CLI.** `namidb parse`, `namidb explain --verbose`, `namidb run --store <uri>` for ad-hoc query work against any backend.
-- **HTTP server.** The `namidb-server` binary, with bearer-token auth, a periodic flush loop, a lock-free `/v0/livez` liveness probe, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`). Optional TLS on both the HTTP and Bolt listeners via `--tls-cert` / `--tls-key` (rustls).
+- **HTTP server.** The `namidb-server` binary, with bearer-token auth, a periodic flush loop, a lock-free `/v0/livez` liveness probe, Prometheus metrics at `/v0/metrics` plus a slow-query log, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`). Optional TLS on both the HTTP and Bolt listeners via `--tls-cert` / `--tls-key` (rustls).
 - **Bolt protocol.** Same `namidb-server` binary speaks Bolt 4.4 / 5.0 / 5.4 on an opt-in TCP listener (default 7687). Neo4j drivers connect over `bolt://host:7687` and run Cypher, verified end-to-end with the Python driver. The other language drivers (Java, JavaScript, .NET, Go, Rust) speak the same protocol but are not all exercised yet, and GUI clients that introspect the schema hit `CALL` / `SHOW` procedures the parser does not implement yet, so their schema panels come up empty. See [RFC-022](./docs/rfc/022-bolt-protocol.md).
 - **Bench harness.** A synthetic, deterministic LDBC SNB Interactive harness under [`bench/`](./bench/).
 
@@ -351,8 +351,9 @@ curl -X POST http://your-host:8080/v0/cypher \
 
 See [`crates/namidb-server/README.md`](./crates/namidb-server/README.md)
 for the full route reference (`/v0/cypher`, `/v0/health`,
-`/v0/version`, `/v0/admin/flush`), the JSON to Cypher type mapping, and
-the concurrency model.
+`/v0/version`, `/v0/metrics`, `/v0/admin/flush`), the metrics and
+slow-query log, the JSON to Cypher type mapping, and the concurrency
+model.
 
 ### Recipe: docker-compose with MinIO plus namidb-server
 
@@ -530,6 +531,7 @@ performance or memory problem.
 | `NAMIDB_LISTEN` | `0.0.0.0:8080` | TCP bind address. |
 | `NAMIDB_AUTH_TOKEN` | unset (open) | Bearer token. When it's unset the server warns and accepts every request. |
 | `NAMIDB_FLUSH_INTERVAL` | `30s` | Background memtable -> L0 flush cadence. `0s` disables it. |
+| `NAMIDB_SLOW_QUERY_THRESHOLD` | `1s` | Log any query at or above this wall-clock at WARN. `0s` disables the slow-query log. |
 
 <br />
 

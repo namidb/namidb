@@ -193,8 +193,11 @@ impl ServerBackend {
             let tx = match slot.as_mut() {
                 Some(tx) => tx,
                 None => {
+                    // A protocol-state error, not an executed query: keep it out
+                    // of the latency histogram (kind None) like a parse/plan
+                    // error. It still counts toward queries_total status=error.
                     return RunObservation {
-                        kind: Some(QueryKind::Write),
+                        kind: None,
                         elapsed: started.elapsed(),
                         result: Err(BackendError::Other("no open transaction".into())),
                     };
@@ -228,8 +231,10 @@ impl ServerBackend {
             let tx = match slot.as_mut() {
                 Some(tx) => tx,
                 None => {
+                    // See the write branch: a no-open-transaction error is a
+                    // protocol-state error, not an executed query.
                     return RunObservation {
-                        kind: Some(QueryKind::Read),
+                        kind: None,
                         elapsed: started.elapsed(),
                         result: Err(BackendError::Other("no open transaction".into())),
                     };
