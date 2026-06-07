@@ -802,6 +802,61 @@ async fn bolt_in_tx_read_sees_own_staged_write() {
 }
 
 #[tokio::test]
+async fn bolt_in_tx_read_sees_own_staged_edge() {
+    // RFC-026 edge overlay: a traversal in statement N of a transaction must
+    // see an edge that statements 1..N-1 staged, while another session on the
+    // committed snapshot must not. This is the edge counterpart of
+    // `bolt_in_tx_read_sees_own_staged_write`.
+    let (bolt_addr, task) = boot_bolt("bolt-tx-ryow-edge", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    begin(&mut stream).await;
+    // Statement 1: stage two nodes and an edge between them, no commit.
+    pull_all(
+        &mut stream,
+        "CREATE (a:Person {name: 'Uma'})-[:KNOWS]->(b:Person {name: 'Ivo'})",
+    )
+    .await;
+    // Statement 2: a traversal in the SAME transaction follows the staged
+    // edge. Before the edge overlay this returned zero rows.
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "MATCH (:Person {name: 'Uma'})-[:KNOWS]->(x) RETURN x.name AS name",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "an in-tx traversal must see the tx's own staged edge"
+    );
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Ivo".into())));
+
+    // Isolation: a second connection reads the committed snapshot and must
+    // not observe the still-uncommitted edge (nor its endpoints).
+    let mut other = TcpStream::connect(bolt_addr).await.expect("connect other");
+    handshake(&mut other).await;
+    hello_and_logon(&mut other, "test-token").await;
+    let (_f, rows2) = pull_all(
+        &mut other,
+        "MATCH (:Person)-[:KNOWS]->(x) RETURN x.name AS name",
+    )
+    .await;
+    assert!(
+        rows2.is_empty(),
+        "an uncommitted staged edge must not be visible to other sessions, got {rows2:?}"
+    );
+    goodbye(&mut other).await;
+    other.shutdown().await.ok();
+
+    commit(&mut stream).await;
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
 async fn bolt_read_query_times_out() {
     // A 1ns read budget: the deadline (now + 1ns) is already past by the
     // time the executor reaches its first operator guard, so a read RUN

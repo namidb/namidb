@@ -15,7 +15,9 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
 use namidb_query::cost::StatsCatalog;
-use namidb_query::{execute, execute_write, lower, optimize, parse, Params, RuntimeValue};
+use namidb_query::{
+    execute, execute_write, execute_write_staged, lower, optimize, parse, Params, RuntimeValue,
+};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -1032,6 +1034,62 @@ async fn create_then_match_in_one_statement_reads_own_write() {
         }
         other => panic!("expected node p, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn staged_edge_is_traversable_via_overlay_snapshot() {
+    // RFC-026 edge overlay at the query boundary: an edge staged by a write
+    // (not yet committed) is traversable by a MATCH run against the writer's
+    // overlay snapshot — the same path the Bolt transaction handler uses for
+    // an in-tx read — while a plain committed snapshot does not see it. The
+    // intra-statement `CREATE ... WITH ... MATCH (expand)` form would need the
+    // executor to run a read pipeline above a write in one statement, which is
+    // a separate, not-yet-supported capability for nodes or edges (RFC-026
+    // follow-up), so this exercises the staged-then-traverse path instead.
+    let mut writer = WriterSession::open(store(), paths("w-ryow-edge-overlay"))
+        .await
+        .unwrap();
+
+    // Stage two persons and a KNOWS edge between them; do NOT commit
+    // (`execute_write_staged` leaves the batch pending, unlike the
+    // auto-committing `execute_write`).
+    let create =
+        lower(&parse("CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bo'})").unwrap())
+            .unwrap();
+    let outcome = execute_write_staged(&create, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.edges_created, 1);
+
+    let match_plan =
+        lower(&parse("MATCH (:Person {name: 'Ada'})-[:KNOWS]->(x) RETURN x.name AS name").unwrap())
+            .unwrap();
+
+    // Committed snapshot: the staged edge (and its endpoints) are invisible.
+    let committed = writer.snapshot();
+    let rows = execute(&match_plan, &committed, &Params::new())
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a plain committed snapshot must not see the staged edge, got {rows:?}"
+    );
+    drop(committed);
+
+    // Overlay snapshot: the staged edge is traversable end-to-end.
+    let overlay = writer.overlay_snapshot();
+    let rows = execute(&match_plan, &overlay, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the overlay snapshot must surface the staged edge"
+    );
+    assert_eq!(
+        rows[0].get("name"),
+        Some(&RuntimeValue::String("Bo".into()))
+    );
 }
 
 #[tokio::test]
