@@ -221,7 +221,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn load_vault_cmd(
     store_uri: Option<&str>,
     namespace: &str,
