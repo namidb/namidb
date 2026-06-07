@@ -1479,6 +1479,9 @@ impl<'mt> Snapshot<'mt> {
                 projection.map(|cols| cols.iter().map(|s| s.as_str()).collect());
 
             for batch in reader.scan_with_predicates_and_projection(predicates, projection)? {
+                // Cooperative cancellation (query timeout): one large SST can
+                // decode into many batches, so probe the deadline per batch.
+                crate::cancel::check()?;
                 let id_col = batch
                     .column_by_name(COL_NODE_ID)
                     .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -1644,6 +1647,11 @@ impl<'mt> Snapshot<'mt> {
             let overflows = reader.read_overflow_strings()?;
             let declared_streams = load_declared_streams(&reader, &declared_property_names)?;
             for (idx, row) in rows.iter().enumerate() {
+                // Cooperative cancellation (query timeout): a strided probe so
+                // a huge single edge SST aborts mid-decode, not just per SST.
+                if idx % crate::cancel::CHECK_STRIDE == 0 {
+                    crate::cancel::check()?;
+                }
                 let src = NodeId::from_uuid(Uuid::from_bytes(row.key_id));
                 let dst = NodeId::from_uuid(Uuid::from_bytes(row.partner_id));
                 let view = if row.tombstone {
@@ -1713,7 +1721,11 @@ impl<'mt> Snapshot<'mt> {
             let body = self.get_sst_body(desc).await?;
             let reader = EdgeSstReader::open(body)?;
             let rows = reader.scan_all_edges()?;
-            for row in &rows {
+            for (i, row) in rows.iter().enumerate() {
+                // Cooperative cancellation (query timeout): strided probe.
+                if i % crate::cancel::CHECK_STRIDE == 0 {
+                    crate::cancel::check()?;
+                }
                 let src = NodeId::from_uuid(Uuid::from_bytes(row.key_id));
                 let dst = NodeId::from_uuid(Uuid::from_bytes(row.partner_id));
                 update_edge_count_winner(&mut latest, (src, dst), row.lsn, !row.tombstone);
@@ -2199,6 +2211,12 @@ impl<'mt> Snapshot<'mt> {
     }
 
     async fn get_sst_body(&self, desc: &SstDescriptor) -> Result<Bytes> {
+        // Cooperative cancellation (query timeout): every read path fetches a
+        // candidate SST body through here once per SST, so this one probe
+        // bounds the "scan touches many SSTs" case across all of them. The
+        // per-row decode loops add their own strided probes for a single huge
+        // SST. A no-op when no deadline is in scope (writes, compaction).
+        crate::cancel::check()?;
         let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
         self.fetch_bytes(&absolute).await
     }
@@ -3176,6 +3194,50 @@ mod tests {
             Some(&Value::Str("Alice".into()))
         );
         assert_eq!(view.properties.get("age"), Some(&Value::I64(30)));
+    }
+
+    #[tokio::test]
+    async fn scan_aborts_on_a_passed_deadline() {
+        // Cooperative cancellation (query timeout): a scan run under an
+        // already-passed deadline aborts inside storage with `Error::Timeout`,
+        // at the per-SST body fetch, rather than decoding to completion first.
+        // No deadline in scope leaves the scan unguarded.
+        let store = make_store();
+        let paths = make_paths("read-deadline");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+
+        // Flush a node so the scan reaches an SST; the deadline probe lives in
+        // the per-SST body fetch and the per-batch decode loop.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                id: sorted_node_id(1),
+            },
+            10,
+            MemOp::Upsert(node_payload("Alice", Some(30))),
+        );
+        let committed = flush(&ms, &fence, &base, &mt.freeze(), schema)
+            .await
+            .unwrap()
+            .committed;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+
+        // Unguarded: the scan succeeds.
+        assert_eq!(snap.scan_label("Person").await.unwrap().len(), 1);
+
+        // Under a deadline already in the past, the same scan aborts.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let result = crate::cancel::with_deadline(Some(past), snap.scan_label("Person")).await;
+        assert!(
+            matches!(result, Err(Error::Timeout)),
+            "expected Error::Timeout, got {result:?}"
+        );
     }
 
     // ── secondary equality index (non-unique `indexed` property) ──

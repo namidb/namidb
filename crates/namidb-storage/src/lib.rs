@@ -15,6 +15,7 @@
 
 pub mod adjacency;
 pub mod cache;
+pub mod cancel;
 pub mod compact;
 pub mod error;
 pub mod fence;
