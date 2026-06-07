@@ -51,6 +51,14 @@ below and in the release notes.
   label scan and a typed-value compare (a typed index is a later
   optimisation). The check reads through the read-your-own-writes overlay, so
   an intra-batch duplicate is caught too.
+- The read-query timeout now cancels cooperatively inside the storage decode,
+  not only at query operator boundaries. The deadline rides a task-local in
+  `namidb-storage`, so the CPU-bound SST body fetch and the per-batch /
+  per-row decode and merge loops probe it and abort a single long-running
+  operator (for example a large scan or a big leveled SST decode) mid-flight
+  with a timeout, instead of pinning a worker until the operator returns.
+  Untimed reads, writes and compaction are unaffected (the probe is a no-op
+  when no deadline is in scope).
 
 ## [0.13.0] - 2026-06-07: read-your-own-writes for nodes, compaction space reclamation, query timeout and row cap
 

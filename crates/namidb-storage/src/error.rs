@@ -37,6 +37,13 @@ pub enum Error {
     #[error("precondition failed: {0}")]
     Precondition(String),
 
+    /// A read query ran past its wall-clock deadline while this crate was
+    /// decoding or merging SSTs (cooperative cancellation, see
+    /// [`crate::cancel`]). The query layer maps it to its own timeout error.
+    /// Only raised when a deadline is in scope.
+    #[error("read query exceeded its deadline")]
+    Timeout,
+
     /// The expected manifest version does not exist yet.
     #[error("manifest version {0} not found")]
     ManifestNotFound(u64),

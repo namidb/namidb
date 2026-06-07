@@ -73,7 +73,13 @@ impl From<EvalError> for ExecError {
 
 impl From<namidb_storage::Error> for ExecError {
     fn from(e: namidb_storage::Error) -> Self {
-        ExecError::Storage(e)
+        match e {
+            // Storage raises its own Timeout when a query's deadline fires
+            // mid-decode (cooperative cancellation); surface it as the
+            // executor's Timeout, not a generic storage error.
+            namidb_storage::Error::Timeout => ExecError::Timeout,
+            other => ExecError::Storage(other),
+        }
     }
 }
 
@@ -1763,7 +1769,7 @@ pub(crate) async fn lookup_node_by_property_via_scan(
         return snapshot
             .lookup_node_by_property(label, property, s)
             .await
-            .map_err(ExecError::Storage);
+            .map_err(ExecError::from);
     }
 
     // Fallback for non-string keys.
@@ -1781,12 +1787,9 @@ pub(crate) async fn lookup_node_by_property_via_scan(
         snapshot
             .scan_label_with_predicates(label, &[pred])
             .await
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
     } else {
-        snapshot
-            .scan_label(label)
-            .await
-            .map_err(ExecError::Storage)?
+        snapshot.scan_label(label).await.map_err(ExecError::from)?
     };
     Ok(candidates.into_iter().next())
 }
@@ -1806,12 +1809,9 @@ pub(crate) async fn lookup_nodes_by_property_via_scan(
         return snapshot
             .lookup_nodes_by_property(label, property, s)
             .await
-            .map_err(ExecError::Storage);
+            .map_err(ExecError::from);
     }
-    let all = snapshot
-        .scan_label(label)
-        .await
-        .map_err(ExecError::Storage)?;
+    let all = snapshot.scan_label(label).await.map_err(ExecError::from)?;
     Ok(all
         .into_iter()
         .filter(|view| {
