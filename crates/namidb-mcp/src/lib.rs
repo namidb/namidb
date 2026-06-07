@@ -5,7 +5,8 @@
 //! instead of grepping flat files. Pointed at a namespace where a markdown
 //! vault was loaded (see `namidb-markdown` / `namidb load-vault`), it exposes
 //! read-only tools: list/get notes, backlinks, neighbors, orphans, full-text
-//! substring search, tag tools (list tags, notes by tag including nested
+//! substring search, semantic vector search (K-NN over stored embeddings via
+//! cosine similarity), tag tools (list tags, notes by tag including nested
 //! children, tags of a note, subtags of a tag), and an escape-hatch read-only
 //! `cypher` tool.
 //!
@@ -346,6 +347,35 @@ impl Server {
                     p,
                 )
             }
+            "vector_search" => {
+                let query = vec_arg(args, "query")?;
+                let label = ident_arg(args, "label", "Note")?;
+                let property = ident_arg(args, "property", "embedding")?;
+                // LIMIT takes a literal, so clamp and interpolate `k` rather
+                // than bind it.
+                let k = args
+                    .get("k")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10)
+                    .clamp(1, 100);
+                let mut p = Params::new();
+                p.insert("query".to_string(), RuntimeValue::Vector(query));
+                (
+                    // Pre-filter on label + "has an embedding" (and drop
+                    // placeholder stubs) narrows the candidate set, then rank by
+                    // cosine similarity. `label`/`property` are validated as bare
+                    // identifiers by `ident_arg`, so interpolating them is
+                    // injection-safe.
+                    format!(
+                        "MATCH (n:{label}) \
+                         WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL \
+                         RETURN n.title AS title, n.path AS path, \
+                                cosine_similarity(n.{property}, $query) AS score \
+                         ORDER BY score DESC LIMIT {k}"
+                    ),
+                    p,
+                )
+            }
             "cypher" => (str_arg(args, "query")?, Params::new()),
             other => return Err(format!("unknown tool: {other}")),
         };
@@ -461,6 +491,42 @@ fn str_arg(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required string argument '{key}'"))
 }
 
+/// Parse a required numeric-array argument into an `f32` query vector.
+fn vec_arg(args: &Value, key: &str) -> Result<Vec<f32>, String> {
+    let arr = args
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("missing required array argument '{key}'"))?;
+    if arr.is_empty() {
+        return Err(format!("'{key}' must be a non-empty array of numbers"));
+    }
+    arr.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_f64()
+                .map(|f| f as f32)
+                .ok_or_else(|| format!("'{key}'[{i}] is not a number"))
+        })
+        .collect()
+}
+
+/// Read an optional identifier argument (a label or property name), falling
+/// back to `default`. Restricted to `[A-Za-z_][A-Za-z0-9_]*` so it can be
+/// interpolated into the query text without opening an injection hole.
+fn ident_arg(args: &Value, key: &str, default: &str) -> Result<String, String> {
+    let raw = args.get(key).and_then(Value::as_str).unwrap_or(default);
+    let mut chars = raw.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(raw.to_string())
+    } else {
+        Err(format!(
+            "'{key}' must be a simple identifier (letters, digits, underscore)"
+        ))
+    }
+}
+
 /// Build a `(predicate, params)` pair resolving the note bound as `var` by
 /// name: the normalized key, the exact title, or the path. `var` is a fixed
 /// pattern variable ("t" / "s" / "n"), never user input.
@@ -568,6 +634,20 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": { "note": { "type": "string", "description": "Note name (file stem), title, or path" } },
                 "required": ["note"],
+            },
+        }),
+        json!({
+            "name": "vector_search",
+            "description": "Semantic K-nearest-neighbour search: rank nodes by cosine similarity between a stored embedding property and the given query vector. Pass a pre-computed query embedding as `query` (array of floats, same dimension as the stored vectors). Optional: `label` (default \"Note\"), `property` (default \"embedding\"), `k` (default 10, max 100). Returns title, path and score, highest first. Nodes without an embedding are skipped.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "array", "items": { "type": "number" }, "description": "Query embedding (array of floats), same dimension as the stored vectors" },
+                    "label": { "type": "string", "description": "Node label to search (default \"Note\")" },
+                    "property": { "type": "string", "description": "Embedding property name (default \"embedding\")" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" }
+                },
+                "required": ["query"],
             },
         }),
         json!({
@@ -682,7 +762,7 @@ mod tests {
         let init = server.dispatch("initialize", &Value::Null).await.unwrap();
         assert_eq!(init["protocolVersion"], json!(PROTOCOL_VERSION));
         let list = server.dispatch("tools/list", &Value::Null).await.unwrap();
-        assert_eq!(list["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 12);
     }
 
     #[tokio::test]
@@ -970,6 +1050,60 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn vector_search_runs_and_skips_notes_without_embeddings() {
+        // The markdown vault stores no embeddings, so KNN returns no rows (the
+        // `embedding IS NOT NULL` pre-filter excludes every note), but the tool
+        // must still succeed end to end: array-arg parsing, the $query vector
+        // binding, the cosine_similarity builtin and ORDER BY/LIMIT all wire up.
+        let server = server_with_vault().await;
+        let rows = call(
+            &server,
+            "vector_search",
+            json!({ "query": [0.1, 0.2, 0.3], "k": 5 }),
+        )
+        .await;
+        assert!(
+            rows.as_array().unwrap().is_empty(),
+            "no stored embeddings -> no hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_rejects_unsafe_label() {
+        // A label carrying Cypher syntax must be rejected by the identifier
+        // guard, never interpolated into the query text.
+        let server = server_with_vault().await;
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({
+                    "name": "vector_search",
+                    "arguments": { "query": [0.1], "label": "Note) RETURN 1 //" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("identifier"));
+    }
+
+    #[tokio::test]
+    async fn vector_search_requires_query_array() {
+        let server = server_with_vault().await;
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "vector_search", "arguments": {} }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
     }
 
     #[tokio::test]

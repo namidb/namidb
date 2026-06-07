@@ -801,6 +801,48 @@ fn call_scalar_function(
             }
         }
 
+        // --- Vector similarity / distance
+        // These power KNN over stored embeddings without a dedicated operator:
+        // a query like
+        //   MATCH (n:Note) WHERE n.embedding IS NOT NULL
+        //   RETURN n ORDER BY cosine_similarity(n.embedding, $q) DESC LIMIT 10
+        // expresses semantic search through the existing scan + sort + limit
+        // path, with a WHERE on labels/properties acting as a pre-filter on the
+        // candidate set. Each takes two operands that are a stored `Vector` or a
+        // numeric `List` (so a `$param` array works without an explicit
+        // `vector()` wrap). NULL in either operand propagates to NULL; a
+        // dimension mismatch is a usage error.
+        "cosine_similarity" | "dot_product" | "euclidean_distance" => {
+            match vector_pair(name, args, span)? {
+                None => Ok(RuntimeValue::Null),
+                Some((a, b)) => Ok(match name {
+                    "dot_product" => RuntimeValue::Float(vec_dot_f64(&a, &b)),
+                    "euclidean_distance" => {
+                        let sum: f64 = a
+                            .iter()
+                            .zip(&b)
+                            .map(|(x, y)| {
+                                let d = *x as f64 - *y as f64;
+                                d * d
+                            })
+                            .sum();
+                        RuntimeValue::Float(sum.sqrt())
+                    }
+                    // cosine_similarity: undefined (NULL) when either vector has
+                    // zero magnitude, since the denominator would be zero.
+                    _ => {
+                        let na = vec_dot_f64(&a, &a).sqrt();
+                        let nb = vec_dot_f64(&b, &b).sqrt();
+                        if na == 0.0 || nb == 0.0 {
+                            RuntimeValue::Null
+                        } else {
+                            RuntimeValue::Float(vec_dot_f64(&a, &b) / (na * nb))
+                        }
+                    }
+                }),
+            }
+        }
+
         // --- Lowering helpers (internal)
         "__path" => Ok(RuntimeValue::Path(args.to_vec())),
         "__label_eq" => match args {
@@ -870,6 +912,96 @@ fn num_to_float(v: &RuntimeValue, f: impl Fn(f64) -> f64) -> RuntimeValue {
         RuntimeValue::Float(x) => RuntimeValue::Float(f(*x)),
         _ => RuntimeValue::Null,
     }
+}
+
+/// Sum of products in f64. Embeddings are stored as f32; accumulating in f64
+/// keeps the dot product (and the norms derived from it) numerically stable
+/// over high-dimensional vectors.
+fn vec_dot_f64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+}
+
+/// Coerce a similarity/distance operand into a vector. Accepts a stored
+/// `Vector` or a numeric `List` (so a `$param` array works without an explicit
+/// `vector()` wrap). `Null` yields `Ok(None)` so the caller can propagate NULL;
+/// a non-numeric element or a non-vector value is an error.
+fn coerce_vector(
+    v: &RuntimeValue,
+    fname: &str,
+    span: SourceSpan,
+) -> Result<Option<Vec<f32>>, EvalError> {
+    match v {
+        RuntimeValue::Null => Ok(None),
+        RuntimeValue::Vector(items) => Ok(Some(items.clone())),
+        RuntimeValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, it) in items.iter().enumerate() {
+                match it {
+                    RuntimeValue::Float(f) => out.push(*f as f32),
+                    RuntimeValue::Integer(n) => out.push(*n as f32),
+                    other => {
+                        return Err(EvalError::new(
+                            format!(
+                                "{}: vector elements must be numeric; got {} at index {}",
+                                fname,
+                                other.type_name(),
+                                idx
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        other => Err(EvalError::new(
+            format!("{} requires vectors; got {}", fname, other.type_name()),
+            span,
+        )),
+    }
+}
+
+/// A coerced pair of equal-length vector operands, or `None` when either
+/// operand was NULL (so the caller propagates NULL).
+type VectorPair = Option<(Vec<f32>, Vec<f32>)>;
+
+/// Pull the two operands of a vector similarity/distance builtin, returning
+/// `Ok(None)` when either is NULL so the caller yields NULL. Errors on arity, a
+/// non-vector operand, or a dimension mismatch.
+fn vector_pair(
+    name: &str,
+    args: &[RuntimeValue],
+    span: SourceSpan,
+) -> Result<VectorPair, EvalError> {
+    let (a, b) = match args {
+        [a, b] => (a, b),
+        _ => {
+            return Err(EvalError::new(
+                format!("`{}` expects exactly 2 vectors", name),
+                span,
+            ))
+        }
+    };
+    let va = match coerce_vector(a, name, span)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let vb = match coerce_vector(b, name, span)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if va.len() != vb.len() {
+        return Err(EvalError::new(
+            format!(
+                "{}: vectors must have the same dimension ({} vs {})",
+                name,
+                va.len(),
+                vb.len()
+            ),
+            span,
+        ));
+    }
+    Ok(Some((va, vb)))
 }
 
 /// `left(s, n)` / `right(s, n)`: the first / last `n` characters.
@@ -1647,6 +1779,82 @@ mod tests {
         let err = eval_expr_err("vector([1.0], [2.0])");
         assert!(
             err.message.contains("vector") && err.message.contains("exactly 1"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    // ─── vector similarity / distance builtins ────────────────────
+
+    #[test]
+    fn builtin_vector_distances() {
+        // Identical unit vectors: cosine 1.0.
+        assert_eq!(
+            s("cosine_similarity(vector([1.0, 0.0, 0.0]), vector([1.0, 0.0, 0.0]))"),
+            RuntimeValue::Float(1.0)
+        );
+        // Orthogonal: cosine 0.0.
+        assert_eq!(
+            s("cosine_similarity(vector([1.0, 0.0]), vector([0.0, 1.0]))"),
+            RuntimeValue::Float(0.0)
+        );
+        // Opposite direction: cosine -1.0.
+        assert_eq!(
+            s("cosine_similarity(vector([1.0, 0.0]), vector([-1.0, 0.0]))"),
+            RuntimeValue::Float(-1.0)
+        );
+        // dot_product and euclidean_distance on exact-representable inputs.
+        assert_eq!(
+            s("dot_product(vector([1.0, 2.0, 3.0]), vector([4.0, 5.0, 6.0]))"),
+            RuntimeValue::Float(32.0)
+        );
+        assert_eq!(
+            s("euclidean_distance(vector([0.0, 0.0]), vector([3.0, 4.0]))"),
+            RuntimeValue::Float(5.0)
+        );
+    }
+
+    #[test]
+    fn builtin_vector_accepts_bare_numeric_lists() {
+        // A `$param` array arrives as a List, not a Vector, so the distance
+        // builtins coerce numeric lists directly (no explicit `vector()` wrap).
+        assert_eq!(
+            s("cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0, 0.0])"),
+            RuntimeValue::Float(1.0)
+        );
+        assert_eq!(
+            s("euclidean_distance([0, 0], [3, 4])"),
+            RuntimeValue::Float(5.0)
+        );
+    }
+
+    #[test]
+    fn builtin_vector_null_propagates() {
+        assert!(s("cosine_similarity(NULL, vector([1.0, 0.0]))").is_null());
+        assert!(s("dot_product(vector([1.0]), NULL)").is_null());
+    }
+
+    #[test]
+    fn builtin_vector_zero_magnitude_is_null() {
+        // Cosine is undefined when a vector has zero magnitude.
+        assert!(s("cosine_similarity(vector([0.0, 0.0]), vector([1.0, 1.0]))").is_null());
+    }
+
+    #[test]
+    fn builtin_vector_dimension_mismatch_errors() {
+        let err = eval_expr_err("cosine_similarity(vector([1.0, 2.0]), vector([1.0]))");
+        assert!(
+            err.message.contains("same dimension"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn builtin_vector_wrong_arity_errors() {
+        let err = eval_expr_err("dot_product(vector([1.0]))");
+        assert!(
+            err.message.contains("exactly 2"),
             "unexpected message: {}",
             err.message
         );
