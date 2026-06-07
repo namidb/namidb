@@ -1158,3 +1158,110 @@ async fn intra_batch_duplicate_unique_value_is_rejected() {
     let snap = writer.snapshot();
     assert_eq!(snap.scan_label("Account").await.unwrap().len(), 1);
 }
+
+/// Schema with a single integer unique property.
+fn int_unique_schema() -> namidb_core::schema::Schema {
+    SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("account_no", DataType::Int64, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build()
+}
+
+#[tokio::test]
+async fn nonstring_unique_create_rejects_duplicate() {
+    // A non-string (Int64) unique property is now enforced on CREATE, not
+    // just string properties.
+    let mut writer = WriterSession::open(store(), paths("w-unique-int-create"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 1})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    // A different value is fine.
+    write_q(&mut writer, "CREATE (:Account {account_no: 2})").await;
+
+    // A duplicate of a committed value is rejected.
+    let plan = lower(&parse("CREATE (:Account {account_no: 1})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate integer unique value must be rejected");
+    assert!(
+        format!("{err:?}").contains("unique"),
+        "expected a unique-constraint error, got: {err:?}"
+    );
+
+    let snap = writer.snapshot();
+    assert_eq!(snap.scan_label("Account").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn nonstring_unique_intra_batch_duplicate_rejected() {
+    // The non-string check reads the overlay too: two creates of the same
+    // integer value in one uncommitted statement are caught.
+    let mut writer = WriterSession::open(store(), paths("w-unique-int-batch"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 7})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    let plan =
+        lower(&parse("CREATE (:Account {account_no: 9}), (:Account {account_no: 9})").unwrap())
+            .unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate integer value in one batch must be rejected");
+    assert!(
+        format!("{err:?}").contains("unique"),
+        "expected a unique-constraint error, got: {err:?}"
+    );
+
+    // The failed batch was discarded: only the committed seed remains.
+    let snap = writer.snapshot();
+    assert_eq!(snap.scan_label("Account").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn nonstring_unique_set_rejects_collision_but_allows_self_update() {
+    // SET enforces a non-string unique constraint: moving a node onto another
+    // node's value is rejected, while a self-update or a move to a free value
+    // is allowed.
+    let mut writer = WriterSession::open(store(), paths("w-unique-int-set"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 1})").await;
+    write_q(&mut writer, "CREATE (:Account {account_no: 2})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    // Collision: account 1 -> 2 (held by another node) is rejected.
+    let plan =
+        lower(&parse("MATCH (a:Account {account_no: 1}) SET a.account_no = 2").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("SET onto another node's unique value must be rejected");
+    assert!(
+        format!("{err:?}").contains("unique"),
+        "expected a unique-constraint error, got: {err:?}"
+    );
+
+    // Self-update: account 1 -> 1 is allowed (the node's own value).
+    write_q(
+        &mut writer,
+        "MATCH (a:Account {account_no: 1}) SET a.account_no = 1",
+    )
+    .await;
+    // Move to a free value: account 1 -> 3 is allowed.
+    write_q(
+        &mut writer,
+        "MATCH (a:Account {account_no: 1}) SET a.account_no = 3",
+    )
+    .await;
+
+    let snap = writer.snapshot();
+    let rows = snap.scan_label("Account").await.unwrap();
+    assert_eq!(rows.len(), 2, "no node was created or dropped by the SETs");
+}
