@@ -60,7 +60,9 @@ pub use node_cache::{
 };
 pub use parquet_loader::{load_nodes as load_nodes_from_parquet, LoadOutcome};
 pub use paths::NamespacePaths;
-pub use read::{EdgeListView, EdgeView, NodeView, OwnedSnapshot, Snapshot, SnapshotCell};
+pub use read::{
+    EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
+};
 pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,

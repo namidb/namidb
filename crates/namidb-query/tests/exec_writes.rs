@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use namidb_core::id::{NamespaceId, NodeId};
+use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
 use namidb_core::value::Value as CoreValue;
 use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
@@ -993,4 +994,109 @@ async fn merge_rel_over_matched_nodes_is_idempotent() {
         outcome2.edges_created, 0,
         "second MERGE should not duplicate the edge"
     );
+}
+
+// ─────────────────── RFC-026: read-your-own-writes ───────────────────
+
+#[tokio::test]
+async fn create_then_match_in_one_statement_reads_own_write() {
+    // RFC-026 example 1: a MATCH that follows a CREATE in the same
+    // statement must see the just-created node. Before read-your-own-
+    // writes this returned zero rows.
+    let mut writer = WriterSession::open(store(), paths("w-ryow-create-match"))
+        .await
+        .unwrap();
+    let q = parse(
+        "CREATE (a:Person {name: 'Ada'}) \
+         WITH a \
+         MATCH (p:Person {name: 'Ada'}) \
+         RETURN p",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    assert_eq!(
+        outcome.rows.len(),
+        1,
+        "the MATCH must see the node staged by the CREATE in the same statement"
+    );
+    match outcome.rows[0].get("p") {
+        Some(RuntimeValue::Node(n)) => {
+            assert_eq!(
+                n.properties.get("name"),
+                Some(&RuntimeValue::String("Ada".into()))
+            );
+        }
+        other => panic!("expected node p, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn merge_after_create_in_one_statement_does_not_duplicate() {
+    // RFC-026 example 2: MERGE's match phase must see a node the same
+    // statement just created, so it matches instead of creating a
+    // duplicate.
+    let mut writer = WriterSession::open(store(), paths("w-ryow-merge-create"))
+        .await
+        .unwrap();
+    let q = parse(
+        "CREATE (a:Person {name: 'Ada'}) \
+         MERGE (b:Person {name: 'Ada'}) \
+         RETURN b",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.nodes_created, 1,
+        "MERGE must match the staged CREATE, not create a second node"
+    );
+
+    // Exactly one Person is durable after commit.
+    let snap = writer.snapshot();
+    assert_eq!(snap.scan_label("Person").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn intra_batch_duplicate_unique_value_is_rejected() {
+    // RFC-026: the unique-constraint check reads the overlay, so two
+    // creates of the same unique value in one uncommitted statement are
+    // caught — the second now sees the first.
+    let mut writer = WriterSession::open(store(), paths("w-ryow-unique"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("email", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    // Seed one committed Account so the flush is non-empty and persists the
+    // unique schema into the manifest (an empty flush is a no-op).
+    write_q(&mut writer, "CREATE (:Account {email: 'seed@x.com'})").await;
+    writer.flush(schema).await.unwrap();
+
+    let q =
+        parse("CREATE (:Account {email: 'dup@x.com'}), (:Account {email: 'dup@x.com'})").unwrap();
+    let plan = lower(&q).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate unique value in one batch must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("unique"),
+        "expected a unique-constraint error, got: {msg}"
+    );
+
+    // The failed statement discarded its batch: only the seed remains.
+    let snap = writer.snapshot();
+    assert_eq!(snap.scan_label("Account").await.unwrap().len(), 1);
 }

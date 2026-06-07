@@ -67,10 +67,17 @@ struct Cli {
     )]
     sweep_min_age: Duration,
 
-    /// Actually delete orphaned SST bodies during the sweep. Off by
-    /// default: the sweep runs as a dry-run and only logs what it would
-    /// free, so an operator can review the volume before opting in.
-    #[arg(long, env = "NAMIDB_SWEEP_DELETE", default_value_t = false)]
+    /// Delete orphaned SST bodies during the sweep. On by default: the
+    /// retention horizon (RFC-027) makes deletion safe by construction (an
+    /// object referenced by no manifest version from the horizon to current
+    /// is unreachable by any reader). Set to `false` for a dry-run that only
+    /// logs what it would free.
+    #[arg(
+        long,
+        env = "NAMIDB_SWEEP_DELETE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
     sweep_delete: bool,
 
     /// Address for the Bolt protocol listener (Neo4j driver
@@ -90,6 +97,48 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     bolt_tx_timeout: Duration,
+
+    /// Wall-clock budget for a single read query (HTTP and Bolt, including
+    /// in-transaction reads). A runaway scan or expansion is aborted with a
+    /// timeout error instead of pinning a worker. Set to `0s` to allow read
+    /// queries to run unbounded.
+    #[arg(
+        long,
+        env = "NAMIDB_QUERY_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    query_timeout: Duration,
+
+    /// Maximum rows a single read-query operator may materialise. A query
+    /// whose operator output would exceed this aborts with a row-cap error
+    /// instead of risking an out-of-memory blow-up. Set to `0` to allow read
+    /// queries to materialise without limit.
+    #[arg(long, env = "NAMIDB_QUERY_ROW_CAP", default_value_t = 0)]
+    query_row_cap: usize,
+
+    /// L0-count high-water mark per bucket that triggers a compaction as
+    /// soon as a flush crosses it, instead of waiting for the periodic
+    /// compaction tick. Bounds read amplification under sustained writes.
+    /// Set to `0` to disable the reactive trigger.
+    #[arg(long, env = "NAMIDB_COMPACTION_L0_TRIGGER", default_value_t = 8)]
+    compaction_l0_trigger: usize,
+
+    /// L0-count per bucket above which a committed write is softly stalled
+    /// by `--write-stall-delay`, so the writer cannot outrun compaction
+    /// without bound. Set to `0` (the default) to disable the stall.
+    #[arg(long, env = "NAMIDB_WRITE_STALL_L0", default_value_t = 0)]
+    write_stall_l0: usize,
+
+    /// Delay applied to a committed write while L0 is above
+    /// `--write-stall-l0`. Ignored when the stall is disabled.
+    #[arg(
+        long,
+        env = "NAMIDB_WRITE_STALL_DELAY",
+        default_value = "50ms",
+        value_parser = humantime::parse_duration,
+    )]
+    write_stall_delay: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,6 +160,11 @@ fn main() -> anyhow::Result<()> {
         sweep_delete: cli.sweep_delete,
         bolt_listen: cli.bolt_listen,
         bolt_tx_timeout: cli.bolt_tx_timeout,
+        query_timeout: cli.query_timeout,
+        query_row_cap: cli.query_row_cap,
+        compaction_l0_trigger: cli.compaction_l0_trigger,
+        write_stall_l0: cli.write_stall_l0,
+        write_stall_delay: cli.write_stall_delay,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()

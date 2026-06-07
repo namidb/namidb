@@ -67,7 +67,7 @@ use crate::cache::{EdgeStreamBundle, SstCache};
 use crate::error::{Error, Result};
 use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
 use crate::manifest::{LoadedManifest, SstDescriptor, SstKind};
-use crate::memtable::{MemKey, MemOp, MemtableSnapshot};
+use crate::memtable::{MemEntry, MemKey, MemOp, MemtableSnapshot};
 use crate::node_cache::{NodeCacheKey, NodeViewCache};
 use crate::paths::NamespacePaths;
 use crate::sst::bloom::BloomFilter;
@@ -196,6 +196,20 @@ pub struct Snapshot<'mt> {
     /// per-parent batch calls the factor-path executor issues during a
     /// 2-hop Expand chain (LDBC SNB IC09: 150+ calls/query).
     decoded_node_sst_batches: Mutex<HashMap<String, Arc<Vec<RecordBatch>>>>,
+    /// Read-your-own-writes overlay (RFC-026). A writer's staged-but-
+    /// uncommitted batch, materialised as a second memtable and consulted
+    /// alongside the committed `memtable` on the node read paths. The
+    /// staged ops carry LSNs strictly greater than any committed LSN, so
+    /// the existing last-LSN-wins merge resolves a staged upsert over the
+    /// committed row and a staged tombstone hides it — no separate read
+    /// engine. `None` for every read outside a write context (auto-commit
+    /// reads, the HTTP read path, the Bolt auto-commit branch), which is
+    /// the only behaviour that changes nothing.
+    ///
+    /// v1 wires the node read paths only; edges are a fast follow (RFC-026
+    /// Q1). Edge entries staged in the batch are present in this overlay
+    /// but not yet consulted by the edge read methods.
+    overlay: Option<MemtableSnapshot>,
 }
 
 /// Cold-path routing policy for [`Snapshot::lookup_node`]. See
@@ -253,6 +267,7 @@ impl<'mt> Snapshot<'mt> {
             shared_node_cache: None,
             property_index_cache: None,
             decoded_node_sst_batches: Mutex::new(HashMap::new()),
+            overlay: None,
         }
     }
 
@@ -316,6 +331,62 @@ impl<'mt> Snapshot<'mt> {
         self
     }
 
+    /// Attach a read-your-own-writes overlay (RFC-026): a writer's staged
+    /// batch, materialised as a second memtable, that the node read paths
+    /// consult alongside the committed `memtable`. Built by
+    /// [`crate::ingest::WriterSession::overlay_snapshot`]. See the
+    /// [`Self::overlay`] field for the merge semantics.
+    pub fn with_overlay(mut self, overlay: MemtableSnapshot) -> Self {
+        self.overlay = Some(overlay);
+        self
+    }
+
+    /// Node memtable entries to merge at read time: the committed
+    /// `memtable`, with the staged overlay (RFC-026) chained on when this
+    /// is an overlay snapshot. Staged LSNs are strictly greater than any
+    /// committed LSN, so callers' [`update_node_winner`] last-LSN-wins
+    /// merge picks the staged op for a key present in both. The overlay
+    /// yields only `MemKey::Node` entries, matching `iter_nodes`.
+    fn node_entries(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
+        self.memtable
+            .iter_nodes()
+            .chain(self.overlay.iter().flat_map(|o| o.iter_nodes()))
+    }
+
+    /// Point read of a single node's memtable entry with the staged
+    /// overlay (RFC-026) winning when present. A staged tombstone returns
+    /// the tombstone entry (high LSN), so the caller's last-LSN-wins merge
+    /// hides the committed row.
+    ///
+    /// Staged LSNs are strictly greater than any committed LSN (the writer
+    /// seeds `next_lsn` past every committed LSN on open). We compare the
+    /// two LSNs anyway, rather than blindly trusting the overlay, so a
+    /// future regression in LSN allocation degrades to the same
+    /// last-LSN-wins rule the scan path uses instead of silently surfacing
+    /// a stale row.
+    fn node_mem_entry(&self, id: NodeId) -> Option<&MemEntry> {
+        let key = MemKey::Node { id };
+        let committed = self.memtable.get(&key);
+        let staged = self.overlay.as_ref().and_then(|o| o.get(&key));
+        match (staged, committed) {
+            (Some(s), Some(c)) => {
+                debug_assert!(
+                    s.lsn > c.lsn,
+                    "overlay LSN {} must exceed committed LSN {}",
+                    s.lsn,
+                    c.lsn
+                );
+                if s.lsn >= c.lsn {
+                    Some(s)
+                } else {
+                    Some(c)
+                }
+            }
+            (Some(s), None) => Some(s),
+            (None, c) => c,
+        }
+    }
+
     /// Point-lookup a node by a *unique* user property. The first call
     /// per (label, prop) pays a full label scan to populate the
     /// cross-snapshot cache; subsequent calls are `O(1)`. Caller is
@@ -369,7 +440,7 @@ impl<'mt> Snapshot<'mt> {
             // ours. Materialise as a full label scan over the memtable
             // — bounded by memtable size, not the SST.
             let mut winner: Option<(u64, namidb_core::id::NodeId, bool)> = None;
-            for (mk, e) in self.memtable.iter() {
+            for (mk, e) in self.node_entries() {
                 if let MemKey::Node { id } = mk {
                     match &e.op {
                         MemOp::Upsert(payload) => {
@@ -538,7 +609,7 @@ impl<'mt> Snapshot<'mt> {
         // union of every SST posting list under `value`.
         let mut candidates: std::collections::BTreeSet<namidb_core::id::NodeId> =
             std::collections::BTreeSet::new();
-        for (mk, e) in self.memtable.iter() {
+        for (mk, e) in self.node_entries() {
             if let MemKey::Node { id } = mk {
                 if let MemOp::Upsert(payload) = &e.op {
                     let rec = NodeWriteRecord::decode(payload)?;
@@ -1038,7 +1109,7 @@ impl<'mt> Snapshot<'mt> {
         // 1. Memtable: probe each pending id.
         for id_bytes in &pending {
             let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-            if let Some(entry) = self.memtable.get(&MemKey::Node { id }) {
+            if let Some(entry) = self.node_mem_entry(id) {
                 let view = match &entry.op {
                     MemOp::Tombstone => None,
                     MemOp::Upsert(payload) => Some(node_view_from_payload(
@@ -1191,7 +1262,7 @@ impl<'mt> Snapshot<'mt> {
         let mut winner: Option<(u64, Option<NodeView>)> = None;
 
         // 1. Memtable (highest LSN typically).
-        if let Some(entry) = self.memtable.get(&MemKey::Node { id }) {
+        if let Some(entry) = self.node_mem_entry(id) {
             let view = match &entry.op {
                 MemOp::Tombstone => None,
                 MemOp::Upsert(payload) => {
@@ -1349,7 +1420,7 @@ impl<'mt> Snapshot<'mt> {
         // 1. Memtable rows. Apply predicates after materialising the view; a
         // failing predicate yields a tombstone-like None so a lower-LSN SST row
         // for the same id is not spuriously surfaced.
-        for (mk, entry) in self.memtable.iter() {
+        for (mk, entry) in self.node_entries() {
             let MemKey::Node { id } = mk else {
                 continue;
             };
@@ -2788,6 +2859,96 @@ impl OwnedSnapshot {
     }
 }
 
+/// Tracks the manifest versions live readers are pinned to (RFC-027).
+///
+/// Each [`SnapshotCell::load`] registers the version of the snapshot it
+/// hands out; the returned [`PinnedSnapshot`] deregisters it on drop. The
+/// compactor's sweep and version GC read the resulting retention horizon —
+/// the oldest version any reader could still need — so they never reclaim
+/// an object a live reader can still reach. `min_live()` is monotonically
+/// non-decreasing while a given set of readers runs (readers only ever
+/// register the current version, which increases), so a sweep that samples
+/// it gets a safe lower bound.
+#[derive(Debug, Default)]
+struct SnapshotRegistry {
+    /// `manifest version -> number of live readers pinned to it`.
+    live: std::sync::Mutex<BTreeMap<u64, usize>>,
+}
+
+impl SnapshotRegistry {
+    fn acquire(&self, version: u64) {
+        *self
+            .live
+            .lock()
+            .expect("snapshot registry poisoned")
+            .entry(version)
+            .or_insert(0) += 1;
+    }
+
+    fn release(&self, version: u64) {
+        let mut g = self.live.lock().expect("snapshot registry poisoned");
+        if let Some(count) = g.get_mut(&version) {
+            *count -= 1;
+            if *count == 0 {
+                g.remove(&version);
+            }
+        }
+    }
+
+    /// Oldest manifest version any live reader is pinned to, or `None` when
+    /// no reader is active.
+    fn min_live(&self) -> Option<u64> {
+        self.live
+            .lock()
+            .expect("snapshot registry poisoned")
+            .keys()
+            .next()
+            .copied()
+    }
+}
+
+/// An [`OwnedSnapshot`] handed to a reader with its manifest version
+/// registered as live for the duration (RFC-027). Deref-transparent to
+/// `OwnedSnapshot`, so call sites use `.borrow()` / `.manifest()` as
+/// before. Dropping it releases the reader's hold on the retention
+/// horizon, letting the sweep / GC reclaim that version once no reader
+/// needs it.
+pub struct PinnedSnapshot {
+    snap: Arc<OwnedSnapshot>,
+    registry: Arc<SnapshotRegistry>,
+    version: u64,
+}
+
+impl std::ops::Deref for PinnedSnapshot {
+    type Target = OwnedSnapshot;
+    fn deref(&self) -> &OwnedSnapshot {
+        &self.snap
+    }
+}
+
+impl Drop for PinnedSnapshot {
+    fn drop(&mut self) {
+        self.registry.release(self.version);
+    }
+}
+
+impl PinnedSnapshot {
+    /// Clone the shared `Arc` for callers that need to store or republish
+    /// it. The clone is NOT separately registered; the horizon hold lives
+    /// with this `PinnedSnapshot`.
+    pub fn arc(&self) -> Arc<OwnedSnapshot> {
+        Arc::clone(&self.snap)
+    }
+}
+
+impl std::fmt::Debug for PinnedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedSnapshot")
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
 /// Atomic publisher cell for the currently-active [`OwnedSnapshot`].
 ///
 /// `SnapshotCell` is the lock-light handoff between the writer (which
@@ -2802,21 +2963,34 @@ impl OwnedSnapshot {
 #[derive(Debug)]
 pub struct SnapshotCell {
     inner: std::sync::Mutex<Arc<OwnedSnapshot>>,
+    registry: Arc<SnapshotRegistry>,
 }
 
 impl SnapshotCell {
     pub fn new(snap: Arc<OwnedSnapshot>) -> Self {
         Self {
             inner: std::sync::Mutex::new(snap),
+            registry: Arc::new(SnapshotRegistry::default()),
         }
     }
 
-    /// Pick up the current snapshot. Cheap: one mutex acquire plus
-    /// one `Arc::clone`. The returned `Arc` is independent of any
-    /// future `store` calls, so the read can run for as long as it
-    /// needs without holding any cell lock.
-    pub fn load(&self) -> Arc<OwnedSnapshot> {
-        Arc::clone(&self.inner.lock().expect("snapshot cell poisoned"))
+    /// Pick up the current snapshot, registering its version as live until
+    /// the returned [`PinnedSnapshot`] drops. Cheap: one mutex acquire plus
+    /// an `Arc::clone` and a counter bump. The version is registered while
+    /// the cell lock is held, so it is selected and recorded atomically and
+    /// the retention horizon never excludes a version a reader is about to
+    /// read.
+    pub fn load(&self) -> PinnedSnapshot {
+        let guard = self.inner.lock().expect("snapshot cell poisoned");
+        let snap = Arc::clone(&guard);
+        let version = snap.manifest_version();
+        self.registry.acquire(version);
+        drop(guard);
+        PinnedSnapshot {
+            snap,
+            registry: Arc::clone(&self.registry),
+            version,
+        }
     }
 
     /// Publish a new snapshot. The previous Arc is dropped once
@@ -2833,6 +3007,20 @@ impl SnapshotCell {
             .lock()
             .expect("snapshot cell poisoned")
             .manifest_version()
+    }
+
+    /// Retention horizon (RFC-027): the oldest manifest version any live
+    /// reader is pinned to, or the currently-published version when no
+    /// reader is active. The sweep / GC may reclaim any object that no
+    /// manifest version at or above this references — by construction a
+    /// reader pinned at version `V` keeps the horizon at or below `V`, so
+    /// nothing `V` needs is collected.
+    pub fn retention_horizon(&self) -> u64 {
+        let current = self.manifest_version();
+        self.registry
+            .min_live()
+            .map(|m| m.min(current))
+            .unwrap_or(current)
     }
 }
 
@@ -4679,5 +4867,31 @@ mod tests {
         // happens to store it as Int64 in the SST, the declared type
         // is what surfaces in the schema introspection.
         assert_eq!(props.get("age"), Some(&DataType::Int32));
+    }
+
+    #[test]
+    fn snapshot_registry_tracks_oldest_live_version() {
+        // The retention horizon (RFC-027) is min_live(); it must reflect the
+        // oldest version with at least one live holder and advance only when
+        // every holder of that version releases.
+        let reg = SnapshotRegistry::default();
+        assert_eq!(reg.min_live(), None);
+
+        reg.acquire(5);
+        reg.acquire(7);
+        reg.acquire(5);
+        assert_eq!(reg.min_live(), Some(5));
+
+        reg.release(5);
+        assert_eq!(reg.min_live(), Some(5), "one holder of v5 remains");
+        reg.release(5);
+        assert_eq!(
+            reg.min_live(),
+            Some(7),
+            "v5 fully released, v7 is now the oldest live version"
+        );
+
+        reg.release(7);
+        assert_eq!(reg.min_live(), None, "no live readers");
     }
 }

@@ -13,11 +13,64 @@ below and in the release notes.
 
 ### Added
 
+- Read query timeout (`NAMIDB_QUERY_TIMEOUT` / `--query-timeout`, default
+  `30s`, `0s` disables). A single HTTP or Bolt read, including a read
+  inside an open transaction, is bounded by a wall-clock deadline checked
+  at operator boundaries and inside the scan and expand loops; a query
+  that runs past it aborts with a timeout error instead of pinning a
+  worker. Writes are bounded by the transaction lifecycle, not by this.
+- Read query row cap (`NAMIDB_QUERY_ROW_CAP` / `--query-row-cap`, default
+  `0` = unlimited). Bounds the rows any single read-query operator may
+  materialise; a query whose operator output would exceed the cap aborts
+  with a row-cap error. The multiplicative cross product is rejected
+  before it builds, and a runaway expansion fails fast mid-loop, so a
+  pathological query cannot blow up memory first.
+- Reactive compaction trigger and soft write stall (RFC-027 P5).
+  `NAMIDB_COMPACTION_L0_TRIGGER` (default `8`) compacts a bucket as soon
+  as a flush leaves it with that many L0 SSTs, instead of waiting for the
+  periodic compaction tick, so read amplification stays bounded under
+  sustained writes. `NAMIDB_WRITE_STALL_L0` (default `0` = off) with
+  `NAMIDB_WRITE_STALL_DELAY` (default `50ms`) applies backpressure to a
+  committed write when L0 climbs past the threshold, so the writer cannot
+  outrun compaction without bound.
+
 ### Changed
+
+- Compaction reclaims tombstones and superseded versions (RFC-027 P3).
+  Each compaction is now full-bucket: it merges a bucket's existing L1
+  with its new L0s into a single L1, so the result is the bucket's only
+  SST at the new version and a key whose newest version is a tombstone (or
+  a fully-deleted node/edge) is dropped entirely instead of carried
+  forever. A reader pinned at an older version still observes the delete
+  through the retained source bodies. This bounds on-disk size for
+  delete- and update-heavy workloads; the cost is a full-bucket rewrite
+  (write amplification), which leveled compaction will later bound.
+- Orphan sweep is now reference-counted and snapshot-horizon aware
+  (RFC-027), and enabled by default. It keeps every object referenced by
+  any manifest version from the retention horizon (the oldest version a
+  live reader is pinned to) up to current, then deletes the rest, so it
+  reclaims compaction inputs and failed-commit orphans without a
+  wall-clock guess and can never delete a body a live reader still needs.
+  `min_age` stays as a small secondary guard for the body-PUT-then-CAS
+  race; `NAMIDB_SWEEP_DELETE=false` keeps a dry-run available.
 
 ### Fixed
 
+- Read-your-own-writes within a statement and an open transaction
+  (RFC-026, node overlay). A read sub-plan that runs after a write in the
+  same statement or transaction now sees the staged rows, so `CREATE` then
+  `MATCH`, `MERGE` after `CREATE`, and duplicate detection inside one
+  uncommitted batch all return the right result instead of reading the
+  pre-call committed snapshot. Reads outside a write context are
+  unchanged. Staged edges are not yet visible to traversals; that is a
+  follow-up.
+
 ### Breaking
+
+- The orphan sweep deletes by default (`NAMIDB_SWEEP_DELETE` now defaults
+  to `true`); the retention horizon makes that safe. Set it to `false` to
+  keep the previous dry-run behaviour. The `namidb_storage::sweep_orphans`
+  function gained a `retention_horizon` parameter.
 
 ---
 

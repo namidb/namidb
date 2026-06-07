@@ -13,8 +13,6 @@
 //! 4. The orphan sweep finds the now-unreferenced L0 bodies, deletes them
 //!    when asked, and a re-run finds nothing — and reads still hold.
 
-use std::sync::Arc;
-
 use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
     StatsCatalog,
@@ -62,7 +60,7 @@ fn node_ssts(snap: &OwnedSnapshot, level: SstLevel) -> usize {
 }
 
 /// `MATCH (p:Person) RETURN count(p)` against a pinned snapshot.
-async fn count_persons(snap: &Arc<OwnedSnapshot>) -> i64 {
+async fn count_persons(snap: &OwnedSnapshot) -> i64 {
     let parsed = cypher_parse("MATCH (p:Person) RETURN count(p) AS c").expect("parse");
     let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
     let plan = build_plan(&parsed, &catalog).expect("plan");
@@ -97,17 +95,21 @@ async fn compaction_collapses_l0_and_sweep_reclaims_orphans() {
     }
     let total = (BATCHES * PER_BATCH) as i64;
 
-    let before = state.snapshot.load();
-    assert!(
-        node_ssts(&before, SstLevel::L0) >= 2,
-        "expected >= 2 L0 Person SSTs before compaction, got {}",
-        node_ssts(&before, SstLevel::L0)
-    );
-    assert_eq!(count_persons(&before).await, total, "baseline count");
+    {
+        let before = state.snapshot.load();
+        assert!(
+            node_ssts(&before, SstLevel::L0) >= 2,
+            "expected >= 2 L0 Person SSTs before compaction, got {}",
+            node_ssts(&before, SstLevel::L0)
+        );
+        assert_eq!(count_persons(&before).await, total, "baseline count");
+    } // drop `before` so only the explicit pin below holds the old version
 
     // Pin a snapshot from before compaction: its source L0 bodies must
-    // remain readable even after compaction drops them from the manifest.
+    // remain readable even after compaction drops them from the manifest,
+    // and the retention horizon must keep the sweep off them (RFC-027).
     let pinned_pre_compaction = state.snapshot.load();
+    let pinned_version = pinned_pre_compaction.manifest_version();
 
     // ── One maintenance tick: compaction under the writer lock ──
     {
@@ -127,50 +129,94 @@ async fn compaction_collapses_l0_and_sweep_reclaims_orphans() {
         state.snapshot.store(w.owned_snapshot());
     }
 
-    let after = state.snapshot.load();
-    assert_eq!(
-        node_ssts(&after, SstLevel::L0),
-        0,
-        "no L0 Person SSTs should remain after compaction"
-    );
-    assert_eq!(
-        node_ssts(&after, SstLevel(1)),
-        1,
-        "the bucket should collapse to a single L1 SST"
-    );
+    {
+        let after = state.snapshot.load();
+        assert_eq!(
+            node_ssts(&after, SstLevel::L0),
+            0,
+            "no L0 Person SSTs should remain after compaction"
+        );
+        assert_eq!(
+            node_ssts(&after, SstLevel(1)),
+            1,
+            "the bucket should collapse to a single L1 SST"
+        );
+        // Reads stay correct on the new snapshot AND on the pre-compaction one.
+        assert_eq!(count_persons(&after).await, total, "count after compaction");
+    } // drop `after` so the post-compaction version is not separately pinned
 
-    // Reads stay correct on the new snapshot AND on the pre-compaction one.
-    assert_eq!(count_persons(&after).await, total, "count after compaction");
     assert_eq!(
         count_persons(&pinned_pre_compaction).await,
         total,
         "a snapshot pinned before compaction still reads its source bodies"
     );
 
-    // ── Orphan sweep: the dropped L0 bodies are now unreferenced. ──
-    // min_age = 0 in-test (production default is 24h); max_level = 1.
-    let dry = sweep_orphans(&manifest_store, std::time::Duration::ZERO, 1, false)
-        .await
-        .expect("dry-run sweep");
-    assert!(
-        dry.orphans_found >= 2,
-        "dry-run should find >= 2 orphaned L0 bodies, found {}",
-        dry.orphans_found
-    );
-    assert_eq!(dry.orphans_deleted, 0, "dry-run deletes nothing");
-
-    let del = sweep_orphans(&manifest_store, std::time::Duration::ZERO, 1, true)
-        .await
-        .expect("delete sweep");
+    // ── Horizon-aware orphan sweep (RFC-027). min_age = 0 in-test
+    // (production default is 24h); max_level = 1. ──
+    //
+    // While the pre-compaction reader is alive it holds the horizon at its
+    // version, which still references the dropped L0 bodies, so the sweep
+    // must NOT delete them even with delete = true.
+    let horizon_pinned = state.snapshot.retention_horizon();
     assert_eq!(
-        del.orphans_deleted, dry.orphans_found,
-        "delete sweep removes exactly the orphans the dry-run found"
+        horizon_pinned, pinned_version,
+        "the pinned reader holds the retention horizon at its version"
+    );
+    let guarded = sweep_orphans(
+        &manifest_store,
+        horizon_pinned,
+        std::time::Duration::ZERO,
+        1,
+        true,
+    )
+    .await
+    .expect("guarded sweep");
+    assert_eq!(
+        guarded.orphans_found, 0,
+        "the pinned version still references the L0 bodies; none are orphans"
+    );
+    assert_eq!(guarded.orphans_deleted, 0, "nothing deleted under the pin");
+    assert_eq!(
+        count_persons(&pinned_pre_compaction).await,
+        total,
+        "the pinned reader still reads its source bodies after the guarded sweep"
     );
 
-    let dry2 = sweep_orphans(&manifest_store, std::time::Duration::ZERO, 1, false)
-        .await
-        .expect("second dry-run");
-    assert_eq!(dry2.orphans_found, 0, "no orphans remain after the sweep");
+    // Drop the reader: the horizon advances to current and the L0 bodies,
+    // now referenced by no retained version, become reclaimable.
+    drop(pinned_pre_compaction);
+    let horizon_free = state.snapshot.retention_horizon();
+    assert_eq!(
+        horizon_free,
+        state.snapshot.manifest_version(),
+        "with no readers the horizon is the current version"
+    );
+    let del = sweep_orphans(
+        &manifest_store,
+        horizon_free,
+        std::time::Duration::ZERO,
+        1,
+        true,
+    )
+    .await
+    .expect("delete sweep");
+    assert!(
+        del.orphans_deleted >= 2,
+        "after the reader leaves, the orphaned L0 bodies are reclaimed, deleted {}",
+        del.orphans_deleted
+    );
+
+    // Idempotent: a second sweep finds nothing.
+    let again = sweep_orphans(
+        &manifest_store,
+        state.snapshot.retention_horizon(),
+        std::time::Duration::ZERO,
+        1,
+        true,
+    )
+    .await
+    .expect("second sweep");
+    assert_eq!(again.orphans_found, 0, "no orphans remain after the sweep");
 
     // The live L1 SST was untouched: a fresh read still returns everything.
     let final_snap = state.snapshot.load();

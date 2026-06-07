@@ -22,30 +22,30 @@
 //!
 //! ## What the janitor does
 //!
-//! 1. Loads `manifest/current.json` and builds the set of "live" relative
-//! paths from `Manifest::ssts[i].path` and `Manifest::ssts[i].bloom`.
+//! 1. Loads `manifest/current.json` and, for every manifest version from
+//! the caller-supplied retention horizon to current, unions the "live"
+//! relative paths (SST body, bloom side-car, unique/equality/label index
+//! side-cars). The horizon is the oldest version any live reader is
+//! pinned to (RFC-027), so a reader still reading an old version keeps
+//! every object that version needs in the live set.
 //! 2. Lists `sst/level0/`, `sst/level1/`, … up to a configurable max level.
 //! 3. For every listed object not in the live set, checks its
 //! `last_modified` age. Any object younger than `min_age` is skipped —
-//! this is the safety margin against in-flight writers whose body PUT
-//! succeeded a moment ago and whose manifest CAS is still in flight.
+//! this is a secondary guard against an in-flight writer whose body PUT
+//! succeeded a moment ago and whose manifest CAS is still in flight (the
+//! object is referenced by no version yet).
 //! 4. Older objects are reported as orphans and (when `delete = true`)
 //! removed via `ObjectStore::delete`.
 //!
-//! ## Production discipline
+//! ## Safety
 //!
-//! - **Operate on dry-run mode first.** `delete = false` returns the same
-//! [`JanitorReport`] without mutating the store. Skim the report before
-//! enabling deletion in a new environment.
-//! - **Pick `min_age` conservatively.** 24 h is a safe default for most
-//! deployments; lower values can keep storage cleaner but risk racing a
-//! slow writer.
-//! - **Snapshot pinning.** A long-running reader pinned on a manifest
-//! version older than the current one may still reference an SST that
-//! compaction removed. Either the operator runs the janitor with a
-//! safety window larger than the longest expected snapshot lifetime,
-//! or a future "snapshot anchor" RFC pins those SSTs via a side-table.
-//! Until then, prefer the conservative `min_age`.
+//! The retention horizon is the correctness mechanism: an object the sweep
+//! deletes is referenced by no manifest version at or above the horizon, so
+//! no live reader can reach it. This covers both compaction inputs merged
+//! away before the horizon and orphans from failed commits, with no
+//! time-based guess. `min_age` remains as a small secondary guard for the
+//! body-PUT-then-CAS race; `delete = false` keeps a dry-run available for
+//! operators who want to review a run before trusting it.
 
 use std::collections::HashSet;
 
@@ -90,6 +90,7 @@ pub struct JanitorReport {
  skip(manifest_store),
  fields(
  namespace = %manifest_store.paths().namespace(),
+ retention_horizon,
  min_age_secs = min_age.as_secs(),
  delete,
  max_level,
@@ -97,30 +98,53 @@ pub struct JanitorReport {
 )]
 pub async fn sweep_orphans(
     manifest_store: &ManifestStore,
+    retention_horizon: u64,
     min_age: std::time::Duration,
     max_level: u32,
     delete: bool,
 ) -> Result<JanitorReport> {
-    let manifest = manifest_store.load_current().await?;
+    let current = manifest_store.load_current().await?;
+    let current_version = current.manifest.version;
+    // The horizon is the oldest manifest version any live reader is pinned
+    // to (RFC-027). Clamp defensively to the current version.
+    let horizon = retention_horizon.min(current_version);
+
+    // Build the live object set from the union of every retained manifest
+    // version from the horizon to current (inclusive). A reader pinned at
+    // `horizon` still needs every object that version references, so none of
+    // them can be swept; an object only an older version referenced (a
+    // compaction input merged away before the horizon, say) drops out of the
+    // set and becomes reclaimable. This is what makes deletion safe by
+    // construction rather than by a wall-clock guess.
     let mut referenced: HashSet<String> = HashSet::new();
-    for desc in &manifest.manifest.ssts {
-        referenced.insert(desc.path.clone());
-        if let Some(b) = &desc.bloom {
-            referenced.insert(b.path.clone());
+    let mut mark_live = |ssts: &[crate::manifest::SstDescriptor]| {
+        for desc in ssts {
+            referenced.insert(desc.path.clone());
+            if let Some(b) = &desc.bloom {
+                referenced.insert(b.path.clone());
+            }
+            // Side-car bodies live in the same `sst/level{N}/` prefix the
+            // sweep scans, so they must be marked live too — otherwise the
+            // sweep deletes unique/equality/label-index side-cars a retained
+            // manifest still references, breaking point lookups and (with the
+            // typed-column layout) label scans.
+            for u in &desc.unique_property_indices {
+                referenced.insert(u.path.clone());
+            }
+            for e in &desc.equality_property_indices {
+                referenced.insert(e.path.clone());
+            }
+            if let Some(li) = &desc.label_index {
+                referenced.insert(li.path.clone());
+            }
         }
-        // Side-car bodies live in the same `sst/level{N}/` prefix the sweep
-        // scans, so they must be marked live too — otherwise the sweep deletes
-        // unique/equality/label-index side-cars that the current manifest still
-        // references, breaking point lookups and (with the typed-column layout)
-        // label scans.
-        for u in &desc.unique_property_indices {
-            referenced.insert(u.path.clone());
-        }
-        for e in &desc.equality_property_indices {
-            referenced.insert(e.path.clone());
-        }
-        if let Some(li) = &desc.label_index {
-            referenced.insert(li.path.clone());
+    };
+    for version in horizon..=current_version {
+        if version == current_version {
+            mark_live(&current.manifest.ssts);
+        } else {
+            let manifest = manifest_store.load_manifest_at(version).await?;
+            mark_live(&manifest.ssts);
         }
     }
 
@@ -252,7 +276,7 @@ mod tests {
 
         let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
 
-        let report = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
             .await
             .unwrap();
         assert_eq!(report.orphans_found, 0);
@@ -280,7 +304,7 @@ mod tests {
         store.put(&orphan, PutPayload::from(body)).await.unwrap();
 
         // Dry run: report should flag the orphan but the body must remain.
-        let dry = sweep_orphans(&ms, Duration::from_secs(0), 4, false)
+        let dry = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, false)
             .await
             .unwrap();
         assert_eq!(dry.orphans_found, 1);
@@ -289,7 +313,7 @@ mod tests {
         assert!(store.head(&orphan).await.is_ok(), "dry run must not delete");
 
         // Real run: deletes the orphan.
-        let real = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+        let real = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
             .await
             .unwrap();
         assert_eq!(real.orphans_found, 1);
@@ -301,7 +325,7 @@ mod tests {
         );
 
         // Idempotent: a second sweep finds nothing.
-        let again = sweep_orphans(&ms, Duration::from_secs(0), 4, true)
+        let again = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
             .await
             .unwrap();
         assert_eq!(again.orphans_found, 0);
@@ -322,7 +346,7 @@ mod tests {
             .unwrap();
 
         // min_age = 24h → the freshly-written orphan must be skipped.
-        let report = sweep_orphans(&ms, Duration::from_secs(86_400), 4, true)
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
             .await
             .unwrap();
         assert_eq!(report.orphans_found, 0);
@@ -354,7 +378,7 @@ mod tests {
             .unwrap();
 
         // max_level = 1 catches only the L0 body.
-        let report = sweep_orphans(&ms, Duration::from_secs(0), 1, true)
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 1, true)
             .await
             .unwrap();
         assert_eq!(report.orphans_found, 1);

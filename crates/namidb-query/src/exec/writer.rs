@@ -7,10 +7,14 @@
 //!
 //! See [`docs/rfc/009-write-clauses.md`](../../../../docs/rfc/009-write-clauses.md).
 //!
+//! Read-your-own-writes (RFC-026): read sub-plans run against
+//! [`WriterSession::overlay_snapshot`], so a `MATCH`/`MERGE`-match/unique
+//! check that follows a `CREATE` in the same statement or transaction sees
+//! the staged rows. v1 wires node reads; staged edges are not yet visible
+//! to traversals (RFC-026 Q1, a fast follow).
+//!
 //! Limitations of v0:
 //!
-//! - No read-your-own-writes: each read sub-plan sees the pre-call
-//! snapshot. Pieces created mid-query are not visible until commit.
 //! - MERGE matches by single-element pattern (one node or
 //! node-rel-node chain).
 //! - DETACH DELETE enumerates incident edges across every edge_type
@@ -52,8 +56,8 @@ pub struct WriteOutcome {
 /// `writer.discard_batch()` to roll it back. Used by explicit Bolt
 /// transactions, which stage several statements and commit once at COMMIT.
 /// The RETURN rows are computed during the apply, so they are available
-/// before the commit; like [`execute_write`] there is no
-/// read-your-own-writes (a later read sub-plan sees the pre-call snapshot).
+/// before the commit; a later read sub-plan in the same statement sees the
+/// staged batch through the read-your-own-writes overlay (RFC-026).
 pub async fn execute_write_staged(
     plan: &LogicalPlan,
     writer: &mut WriterSession,
@@ -286,13 +290,13 @@ fn execute_write_inner<'a>(
                 // never touch subtrees that contain writes). In a write
                 // path we delegate to the post-write snapshot reader so
                 // the executor lives in exactly one place.
-                let snap = writer.snapshot();
+                let snap = writer.overlay_snapshot();
                 crate::exec::walker::execute_inner(plan, &snap, params, None).await
             }
 
             LogicalPlan::EdgeTypeCount { .. } => {
                 // Read-only leaf: delegate to the post-write snapshot reader.
-                let snap = writer.snapshot();
+                let snap = writer.overlay_snapshot();
                 crate::exec::walker::execute_inner(plan, &snap, params, None).await
             }
 
@@ -307,7 +311,7 @@ fn execute_write_inner<'a>(
                 id,
             } => {
                 let input_rows = execute_write_inner(input, writer, params, outcome).await?;
-                let snap = writer.snapshot();
+                let snap = writer.overlay_snapshot();
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let id_value = evaluate(id, &row, params)?;
@@ -342,7 +346,7 @@ fn execute_write_inner<'a>(
                 multi,
             } => {
                 let input_rows = execute_write_inner(input, writer, params, outcome).await?;
-                let snap = writer.snapshot();
+                let snap = writer.overlay_snapshot();
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
@@ -392,7 +396,7 @@ fn execute_write_inner<'a>(
             | LogicalPlan::SemiApply { .. }
             | LogicalPlan::PatternList { .. }
             | LogicalPlan::MultiwayJoin { .. } => {
-                let snap = writer.snapshot();
+                let snap = writer.overlay_snapshot();
                 execute_inner(plan, &snap, params, None).await
             }
         }
@@ -445,11 +449,11 @@ fn apply_spread_properties(
 
 /// Enforce declared unique constraints for a node about to be created.
 /// Each label's unique string-valued properties are checked against the
-/// committed snapshot through the property index (O(1) on the warm path).
-/// Returns [`ExecError::Constraint`] on the first duplicate. Non-string
-/// unique properties are not checked (the property index keys on strings);
-/// nor are duplicates staged within the same uncommitted batch (that needs
-/// read-your-own-writes).
+/// read-your-own-writes overlay (RFC-026), so a duplicate value staged
+/// earlier in the same uncommitted statement/transaction is caught too,
+/// not just one already committed. Returns [`ExecError::Constraint`] on the
+/// first duplicate. Non-string unique properties are not checked (the
+/// property index keys on strings).
 async fn enforce_unique_on_create(
     writer: &WriterSession,
     labels: &[String],
@@ -474,7 +478,7 @@ async fn enforce_unique_on_create(
         checks
     };
     for (label, prop, value) in checks {
-        let snap = writer.snapshot();
+        let snap = writer.overlay_snapshot();
         let existing = snap
             .lookup_node_by_property(label, prop, value)
             .await
@@ -519,7 +523,12 @@ async fn enforce_unique_on_set(
             .collect()
     };
     for label in &unique_labels {
-        let snap = writer.snapshot();
+        // Read-your-own-writes overlay (RFC-026): a SET that follows a
+        // CREATE in the same statement/transaction must see the staged row,
+        // so a duplicate value staged earlier in the batch is caught too,
+        // not just one already committed. Self-update stays allowed via the
+        // `self_id` check below.
+        let snap = writer.overlay_snapshot();
         let existing = snap
             .lookup_node_by_property(label, key, v)
             .await
@@ -590,10 +599,10 @@ async fn apply_create(
                     Some(id) => id,
                     None => NodeId::new(),
                 };
-                // Enforce declared unique constraints against the committed
-                // snapshot before staging the node. Note: duplicates staged
-                // within the same uncommitted statement/transaction are not
-                // caught yet (needs read-your-own-writes).
+                // Enforce declared unique constraints against the
+                // read-your-own-writes overlay (RFC-026) before staging the
+                // node, so a duplicate staged earlier in the same uncommitted
+                // batch is caught as well as one already committed.
                 enforce_unique_on_create(writer, labels, &core_props).await?;
                 let record = NodeWriteRecord {
                     properties: core_props,
@@ -950,7 +959,7 @@ async fn detach_incident_edges(
     for et in edge_types {
         let mut to_delete: Vec<(NodeId, NodeId)> = Vec::new();
         {
-            let snap = writer.snapshot();
+            let snap = writer.overlay_snapshot();
             let out_edges = snap
                 .out_edges(&et, node)
                 .await
@@ -1051,7 +1060,7 @@ async fn find_merge_matches(
             ));
         }
         let (head_alias, (head_labels, head_props)) = nodes.into_iter().next().expect("len == 1");
-        let snap = writer.snapshot();
+        let snap = writer.overlay_snapshot();
         let candidates = snap
             .scan_label(merge_scan_label(head_labels))
             .await
@@ -1085,7 +1094,7 @@ async fn find_merge_matches(
     //   * a back-reference to an alias already bound on the outer row
     //     (e.g. `MATCH (a), (b) MERGE (a)-[:R]->(b)`) — no scan, just
     //     keep the carried-in NodeValue.
-    let snap = writer.snapshot();
+    let snap = writer.overlay_snapshot();
     let first_head_alias = match rels[0] {
         CreateElement::Rel { source_alias, .. } => source_alias.as_str(),
         _ => unreachable!("rels only contains Rel variants"),

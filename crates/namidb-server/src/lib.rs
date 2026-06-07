@@ -24,8 +24,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use namidb_query::{
-    execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
-    StatsCatalog, WriteOutcome,
+    execute_with_limits, execute_write, parse as cypher_parse, plan as build_plan, Params,
+    RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
@@ -46,8 +46,10 @@ pub struct Config {
     /// body — the sole guard against deleting a file a slow reader's pinned
     /// snapshot still references.
     pub sweep_min_age: Duration,
-    /// When `false` the orphan sweep is a dry-run (logs what it would free
-    /// without deleting). Operators opt in after reviewing the volume.
+    /// When `true` (the default) the orphan sweep deletes unreferenced SST
+    /// bodies; the retention horizon (RFC-027) makes that safe by
+    /// construction. Set `false` for a dry-run that only logs what it would
+    /// free.
     pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
@@ -56,6 +58,27 @@ pub struct Config {
     /// pin it; after this long without a message the transaction is rolled
     /// back and failed. `Duration::ZERO` disables the timeout.
     pub bolt_tx_timeout: Duration,
+    /// Wall-clock deadline for a single read query (HTTP and Bolt, including
+    /// in-transaction reads). A runaway scan or expansion is aborted with a
+    /// timeout error rather than pinning a worker. Writes are bounded by the
+    /// transaction lifecycle, not this. `Duration::ZERO` disables it.
+    pub query_timeout: Duration,
+    /// Maximum rows a single read-query operator may materialise. A query
+    /// whose operator output would exceed this aborts with a row-cap error
+    /// instead of risking an out-of-memory blow-up (e.g. a cross product).
+    /// `0` disables it.
+    pub query_row_cap: usize,
+    /// L0-count high-water mark per bucket that triggers a compaction as
+    /// soon as a flush crosses it, instead of waiting for the periodic
+    /// compaction tick (RFC-027 P5). Keeps read amplification bounded under
+    /// sustained writes. `0` disables the reactive trigger.
+    pub compaction_l0_trigger: usize,
+    /// L0-count per bucket above which writes are softly stalled by
+    /// `write_stall_delay` (RFC-027 P5), so the writer cannot outrun
+    /// compaction without bound. `0` disables the stall.
+    pub write_stall_l0: usize,
+    /// Delay applied to a write when L0 is above `write_stall_l0`.
+    pub write_stall_delay: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -77,6 +100,19 @@ pub struct AppState {
     catalog_cache: CatalogCache,
     auth_token: Option<Arc<str>>,
     namespace: String,
+    /// Per-read-query wall-clock budget. `Duration::ZERO` disables it.
+    /// Defaults to disabled; the server sets it from [`Config`] at boot.
+    query_timeout: Duration,
+    /// Per-read-query operator row cap. `0` disables it. Defaults to
+    /// disabled; the server sets it from [`Config`] at boot.
+    query_row_cap: usize,
+    /// Soft write-stall threshold and delay (RFC-027 P5). When the worst
+    /// bucket's L0 count reaches `write_stall_l0` (and it is non-zero), a
+    /// committed write waits `write_stall_delay` before returning, applying
+    /// backpressure so the writer cannot outrun compaction. Defaults to
+    /// disabled; the server sets them from [`Config`] at boot.
+    write_stall_l0: usize,
+    write_stall_delay: Duration,
 }
 
 impl AppState {
@@ -88,7 +124,56 @@ impl AppState {
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             auth_token: auth_token.map(Arc::from),
             namespace,
+            query_timeout: Duration::ZERO,
+            query_row_cap: 0,
+            write_stall_l0: 0,
+            write_stall_delay: Duration::ZERO,
         }
+    }
+
+    /// Set the soft write-stall threshold and delay (builder style). A
+    /// threshold of `0` leaves writes unstalled.
+    pub fn with_write_stall(mut self, l0_threshold: usize, delay: Duration) -> Self {
+        self.write_stall_l0 = l0_threshold;
+        self.write_stall_delay = delay;
+        self
+    }
+
+    /// If a write should be stalled given the worst bucket's current L0
+    /// count, the delay to apply; otherwise `None`. The caller samples
+    /// `max_l0_bucket_len()` while holding the writer lock, then sleeps
+    /// after releasing it.
+    pub(crate) fn write_stall_for(&self, max_l0: usize) -> Option<Duration> {
+        (self.write_stall_l0 > 0
+            && max_l0 >= self.write_stall_l0
+            && self.write_stall_delay > Duration::ZERO)
+            .then_some(self.write_stall_delay)
+    }
+
+    /// Set the per-read-query timeout (builder style). `Duration::ZERO`
+    /// leaves reads unbounded.
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
+    }
+
+    /// Set the per-read-query operator row cap (builder style). `0` leaves
+    /// reads uncapped.
+    pub fn with_query_row_cap(mut self, row_cap: usize) -> Self {
+        self.query_row_cap = row_cap;
+        self
+    }
+
+    /// Deadline for a read query starting now, or `None` when the timeout
+    /// is disabled. Computed per query so each read gets the full budget.
+    pub(crate) fn query_deadline(&self) -> Option<std::time::Instant> {
+        (self.query_timeout > Duration::ZERO)
+            .then(|| std::time::Instant::now() + self.query_timeout)
+    }
+
+    /// Operator row cap for a read query, or `None` when disabled.
+    pub(crate) fn query_row_cap(&self) -> Option<usize> {
+        (self.query_row_cap > 0).then_some(self.query_row_cap)
     }
 
     /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
@@ -152,12 +237,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let maint_manifest_store = ManifestStore::new(store.clone(), paths.clone());
     let writer = WriterSession::open(store, paths).await?;
 
-    let state = AppState::new(writer, config.auth_token.clone(), namespace);
+    let state = AppState::new(writer, config.auth_token.clone(), namespace)
+        .with_query_timeout(config.query_timeout)
+        .with_query_row_cap(config.query_row_cap)
+        .with_write_stall(config.write_stall_l0, config.write_stall_delay);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
         let state_for_flush = state.clone();
         let interval = config.flush_interval;
+        // Reactive compaction trigger (RFC-027 P5): when a flush leaves a
+        // bucket with >= this many L0 SSTs, compact immediately under the
+        // same writer lock rather than waiting for the periodic compaction
+        // tick, so read amplification does not spike between ticks.
+        let l0_trigger = config.compaction_l0_trigger;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // first tick fires immediately; skip.
@@ -165,8 +258,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 tick.tick().await;
                 let mut w = state_for_flush.writer.lock().await;
                 let schema = w.snapshot().manifest().manifest.schema.clone();
-                match w.flush(schema).await {
-                    Ok(_) => state_for_flush.snapshot.store(w.owned_snapshot()),
+                match w.flush(schema.clone()).await {
+                    Ok(_) => {
+                        state_for_flush.snapshot.store(w.owned_snapshot());
+                        if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
+                            match w.compact_l0(&schema).await {
+                                Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                    state_for_flush.snapshot.store(w.owned_snapshot());
+                                    info!(
+                                        removed = outcome.source_ssts_removed,
+                                        written = outcome.new_ssts_written,
+                                        "reactive compaction (L0 high-water)"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => error!(error = %e, "reactive compaction failed"),
+                            }
+                        }
+                    }
                     Err(e) => error!(error = %e, "periodic flush failed"),
                 }
             }
@@ -178,9 +287,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // compaction. Compaction is a writer mutation, so it goes through the
     // ONE writer lock — never a second `WriterSession`, which would bump the
     // epoch and fence the foreground writer. The sweep takes no lock (it
-    // reads the committed manifest itself) and is gated to a dry-run by
-    // default; `sweep_min_age` is the only thing keeping it from deleting a
-    // body a slow reader's pinned snapshot still references.
+    // reads the committed manifest itself); the retention horizon (RFC-027)
+    // is what keeps it from deleting a body a slow reader's pinned snapshot
+    // still references, so it is safe to enable by default.
     if config.compaction_interval > Duration::ZERO {
         let state_for_maint = state.clone();
         let interval = config.compaction_interval;
@@ -213,8 +322,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     }
                 }
                 // Orphan sweep — no writer lock. `max_level = 1` because the
-                // engine only produces L0 + L1 today.
-                match sweep_orphans(&maint_manifest_store, sweep_min_age, 1, sweep_delete).await {
+                // engine only produces L0 + L1 today. The retention horizon
+                // (RFC-027) is the oldest manifest version any live reader is
+                // pinned to; the sweep keeps every object referenced from the
+                // horizon to current, so it can never delete a body a reader
+                // still needs.
+                let horizon = state_for_maint.snapshot.retention_horizon();
+                match sweep_orphans(
+                    &maint_manifest_store,
+                    horizon,
+                    sweep_min_age,
+                    1,
+                    sweep_delete,
+                )
+                .await
+                {
                     Ok(report) if report.orphans_found > 0 => info!(
                         found = report.orphans_found,
                         deleted = report.orphans_deleted,
@@ -422,11 +544,24 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
 
     if plan.contains_write() {
         let mut writer = state.writer.lock().await;
-        match execute_write(&plan, &mut writer, &params).await {
+        let result = execute_write(&plan, &mut writer, &params).await;
+        // Sample the soft write-stall decision while still holding the lock
+        // (RFC-027 P5), then release it and sleep — backpressure applies to
+        // this request, not to the writer mutex other connections need.
+        let stall = if result.is_ok() {
+            // Refresh the published snapshot so subsequent reads see the
+            // just-committed records (RFC-021).
+            state.snapshot.store(writer.owned_snapshot());
+            state.write_stall_for(writer.max_l0_bucket_len())
+        } else {
+            None
+        };
+        drop(writer);
+        if let Some(delay) = stall {
+            tokio::time::sleep(delay).await;
+        }
+        match result {
             Ok(outcome) => {
-                // Refresh the published snapshot so subsequent reads
-                // see the just-committed records (RFC-021).
-                state.snapshot.store(writer.owned_snapshot());
                 let summary = WriteSummary::from(&outcome);
                 let (columns, rows) = rows_to_json(&outcome.rows);
                 Json(CypherResponse {
@@ -449,7 +584,15 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
         let snap = owned.borrow();
-        match execute(&plan, &snap, &params).await {
+        match execute_with_limits(
+            &plan,
+            &snap,
+            &params,
+            state.query_deadline(),
+            state.query_row_cap(),
+        )
+        .await
+        {
             Ok(rows) => {
                 let (columns, rows) = rows_to_json(&rows);
                 Json(CypherResponse {
@@ -674,6 +817,41 @@ mod tests {
         );
         let c4 = state.catalog_for(&m1);
         assert!(Arc::ptr_eq(&c3, &c4));
+    }
+
+    #[tokio::test]
+    async fn write_stall_for_respects_threshold() {
+        // RFC-027 P5 backpressure decision. Disabled by default.
+        let (store, paths) = namidb_storage::parse_uri("memory://test-stall-off").unwrap();
+        let off = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        );
+        assert!(
+            off.write_stall_for(1_000).is_none(),
+            "disabled: never stalls"
+        );
+
+        // Enabled: stall only at or above the threshold.
+        let (store2, paths2) = namidb_storage::parse_uri("memory://test-stall-on").unwrap();
+        let on = AppState::new(
+            WriterSession::open(store2, paths2).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_write_stall(8, Duration::from_millis(50));
+        assert_eq!(on.write_stall_for(7), None, "below threshold");
+        assert_eq!(
+            on.write_stall_for(8),
+            Some(Duration::from_millis(50)),
+            "at threshold"
+        );
+        assert_eq!(
+            on.write_stall_for(99),
+            Some(Duration::from_millis(50)),
+            "above threshold"
+        );
     }
 
     #[tokio::test]

@@ -14,8 +14,8 @@ use namidb_bolt::{
     AuthPolicy, Backend, BackendError, RunOutcome, ServerInfo, Session, StatementType,
 };
 use namidb_query::{
-    execute, execute_write, execute_write_staged, parse as cypher_parse, plan as build_plan,
-    ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
+    execute_with_limits, execute_write, execute_write_staged, parse as cypher_parse,
+    plan as build_plan, ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
 };
 use namidb_storage::WriterSession;
 use tokio::net::TcpListener;
@@ -97,13 +97,28 @@ impl Backend for ServerBackend {
                 .await
                 .map_err(map_exec_err)?;
             self.state.snapshot.store(writer.owned_snapshot());
+            // Soft write stall (RFC-027 P5): sample under the lock, release,
+            // then back off this request if L0 is piling up.
+            let stall = self.state.write_stall_for(writer.max_l0_bucket_len());
+            drop(writer);
+            if let Some(delay) = stall {
+                tokio::time::sleep(delay).await;
+            }
             Ok(write_run_outcome(outcome))
         } else {
             // Read path: borrow a short-lived `Snapshot` from the owned
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
             let snap = owned.borrow();
-            let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await
+            .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }
@@ -128,9 +143,10 @@ impl Backend for ServerBackend {
         cypher: &str,
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
-        // Introspection and reads run against the published snapshot, same
-        // as auto-commit — an in-tx read does NOT see the tx's own staged
-        // writes (no read-your-own-writes; documented limitation).
+        // Introspection runs against the published snapshot (schema only).
+        // Data reads, below, run against the transaction's own writer with
+        // its staged batch overlaid, so an in-tx read sees the tx's own
+        // staged writes (read-your-own-writes, RFC-026).
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -173,8 +189,24 @@ impl Backend for ServerBackend {
             tx.staged = true;
             Ok(write_run_outcome(outcome))
         } else {
-            let snap = owned.borrow();
-            let rows = execute(&plan, &snap, &params).await.map_err(map_exec_err)?;
+            // Read against the transaction's own writer so the staged batch
+            // is visible (RFC-026). The writer pins the committed state at
+            // tx-begin (no commit happens mid-tx while we hold the lock) and
+            // overlays everything statements 1..N-1 staged.
+            let mut slot = self.tx.lock().await;
+            let tx = slot
+                .as_mut()
+                .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
+            let snap = tx.writer.overlay_snapshot();
+            let rows = execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                self.state.query_deadline(),
+                self.state.query_row_cap(),
+            )
+            .await
+            .map_err(map_exec_err)?;
             Ok(read_run_outcome(rows))
         }
     }

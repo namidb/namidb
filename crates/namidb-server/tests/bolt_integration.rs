@@ -270,6 +270,15 @@ async fn boot_bolt(
     ns: &str,
     tx_timeout: Duration,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_full(ns, tx_timeout, Duration::ZERO).await
+}
+
+/// Like [`boot_bolt`] but also sets the per-read-query timeout.
+async fn boot_bolt_full(
+    ns: &str,
+    tx_timeout: Duration,
+    query_timeout: Duration,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bolt_addr = listener.local_addr().unwrap();
     drop(listener);
@@ -287,6 +296,11 @@ async fn boot_bolt(
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: tx_timeout,
+        query_timeout,
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -328,6 +342,11 @@ async fn bolt_create_then_match_roundtrip() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -396,6 +415,11 @@ async fn bolt_bad_token_yields_failure() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
     };
 
     let server_task = tokio::spawn(async move {
@@ -528,6 +552,11 @@ async fn bolt_memgraph_introspection_populates_schema() {
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;
@@ -721,6 +750,85 @@ async fn bolt_multi_statement_commit_is_atomic() {
     assert_eq!(rows.len(), 2, "rolled-back create must not appear");
 
     goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_in_tx_read_sees_own_staged_write() {
+    // RFC-026 read-your-own-writes: a read in statement N of a transaction
+    // must see what statements 1..N-1 staged, while other sessions (on the
+    // committed snapshot) must NOT see the uncommitted work.
+    let (bolt_addr, task) = boot_bolt("bolt-tx-ryow", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    begin(&mut stream).await;
+    // Statement 1: stage a node, no commit.
+    pull_all(&mut stream, "CREATE (a:Person {name: 'Uma'})").await;
+    // Statement 2: a read in the SAME transaction sees the staged node.
+    // Before read-your-own-writes this returned zero rows.
+    let (_f, rows) = pull_all(
+        &mut stream,
+        "MATCH (p:Person {name: 'Uma'}) RETURN p.name AS name",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "an in-tx read must see the tx's own staged write"
+    );
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Uma".into())));
+
+    // Isolation: a second connection reads the committed snapshot and must
+    // not observe the still-uncommitted node. (A read never needs the writer
+    // lock that the open transaction holds.)
+    let mut other = TcpStream::connect(bolt_addr).await.expect("connect other");
+    handshake(&mut other).await;
+    hello_and_logon(&mut other, "test-token").await;
+    let (_f, rows2) = pull_all(&mut other, "MATCH (p:Person) RETURN p.name AS name").await;
+    assert!(
+        rows2.is_empty(),
+        "an uncommitted staged write must not be visible to other sessions, got {rows2:?}"
+    );
+    goodbye(&mut other).await;
+    other.shutdown().await.ok();
+
+    commit(&mut stream).await;
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_read_query_times_out() {
+    // A 1ns read budget: the deadline (now + 1ns) is already past by the
+    // time the executor reaches its first operator guard, so a read RUN
+    // fails with a timeout instead of returning rows. Planning alone takes
+    // far longer than a nanosecond, so this is deterministic.
+    let (bolt_addr, task) =
+        boot_bolt_full("bolt-qtimeout", Duration::ZERO, Duration::from_nanos(1)).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("MATCH (p:Person) RETURN p".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let resp = recv_msg(&mut stream).await;
+    assert!(
+        matches!(resp, Response::Failure(_)),
+        "a read past its 1ns budget must fail, got {resp:?}"
+    );
+
+    // Session is FAILED after the error; just drop the connection.
     stream.shutdown().await.ok();
     task.abort();
 }
