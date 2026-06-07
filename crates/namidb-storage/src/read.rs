@@ -198,17 +198,19 @@ pub struct Snapshot<'mt> {
     decoded_node_sst_batches: Mutex<HashMap<String, Arc<Vec<RecordBatch>>>>,
     /// Read-your-own-writes overlay (RFC-026). A writer's staged-but-
     /// uncommitted batch, materialised as a second memtable and consulted
-    /// alongside the committed `memtable` on the node read paths. The
-    /// staged ops carry LSNs strictly greater than any committed LSN, so
-    /// the existing last-LSN-wins merge resolves a staged upsert over the
-    /// committed row and a staged tombstone hides it — no separate read
-    /// engine. `None` for every read outside a write context (auto-commit
-    /// reads, the HTTP read path, the Bolt auto-commit branch), which is
-    /// the only behaviour that changes nothing.
+    /// alongside the committed `memtable`. The staged ops carry LSNs
+    /// strictly greater than any committed LSN, so the existing
+    /// last-LSN-wins merge resolves a staged upsert over the committed row
+    /// and a staged tombstone hides it, with no separate read engine.
+    /// `None` for every read outside a write context (auto-commit reads,
+    /// the HTTP read path, the Bolt auto-commit branch), which is the only
+    /// behaviour that changes nothing.
     ///
-    /// v1 wires the node read paths only; edges are a fast follow (RFC-026
-    /// Q1). Edge entries staged in the batch are present in this overlay
-    /// but not yet consulted by the edge read methods.
+    /// The node read paths merge it via [`node_entries`](Self::node_entries)
+    /// and [`node_mem_entry`](Self::node_mem_entry); the edge read paths
+    /// merge it via [`edge_mem_entries`](Self::edge_mem_entries) (RFC-026
+    /// edge overlay), so a traversal over an edge staged earlier in the
+    /// same statement or transaction sees it.
     overlay: Option<MemtableSnapshot>,
 }
 
@@ -351,6 +353,23 @@ impl<'mt> Snapshot<'mt> {
         self.memtable
             .iter_nodes()
             .chain(self.overlay.iter().flat_map(|o| o.iter_nodes()))
+    }
+
+    /// Memtable entries to consult on the edge read paths (RFC-026 edge
+    /// overlay): the committed `memtable`, with the writer's staged batch
+    /// chained on when this is an overlay snapshot. Staged LSNs are
+    /// strictly greater than any committed LSN, so the per-partner /
+    /// per-edge last-LSN-wins merge in every edge read path picks a staged
+    /// upsert or tombstone over the committed edge. Unlike
+    /// [`node_entries`](Self::node_entries) this yields every entry; the
+    /// edge paths filter `MemKey::Edge` inline, exactly as they did over
+    /// the bare committed `memtable`, so node entries are skipped. When
+    /// nothing is staged (`overlay` is `None`) this is the committed
+    /// `memtable` alone.
+    fn edge_mem_entries(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
+        self.memtable
+            .iter()
+            .chain(self.overlay.iter().flat_map(|o| o.iter()))
     }
 
     /// Point read of a single node's memtable entry with the staged
@@ -1569,8 +1588,8 @@ impl<'mt> Snapshot<'mt> {
     pub async fn scan_edge_type(&self, edge_type: &str) -> Result<Vec<EdgeView>> {
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, Option<EdgeView>)> = BTreeMap::new();
 
-        // 1. Memtable.
-        for (mk, entry) in self.memtable.iter() {
+        // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
+        for (mk, entry) in self.edge_mem_entries() {
             let MemKey::Edge {
                 edge_type: et,
                 src,
@@ -1665,8 +1684,8 @@ impl<'mt> Snapshot<'mt> {
         // merge exactly, minus the EdgeView materialisation.
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, bool)> = BTreeMap::new();
 
-        // 1. Memtable.
-        for (mk, entry) in self.memtable.iter() {
+        // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
+        for (mk, entry) in self.edge_mem_entries() {
             let MemKey::Edge {
                 edge_type: et,
                 src,
@@ -1759,9 +1778,10 @@ impl<'mt> Snapshot<'mt> {
         // Partner bytes -> (lsn, is_upsert).
         let mut latest: BTreeMap<[u8; 16], (u64, bool)> = BTreeMap::new();
 
-        // Memtable sweep first; the SST/CSR path below shadows whatever
-        // the memtable contributed only when its LSN is strictly higher.
-        for (mk, entry) in self.memtable.iter() {
+        // Committed memtable then the staged overlay (RFC-026 edge RYOW)
+        // first; the SST/CSR path below shadows whatever they contributed
+        // only when its LSN is strictly higher.
+        for (mk, entry) in self.edge_mem_entries() {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -1951,8 +1971,8 @@ impl<'mt> Snapshot<'mt> {
         // Per-partner last-write-wins state.
         let mut latest: BTreeMap<[u8; 16], (u64, Option<EdgeView>)> = BTreeMap::new();
 
-        // 1. Memtable.
-        for (mk, entry) in self.memtable.iter() {
+        // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
+        for (mk, entry) in self.edge_mem_entries() {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -2103,10 +2123,10 @@ impl<'mt> Snapshot<'mt> {
         // 2. Per-partner last-write-wins state. Memtable + CSR feed it.
         let mut latest: BTreeMap<[u8; 16], (u64, Option<EdgeView>)> = BTreeMap::new();
 
-        // 2a. Memtable sweep — same shape as the SST path but unchanged
-        // because the memtable is already in-RAM. Tombstones from
-        // here can shadow CSR upserts of equal-or-lower LSN.
-        for (mk, entry) in self.memtable.iter() {
+        // 2a. Memtable sweep, then the writer's staged overlay (RFC-026
+        // edge RYOW): same shape as the SST path. A staged or committed
+        // tombstone here shadows a CSR upsert of equal-or-lower LSN.
+        for (mk, entry) in self.edge_mem_entries() {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -3663,6 +3683,142 @@ mod tests {
         // bob's edge tombstoned, only carol remains.
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].dst, carol);
+    }
+
+    #[tokio::test]
+    async fn edge_overlay_read_your_own_writes_sst_and_csr() {
+        // RFC-026 edge overlay: a writer's staged-but-uncommitted edge is
+        // visible through the overlay (a staged upsert appears, a staged
+        // tombstone hides a committed edge) on BOTH edge read paths — the
+        // legacy SST scan and the CSR adjacency — and through both the
+        // partner list (out/in_edges) and the WCOJ topology
+        // (sorted_partners). The overlay is built by hand here; the query
+        // and Bolt suites cover the real `overlay_snapshot()` wiring.
+        let store = make_store();
+        let paths = make_paths("read-edge-overlay");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+
+        // Commit (flush to SST) alice→bob (LSN 10) and alice→dave (LSN 11).
+        let mut mt_flush = Memtable::new();
+        for (dst, lsn) in [(bob, 10u64), (dave, 11)] {
+            mt_flush.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst,
+                },
+                lsn,
+                MemOp::Upsert(edge_payload()),
+            );
+        }
+        let frozen = mt_flush.freeze();
+        let outcome = flush(&ms, &fence, &base, &frozen, schema.clone())
+            .await
+            .unwrap();
+
+        // The committed (live) memtable is empty; the staged batch lives only
+        // in the overlay: upsert alice→carol (LSN 30) and tombstone alice→bob
+        // (LSN 31). Staged LSNs exceed every committed LSN, as the real
+        // `overlay_snapshot` guarantees.
+        let live = Memtable::new();
+        let live_view = live.snapshot_view();
+
+        let mut staged = Memtable::new();
+        staged.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: carol,
+            },
+            30,
+            MemOp::Upsert(edge_payload()),
+        );
+        staged.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            31,
+            MemOp::Tombstone,
+        );
+
+        // Baseline (no overlay): the committed edges are alice→{bob, dave}.
+        let plain = Snapshot::new(
+            outcome.committed.clone(),
+            &live_view,
+            store.clone(),
+            paths.clone(),
+        );
+        let base_out = plain.out_edges_via_sst("KNOWS", alice).await.unwrap();
+        assert_eq!(
+            base_out.edges.iter().map(|e| e.dst).collect::<Vec<_>>(),
+            vec![bob, dave],
+            "without the overlay only the committed edges are visible"
+        );
+        drop(plain);
+
+        // With the overlay attached: bob is hidden by the staged tombstone,
+        // carol appears from the staged upsert, dave stays committed. The
+        // result must be identical on the SST path and the CSR path.
+        for use_csr in [false, true] {
+            let mut snap = Snapshot::new(
+                outcome.committed.clone(),
+                &live_view,
+                store.clone(),
+                paths.clone(),
+            )
+            .with_overlay(staged.snapshot_view());
+            if use_csr {
+                snap = snap
+                    .with_adjacency_cache(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())));
+            }
+
+            let out = if use_csr {
+                snap.out_edges_via_csr("KNOWS", alice).await.unwrap()
+            } else {
+                snap.out_edges_via_sst("KNOWS", alice).await.unwrap()
+            };
+            assert_eq!(
+                out.edges.iter().map(|e| e.dst).collect::<Vec<_>>(),
+                vec![carol, dave],
+                "out_edges (csr={use_csr}) must hide the tombstoned edge and surface the staged one"
+            );
+
+            let inc = if use_csr {
+                snap.in_edges_via_csr("KNOWS", carol).await.unwrap()
+            } else {
+                snap.in_edges_via_sst("KNOWS", carol).await.unwrap()
+            };
+            assert_eq!(
+                inc.edges.iter().map(|e| e.src).collect::<Vec<_>>(),
+                vec![alice],
+                "in_edges (csr={use_csr}) must see the staged edge in reverse"
+            );
+
+            let partners = snap
+                .sorted_partners("KNOWS", alice, EdgeDirection::Forward)
+                .await
+                .unwrap();
+            assert_eq!(
+                partners,
+                vec![carol, dave],
+                "sorted_partners (csr={use_csr}) must reflect the staged upsert and tombstone"
+            );
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,22 @@ below and in the release notes.
 
 ## [Unreleased]
 
+### Added
+
+- Read-your-own-writes for edges (RFC-026 edge overlay). A traversal that
+  runs after an edge is staged in the same transaction now sees that edge:
+  every edge read path (`out_edges` / `in_edges` over both the SST scan and
+  the CSR adjacency, plus the WCOJ `sorted_partners` and the edge-type scan
+  and count) merges the writer's staged batch last-LSN-wins, so a staged
+  upsert is traversable and a staged tombstone hides a committed edge. This
+  completes the node overlay shipped in 0.13.0; a read against a plain
+  committed snapshot is unchanged, and reads outside a write context have
+  nothing staged and pay nothing. Running a read pipeline directly above a
+  write within one statement (`CREATE (a)-[:R]->(b) WITH a MATCH
+  (a)-[:R]->(x)`) is still a follow-up: the staged edge is visible to a later
+  statement or an in-transaction read, not to an expand stacked on the same
+  statement's write.
+
 ## [0.13.0] - 2026-06-07: read-your-own-writes for nodes, compaction space reclamation, query timeout and row cap
 
 ### Added

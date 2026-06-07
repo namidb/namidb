@@ -4,7 +4,7 @@
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-05
 **Updated:** 2026-06-05
-**Implements:** node overlay (v1) landed; edge overlay pending (Q1)
+**Implements:** node overlay and edge overlay landed
 **Supersedes:** none
 
 ## Summary
@@ -203,8 +203,12 @@ insert hot path. Revisit only if overlay build cost shows up in a profile.
 
 2. **Edge and adjacency overlay is more involved than nodes.** Staged edges
    have to merge into adjacency scans, including DETACH DELETE's incident-
-   edge enumeration. v1 can land nodes first and edges in a fast follow if
-   the edge overlay proves large; the open questions track this.
+   edge enumeration. Resolved: the edge overlay landed as a fast follow.
+   Every edge read path (`out_edges`/`in_edges` over both the SST scan and
+   the CSR adjacency, plus `sorted_partners`, `scan_edge_type` and
+   `count_edge_type`) merges the staged batch through
+   `Snapshot::edge_mem_entries`, the edge counterpart of `node_entries`, so
+   there is still one read engine with a resolve-staged-first step in front.
 
 3. **Visibility is the operational rule, not the full standard.** Queries
    that depend on the standard's read/write phase separation (rare, mostly
@@ -214,10 +218,16 @@ insert hot path. Revisit only if overlay build cost shows up in a profile.
 
 ## Open questions
 
-- **Q1: Node-only v1, edges in a follow-up?** Nodes unblock CREATE-then-
-  MATCH, MERGE, and the intra-batch unique check. Edge overlay unblocks
-  traversals over just-created edges. Leaning land nodes plus the
-  property-lookup overlay first, edges immediately after.
+- **Q1: Node-only v1, edges in a follow-up?** Resolved. Nodes landed first
+  (CREATE-then-MATCH, MERGE, the intra-batch unique check); the edge overlay
+  followed, so a traversal over an edge staged earlier in the same statement
+  or transaction now sees it. One capability is still a follow-up: running a
+  read pipeline (an `Expand`) directly above a write within a single
+  statement, `CREATE (a)-[:R]->(b) WITH a MATCH (a)-[:R]->(x)`. The write
+  executor delegates such a sub-plan to the read-only walker, which rejects
+  the embedded write; it is unsupported for nodes and edges alike. The staged
+  edge is visible through `overlay_snapshot` to a later statement or an
+  in-transaction read, which is the common case.
 
 - **Q2: Property index cache interaction.** The cross-snapshot property
   index cache (see the read path) must not serve a stale negative for a
