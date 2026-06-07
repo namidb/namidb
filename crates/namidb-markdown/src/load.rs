@@ -199,6 +199,25 @@ async fn load_graph_inner(
 ) -> anyhow::Result<VaultLoadOutcome> {
     // A sync always mirrors the vault; a plain load prunes only if asked.
     let prune = opts.prune || prev_state.is_some();
+
+    // One embedder per namespace. A sync re-embeds only changed notes, so
+    // switching embedders and then syncing would leave a namespace with mixed
+    // stamps (some notes in the old space, some in the new), which the
+    // query-time guard can only catch nondeterministically. Refuse such a sync
+    // and require a full re-embed (a prune-load) instead. Only a sync is
+    // checked (prev_state is Some); a fresh or prune load re-embeds every note.
+    if let (Some(embedder), Some(_)) = (&opts.embedder, prev_state) {
+        if let Some(stored) = read_stored_embedder_id(writer, &opts.label).await? {
+            let current = embedder.id();
+            if stored != current {
+                anyhow::bail!(
+                    "this namespace was embedded with `{stored}`, but the current \
+                     embedder is `{current}`. Switching embedders requires a full \
+                     re-embed: re-run the load with --prune (a prune-load), not a sync."
+                );
+            }
+        }
+    }
     // The set of normalized keys that exist as real notes, used to tell a
     // resolved link from a dangling one.
     let mut known: HashSet<&str> = HashSet::with_capacity(graph.notes.len());
@@ -689,6 +708,27 @@ pub async fn read_vault_state(writer: &WriterSession, label: &str) -> anyhow::Re
     Ok(state)
 }
 
+/// The embedder id stamped on any one embedded note of `label`, or `None` if
+/// the namespace has no embeddings yet. Used to refuse a sync that would mix a
+/// different embedder into an existing namespace.
+async fn read_stored_embedder_id(
+    writer: &WriterSession,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    let projection = ["embedding_model".to_string()];
+    let snap = writer.snapshot();
+    let nodes = snap
+        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
+        .await
+        .map_err(|e| anyhow::anyhow!("scan {label} embedder id: {e}"))?;
+    Ok(nodes
+        .iter()
+        .find_map(|n| match n.properties.get("embedding_model") {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        }))
+}
+
 /// How a re-parsed vault differs from the last-loaded [`VaultState`]. Indices
 /// point into the parsed graph's `notes`; `deleted` holds the keys of real
 /// notes that are gone from disk.
@@ -772,6 +812,53 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let paths = NamespacePaths::new("test", NamespaceId::new(ns).unwrap());
         WriterSession::open(store, paths).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_with_a_different_embedder_is_refused() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "A.md", "rust graph database\n");
+        let mut writer = open("embedder-switch").await;
+
+        let opts_a = LoadOptions {
+            embedder: Some(Arc::new(crate::HashingEmbedder::new(256))),
+            ..Default::default()
+        };
+        load_vault(dir.path(), &mut writer, &opts_a).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Edit a note and sync with a DIFFERENT embedder: must refuse rather
+        // than leave the namespace half-embedded by each model.
+        write(dir.path(), "A.md", "rust graph database engine\n");
+        let opts_b = LoadOptions {
+            embedder: Some(Arc::new(crate::HashingEmbedder::new(64))),
+            ..Default::default()
+        };
+        let err = sync_vault(dir.path(), &mut writer, &opts_b)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("re-embed") && msg.contains("hashing-v1:256"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_the_same_embedder_is_allowed() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "A.md", "rust graph database\n");
+        let mut writer = open("embedder-same").await;
+        let opts = LoadOptions {
+            embedder: Some(Arc::new(crate::HashingEmbedder::new(256))),
+            ..Default::default()
+        };
+        load_vault(dir.path(), &mut writer, &opts).await.unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // Same embedder id -> the sync proceeds.
+        write(dir.path(), "A.md", "rust graph database engine\n");
+        sync_vault(dir.path(), &mut writer, &opts).await.unwrap();
     }
 
     async fn note_titles(writer: &WriterSession) -> Vec<String> {
