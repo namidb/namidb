@@ -36,3 +36,5 @@ serde_json = { workspace = true, optional = true }
 [dev-dependencies]
 object_store = { workspace = true }
 tempfile = { workspace = true }
+# HTTP mock for the remote-embedder tests (used only by feature-gated tests).
+wiremock = "0.6"

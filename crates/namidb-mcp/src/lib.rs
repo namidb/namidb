@@ -226,6 +226,11 @@ impl Server {
     /// Run a named tool, returning a text payload (JSON rows) or an error
     /// message string.
     async fn call_tool(&self, name: &str, args: &Value) -> Result<String, String> {
+        // vector_search embeds the query and guards against an embedder
+        // mismatch, so it runs its own query rather than the shared path below.
+        if name == "vector_search" {
+            return self.vector_search(args).await;
+        }
         let (cypher, params): (String, Params) = match name {
             "list_notes" => (
                 // `placeholder IS NULL` keeps unresolved-reference stubs (which
@@ -362,43 +367,6 @@ impl Server {
                     p,
                 )
             }
-            "vector_search" => {
-                let text = str_arg(args, "query")?;
-                let label = ident_arg(args, "label", "Note")?;
-                let property = ident_arg(args, "property", "embedding")?;
-                // LIMIT takes a literal, so clamp and interpolate `k` rather
-                // than bind it.
-                let k = args
-                    .get("k")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(10)
-                    .clamp(1, 100);
-                // Embed the query text server-side with the same embedder that
-                // indexed the vault, so the query and the stored notes share one
-                // vector space. The embedder tags this as a query (vs document).
-                let vector = self
-                    .embedder
-                    .embed(&text)
-                    .await
-                    .map_err(|e| format!("embedding the query failed: {e}"))?;
-                let mut p = Params::new();
-                p.insert("query".to_string(), RuntimeValue::Vector(vector));
-                (
-                    // Pre-filter on label + "has an embedding" (and drop
-                    // placeholder stubs) narrows the candidate set, then rank by
-                    // cosine similarity. `label`/`property` are validated as bare
-                    // identifiers by `ident_arg`, so interpolating them is
-                    // injection-safe.
-                    format!(
-                        "MATCH (n:{label}) \
-                         WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL \
-                         RETURN n.title AS title, n.path AS path, \
-                                cosine_similarity(n.{property}, $query) AS score \
-                         ORDER BY score DESC LIMIT {k}"
-                    ),
-                    p,
-                )
-            }
             "cypher" => (str_arg(args, "query")?, Params::new()),
             other => return Err(format!("unknown tool: {other}")),
         };
@@ -408,6 +376,85 @@ impl Server {
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())
+    }
+
+    /// Semantic K-NN: embed the query text with the server's embedder and rank
+    /// nodes by cosine similarity. Guards against an embedder mismatch first so
+    /// a vault embedded by a different model is refused rather than ranked
+    /// wrongly.
+    async fn vector_search(&self, args: &Value) -> Result<String, String> {
+        let text = str_arg(args, "query")?;
+        let label = ident_arg(args, "label", "Note")?;
+        let property = ident_arg(args, "property", "embedding")?;
+        // LIMIT takes a literal, so clamp and interpolate `k` rather than bind.
+        let k = args
+            .get("k")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 100);
+
+        // Mismatch guard: notes carry the id of the embedder that indexed them.
+        // If that differs from the server's current embedder, cosine over two
+        // different spaces would be silently wrong, so refuse with guidance.
+        let current = self.embedder.id();
+        if let Some(stored) = self.stored_embedder_id(&label, &property).await? {
+            if stored != current {
+                return Err(format!(
+                    "this namespace was embedded with `{stored}`, but the server's \
+                     embedder is `{current}`. Re-embed the vault (load it with the \
+                     matching embedder) before searching."
+                ));
+            }
+        }
+
+        // Embed the query as a query (vs a document) in the same space as the
+        // stored notes.
+        let vector = self
+            .embedder
+            .embed(&text)
+            .await
+            .map_err(|e| format!("embedding the query failed: {e}"))?;
+        let mut p = Params::new();
+        p.insert("query".to_string(), RuntimeValue::Vector(vector));
+
+        // Pre-filter on label + "has an embedding" (and drop placeholder stubs)
+        // narrows the candidate set, then rank by cosine. `label`/`property` are
+        // validated identifiers, so interpolating them is injection-safe.
+        let cypher = format!(
+            "MATCH (n:{label}) \
+             WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL \
+             RETURN n.title AS title, n.path AS path, \
+                    cosine_similarity(n.{property}, $query) AS score \
+             ORDER BY score DESC LIMIT {k}"
+        );
+        let rows = self
+            .run_read_query(&cypher, &p)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())
+    }
+
+    /// The embedder id stamped on one embedded node of `label`, if any. `None`
+    /// means the namespace has no embeddings yet, or they predate stamping (in
+    /// which case the mismatch guard can't fire and the search proceeds).
+    async fn stored_embedder_id(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<String>, String> {
+        let cypher = format!(
+            "MATCH (n:{label}) WHERE n.{property} IS NOT NULL \
+             RETURN n.embedding_model AS model LIMIT 1"
+        );
+        let rows = self
+            .run_read_query(&cypher, &Params::new())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 
     /// Parse, plan, and execute a read-only Cypher query, returning rows as
@@ -1123,6 +1170,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res["isError"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn vector_search_refuses_on_embedder_mismatch() {
+        // Index a note with the server's default embedder (id hashing-v1:256),
+        // then simulate a server configured with a different embedder. The
+        // stamped id no longer matches, so the search must refuse rather than
+        // rank across two incompatible vector spaces.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "rust graph database\n");
+        let mut server = Server::open("memory://mcp-mismatch").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+        server.embedder = std::sync::Arc::new(namidb_markdown::HashingEmbedder::new(64));
+
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "vector_search", "arguments": { "query": "db" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        assert!(res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Re-embed"));
     }
 
     #[tokio::test]

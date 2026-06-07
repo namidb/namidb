@@ -461,10 +461,18 @@ async fn load_graph_inner(
         None => vec![None; to_write.len()],
     };
 
+    // Stamp the embedder identity onto every embedded note so a query-time
+    // mismatch (a vault embedded by one model, searched with another) can be
+    // detected instead of silently returning wrong rankings.
+    let model_id = opts.embedder.as_ref().map(|e| e.id());
+
     for (note, embedding) in to_write.into_iter().zip(embeddings) {
         let mut properties = note.properties.clone();
         if let Some(vec) = embedding {
             properties.insert("embedding".to_string(), Value::Vec(vec));
+            if let Some(id) = &model_id {
+                properties.insert("embedding_model".to_string(), Value::Str(id.clone()));
+            }
         }
         let record = NodeWriteRecord {
             properties,

@@ -43,6 +43,12 @@ pub trait Embedder: Debug + Send + Sync {
     /// Dimension of every vector this embedder produces. Constant for its life.
     fn dim(&self) -> usize;
 
+    /// A stable identity ("kind:model:dim") stamped onto each embedded note so
+    /// a query-time mismatch can be caught. Two embeddings are comparable only
+    /// when their ids match: different models live in different spaces even at
+    /// the same dimension.
+    fn id(&self) -> String;
+
     /// Embed a batch of texts in one round-trip. The output is 1:1 with
     /// `texts` and in the same order. An empty input yields an empty output
     /// without any network call.
@@ -101,6 +107,10 @@ impl Default for HashingEmbedder {
 impl Embedder for HashingEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn id(&self) -> String {
+        format!("hashing-v1:{}", self.dim)
     }
 
     async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -250,5 +260,11 @@ mod tests {
         let e = HashingEmbedder::new(64);
         assert_eq!(e.dim(), 64);
         assert_eq!(e.embed_sync("hello world").len(), 64);
+    }
+
+    #[test]
+    fn id_includes_kind_and_dim() {
+        assert_eq!(HashingEmbedder::new(128).id(), "hashing-v1:128");
+        assert_eq!(HashingEmbedder::default().id(), "hashing-v1:256");
     }
 }

@@ -81,6 +81,17 @@ impl Provider {
         }
     }
 
+    /// Short stable name used in the embedder id stamped onto a namespace.
+    fn name(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "openai",
+            Provider::Voyage => "voyage",
+            Provider::Cohere => "cohere",
+            Provider::Gemini => "gemini",
+            Provider::Jina => "jina",
+        }
+    }
+
     /// Max inputs per HTTP call. Tuned below each provider's hard cap to stay
     /// under per-request token limits for note-sized text.
     fn max_batch(self) -> usize {
@@ -128,6 +139,12 @@ pub struct RemoteEmbedder {
     api_key: String,
     endpoint_override: Option<String>,
     max_retries: u32,
+    /// Inputs per HTTP call (defaults to the provider cap; tests shrink it to
+    /// exercise chunking without thousands of inputs).
+    max_batch: usize,
+    /// Base backoff delay; the first retry waits this long, then it doubles
+    /// (capped). Tests set it tiny so retry paths run fast.
+    retry_base: Duration,
 }
 
 // Hand-written so the API key never lands in a log line or panic message.
@@ -167,6 +184,8 @@ impl RemoteEmbedder {
             api_key,
             endpoint_override,
             max_retries: 4,
+            max_batch: provider.max_batch(),
+            retry_base: Duration::from_millis(500),
         })
     }
 
@@ -211,10 +230,12 @@ impl RemoteEmbedder {
                 }),
             ),
             Provider::Gemini => {
-                let url = format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
-                    self.model
-                );
+                let url = self.endpoint_override.clone().unwrap_or_else(|| {
+                    format!(
+                        "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents",
+                        self.model
+                    )
+                });
                 let requests: Vec<_> = chunk
                     .iter()
                     .map(|t| {
@@ -310,7 +331,7 @@ impl RemoteEmbedder {
             return Ok(Vec::new());
         }
         let mut out = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(self.provider.max_batch()) {
+        for chunk in texts.chunks(self.max_batch) {
             out.extend(self.embed_chunk(chunk, input).await?);
         }
         Ok(out)
@@ -343,7 +364,8 @@ impl RemoteEmbedder {
                     }
                     let retryable = status.as_u16() == 429 || status.is_server_error();
                     if retryable && attempt < self.max_retries {
-                        let delay = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
+                        let delay =
+                            retry_after(&resp).unwrap_or_else(|| backoff(self.retry_base, attempt));
                         attempt += 1;
                         tokio::time::sleep(delay).await;
                         continue;
@@ -357,8 +379,8 @@ impl RemoteEmbedder {
                     );
                 }
                 Err(e) if attempt < self.max_retries && (e.is_timeout() || e.is_connect()) => {
+                    tokio::time::sleep(backoff(self.retry_base, attempt)).await;
                     attempt += 1;
-                    tokio::time::sleep(backoff(attempt - 1)).await;
                 }
                 Err(e) => return Err(e).context("sending embedding request"),
             }
@@ -370,6 +392,10 @@ impl RemoteEmbedder {
 impl Embedder for RemoteEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn id(&self) -> String {
+        format!("{}:{}:{}", self.provider.name(), self.model, self.dim)
     }
 
     async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -437,10 +463,11 @@ fn resolve_key(provider: Provider) -> anyhow::Result<String> {
     )
 }
 
-/// Capped exponential backoff: 0.5s, 1s, 2s, 4s, ... up to 8s.
-fn backoff(attempt: u32) -> Duration {
-    let secs = (0.5_f64 * 2f64.powi(attempt as i32)).min(8.0);
-    Duration::from_millis((secs * 1000.0) as u64)
+/// Capped exponential backoff from a base delay: base, 2*base, 4*base, ...
+/// clamped to 8s.
+fn backoff(base: Duration, attempt: u32) -> Duration {
+    let scaled = base.saturating_mul(1u32 << attempt.min(20));
+    scaled.min(Duration::from_secs(8))
 }
 
 /// Honor a `Retry-After: <seconds>` header when the provider sends one.
@@ -503,6 +530,14 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn id_includes_provider_model_dim() {
+        assert_eq!(
+            embedder(Provider::Voyage, 1024).id(),
+            "voyage:voyage-4-large:1024"
+        );
     }
 
     #[test]
@@ -586,7 +621,201 @@ mod tests {
 
     #[test]
     fn backoff_is_capped() {
-        assert!(backoff(0) < backoff(1));
-        assert_eq!(backoff(20), Duration::from_secs(8));
+        let base = Duration::from_millis(100);
+        assert!(backoff(base, 0) < backoff(base, 1));
+        assert_eq!(backoff(base, 20), Duration::from_secs(8));
+    }
+
+    // ── HTTP-path tests against a local mock server ───────────────────────
+
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A RemoteEmbedder pointed at `url` with near-zero backoff so retry paths
+    /// run fast. `endpoint_override` makes every provider (including Gemini)
+    /// POST to the mock.
+    fn embedder_at(provider: Provider, dim: usize, url: &str) -> RemoteEmbedder {
+        let mut e = RemoteEmbedder::new(
+            provider,
+            provider.default_model().into(),
+            dim,
+            "test-key".into(),
+            Some(url.to_string()),
+        )
+        .unwrap();
+        e.retry_base = Duration::from_millis(1);
+        e
+    }
+
+    fn unit_norm(v: &[f32]) -> bool {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        (n - 1.0).abs() < 1e-5
+    }
+
+    #[tokio::test]
+    async fn openai_http_normalizes_and_preserves_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "embedding": [3.0, 4.0] },
+                    { "embedding": [0.0, 2.0] },
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        let out = e.embed_batch(&["a".into(), "b".into()]).await.unwrap();
+        assert_eq!(out.len(), 2);
+        // [3,4] -> [0.6,0.8]; order preserved; both unit-norm.
+        assert!((out[0][0] - 0.6).abs() < 1e-5 && (out[0][1] - 0.8).abs() < 1e-5);
+        assert!(unit_norm(&out[1]));
+    }
+
+    #[tokio::test]
+    async fn cohere_http_parses_float_object_and_tags_documents() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            // embed_batch is the document side.
+            .and(body_string_contains("search_document"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embeddings": { "float": [[1.0, 0.0]] }
+            })))
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(Provider::Cohere, 2, &format!("{}/v2/embed", server.uri()));
+        let out = e.embed_batch(&["x".into()]).await.unwrap();
+        assert_eq!(out, vec![vec![1.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn gemini_http_uses_api_key_header_and_query_task() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "test-key"))
+            .and(body_string_contains("RETRIEVAL_QUERY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embeddings": [ { "values": [0.0, 5.0] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        // embed() is the query side; override is used verbatim for Gemini.
+        let e = embedder_at(Provider::Gemini, 2, &server.uri());
+        let v = e.embed("how do vectors work").await.unwrap();
+        assert!(unit_norm(&v));
+    }
+
+    #[tokio::test]
+    async fn chunks_by_max_batch_into_multiple_calls() {
+        let server = MockServer::start().await;
+        // Every call returns two embeddings, so each even chunk matches.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": [1.0, 0.0] }, { "embedding": [0.0, 1.0] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        e.max_batch = 2;
+        let texts: Vec<String> = (0..4).map(|i| format!("note {i}")).collect();
+        let out = e.embed_batch(&texts).await.unwrap();
+        assert_eq!(out.len(), 4, "all inputs embedded");
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "4 inputs at max_batch 2 -> 2 calls");
+    }
+
+    #[tokio::test]
+    async fn retries_on_429_then_succeeds() {
+        let server = MockServer::start().await;
+        // First match: one 429 (higher priority). Then the 200 fallback.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": [1.0, 0.0] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        let out = e.embed_batch(&["x".into()]).await.unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hard_fails_on_4xx_without_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            // Exactly one call: a 401 must not be retried (verified on drop).
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        assert!(e.embed_batch(&["x".into()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn errors_on_wrong_dimension() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": [1.0, 0.0, 0.0] } ] // 3-dim, but dim=2
+            })))
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        assert!(e.embed_batch(&["x".into()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn errors_when_count_mismatches_inputs() {
+        let server = MockServer::start().await;
+        // One embedding returned for two inputs.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": [1.0, 0.0] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let e = embedder_at(
+            Provider::OpenAi,
+            2,
+            &format!("{}/v1/embeddings", server.uri()),
+        );
+        assert!(e.embed_batch(&["a".into(), "b".into()]).await.is_err());
     }
 }
