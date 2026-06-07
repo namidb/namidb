@@ -195,10 +195,11 @@ impl AppState {
 }
 
 /// Assemble the `axum` router with every public route + auth
-/// middleware. `/v0/health` and `/v0/version` are intentionally
-/// excluded from the auth check.
+/// middleware. `/v0/livez`, `/v0/health` and `/v0/version` are intentionally
+/// excluded from the auth check (a healthcheck probe carries no token).
 pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
+        .route("/v0/livez", get(livez))
         .route("/v0/health", get(health))
         .route("/v0/version", get(version));
 
@@ -354,12 +355,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Optional Bolt listener (binds an extra TCP port for native
     // Neo4j drivers — see RFC-022). When not configured we stay
     // HTTP-only.
+    // A single shutdown signal, flipped to `true` on SIGINT or SIGTERM, that
+    // both the HTTP server and the Bolt listener observe, so a `docker stop`
+    // or a Kubernetes pod termination drains cleanly instead of being killed.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     if let Some(bolt_addr) = config.bolt_listen {
         let bolt_state = state.clone();
         let bolt_auth = state.auth_token.clone();
         let tx_timeout = config.bolt_tx_timeout;
+        let bolt_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = bolt::serve(bolt_state, bolt_addr, bolt_auth, tx_timeout).await {
+            if let Err(e) =
+                bolt::serve(bolt_state, bolt_addr, bolt_auth, tx_timeout, bolt_shutdown).await
+            {
                 error!(error = %e, "bolt listener exited");
             }
         });
@@ -369,15 +382,39 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(config.listen).await?;
     info!(addr = %config.listen, "namidb-server listening");
+    let mut http_shutdown = shutdown_rx;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            let _ = http_shutdown.wait_for(|stop| *stop).await;
+            info!("shutdown signalled, draining HTTP requests…");
+        })
         .await?;
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("ctrl-c received, draining requests…");
+/// Resolve when the process is asked to stop: Ctrl-C (SIGINT) on every
+/// platform, plus SIGTERM on Unix — what `docker stop`, systemd and
+/// Kubernetes send. Without the SIGTERM arm the server ignored the orderly
+/// stop signal and was hard-killed once the grace period elapsed.
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => info!("SIGINT received, draining…"),
+        _ = terminate => info!("SIGTERM received, draining…"),
+    }
 }
 
 // ── auth ──────────────────────────────────────────────────────────────
@@ -442,14 +479,27 @@ struct HealthResponse {
     epoch: u64,
 }
 
+/// Liveness: the process is up and its async runtime is responsive. Takes no
+/// lock and reads no namespace state, so a long write or compaction (which
+/// holds the writer lock) can never make it hang — a container liveness probe
+/// stays green while the engine is busy. This is the endpoint a Docker
+/// HEALTHCHECK or a Kubernetes livenessProbe should target.
+async fn livez() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Readiness: report the latest published snapshot's manifest version and
+/// epoch WITHOUT taking the writer lock. The snapshot is republished after
+/// every commit, so it reflects committed state; a long write or compaction
+/// holding the writer lock does not stall the probe.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let w = state.writer.lock().await;
-    let snap = w.snapshot();
+    let owned = state.snapshot.load();
+    let m = &owned.manifest().manifest;
     Json(HealthResponse {
         status: "ok",
         namespace: state.namespace.clone(),
-        manifest_version: snap.manifest().manifest.version,
-        epoch: snap.manifest().manifest.epoch.as_u64(),
+        manifest_version: m.version,
+        epoch: m.epoch.as_u64(),
     })
 }
 
@@ -871,6 +921,33 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["namespace"], "test");
+    }
+
+    #[tokio::test]
+    async fn livez_and_health_do_not_block_on_the_writer_lock() {
+        // A long write or compaction holds the writer lock; the liveness and
+        // readiness probes must still answer promptly, or an orchestrator
+        // kills a busy-but-healthy server. livez takes no lock; health reads
+        // the published snapshot, not the writer.
+        let (store, paths) = namidb_storage::parse_uri("memory://livez").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into());
+        let app = build_router(state.clone());
+
+        // Hold the writer lock for the duration of both probes.
+        let _guard = state.writer.lock().await;
+
+        for uri in ["/v0/livez", "/v0/health"] {
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{uri} blocked on the writer lock"))
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
     }
 
     #[tokio::test]

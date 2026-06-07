@@ -26,6 +26,15 @@ below and in the release notes.
   (a)-[:R]->(x)`) is still a follow-up: the staged edge is visible to a later
   statement or an in-transaction read, not to an expand stacked on the same
   statement's write.
+- Operability: a lock-free liveness probe, graceful `SIGTERM`, and a container
+  healthcheck. A new unauthenticated `GET /v0/livez` answers without taking any
+  lock or reading namespace state, so a long write or compaction (which holds
+  the writer lock) no longer makes a liveness probe hang and get the server
+  killed; `GET /v0/health` now reports the published snapshot's version and
+  epoch without the writer lock too. The server drains on `SIGTERM` (what
+  `docker stop`, systemd and Kubernetes send), not only on Ctrl-C: a shared
+  signal stops the HTTP server and the Bolt listener together. A `Dockerfile`
+  ships with a `HEALTHCHECK` targeting `/v0/livez`.
 
 ### Changed
 
