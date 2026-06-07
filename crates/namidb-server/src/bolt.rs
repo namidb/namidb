@@ -342,6 +342,7 @@ pub async fn serve(
     auth_token: Option<Arc<str>>,
     tx_timeout: std::time::Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> anyhow::Result<()> {
     // `Duration::ZERO` disables the per-transaction idle timeout.
     let tx_idle_timeout = (!tx_timeout.is_zero()).then_some(tx_timeout);
@@ -380,26 +381,46 @@ pub async fn serve(
         }
         let state = state.clone();
         let policy = auth_policy(&auth_token);
-        let agent = agent.clone();
-        let connection_id = Uuid::now_v7().to_string();
+        let info = ServerInfo {
+            agent: agent.clone(),
+            connection_id: Uuid::now_v7().to_string(),
+        };
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let backend = Arc::new(ServerBackend::new(state));
-            let session = Session::new(
-                socket,
-                ServerInfo {
-                    agent,
-                    connection_id,
+            let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state));
+            // `Session` is generic over the transport, so the only fork is the
+            // optional TLS handshake on the accepted socket.
+            match tls {
+                Some(acceptor) => match acceptor.accept(socket).await {
+                    Ok(stream) => {
+                        run_session(stream, info, policy, backend, tx_idle_timeout, peer).await
+                    }
+                    Err(e) => warn!(error = %e, %peer, "bolt TLS handshake failed"),
                 },
-                policy,
-                backend,
-            )
-            .with_tx_idle_timeout(tx_idle_timeout);
-            if let Err(e) = session.run().await {
-                warn!(error = %e, %peer, "bolt session ended with error");
+                None => run_session(socket, info, policy, backend, tx_idle_timeout, peer).await,
             }
         });
     }
     Ok(())
+}
+
+/// Build and run one Bolt session over any byte stream — a plain `TcpStream`
+/// or a TLS stream. `Session` is generic over the transport, so TLS adds only
+/// a handshake in front of the same session loop.
+async fn run_session<S>(
+    socket: S,
+    info: ServerInfo,
+    policy: AuthPolicy,
+    backend: Arc<dyn Backend>,
+    tx_idle_timeout: Option<std::time::Duration>,
+    peer: std::net::SocketAddr,
+) where
+    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+{
+    let session = Session::new(socket, info, policy, backend).with_tx_idle_timeout(tx_idle_timeout);
+    if let Err(e) = session.run().await {
+        warn!(error = %e, %peer, "bolt session ended with error");
+    }
 }
 
 // `ParseError` is included for callers that want a custom Bolt error
