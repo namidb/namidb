@@ -27,6 +27,20 @@ below and in the release notes.
   statement or an in-transaction read, not to an expand stacked on the same
   statement's write.
 
+### Changed
+
+- Leveled-lite compaction (RFC-027 P4). Compaction keeps one SST per `(kind,
+  scope, level)` across L1..Lk with a per-level byte budget
+  (`NAMIDB_COMPACTION_BASE_BYTES` / `NAMIDB_COMPACTION_LEVEL_RATIO`, defaults
+  8 MiB / 10). New L0s drain into L1, and a merge cascades into a deeper level
+  only when the accumulated bytes exceed that level's budget, so the large
+  base levels are rewritten rarely. This bounds write amplification, the cost
+  the previous full-bucket compaction traded for its space bound, while space
+  and read amplification stay bounded. Tombstone and superseded-version GC now
+  runs only on the merge whose output is the bucket's deepest occupied level,
+  where the LSM invariant (a shallower level holds the newer LSN for a key)
+  guarantees the dropped tombstone shadows nothing.
+
 ## [0.13.0] - 2026-06-07: read-your-own-writes for nodes, compaction space reclamation, query timeout and row cap
 
 ### Added

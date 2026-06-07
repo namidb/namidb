@@ -1,42 +1,48 @@
-//! Full-bucket compaction to a single L1.
+//! Leveled-lite compaction.
 //!
 //! Each [`crate::flush::flush`] call appends a new L0 SST per `(kind,
 //! scope)` bucket that had memtable rows. Without compaction, a
 //! namespace's L0 footprint grows monotonically with every batch and
 //! every point lookup pays an `O(L0 count)` candidate-SST scan.
 //!
-//! The compactor groups every SST by `(kind, scope)` — the new L0s *and*
-//! the bucket's existing L1 — merges them into a single L1 SST per bucket,
-//! and commits a manifest version that removes the source descriptors and
-//! adds the new one in a single CAS. The source SST bodies become orphans
-//! in object storage (no current manifest version references them after the
-//! commit); the horizon-aware [`crate::janitor::sweep_orphans`] reclaims
-//! them once no pinned reader needs them.
+//! The compactor keeps one SST per `(kind, scope, level)` across L1..Lk with
+//! a per-level byte budget (`budget(Li) = base * ratio^(i-1)`). L0s drain
+//! into L1; a merge cascades into the next deeper level only when the
+//! accumulated bytes exceed a level's budget, so the large base levels are
+//! rewritten rarely (bounded write amplification) while space and read
+//! amplification stay bounded. Each sweep commits a manifest version that
+//! removes the merged source descriptors and adds the new one in a single
+//! CAS. The source SST bodies become orphans in object storage (no current
+//! manifest version references them after the commit); the horizon-aware
+//! [`crate::janitor::sweep_orphans`] reclaims them once no pinned reader
+//! needs them.
 //!
 //! ## Merge semantics
 //!
 //! Per `(node_id)` (nodes) or `(key_id, partner_id)` (edges): the row with
-//! the highest LSN wins; lower-LSN versions are dropped. Because the merge
-//! is full-bucket the resulting L1 is the bucket's only SST in the new
-//! version, so a winning **tombstone** shadows nothing and is dropped
-//! entirely (RFC-027 P3) rather than carried forever. A reader pinned at an
-//! older manifest version still observes the delete through the retained
-//! source bodies, never through this L1.
+//! the highest LSN wins; lower-LSN versions are dropped. A winning
+//! **tombstone** is dropped entirely (RFC-027 P3) only when the merge output
+//! is the bucket's deepest occupied level: the LSM invariant (a shallower
+//! level holds the newer LSN for a key) means no un-merged deeper level can
+//! hold a live row the tombstone was shadowing, so dropping it can never
+//! resurrect a row. A reader pinned at an older manifest version still
+//! observes the delete through the retained source bodies, never through the
+//! new SST.
 //!
 //! ## What's deliberately not here
 //!
-//! - Multi-level compaction (L1 → L2, etc.) with a size ratio. The bucket
-//! collapses to one L1; leveled compaction to bound write amplification is
-//! RFC-027 P4.
-//! - Background scheduling beyond the periodic maintenance tick; a reactive
-//! L0-count trigger and write stall are RFC-027 P5.
-//! - Range-partitioned compaction (split a bucket into multiple L1 files by
-//! key range). Each bucket emits exactly one L1 SST.
+//! - Range-partitioned leveled compaction (multiple non-overlapping SSTs per
+//! level, rewriting only the overlapping key ranges). leveled-lite keeps one
+//! SST per `(bucket, level)`, so a cascade rewrites the whole next level, not
+//! just the overlapping range. That refinement is the remaining RFC-027 P4
+//! step.
+//! - Background scheduling beyond the periodic maintenance tick and the
+//! reactive L0-count trigger / write stall (RFC-027 P5).
 //!
 //! Declared edge property streams (RFC-002 §3.2.7) are preserved
 //! end-to-end: the compactor reads each declared stream from every
 //! source SST, joins it with the per-edge enumeration, and re-emits
-//! the merged stream into the L1 body alongside `__overflow_json`.
+//! the merged stream into the new SST body alongside `__overflow_json`.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -79,8 +85,145 @@ pub struct CompactionOutcome {
     pub bloom_sidecars_written: usize,
 }
 
-/// Run one L0 → L1 compaction sweep across every `(kind, scope)`
-/// bucket that holds more than one L0 SST.
+// ── Leveled-lite level budgets ──────────────────────────────────────────
+//
+// One SST per `(kind, scope, level)`. L0s drain into L1; a merge cascades
+// into a deeper level only when the accumulated bytes exceed that level's
+// budget, so the large base levels are rewritten rarely. Read from the
+// environment so an operator can tune them without a rebuild.
+
+/// `L1` byte budget when `NAMIDB_COMPACTION_BASE_BYTES` is unset.
+const DEFAULT_COMPACTION_BASE_BYTES: u64 = 8 * 1024 * 1024;
+/// Per-level size ratio when `NAMIDB_COMPACTION_LEVEL_RATIO` is unset.
+const DEFAULT_COMPACTION_LEVEL_RATIO: u64 = 10;
+
+/// `L1` byte budget. Deeper levels are `base * ratio^(level-1)`.
+fn compaction_base_bytes() -> u64 {
+    std::env::var("NAMIDB_COMPACTION_BASE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|b| *b > 0)
+        .unwrap_or(DEFAULT_COMPACTION_BASE_BYTES)
+}
+
+/// Per-level size ratio. A higher ratio means fewer, larger levels.
+fn compaction_level_ratio() -> u64 {
+    std::env::var("NAMIDB_COMPACTION_LEVEL_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|r| *r >= 2)
+        .unwrap_or(DEFAULT_COMPACTION_LEVEL_RATIO)
+}
+
+/// Byte budget for `level` (>= 1): `base * ratio^(level-1)`, saturating.
+fn level_budget_bytes(level: u32, base: u64, ratio: u64) -> u64 {
+    let mut budget = base;
+    for _ in 1..level {
+        budget = budget.saturating_mul(ratio);
+    }
+    budget
+}
+
+/// The leveled-lite merge chosen for one `(kind, scope)` bucket.
+struct BucketPlan<'a> {
+    /// SSTs to read and merge: the L0s plus the levels the cascade reaches.
+    inputs: Vec<&'a SstDescriptor>,
+    /// Level the merged SST is written at.
+    target_level: u32,
+    /// Whether `target_level` is the bucket's deepest occupied level, so no
+    /// un-merged deeper level can hold a row a tombstone is shadowing and
+    /// tombstone / superseded-version GC is safe.
+    is_deepest: bool,
+}
+
+/// Decide the leveled-lite merge for one bucket, or `None` when fewer than
+/// two SSTs would be merged (nothing worth rewriting).
+///
+/// L0s always drain into L1. When the accumulated bytes would exceed a
+/// level's budget the merge cascades into the next deeper occupied level, so
+/// the shallow levels stay small and the large base levels are rewritten only
+/// when a shallower level overflows into them. A brand-new bucket lands its
+/// first SST in L1 and cascades later, once a shallow level actually
+/// overflows.
+fn plan_bucket_merge<'a>(
+    sources: &[&'a SstDescriptor],
+    base: u64,
+    ratio: u64,
+) -> Option<BucketPlan<'a>> {
+    let mut l0: Vec<&SstDescriptor> = Vec::new();
+    let mut leveled: BTreeMap<u32, Vec<&SstDescriptor>> = BTreeMap::new();
+    for d in sources {
+        let lvl = d.level.as_u32();
+        if lvl == 0 {
+            l0.push(*d);
+        } else {
+            leveled.entry(lvl).or_default().push(*d);
+        }
+    }
+    let deepest_present = leveled.keys().copied().max().unwrap_or(0);
+
+    let mut inputs: Vec<&SstDescriptor> = l0.clone();
+    let mut cum: u64 = l0.iter().map(|d| d.size_bytes).sum();
+    let mut target: u32 = 1;
+    loop {
+        if let Some(ds) = leveled.get(&target) {
+            for d in ds {
+                inputs.push(*d);
+                cum += d.size_bytes;
+            }
+        }
+        if cum <= level_budget_bytes(target, base, ratio) {
+            break;
+        }
+        if target < deepest_present {
+            // Cascade into the next deeper occupied level.
+            target += 1;
+            continue;
+        }
+        // At (or past) the deepest occupied level and still over budget. Spill
+        // into one fresh deeper level, but only when there is leveled data to
+        // push past; a new bucket's first SST lands in L1 even if it exceeds
+        // the budget and cascades on a later sweep.
+        if deepest_present >= 1 {
+            target += 1;
+        }
+        break;
+    }
+
+    if inputs.len() < 2 {
+        return None;
+    }
+    let is_deepest = target >= deepest_present;
+    Some(BucketPlan {
+        inputs,
+        target_level: target,
+        is_deepest,
+    })
+}
+
+/// Run one leveled-lite compaction sweep across every `(kind, scope)`
+/// bucket, reading the level budgets from the environment.
+pub async fn compact_l0_to_l1(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    schema: &Schema,
+) -> Result<CompactionOutcome> {
+    compact_leveled(
+        manifest_store,
+        fence,
+        base,
+        schema,
+        compaction_base_bytes(),
+        compaction_level_ratio(),
+    )
+    .await
+}
+
+/// Run one leveled-lite compaction sweep with explicit level budgets. The
+/// public [`compact_l0_to_l1`] wraps this with the environment-configured
+/// budgets; tests call it directly with small budgets to exercise the
+/// cascade deterministically without touching process-wide env.
 #[instrument(
  skip(manifest_store, fence, base, schema),
  fields(
@@ -88,24 +231,24 @@ pub struct CompactionOutcome {
  base_version = base.manifest.version,
  )
 )]
-pub async fn compact_l0_to_l1(
+async fn compact_leveled(
     manifest_store: &ManifestStore,
     fence: &WriterFence,
     base: &LoadedManifest,
     schema: &Schema,
+    base_bytes: u64,
+    ratio: u64,
 ) -> Result<CompactionOutcome> {
     fence.assert_alive(base.manifest.epoch)?;
 
-    // Group every SST by (kind, scope) — both L0 and any existing L1.
-    // Including the prior L1 makes each compaction a full-bucket merge: the
-    // resulting L1 is the bucket's only SST in the new manifest version, so
-    // it is authoritative for every key. That is what lets the merge drop
-    // tombstones and superseded versions safely (RFC-027 P3): no other SST
-    // at the new version can hold a live row the tombstone was shadowing,
-    // and a reader pinned at an older version reads the retained source
-    // bodies, not this L1 (the horizon-aware sweep keeps them alive). It
-    // also collapses the bucket back to one L1, bounding the footprint a
-    // pure L0->L1 merge let grow.
+    // Group every SST by (kind, scope), every level together, so
+    // `plan_bucket_merge` sees the whole bucket shape and can decide which
+    // levels to merge and the output level. Tombstone and superseded-version
+    // GC (RFC-027 P3) is gated below on the merge being authoritative: the
+    // output is the deepest level (no older un-merged level below it can hold
+    // a shadowed row), and for nodes the bucket is single-scope. A reader
+    // pinned at an older version reads the retained source bodies, not the new
+    // SST (the horizon-aware sweep keeps them alive).
     let mut node_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut fwd_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut inv_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
@@ -132,15 +275,16 @@ pub async fn compact_l0_to_l1(
     let mut removed_ids: Vec<Uuid> = Vec::new();
     let mut bloom_count: usize = 0;
 
-    // Node tombstone GC is safe only when the merge is authoritative for
-    // every node key it touches. Nodes are id-primary, so a key can live in
-    // any node SST regardless of scope; if more than one node scope is
-    // present (a legacy per-label SST alongside the id-primary `""` one), a
-    // full-bucket merge of a single scope is NOT authoritative and dropping
-    // a tombstone could resurrect a live row from the other scope. Restrict
-    // node GC to the single-scope case (the id-primary norm). Edges are
-    // keyed within `(edge_type, direction)`, so every edge bucket is
-    // authoritative on its own and GC is always safe there.
+    // Node tombstone GC needs the merge authoritative for every node key it
+    // touches. Nodes are id-primary, so a key can live in any node SST
+    // regardless of scope; if more than one node scope is present (a legacy
+    // per-label SST alongside the id-primary `""` one), a single-scope merge
+    // is NOT authoritative and dropping a tombstone could resurrect a live
+    // row from the other scope. Restrict node GC to the single-scope case
+    // (the id-primary norm); the per-bucket deepest-level check below adds the
+    // second condition. Edges are keyed within `(edge_type, direction)`, so an
+    // edge bucket is authoritative on its own and only the deepest-level check
+    // applies.
     let node_scopes: HashSet<&str> = base
         .manifest
         .ssts
@@ -152,30 +296,35 @@ pub async fn compact_l0_to_l1(
 
     // Nodes.
     for (label, sources) in node_buckets {
-        if sources.len() < 2 {
+        let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
             continue;
-        }
+        };
         let label_def = schema.label(&label).cloned().unwrap_or_else(|| LabelDef {
             name: label.clone(),
             properties: vec![],
         });
-        let mut readers: Vec<NodeSstReader> = Vec::with_capacity(sources.len());
-        for desc in &sources {
+        let mut readers: Vec<NodeSstReader> = Vec::with_capacity(plan.inputs.len());
+        for desc in &plan.inputs {
             let body = get_sst_body(store.as_ref(), paths, desc).await?;
             readers.push(NodeSstReader::open(label_def.clone(), body)?);
         }
-        let (finish, merged_rows) = compact_node_ssts(&label_def, &readers, node_gc_safe)?;
+        // GC tombstones only when this merge is authoritative: a single node
+        // scope (no other scope can hold the key) AND the output is the
+        // bucket's deepest level (no older un-merged level below it).
+        let gc = node_gc_safe && plan.is_deepest;
+        let (finish, merged_rows) = compact_node_ssts(&label_def, &readers, gc)?;
         if finish.stats.row_count == 0 {
-            // Nothing to write; still mark sources for removal so the
-            // bucket truly shrinks.
-            for src in &sources {
+            // Nothing to write; still mark the merged sources for removal so
+            // the bucket truly shrinks.
+            for src in &plan.inputs {
                 removed_ids.push(src.id);
             }
             continue;
         }
-        let (descriptor, wrote_bloom) = put_node_sst_l1(
+        let (descriptor, wrote_bloom) = put_node_sst_leveled(
             store.as_ref(),
             paths,
+            plan.target_level,
             &label,
             &label_def,
             &merged_rows,
@@ -187,7 +336,7 @@ pub async fn compact_l0_to_l1(
         if wrote_bloom {
             bloom_count += 1;
         }
-        for src in &sources {
+        for src in &plan.inputs {
             removed_ids.push(src.id);
         }
         new_descs.push(descriptor);
@@ -195,16 +344,18 @@ pub async fn compact_l0_to_l1(
 
     // Edges (forward).
     for (edge_type, sources) in fwd_buckets {
-        if sources.len() < 2 {
+        let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
             continue;
-        }
+        };
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
             store.as_ref(),
             paths,
             schema,
             &edge_type,
-            &sources,
+            &plan.inputs,
             EdgeDirection::Forward,
+            plan.target_level,
+            plan.is_deepest,
         )
         .await?;
         if wrote_bloom {
@@ -220,16 +371,18 @@ pub async fn compact_l0_to_l1(
 
     // Edges (inverse).
     for (edge_type, sources) in inv_buckets {
-        if sources.len() < 2 {
+        let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
             continue;
-        }
+        };
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
             store.as_ref(),
             paths,
             schema,
             &edge_type,
-            &sources,
+            &plan.inputs,
             EdgeDirection::Inverse,
+            plan.target_level,
+            plan.is_deepest,
         )
         .await?;
         if wrote_bloom {
@@ -269,6 +422,7 @@ pub async fn compact_l0_to_l1(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compact_and_write_edges(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
@@ -276,6 +430,8 @@ async fn compact_and_write_edges(
     edge_type: &str,
     sources: &[&SstDescriptor],
     direction: EdgeDirection,
+    level: u32,
+    gc_tombstones: bool,
 ) -> Result<(Option<SstDescriptor>, bool, Vec<Uuid>)> {
     let edge_def = schema.edge_type(edge_type).cloned();
     let mut readers: Vec<EdgeSstReader> = Vec::with_capacity(sources.len());
@@ -283,13 +439,19 @@ async fn compact_and_write_edges(
         let body = get_sst_body(store, paths, desc).await?;
         readers.push(EdgeSstReader::open(body)?);
     }
-    let finish = compact_edge_ssts(edge_type, edge_def.as_ref(), &readers, direction)?;
+    let finish = compact_edge_ssts(
+        edge_type,
+        edge_def.as_ref(),
+        &readers,
+        direction,
+        gc_tombstones,
+    )?;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
     if finish.stats.edge_count == 0 {
         return Ok((None, false, removed));
     }
     let (descriptor, wrote_bloom) =
-        put_edge_sst_l1(store, paths, edge_type, direction, finish).await?;
+        put_edge_sst_leveled(store, paths, level, edge_type, direction, finish).await?;
     Ok((Some(descriptor), wrote_bloom, removed))
 }
 
@@ -430,6 +592,7 @@ fn compact_edge_ssts(
     edge_def: Option<&namidb_core::EdgeTypeDef>,
     sources: &[EdgeSstReader],
     direction: EdgeDirection,
+    gc_tombstones: bool,
 ) -> Result<EdgeSstFinish> {
     // Each source SST is already in `direction` orientation (the
     // caller groups by SstKind::EdgesFwd vs EdgesInv before invoking
@@ -487,11 +650,15 @@ fn compact_edge_ssts(
             .then(b.lsn.cmp(&a.lsn))
     });
     rows.dedup_by_key(|r| (r.key_id, r.partner_id));
-    // Tombstone GC (RFC-027 P3), same reasoning as the node path: a
-    // full-bucket merge is authoritative for the (edge_type, direction)
-    // bucket, so a winning tombstone shadows nothing in the new version and
-    // is dropped. Old readers see the delete through retained source bodies.
-    rows.retain(|r| !r.tombstone);
+    // Tombstone GC (RFC-027 P3), same reasoning as the node path: when this
+    // merge is authoritative for the (edge_type, direction) bucket — its
+    // output is the bucket's deepest level — a winning tombstone shadows
+    // nothing and is dropped. Otherwise a deeper un-merged level may still
+    // hold a row the tombstone masks, so it is kept. Old readers see the
+    // delete through the retained source bodies.
+    if gc_tombstones {
+        rows.retain(|r| !r.tombstone);
+    }
 
     build_edge_sst(edge_type, edge_def, &rows, direction)
 }
@@ -502,9 +669,10 @@ fn compact_edge_ssts(
 // stats for declared-but-absent properties during the L0->L1 rebuild; the
 // params are all distinct and bundling them would not aid readability.
 #[allow(clippy::too_many_arguments)]
-async fn put_node_sst_l1(
+async fn put_node_sst_leveled(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
+    out_level: u32,
     label: &str,
     label_def: &LabelDef,
     merged_rows: &[NodeRow],
@@ -513,7 +681,7 @@ async fn put_node_sst_l1(
     label_dict: &LabelDictionary,
 ) -> Result<(SstDescriptor, bool)> {
     let id = Uuid::now_v7();
-    let level = SstLevel(1);
+    let level = SstLevel(out_level);
     let file_name = format!(
         "{}-{}-{}.parquet",
         uuid_path_id(&id),
@@ -616,15 +784,16 @@ async fn put_node_sst_l1(
     Ok((descriptor, wrote_bloom))
 }
 
-async fn put_edge_sst_l1(
+async fn put_edge_sst_leveled(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
+    out_level: u32,
     edge_type: &str,
     direction: EdgeDirection,
     finish: EdgeSstFinish,
 ) -> Result<(SstDescriptor, bool)> {
     let id = Uuid::now_v7();
-    let level = SstLevel(1);
+    let level = SstLevel(out_level);
     let kind = match direction {
         EdgeDirection::Forward => SstKind::EdgesFwd,
         EdgeDirection::Inverse => SstKind::EdgesInv,
@@ -1301,5 +1470,311 @@ mod tests {
         let by_dst: BTreeMap<NodeId, &EdgeView> = outs.edges.iter().map(|e| (e.dst, e)).collect();
         assert_eq!(by_dst[&bob].properties, props_ab);
         assert_eq!(by_dst[&carol].properties, props_ac);
+    }
+
+    // ── Leveled-lite ────────────────────────────────────────────────────
+
+    /// Flush one node op (upsert or tombstone) as its own L0 SST.
+    async fn flush_node_op(
+        ms: &ManifestStore,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        id: NodeId,
+        lsn: u64,
+        op: MemOp,
+    ) -> LoadedManifest {
+        let mut mt = Memtable::new();
+        mt.apply(MemKey::Node { id }, lsn, op);
+        flush(ms, fence, base, &mt.freeze(), schema())
+            .await
+            .unwrap()
+            .committed
+    }
+
+    fn node_levels(m: &LoadedManifest) -> Vec<u32> {
+        let mut levels: Vec<u32> = m
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == SstKind::Nodes)
+            .map(|d| d.level.as_u32())
+            .collect();
+        levels.sort_unstable();
+        levels
+    }
+
+    /// `plan_bucket_merge` reduced to `(target_level, is_deepest, n_inputs)`,
+    /// so the borrowed `BucketPlan` does not escape the call.
+    fn plan_levels(owned: &[SstDescriptor], base: u64, ratio: u64) -> Option<(u32, bool, usize)> {
+        let refs: Vec<&SstDescriptor> = owned.iter().collect();
+        plan_bucket_merge(&refs, base, ratio)
+            .map(|p| (p.target_level, p.is_deepest, p.inputs.len()))
+    }
+
+    #[tokio::test]
+    async fn plan_bucket_merge_cascades_and_gates_gc_on_the_deepest_level() {
+        // Build one real descriptor to clone; `plan_bucket_merge` only reads
+        // `level` and `size_bytes`, so cloning + mutating those is enough to
+        // drive every branch deterministically without env or flush.
+        let (.., base) = build_two_l0_node_ssts().await;
+        let template = base.manifest.ssts[0].clone();
+        let mk = |level: u32, size: u64| {
+            let mut d = template.clone();
+            d.id = Uuid::now_v7();
+            d.level = SstLevel(level);
+            d.size_bytes = size;
+            d
+        };
+        // budgets: L1 = 100, L2 = 1000, L3 = 10_000.
+        let (bb, r) = (100u64, 10u64);
+
+        // 1. L0 + L1 within L1's budget, no deeper level → land in L1, GC.
+        assert_eq!(
+            plan_levels(&[mk(0, 10), mk(1, 50)], bb, r),
+            Some((1, true, 2))
+        );
+
+        // 2. L0 + L1 over L1's budget, deepest present = 1 → spill to L2, GC.
+        assert_eq!(
+            plan_levels(&[mk(0, 80), mk(1, 80)], bb, r).map(|(l, d, _)| (l, d)),
+            Some((2, true))
+        );
+
+        // 3. L0 + L1 within budget but a deeper L3 exists → land in L1, NO GC
+        //    (the tombstone could still be shadowing a row down in L3), and L3
+        //    is left untouched (only L0 + L1 are merged).
+        assert_eq!(
+            plan_levels(&[mk(0, 10), mk(1, 20), mk(3, 5000)], bb, r),
+            Some((1, false, 2))
+        );
+
+        // 4. L0 + L1 over L1's budget, cascades through L2 which fits → output
+        //    L2 (the deepest), GC; all three levels merged.
+        assert_eq!(
+            plan_levels(&[mk(0, 60), mk(1, 60), mk(2, 200)], bb, r),
+            Some((2, true, 3))
+        );
+
+        // 5. A single L0 with nothing else → nothing worth merging.
+        assert_eq!(plan_levels(&[mk(0, 10)], bb, r), None);
+
+        // 6. Fresh bucket, two big L0s over L1's budget, no leveled data → land
+        //    in L1 (no spilling past a non-existent deeper level); cascades on
+        //    a later sweep.
+        assert_eq!(
+            plan_levels(&[mk(0, 80), mk(0, 80)], bb, r).map(|(l, d, _)| (l, d)),
+            Some((1, true))
+        );
+
+        // 7. A lone over-budget L1 with no L0 → not worth a pure rewrite.
+        assert_eq!(plan_levels(&[mk(1, 5000)], bb, r), None);
+    }
+
+    #[tokio::test]
+    async fn compact_leveled_cascades_into_a_deeper_level() {
+        let s = store();
+        let p = paths("compact-cascade");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let a = sorted_node_id(1);
+        let b = sorted_node_id(2);
+        let c = sorted_node_id(3);
+
+        // Two L0s → compact (tiny budget, but a brand-new bucket still lands in
+        // L1, not deeper).
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &base,
+            a,
+            10,
+            MemOp::Upsert(node_payload("a", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            b,
+            11,
+            MemOp::Upsert(node_payload("b", None)),
+        )
+        .await;
+        let after_l1 = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            node_levels(&after_l1.committed),
+            vec![1],
+            "two fresh L0s land in L1"
+        );
+
+        // A third L0 alongside the L1 overflows the tiny budget → cascade to L2.
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &after_l1.committed,
+            c,
+            12,
+            MemOp::Upsert(node_payload("c", None)),
+        )
+        .await;
+        let after_l2 = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            node_levels(&after_l2.committed),
+            vec![2],
+            "L0 + L1 over budget cascades into L2"
+        );
+
+        // All three nodes remain readable through the deeper level.
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(after_l2.committed.clone(), &mt_view, s, p);
+        for id in [a, b, c] {
+            assert!(
+                snap.lookup_node("Person", id).await.unwrap().is_some(),
+                "node {id} must read through L2"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_above_a_deeper_level_is_preserved_then_gcd_at_the_deepest() {
+        // Resurrection safety: a tombstone merged at a shallow level while a
+        // deeper level still holds the row's value must NOT be dropped, or the
+        // delete would be undone. It is dropped only at the deepest merge.
+        let s = store();
+        let p = paths("compact-tomb-levels");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let alice = sorted_node_id(1);
+        let x = sorted_node_id(2);
+        let y = sorted_node_id(3);
+        let bob = sorted_node_id(4);
+        let z = sorted_node_id(5);
+        let big = 16 * 1024 * 1024u64; // larger than any SST these flushes make
+
+        // Push alice's VALUE down into L2 (tiny budget forces the cascade).
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &base,
+            alice,
+            10,
+            MemOp::Upsert(node_payload("alice", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            x,
+            11,
+            MemOp::Upsert(node_payload("x", None)),
+        )
+        .await;
+        let m = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+            .await
+            .unwrap()
+            .committed; // L1
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            y,
+            12,
+            MemOp::Upsert(node_payload("y", None)),
+        )
+        .await;
+        let m = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+            .await
+            .unwrap()
+            .committed; // L2
+        assert_eq!(node_levels(&m), vec![2], "alice's value now lives in L2");
+
+        // Build a fresh L1 from two new L0s (big budget keeps them at L1).
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            bob,
+            13,
+            MemOp::Upsert(node_payload("bob", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            z,
+            14,
+            MemOp::Upsert(node_payload("z", None)),
+        )
+        .await;
+        let m = compact_leveled(&ms, &fence, &m, &schema(), big, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(
+            node_levels(&m),
+            vec![1, 2],
+            "L1 (bob, z) sits above L2 (alice, x, y)"
+        );
+
+        // Tombstone alice in a new L0, then compact L0 + L1 → L1. The output is
+        // NOT the deepest level (L2 is below), so the tombstone must survive.
+        let m = flush_node_op(&ms, &fence, &m, alice, 20, MemOp::Tombstone).await;
+        let m = compact_leveled(&ms, &fence, &m, &schema(), big, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(
+            node_levels(&m),
+            vec![1, 2],
+            "the shallow merge stays at L1; L2 untouched"
+        );
+
+        // alice reads as deleted: the L1 tombstone (LSN 20) shadows the L2
+        // value (LSN 10). If the shallow merge had GC'd the tombstone, alice
+        // would resurrect from L2.
+        {
+            let mt = Memtable::new();
+            let mt_view = mt.snapshot_view();
+            let snap = Snapshot::new(m.clone(), &mt_view, s.clone(), p.clone());
+            assert!(
+                snap.lookup_node("Person", alice).await.unwrap().is_none(),
+                "the preserved tombstone must keep alice deleted"
+            );
+            assert!(snap.lookup_node("Person", bob).await.unwrap().is_some());
+        }
+
+        // Now compact down to the deepest level (tiny budget merges L1 + L2):
+        // the tombstone is authoritative and is dropped together with the
+        // shadowed value, so alice is physically gone and the survivors remain.
+        let m = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+            .await
+            .unwrap()
+            .committed;
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(m.clone(), &mt_view, s, p);
+        assert!(
+            snap.lookup_node("Person", alice).await.unwrap().is_none(),
+            "alice stays deleted after the deepest merge GCs the tombstone"
+        );
+        for id in [x, y, bob, z] {
+            assert!(
+                snap.lookup_node("Person", id).await.unwrap().is_some(),
+                "survivor {id} must remain after GC"
+            );
+        }
     }
 }
