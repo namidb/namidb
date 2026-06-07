@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -113,12 +113,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Local workspace crates
-namidb-core = { path = "crates/namidb-core", version = "0.13.0" }
-namidb-storage = { path = "crates/namidb-storage", version = "0.13.0" }
-namidb-markdown = { path = "crates/namidb-markdown", version = "0.13.0" }
-namidb-graph = { path = "crates/namidb-graph", version = "0.13.0" }
-namidb-query = { path = "crates/namidb-query", version = "0.13.0" }
-namidb-bolt = { path = "crates/namidb-bolt", version = "0.13.0" }
+namidb-core = { path = "crates/namidb-core", version = "0.14.0" }
+namidb-storage = { path = "crates/namidb-storage", version = "0.14.0" }
+namidb-markdown = { path = "crates/namidb-markdown", version = "0.14.0" }
+namidb-graph = { path = "crates/namidb-graph", version = "0.14.0" }
+namidb-query = { path = "crates/namidb-query", version = "0.14.0" }
+namidb-bolt = { path = "crates/namidb-bolt", version = "0.14.0" }
 
 [profile.release]
 opt-level = 3

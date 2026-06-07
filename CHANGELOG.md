@@ -11,8 +11,33 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
+
 ### Added
 
+- Vector search. Three scalar similarity/distance builtins,
+  `cosine_similarity`, `dot_product` and `euclidean_distance`, operate on a
+  stored vector property or a numeric `$param` array, so K-nearest-neighbour
+  search is expressible through the existing scan + `ORDER BY` + `LIMIT` path:
+  `MATCH (n:Note) WHERE n.embedding IS NOT NULL RETURN n ORDER BY
+  cosine_similarity(n.embedding, $q) DESC LIMIT 10`, with the `WHERE` clause
+  acting as a pre-filter on the candidate set. NULL propagates, a
+  zero-magnitude vector makes cosine NULL, and a dimension mismatch is a clear
+  error; `size()` returns a vector's dimension.
+- Embeddings on vault load. `load-vault --embed` (and the MCP server by
+  default) computes a text embedding for each note and stores it as an
+  `embedding` property, so semantic search works over an Obsidian vault. The
+  default embedder is local, deterministic and dependency-free (a hashing
+  embedder; lexical similarity). Build with `--features remote-embedder` and
+  set `NAMIDB_EMBEDDER=remote` plus `NAMIDB_EMBED_PROVIDER` (openai, voyage,
+  cohere, gemini or jina) and an API key to embed with a real model instead;
+  the load batches notes into one request per call. Each note is stamped with
+  the embedder identity, and a search refuses (rather than ranking wrongly) if
+  the namespace was embedded by a different model than the one querying it; a
+  sync that would switch the embedder is likewise refused.
+- MCP `vector_search` tool: semantic K-NN over the vault. It takes
+  natural-language query text, embeds it server-side with the same embedder
+  that indexed the notes, and returns the closest notes by cosine similarity.
 - Read-your-own-writes for edges (RFC-026 edge overlay). A traversal that
   runs after an edge is staged in the same transaction now sees that edge:
   every edge read path (`out_edges` / `in_edges` over both the SST scan and
