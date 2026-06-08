@@ -110,6 +110,18 @@ struct Cli {
     )]
     query_timeout: Duration,
 
+    /// Wall-clock budget for a single write query: an HTTP / Bolt auto-commit
+    /// statement, or each statement of a Bolt explicit transaction. A runaway
+    /// MERGE/DELETE is aborted instead of pinning the single writer, and its
+    /// pending batch is discarded so nothing partial commits. Defaults to
+    /// `--query-timeout`; set to `0s` to allow writes to run unbounded.
+    #[arg(
+        long,
+        env = "NAMIDB_WRITE_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    write_timeout: Option<Duration>,
+
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error
     /// instead of risking an out-of-memory blow-up. Set to `0` to allow read
@@ -182,6 +194,8 @@ fn main() -> anyhow::Result<()> {
         bolt_listen: cli.bolt_listen,
         bolt_tx_timeout: cli.bolt_tx_timeout,
         query_timeout: cli.query_timeout,
+        // Writes inherit the read budget unless given their own; `0s` opts out.
+        write_timeout: cli.write_timeout.unwrap_or(cli.query_timeout),
         query_row_cap: cli.query_row_cap,
         compaction_l0_trigger: cli.compaction_l0_trigger,
         write_stall_l0: cli.write_stall_l0,
