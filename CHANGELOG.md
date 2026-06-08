@@ -11,6 +11,18 @@ below and in the release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Bounded top-k for `ORDER BY ... LIMIT`. When a limit bounds the result to
+  `k = skip + limit` rows and `k` is smaller than the number of candidates,
+  the `TopN` operator now keeps only the `k` best in a max-heap instead of
+  materialising and sorting every candidate: O(n log k) time and O(k) memory
+  rather than O(n log n) and O(n). This is the hot path for K-nearest-neighbour
+  vector search (`ORDER BY cosine_similarity(n.embedding, $q) DESC LIMIT k`),
+  which previously sorted the whole scanned set. Results are identical to the
+  full sort, ties included. (The flat O(n) scan and uncompressed f32 vectors
+  remain; int8 quantization and an ANN index are the next steps.)
+
 ## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
 
 ### Added
