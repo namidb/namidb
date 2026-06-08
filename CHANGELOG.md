@@ -48,6 +48,20 @@ below and in the release notes.
   `CREATE`, `SET`, `REMOVE`, `MERGE`, or a label addition. Violations surface
   as `ExecError::Constraint` (HTTP 4xx / Bolt failure), the same path unique
   violations take.
+- Consistent backup and restore. `namidb backup --from <uri> --to <uri>`
+  copies a point-in-time snapshot of a namespace: it pins a manifest version
+  and copies its closure (the manifest, every SST and its bloom / unique /
+  equality / label-index side-cars, and the WAL segments still needed for
+  recovery). Every one of those objects is immutable once written, so the
+  snapshot is consistent by construction rather than a racy `aws s3 sync`.
+  `namidb restore --from <uri> --to <uri>` is the same copy in the recovery
+  direction. The destination is left as a self-contained, openable namespace
+  (renumbered to a fresh version 0). `--version N` pins a specific committed
+  version; `--force` overwrites a destination that already holds a namespace.
+  Also exposed as the library function
+  `namidb_storage::copy_namespace_snapshot`. Run against a quiescent source;
+  there is no `FREEZE` yet, so a concurrent compaction plus orphan sweep
+  could delete a pinned object mid-copy.
 
 ## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
 

@@ -14,6 +14,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod adjacency;
+pub mod backup;
 pub mod cache;
 pub mod cancel;
 pub mod compact;
@@ -39,6 +40,7 @@ pub use adjacency::{
     adjacency_budget_bytes, adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey,
     EdgeAdjacency, EdgeSlice, DEFAULT_ADJACENCY_BUDGET_MIB,
 };
+pub use backup::{copy_namespace_snapshot, SnapshotCopyReport};
 pub use cache::{
     sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
     DEFAULT_SST_CACHE_BUDGET_MIB,
