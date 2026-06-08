@@ -1454,6 +1454,43 @@ fn compare_keys(a: &[RuntimeValue], b: &[RuntimeValue], keys: &[OrderKey]) -> Or
     Ordering::Equal
 }
 
+/// Heap element for the bounded top-k path of `TopN`. Orders by the same
+/// per-key direction `compare_keys` uses (`descs[i]` is true when ORDER BY key
+/// `i` is `DESC`), then breaks ties by `pos` — the element's position in the
+/// input — so a max-heap that keeps the `k` smallest reproduces the stable
+/// full-sort's first `k` exactly, ties and all. The heap's `peek` is the worst
+/// kept candidate, evicted when a better one arrives.
+struct TopNItem {
+    vals: Vec<RuntimeValue>,
+    leaf: crate::exec::FactorIdx,
+    pos: usize,
+    descs: std::sync::Arc<[bool]>,
+}
+
+impl Ord for TopNItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (i, &desc) in self.descs.iter().enumerate() {
+            let o = order_for_sort(&self.vals[i], &other.vals[i], desc);
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        // Stable tiebreak: earlier input position sorts first.
+        self.pos.cmp(&other.pos)
+    }
+}
+impl PartialOrd for TopNItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for TopNItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for TopNItem {}
+
 pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
     if left.is_empty() || right.is_empty() {
         return Vec::new();
@@ -2166,6 +2203,62 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let mut needed: BTreeSet<String> = BTreeSet::new();
                 for k in keys {
                     collect_referenced_variables(&k.expression, &mut needed);
+                }
+
+                // Bounded top-k fast path. When a `LIMIT` bounds the result to
+                // `k = skip + limit` rows and `k < n`, keep only the `k` best in
+                // a max-heap whose top is the worst kept candidate: O(n log k)
+                // time and O(k) memory instead of materialising and sorting all
+                // `n` keyed rows. This is the hot path for KNN
+                // (`ORDER BY cosine_similarity(...) DESC LIMIT k`). The position
+                // tiebreak makes the result identical to the full sort below.
+                if limit != u64::MAX {
+                    let k = (skip as usize).saturating_add(limit as usize);
+                    if k > 0 && k < input_set.cardinality() {
+                        let descs: std::sync::Arc<[bool]> = std::sync::Arc::from(
+                            keys.iter()
+                                .map(|key| {
+                                    matches!(key.direction, crate::parser::OrderDirection::Desc)
+                                })
+                                .collect::<Vec<bool>>(),
+                        );
+                        let mut heap: std::collections::BinaryHeap<TopNItem> =
+                            std::collections::BinaryHeap::with_capacity(k + 1);
+                        for (pos, &leaf) in input_set.leaves.iter().enumerate() {
+                            let mut thin_row = Row::new();
+                            for var_name in &needed {
+                                if let Some(v) = input_set.arena.lookup_binding(leaf, var_name) {
+                                    thin_row.set(var_name.clone(), v.clone());
+                                }
+                            }
+                            let mut key_vals = Vec::with_capacity(keys.len());
+                            for key in keys {
+                                key_vals.push(evaluate(&key.expression, &thin_row, params)?);
+                            }
+                            let item = TopNItem {
+                                vals: key_vals,
+                                leaf,
+                                pos,
+                                descs: descs.clone(),
+                            };
+                            if heap.len() < k {
+                                heap.push(item);
+                            } else if &item < heap.peek().expect("heap full so non-empty") {
+                                // `item` sorts before the current worst kept.
+                                heap.pop();
+                                heap.push(item);
+                            }
+                        }
+                        let mut kept = heap.into_vec();
+                        kept.sort_unstable();
+                        let rows: Vec<Row> = kept
+                            .into_iter()
+                            .skip(skip as usize)
+                            .take(limit as usize)
+                            .map(|it| input_set.arena.materialize(it.leaf, None))
+                            .collect();
+                        return Ok(FactorRowSet::from_flat(rows));
+                    }
                 }
 
                 let mut keyed: Vec<(Vec<RuntimeValue>, crate::exec::FactorIdx)> =

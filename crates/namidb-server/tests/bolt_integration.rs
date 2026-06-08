@@ -349,6 +349,7 @@ async fn boot_bolt_tokens(
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
