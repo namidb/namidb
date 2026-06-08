@@ -574,6 +574,64 @@ async fn enforce_unique_on_set(
     Ok(())
 }
 
+/// Enforce declared NOT NULL constraints for a node that is being created or
+/// is gaining new labels. For each label in `labels`, every property the
+/// schema declares `nullable = false` must be present in `core_props` with a
+/// non-null value; a missing property and an explicit `NULL` are both
+/// violations. Returns [`ExecError::Constraint`] on the first one.
+///
+/// Pure schema lookup, no snapshot read: declared NOT NULL is a property of
+/// the row being staged, unlike the unique checks which must consult the
+/// read-your-own-writes overlay. Node-only, mirroring `enforce_unique_*`
+/// (edges carry no declared-property validation today).
+fn enforce_notnull_on_create(
+    writer: &WriterSession,
+    labels: &[String],
+    core_props: &BTreeMap<String, CoreValue>,
+) -> Result<(), ExecError> {
+    let schema = writer.schema();
+    for label in labels {
+        let Some(def) = schema.label(label) else {
+            continue;
+        };
+        for prop in &def.properties {
+            if prop.nullable {
+                continue;
+            }
+            match core_props.get(&prop.name) {
+                Some(v) if !matches!(v, CoreValue::Null) => {}
+                Some(_) => {
+                    return Err(ExecError::Constraint(format!(
+                        "{label}.{} is declared NOT NULL but was set to null (not-null constraint)",
+                        prop.name
+                    )));
+                }
+                None => {
+                    return Err(ExecError::Constraint(format!(
+                        "{label}.{} is declared NOT NULL but is missing (not-null constraint)",
+                        prop.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first of the node's `labels` that declares `key` as `nullable =
+/// false`, if any. Shared by the SET-to-null and REMOVE not-null guards.
+fn not_null_label(writer: &WriterSession, labels: &[String], key: &str) -> Option<String> {
+    let schema = writer.schema();
+    labels.iter().find_map(|label| {
+        schema.label(label).and_then(|def| {
+            def.properties
+                .iter()
+                .any(|p| p.name == key && !p.nullable)
+                .then(|| label.clone())
+        })
+    })
+}
+
 async fn apply_create(
     elements: &[CreateElement],
     mut row: Row,
@@ -633,6 +691,7 @@ async fn apply_create(
                 // node, so a duplicate staged earlier in the same uncommitted
                 // batch is caught as well as one already committed.
                 enforce_unique_on_create(writer, labels, &core_props).await?;
+                enforce_notnull_on_create(writer, labels, &core_props)?;
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
@@ -755,6 +814,14 @@ async fn apply_set(
                     // the node's own value) is allowed.
                     let label_vec: Vec<String> = n.labels.iter().cloned().collect();
                     enforce_unique_on_set(writer, &label_vec, key, &core, n.id).await?;
+                    if matches!(core, CoreValue::Null) {
+                        if let Some(label) = not_null_label(writer, &label_vec, key) {
+                            return Err(ExecError::Constraint(format!(
+                                "{label}.{key} is declared NOT NULL and cannot be set to null \
+                                 (not-null constraint)"
+                            )));
+                        }
+                    }
                     let mut core_props = node_runtime_props_to_core(&n.properties)?;
                     core_props.insert(key.clone(), core);
                     let record = NodeWriteRecord {
@@ -814,19 +881,25 @@ async fn apply_set(
             Some(RuntimeValue::Node(mut n)) => {
                 // Union the new labels into the node's set, then re-upsert
                 // (keyed by id) so the row carries the full set.
-                let added = labels
+                let added_labels: Vec<String> = labels
                     .iter()
                     .filter(|l| n.labels.insert((*l).clone()))
-                    .count();
+                    .cloned()
+                    .collect();
+                let core_props = node_runtime_props_to_core(&n.properties)?;
+                // A newly-added label brings its own NOT NULL contract: the
+                // node must already carry a non-null value for every property
+                // that label declares non-null.
+                enforce_notnull_on_create(writer, &added_labels, &core_props)?;
                 let record = NodeWriteRecord {
-                    properties: node_runtime_props_to_core(&n.properties)?,
+                    properties: core_props,
                     schema_version: 1,
                     ..Default::default()
                 };
                 writer
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                     .map_err(ExecError::Storage)?;
-                outcome.labels_set += added as u64;
+                outcome.labels_set += added_labels.len() as u64;
                 row.set(target_alias.clone(), RuntimeValue::Node(n));
             }
             other => {
@@ -863,6 +936,13 @@ fn apply_remove(
     match op {
         RemoveOp::Property { target_alias, key } => match row.get(target_alias).cloned() {
             Some(RuntimeValue::Node(mut n)) => {
+                let labels: Vec<String> = n.labels.iter().cloned().collect();
+                if let Some(label) = not_null_label(writer, &labels, key) {
+                    return Err(ExecError::Constraint(format!(
+                        "{label}.{key} is declared NOT NULL and cannot be removed \
+                         (not-null constraint)"
+                    )));
+                }
                 let mut core_props = node_runtime_props_to_core(&n.properties)?;
                 core_props.remove(key);
                 let record = NodeWriteRecord {
