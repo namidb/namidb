@@ -22,7 +22,7 @@ use namidb_query::{
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
     WriteOutcome,
 };
-use namidb_storage::{parse_uri, NamespacePaths, WriterSession};
+use namidb_storage::{copy_namespace_snapshot, parse_uri, NamespacePaths, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -135,6 +135,48 @@ enum Cmd {
         /// Path to the vault directory.
         path: String,
     },
+    /// Copy a consistent snapshot of a namespace to another location.
+    ///
+    /// Pins a manifest version and copies its closure — the manifest, every
+    /// SST and its side-cars, and the WAL segments still needed for recovery.
+    /// All are immutable, so the snapshot is consistent by construction. The
+    /// destination is left as a self-contained, openable namespace.
+    ///
+    /// Run against a quiescent source: a concurrent compaction + orphan sweep
+    /// could delete a pinned object mid-copy.
+    Backup {
+        /// Source namespace URI to back up (see `run --help` for schemes).
+        #[arg(long)]
+        from: String,
+        /// Destination namespace URI for the snapshot (a fresh location).
+        #[arg(long)]
+        to: String,
+        /// Manifest version to pin. Defaults to the current committed version.
+        #[arg(long)]
+        version: Option<u64>,
+        /// Proceed even if the destination already holds a namespace.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Restore a namespace from a backup made with `backup`.
+    ///
+    /// The same consistent copy as `backup`, in the recovery direction. The
+    /// destination must be offline (there is no fencing against a concurrent
+    /// writer); restoring over an existing namespace requires `--force`.
+    Restore {
+        /// Backup namespace URI to restore from.
+        #[arg(long)]
+        from: String,
+        /// Destination namespace URI to restore into.
+        #[arg(long)]
+        to: String,
+        /// Manifest version to pin. Defaults to the current committed version.
+        #[arg(long)]
+        version: Option<u64>,
+        /// Overwrite the destination even if it already holds a namespace.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -216,7 +258,53 @@ fn main() -> anyhow::Result<()> {
                 &path,
             ))?;
         }
+        Cmd::Backup {
+            from,
+            to,
+            version,
+            force,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(copy_namespace_cmd("backed up", &from, &to, version, force))?;
+        }
+        Cmd::Restore {
+            from,
+            to,
+            version,
+            force,
+        } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(copy_namespace_cmd("restored", &from, &to, version, force))?;
+        }
     }
+    Ok(())
+}
+
+/// Shared driver for `backup` and `restore`: both copy a consistent namespace
+/// snapshot from `from` to `to`. `verb` only changes the success line.
+async fn copy_namespace_cmd(
+    verb: &str,
+    from: &str,
+    to: &str,
+    version: Option<u64>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let (src_store, src_paths) = parse_uri(from)?;
+    let (dst_store, dst_paths) = parse_uri(to)?;
+    let report =
+        copy_namespace_snapshot(src_store, src_paths, dst_store, dst_paths, version, force).await?;
+    println!(
+        "{verb} {from} (source version {}) -> {to}",
+        report.source_version
+    );
+    println!(
+        "  {} objects, {} bytes",
+        report.objects_copied, report.bytes_copied
+    );
     Ok(())
 }
 
