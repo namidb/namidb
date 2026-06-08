@@ -20,6 +20,14 @@ below and in the release notes.
   `--write-timeout 0s` / `NAMIDB_WRITE_TIMEOUT=0s`, or raise the budget to a
   value that fits the workload. Embedded callers are unaffected: the bare
   `execute_write` / `execute_write_staged` stay unbounded.
+- A property a label declares `nullable = false` is now enforced on write,
+  where before the flag was advisory. A `CREATE` that omits it or sets it to
+  `NULL`, a `SET p = NULL`, a `REMOVE p`, or adding the declaring label to a
+  node that lacks the value are all rejected with a constraint error. Schemas
+  that declared `nullable = false` without supplying the value on every write
+  will now see those writes fail; mark the property nullable, or supply a
+  value. Enforcement is node-only and pure (no extra read): edges still carry
+  no declared-property validation.
 
 ### Added
 
@@ -34,6 +42,12 @@ below and in the release notes.
   Bolt explicit transaction. Embedded callers reach it through the new
   `execute_write_with_deadline` / `execute_write_staged_with_deadline`; the
   existing `execute_write` / `execute_write_staged` stay unbounded.
+- NOT NULL constraint enforcement. Declaring a property `nullable = false`
+  now makes it a hard write-time invariant, alongside the existing unique
+  constraint, so a label's required properties cannot be left null through
+  `CREATE`, `SET`, `REMOVE`, `MERGE`, or a label addition. Violations surface
+  as `ExecError::Constraint` (HTTP 4xx / Bolt failure), the same path unique
+  violations take.
 
 ## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
 
