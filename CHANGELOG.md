@@ -62,6 +62,24 @@ below and in the release notes.
   `namidb_storage::copy_namespace_snapshot`. Run against a quiescent source;
   there is no `FREEZE` yet, so a concurrent compaction plus orphan sweep
   could delete a pinned object mid-copy.
+- Per-token roles and multiple tokens. A new `--auth-tokens-file` /
+  `NAMIDB_AUTH_TOKENS_FILE` points at a JSON file of tokens, each granting
+  `read-only` or `read-write`:
+
+  ```json
+  { "tokens": [
+      { "name": "ci",        "token": "…", "role": "read-write" },
+      { "name": "dashboard", "token": "…", "role": "read-only"  }
+  ] }
+  ```
+
+  A read-only token may run reads but is refused on any write or admin flush,
+  over both HTTP (`403 Forbidden`) and Bolt (`Neo.ClientError.Security.
+  Forbidden`). Keeping secrets in a file also keeps them out of the process
+  arguments. The existing single `--auth-token` still works and grants
+  read-write; the tokens file takes precedence when both are set.
+  Per-namespace token scoping is deferred until multi-namespace routing
+  exists (the server serves one namespace today).
 
 ## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
 

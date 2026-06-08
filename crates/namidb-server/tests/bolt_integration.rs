@@ -290,6 +290,7 @@ async fn boot_bolt_full(
         store_uri: format!("memory://{ns}"),
         listen: http_addr,
         auth_token: Some("test-token".into()),
+        auth_tokens_file: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -320,6 +321,91 @@ async fn boot_bolt_full(
     (bolt_addr, task)
 }
 
+/// Boot a Bolt server whose auth comes from a JSON tokens file (per-token
+/// roles). Writes `tokens_json` to a temp file the server reads at boot.
+async fn boot_bolt_tokens(
+    ns: &str,
+    tokens_json: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let tokens_path = std::env::temp_dir().join(format!("namidb-bolt-tokens-{ns}.json"));
+    std::fs::write(&tokens_path, tokens_json).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+
+    let config = namidb_server::Config {
+        store_uri: format!("memory://{ns}"),
+        listen: http_addr,
+        auth_token: None,
+        auth_tokens_file: Some(tokens_path),
+        flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
+        bolt_listen: Some(bolt_addr),
+        bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::ZERO,
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
+        tls_cert: None,
+        tls_key: None,
+        slow_query_threshold: Duration::ZERO,
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = namidb_server::run(config).await {
+            eprintln!("server exited: {e}");
+        }
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(bolt_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (bolt_addr, task)
+}
+
+#[tokio::test]
+async fn bolt_read_only_token_cannot_write() {
+    let tokens = r#"{ "tokens": [
+        { "name": "reader", "token": "rkey", "role": "read-only" },
+        { "name": "writer", "token": "wkey", "role": "read-write" }
+    ] }"#;
+    let (bolt_addr, task) = boot_bolt_tokens("bolt-ro", tokens).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    // LOGON with the read-only token succeeds (the helper asserts SUCCESS), so
+    // the token authenticates — reads would be served. A write must not be.
+    hello_and_logon(&mut stream, "rkey").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("CREATE (:Person {name: 'x'})".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    match recv_msg(&mut stream).await {
+        Response::Failure(meta) => assert_eq!(
+            meta.get("code").cloned(),
+            Some(Value::String("Neo.ClientError.Security.Forbidden".into())),
+            "a read-only write must fail with the forbidden code, meta: {meta:?}"
+        ),
+        other => panic!("a read-only write must fail, got {other:?}"),
+    }
+
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
 #[tokio::test]
 async fn bolt_create_then_match_roundtrip() {
     // Bind on an ephemeral port.
@@ -340,6 +426,7 @@ async fn bolt_create_then_match_roundtrip() {
         store_uri: "memory://bolt-test".into(),
         listen: http_addr,
         auth_token: Some("test-token".into()),
+        auth_tokens_file: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -417,6 +504,7 @@ async fn bolt_bad_token_yields_failure() {
         store_uri: "memory://bolt-bad-auth".into(),
         listen: http_addr,
         auth_token: Some("correct-token".into()),
+        auth_tokens_file: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -558,6 +646,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         store_uri: "memory://bolt-introspect".into(),
         listen: http_addr,
         auth_token: Some("test-token".into()),
+        auth_tokens_file: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,

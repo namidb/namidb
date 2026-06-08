@@ -6,6 +6,7 @@
 //! See [`build_router`] for the full route surface and [`run`] for
 //! the end-to-end boot procedure.
 
+pub mod auth;
 pub mod bolt;
 mod introspect;
 pub mod metrics;
@@ -14,7 +15,7 @@ pub mod tls;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +32,7 @@ use namidb_query::{
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
+use crate::auth::{AuthConfig, Role};
 use crate::metrics::{Metrics, Protocol, QueryKind};
 
 /// Process-wide configuration assembled from CLI flags or env vars.
@@ -40,8 +42,13 @@ pub struct Config {
     pub listen: std::net::SocketAddr,
     /// `None` means "no auth"; the server will log a loud warning at
     /// boot and accept every request. Production callers should set a
-    /// long random secret.
+    /// long random secret. A single token grants read-write access; for
+    /// read-only tokens or several tokens, use `auth_tokens_file`.
     pub auth_token: Option<String>,
+    /// Path to a JSON file of tokens, each with a `read-only` or
+    /// `read-write` role. Takes precedence over `auth_token` when set. `None`
+    /// falls back to `auth_token` (or no auth when that is also `None`).
+    pub auth_tokens_file: Option<std::path::PathBuf>,
     pub flush_interval: Duration,
     /// Interval for the background maintenance task (L0->L1 compaction +
     /// orphan sweep). `Duration::ZERO` disables it.
@@ -120,7 +127,10 @@ pub struct AppState {
     /// scratch. Shared across cloned `AppState`s (the router clones it per
     /// request) via the inner `Arc`, so all handlers hit one cache.
     catalog_cache: CatalogCache,
-    auth_token: Option<Arc<str>>,
+    /// Accepted bearer tokens and their roles. Empty = open (no auth). Shared
+    /// with the Bolt serving path so a read-only token cannot write over
+    /// either protocol.
+    auth: Arc<AuthConfig>,
     namespace: String,
     /// Per-read-query wall-clock budget. `Duration::ZERO` disables it.
     /// Defaults to disabled; the server sets it from [`Config`] at boot.
@@ -148,11 +158,19 @@ pub struct AppState {
 impl AppState {
     pub fn new(writer: WriterSession, auth_token: Option<String>, namespace: String) -> Self {
         let snapshot = Arc::new(SnapshotCell::new(writer.owned_snapshot()));
+        // A single non-empty token is read-write; `None` or an empty string is
+        // open (an empty secret would otherwise be a bypass — `Bearer ` would
+        // match it). The server overrides this with the resolved multi-token
+        // config via `with_auth` at boot.
+        let auth = match auth_token {
+            Some(secret) if !secret.is_empty() => AuthConfig::single_read_write(secret),
+            _ => AuthConfig::open(),
+        };
         Self {
             writer: Arc::new(Mutex::new(writer)),
             snapshot,
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
-            auth_token: auth_token.map(Arc::from),
+            auth: Arc::new(auth),
             namespace,
             query_timeout: Duration::ZERO,
             write_timeout: Duration::ZERO,
@@ -202,6 +220,19 @@ impl AppState {
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
         self
+    }
+
+    /// Replace the auth configuration (builder style). The server calls this
+    /// at boot with the resolved token set (single token, tokens file, or
+    /// open). Shared by clone with the Bolt serving path.
+    pub fn with_auth(mut self, auth: Arc<AuthConfig>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// The accepted tokens, shared with the Bolt listener.
+    pub(crate) fn auth(&self) -> Arc<AuthConfig> {
+        self.auth.clone()
     }
 
     /// Set the per-read-query operator row cap (builder style). `0` leaves
@@ -271,13 +302,30 @@ pub fn build_router(state: AppState) -> Router {
 /// spawn a periodic flush task, and serve until the process receives
 /// SIGINT.
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    if config.auth_token.is_none() {
+    // Resolve the auth configuration: a tokens file (with roles) wins, else a
+    // single read-write `--auth-token`, else open.
+    let auth = match (&config.auth_tokens_file, &config.auth_token) {
+        (Some(path), _) => Arc::new(AuthConfig::load_file(path)?),
+        // Refuse an empty `--auth-token`: it logs as "auth enabled" but a
+        // `Bearer ` request would match the empty secret. Omit it to run open.
+        (None, Some(secret)) if secret.is_empty() => {
+            anyhow::bail!(
+                "--auth-token is empty; omit it (and NAMIDB_AUTH_TOKEN) to run without auth"
+            )
+        }
+        (None, Some(secret)) => Arc::new(AuthConfig::single_read_write(secret.clone())),
+        (None, None) => Arc::new(AuthConfig::open()),
+    };
+    if auth.is_open() {
         warn!(
             "⚠️  namidb-server is running WITHOUT auth. Anyone who can reach \
              {} can issue arbitrary Cypher queries. Set --auth-token (or env \
-             NAMIDB_AUTH_TOKEN) before exposing this port beyond localhost.",
+             NAMIDB_AUTH_TOKEN), or --auth-tokens-file for per-token roles, \
+             before exposing this port beyond localhost.",
             config.listen
         );
+    } else {
+        info!(tokens = auth.len(), "auth enabled");
     }
 
     let (store, paths) = namidb_storage::parse_uri(&config.store_uri)
@@ -294,7 +342,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let maint_manifest_store = ManifestStore::new(store.clone(), paths.clone());
     let writer = WriterSession::open(store, paths).await?;
 
-    let state = AppState::new(writer, config.auth_token.clone(), namespace)
+    let state = AppState::new(writer, None, namespace)
+        .with_auth(auth)
         .with_query_timeout(config.query_timeout)
         .with_write_timeout(config.write_timeout)
         .with_query_row_cap(config.query_row_cap)
@@ -433,7 +482,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     if let Some(bolt_addr) = config.bolt_listen {
         let bolt_state = state.clone();
-        let bolt_auth = state.auth_token.clone();
+        let bolt_auth = state.auth();
         let tx_timeout = config.bolt_tx_timeout;
         let bolt_shutdown = shutdown_rx.clone();
         let bolt_tls = tls_config.clone().map(tls::acceptor);
@@ -517,22 +566,27 @@ async fn wait_for_shutdown_signal() {
 
 async fn require_auth(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.auth_token.as_deref() else {
+    // Open mode: serve every request as read-write, recording the role so the
+    // handler's write gate has a value to read uniformly.
+    if state.auth.is_open() {
+        req.extensions_mut().insert(Role::ReadWrite);
         return next.run(req).await;
-    };
+    }
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
-    match presented {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+        .and_then(strip_bearer);
+    match presented.and_then(|token| state.auth.role_for(token)) {
+        Some(role) => {
+            // Carry the matched token's role to the handler, which gates writes.
+            req.extensions_mut().insert(role);
             next.run(req).await
         }
-        _ => (
+        None => (
             StatusCode::UNAUTHORIZED,
             [(
                 axum::http::header::WWW_AUTHENTICATE,
@@ -546,18 +600,11 @@ async fn require_auth(
     }
 }
 
-/// Subtle::ConstantTimeEq would pull in another crate; this open-coded
-/// variant is good enough for short shared secrets (we walk every byte
-/// regardless of mismatch position).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc |= x ^ y;
-    }
-    acc == 0
+/// The token from an `Authorization: Bearer <token>` header value. The scheme
+/// is matched case-insensitively (RFC 7235 §2.1), matching the Bolt path.
+fn strip_bearer(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 // ── routes ────────────────────────────────────────────────────────────
@@ -672,11 +719,15 @@ struct ObservedQuery {
     response: Response,
 }
 
-async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -> Response {
+async fn cypher(
+    State(state): State<AppState>,
+    Extension(role): Extension<Role>,
+    Json(req): Json<CypherRequest>,
+) -> Response {
     // The guard drops at the end of the handler, so the in-flight gauge is
     // correct even on an early error return.
     let _in_flight = state.metrics.track_in_flight();
-    let obs = run_cypher(&state, &req).await;
+    let obs = run_cypher(&state, &req, role).await;
     state
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -686,7 +737,7 @@ async fn cypher(State(state): State<AppState>, Json(req): Json<CypherRequest>) -
 /// Run one HTTP Cypher request and classify it for metrics. Mirrors the Bolt
 /// `ServerBackend::run` path; the two do not share a chokepoint, so the
 /// parse/plan/execute logic is intentionally parallel.
-async fn run_cypher(state: &AppState, req: &CypherRequest) -> ObservedQuery {
+async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> ObservedQuery {
     let started = std::time::Instant::now();
 
     let parsed = match cypher_parse(&req.query) {
@@ -744,6 +795,22 @@ async fn run_cypher(state: &AppState, req: &CypherRequest) -> ObservedQuery {
     };
 
     if plan.contains_write() {
+        // A read-only token may not write. Reject before taking the writer
+        // lock so a forbidden write costs nothing.
+        if !role.allows_write() {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorBody {
+                        error: "this token is read-only; write queries are forbidden".into(),
+                    }),
+                )
+                    .into_response(),
+            };
+        }
         let mut writer = state.writer.lock().await;
         let result =
             execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
@@ -847,7 +914,17 @@ struct FlushResponse {
     manifest_version: u64,
 }
 
-async fn admin_flush(State(state): State<AppState>) -> Response {
+async fn admin_flush(State(state): State<AppState>, Extension(role): Extension<Role>) -> Response {
+    // A flush mutates durable state, so a read-only token may not trigger it.
+    if !role.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin flush is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
     let mut w = state.writer.lock().await;
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
@@ -1018,6 +1095,139 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, auth_token.map(|s| s.to_string()), "test".into());
         build_router(state)
+    }
+
+    /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the
+    /// real `--auth-tokens-file` path), exercising per-token roles.
+    async fn fixture_with_tokens(ns: &str, tokens_json: &str) -> Router {
+        let path = std::env::temp_dir().join(format!("namidb-test-tokens-{ns}.json"));
+        std::fs::write(&path, tokens_json).unwrap();
+        let auth = crate::auth::AuthConfig::load_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let (store, paths) = namidb_storage::parse_uri(&format!("memory://{ns}")).unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, ns.into()).with_auth(Arc::new(auth));
+        build_router(state)
+    }
+
+    /// POST a Cypher query with an optional bearer token; return the response.
+    async fn post_cypher(app: &Router, token: Option<&str>, query: &str) -> Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v0/cypher")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            builder = builder.header("authorization", format!("Bearer {t}"));
+        }
+        app.clone()
+            .oneshot(
+                builder
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    const ROLE_TOKENS: &str = r#"{ "tokens": [
+        { "name": "writer", "token": "wkey", "role": "read-write" },
+        { "name": "reader", "token": "rkey", "role": "read-only" }
+    ] }"#;
+
+    #[tokio::test]
+    async fn read_only_token_reads_but_cannot_write() {
+        let app = fixture_with_tokens("authz-ro", ROLE_TOKENS).await;
+
+        // A read with the read-only token is allowed.
+        let read = post_cypher(&app, Some("rkey"), "MATCH (n) RETURN n").await;
+        assert_eq!(read.status(), StatusCode::OK);
+
+        // A write with the read-only token is forbidden (not unauthorized).
+        let write = post_cypher(&app, Some("rkey"), "CREATE (:Person {name: 'x'})").await;
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
+        // Nothing was written.
+        let after = post_cypher(&app, Some("rkey"), "MATCH (p:Person) RETURN p").await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(after.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_write_token_can_write() {
+        let app = fixture_with_tokens("authz-rw", ROLE_TOKENS).await;
+        let write = post_cypher(&app, Some("wkey"), "CREATE (:Person {name: 'x'}) RETURN 1").await;
+        assert_eq!(write.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        // RFC 7235 §2.1: the scheme is case-insensitive, and the Bolt path
+        // already lowercases it. A lowercase `bearer` must be accepted.
+        let app = fixture_with_tokens("authz-case", ROLE_TOKENS).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header("authorization", "bearer wkey")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "query": "MATCH (n) RETURN n" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn empty_single_token_is_treated_as_open_not_a_bypass() {
+        // An empty `--auth-token` must not become a token a `Bearer ` request
+        // matches. `AppState::new` falls back to open mode (the boot path in
+        // `run` rejects it outright); either way there is no empty-secret token.
+        let (store, paths) = namidb_storage::parse_uri("memory://authz-empty").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let app = build_router(AppState::new(writer, Some(String::new()), "t".into()));
+        // No token at all is served (open mode), and a `Bearer ` (empty) is not
+        // a privileged match — both reach the handler as read-write.
+        assert_eq!(
+            post_cypher(&app, None, "MATCH (n) RETURN n").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_token_is_unauthorized() {
+        let app = fixture_with_tokens("authz-bad", ROLE_TOKENS).await;
+        let resp = post_cypher(&app, Some("nope"), "MATCH (n) RETURN n").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_flush_is_forbidden_for_a_read_only_token() {
+        let app = fixture_with_tokens("authz-flush", ROLE_TOKENS).await;
+        let flush = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v0/admin/flush")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(flush("rkey").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(flush("wkey").await.status(), StatusCode::OK);
     }
 
     #[tokio::test]

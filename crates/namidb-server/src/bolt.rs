@@ -7,11 +7,14 @@
 //! Most of the heavy lifting lives in `namidb-bolt`. This module
 //! supplies the [`Backend`] adapter and the `accept()` loop.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use namidb_bolt::{
-    AuthPolicy, Backend, BackendError, RunOutcome, ServerInfo, Session, StatementType,
+    AuthPolicy, Authenticator, Backend, BackendError, RunOutcome, ServerInfo, Session,
+    StatementType, Value,
 };
 use namidb_query::{
     execute_with_limits, execute_write_staged_with_deadline, execute_write_with_deadline,
@@ -24,6 +27,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::auth::AuthConfig;
 use crate::metrics::{Protocol, QueryKind};
 use crate::AppState;
 
@@ -55,14 +59,27 @@ pub struct ServerBackend {
     state: AppState,
     /// Per-connection explicit-transaction slot. `None` outside BEGIN..END.
     tx: Mutex<Option<TxState>>,
+    /// `true` once a read-only token authenticates this connection (set by the
+    /// paired [`TokenAuthenticator`] at LOGON). Read on every write to reject
+    /// it. Defaults to `false` (read-write), which also covers open mode.
+    read_only: Arc<AtomicBool>,
 }
 
 impl ServerBackend {
-    pub fn new(state: AppState) -> Self {
+    pub fn new(state: AppState, read_only: Arc<AtomicBool>) -> Self {
         Self {
             state,
             tx: Mutex::new(None),
+            read_only,
         }
+    }
+
+    /// `Some(error)` when the connection's token is read-only, to reject a
+    /// write before it touches the writer lock.
+    fn write_forbidden(&self) -> Option<BackendError> {
+        self.read_only.load(Ordering::Relaxed).then(|| {
+            BackendError::Forbidden("this token is read-only; write queries are forbidden".into())
+        })
     }
 
     /// Auto-commit query: parse, plan, and execute against the published
@@ -102,6 +119,14 @@ impl ServerBackend {
         };
 
         if plan.contains_write() {
+            // A read-only token may not write — reject before the writer lock.
+            if let Some(err) = self.write_forbidden() {
+                return RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed: started.elapsed(),
+                    result: Err(err),
+                };
+            }
             // Writes still take the writer lock (single-writer invariant).
             // On success we refresh the snapshot cell so subsequent reads
             // see the just-committed records (RFC-021).
@@ -195,6 +220,14 @@ impl ServerBackend {
         };
 
         if plan.contains_write() {
+            // A read-only token may not write, even inside an open transaction.
+            if let Some(err) = self.write_forbidden() {
+                return RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed: started.elapsed(),
+                    result: Err(err),
+                };
+            }
             // Stage into the transaction's held writer; do NOT commit. The
             // RETURN rows are computed during the apply, so they stream now.
             let mut slot = self.tx.lock().await;
@@ -468,11 +501,54 @@ fn map_exec_err(e: ExecError) -> BackendError {
     }
 }
 
-/// Translate the server's auth token into a Bolt [`AuthPolicy`].
-fn auth_policy(token: &Option<Arc<str>>) -> AuthPolicy {
-    match token {
-        Some(t) => AuthPolicy::Token(t.clone()),
-        None => AuthPolicy::Open,
+/// Bolt `Custom` authenticator backed by the server's token set. On a
+/// successful LOGON it records the matched token's role into the per-connection
+/// `read_only` cell the paired [`ServerBackend`] reads to gate writes — the
+/// "out of band" per-connection context the [`Authenticator`] contract
+/// describes.
+struct TokenAuthenticator {
+    auth: Arc<AuthConfig>,
+    read_only: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Authenticator for TokenAuthenticator {
+    async fn authenticate(
+        &self,
+        extra: &BTreeMap<String, Value>,
+    ) -> std::result::Result<(), String> {
+        let str_field = |key: &str| {
+            extra.get(key).and_then(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+        };
+        let scheme = str_field("scheme").unwrap_or("none");
+        if scheme != "basic" && scheme != "bearer" {
+            return Err(format!("unsupported auth scheme `{scheme}`"));
+        }
+        match str_field("credentials").and_then(|c| self.auth.role_for(c)) {
+            Some(role) => {
+                self.read_only
+                    .store(!role.allows_write(), Ordering::Relaxed);
+                Ok(())
+            }
+            None => Err("invalid credentials".into()),
+        }
+    }
+}
+
+/// Build the per-connection [`AuthPolicy`]: `Open` when no tokens are
+/// configured, otherwise a [`TokenAuthenticator`] that records the matched
+/// role into `read_only` for the backend's write gate.
+fn make_policy(auth: &Arc<AuthConfig>, read_only: Arc<AtomicBool>) -> AuthPolicy {
+    if auth.is_open() {
+        AuthPolicy::Open
+    } else {
+        AuthPolicy::Custom(Arc::new(TokenAuthenticator {
+            auth: auth.clone(),
+            read_only,
+        }))
     }
 }
 
@@ -480,7 +556,7 @@ fn auth_policy(token: &Option<Arc<str>>) -> AuthPolicy {
 pub async fn serve(
     state: AppState,
     listen: std::net::SocketAddr,
-    auth_token: Option<Arc<str>>,
+    auth: Arc<AuthConfig>,
     tx_timeout: std::time::Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     tls: Option<tokio_rustls::TlsAcceptor>,
@@ -521,14 +597,17 @@ pub async fn serve(
             warn!(error = %e, %peer, "set_nodelay failed");
         }
         let state = state.clone();
-        let policy = auth_policy(&auth_token);
+        // One role cell per connection, shared between the authenticator (which
+        // sets it at LOGON) and the backend (which reads it on every write).
+        let read_only = Arc::new(AtomicBool::new(false));
+        let policy = make_policy(&auth, read_only.clone());
         let info = ServerInfo {
             agent: agent.clone(),
             connection_id: Uuid::now_v7().to_string(),
         };
         let tls = tls.clone();
         tokio::spawn(async move {
-            let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state));
+            let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state, read_only));
             // `Session` is generic over the transport, so the only fork is the
             // optional TLS handshake on the accepted socket.
             match tls {
