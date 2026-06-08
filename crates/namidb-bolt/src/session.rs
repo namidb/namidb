@@ -133,6 +133,9 @@ pub enum BackendError {
     Storage(String),
     /// A declared schema constraint (e.g. a unique property) was violated.
     Constraint(String),
+    /// The authenticated principal is not allowed to run this statement (e.g.
+    /// a read-only token attempting a write).
+    Forbidden(String),
     /// Anything else.
     Other(String),
 }
@@ -146,6 +149,7 @@ impl BackendError {
             BackendError::Eval(_) => "Neo.ClientError.Statement.ArgumentError",
             BackendError::Storage(_) => "Neo.TransientError.General.DatabaseUnavailable",
             BackendError::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
+            BackendError::Forbidden(_) => "Neo.ClientError.Security.Forbidden",
             BackendError::Other(_) => "Neo.DatabaseError.General.UnknownError",
         }
     }
@@ -158,6 +162,7 @@ impl BackendError {
             | BackendError::Eval(s)
             | BackendError::Storage(s)
             | BackendError::Constraint(s)
+            | BackendError::Forbidden(s)
             | BackendError::Other(s) => s,
         }
     }

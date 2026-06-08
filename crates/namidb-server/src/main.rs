@@ -26,11 +26,19 @@ struct Cli {
     #[arg(long, env = "NAMIDB_LISTEN", default_value = "0.0.0.0:8080")]
     listen: std::net::SocketAddr,
 
-    /// Bearer token required for `/v0/cypher` and `/v0/admin/*`.
-    /// When unset, the server starts in unauthenticated mode and
-    /// logs a loud warning.
+    /// Bearer token required for `/v0/cypher` and `/v0/admin/*`. Grants
+    /// read-write access. When unset (and no `--auth-tokens-file`), the server
+    /// starts in unauthenticated mode and logs a loud warning.
     #[arg(long, env = "NAMIDB_AUTH_TOKEN")]
     auth_token: Option<String>,
+
+    /// Path to a JSON file of tokens, each with a `read-only` or `read-write`
+    /// role, e.g. `{ "tokens": [{ "name": "ci", "token": "…", "role":
+    /// "read-write" }, { "token": "…", "role": "read-only" }] }`. Takes
+    /// precedence over `--auth-token`; lets you hand out read-only tokens and
+    /// keep secrets out of the process arguments.
+    #[arg(long, env = "NAMIDB_AUTH_TOKENS_FILE")]
+    auth_tokens_file: Option<std::path::PathBuf>,
 
     /// Interval at which the memtable is flushed to L0 SSTs in the
     /// background. Set to `0s` to disable periodic flush (callers
@@ -175,6 +183,7 @@ fn main() -> anyhow::Result<()> {
         store_uri: cli.store,
         listen: cli.listen,
         auth_token: cli.auth_token,
+        auth_tokens_file: cli.auth_tokens_file,
         flush_interval: cli.flush_interval,
         compaction_interval: cli.compaction_interval,
         sweep_min_age: cli.sweep_min_age,
