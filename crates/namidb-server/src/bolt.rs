@@ -14,8 +14,9 @@ use namidb_bolt::{
     AuthPolicy, Backend, BackendError, RunOutcome, ServerInfo, Session, StatementType,
 };
 use namidb_query::{
-    execute_with_limits, execute_write, execute_write_staged, parse as cypher_parse,
-    plan as build_plan, ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
+    execute_with_limits, execute_write_staged_with_deadline, execute_write_with_deadline,
+    parse as cypher_parse, plan as build_plan, ExecError, LowerError, Params, ParseError, Row,
+    WriteOutcome,
 };
 use namidb_storage::WriterSession;
 use tokio::net::TcpListener;
@@ -105,7 +106,14 @@ impl ServerBackend {
             // On success we refresh the snapshot cell so subsequent reads
             // see the just-committed records (RFC-021).
             let mut writer = self.state.writer.lock().await;
-            match execute_write(&plan, &mut writer, &params).await {
+            match execute_write_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                self.state.write_deadline(),
+            )
+            .await
+            {
                 Ok(outcome) => {
                     self.state.snapshot.store(writer.owned_snapshot());
                     // Soft write stall (RFC-027 P5): sample under the lock,
@@ -203,7 +211,14 @@ impl ServerBackend {
                     };
                 }
             };
-            let result = match execute_write_staged(&plan, &mut tx.writer, &params).await {
+            let result = match execute_write_staged_with_deadline(
+                &plan,
+                &mut tx.writer,
+                &params,
+                self.state.write_deadline(),
+            )
+            .await
+            {
                 Ok(outcome) => {
                     tx.staged = true;
                     Ok(write_run_outcome(outcome))

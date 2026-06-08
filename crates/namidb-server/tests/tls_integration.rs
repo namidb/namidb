@@ -69,6 +69,7 @@ async fn serves_https_and_bolt_over_tls() {
         bolt_listen: Some(bolt),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,

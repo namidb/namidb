@@ -26,8 +26,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use namidb_query::{
-    execute_with_limits, execute_write, parse as cypher_parse, plan as build_plan, Params,
-    RuntimeValue, StatsCatalog, WriteOutcome,
+    execute_with_limits, execute_write_with_deadline, parse as cypher_parse, plan as build_plan,
+    Params, RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
@@ -64,9 +64,16 @@ pub struct Config {
     pub bolt_tx_timeout: Duration,
     /// Wall-clock deadline for a single read query (HTTP and Bolt, including
     /// in-transaction reads). A runaway scan or expansion is aborted with a
-    /// timeout error rather than pinning a worker. Writes are bounded by the
-    /// transaction lifecycle, not this. `Duration::ZERO` disables it.
+    /// timeout error rather than pinning a worker. `Duration::ZERO` disables
+    /// it.
     pub query_timeout: Duration,
+    /// Wall-clock deadline for a single write query: an HTTP / Bolt
+    /// auto-commit statement, or each statement of a Bolt explicit
+    /// transaction. A runaway MERGE/DELETE is aborted cooperatively rather
+    /// than pinning the single writer, and its pending batch is discarded so
+    /// nothing partial is committed. `Duration::ZERO` disables it; the CLI
+    /// defaults it to `query_timeout`.
+    pub write_timeout: Duration,
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error
     /// instead of risking an out-of-memory blow-up (e.g. a cross product).
@@ -118,6 +125,9 @@ pub struct AppState {
     /// Per-read-query wall-clock budget. `Duration::ZERO` disables it.
     /// Defaults to disabled; the server sets it from [`Config`] at boot.
     query_timeout: Duration,
+    /// Per-write-query wall-clock budget. `Duration::ZERO` disables it.
+    /// Defaults to disabled; the server sets it from [`Config`] at boot.
+    write_timeout: Duration,
     /// Per-read-query operator row cap. `0` disables it. Defaults to
     /// disabled; the server sets it from [`Config`] at boot.
     query_row_cap: usize,
@@ -145,6 +155,7 @@ impl AppState {
             auth_token: auth_token.map(Arc::from),
             namespace,
             query_timeout: Duration::ZERO,
+            write_timeout: Duration::ZERO,
             query_row_cap: 0,
             write_stall_l0: 0,
             write_stall_delay: Duration::ZERO,
@@ -186,6 +197,13 @@ impl AppState {
         self
     }
 
+    /// Set the per-write-query timeout (builder style). `Duration::ZERO`
+    /// leaves writes unbounded.
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
     /// Set the per-read-query operator row cap (builder style). `0` leaves
     /// reads uncapped.
     pub fn with_query_row_cap(mut self, row_cap: usize) -> Self {
@@ -198,6 +216,13 @@ impl AppState {
     pub(crate) fn query_deadline(&self) -> Option<std::time::Instant> {
         (self.query_timeout > Duration::ZERO)
             .then(|| std::time::Instant::now() + self.query_timeout)
+    }
+
+    /// Deadline for a write query starting now, or `None` when the timeout
+    /// is disabled. Computed per statement so each write gets the full budget.
+    pub(crate) fn write_deadline(&self) -> Option<std::time::Instant> {
+        (self.write_timeout > Duration::ZERO)
+            .then(|| std::time::Instant::now() + self.write_timeout)
     }
 
     /// Operator row cap for a read query, or `None` when disabled.
@@ -271,6 +296,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let state = AppState::new(writer, config.auth_token.clone(), namespace)
         .with_query_timeout(config.query_timeout)
+        .with_write_timeout(config.write_timeout)
         .with_query_row_cap(config.query_row_cap)
         .with_write_stall(config.write_stall_l0, config.write_stall_delay)
         .with_slow_query_threshold(config.slow_query_threshold);
@@ -719,7 +745,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest) -> ObservedQuery {
 
     if plan.contains_write() {
         let mut writer = state.writer.lock().await;
-        let result = execute_write(&plan, &mut writer, &params).await;
+        let result =
+            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
         // Sample the soft write-stall decision while still holding the lock
         // (RFC-027 P5), then release it and sleep — backpressure applies to
         // this request, not to the writer mutex other connections need.

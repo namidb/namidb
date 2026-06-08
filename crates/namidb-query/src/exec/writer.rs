@@ -23,6 +23,7 @@
 //! (List/Map/Node/Rel are rejected with an explicit error).
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -63,8 +64,29 @@ pub async fn execute_write_staged(
     writer: &mut WriterSession,
     params: &Params,
 ) -> Result<WriteOutcome, ExecError> {
+    execute_write_staged_with_deadline(plan, writer, params, None).await
+}
+
+/// [`execute_write_staged`] with a wall-clock `deadline`. The deadline rides
+/// the shared [`namidb_storage::cancel`] task-local for the whole apply, so
+/// the storage decode loops a read sub-plan drives and the per-row / per-edge
+/// write loops here both probe it and abort a runaway statement mid-flight
+/// (cooperative cancellation) with [`ExecError::Timeout`]. `None` runs
+/// unguarded with the baseline cost — the server passes a deadline, embedded
+/// callers and tests do not.
+pub async fn execute_write_staged_with_deadline(
+    plan: &LogicalPlan,
+    writer: &mut WriterSession,
+    params: &Params,
+    deadline: Option<Instant>,
+) -> Result<WriteOutcome, ExecError> {
     let mut outcome = WriteOutcome::default();
-    let rows = execute_write_inner(plan, writer, params, &mut outcome).await?;
+    let rows = crate::exec::limits::with_limits(
+        deadline,
+        None,
+        execute_write_inner(plan, writer, params, &mut outcome),
+    )
+    .await?;
     outcome.rows = rows;
     Ok(outcome)
 }
@@ -79,13 +101,27 @@ pub async fn execute_write(
     writer: &mut WriterSession,
     params: &Params,
 ) -> Result<WriteOutcome, ExecError> {
-    let outcome = match execute_write_staged(plan, writer, params).await {
+    execute_write_with_deadline(plan, writer, params, None).await
+}
+
+/// [`execute_write`] with a wall-clock `deadline` bounding the apply. A write
+/// that overruns is aborted with [`ExecError::Timeout`] before
+/// `commit_batch`, so the pending batch is discarded and nothing partial is
+/// sealed — the writer is left clean for the next statement. `None` runs
+/// unbounded.
+pub async fn execute_write_with_deadline(
+    plan: &LogicalPlan,
+    writer: &mut WriterSession,
+    params: &Params,
+    deadline: Option<Instant>,
+) -> Result<WriteOutcome, ExecError> {
+    let outcome = match execute_write_staged_with_deadline(plan, writer, params, deadline).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            // The statement failed after staging some mutations into the
-            // pending batch (writers are long-lived and shared, so the
-            // batch outlives this call). Drop them, or the next write on
-            // this writer would seal them with its own commit.
+            // The statement failed (a timeout counts) after staging some
+            // mutations into the pending batch (writers are long-lived and
+            // shared, so the batch outlives this call). Drop them, or the
+            // next write on this writer would seal them with its own commit.
             writer.discard_batch();
             return Err(e);
         }
@@ -107,6 +143,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
+                    crate::exec::limits::check_deadline()?;
                     let new_row = apply_create(elements, row, writer, params, outcome).await?;
                     out.push(new_row);
                 }
@@ -117,6 +154,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
+                    crate::exec::limits::check_deadline()?;
                     let new_row = apply_sets(items, row, writer, params, outcome).await?;
                     out.push(new_row);
                 }
@@ -127,6 +165,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
+                    crate::exec::limits::check_deadline()?;
                     let new_row = apply_removes(items, row, writer, outcome)?;
                     out.push(new_row);
                 }
@@ -141,6 +180,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
+                    crate::exec::limits::check_deadline()?;
                     apply_delete(targets, *detach, &row, writer, params, outcome).await?;
                     out.push(row);
                 }
@@ -156,6 +196,7 @@ fn execute_write_inner<'a>(
                 let rows = execute_write_inner(input, writer, params, outcome).await?;
                 let mut out = Vec::with_capacity(rows.len().max(1));
                 for row in rows {
+                    crate::exec::limits::check_deadline()?;
                     let merged = apply_merge(
                         pattern,
                         on_match_sets,
@@ -986,6 +1027,7 @@ async fn detach_incident_edges(
     // — acceptable for v0; see RFC-009 §Drawbacks.
     let edge_types: Vec<String> = writer.observed_edge_types();
     for et in edge_types {
+        crate::exec::limits::check_deadline()?;
         let mut to_delete: Vec<(NodeId, NodeId)> = Vec::new();
         {
             let snap = writer.overlay_snapshot();
@@ -1001,7 +1043,13 @@ async fn detach_incident_edges(
                 to_delete.push((e.src, e.dst));
             }
         }
-        for (src, dst) in to_delete {
+        for (i, (src, dst)) in to_delete.into_iter().enumerate() {
+            // Probe on a stride: tombstoning is a cheap memtable insert, so an
+            // `Instant::now()` per edge would show on a million-edge detach.
+            // The bounded read above already probes during edge decode.
+            if i % namidb_storage::cancel::CHECK_STRIDE == 0 {
+                crate::exec::limits::check_deadline()?;
+            }
             writer
                 .tombstone_edge(et.clone(), src, dst)
                 .map_err(ExecError::Storage)?;

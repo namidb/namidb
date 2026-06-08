@@ -11,6 +11,30 @@ below and in the release notes.
 
 ## [Unreleased]
 
+### Breaking
+
+- Server-initiated writes are now bounded by a wall-clock timeout that
+  defaults to `--query-timeout` (30s). Before this, writes ran unbounded; a
+  bulk load or large `MERGE`/`DELETE` that takes longer than the budget now
+  aborts and rolls back. To keep the old unbounded behaviour set
+  `--write-timeout 0s` / `NAMIDB_WRITE_TIMEOUT=0s`, or raise the budget to a
+  value that fits the workload. Embedded callers are unaffected: the bare
+  `execute_write` / `execute_write_staged` stay unbounded.
+
+### Added
+
+- Write-query timeout. A write statement now honours a wall-clock deadline,
+  so a runaway `MERGE`/`DELETE` is aborted instead of pinning the single
+  writer of a namespace. The deadline rides the same cooperative
+  cancellation the read path uses, and a write that overruns has its pending
+  batch discarded, so nothing partial is committed. Configure it with
+  `--write-timeout` / `NAMIDB_WRITE_TIMEOUT`; it defaults to the read budget
+  (`--query-timeout`), and `0s` opts a write back into running unbounded. It
+  applies to HTTP and Bolt auto-commit statements and to each statement of a
+  Bolt explicit transaction. Embedded callers reach it through the new
+  `execute_write_with_deadline` / `execute_write_staged_with_deadline`; the
+  existing `execute_write` / `execute_write_staged` stay unbounded.
+
 ## [0.14.0] - 2026-06-07: vector search and embeddings, TLS, Prometheus metrics, leveled-lite compaction
 
 ### Added

@@ -297,6 +297,7 @@ async fn boot_bolt_full(
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: tx_timeout,
         query_timeout,
+        write_timeout: query_timeout,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
@@ -346,6 +347,7 @@ async fn bolt_create_then_match_roundtrip() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
@@ -422,6 +424,7 @@ async fn bolt_bad_token_yields_failure() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
@@ -562,6 +565,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         bolt_listen: Some(bolt_addr),
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
         query_row_cap: 0,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
@@ -893,6 +897,38 @@ async fn bolt_read_query_times_out() {
     assert!(
         matches!(resp, Response::Failure(_)),
         "a read past its 1ns budget must fail, got {resp:?}"
+    );
+
+    // Session is FAILED after the error; just drop the connection.
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_write_query_times_out() {
+    // A 1ns write budget: the deadline (now + 1ns) is already past by the
+    // time the write executor reaches its first per-row guard, so an
+    // auto-commit write RUN fails with a timeout and commits nothing.
+    // `boot_bolt_full` sets the write budget equal to the read budget.
+    let (bolt_addr, task) =
+        boot_bolt_full("bolt-wtimeout", Duration::ZERO, Duration::from_nanos(1)).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("CREATE (p:Person {name: 'Ada'})".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let resp = recv_msg(&mut stream).await;
+    assert!(
+        matches!(resp, Response::Failure(_)),
+        "a write past its 1ns budget must fail, got {resp:?}"
     );
 
     // Session is FAILED after the error; just drop the connection.

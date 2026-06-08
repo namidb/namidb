@@ -16,8 +16,12 @@
 //!   materialises.
 //!
 //! The server scopes both from its configuration (env `NAMIDB_QUERY_TIMEOUT`
-//! and `NAMIDB_QUERY_ROW_CAP`). Writes are not guarded here; an open Bolt
-//! transaction is bounded separately by its idle timeout.
+//! and `NAMIDB_QUERY_ROW_CAP`). Writes carry only a deadline (no row cap):
+//! the write executor scopes it through [`with_limits`] in
+//! `execute_write_with_deadline` and probes it in its per-row loops, so a
+//! runaway statement aborts before commit. The bare `execute_write` and an
+//! open Bolt transaction's own idle timeout remain separate, unrelated
+//! bounds.
 
 use std::future::Future;
 use std::time::Instant;
