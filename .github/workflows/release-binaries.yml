@@ -34,7 +34,7 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --bin namidb --bin namidb-mcp
 
@@ -48,7 +48,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create the release for this tag (idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,7 +74,7 @@ jobs:
           - { target: aarch64-apple-darwin, runner: macos-14 }
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and upload namidb + namidb-mcp
         uses: taiki-e/upload-rust-binary-action@v1
         with:

@@ -77,8 +77,8 @@ jobs:
           - { os: macos,   arch: arm64,   rust_target: aarch64-apple-darwin,        runner: macos-14,     manylinux: "" }
           - { os: windows, arch: x86_64,  rust_target: x86_64-pc-windows-msvc,      runner: windows-2022, manylinux: "" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build wheel via maturin-action
@@ -100,8 +100,8 @@ jobs:
     name: sdist
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build sdist via maturin-action
@@ -130,8 +130,8 @@ jobs:
           - { os: macos-14,     python: "3.12", artifact: wheel-macos-arm64 }
           - { os: windows-2022, python: "3.12", artifact: wheel-windows-x86_64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@v4
