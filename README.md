@@ -97,6 +97,7 @@ NamiDB is pre-1.0 and alpha: the engine has run inside LESAI for about a year, b
 - **CLI.** `namidb parse`, `namidb explain --verbose`, `namidb run --store <uri>` for ad-hoc query work against any backend.
 - **HTTP server.** The `namidb-server` binary, with bearer-token auth, a periodic flush loop, a lock-free `/v0/livez` liveness probe, Prometheus metrics at `/v0/metrics` plus a slow-query log, and a small REST API (`/v0/cypher`, `/v0/health`, `/v0/admin/flush`). Optional TLS on both the HTTP and Bolt listeners via `--tls-cert` / `--tls-key` (rustls).
 - **Bolt protocol.** Same `namidb-server` binary speaks Bolt 4.4 / 5.0 / 5.4 on an opt-in TCP listener (default 7687). Neo4j drivers connect over `bolt://host:7687` and run Cypher, verified end-to-end with the Python driver. The other language drivers (Java, JavaScript, .NET, Go, Rust) speak the same protocol but are not all exercised yet, and GUI clients that introspect the schema hit `CALL` / `SHOW` procedures the parser does not implement yet, so their schema panels come up empty. See [RFC-022](./docs/rfc/022-bolt-protocol.md).
+- **Vector search and embeddings.** `cosine_similarity`, `dot_product` and `euclidean_distance` builtins rank stored f32 vectors through the normal scan + `ORDER BY` + `LIMIT` path, so K-nearest-neighbour search is just Cypher. Loading a markdown vault (`namidb load-vault --embed`, or the MCP server) embeds each note so semantic search works over it. The default embedder is **local and lexical**: a dependency-free hashing embedder that matches shared vocabulary, not meaning. For meaning-level search, build with `--features remote-embedder` and set the `NAMIDB_EMBED_*` variables to use OpenAI, Voyage, Cohere, Gemini or Jina. A namespace must be embedded consistently; switching embedders means a re-embed. The scan is still flat (no ANN index yet) and vectors are stored uncompressed.
 - **Bench harness.** A synthetic, deterministic LDBC SNB Interactive harness under [`bench/`](./bench/).
 
 <br />
@@ -165,6 +166,8 @@ The URI tells the client which bucket and which namespace to use.
 | `memory://<ns>` | In-process and ephemeral, for testing only |
 
 Every backend speaks the same Cypher, exposes the same Python, Rust and HTTP APIs, and gives you the same snapshot-isolated reads.
+
+**Durability.** A write is acknowledged once `commit_batch` has written its WAL segment and swung the manifest pointer on the backend. On the object stores (`s3://`, `gs://`, `az://`, and S3-compatibles like R2 or MinIO) that inherits the backend's own durability: once the PUT is acked, the write is on durable storage. The `file://` backend writes through the OS page cache and does **not** `fsync`, so a committed write survives a process crash but a kernel panic or power loss can lose the most recent un-flushed writes. Treat `file://` as a development and single-node store, not as the only copy of data you cannot lose; point production at an object store. `memory://` is not durable at all. Backup and restore a consistent snapshot of any namespace with `namidb backup` / `namidb restore`.
 
 ### AWS S3 (the primary path)
 
