@@ -11,6 +11,8 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-10: production hardening — write timeouts, NOT NULL, backup/restore, token roles, bounded top-k
+
 ### Breaking
 
 - Server-initiated writes are now bounded by a wall-clock timeout that
