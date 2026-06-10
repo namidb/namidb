@@ -414,6 +414,9 @@ impl Client {
     /// `tags_loaded`, `tag_links`, `tags_pruned`, `tag_links_pruned`,
     /// `subtag_edges`, `subtag_edges_pruned`, `placeholders_created` and
     /// `commit_batches`.
+    // Wide arity is inherent to the Python keyword-argument surface; the
+    // `#[pyo3(signature = ...)]` above gives every extra parameter a default.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (path, label="Note", edge_type="LINKS_TO", commit_every=1000, prune=false, placeholders=false))]
     fn load_vault(
         &self,

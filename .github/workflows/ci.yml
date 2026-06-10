@@ -42,7 +42,7 @@ jobs:
       # `--all-targets` is intentionally NOT passed: it would pull
       # criterion and the other bench-only dev-deps into the lint gate.
       # Benches are exercised on demand via `cargo bench`, not in CI.
-      - run: cargo clippy --workspace --lib --tests --exclude namidb-py -- -D warnings -A clippy::doc_lazy_continuation
+      - run: cargo clippy --workspace --lib --tests -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
     name: test (${{ matrix.os }})
