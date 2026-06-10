@@ -144,10 +144,13 @@ struct Cli {
     #[arg(long, env = "NAMIDB_COMPACTION_L0_TRIGGER", default_value_t = 8)]
     compaction_l0_trigger: usize,
 
-    /// L0-count per bucket above which a committed write is softly stalled
-    /// by `--write-stall-delay`, so the writer cannot outrun compaction
-    /// without bound. Set to `0` (the default) to disable the stall.
-    #[arg(long, env = "NAMIDB_WRITE_STALL_L0", default_value_t = 0)]
+    /// L0-count per bucket above which a committed write is softly stalled by
+    /// `--write-stall-delay`, so the writer cannot outrun compaction without
+    /// bound (which would let L0 grow and inflate read amplification). Defaults
+    /// to `24` — three times the reactive-compaction trigger, so it is
+    /// invisible under normal load and only bites under sustained write
+    /// overload. Set to `0` to disable the stall entirely.
+    #[arg(long, env = "NAMIDB_WRITE_STALL_L0", default_value_t = 24)]
     write_stall_l0: usize,
 
     /// Delay applied to a committed write while L0 is above
