@@ -11,6 +11,21 @@ below and in the release notes.
 
 ## [Unreleased]
 
+### Added
+
+- MCP `vector_search` gains an optional `where` argument: a Cypher predicate
+  over the matched node that pre-filters the candidate set *before* cosine
+  ranking, so a metadata-constrained semantic search returns the true top-k
+  within the filter instead of post-filtering (and truncating) the global
+  top-k. Still read-only.
+
+### Changed
+
+- MCP `vector_search` memoises the query embedding (keyed by embedder id +
+  text) and the namespace's stored embedder id, so a query repeated in a RAG
+  loop is embedded once — one API call instead of N for a remote embedder —
+  and the embedder-mismatch guard no longer runs an extra lookup per search.
+
 ## [0.15.0] - 2026-06-10: production hardening — write timeouts, NOT NULL, backup/restore, token roles, bounded top-k
 
 ### Breaking

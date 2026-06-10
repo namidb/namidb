@@ -52,7 +52,21 @@ pub struct Server {
     /// the same vector space. Chosen by `embedder_from_env` (remote when
     /// configured, else the local hashing embedder).
     embedder: Arc<dyn Embedder>,
+    /// Query-embedding cache for the `vector_search` hot path, keyed by
+    /// `embedder_id\0text`. A query repeated in a RAG loop is embedded once,
+    /// which matters most for remote embedders (one API call instead of N).
+    /// Bounded; cleared wholesale when it crosses the cap. A `std` mutex over a
+    /// short, await-free critical section.
+    query_embeddings: std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>,
+    /// The namespace's stored embedder id, fetched once and memoised: it is
+    /// immutable while the server holds one embedder, so the mismatch guard
+    /// need not re-query it on every search. `None` until first observed.
+    stored_embedder: std::sync::Mutex<Option<String>>,
 }
+
+/// Cap for [`Server::query_embeddings`]; past this it is cleared wholesale (a
+/// RAG working set is far smaller, so this rarely trips).
+const QUERY_EMBED_CACHE_CAP: usize = 512;
 
 impl Server {
     /// Open the namespace at `store_uri` (any scheme `namidb_storage::parse_uri`
@@ -67,6 +81,8 @@ impl Server {
             cache: SstCache::new(64 * 1024 * 1024),
             snapshot,
             embedder: namidb_markdown::embedder_from_env(),
+            query_embeddings: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stored_embedder: std::sync::Mutex::new(None),
         })
     }
 
@@ -392,12 +408,22 @@ impl Server {
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .clamp(1, 100);
+        // Optional metadata pre-filter: a Cypher predicate spliced into the
+        // WHERE before ranking, so the candidate set is narrowed *before* top-k
+        // rather than truncated after it. Still read-only — `run_read_query`
+        // rejects writes, and the agent can already run arbitrary reads via the
+        // `cypher` tool, so this grants no new reach.
+        let filter = args
+            .get("where")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         // Mismatch guard: notes carry the id of the embedder that indexed them.
         // If that differs from the server's current embedder, cosine over two
         // different spaces would be silently wrong, so refuse with guidance.
         let current = self.embedder.id();
-        if let Some(stored) = self.stored_embedder_id(&label, &property).await? {
+        if let Some(stored) = self.cached_stored_embedder_id(&label, &property).await? {
             if stored != current {
                 return Err(format!(
                     "this namespace was embedded with `{stored}`, but the server's \
@@ -408,21 +434,22 @@ impl Server {
         }
 
         // Embed the query as a query (vs a document) in the same space as the
-        // stored notes.
-        let vector = self
-            .embedder
-            .embed(&text)
-            .await
-            .map_err(|e| format!("embedding the query failed: {e}"))?;
+        // stored notes; memoised by embedder id + text.
+        let vector = self.embed_query_cached(&text).await?;
         let mut p = Params::new();
         p.insert("query".to_string(), RuntimeValue::Vector(vector));
 
         // Pre-filter on label + "has an embedding" (and drop placeholder stubs)
-        // narrows the candidate set, then rank by cosine. `label`/`property` are
-        // validated identifiers, so interpolating them is injection-safe.
+        // narrows the candidate set, plus the optional user predicate, then rank
+        // by cosine. `label`/`property` are validated identifiers, so
+        // interpolating them is injection-safe.
+        let where_extra = match filter {
+            Some(f) => format!(" AND ({f})"),
+            None => String::new(),
+        };
         let cypher = format!(
             "MATCH (n:{label}) \
-             WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL \
+             WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL{where_extra} \
              RETURN n.title AS title, n.path AS path, \
                     cosine_similarity(n.{property}, $query) AS score \
              ORDER BY score DESC LIMIT {k}"
@@ -432,6 +459,50 @@ impl Server {
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::stored_embedder_id`] memoised. The stored id is immutable while
+    /// the server holds one embedder, so it is fetched at most once. A `None`
+    /// (no embeddings yet) is deliberately not cached, so the guard starts
+    /// working the moment a vault is embedded in this session.
+    async fn cached_stored_embedder_id(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<String>, String> {
+        let cached = self.stored_embedder.lock().unwrap().clone();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let observed = self.stored_embedder_id(label, property).await?;
+        if let Some(id) = &observed {
+            *self.stored_embedder.lock().unwrap() = Some(id.clone());
+        }
+        Ok(observed)
+    }
+
+    /// [`Embedder::embed`] for the query side, memoised by `embedder_id\0text`
+    /// so a query repeated in a RAG loop is embedded once (one API call instead
+    /// of N for a remote embedder). The lock is never held across the embed.
+    async fn embed_query_cached(&self, text: &str) -> Result<Vec<f32>, String> {
+        let key = format!("{}\0{text}", self.embedder.id());
+        let cached = self.query_embeddings.lock().unwrap().get(&key).cloned();
+        if let Some(v) = cached {
+            return Ok(v);
+        }
+        let vector = self
+            .embedder
+            .embed(text)
+            .await
+            .map_err(|e| format!("embedding the query failed: {e}"))?;
+        let mut cache = self.query_embeddings.lock().unwrap();
+        // Bounded: a RAG working set fits well under the cap; clear wholesale if
+        // a long-running session accumulates many distinct queries.
+        if cache.len() >= QUERY_EMBED_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, vector.clone());
+        Ok(vector)
     }
 
     /// The embedder id stamped on one embedded node of `label`, if any. `None`
@@ -689,14 +760,15 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "vector_search",
-            "description": "Semantic search: rank notes by meaning, not keywords. Give a natural-language `query`; the server embeds it with the same model used to index the vault and returns the K nearest notes by cosine similarity. Optional: `label` (default \"Note\"), `property` (default \"embedding\"), `k` (default 10, max 100). Returns title, path and score, highest first. Notes without an embedding are skipped (load the vault with embeddings enabled).",
+            "description": "Semantic search: rank notes by meaning, not keywords. Give a natural-language `query`; the server embeds it with the same model used to index the vault and returns the K nearest notes by cosine similarity. Optional: `label` (default \"Note\"), `property` (default \"embedding\"), `k` (default 10, max 100), and `where` (a Cypher predicate to pre-filter on metadata before ranking). Returns title, path and score, highest first. Notes without an embedding are skipped (load the vault with embeddings enabled).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural-language search text; embedded server-side" },
                     "label": { "type": "string", "description": "Node label to search (default \"Note\")" },
                     "property": { "type": "string", "description": "Embedding property name (default \"embedding\")" },
-                    "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" }
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" },
+                    "where": { "type": "string", "description": "Optional Cypher predicate over the matched node `n` to pre-filter the candidate set before ranking, e.g. `n.path STARTS WITH 'work/'`. Read-only." }
                 },
                 "required": ["query"],
             },
@@ -1135,6 +1207,54 @@ mod tests {
             .filter_map(|r| r["title"].as_str())
             .collect();
         assert_eq!(titles, vec!["Rust"], "the database note must rank first");
+    }
+
+    #[tokio::test]
+    async fn vector_search_where_pre_filters_before_ranking() {
+        // The closest note to the query is excluded by `where`, so the predicate
+        // must narrow the candidate set BEFORE top-k rather than truncate after:
+        // the returned note is the best match *within* the filter.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Postgres.md",
+            "rust graph database engine on object storage\n",
+        );
+        write(
+            dir.path(),
+            "Sqlite.md",
+            "small embedded relational database file\n",
+        );
+        let server = Server::open("memory://mcp-vsearch-where").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        // Unfiltered, the closer note wins.
+        let unfiltered = call(
+            &server,
+            "vector_search",
+            json!({ "query": "graph database storage", "k": 1 }),
+        )
+        .await;
+        assert_eq!(unfiltered[0]["title"], json!("Postgres"));
+
+        // A `where` that excludes the closer note returns the best match left.
+        let filtered = call(
+            &server,
+            "vector_search",
+            json!({ "query": "graph database storage", "k": 1, "where": "n.title = 'Sqlite'" }),
+        )
+        .await;
+        let titles: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Sqlite"],
+            "the where must pre-filter to Sqlite"
+        );
     }
 
     #[tokio::test]
