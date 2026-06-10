@@ -25,6 +25,12 @@ below and in the release notes.
   text) and the namespace's stored embedder id, so a query repeated in a RAG
   loop is embedded once — one API call instead of N for a remote embedder —
   and the embedder-mismatch guard no longer runs an extra lookup per search.
+- The server now applies soft write-stall backpressure by default
+  (`--write-stall-l0` defaults to `24`, three times the reactive-compaction
+  trigger). Before, backpressure was off, so a writer could outrun compaction
+  and let L0 grow unbounded, inflating read amplification. It is invisible
+  under normal load and only delays a committed write under sustained
+  overload; set `--write-stall-l0 0` to restore the old unbounded behaviour.
 
 ## [0.15.0] - 2026-06-10: production hardening — write timeouts, NOT NULL, backup/restore, token roles, bounded top-k
 
