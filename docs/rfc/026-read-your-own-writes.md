@@ -221,13 +221,14 @@ insert hot path. Revisit only if overlay build cost shows up in a profile.
 - **Q1: Node-only v1, edges in a follow-up?** Resolved. Nodes landed first
   (CREATE-then-MATCH, MERGE, the intra-batch unique check); the edge overlay
   followed, so a traversal over an edge staged earlier in the same statement
-  or transaction now sees it. One capability is still a follow-up: running a
-  read pipeline (an `Expand`) directly above a write within a single
-  statement, `CREATE (a)-[:R]->(b) WITH a MATCH (a)-[:R]->(x)`. The write
-  executor delegates such a sub-plan to the read-only walker, which rejects
-  the embedded write; it is unsupported for nodes and edges alike. The staged
-  edge is visible through `overlay_snapshot` to a later statement or an
-  in-transaction read, which is the common case.
+  or transaction now sees it. The last residual, running a read pipeline (an
+  `Expand`) directly above a write within a single statement
+  (`CREATE (a)-[:R]->(b) WITH a MATCH (a)-[:R]->(x)`), is resolved too: the
+  write executor recurses the Expand's write-bearing input through
+  `execute_write_inner` to stage the mutations, then runs the traversal step
+  against `overlay_snapshot`, so the just-staged edge is visible. A pure-read
+  `Expand` still delegates wholesale to the read-only walker, and the walker's
+  write-operator guard stays as the backstop.
 
 - **Q2: Property index cache interaction.** The cross-snapshot property
   index cache (see the read path) must not serve a stale negative for a

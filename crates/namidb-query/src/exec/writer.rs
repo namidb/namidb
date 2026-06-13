@@ -427,6 +427,55 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
 
+            // ─── An Expand whose input stages writes (RFC-026 Q1):
+            // `CREATE (a)-[:R]->(b) WITH a MATCH (a)-[:R]->(x) RETURN x`. The
+            // input subtree carries the CREATE, so it cannot go to the
+            // read-only walker (which rejects embedded writes). Recurse the
+            // input through the write executor to stage the mutations and
+            // materialise the source rows, then run the traversal step against
+            // the read-your-own-writes overlay so the just-staged edge is
+            // visible. A pure-read Expand still falls to the read-leaf arm
+            // below. `want_properties = true` / `skip_target_materialize =
+            // false`: the routing optimisation that prunes those is a read-only
+            // walker concern, so materialise fully here (correct, just not
+            // pruned).
+            LogicalPlan::Expand {
+                input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_labels,
+                length,
+                optional,
+                back_reference,
+                shortest,
+                path_binding,
+            } if input.contains_write() => {
+                let input_rows = execute_write_inner(input, writer, params, outcome).await?;
+                let snap = writer.overlay_snapshot();
+                crate::exec::walker::execute_expand(
+                    input_rows,
+                    source,
+                    edge_type.as_deref(),
+                    *direction,
+                    rel_alias.as_deref(),
+                    target_alias,
+                    target_labels,
+                    *length,
+                    *optional,
+                    *back_reference,
+                    *shortest,
+                    path_binding.as_deref(),
+                    &snap,
+                    true,
+                    false,
+                    None,
+                )
+                .await
+            }
+
             // ─── Pure read leaves and pattern-driven operators that do
             // NOT contain writes: delegate to the read-only walker on a
             // freshly pinned snapshot. v0: no read-your-own-writes.

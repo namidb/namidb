@@ -1265,3 +1265,51 @@ async fn nonstring_unique_set_rejects_collision_but_allows_self_update() {
     let rows = snap.scan_label("Account").await.unwrap();
     assert_eq!(rows.len(), 2, "no node was created or dropped by the SETs");
 }
+
+#[tokio::test]
+async fn expand_above_write_sees_staged_edge_in_one_statement() {
+    // RFC-026 Q1: a traversal (Expand) running directly above a write in the
+    // same statement must see the edge that write just staged. Before the fix
+    // this errored ("write operators require execute_write...") because the
+    // whole Expand-over-CREATE subtree was handed to the read-only walker; now
+    // the write executor stages the input, then expands over the overlay.
+    let mut writer = WriterSession::open(store(), paths("w-expand-above-write"))
+        .await
+        .unwrap();
+    let q = parse(
+        "CREATE (a:Person {name: 'A'})-[:R]->(b:Person {name: 'B'}) \
+         WITH a MATCH (a)-[:R]->(x) RETURN x",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 2);
+    assert_eq!(outcome.edges_created, 1);
+    assert_eq!(
+        outcome.rows.len(),
+        1,
+        "the just-staged edge must be traversed by the following MATCH"
+    );
+    match outcome.rows[0].get("x") {
+        Some(RuntimeValue::Node(n)) => match n.properties.get("name") {
+            Some(RuntimeValue::String(s)) => {
+                assert_eq!(s.as_str(), "B", "x must bind to the created target b")
+            }
+            other => panic!("expected x.name = 'B', got {other:?}"),
+        },
+        other => panic!("expected node x, got {other:?}"),
+    }
+
+    // And it committed: a fresh snapshot sees the edge.
+    let snap = writer.snapshot();
+    let rows = execute(
+        &lower(&parse("MATCH (:Person)-[:R]->(x) RETURN x").unwrap()).unwrap(),
+        &snap,
+        &Params::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the edge must persist after commit");
+}

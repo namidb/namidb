@@ -885,7 +885,7 @@ fn execute_capped<'a>(
 // ───────────────────────── Expand ────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_expand(
+pub(crate) async fn execute_expand(
     rows: Vec<Row>,
     source: &str,
     edge_type: Option<&[String]>,
