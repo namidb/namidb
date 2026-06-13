@@ -1,4 +1,5 @@
-//! Stateless janitor for orphaned SST + bloom side-car objects.
+//! Stateless janitor for orphaned SST + bloom side-car objects and
+//! superseded manifest snapshots.
 //!
 //! ## Why orphans exist
 //!
@@ -36,6 +37,11 @@
 //! object is referenced by no version yet).
 //! 4. Older objects are reported as orphans and (when `delete = true`)
 //! removed via `ObjectStore::delete`.
+//! 5. Lists `manifest/` and reclaims every `manifest/v{N}.json` whose version
+//! `N` is strictly below the horizon — a retired version no live reader can
+//! load — under the same `min_age` guard. `current.json` and every version
+//! at or above the horizon are kept. Without this the `manifest/` prefix
+//! grows by one immutable snapshot per commit forever.
 //!
 //! ## Safety
 //!
@@ -75,11 +81,23 @@ pub struct JanitorReport {
     /// `last_modified` falls within `min_age`. These are the candidates
     /// the operator should re-evaluate on the next sweep.
     pub skipped_too_young: usize,
+    /// Superseded manifest snapshots (`manifest/v{N}.json` strictly below the
+    /// retention horizon) reclaimable this sweep. Like `orphans_found`, this is
+    /// the candidate count and is populated in dry-run too; the bodies are
+    /// physically removed only when `delete = true` (consult the caller's
+    /// dry-run flag). Counted separately from `orphans_found` because a retired
+    /// manifest version is not an orphan — it is a version no live reader can
+    /// still load, reclaimable by the same retention-horizon argument.
+    pub manifest_snapshots_reclaimed: usize,
+    /// Bytes held by the manifest snapshots in `manifest_snapshots_reclaimed`
+    /// (freed when `delete = true`, otherwise what *would* be freed).
+    pub manifest_bytes_freed: u64,
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
 /// current manifest and (when `delete = true`) remove the ones older than
-/// `min_age`. See module docs for the safety reasoning.
+/// `min_age`, then reclaim manifest snapshots retired below the retention
+/// horizon. See module docs for the safety reasoning.
 ///
 /// The function loads the manifest **once** at the start of the sweep.
 /// If a writer commits a fresh manifest while we are listing objects, any
@@ -189,6 +207,53 @@ pub async fn sweep_orphans(
                     .map_err(Error::ObjectStore)?;
                 report.orphans_deleted += 1;
             }
+        }
+    }
+
+    // Reclaim superseded manifest snapshots. Every commit / flush / compaction
+    // writes an immutable `manifest/v{N}.json` and nothing ever removed the old
+    // ones, so the `manifest/` prefix grew by one object per write forever —
+    // unbounded space amplification independent of logical data size. A
+    // snapshot at version N is reachable only through `load_manifest_at(N)`,
+    // which the engine calls for versions at or above the horizon (a reader
+    // pinned at `horizon` loads exactly `v{horizon}.json`, and `current.json`
+    // points at `current_version >= horizon`). Versions strictly below the
+    // horizon are reachable by no live reader, so they fall out of the live set
+    // and become reclaimable — the same retention-horizon argument that makes
+    // the SST sweep safe. `min_age` is the same secondary guard for the
+    // body-PUT-then-pointer-CAS race.
+    let manifest_dir = paths.manifest_dir();
+    let mut manifests = store.list(Some(&manifest_dir));
+    while let Some(meta) = manifests.try_next().await.map_err(Error::ObjectStore)? {
+        // Parse the version out of a `v{16-hex}.json` body. The pointer
+        // (`current.json`) and anything that is not a versioned snapshot fail
+        // the parse and are left untouched.
+        let Some(version) = meta
+            .location
+            .filename()
+            .and_then(|f| f.strip_prefix('v'))
+            .and_then(|f| f.strip_suffix(".json"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        else {
+            continue;
+        };
+        // Keep current and every version a pinned reader could still load.
+        if version >= horizon {
+            continue;
+        }
+        let age_secs = (now - meta.last_modified).num_seconds();
+        if age_secs < min_age_secs {
+            report.skipped_too_young += 1;
+            debug!(path = %meta.location, age_secs, "manifest snapshot too young, deferring");
+            continue;
+        }
+        report.manifest_snapshots_reclaimed += 1;
+        report.manifest_bytes_freed = report.manifest_bytes_freed.saturating_add(meta.size);
+        if delete {
+            store
+                .delete(&meta.location)
+                .await
+                .map_err(Error::ObjectStore)?;
         }
     }
 
@@ -384,5 +449,105 @@ mod tests {
         assert_eq!(report.orphans_found, 1);
         assert!(store.head(&l0).await.is_err(), "l0 orphan must be deleted");
         assert!(store.head(&l3).await.is_ok(), "l3 orphan must survive");
+    }
+
+    /// With no live reader pinned (horizon clamps to current), every manifest
+    /// snapshot below the current version is reclaimed; the current snapshot
+    /// and the pointer survive and the namespace still loads.
+    #[tokio::test]
+    async fn sweep_reclaims_manifest_snapshots_below_horizon() {
+        let store = make_store();
+        let paths = make_paths("janitor-manifest-reclaim");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+
+        // Four manifest versions: bootstrap v0, then three flushes (v1..v3).
+        let v0 = base.manifest.version;
+        let m1 = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
+        let m2 = flush_one_node(&ms, &fence, &m1, &schema, sorted_node_id(2), "B", 2).await;
+        let m3 = flush_one_node(&ms, &fence, &m2, &schema, sorted_node_id(3), "C", 3).await;
+        let (v1, v2, current) = (
+            m1.manifest.version,
+            m2.manifest.version,
+            m3.manifest.version,
+        );
+        assert!(v0 < v1 && v1 < v2 && v2 < current);
+
+        // Every old snapshot body exists before the sweep.
+        for v in [v0, v1, v2] {
+            assert!(store.head(&paths.manifest_version(v)).await.is_ok());
+        }
+
+        // horizon = u64::MAX clamps to the current version: only it is needed.
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(report.manifest_snapshots_reclaimed, 3);
+        assert!(report.manifest_bytes_freed > 0);
+        // The accumulating flushes leave every SST referenced by current, so no
+        // SST orphans — only the retired manifest snapshots are reclaimed.
+        assert_eq!(report.orphans_found, 0);
+
+        for v in [v0, v1, v2] {
+            assert!(
+                store.head(&paths.manifest_version(v)).await.is_err(),
+                "retired snapshot v{v} must be reclaimed"
+            );
+        }
+        assert!(
+            store.head(&paths.manifest_version(current)).await.is_ok(),
+            "the current snapshot must survive"
+        );
+        assert!(store.head(&paths.current_pointer()).await.is_ok());
+        assert_eq!(ms.load_current().await.unwrap().manifest.version, current);
+
+        // Idempotent: a second sweep reclaims nothing.
+        let again = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(again.manifest_snapshots_reclaimed, 0);
+    }
+
+    /// A reader pinned at the retention horizon keeps its snapshot and every
+    /// later one; only strictly-older snapshots are reclaimed.
+    #[tokio::test]
+    async fn sweep_keeps_manifest_snapshots_at_or_above_horizon() {
+        let store = make_store();
+        let paths = make_paths("janitor-manifest-horizon");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+
+        let v0 = base.manifest.version;
+        let m1 = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
+        let m2 = flush_one_node(&ms, &fence, &m1, &schema, sorted_node_id(2), "B", 2).await;
+        let m3 = flush_one_node(&ms, &fence, &m2, &schema, sorted_node_id(3), "C", 3).await;
+        let (v1, v2, current) = (
+            m1.manifest.version,
+            m2.manifest.version,
+            m3.manifest.version,
+        );
+
+        // A reader is pinned at v2: the sweep must keep v2 and everything newer,
+        // reclaiming only v0 and v1.
+        let report = sweep_orphans(&ms, v2, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(report.manifest_snapshots_reclaimed, 2);
+
+        assert!(store.head(&paths.manifest_version(v0)).await.is_err());
+        assert!(store.head(&paths.manifest_version(v1)).await.is_err());
+        assert!(
+            store.head(&paths.manifest_version(v2)).await.is_ok(),
+            "the pinned reader's snapshot must survive"
+        );
+        assert!(
+            store.head(&paths.manifest_version(current)).await.is_ok(),
+            "the current snapshot must survive"
+        );
+        assert!(store.head(&paths.current_pointer()).await.is_ok());
     }
 }
