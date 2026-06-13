@@ -17,6 +17,7 @@ mod dataset;
 mod loader;
 mod queries;
 mod runner;
+mod vector_recall;
 
 use dataset::{DatasetConfig, DatasetSizes};
 use queries::Query;
@@ -104,6 +105,35 @@ enum Cmd {
         /// Object-store root prefix; must match the worker's `storage.root_prefix`.
         #[arg(long, default_value = "tenants")]
         root_prefix: String,
+    },
+    /// Measure int8 quantization recall@k + latency vs exact f32 on synthetic
+    /// unit-norm vectors. The gate for the int8 storage work: run at the
+    /// embedder dimensions (e.g. 256 and 1536) and confirm recall@10 stays high
+    /// before committing to int8 on disk.
+    VectorRecall {
+        /// Vector dimension (e.g. 256 local, 1536 OpenAI).
+        #[arg(long, default_value_t = 256)]
+        dim: usize,
+        /// Number of stored vectors to search over.
+        #[arg(long, default_value_t = 10_000)]
+        num: usize,
+        /// Number of query vectors to average recall/latency over.
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+        /// Top-k.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        /// Number of cluster centroids. `0` = uniform random (pessimistic
+        /// floor); `>0` draws vectors/queries around centroids, like real
+        /// embeddings with meaningful neighbours.
+        #[arg(long, default_value_t = 64)]
+        clusters: usize,
+        /// Cluster tightness (Gaussian noise stddev added to a centroid before
+        /// renormalizing). Smaller = tighter clusters.
+        #[arg(long, default_value_t = 0.35)]
+        spread: f32,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
     },
 }
 
@@ -331,6 +361,28 @@ async fn main() -> Result<()> {
                     + sizes.likes
                     + sizes.reply_of) as f64
                     / load_time_secs,
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Cmd::VectorRecall {
+            dim,
+            num,
+            queries,
+            k,
+            clusters,
+            spread,
+            seed,
+        } => {
+            let report = vector_recall::run(dim, num, queries, k, clusters, spread, seed);
+            eprintln!(
+                "vector-recall dim={dim} num={num} queries={queries} k={k} clusters={clusters}: \
+                 recall@{k}={:.4} (fixed-scale {:.4}) compression={:.2}x  \
+                 exact p50={}µs  int8 p50={}µs",
+                report.recall_at_k,
+                report.recall_at_k_fixed_scale,
+                report.compression_ratio,
+                report.exact_p50_us,
+                report.int8_p50_us,
             );
             println!("{}", serde_json::to_string_pretty(&report)?);
         }

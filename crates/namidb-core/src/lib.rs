@@ -12,11 +12,13 @@
 pub mod error;
 pub mod id;
 pub mod profile;
+pub mod quantize;
 pub mod schema;
 pub mod value;
 
 pub use error::{Error, Result};
 pub use id::{EdgeId, LabelId, NamespaceId, NodeId};
+pub use quantize::{dequantize_i8, quantize_i8};
 pub use schema::{
     DataType, EdgeTypeDef, LabelDef, LabelDictionary, PropertyDef, Schema, SchemaBuilder,
 };
