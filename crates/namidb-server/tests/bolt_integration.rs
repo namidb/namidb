@@ -1065,6 +1065,69 @@ async fn bolt_idle_transaction_times_out_and_releases_writer() {
     task.abort();
 }
 
+#[tokio::test]
+async fn bolt_failed_in_tx_statement_releases_writer() {
+    // A statement that fails inside an explicit transaction (here a parse
+    // error; a mid-tx query/write timeout takes the same path) must not leave
+    // the transaction pinning the global writer. No tx idle timeout is set, so
+    // the writer has to be freed by the failure and the client's RESET — not by
+    // the idle-timeout fallback that bolt_idle_transaction_* relies on.
+    let (bolt_addr, task) = boot_bolt("bolt-tx-fail-release", Duration::ZERO).await;
+
+    // Connection A: BEGIN, then run a statement that cannot parse. The in-tx
+    // RUN fails and the session goes FAILED with the transaction still holding
+    // the writer it took at BEGIN.
+    let mut a = TcpStream::connect(bolt_addr).await.expect("connect a");
+    handshake(&mut a).await;
+    hello_and_logon(&mut a, "test-token").await;
+    begin(&mut a).await;
+    let bad = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("this is not valid cypher !!!".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut a, &pack(&bad)).await;
+    let resp = recv_msg(&mut a).await;
+    assert!(
+        matches!(resp, Response::Failure(_)),
+        "an unparseable in-tx statement must fail, got {resp:?}"
+    );
+    // RESET recovers the FAILED session to READY. The writer must already be
+    // free; before the fix it stayed pinned for the life of the connection.
+    let reset = Value::Struct {
+        tag: struct_tag::RESET,
+        fields: vec![],
+    };
+    send_msg(&mut a, &pack(&reset)).await;
+    match recv_msg(&mut a).await {
+        Response::Success(_) => {}
+        other => panic!("RESET should recover to READY, got {other:?}"),
+    }
+
+    // Connection B: a WRITE must complete without blocking — if A still held
+    // the writer this hangs until the harness kills the test. The aborted tx
+    // staged nothing, so only B's node exists.
+    let mut b = TcpStream::connect(bolt_addr).await.expect("connect b");
+    handshake(&mut b).await;
+    hello_and_logon(&mut b, "test-token").await;
+    pull_all(&mut b, "CREATE (p:Person {name: 'After'})").await;
+    let (_f, rows) = pull_all(&mut b, "MATCH (p:Person) RETURN p.name AS name").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the aborted tx must have staged nothing, got {rows:?}"
+    );
+    assert_eq!(rows[0].get("name"), Some(&Value::String("After".into())));
+
+    goodbye(&mut b).await;
+    a.shutdown().await.ok();
+    b.shutdown().await.ok();
+    task.abort();
+}
+
 /// Run a statement and return the metadata of its closing `SUCCESS`
 /// (after a single PULL) — e.g. to inspect the write `stats` map.
 async fn run_capture_close(stream: &mut TcpStream, cypher: &str) -> BTreeMap<String, Value> {
