@@ -11,6 +11,8 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-13: read-your-own-writes traversals, int8 quantizer foundation, writer-lock and space-leak fixes
+
 ### Added
 
 - MCP `vector_search` gains an optional `where` argument: a Cypher predicate
@@ -18,6 +20,16 @@ below and in the release notes.
   ranking, so a metadata-constrained semantic search returns the true top-k
   within the filter instead of post-filtering (and truncating) the global
   top-k. Still read-only.
+- A traversal that runs directly above a write in one statement now sees the
+  edge that write just staged. `CREATE (a)-[:R]->(b) WITH a MATCH (a)-[:R]->(x)
+  RETURN x` previously failed with a "write operators require execute_write"
+  error and committed nothing; it now stages the write and expands over the
+  read-your-own-writes overlay, returning `b`. Closes the last RFC-026 Q1 gap.
+- `namidb-bench vector-recall`: a harness that measures int8 quantization
+  recall@k and latency against exact f32, plus a per-vector int8 quantizer in
+  `namidb-core` (`quantize_i8` / `dequantize_i8`, max-abs scale so the full
+  int8 range is used at any dimension). Foundation for int8 vector storage; no
+  on-disk format change yet.
 
 ### Changed
 
@@ -31,6 +43,21 @@ below and in the release notes.
   and let L0 grow unbounded, inflating read amplification. It is invisible
   under normal load and only delays a committed write under sustained
   overload; set `--write-stall-l0 0` to restore the old unbounded behaviour.
+
+### Fixed
+
+- A Bolt statement that failed inside an explicit transaction (for example a
+  mid-transaction query timeout) left the session holding the global writer
+  lock. A `RESET` after the failure recovered the session to a usable state but
+  never released the writer, so one client could wedge every other write on the
+  server until its connection closed. The transaction is now rolled back as
+  soon as an in-transaction statement fails, and `RESET`/`GOODBYE` release it
+  from the failed state too.
+- The orphan sweep now reclaims superseded manifest snapshots
+  (`manifest/v{N}.json`) below the retention horizon. Before, every commit,
+  flush, and compaction wrote an immutable manifest snapshot that was never
+  deleted, so the `manifest/` prefix grew by one object per write forever:
+  unbounded space amplification independent of how much data was stored.
 
 ## [0.15.0] - 2026-06-10: production hardening — write timeouts, NOT NULL, backup/restore, token roles, bounded top-k
 
