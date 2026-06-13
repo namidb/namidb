@@ -445,13 +445,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 )
                 .await
                 {
-                    Ok(report) if report.orphans_found > 0 => info!(
-                        found = report.orphans_found,
-                        deleted = report.orphans_deleted,
-                        bytes_freed = report.bytes_freed,
-                        dry_run = !sweep_delete,
-                        "orphan sweep"
-                    ),
+                    Ok(report)
+                        if report.orphans_found > 0 || report.manifest_snapshots_reclaimed > 0 =>
+                    {
+                        info!(
+                            found = report.orphans_found,
+                            deleted = report.orphans_deleted,
+                            bytes_freed = report.bytes_freed,
+                            manifest_snapshots = report.manifest_snapshots_reclaimed,
+                            manifest_bytes_freed = report.manifest_bytes_freed,
+                            dry_run = !sweep_delete,
+                            "orphan sweep"
+                        )
+                    }
                     Ok(_) => {}
                     Err(e) => error!(error = %e, "orphan sweep failed"),
                 }
