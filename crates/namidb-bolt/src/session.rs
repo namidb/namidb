@@ -376,17 +376,26 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         // not grant READY, or a client could skip HELLO/LOGON entirely
         // (handshake -> RESET -> RUN). When unauthenticated it falls through
         // to the per-state handlers below, which reject it. GOODBYE always
-        // ends. Either one while a transaction is open rolls it back so its
-        // staged writes are discarded (and the writer it holds is released).
+        // ends. Either one while a transaction may still be open rolls it back
+        // so its staged writes are discarded and the writer it holds is
+        // released — including a transaction left dangling by a statement that
+        // failed mid-tx, where the state is FAILED (not TX_READY) but the
+        // writer can still be pinned. `rollback_tx` is a no-op with no open tx.
         if matches!(req, Request::Reset) && self.authenticated {
-            if matches!(self.state, State::TxReady | State::TxStreaming) {
+            if matches!(
+                self.state,
+                State::TxReady | State::TxStreaming | State::Failed
+            ) {
                 let _ = self.backend.rollback_tx().await;
             }
             self.state = State::Ready;
             return self.write_response(Response::success_empty()).await;
         }
         if matches!(req, Request::Goodbye) {
-            if matches!(self.state, State::TxReady | State::TxStreaming) {
+            if matches!(
+                self.state,
+                State::TxReady | State::TxStreaming | State::Failed
+            ) {
                 let _ = self.backend.rollback_tx().await;
             }
             self.state = State::Defunct;
@@ -590,6 +599,18 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         let outcome = match run_result {
             Ok(o) => o,
             Err(e) => {
+                // A statement that fails inside an explicit transaction aborts
+                // it. The backend has already discarded any staged batch, but
+                // the transaction still pins the global writer lock. Roll it
+                // back now to release that writer: otherwise the session moves
+                // to FAILED (where the tx idle timeout no longer arms), and a
+                // client that idles there — or only ever sends RESET — would
+                // pin the single writer, wedging every other writer on the
+                // server, until it disconnects. `rollback_tx` is a no-op when
+                // no transaction is open, so the auto-commit path is unaffected.
+                if inside_tx {
+                    let _ = self.backend.rollback_tx().await;
+                }
                 self.state = State::Failed;
                 return self.write_failure(e.code(), e.message().to_string()).await;
             }
@@ -1232,6 +1253,141 @@ mod tests {
         ));
 
         // RESET on the authenticated session returns SUCCESS.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RESET,
+                fields: vec![],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        drop(client);
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_in_tx_statement_rolls_back_to_release_writer() {
+        // A statement that fails inside an explicit transaction must roll the
+        // transaction back so the backend releases the global writer it took at
+        // BEGIN. Otherwise the session sits in FAILED still holding the writer
+        // until the connection closes — a single client whose in-tx statement
+        // fails (e.g. a mid-tx timeout) could wedge every other writer on the
+        // server. Regression test for that writer-lock leak.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TxFailBackend {
+            rollbacks: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Backend for TxFailBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                Ok(RunOutcome::default())
+            }
+            async fn run_in_tx(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                // The in-tx statement fails (stands in for a mid-tx timeout or
+                // eval error).
+                Err(BackendError::Eval("boom".into()))
+            }
+            async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
+                self.rollbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-conn".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(TxFailBackend {
+                rollbacks: rollbacks.clone(),
+            }),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+
+        // HELLO + LOGON (open auth) -> READY.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map({
+                    let mut m = BTreeMap::new();
+                    m.insert("scheme".into(), Value::String("none".into()));
+                    m
+                })],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        // BEGIN -> TX_READY (the backend takes the writer here).
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::BEGIN,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        // An in-tx RUN that fails must roll the transaction back (releasing the
+        // writer) even as the session moves to FAILED.
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RUN,
+                fields: vec![
+                    Value::String("CREATE (n)".into()),
+                    Value::Map(BTreeMap::new()),
+                    Value::Map(BTreeMap::new()),
+                ],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Failure(_)
+        ));
+        assert_eq!(
+            rollbacks.load(Ordering::SeqCst),
+            1,
+            "a failed in-tx statement must roll the transaction back to release the writer"
+        );
+
+        // RESET still recovers the (already released) session to READY.
         write_msg(
             &mut client,
             &pack_request(&Value::Struct {
