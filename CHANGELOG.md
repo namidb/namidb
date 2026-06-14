@@ -11,6 +11,25 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-14: int8 vector storage and scoring
+
+### Added
+
+- int8 vector storage. A new `Int8Vector(dim)` property type stores an
+  embedding as one `FixedSizeBinary(4 + dim)` column: a 4-byte per-vector f32
+  scale followed by the int8 codes (`x_i ≈ code_i * scale`), 4x smaller than
+  `FloatVector`. Writing an f32 vector to an int8 column quantizes it on the
+  fly with a per-vector max-abs scale, which 0.16.0's `namidb-bench
+  vector-recall` harness measured at recall@10 around 0.98 to 0.99 at dim 256
+  and 1536.
+- The similarity builtins (`cosine_similarity`, `dot_product`,
+  `euclidean_distance`) and `size()` now accept a stored int8 vector, scoring
+  an f32 query against it by dequantizing on the fly (the asymmetric case:
+  f32 query, int8 stored), with f64 accumulation. Encoding is fixed per
+  property, so compaction never sees a mixed f32/int8 column. Declaring an
+  int8 column goes through the programmatic / offline-builder schema path for
+  now; a vault-load `--quantize` opt-in is a follow-up.
+
 ## [0.16.0] - 2026-06-13: read-your-own-writes traversals, int8 quantizer foundation, writer-lock and space-leak fixes
 
 ### Added
