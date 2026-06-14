@@ -55,6 +55,13 @@ pub fn runtime_to_bolt(v: &RuntimeValue, mode: ElementIdMode) -> Value {
         RuntimeValue::String(s) => Value::String(s.clone()),
         RuntimeValue::Bytes(b) => Value::Bytes(b.clone()),
         RuntimeValue::Vector(v) => Value::List(v.iter().map(|x| Value::Float(*x as f64)).collect()),
+        // Dequantize int8 to floats on the wire so clients see a float vector.
+        RuntimeValue::Vector8 { codes, scale } => Value::List(
+            codes
+                .iter()
+                .map(|&c| Value::Float(c as f64 * *scale as f64))
+                .collect(),
+        ),
         RuntimeValue::List(items) => {
             Value::List(items.iter().map(|v| runtime_to_bolt(v, mode)).collect())
         }

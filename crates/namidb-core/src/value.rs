@@ -30,6 +30,11 @@ const TAG_MAP: &str = "$map";
 /// on the way back. The tagged form `{"$bytes": [0, 1, 2]}` keeps
 /// the type stable through `__overflow_json`.
 const TAG_BYTES: &str = "$bytes";
+/// Tag for `Value::VecI8 { codes, scale }`. The JSON form is
+/// `{"$i8vec": [<scale>, [<codes>...]]}` so an int8-quantized vector keeps
+/// its type (codes + per-vector scale) through `__overflow_json` and the WAL
+/// instead of being re-decoded as a `Vec<f32>` via `visit_seq`.
+const TAG_I8VEC: &str = "$i8vec";
 
 /// A single property value. Loose, JSON-ish.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +46,13 @@ pub enum Value {
     Str(String),
     Bytes(Vec<u8>),
     Vec(Vec<f32>),
+    /// Int8-quantized vector: int8 `codes` plus the per-vector f32 `scale`,
+    /// with `x_i ≈ codes_i * scale` (see [`crate::quantize`]). The in-memory
+    /// form of a `DataType::Int8Vector` column; tagged `$i8vec` on the wire.
+    VecI8 {
+        codes: Vec<i8>,
+        scale: f32,
+    },
     /// Calendar date stored as days since 1970-01-01. Round-trips
     /// through Arrow `Date32`. Tagged as `{"$date": <days>}` in JSON
     /// so the typing survives the `__overflow_json` path.
@@ -130,6 +142,11 @@ impl Serialize for Value {
                 m.end()
             }
             Value::Vec(v) => v.serialize(s),
+            Value::VecI8 { codes, scale } => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry(TAG_I8VEC, &(*scale, codes))?;
+                m.end()
+            }
             Value::Date(d) => {
                 let mut m = s.serialize_map(Some(1))?;
                 m.serialize_entry(TAG_DATE, d)?;
@@ -253,9 +270,23 @@ impl<'de> Deserialize<'de> for Value {
                         }
                         Ok(Value::Bytes(bytes))
                     }
+                    TAG_I8VEC => {
+                        let (scale, codes): (f32, Vec<i8>) = map.next_value()?;
+                        if map.next_key::<String>()?.is_some() {
+                            return Err(de::Error::custom("$i8vec map must have exactly one key"));
+                        }
+                        Ok(Value::VecI8 { codes, scale })
+                    }
                     other => Err(de::Error::unknown_field(
                         other,
-                        &[TAG_DATE, TAG_DATETIME, TAG_LIST, TAG_MAP, TAG_BYTES],
+                        &[
+                            TAG_DATE,
+                            TAG_DATETIME,
+                            TAG_LIST,
+                            TAG_MAP,
+                            TAG_BYTES,
+                            TAG_I8VEC,
+                        ],
                     )),
                 }
             }
@@ -303,6 +334,19 @@ mod tests {
         eprintln!("bytes serialized as: {json}");
         let back: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(back, v, "bytes must round-trip; got {back:?}");
+    }
+
+    #[test]
+    fn value_vec_i8_roundtrips_through_json() {
+        let v = Value::VecI8 {
+            codes: vec![1, -2, 127, -127, 0],
+            scale: 0.0123,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v, "int8 vector must round-trip; got {back:?}");
+        // It must NOT silently re-decode as a plain Vec<f32>.
+        assert!(matches!(back, Value::VecI8 { .. }));
     }
 
     #[test]

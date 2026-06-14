@@ -821,6 +821,11 @@ fn rv_to_json(v: &RuntimeValue) -> Value {
         RuntimeValue::DateTime(micros) => json!({ "datetime_micros": micros }),
         RuntimeValue::Bytes(b) => json!({ "bytes_len": b.len() }),
         RuntimeValue::Vector(v) => json!(v),
+        RuntimeValue::Vector8 { codes, scale } => {
+            // Dequantize int8 to floats so clients see a float vector.
+            let f: Vec<f32> = codes.iter().map(|&c| c as f32 * *scale).collect();
+            json!(f)
+        }
     }
 }
 

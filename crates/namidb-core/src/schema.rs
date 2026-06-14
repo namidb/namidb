@@ -36,6 +36,14 @@ pub enum DataType {
     FloatVector {
         dim: u32,
     },
+    /// Fixed-size int8-quantized vector (used for embeddings, 4x smaller than
+    /// `FloatVector`). Stored as one `FixedSizeBinary(4 + dim)` column: the
+    /// first 4 bytes are the per-vector f32 scale (little-endian), the next
+    /// `dim` bytes are the int8 codes, with `x_i ≈ code_i * scale` (see
+    /// [`crate::quantize`]). One property = one column, like `FloatVector`.
+    Int8Vector {
+        dim: u32,
+    },
     /// Catch-all for JSON-shaped values that the engine still needs to
     /// represent as one Arrow column.
     Json,
@@ -61,6 +69,8 @@ impl DataType {
                 std::sync::Arc::new(Field::new("item", ArrowDataType::Float32, false)),
                 *dim as i32,
             ),
+            // 4-byte f32 scale prefix + `dim` int8 code bytes, in one column.
+            DataType::Int8Vector { dim } => ArrowDataType::FixedSizeBinary(4 + *dim as i32),
             DataType::Json => ArrowDataType::Utf8,
         }
     }
@@ -484,6 +494,15 @@ mod tests {
             f.data_type(),
             ArrowDataType::FixedSizeList(_, 1536)
         ));
+        assert!(f.is_nullable());
+    }
+
+    #[test]
+    fn int8_vector_maps_to_fixed_size_binary() {
+        // 4-byte f32 scale prefix + `dim` int8 code bytes, one column.
+        let p = PropertyDef::new("emb", DataType::Int8Vector { dim: 256 }, true).unwrap();
+        let f = p.to_arrow_field();
+        assert!(matches!(f.data_type(), ArrowDataType::FixedSizeBinary(260)));
         assert!(f.is_nullable());
     }
 

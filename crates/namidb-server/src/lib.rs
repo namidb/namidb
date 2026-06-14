@@ -1038,6 +1038,17 @@ fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
                 })
                 .collect(),
         ),
+        // Dequantize int8 to floats so HTTP clients see a float vector.
+        RuntimeValue::Vector8 { codes, scale } => J::Array(
+            codes
+                .iter()
+                .map(|&c| {
+                    serde_json::Number::from_f64(c as f64 * *scale as f64)
+                        .map(J::Number)
+                        .unwrap_or(J::Null)
+                })
+                .collect(),
+        ),
         RuntimeValue::List(items) => J::Array(items.iter().map(runtime_to_json).collect()),
         RuntimeValue::Map(m) => J::Object(
             m.iter()

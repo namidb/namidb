@@ -855,7 +855,7 @@ fn value_to_stat_scalar(v: &Value) -> Option<StatScalar> {
         Value::Bytes(b) => Some(StatScalar::Binary(b.clone())),
         Value::Date(d) => Some(StatScalar::Date32(*d)),
         Value::DateTime(m) => Some(StatScalar::TimestampMicrosUtc(*m)),
-        Value::Null | Value::Vec(_) | Value::List(_) | Value::Map(_) => None,
+        Value::Null | Value::Vec(_) | Value::VecI8 { .. } | Value::List(_) | Value::Map(_) => None,
     }
 }
 
@@ -1186,6 +1186,12 @@ enum PropertyBuilder {
         dim: u32,
         builder: FixedSizeListBuilder<Float32Builder>,
     },
+    /// int8-quantized vector packed into one `FixedSizeBinary(4 + dim)`:
+    /// 4-byte little-endian f32 scale, then `dim` int8 code bytes.
+    Int8Vector {
+        dim: u32,
+        builder: FixedSizeBinaryBuilder,
+    },
     Json(StringBuilder),
 }
 
@@ -1216,6 +1222,10 @@ impl PropertyBuilder {
                 let inner = Float32Builder::with_capacity(capacity * *dim as usize);
                 let builder = FixedSizeListBuilder::new(inner, *dim as i32);
                 PropertyBuilder::FloatVector { dim: *dim, builder }
+            }
+            DataType::Int8Vector { dim } => {
+                let builder = FixedSizeBinaryBuilder::with_capacity(capacity, 4 + *dim as i32);
+                PropertyBuilder::Int8Vector { dim: *dim, builder }
             }
             DataType::Json => {
                 PropertyBuilder::Json(StringBuilder::with_capacity(capacity, 64 * capacity.max(1)))
@@ -1319,6 +1329,42 @@ impl PropertyBuilder {
                 builder.append(true);
                 Ok(())
             }
+            // Already-quantized int8 vector: pack scale + codes and store.
+            (PropertyBuilder::Int8Vector { dim, builder }, Value::VecI8 { codes, scale }) => {
+                if codes.len() != *dim as usize {
+                    return Err(Error::invariant(format!(
+                        "property '{}' int8 vector dim={} != declared {}",
+                        def.name,
+                        codes.len(),
+                        dim
+                    )));
+                }
+                builder
+                    .append_value(pack_i8vec(*scale, codes))
+                    .map_err(|e| {
+                        Error::invariant(format!("int8 vector append for '{}': {e}", def.name))
+                    })?;
+                Ok(())
+            }
+            // Convenience: an f32 vector written to an int8 column is quantized
+            // on the fly, so callers can hand the writer raw embeddings.
+            (PropertyBuilder::Int8Vector { dim, builder }, Value::Vec(v)) => {
+                if v.len() != *dim as usize {
+                    return Err(Error::invariant(format!(
+                        "property '{}' vector dim={} != declared int8 vector {}",
+                        def.name,
+                        v.len(),
+                        dim
+                    )));
+                }
+                let (codes, scale) = namidb_core::quantize::quantize_i8(v);
+                builder
+                    .append_value(pack_i8vec(scale, &codes))
+                    .map_err(|e| {
+                        Error::invariant(format!("int8 vector append for '{}': {e}", def.name))
+                    })?;
+                Ok(())
+            }
             (PropertyBuilder::Json(b), v) => {
                 let s = serde_json::to_string(v).map_err(|e| {
                     Error::invariant(format!("json encode for '{}': {e}", def.name))
@@ -1355,6 +1401,7 @@ impl PropertyBuilder {
                 }
                 builder.append(false);
             }
+            PropertyBuilder::Int8Vector { builder, .. } => builder.append_null(),
             PropertyBuilder::Json(b) => b.append_null(),
         }
     }
@@ -1372,6 +1419,7 @@ impl PropertyBuilder {
             PropertyBuilder::Date32(_) => "Date32",
             PropertyBuilder::Timestamp(_) => "TimestampMicrosUtc",
             PropertyBuilder::FloatVector { .. } => "FloatVector",
+            PropertyBuilder::Int8Vector { .. } => "Int8Vector",
             PropertyBuilder::Json(_) => "Json",
         }
     }
@@ -1389,9 +1437,20 @@ impl PropertyBuilder {
             PropertyBuilder::Date32(b) => Arc::new(b.finish()),
             PropertyBuilder::Timestamp(b) => Arc::new(b.finish()),
             PropertyBuilder::FloatVector { builder, .. } => Arc::new(builder.finish()),
+            PropertyBuilder::Int8Vector { builder, .. } => Arc::new(builder.finish()),
             PropertyBuilder::Json(b) => Arc::new(b.finish()),
         }
     }
+}
+
+/// Pack an int8-quantized vector into the `FixedSizeBinary(4 + dim)` layout:
+/// 4-byte little-endian f32 scale, then the int8 codes as raw bytes. The read
+/// path in `read.rs` reverses this exactly.
+fn pack_i8vec(scale: f32, codes: &[i8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + codes.len());
+    buf.extend_from_slice(&scale.to_le_bytes());
+    buf.extend(codes.iter().map(|&c| c as u8));
+    buf
 }
 
 // ───────────────────────── Offline SST builder facade (RFC-023) ─────────
@@ -1798,6 +1857,46 @@ mod tests {
         let bytes = r.encode().unwrap();
         let back = EdgeWriteRecord::decode(&bytes).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn int8_vector_property_round_trips_through_arrow() {
+        use namidb_core::value::Value;
+        let dt = DataType::Int8Vector { dim: 4 };
+        let def = PropertyDef::new("emb", dt.clone(), true).unwrap();
+        let mut b = PropertyBuilder::new(&dt, 3).unwrap();
+
+        // Row 0: an already-quantized vector (exact round-trip).
+        let v0 = Value::VecI8 {
+            codes: vec![127, -127, 0, 64],
+            scale: 0.01,
+        };
+        b.append(Some(&v0), &def).unwrap();
+        // Row 1: null.
+        b.append(None, &def).unwrap();
+        // Row 2: an f32 vector, quantized on the fly by the writer.
+        let f = vec![0.5f32, -0.25, 0.0, 0.1];
+        b.append(Some(&Value::Vec(f.clone())), &def).unwrap();
+
+        let arr = b.finish();
+
+        assert_eq!(
+            crate::read::arrow_value_to_value(arr.as_ref(), 0, &dt).unwrap(),
+            Some(v0)
+        );
+        assert_eq!(
+            crate::read::arrow_value_to_value(arr.as_ref(), 1, &dt).unwrap(),
+            None
+        );
+        match crate::read::arrow_value_to_value(arr.as_ref(), 2, &dt).unwrap() {
+            Some(Value::VecI8 { codes, scale }) => {
+                let back: Vec<f32> = codes.iter().map(|&c| c as f32 * scale).collect();
+                for (x, y) in f.iter().zip(&back) {
+                    assert!((x - y).abs() <= 0.5 * scale + 1e-6, "{x} vs {y}");
+                }
+            }
+            other => panic!("expected VecI8, got {other:?}"),
+        }
     }
 
     #[tokio::test]
