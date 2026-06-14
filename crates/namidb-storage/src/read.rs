@@ -2810,6 +2810,23 @@ pub(crate) fn arrow_value_to_value(
             }
             Value::Vec(f.values().to_vec())
         }
+        DataType::Int8Vector { dim } => {
+            let a = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| Error::invariant("expected FixedSizeBinaryArray"))?;
+            let bytes = a.value(row);
+            let want = 4 + *dim as usize;
+            if bytes.len() != want {
+                return Err(Error::invariant(format!(
+                    "Int8Vector byte width mismatch: expected {want}, got {}",
+                    bytes.len()
+                )));
+            }
+            let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let codes = bytes[4..].iter().map(|&b| b as i8).collect();
+            Value::VecI8 { codes, scale }
+        }
         DataType::Json => {
             let a = array
                 .as_any()

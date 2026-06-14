@@ -30,6 +30,14 @@ pub enum RuntimeValue {
     Bytes(Vec<u8>),
     /// Float-vector — carried through but no arithmetic in v0.
     Vector(Vec<f32>),
+    /// Int8-quantized vector: int8 codes plus the per-vector f32 scale
+    /// (`x_i ≈ codes_i * scale`). Stays int8 in memory to keep the 4x size
+    /// win; the asymmetric scorer reads it directly and presentation paths
+    /// dequantize to floats on the way out.
+    Vector8 {
+        codes: Vec<i8>,
+        scale: f32,
+    },
     /// Alternating sequence `Node, Rel, Node, Rel, ..., Node` produced
     /// by binding a pattern part `p = (a)-[r]->(b)`. RFC-009 §"Path
     /// binding (caso simple)". Variable-length paths land.
@@ -67,6 +75,7 @@ impl RuntimeValue {
             RuntimeValue::DateTime(_) => "DATETIME",
             RuntimeValue::Bytes(_) => "BYTES",
             RuntimeValue::Vector(_) => "VECTOR",
+            RuntimeValue::Vector8 { .. } => "VECTOR",
             RuntimeValue::Path(_) => "PATH",
         }
     }
@@ -130,6 +139,7 @@ impl From<CoreValue> for RuntimeValue {
             CoreValue::Str(s) => RuntimeValue::String(s),
             CoreValue::Bytes(b) => RuntimeValue::Bytes(b),
             CoreValue::Vec(v) => RuntimeValue::Vector(v),
+            CoreValue::VecI8 { codes, scale } => RuntimeValue::Vector8 { codes, scale },
             CoreValue::Date(d) => RuntimeValue::Date(d),
             CoreValue::DateTime(m) => RuntimeValue::DateTime(m),
             CoreValue::List(items) => {

@@ -1565,6 +1565,7 @@ fn fingerprint_value(v: &RuntimeValue) -> String {
         RuntimeValue::DateTime(d) => format!("dt:{}", d),
         RuntimeValue::Bytes(b) => format!("b:{}", b.len()),
         RuntimeValue::Vector(v) => format!("v:{}", v.len()),
+        RuntimeValue::Vector8 { codes, .. } => format!("v8:{}", codes.len()),
         RuntimeValue::Path(items) => {
             let mut s = "p:[".to_string();
             for (i, it) in items.iter().enumerate() {

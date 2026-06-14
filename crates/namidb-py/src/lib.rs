@@ -793,6 +793,14 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
             }
             list.into_any().unbind()
         }
+        Value::VecI8 { codes, scale } => {
+            // Dequantize int8 to floats so Python sees a float vector.
+            let list = PyList::empty_bound(py);
+            for &c in codes {
+                list.append(c as f32 * *scale)?;
+            }
+            list.into_any().unbind()
+        }
         Value::Date(days) => {
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("static epoch");
             let d = epoch + chrono::Duration::days(*days as i64);
@@ -946,6 +954,14 @@ fn runtime_value_to_py(py: Python<'_>, v: &RuntimeValue) -> PyResult<Py<PyAny>> 
             let list = PyList::empty_bound(py);
             for x in v {
                 list.append(*x)?;
+            }
+            list.into_any().unbind()
+        }
+        RuntimeValue::Vector8 { codes, scale } => {
+            // Dequantize int8 to floats so Python sees a float vector.
+            let list = PyList::empty_bound(py);
+            for &c in codes {
+                list.append(c as f32 * *scale)?;
             }
             list.into_any().unbind()
         }

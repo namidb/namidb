@@ -629,6 +629,7 @@ fn datatype_name(dt: &DataType) -> &'static str {
         DataType::Date32 => "Date",
         DataType::TimestampMicrosUtc => "LocalDateTime",
         DataType::FloatVector { .. } => "List",
+        DataType::Int8Vector { .. } => "List",
         DataType::Json => "Map",
     }
 }

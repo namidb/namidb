@@ -580,6 +580,7 @@ fn format_runtime(v: &RuntimeValue) -> String {
         RuntimeValue::DateTime(d) => format!("datetime({})", d),
         RuntimeValue::Bytes(b) => format!("bytes({} bytes)", b.len()),
         RuntimeValue::Vector(v) => format!("vec[{}]", v.len()),
+        RuntimeValue::Vector8 { codes, .. } => format!("vec8[{}]", codes.len()),
     }
 }
 
