@@ -631,6 +631,7 @@ fn call_scalar_function(
             // A vector's size is its dimension, so `size(n.embedding)` answers
             // "how many dimensions" without a dedicated builtin.
             RuntimeValue::Vector(v) => RuntimeValue::Integer(v.len() as i64),
+            RuntimeValue::Vector8 { codes, .. } => RuntimeValue::Integer(codes.len() as i64),
             // Path is `[Node, Rel, Node, Rel, ..., Node]` so the
             // relationship count is `(len - 1) / 2`. The shortestPath
             // lower fills missing rel/target bindings with NULL,
@@ -936,6 +937,13 @@ fn coerce_vector(
     match v {
         RuntimeValue::Null => Ok(None),
         RuntimeValue::Vector(items) => Ok(Some(items.clone())),
+        // Asymmetric scoring: a stored int8 vector dequantizes to f32 here, so a
+        // similarity against an f32 query (or another vector) is computed in f32
+        // with f64 accumulation. `code * scale` recovers the approximation the
+        // recall harness measured (RFC int8 quantization).
+        RuntimeValue::Vector8 { codes, scale } => {
+            Ok(Some(codes.iter().map(|&c| c as f32 * *scale).collect()))
+        }
         RuntimeValue::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (idx, it) in items.iter().enumerate() {
@@ -1828,6 +1836,44 @@ mod tests {
         assert_eq!(
             s("euclidean_distance([0, 0], [3, 4])"),
             RuntimeValue::Float(5.0)
+        );
+    }
+
+    #[test]
+    fn cosine_over_int8_approximates_exact_f32() {
+        use namidb_core::quantize::quantize_i8;
+        // A stored vector quantized to int8, scored against an f32 query: the
+        // asymmetric scorer dequantizes and must land close to the exact f32
+        // cosine (the recall the int8 harness validated). Vectors arrive via
+        // params because there is no Cypher literal for a Vector8.
+        let stored = vec![0.2f32, -0.5, 0.9, 0.1, -0.3, 0.7, -0.15];
+        let query = vec![0.1f32, -0.4, 0.8, 0.2, -0.2, 0.6, -0.1];
+        let (codes, scale) = quantize_i8(&stored);
+
+        let mut p_i8 = Params::new();
+        p_i8.insert("emb".into(), RuntimeValue::Vector8 { codes, scale });
+        p_i8.insert("q".into(), RuntimeValue::Vector(query.clone()));
+        let int8_cos = eval_str("cosine_similarity($emb, $q)", &Row::new(), &p_i8);
+
+        let mut p_f = Params::new();
+        p_f.insert("emb".into(), RuntimeValue::Vector(stored));
+        p_f.insert("q".into(), RuntimeValue::Vector(query));
+        let exact_cos = eval_str("cosine_similarity($emb, $q)", &Row::new(), &p_f);
+
+        match (int8_cos, exact_cos) {
+            (RuntimeValue::Float(a), RuntimeValue::Float(b)) => {
+                assert!((a - b).abs() < 0.01, "int8 cosine {a} vs exact {b}");
+            }
+            other => panic!("expected floats, got {other:?}"),
+        }
+
+        // size() over an int8 vector returns its dimension.
+        let (codes, scale) = quantize_i8(&[0.1f32, 0.2, 0.3]);
+        let mut p = Params::new();
+        p.insert("emb".into(), RuntimeValue::Vector8 { codes, scale });
+        assert_eq!(
+            eval_str("size($emb)", &Row::new(), &p),
+            RuntimeValue::Integer(3)
         );
     }
 
