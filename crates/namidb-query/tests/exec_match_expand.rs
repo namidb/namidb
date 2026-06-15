@@ -1114,3 +1114,33 @@ async fn indexed_property_match_uses_index_and_returns_all_matches() {
         "both LA persons must come back, not the NYC one"
     );
 }
+
+#[tokio::test]
+async fn not_exists_left_of_and_hoists_to_semiapply() {
+    // Regression: `NOT EXISTS(pattern) AND <scalar>` must parse so the
+    // NOT binds only the EXISTS (NOT tighter than AND). Previously NOT
+    // swallowed the AND -> `NOT (EXISTS AND scalar)`, which left the
+    // EXISTS un-hoisted and failed at evaluate() with "must be hoisted to
+    // a SemiApply operator". Covers the NOT-on-the-left position plus the
+    // multi-type / undirected / anonymous pattern the cloud MCP used.
+    let mut writer = WriterSession::open(store(), paths("exec-not-exists-and"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Every Person has an out-KNOWS, so NOT EXISTS((a)-[:KNOWS]-()) is false
+    // for all; AND-ed with a true scalar still yields 0 rows (and crucially
+    // does NOT error).
+    for q in [
+        "MATCH (a:Person) WHERE NOT EXISTS((a)-[:KNOWS]-()) AND a.age > 0 RETURN a.name AS name",
+        "MATCH (a:Person) WHERE NOT EXISTS((a)-[:KNOWS]-()) AND a.age IS NULL RETURN a.name AS name",
+        "MATCH (a:Person) WHERE NOT EXISTS((a)-[:KNOWS]->()) AND a.name = 'Alice' RETURN a.name AS name",
+    ] {
+        let plan = lower(&parse(q).unwrap()).unwrap();
+        let rows = execute(&plan, &snapshot, &Params::new())
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {q}\n  err: {e}"));
+        assert_eq!(rows.len(), 0, "expected 0 rows for: {q}");
+    }
+}
