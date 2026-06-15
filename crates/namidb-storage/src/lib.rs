@@ -61,7 +61,9 @@ pub use node_cache::{
     node_cache_budget_bytes, node_cache_enabled, CachedNodeView, NodeCacheKey, NodeViewCache,
     DEFAULT_NODE_CACHE_BUDGET_MIB,
 };
-pub use parquet_loader::{load_nodes as load_nodes_from_parquet, LoadOutcome};
+pub use parquet_loader::{
+    load_edges as load_edges_from_parquet, load_nodes as load_nodes_from_parquet, LoadOutcome,
+};
 pub use paths::NamespacePaths;
 pub use read::{
     EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,

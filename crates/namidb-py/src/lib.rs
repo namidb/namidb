@@ -168,6 +168,45 @@ impl Client {
         Ok(())
     }
 
+    /// Bulk-load nodes from a Parquet file. Required column `node_id`
+    /// (`FixedSizeBinary(16)` raw UUID); every other column becomes a
+    /// property. `commit_every` rows per durability boundary (`0` leaves
+    /// everything pending for a final `commit()` / `flush()`). Returns the
+    /// number of rows loaded. This is the file-to-graph fast path, no
+    /// per-row dict construction.
+    #[pyo3(signature = (label, path, commit_every=0))]
+    fn load_parquet_nodes(&self, label: &str, path: &str, commit_every: usize) -> PyResult<usize> {
+        let path = std::path::PathBuf::from(path);
+        let outcome = self.runtime.block_on(async {
+            let mut session = self.session.lock().await;
+            namidb_storage::load_nodes_from_parquet(&path, &mut session, label, commit_every)
+                .await
+                .map_err(map_storage_err)
+        })?;
+        Ok(outcome.rows_loaded)
+    }
+
+    /// Bulk-load edges from a Parquet file. Required columns `src` / `dst`
+    /// (`FixedSizeBinary(16)` endpoint UUIDs); every other column becomes a
+    /// property. Endpoint nodes must already exist, so load the node files
+    /// first. Returns the number of edges loaded.
+    #[pyo3(signature = (edge_type, path, commit_every=0))]
+    fn load_parquet_edges(
+        &self,
+        edge_type: &str,
+        path: &str,
+        commit_every: usize,
+    ) -> PyResult<usize> {
+        let path = std::path::PathBuf::from(path);
+        let outcome = self.runtime.block_on(async {
+            let mut session = self.session.lock().await;
+            namidb_storage::load_edges_from_parquet(&path, &mut session, edge_type, commit_every)
+                .await
+                .map_err(map_storage_err)
+        })?;
+        Ok(outcome.rows_loaded)
+    }
+
     /// Stage an edge tombstone into the current batch.
     fn tombstone_edge(&self, edge_type: &str, src: &str, dst: &str) -> PyResult<()> {
         let src = parse_node_id(src)?;
