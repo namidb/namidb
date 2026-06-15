@@ -14,6 +14,7 @@ namidb-core = { workspace = true }
 namidb-graph = { workspace = true }
 namidb-storage = { workspace = true }
 arrow = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -29,5 +30,4 @@ tokio-test = { workspace = true }
 proptest = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
-chrono = { workspace = true }
 serde_json = { workspace = true }
