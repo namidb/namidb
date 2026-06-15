@@ -97,10 +97,12 @@ pub struct PropertyDef {
     /// When `true`, the planner is allowed to assume *at most one* node
     /// of the parent label has any given value for this property, which
     /// lets `MATCH (a:Label {prop: literal})` lower to a point-lookup
-    /// instead of a full label scan + filter. The engine does NOT
-    /// enforce uniqueness on write — it's a planner hint, equivalent
-    /// to Kuzu's `PRIMARY KEY` or Neo4j's `UNIQUENESS CONSTRAINT`
-    /// without the enforcement. Caller takes responsibility.
+    /// instead of a full label scan + filter. The engine ALSO enforces
+    /// uniqueness on write: CREATE, MERGE, and SET reject a duplicate
+    /// value against the read-your-own-writes overlay, and the low-level
+    /// bulk API (Python `upsert_node` / `upsert_node_with_labels` /
+    /// `merge_nodes`) runs the same check before staging. So this behaves
+    /// like Neo4j's `UNIQUENESS CONSTRAINT`, not just a planner hint.
     ///
     /// Defaults to `false` so existing schemas / manifests load
     /// unchanged via the `#[serde(default)]` on the wire repr.

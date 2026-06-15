@@ -95,6 +95,10 @@ impl Client {
         };
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
+            let labels = [label.to_string()];
+            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
+                .await
+                .map_err(PyValueError::new_err)?;
             session
                 .upsert_node(label, id, &record)
                 .map_err(map_storage_err)
@@ -120,6 +124,9 @@ impl Client {
         };
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
+            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
+                .await
+                .map_err(PyValueError::new_err)?;
             session
                 .upsert_node_with_labels(labels, id, &record)
                 .map_err(map_storage_err)
@@ -307,12 +314,45 @@ impl Client {
         let session = self.session.clone();
         let count = self.runtime.block_on(async move {
             let mut guard = session.lock().await;
+            // Unique property names declared for this label (empty if none).
+            let unique_props: Vec<String> = guard
+                .schema()
+                .label(&label)
+                .map(|d| {
+                    d.properties
+                        .iter()
+                        .filter(|p| p.unique)
+                        .map(|p| p.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let labels = [label.clone()];
+            let mut seen: std::collections::HashMap<(String, String), NodeId> =
+                std::collections::HashMap::new();
             for (id, props) in &parsed {
                 let record = NodeWriteRecord {
                     properties: props.clone(),
                     schema_version: 0,
                     ..Default::default()
                 };
+                // Committed + already-staged duplicates, via the RYOW overlay.
+                namidb_query::enforce_node_unique_constraints(&guard, &labels, &record.properties)
+                    .await
+                    .map_err(PyValueError::new_err)?;
+                // Two rows in THIS batch carrying the same unique value.
+                for uprop in &unique_props {
+                    if let Some(v) = props.get(uprop) {
+                        let key = (uprop.clone(), format!("{v:?}"));
+                        if let Some(prev) = seen.insert(key, *id) {
+                            if prev != *id {
+                                return Err(PyValueError::new_err(format!(
+                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
+                                     merge_nodes batch (unique constraint)"
+                                )));
+                            }
+                        }
+                    }
+                }
                 guard
                     .upsert_node(&label, *id, &record)
                     .map_err(map_storage_err)?;

@@ -621,6 +621,24 @@ async fn enforce_unique_on_create(
     Ok(())
 }
 
+/// Enforce declared unique constraints for a node about to be staged by a
+/// caller OUTSIDE the Cypher executor (the Python low-level bulk API), against
+/// the read-your-own-writes overlay. Returns the conflict message on the first
+/// duplicate, mirroring the check `CREATE` already runs, so the low-level path
+/// cannot silently commit duplicate unique-property values.
+pub async fn enforce_node_unique_constraints(
+    writer: &WriterSession,
+    labels: &[String],
+    core_props: &BTreeMap<String, CoreValue>,
+) -> Result<(), String> {
+    enforce_unique_on_create(writer, labels, core_props)
+        .await
+        .map_err(|e| match e {
+            ExecError::Constraint(msg) => msg,
+            other => other.to_string(),
+        })
+}
+
 /// Enforce a unique constraint when SET assigns `value` to `key` on a node.
 /// If `key` is a declared unique property on any of the node's labels and a
 /// different node already holds `value`, reject. Setting the node's own
@@ -1874,6 +1892,51 @@ mod tests {
         execute_write(&lower(&ok).unwrap(), &mut writer, &Params::new())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enforce_node_unique_constraints_rejects_duplicate_for_low_level_path() {
+        use crate::{lower, parse, Params};
+        use namidb_core::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+
+        let mut writer = WriterSession::open(store(), paths("enforce-unique-helper"))
+            .await
+            .unwrap();
+        execute_write(
+            &lower(&parse("CREATE (a:Person {name: 'Ada'}) RETURN a").unwrap()).unwrap(),
+            &mut writer,
+            &Params::new(),
+        )
+        .await
+        .unwrap();
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, true)
+                    .unwrap()
+                    .with_unique(true)],
+            })
+            .unwrap()
+            .build();
+        writer.flush(schema).await.unwrap();
+
+        // The public helper the Python low-level bulk API calls must reject a
+        // duplicate unique value the same way CREATE does.
+        let labels = vec!["Person".to_string()];
+        let mut dup = BTreeMap::new();
+        dup.insert("name".to_string(), CoreValue::Str("Ada".into()));
+        assert!(
+            enforce_node_unique_constraints(&writer, &labels, &dup)
+                .await
+                .is_err(),
+            "the low-level path must reject a duplicate unique value"
+        );
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert("name".to_string(), CoreValue::Str("Bob".into()));
+        assert!(enforce_node_unique_constraints(&writer, &labels, &fresh)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
