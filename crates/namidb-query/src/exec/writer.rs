@@ -958,11 +958,11 @@ async fn apply_set(
                 }
             }
         }
-        SetOp::Replace { target_alias, .. } | SetOp::Merge { target_alias, .. } => {
-            return Err(ExecError::Runtime(format!(
-                "SET {} = {{...}} / += {{...}} land (use SET prop = value forms)",
-                target_alias
-            )));
+        SetOp::Replace { target_alias, value } => {
+            row = apply_set_map(true, target_alias, value, row, writer, params, outcome).await?;
+        }
+        SetOp::Merge { target_alias, value } => {
+            row = apply_set_map(false, target_alias, value, row, writer, params, outcome).await?;
         }
         SetOp::Labels {
             target_alias,
@@ -999,6 +999,117 @@ async fn apply_set(
                 )));
             }
         },
+    }
+    Ok(row)
+}
+
+/// Compute the post-SET property set for a map-form SET. `replace` (`SET x =
+/// {..}`) starts from an empty set; otherwise (`SET x += {..}`) it starts from
+/// the current properties and merges. A `null` value removes its key in both
+/// forms (openCypher property-removal semantics).
+fn merged_props(
+    replace: bool,
+    current: &BTreeMap<String, RuntimeValue>,
+    incoming: &[(String, RuntimeValue)],
+) -> BTreeMap<String, RuntimeValue> {
+    let mut out = if replace {
+        BTreeMap::new()
+    } else {
+        current.clone()
+    };
+    for (k, v) in incoming {
+        if matches!(v, RuntimeValue::Null) {
+            out.remove(k);
+        } else {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Apply a map-form SET: `SET x = {..}` (replace, `replace = true`) or
+/// `SET x += {..}` (merge). The right-hand side may be a map literal, a
+/// `$param` map, or another node/relationship whose properties are copied.
+/// `+= null` is a no-op and `= null` clears all properties, matching Neo4j.
+/// Uniqueness and NOT NULL are enforced against the FINAL property set, so a
+/// `=` that drops a NOT NULL column is rejected rather than silently committed.
+async fn apply_set_map(
+    replace: bool,
+    target_alias: &str,
+    value: &Expression,
+    mut row: Row,
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<Row, ExecError> {
+    let incoming: Vec<(String, RuntimeValue)> = match evaluate(value, &row, params)? {
+        RuntimeValue::Map(m) => m.into_iter().collect(),
+        RuntimeValue::Node(n) => n.properties.into_iter().collect(),
+        RuntimeValue::Rel(r) => r.properties.into_iter().collect(),
+        RuntimeValue::Null => {
+            if !replace {
+                return Ok(row); // `+= null` is a no-op.
+            }
+            Vec::new() // `= null` clears all properties.
+        }
+        other => {
+            return Err(ExecError::Runtime(format!(
+                "SET {target_alias} {} requires a map, node, or relationship, got {}",
+                if replace { "=" } else { "+=" },
+                other.type_name()
+            )));
+        }
+    };
+
+    match row.get(target_alias).cloned() {
+        Some(RuntimeValue::Node(mut n)) => {
+            let final_runtime = merged_props(replace, &n.properties, &incoming);
+            let final_core = node_runtime_props_to_core(&final_runtime)?;
+            let labels: Vec<String> = n.labels.iter().cloned().collect();
+            // Uniqueness against the final set, excluding the node's own row so
+            // a self-update is allowed; then NOT NULL so a `=` that drops a
+            // required column is rejected, not silently committed.
+            for (k, cv) in &final_core {
+                enforce_unique_on_set(writer, &labels, k, cv, n.id).await?;
+            }
+            enforce_notnull_on_create(writer, &labels, &final_core)?;
+            let record = NodeWriteRecord {
+                properties: final_core,
+                schema_version: 1,
+                ..Default::default()
+            };
+            writer
+                .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
+                .map_err(ExecError::Storage)?;
+            outcome.properties_set += incoming.len() as u64;
+            n.properties = final_runtime;
+            row.set(target_alias.to_string(), RuntimeValue::Node(n));
+        }
+        Some(RuntimeValue::Rel(mut r)) => {
+            let final_runtime = merged_props(replace, &r.properties, &incoming);
+            let final_core = node_runtime_props_to_core(&final_runtime)?;
+            let record = EdgeWriteRecord {
+                properties: final_core,
+                schema_version: 1,
+            };
+            writer
+                .upsert_edge(r.edge_type.clone(), r.src, r.dst, &record)
+                .map_err(ExecError::Storage)?;
+            outcome.properties_set += incoming.len() as u64;
+            r.properties = final_runtime;
+            row.set(target_alias.to_string(), RuntimeValue::Rel(r));
+        }
+        Some(other) => {
+            return Err(ExecError::Runtime(format!(
+                "SET target `{target_alias}` must be a Node or Relationship, got {}",
+                other.type_name()
+            )));
+        }
+        None => {
+            return Err(ExecError::Runtime(format!(
+                "SET target `{target_alias}` is not bound"
+            )));
+        }
     }
     Ok(row)
 }
