@@ -1156,7 +1156,15 @@ impl<'src> Parser<'src> {
             Some(Token::Not) => {
                 let start = self.peek_span().start;
                 self.bump();
-                let inner = self.parse_expr_bp(5)?;
+                // NOT binds tighter than AND/XOR/OR but looser than the
+                // comparison operators (openCypher precedence). Parsing the
+                // operand at the comparison binding power (7) makes `NOT a = b`
+                // parse as `NOT (a = b)` while `NOT a AND b` parses as
+                // `(NOT a) AND b`. Using AND's bp (5) here was a bug: it let
+                // NOT swallow a trailing `AND`, so `NOT EXISTS(p) AND q` became
+                // `NOT (EXISTS(p) AND q)` — which hid the EXISTS from the
+                // SemiApply hoisting in lowering and blew up at evaluate().
+                let inner = self.parse_expr_bp(7)?;
                 let end = inner.span.end;
                 Ok(Expression {
                     kind: ExpressionKind::Unary {
