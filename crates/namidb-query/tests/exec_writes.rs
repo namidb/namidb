@@ -957,6 +957,60 @@ async fn merge_pattern_property_reads_outer_row_binding() {
 }
 
 #[tokio::test]
+async fn unwind_bulk_edges_match_both_endpoints_then_create() {
+    // Issue 01 (bulk-load): a single UNWIND of {from,to} pairs drives a
+    // MATCH of BOTH endpoints by the row binding, then CREATE one edge per
+    // row. This must create exactly N edges in one round-trip — the shape
+    // that previously forced per-edge statements ("binding row not bound").
+    let mut writer = WriterSession::open(store(), paths("w-unwind-bulk-edges"))
+        .await
+        .unwrap();
+    for name in ["Alice", "Bob", "Carol"] {
+        write_q(
+            &mut writer,
+            &format!("CREATE (a:Person {{name: '{name}'}}) RETURN a"),
+        )
+        .await;
+    }
+
+    let outcome = write_q(
+        &mut writer,
+        "UNWIND [{from: 'Alice', to: 'Bob'}, {from: 'Bob', to: 'Carol'}] AS row \
+         MATCH (a:Person {name: row.from}), (b:Person {name: row.to}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await;
+    assert_eq!(outcome.edges_created, 2, "one KNOWS edge per UNWIND row");
+
+    let snap = writer.snapshot();
+    let plan = lower(
+        &parse(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN a.name AS from, b.name AS to ORDER BY from, to",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| match (r.get("from"), r.get("to")) {
+            (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(b))) => {
+                (a.clone(), b.clone())
+            }
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "Bob".to_string()),
+            ("Bob".to_string(), "Carol".to_string()),
+        ],
+    );
+}
+
+#[tokio::test]
 async fn merge_rel_over_matched_nodes_is_idempotent() {
     // MATCH (a), MATCH (b), MERGE (a)-[r:KNOWS]->(b). The MERGE needs
     // to see the matched a and b on the outer row and decide whether

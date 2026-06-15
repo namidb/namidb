@@ -250,28 +250,18 @@ fn lower_match(
     input: Option<LogicalPlan>,
     ctx: &mut LowerCtx,
 ) -> Result<LogicalPlan, LowerError> {
-    // The first part consumes the existing input plan (e.g. from WITH).
-    // Subsequent parts have no shared input and are combined via
-    // CrossProduct. If a later part back-references a binding from an
-    // earlier one, lowering reuses that binding (no cross-product needed
-    // because the back-reference threading on Expand stitches them).
+    // Lower each comma-separated pattern part against the accumulated plan.
+    // Threading the carried plan (rather than lowering a later part against
+    // an empty input and cross-joining the two subtrees) is what keeps OUTER
+    // bindings in scope for every part: a fresh node still cross-products
+    // with the input via `combine`, but its inline-property filters that
+    // reference an outer binding (e.g. `MATCH (a {x: row.a}), (b {y: row.b})`
+    // driven by an UNWIND `row`) are lifted ABOVE the join and stay bound.
+    // A part whose head re-uses an already-bound alias reuses that binding
+    // instead of emitting a new scan (see `lower_node_pattern_head`).
     let mut plan = input;
-    let mut first = true;
     for part in &m.patterns {
-        if first {
-            plan = Some(lower_pattern_part(part, plan, m.optional, ctx)?);
-            first = false;
-        } else if pattern_part_back_references(part, ctx) {
-            // Threaded continuation — same scope, no cross product.
-            plan = Some(lower_pattern_part(part, plan, m.optional, ctx)?);
-        } else {
-            let right = lower_pattern_part(part, None, m.optional, ctx)?;
-            let left = plan.take().expect("MATCH must have ≥ 1 pattern part");
-            plan = Some(LogicalPlan::CrossProduct {
-                left: Box::new(left),
-                right: Box::new(right),
-            });
-        }
+        plan = Some(lower_pattern_part(part, plan, m.optional, ctx)?);
     }
     let mut plan = plan.expect("MATCH must have ≥ 1 pattern part");
     if let Some(pred) = &m.where_ {
@@ -524,16 +514,6 @@ fn reject_nested_pattern_comprehension(expr: &Expression) -> Result<(), LowerErr
         | ExpressionKind::Variable(_)
         | ExpressionKind::Parameter(_)
         | ExpressionKind::Literal(_) => Ok(()),
-    }
-}
-
-/// True if `part`'s head binding is already in scope — the lowering
-/// treats this as "continue from the existing binding" instead of
-/// emitting a CrossProduct between two independent pattern parts.
-fn pattern_part_back_references(part: &PatternPart, ctx: &LowerCtx) -> bool {
-    match &part.element.head.binding {
-        Some(b) => ctx.bindings.contains(&b.name),
-        None => false,
     }
 }
 
