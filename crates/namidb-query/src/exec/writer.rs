@@ -976,10 +976,16 @@ async fn apply_set(
                 }
             }
         }
-        SetOp::Replace { target_alias, value } => {
+        SetOp::Replace {
+            target_alias,
+            value,
+        } => {
             row = apply_set_map(true, target_alias, value, row, writer, params, outcome).await?;
         }
-        SetOp::Merge { target_alias, value } => {
+        SetOp::Merge {
+            target_alias,
+            value,
+        } => {
             row = apply_set_map(false, target_alias, value, row, writer, params, outcome).await?;
         }
         SetOp::Labels {

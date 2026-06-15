@@ -1017,7 +1017,11 @@ async fn set_plus_map_merges_properties() {
     let mut writer = WriterSession::open(store(), paths("w-set-plus-map"))
         .await
         .unwrap();
-    write_q(&mut writer, "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a").await;
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
     let outcome = write_q(
         &mut writer,
         "MATCH (a:Person {name: 'Ada'}) SET a += {age: 40, city: 'Quito'} RETURN a",
@@ -1040,7 +1044,11 @@ async fn set_eq_map_replaces_all_properties() {
     let mut writer = WriterSession::open(store(), paths("w-set-eq-map"))
         .await
         .unwrap();
-    write_q(&mut writer, "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a").await;
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
     write_q(
         &mut writer,
         "MATCH (a:Person {name: 'Ada'}) SET a = {name: 'Bob'} RETURN a",
@@ -1051,7 +1059,11 @@ async fn set_eq_map_replaces_all_properties() {
     assert_eq!(nodes.len(), 1);
     let p = &nodes[0].properties;
     assert_eq!(p.get("name"), Some(&CoreValue::Str("Bob".into())));
-    assert_eq!(p.get("age"), None, "= replaces, dropping unlisted properties");
+    assert_eq!(
+        p.get("age"),
+        None,
+        "= replaces, dropping unlisted properties"
+    );
 }
 
 #[tokio::test]
@@ -1059,7 +1071,11 @@ async fn set_plus_map_null_value_removes_property() {
     let mut writer = WriterSession::open(store(), paths("w-set-plus-null"))
         .await
         .unwrap();
-    write_q(&mut writer, "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a").await;
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
     write_q(
         &mut writer,
         "MATCH (a:Person {name: 'Ada'}) SET a += {age: null} RETURN a",
