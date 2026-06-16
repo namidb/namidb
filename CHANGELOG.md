@@ -11,6 +11,41 @@ below and in the release notes.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-15: Cypher write ergonomics and bulk-load
+
+### Added
+
+- `SET n += {map}` (merge) and `SET n = {map}` (replace). The map forms
+  previously parsed but errored at execution. `+=` merges the map into the
+  node or relationship (a null value removes a key); `=` replaces the whole
+  property set. Uniqueness and NOT NULL are checked against the final set, so
+  a `=` that drops a required column is rejected rather than committed.
+- `datetime()` and `date()` constructors. No-arg returns the current UTC
+  instant / today, a single ISO-8601 string parses to the same. Previously
+  every temporal constructor fell through to "not supported in v0".
+- Label predicate in `WHERE`: `WHERE n:Label`, `n:A:B`, and `NOT n:Person`,
+  reusing the existing label-membership builtin.
+- Bulk-load edges from Parquet: `load_edges` in the storage loader plus
+  Python `Client.load_parquet_nodes` / `load_parquet_edges`, the
+  file-to-graph fast path with no per-row dict construction. The loader was
+  nodes-only.
+
+### Changed
+
+- Variable-length paths are now allowed under `OPTIONAL MATCH`. Lowering and
+  the walker already handled the combination, only the parser rejected it.
+
+### Fixed
+
+- `UNWIND list AS row MATCH (a {x: row.a}), (b {x: row.b})` now propagates the
+  row binding across comma-separated pattern parts, so the canonical bulk-edge
+  load (look up both endpoints per row, then CREATE the edge) runs in one
+  round-trip instead of failing with "binding row not bound".
+- The Python low-level bulk API (`upsert_node`, `upsert_node_with_labels`,
+  `merge_nodes`) now enforces declared unique constraints, the same check the
+  Cypher CREATE path runs, instead of committing duplicate unique-property
+  values silently.
+
 ## [0.17.0] - 2026-06-14: int8 vector storage and scoring
 
 ### Added
