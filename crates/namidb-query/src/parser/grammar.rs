@@ -322,19 +322,6 @@ impl<'src> Parser<'src> {
             patterns.push(self.parse_pattern_part()?);
         }
 
-        if optional {
-            for part in &patterns {
-                if has_variable_length(&part.element) {
-                    return Err(ParseError::new(
-                        ErrorCode::OptionalVariableLength,
-                        "OPTIONAL MATCH cannot use variable-length patterns in v0",
-                        part.span,
-                    )
-                    .with_help("see RFC-004 §Drawbacks 5"));
-                }
-            }
-        }
-
         let where_ = if self.eat(&Token::Where).is_some() {
             Some(self.parse_expression()?)
         } else {
@@ -1251,6 +1238,54 @@ impl<'src> Parser<'src> {
                         };
                     }
                 }
+                Some(Token::Colon) => {
+                    // Label predicate in expression position: `n:Label`,
+                    // `n:A:B`. Encodes to `__label_eq(target, "Label")` — the
+                    // same pseudo-call in-pattern lowering emits — ANDed for
+                    // multiple labels, so the executor's membership builtin and
+                    // the optimizer's `is_synthetic_label_eq` both recognise it.
+                    // `NOT n:Person` comes for free: parse_unary wraps this.
+                    let labels = self.parse_label_list()?;
+                    let mut acc: Option<Expression> = None;
+                    for label in labels {
+                        let span = SourceSpan::new(expr.span.start, label.span.end);
+                        let call = Expression {
+                            kind: ExpressionKind::FunctionCall {
+                                name: QualifiedName::single(Identifier::new(
+                                    "__label_eq",
+                                    label.span,
+                                )),
+                                args: vec![
+                                    expr.clone(),
+                                    Expression {
+                                        kind: ExpressionKind::Literal(Literal::String(
+                                            label.name.clone(),
+                                        )),
+                                        span: label.span,
+                                    },
+                                ],
+                                distinct: false,
+                            },
+                            span,
+                        };
+                        acc = Some(match acc {
+                            None => call,
+                            Some(prev) => {
+                                let span = SourceSpan::new(prev.span.start, call.span.end);
+                                Expression {
+                                    kind: ExpressionKind::Binary {
+                                        op: BinaryOp::And,
+                                        left: Box::new(prev),
+                                        right: Box::new(call),
+                                    },
+                                    span,
+                                }
+                            }
+                        });
+                    }
+                    // parse_label_list yields at least one label after a `:`.
+                    expr = acc.expect("label list after `:` is non-empty");
+                }
                 _ => break,
             }
         }
@@ -1574,10 +1609,6 @@ enum BinOpKind {
     StringOp(StringOp),
 }
 
-fn has_variable_length(element: &PatternElement) -> bool {
-    element.chain.iter().any(|(r, _)| r.length.is_some())
-}
-
 /// Variant-only equality (ignores embedded data like `Token::Ident("a") == Token::Ident("b")`).
 fn discriminant_eq(a: &Token, b: &Token) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
@@ -1802,9 +1833,65 @@ mod tests {
     }
 
     #[test]
-    fn optional_match_no_variable_length() {
-        let code = err_code("OPTIONAL MATCH (a)-[:KNOWS*1..3]->(b) RETURN b");
-        assert_eq!(code, ErrorCode::OptionalVariableLength);
+    fn optional_match_allows_variable_length() {
+        // RFC-004 drawback 5 lifted: lowering (lower_rel_node) and the walker
+        // (execute_expand) already thread `optional` and the length range
+        // independently, so the parser no longer rejects the combination.
+        let q = ok("OPTIONAL MATCH (a)-[:KNOWS*1..3]->(b) RETURN b");
+        assert_eq!(q.head.clauses.len(), 2);
+        assert!(matches!(&q.head.clauses[0], Clause::Match(m) if m.optional));
+    }
+
+    #[test]
+    fn optional_match_unbounded_variable_length_still_rejected() {
+        // E002 is orthogonal to the optional flag: an unbounded `*` upper
+        // bound is still rejected under OPTIONAL MATCH.
+        let code = err_code("OPTIONAL MATCH (a)-[*]->(b) RETURN b");
+        assert_eq!(code, ErrorCode::UnboundedVariableLength);
+    }
+
+    fn match_where(src: &str) -> Expression {
+        let q = ok(src);
+        match &q.head.clauses[0] {
+            Clause::Match(m) => m.where_.clone().expect("WHERE present"),
+            other => panic!("expected MATCH, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn where_label_predicate_lowers_to_label_eq() {
+        match match_where("MATCH (n) WHERE n:Person RETURN n").kind {
+            ExpressionKind::FunctionCall { args, .. } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(
+                    &args[1].kind,
+                    ExpressionKind::Literal(Literal::String(s)) if s == "Person"
+                ));
+            }
+            other => panic!("expected __label_eq call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn where_not_label_predicate_wraps_in_unary_not() {
+        assert!(matches!(
+            match_where("MATCH (n) WHERE NOT n:Person RETURN n").kind,
+            ExpressionKind::Unary {
+                op: UnaryOp::Not,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn where_multi_label_predicate_ands() {
+        assert!(matches!(
+            match_where("MATCH (n) WHERE n:A:B RETURN n").kind,
+            ExpressionKind::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
     }
 
     #[test]

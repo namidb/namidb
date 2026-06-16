@@ -875,8 +875,86 @@ fn call_scalar_function(
             Ok(RuntimeValue::Integer(ms))
         }
 
+        // `datetime()` — Cypher UTC datetime, microseconds since the epoch
+        // (RuntimeValue::DateTime). Zero args returns the current instant
+        // (like Neo4j/Memgraph `datetime()`); a single ISO-8601 / RFC3339
+        // string parses to the same representation; NULL propagates.
+        "datetime" | "localdatetime" => match args {
+            [] => Ok(RuntimeValue::DateTime(now_micros())),
+            [RuntimeValue::Null] => Ok(RuntimeValue::Null),
+            [RuntimeValue::DateTime(m)] => Ok(RuntimeValue::DateTime(*m)),
+            [RuntimeValue::String(s)] => parse_iso_datetime(s, span),
+            _ => Err(EvalError::new(
+                format!("{name}() takes no arguments or a single ISO-8601 string"),
+                span,
+            )),
+        },
+
+        // `date()` — Cypher calendar date, days since the epoch
+        // (RuntimeValue::Date). Zero args returns today (UTC); a single
+        // `YYYY-MM-DD` string parses to the same; NULL propagates.
+        "date" => match args {
+            [] => Ok(RuntimeValue::Date((now_micros() / 86_400_000_000) as i32)),
+            [RuntimeValue::Null] => Ok(RuntimeValue::Null),
+            [RuntimeValue::Date(d)] => Ok(RuntimeValue::Date(*d)),
+            [RuntimeValue::String(s)] => parse_iso_date(s, span),
+            _ => Err(EvalError::new(
+                "date() takes no arguments or a single YYYY-MM-DD string",
+                span,
+            )),
+        },
+
         _ => Err(EvalError::new(
             format!("function `{}` is not supported in v0", name),
+            span,
+        )),
+    }
+}
+
+/// Microseconds since the Unix epoch, read from the wall clock. Shared by the
+/// zero-argument `datetime()` / `date()` constructors.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an ISO-8601 / RFC3339 datetime into microseconds since the epoch.
+/// Accepts an offset-qualified RFC3339 string, a bare `YYYY-MM-DDTHH:MM:SS`
+/// (interpreted as UTC), and a bare `YYYY-MM-DD` (promoted to midnight UTC).
+fn parse_iso_datetime(s: &str, span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(RuntimeValue::DateTime(
+            dt.with_timezone(&chrono::Utc).timestamp_micros(),
+        ));
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(RuntimeValue::DateTime(ndt.and_utc().timestamp_micros()));
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let ndt = d.and_hms_opt(0, 0, 0).expect("midnight is always valid");
+        return Ok(RuntimeValue::DateTime(ndt.and_utc().timestamp_micros()));
+    }
+    Err(EvalError::new(
+        format!("datetime(): could not parse `{s}` as an ISO-8601 datetime"),
+        span,
+    ))
+}
+
+/// Parse a `YYYY-MM-DD` string into days since the epoch.
+fn parse_iso_date(s: &str, span: SourceSpan) -> Result<RuntimeValue, EvalError> {
+    match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        Ok(d) => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+            Ok(RuntimeValue::Date(
+                d.signed_duration_since(epoch).num_days() as i32,
+            ))
+        }
+        Err(_) => Err(EvalError::new(
+            format!("date(): could not parse `{s}` as YYYY-MM-DD"),
             span,
         )),
     }
@@ -1616,6 +1694,41 @@ mod tests {
     fn list_comprehension_null_list_returns_null() {
         let r = eval_str("[x IN NULL | x]", &Row::new(), &Params::new());
         assert!(r.is_null());
+    }
+
+    #[test]
+    fn datetime_no_args_returns_datetime_value() {
+        let r = eval_str("datetime()", &Row::new(), &Params::new());
+        assert!(matches!(r, RuntimeValue::DateTime(_)));
+    }
+
+    #[test]
+    fn datetime_parses_rfc3339_string() {
+        let r = eval_str(
+            "datetime('2024-01-02T03:04:05Z')",
+            &Row::new(),
+            &Params::new(),
+        );
+        // 2024-01-02T03:04:05Z == 1_704_164_645 s since the epoch.
+        assert_eq!(r, RuntimeValue::DateTime(1_704_164_645_000_000));
+    }
+
+    #[test]
+    fn datetime_of_null_is_null() {
+        let r = eval_str("datetime(null)", &Row::new(), &Params::new());
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn date_parses_iso_date_to_days_since_epoch() {
+        let r = eval_str("date('1970-01-02')", &Row::new(), &Params::new());
+        assert_eq!(r, RuntimeValue::Date(1));
+    }
+
+    #[test]
+    fn date_no_args_returns_date_value() {
+        let r = eval_str("date()", &Row::new(), &Params::new());
+        assert!(matches!(r, RuntimeValue::Date(_)));
     }
 
     #[test]

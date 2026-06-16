@@ -843,6 +843,96 @@ async fn unwind_alias_drives_following_match_property_filter() {
 }
 
 #[tokio::test]
+async fn optional_match_variable_length_matches_within_bound() {
+    // Issue 05: variable-length under OPTIONAL MATCH now parses and runs.
+    // Alice reaches Bob (1 hop) and Carol (1 and 2 hops) within `*1..2`.
+    let mut writer = WriterSession::open(store(), paths("exec-opt-varlen"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH (a:Person {name: 'Alice'}) \
+         OPTIONAL MATCH (a)-[:KNOWS*1..2]->(b) \
+         RETURN DISTINCT b.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"Bob".to_string()));
+    assert!(names.contains(&"Carol".to_string()));
+}
+
+#[tokio::test]
+async fn optional_match_variable_length_null_pads_when_no_path() {
+    // OPTIONAL semantics preserved: a source with no outgoing path still
+    // yields exactly one row with the optional endpoint null.
+    let mut writer = WriterSession::open(store(), paths("exec-opt-varlen-null"))
+        .await
+        .unwrap();
+    let solo = NodeId::new();
+    writer
+        .upsert_node("Person", solo, &person("Solo", 50))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH (a:Person {name: 'Solo'}) \
+         OPTIONAL MATCH (a)-[:KNOWS*1..3]->(b) \
+         RETURN a.name AS a, b.name AS b",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1, "OPTIONAL MATCH preserves the source row");
+    assert_eq!(rows[0].get("a"), Some(&RuntimeValue::String("Solo".into())));
+    assert!(matches!(rows[0].get("b"), None | Some(RuntimeValue::Null)));
+}
+
+#[tokio::test]
+async fn where_label_predicate_filters_by_membership() {
+    // Issue 06: `WHERE n:Label` filters by label membership and is not
+    // stripped by the optimizer when no Expand already guarantees the label.
+    let mut writer = WriterSession::open(store(), paths("exec-where-label"))
+        .await
+        .unwrap();
+    let ada = NodeId::new();
+    let post = NodeId::new();
+    writer
+        .upsert_node("Person", ada, &person("Ada", 36))
+        .unwrap();
+    let mut post_props: BTreeMap<String, CoreValue> = BTreeMap::new();
+    post_props.insert("title".into(), CoreValue::Str("Hello".into()));
+    writer
+        .upsert_node(
+            "Post",
+            post,
+            &NodeWriteRecord {
+                properties: post_props,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse("MATCH (n) WHERE n:Person RETURN count(*) AS c").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("c"), Some(&RuntimeValue::Integer(1)));
+}
+
+#[tokio::test]
 async fn var_length_expand_without_rel_type_crosses_heterogeneous_types() {
     // Regression for Bug #6: `[*1..N]` without an explicit edge type
     // must traverse every type at each hop. With `Alice -KNOWS-> Bob

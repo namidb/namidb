@@ -957,6 +957,159 @@ async fn merge_pattern_property_reads_outer_row_binding() {
 }
 
 #[tokio::test]
+async fn unwind_bulk_edges_match_both_endpoints_then_create() {
+    // Issue 01 (bulk-load): a single UNWIND of {from,to} pairs drives a
+    // MATCH of BOTH endpoints by the row binding, then CREATE one edge per
+    // row. This must create exactly N edges in one round-trip — the shape
+    // that previously forced per-edge statements ("binding row not bound").
+    let mut writer = WriterSession::open(store(), paths("w-unwind-bulk-edges"))
+        .await
+        .unwrap();
+    for name in ["Alice", "Bob", "Carol"] {
+        write_q(
+            &mut writer,
+            &format!("CREATE (a:Person {{name: '{name}'}}) RETURN a"),
+        )
+        .await;
+    }
+
+    let outcome = write_q(
+        &mut writer,
+        "UNWIND [{from: 'Alice', to: 'Bob'}, {from: 'Bob', to: 'Carol'}] AS row \
+         MATCH (a:Person {name: row.from}), (b:Person {name: row.to}) \
+         CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await;
+    assert_eq!(outcome.edges_created, 2, "one KNOWS edge per UNWIND row");
+
+    let snap = writer.snapshot();
+    let plan = lower(
+        &parse(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+             RETURN a.name AS from, b.name AS to ORDER BY from, to",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| match (r.get("from"), r.get("to")) {
+            (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(b))) => {
+                (a.clone(), b.clone())
+            }
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "Bob".to_string()),
+            ("Bob".to_string(), "Carol".to_string()),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn set_plus_map_merges_properties() {
+    // Issue 02: `SET n += {map}` merges the map into the node, keeping
+    // existing properties not named in the map.
+    let mut writer = WriterSession::open(store(), paths("w-set-plus-map"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (a:Person {name: 'Ada'}) SET a += {age: 40, city: 'Quito'} RETURN a",
+    )
+    .await;
+    assert_eq!(outcome.properties_set, 2);
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    let p = &nodes[0].properties;
+    assert_eq!(p.get("name"), Some(&CoreValue::Str("Ada".into())));
+    assert_eq!(p.get("age"), Some(&CoreValue::I64(40)));
+    assert_eq!(p.get("city"), Some(&CoreValue::Str("Quito".into())));
+}
+
+#[tokio::test]
+async fn set_eq_map_replaces_all_properties() {
+    // `SET n = {map}` replaces the whole property set, dropping anything
+    // not present in the map.
+    let mut writer = WriterSession::open(store(), paths("w-set-eq-map"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {name: 'Ada'}) SET a = {name: 'Bob'} RETURN a",
+    )
+    .await;
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    let p = &nodes[0].properties;
+    assert_eq!(p.get("name"), Some(&CoreValue::Str("Bob".into())));
+    assert_eq!(
+        p.get("age"),
+        None,
+        "= replaces, dropping unlisted properties"
+    );
+}
+
+#[tokio::test]
+async fn set_plus_map_null_value_removes_property() {
+    let mut writer = WriterSession::open(store(), paths("w-set-plus-null"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada', age: 36}) RETURN a",
+    )
+    .await;
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {name: 'Ada'}) SET a += {age: null} RETURN a",
+    )
+    .await;
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    let p = &nodes[0].properties;
+    assert_eq!(p.get("name"), Some(&CoreValue::Str("Ada".into())));
+    assert_eq!(p.get("age"), None, "+= null removes the property");
+}
+
+#[tokio::test]
+async fn merge_on_create_set_plus_map_is_the_upsert_idiom() {
+    // The canonical Cypher upsert: MERGE then ON CREATE SET n += {props}.
+    // Flows through the same apply_set arm as a bare SET.
+    let mut writer = WriterSession::open(store(), paths("w-merge-set-map"))
+        .await
+        .unwrap();
+    let outcome = write_q(
+        &mut writer,
+        "MERGE (a:Person {name: 'Ada'}) ON CREATE SET a += {age: 36, city: 'Quito'} RETURN a",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 1);
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Person").await.unwrap();
+    let p = &nodes[0].properties;
+    assert_eq!(p.get("name"), Some(&CoreValue::Str("Ada".into())));
+    assert_eq!(p.get("age"), Some(&CoreValue::I64(36)));
+    assert_eq!(p.get("city"), Some(&CoreValue::Str("Quito".into())));
+}
+
+#[tokio::test]
 async fn merge_rel_over_matched_nodes_is_idempotent() {
     // MATCH (a), MATCH (b), MERGE (a)-[r:KNOWS]->(b). The MERGE needs
     // to see the matched a and b on the outer row and decide whether

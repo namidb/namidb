@@ -52,7 +52,7 @@ use uuid::Uuid;
 use namidb_core::{NodeId, Value};
 
 use crate::error::{Error, Result};
-use crate::flush::NodeWriteRecord;
+use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
 use crate::ingest::WriterSession;
 
 /// Default Parquet batch size. Picked to match the row-group target the
@@ -87,14 +87,51 @@ pub async fn load_nodes(
     label: &str,
     commit_every: usize,
 ) -> Result<LoadOutcome> {
+    let label = label.to_string();
+    load_with(path, writer, commit_every, move |batch, writer, outcome| {
+        ingest_batch(batch, writer, &label, outcome)
+    })
+    .await
+}
+
+/// Load every row in a Parquet file as an edge upsert for `edge_type`.
+///
+/// Wire convention: required `src` and `dst` columns of `FixedSizeBinary(16)`
+/// (the raw endpoint UUIDs); every other column is a property. Endpoint nodes
+/// are NOT auto-created, so load the node files first. Flush/commit cadence
+/// matches [`load_nodes`]: the caller owns `writer` and flushes after the load.
+pub async fn load_edges(
+    path: &Path,
+    writer: &mut WriterSession,
+    edge_type: &str,
+    commit_every: usize,
+) -> Result<LoadOutcome> {
+    let edge_type = edge_type.to_string();
+    load_with(path, writer, commit_every, move |batch, writer, outcome| {
+        ingest_edge_batch(batch, writer, &edge_type, outcome)
+    })
+    .await
+}
+
+/// Shared Parquet reader driver for [`load_nodes`] / [`load_edges`]: opens the
+/// file, sizes the reader batch to the commit cadence, and streams each
+/// `RecordBatch` through `ingest`, committing every `commit_every` rows.
+async fn load_with<F>(
+    path: &Path,
+    writer: &mut WriterSession,
+    commit_every: usize,
+    mut ingest: F,
+) -> Result<LoadOutcome>
+where
+    F: FnMut(&RecordBatch, &mut WriterSession, &mut LoadOutcome) -> Result<()>,
+{
     let file = File::open(path)
         .map_err(|e| Error::invariant(format!("open parquet file {}: {e}", path.display())))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::invariant(format!("open parquet reader: {e}")))?;
     // Cap the reader batch to the commit cadence: otherwise a small
-    // `commit_every` would only fire once per (much larger) Arrow
-    // batch, since we only check the commit threshold at batch
-    // boundaries.
+    // `commit_every` would only fire once per (much larger) Arrow batch,
+    // since we only check the commit threshold at batch boundaries.
     let batch_size = if commit_every > 0 {
         DEFAULT_BATCH_SIZE.min(commit_every)
     } else {
@@ -111,7 +148,7 @@ pub async fn load_nodes(
     for batch in reader {
         let batch: RecordBatch =
             batch.map_err(|e| Error::invariant(format!("read parquet batch: {e}")))?;
-        ingest_batch(&batch, writer, label, &mut outcome)?;
+        ingest(&batch, writer, &mut outcome)?;
 
         rows_since_commit += batch.num_rows();
         if commit_every > 0 && rows_since_commit >= commit_every {
@@ -123,8 +160,8 @@ pub async fn load_nodes(
     Ok(outcome)
 }
 
-/// Process one `RecordBatch` worth of rows. Pulled out so the per-row
-/// loop is testable without spinning up Parquet I/O.
+/// Process one node `RecordBatch`. Pulled out so the per-row loop is
+/// testable without spinning up Parquet I/O.
 fn ingest_batch(
     batch: &RecordBatch,
     writer: &mut WriterSession,
@@ -132,33 +169,105 @@ fn ingest_batch(
     outcome: &mut LoadOutcome,
 ) -> Result<()> {
     let schema = batch.schema();
+    let (id_idx, id_array) = fixed16_column(batch, "node_id")?;
+    let prop_indices = collect_property_columns(&schema, &[id_idx])?;
 
-    // Locate the node_id column once per batch.
-    let id_col_idx = schema
-        .index_of("node_id")
-        .map_err(|_| Error::invariant("parquet schema is missing required 'node_id' column"))?;
-    let id_col = batch.column(id_col_idx);
-    let id_array = id_col
+    for row in 0..batch.num_rows() {
+        if id_array.is_null(row) {
+            return Err(Error::invariant(format!(
+                "row {row}: 'node_id' is null; null ids are not allowed"
+            )));
+        }
+        let id = NodeId::from_uuid(Uuid::from_bytes(fixed16_at(id_array, row)));
+        let properties = build_row_properties(batch, &prop_indices, row)?;
+        let record = NodeWriteRecord {
+            properties,
+            schema_version: 1,
+            ..Default::default()
+        };
+        writer.upsert_node(label, id, &record)?;
+        outcome.rows_loaded += 1;
+    }
+    Ok(())
+}
+
+/// Process one edge `RecordBatch`: `src`/`dst` endpoint columns plus
+/// properties, one `upsert_edge` per row. Endpoint nodes must already exist
+/// (a dangling endpoint is the caller's responsibility, surfaced at read time).
+fn ingest_edge_batch(
+    batch: &RecordBatch,
+    writer: &mut WriterSession,
+    edge_type: &str,
+    outcome: &mut LoadOutcome,
+) -> Result<()> {
+    let schema = batch.schema();
+    let (src_idx, src_array) = fixed16_column(batch, "src")?;
+    let (dst_idx, dst_array) = fixed16_column(batch, "dst")?;
+    let prop_indices = collect_property_columns(&schema, &[src_idx, dst_idx])?;
+
+    for row in 0..batch.num_rows() {
+        if src_array.is_null(row) || dst_array.is_null(row) {
+            return Err(Error::invariant(format!(
+                "row {row}: edge 'src'/'dst' endpoints must be non-null"
+            )));
+        }
+        let src = NodeId::from_uuid(Uuid::from_bytes(fixed16_at(src_array, row)));
+        let dst = NodeId::from_uuid(Uuid::from_bytes(fixed16_at(dst_array, row)));
+        let properties = build_row_properties(batch, &prop_indices, row)?;
+        let record = EdgeWriteRecord {
+            properties,
+            schema_version: 1,
+        };
+        writer.upsert_edge(edge_type, src, dst, &record)?;
+        outcome.rows_loaded += 1;
+    }
+    Ok(())
+}
+
+/// Locate a required `FixedSizeBinary(16)` id/endpoint column by name,
+/// returning its index and the typed array.
+fn fixed16_column<'a>(
+    batch: &'a RecordBatch,
+    col: &str,
+) -> Result<(usize, &'a FixedSizeBinaryArray)> {
+    let idx = batch.schema().index_of(col).map_err(|_| {
+        Error::invariant(format!("parquet schema is missing required '{col}' column"))
+    })?;
+    let column = batch.column(idx);
+    let array = column
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
         .ok_or_else(|| {
             Error::invariant(format!(
-                "'node_id' column must be FixedSizeBinary(16), got {:?}",
-                id_col.data_type()
+                "'{col}' column must be FixedSizeBinary(16), got {:?}",
+                column.data_type()
             ))
         })?;
-    if id_array.value_length() != 16 {
+    if array.value_length() != 16 {
         return Err(Error::invariant(format!(
-            "'node_id' FixedSizeBinary width must be 16, got {}",
-            id_array.value_length()
+            "'{col}' FixedSizeBinary width must be 16, got {}",
+            array.value_length()
         )));
     }
+    Ok((idx, array))
+}
 
-    // Precompute the property column indices. We skip node_id and any
-    // reserved engine-managed names (refusing the row if we see them).
+/// Copy a 16-byte UUID out of a `FixedSizeBinary(16)` array cell.
+fn fixed16_at(array: &FixedSizeBinaryArray, row: usize) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(array.value(row));
+    bytes
+}
+
+/// Collect (column index, name) for every property column, skipping the
+/// reserved id/endpoint columns and rejecting engine-managed names.
+fn collect_property_columns(
+    schema: &arrow_schema::Schema,
+    reserved_idx: &[usize],
+) -> Result<Vec<(usize, String)>> {
     let mut prop_indices: Vec<(usize, String)> = Vec::with_capacity(schema.fields().len());
     for (idx, field) in schema.fields().iter().enumerate() {
-        if idx == id_col_idx {
+        if reserved_idx.contains(&idx) {
             continue;
         }
         let name = field.name();
@@ -169,39 +278,25 @@ fn ingest_batch(
         }
         prop_indices.push((idx, name.clone()));
     }
+    Ok(prop_indices)
+}
 
-    for row in 0..batch.num_rows() {
-        if id_array.is_null(row) {
-            return Err(Error::invariant(format!(
-                "row {row}: 'node_id' is null; null ids are not allowed"
-            )));
+/// Build the property map for one row, skipping null cells (absent and
+/// explicit-null are equivalent at flush time, and absent saves a field).
+fn build_row_properties(
+    batch: &RecordBatch,
+    prop_indices: &[(usize, String)],
+    row: usize,
+) -> Result<BTreeMap<String, Value>> {
+    let mut properties: BTreeMap<String, Value> = BTreeMap::new();
+    for (col_idx, name) in prop_indices {
+        let array = batch.column(*col_idx);
+        let value = arrow_value_at(array.as_ref(), row, name)?;
+        if !value.is_null() {
+            properties.insert(name.clone(), value);
         }
-        let bytes = id_array.value(row);
-        let mut uuid_bytes = [0u8; 16];
-        uuid_bytes.copy_from_slice(bytes);
-        let id = NodeId::from_uuid(Uuid::from_bytes(uuid_bytes));
-
-        let mut properties: BTreeMap<String, Value> = BTreeMap::new();
-        for (col_idx, name) in &prop_indices {
-            let array = batch.column(*col_idx);
-            let value = arrow_value_at(array.as_ref(), row, name)?;
-            // Skip null values — the property is simply absent for that
-            // row. The flush path treats absent and explicit-null the
-            // same, but absent saves us a JSON field per row.
-            if !value.is_null() {
-                properties.insert(name.clone(), value);
-            }
-        }
-
-        let record = NodeWriteRecord {
-            properties,
-            schema_version: 1,
-            ..Default::default()
-        };
-        writer.upsert_node(label, id, &record)?;
-        outcome.rows_loaded += 1;
     }
-    Ok(())
+    Ok(properties)
 }
 
 /// Convert a single Arrow array cell to a [`Value`]. Returns
@@ -375,5 +470,55 @@ mod tests {
 
         assert_eq!(outcome.rows_loaded, 1000);
         assert_eq!(outcome.commit_batches, 10);
+    }
+
+    fn write_synth_edges_parquet(path: &Path, pairs: &[(u64, u64)]) {
+        let schema = Schema::new(vec![
+            Field::new("src", DataType::FixedSizeBinary(16), false),
+            Field::new("dst", DataType::FixedSizeBinary(16), false),
+            Field::new("weight", DataType::Int32, true),
+        ]);
+        let srcs: Vec<[u8; 16]> = pairs.iter().map(|(s, _)| synth_id(*s)).collect();
+        let dsts: Vec<[u8; 16]> = pairs.iter().map(|(_, d)| synth_id(*d)).collect();
+        let src_array =
+            FixedSizeBinaryArray::try_from_iter(srcs.iter().map(|b| b.as_slice())).unwrap();
+        let dst_array =
+            FixedSizeBinaryArray::try_from_iter(dsts.iter().map(|b| b.as_slice())).unwrap();
+        let weights = Int32Array::from(pairs.iter().map(|(s, _)| *s as i32).collect::<Vec<_>>());
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(src_array), Arc::new(dst_array), Arc::new(weights)],
+        )
+        .unwrap();
+
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_edges_parquet_through_writer_session() {
+        let parquet = NamedTempFile::new().unwrap();
+        let pairs = [(0u64, 1u64), (1, 2), (2, 0)];
+        write_synth_edges_parquet(parquet.path(), &pairs);
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let paths = NamespacePaths::new("test", NamespaceId::new("pq-load-edges").unwrap());
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+        let outcome = load_edges(parquet.path(), &mut writer, "KNOWS", 0)
+            .await
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert_eq!(outcome.rows_loaded, 3);
+
+        // The first pair (id 0 -> id 1) is traversable as a KNOWS edge.
+        let snap = writer.snapshot();
+        let src0 = NodeId::from_uuid(Uuid::from_bytes(synth_id(0)));
+        let view = snap.out_edges("KNOWS", src0).await.unwrap();
+        assert_eq!(view.edges.len(), 1);
     }
 }
