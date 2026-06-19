@@ -82,6 +82,7 @@ pub async fn copy_namespace_snapshot(
     dst_paths: NamespacePaths,
     version: Option<u64>,
     overwrite: bool,
+    verify: bool,
 ) -> Result<SnapshotCopyReport> {
     // Refuse to stomp a live destination unless explicitly told to. A live
     // namespace is identified by its pointer: the Create-only family
@@ -156,19 +157,34 @@ pub async fn copy_namespace_snapshot(
 
     // 3. The manifest body, renumbered to a self-contained version 0 / fresh
     //    epoch. Its SST paths are relative, so it transplants unchanged apart
-    //    from the version and epoch fields.
+    //    from the version and epoch fields. When NOT overwriting, publish via
+    //    `PutMode::Create` (If-None-Match:*) so a concurrent backup that raced
+    //    past the pre-check is caught at the linearization point instead of
+    //    silently stomping (closing the head()-pre-check TOCTOU).
     manifest.version = 0;
     manifest.epoch = Epoch::ZERO;
     let manifest_path = dst_paths.manifest_version(0);
     let manifest_bytes = serde_json::to_vec(&manifest)?;
     bytes_copied += manifest_bytes.len() as u64;
+    let publish_create = !overwrite;
     dst_store
         .put_opts(
             &manifest_path,
             PutPayload::from(manifest_bytes),
-            PutOptions::from(PutMode::Overwrite),
+            PutOptions::from(if publish_create {
+                PutMode::Create
+            } else {
+                PutMode::Overwrite
+            }),
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => Error::precondition(format!(
+                "destination namespace '{}' was written concurrently — retry or pass overwrite/--force",
+                dst_paths.namespace()
+            )),
+            other => Error::ObjectStore(other),
+        })?;
     objects_copied += 1;
 
     // 4. The pointer LAST, so the destination commits atomically from a
@@ -202,20 +218,92 @@ pub async fn copy_namespace_snapshot(
         epoch: Epoch::ZERO,
         manifest_path: manifest_path.as_ref().to_string(),
     };
+    let pointer_bytes = serde_json::to_vec(&pointer)?;
+    bytes_copied += pointer_bytes.len() as u64;
     dst_store
         .put_opts(
             &dst_paths.pointer_version(0),
-            PutPayload::from(serde_json::to_vec(&pointer)?),
-            PutOptions::from(PutMode::Overwrite),
+            PutPayload::from(pointer_bytes.clone()),
+            PutOptions::from(if publish_create {
+                PutMode::Create
+            } else {
+                PutMode::Overwrite
+            }),
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => Error::precondition(format!(
+                "destination namespace '{}' was written concurrently — retry or pass overwrite/--force",
+                dst_paths.namespace()
+            )),
+            other => Error::ObjectStore(other),
+        })?;
     objects_copied += 1;
+
+    // Also publish the advisory `current.json` (see manifest.rs) so the
+    // restored namespace is findable via a non-LIST read on EC stores.
+    dst_store
+        .put(&dst_paths.current_pointer(), PutPayload::from(pointer_bytes))
+        .await
+        .map_err(Error::ObjectStore)?;
+    objects_copied += 1;
+
+    // Optional post-copy consistency verify: re-open the destination and HEAD
+    // every manifest-referenced object to confirm it landed with a non-zero
+    // size. Catches a partial copy (a dropped/short write) before the caller
+    // trusts the snapshot.
+    if verify {
+        verify_snapshot(&dst_store, &dst_paths, &manifest).await?;
+    }
 
     Ok(SnapshotCopyReport {
         source_version,
         objects_copied,
         bytes_copied,
     })
+}
+
+/// Re-open the destination and HEAD every SST body, side-car, and WAL segment
+/// the (renumbered) manifest references, failing if any is missing or
+/// empty. A best-effort integrity gate for `--verify`.
+async fn verify_snapshot(
+    store: &Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    manifest: &Manifest,
+) -> Result<()> {
+    let prefix = paths.namespace_prefix();
+    for sst in &manifest.ssts {
+        let rels: Vec<&str> = std::iter::once(sst.path.as_str())
+            .chain(sst.bloom.as_ref().map(|b| b.path.as_str()))
+            .chain(sst.unique_property_indices.iter().map(|u| u.path.as_str()))
+            .chain(sst.equality_property_indices.iter().map(|e| e.path.as_str()))
+            .chain(sst.label_index.as_ref().map(|l| l.path.as_str()))
+            .collect();
+        for rel in rels {
+            let p = Path::from(format!("{}/{}", prefix.as_ref(), rel));
+            let meta = store.head(&p).await.map_err(|e| {
+                Error::precondition(format!("verify: missing SST object {rel}: {e}"))
+            })?;
+            if meta.size == 0 {
+                return Err(Error::precondition(format!(
+                    "verify: SST object {rel} is empty (0 bytes)"
+                )));
+            }
+        }
+    }
+    for seg in &manifest.wal_segments {
+        let p = paths.wal_segment(seg.seq);
+        let meta = store.head(&p).await.map_err(|e| {
+            Error::precondition(format!("verify: missing WAL segment {}: {e}", seg.seq))
+        })?;
+        if meta.size == 0 {
+            return Err(Error::precondition(format!(
+                "verify: WAL segment {} is empty",
+                seg.seq
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Stream one object from `src` to `dst`, returning its byte length. Plain
@@ -327,6 +415,7 @@ mod tests {
             dst_paths.clone(),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -362,6 +451,7 @@ mod tests {
             dst_store.clone(),
             dst_paths.clone(),
             None,
+            false,
             false,
         )
         .await
@@ -402,6 +492,7 @@ mod tests {
             dst_paths.clone(),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -414,13 +505,14 @@ mod tests {
             dst_paths.clone(),
             None,
             false,
+            false,
         )
         .await
         .expect_err("must refuse to clobber a live destination");
         assert!(matches!(err, Error::Precondition(_)), "got {err:?}");
 
         // With overwrite, it proceeds.
-        copy_namespace_snapshot(src_store, src_paths, dst_store, dst_paths, None, true)
+        copy_namespace_snapshot(src_store, src_paths, dst_store, dst_paths, None, true, false)
             .await
             .unwrap();
     }
@@ -507,6 +599,7 @@ mod tests {
             dst_paths.clone(),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -544,13 +637,82 @@ mod tests {
             dst_paths.clone(),
             None,
             false,
+            false,
         )
         .await
         .unwrap();
-        // Just the manifest body and the pointer.
-        assert_eq!(report.objects_copied, 2);
+        // The manifest body, the pointer, and the advisory current.json.
+        assert_eq!(report.objects_copied, 3);
 
         // The restored empty namespace opens cleanly and carries no nodes.
         assert!(names_in(dst_store, dst_paths).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_passes_on_a_clean_copy_and_catches_a_missing_object() {
+        let (src_store, src_paths) = (store(), paths("bk-verify-src"));
+        {
+            let mut w = WriterSession::open(src_store.clone(), src_paths.clone())
+                .await
+                .unwrap();
+            w.upsert_node("Person", NodeId::new(), &person("Ada")).unwrap();
+            w.commit_batch().await.unwrap();
+            w.flush(schema()).await.unwrap();
+        }
+        let (dst_store, dst_paths) = (store(), paths("bk-verify-dst"));
+
+        // Clean copy with verify → succeeds.
+        copy_namespace_snapshot(
+            src_store.clone(),
+            src_paths.clone(),
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("verify passes on a clean copy");
+
+        // A second copy with one SST body deleted before verify → must fail
+        // loudly rather than report a healthy-but-truncated snapshot.
+        let (dst2_store, dst2_paths) = (store(), paths("bk-verify-dst2"));
+        copy_namespace_snapshot(
+            src_store,
+            src_paths,
+            dst2_store.clone(),
+            dst2_paths.clone(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        // Delete the first SST body the restored manifest references.
+        let dst_ms = ManifestStore::new(dst2_store.clone(), dst2_paths.clone());
+        let m = dst_ms.load_current().await.unwrap().manifest;
+        let first_sst = &m.ssts[0];
+        let rel = first_sst.path.as_str();
+        let p = object_store::path::Path::from(format!(
+            "{}/{}",
+            dst2_paths.namespace_prefix().as_ref(),
+            rel
+        ));
+        dst2_store.delete(&p).await.unwrap();
+        let err = copy_namespace_snapshot(
+            store(), // fresh src is fine; verify inspects dst
+            paths("bk-verify-src-3"),
+            dst2_store,
+            dst2_paths,
+            None,
+            true, // overwrite so the copy re-runs; verify then catches the gap
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("verify"),
+            "expected a verify failure, got: {err}"
+        );
     }
 }

@@ -157,6 +157,10 @@ enum Cmd {
         /// Proceed even if the destination already holds a namespace.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Re-open the destination after the copy and HEAD every referenced
+        /// SST/WAL object, failing if any is missing or empty.
+        #[arg(long, default_value_t = false)]
+        verify: bool,
     },
     /// Restore a namespace from a backup made with `backup`.
     ///
@@ -176,6 +180,10 @@ enum Cmd {
         /// Overwrite the destination even if it already holds a namespace.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Re-open the destination after the copy and HEAD every referenced
+        /// SST/WAL object, failing if any is missing or empty.
+        #[arg(long, default_value_t = false)]
+        verify: bool,
     },
 }
 
@@ -263,22 +271,24 @@ fn main() -> anyhow::Result<()> {
             to,
             version,
             force,
+            verify,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(copy_namespace_cmd("backed up", &from, &to, version, force))?;
+            rt.block_on(copy_namespace_cmd("backed up", &from, &to, version, force, verify))?;
         }
         Cmd::Restore {
             from,
             to,
             version,
             force,
+            verify,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(copy_namespace_cmd("restored", &from, &to, version, force))?;
+            rt.block_on(copy_namespace_cmd("restored", &from, &to, version, force, verify))?;
         }
     }
     Ok(())
@@ -292,11 +302,14 @@ async fn copy_namespace_cmd(
     to: &str,
     version: Option<u64>,
     force: bool,
+    verify: bool,
 ) -> anyhow::Result<()> {
     let (src_store, src_paths) = parse_uri(from)?;
     let (dst_store, dst_paths) = parse_uri(to)?;
-    let report =
-        copy_namespace_snapshot(src_store, src_paths, dst_store, dst_paths, version, force).await?;
+    let report = copy_namespace_snapshot(
+        src_store, src_paths, dst_store, dst_paths, version, force, verify,
+    )
+    .await?;
     println!(
         "{verb} {from} (source version {}) -> {to}",
         report.source_version
