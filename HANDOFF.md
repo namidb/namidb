@@ -157,16 +157,55 @@ return channel; `serve()`/`make_policy` signatures change; reqwest must be a
 feature-gated dep (not unconditional); default fail-closed for PDP. Gate behind
 feature `jwt`.
 
-### Item 08 PR1 — CALL/YIELD (L) — **needs rework (design verdict)**
-Lexer/AST/grammar → CallProcedure logical node → ProcRegistry source operator
-exposing `algo.wcc`/`algo.pagerank`. **Blocking holes:** a cfg strategy that
-keeps `Clause::Call` always-present but gates the lower arm **will not compile**
-(exhaustive match, no wildcard); P0 query-timeout is over-claimed (the kernels
-are synchronous CPU loops with no `.await`, so the deadline only fires after
-return); isolates dropped (build only calls `add_edge`, never enumerates nodes);
-`neighbours_of` does not exist on Snapshot (real API is `out_edges`); soft-keyword
-(Call/Yield) not reserved to avoid breaking `CALL` as an identifier. Use the
-EXPLAIN soft-keyword precedent.
+### Item 08 PR1 — CALL/YIELD (L) — design verified, ready to implement
+Lexer/AST/grammar → `CallProcedure` source leaf → executor runs `algo.wcc`/
+`algo.pagerank`. The four "blocking holes" from the prior verdict are now
+**resolved against code** (3-agent explore):
+
+- **cfg/exhaustive-match** → CALL is **in-band, always-on** (not feature-gated,
+  not out-of-band): `Clause::Call` + `LogicalPlan::CallProcedure` are
+  always-present variants; the lower arm produces the leaf, the executor runs
+  it. Same shape as `VectorSearch`. Graph algos are core, not experimental, so
+  no Cargo gate.
+- **isolates dropped** → the kernel handles isolates correctly
+  (`weakly_connected_components` enumerates `graph.nodes()`); the fix is the
+  *caller* must `add_node` for every node, not only `add_edge`. The
+  Snapshot→Graph bridge does `observed_labels()` → `scan_label(l)` →
+  `add_node(id)` per node (covers isolates), then `observed_edge_types()` →
+  `scan_edge_type(t)` → `add_edge(src,dst,weight)`.
+- **`neighbours_of` doesn't exist** → confirmed. The bridge uses
+  `scan_edge_type` (full properties incl. weights, unlike CSR `out_edges`).
+- **soft-keyword** → CALL/YIELD stay non-reserved (`Token::Ident`, matched
+  case-insensitively like EXPLAIN/VECTOR). Add a `Some(Token::Ident(n)) if n
+  eq "CALL"` arm in `parse_clause` before the fall-through error.
+
+**API ground truth** (all `namidb-graph/src/algo.rs`):
+- `Graph { add_node, add_edge(src,dst,Option<f64>), nodes, out_edges }`
+- `weakly_connected_components(&Graph) -> Components { assignment: HashMap<NodeId,usize>, count }`
+- `pagerank(&Graph, &PageRankOptions) -> PageRank { scores: HashMap<NodeId,f64>, iterations, converged }`
+- `PageRankOptions { damping:0.85, max_iterations:100, tolerance:1e-6 }` (`Default`)
+- Both kernels are **sync `fn`** taking `&Graph` — the caller builds the Graph.
+  No existing Snapshot→Graph bridge (namidb-graph lists namidb-storage as a dep
+  but doesn't use it); **write `Graph::from_snapshot(&Snapshot<'_>)` async
+  helper in namidb-graph** (nodes via scan_label, edges via scan_edge_type).
+
+**Executor integration** (`exec/walker.rs`): model on `VectorSearch`/`EdgeTypeCount`
+— a source leaf returns `Vec<Row>` directly, each `Row::new().with(alias,
+RuntimeValue)`. Column names = binding keys (the server derives columns from
+`rows.first().bindings.keys()`, `lib.rs:1649`). Has `snapshot` + `params` in
+scope. C5 tax: add the arm in walker flat (`:227`) + factor (`:2075`, wrap via
+`FactorRowSet::from_flat`), `execute_capped` (`:821`), writer delegate group
+(`:482`), `cardinality` (`:65`), `explain` (`:356`, no catch-all — required),
+`collect_plan_referenced_variables` (`:3657`), + the optimizer leaf groups
+(same set VectorSearch touched).
+
+**MVP scope:** `CALL <ns>.<name>([args]) [YIELD col [AS a], …]`; CALL must be
+the leading source clause; dispatch `algo.wcc` (YIELD `node_id, component`) and
+`algo.pagerank` (YIELD `node_id, score`; optional map arg for
+`{damping,max_iterations,tolerance}`). Deadline: the kernels are sync so the
+per-operator `check_deadline` (`walker.rs:219`) fires only around the call —
+documented limitation (a runaway kernel isn't interruptible mid-iteration;
+follow-up: thread `cancel::deadline_exceeded()` into the kernel loops).
 
 ### Deferred bug follow-ups (lower severity, documented)
 - s3b forward-probe `MAX_PROBE` gap-safety after GC (commented as best-effort;
