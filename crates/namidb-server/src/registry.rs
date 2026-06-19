@@ -37,12 +37,19 @@ pub struct NamespaceRegistry {
     root: String,
     /// Active namespace sessions, keyed by namespace string.
     sessions: RwLock<HashMap<String, Arc<NamespaceState>>>,
-    /// Maximum number of concurrent namespaces. When the cap is reached,
-    /// idle sessions are evicted oldest-first.
+    /// Maximum number of concurrent namespaces. `0` means unlimited (no cap,
+    /// no eviction). Otherwise, when the cap is reached, idle sessions are
+    /// evicted oldest-first.
     max_namespaces: usize,
     /// Idle eviction timeout: a namespace unused for this long is evicted
     /// (subject to the cap; eviction only happens when at capacity).
     idle_timeout: Duration,
+    /// Monotonic anchor (registry construction). `last_access` stores
+    /// `anchor.elapsed().as_secs()` so idle duration is
+    /// `now_secs - last_secs` — a plain arithmetic diff, not the
+    /// `Instant::now().elapsed()` near-zero value that previously broke
+    /// eviction entirely.
+    anchor: Instant,
     /// Process-wide metrics (flush, compaction, orphan-sweep increments).
     metrics: Arc<Metrics>,
 }
@@ -62,18 +69,33 @@ impl NamespaceRegistry {
             sessions: RwLock::new(HashMap::new()),
             max_namespaces,
             idle_timeout,
+            anchor: Instant::now(),
             metrics,
         }
+    }
+
+    /// Seconds elapsed since the registry's anchor — the clock `last_access`
+    /// is measured in. Cheap, monotonic, and yields a correct idle diff.
+    fn now_secs(&self) -> u64 {
+        self.anchor.elapsed().as_secs()
+    }
+
+    /// `true` if the cap is configured and reached.
+    fn at_capacity(&self, len: usize) -> bool {
+        self.max_namespaces != 0 && len >= self.max_namespaces
     }
 
     /// Get or create a `NamespaceState` for `namespace`. Returns an error
     /// if the namespace ID is invalid.
     pub async fn get_or_open(&self, namespace: &str) -> Result<Arc<NamespaceState>, RegistryError> {
+        let now = self.now_secs();
         // Fast path: read lock check
         {
             let sessions = self.sessions.read().await;
             if let Some(state) = sessions.get(namespace) {
-                state.last_access.store(Instant::now().elapsed().as_secs(), std::sync::atomic::Ordering::Relaxed);
+                state
+                    .last_access
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Arc::clone(state));
             }
         }
@@ -81,12 +103,14 @@ impl NamespaceRegistry {
         // Slow path: write lock, double-check, then create
         let mut sessions = self.sessions.write().await;
         if let Some(state) = sessions.get(namespace) {
-            state.last_access.store(Instant::now().elapsed().as_secs(), std::sync::atomic::Ordering::Relaxed);
+            state
+                .last_access
+                .store(now, std::sync::atomic::Ordering::Relaxed);
             return Ok(Arc::clone(state));
         }
 
-        // Evict if at capacity
-        while sessions.len() >= self.max_namespaces {
+        // Evict if at capacity (0 = unlimited, never evicts).
+        while self.at_capacity(sessions.len()) {
             if let Some(to_evict) = self.find_idle_oldest(&sessions) {
                 tracing::info!("evicting idle namespace: {}", to_evict);
                 sessions.remove(&to_evict);
@@ -111,9 +135,7 @@ impl NamespaceRegistry {
             namespace: namespace.to_string(),
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             snapshot,
-            last_access: std::sync::atomic::AtomicU64::new(
-                Instant::now().elapsed().as_secs()
-            ),
+            last_access: std::sync::atomic::AtomicU64::new(now),
         });
 
         sessions.insert(namespace.to_string(), Arc::clone(&state));
@@ -122,21 +144,18 @@ impl NamespaceRegistry {
     }
 
     /// Find the oldest idle namespace (unused for > idle_timeout). Returns
-    /// `None` if no namespace is idle.
+    /// `None` if no namespace is idle. Idle duration is the plain arithmetic
+    /// diff `now_secs - last_access_secs` (both measured from the same anchor).
     fn find_idle_oldest(&self, sessions: &HashMap<String, Arc<NamespaceState>>) -> Option<String> {
-        let now = Instant::now();
-        let mut oldest: Option<(&str, Duration)> = None;
+        let now_secs = self.now_secs();
+        let idle_timeout_secs = self.idle_timeout.as_secs();
+        let mut oldest: Option<(&str, u64)> = None;
 
         for (ns, state) in sessions.iter() {
             let last_secs = state.last_access.load(std::sync::atomic::Ordering::Relaxed);
-            // Reconstruct approximate Instant from stored seconds (this loses
-            // sub-second precision but is fine for idle eviction decisions).
-            let last = now - Duration::from_secs(now.elapsed().as_secs().saturating_sub(last_secs));
-            let idle = now.duration_since(last);
-            if idle > self.idle_timeout {
-                if oldest.map_or(true, |(_, t)| idle > t) {
-                    oldest = Some((ns.as_str(), idle));
-                }
+            let idle_secs = now_secs.saturating_sub(last_secs);
+            if idle_secs > idle_timeout_secs && oldest.map_or(true, |(_, t)| idle_secs > t) {
+                oldest = Some((ns.as_str(), idle_secs));
             }
         }
         oldest.map(|(ns, _)| ns.to_string())

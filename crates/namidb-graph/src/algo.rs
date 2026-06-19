@@ -225,18 +225,23 @@ pub fn pagerank(graph: &Graph, opts: &PageRankOptions) -> PageRank {
         for &node in graph.nodes() {
             new_scores.insert(node, teleport + dangling_share);
         }
-        // Push each node's rank along its out-edges.
+        // Push each node's rank along its out-edges. Total out-mass must be
+        // exactly `d * PR(src)` to conserve probability, so the per-edge share
+        // is `d * PR(src) * (w / Σw)` — normalized by the WEIGHT SUM, not the
+        // edge count. (Dividing by count and multiplying by w leaks mass when
+        // weights are not all 1.0.) A non-positive weight sum is degenerate;
+        // skip it rather than divide by zero / produce NaN.
         for (&src, nbrs) in &graph.out {
-            let outdeg = nbrs.len();
-            if outdeg == 0 {
+            if nbrs.is_empty() {
                 continue;
             }
-            let share = d * scores[&src] / outdeg as f64;
+            let weight_sum: f64 = nbrs.iter().map(|&(_, w)| w).sum();
+            if weight_sum <= 0.0 {
+                continue;
+            }
+            let base = d * scores[&src] / weight_sum;
             for &(dst, w) in nbrs {
-                // Weighted edges scale the contributed mass; the weight is
-                // relative to the edge, normalized across the out-set so total
-                // out-mass stays `d * PR(src)`.
-                *new_scores.get_mut(&dst).unwrap() += share * w;
+                *new_scores.get_mut(&dst).unwrap() += base * w;
             }
         }
 
@@ -430,5 +435,42 @@ mod tests {
         // All equal.
         assert!((vals[0] - vals[1]).abs() < 1e-9);
         assert!((vals[1] - vals[2]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pagerank_weighted_edges_conserve_mass() {
+        // Unequal weights: total out-mass must still be `d * PR(src)`, so the
+        // scores sum to ~1.0. The pre-fix code normalized by edge COUNT and
+        // leaked mass whenever weights were not all 1.0 (sum diverged from 1).
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let c = nid([3; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, Some(3.0));
+        g.add_edge(a, c, Some(1.0));
+        g.add_edge(b, c, Some(2.0));
+        let pr = pagerank(&g, &PageRankOptions::default());
+        let total: f64 = pr.scores.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "weighted PageRank must conserve mass (sum to 1.0), got {total}"
+        );
+        // All scores finite.
+        for v in pr.scores.values() {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn pagerank_zero_weight_does_not_nan() {
+        // Degenerate: a zero-weight edge must not produce NaN/inf.
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, Some(0.0));
+        let pr = pagerank(&g, &PageRankOptions::default());
+        for v in pr.scores.values() {
+            assert!(v.is_finite(), "score must be finite, got {v}");
+        }
     }
 }

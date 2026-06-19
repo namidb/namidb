@@ -474,8 +474,9 @@ impl ManifestStore {
             manifest_path: manifest_path.as_ref().to_string(),
         };
         let pointer_path = self.paths.pointer_version(manifest.version);
+        let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
         let put_res = self
-            .put_create(&pointer_path, serde_json::to_vec(&pointer)?.into())
+            .put_create(&pointer_path, pointer_bytes.clone())
             .await
             .map_err(|e| match e {
                 Error::ObjectStore(object_store::Error::AlreadyExists { .. }) => {
@@ -487,6 +488,10 @@ impl ManifestStore {
                 }
                 other => other,
             })?;
+
+        // Publish the advisory `current.json` for the freshly-bootstrapped
+        // namespace (see `write_advisory_current`).
+        self.write_advisory_current(pointer_bytes).await?;
 
         Ok(LoadedManifest::new(
             pointer,
@@ -567,10 +572,18 @@ impl ManifestStore {
     /// is empty (a legacy or uninitialised namespace).
     ///
     /// On eventually-consistent-LIST stores, an empty/stale LIST does **not**
-    /// prove non-existence. Before returning `None`, we HEAD `p0.json` (the
-    /// canonical bootstrap pointer) because GET/HEAD of a specific key is
-    /// read-after-write consistent on every targeted store. Only when that
-    /// specific-key probe also misses do we conclude the family is truly empty.
+    /// prove non-existence. We recover via two non-LIST probes, both using
+    /// GET/HEAD of a specific key (read-after-write consistent everywhere):
+    ///
+    /// 1. HEAD `p0.json` — closes the window for a *fresh* namespace whose
+    ///    LIST has simply not caught up to the just-created pointer.
+    /// 2. GET `current.json` (the advisory) — closes the window for an *aged*
+    ///    namespace where the janitor has reclaimed `p0` (and every pointer
+    ///    below the retention horizon). Without this, a stale empty LIST made
+    ///    the family look empty, `load_current` returned `NotFound`, and
+    ///    `WriterSession::open` re-bootstrapped a live namespace (data loss).
+    ///    The advisory is written on every commit/bootstrap; its `.version`
+    ///    is a lower bound the forward probe then advances to true current.
     async fn max_pointer_version(&self) -> Result<Option<u64>> {
         let dir = self.paths.pointer_dir();
         let mut stream = self.store.list(Some(&dir));
@@ -580,13 +593,28 @@ impl ManifestStore {
                 max = Some(max.map_or(v, |m| m.max(v)));
             }
         }
-        // Empty LIST on an EC store is not authoritative. Before concluding
-        // the family doesn't exist, verify via direct HEAD of p0 (read-after-write
-        // consistent everywhere). This prevents spurious bootstrap when LIST
-        // has not yet caught up to a just-created pointer.
         if max.is_none() {
+            // Fresh namespace: LIST lagged behind a just-created p0.
             if self.store.head(&self.paths.pointer_version(0)).await.is_ok() {
                 max = Some(0);
+            } else if let Ok(res) = self.store.get(&self.paths.current_pointer()).await {
+                // Aged namespace: p0 was reclaimed below the horizon, but the
+                // advisory current.json still names a valid version. Only trust
+                // it when the pointer at that version actually exists — a legacy
+                // namespace has current.json but NO pointer family, and must fall
+                // through to the None branch (which reads current.json directly).
+                if let Ok(body) = res.bytes().await {
+                    if let Ok(p) = serde_json::from_slice::<ManifestPointer>(&body) {
+                        if self
+                            .store
+                            .head(&self.paths.pointer_version(p.version))
+                            .await
+                            .is_ok()
+                        {
+                            max = Some(p.version);
+                        }
+                    }
+                }
             }
         }
         Ok(max)
@@ -736,7 +764,7 @@ impl ManifestStore {
     ) -> Result<LoadedManifest> {
         let pointer_path = self.paths.pointer_version(pointer.version);
         let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
-        let put_res = match self.put_create(&pointer_path, pointer_bytes).await {
+        let put_res = match self.put_create(&pointer_path, pointer_bytes.clone()).await {
             Ok(r) => r,
             Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {
                 // Another writer already published this version's pointer.
@@ -762,6 +790,14 @@ impl ManifestStore {
             }
             Err(other) => return Err(other),
         };
+
+        // Publish the advisory `current.json` so the version is findable via
+        // a non-LIST read on EC stores even after the janitor reclaims `p0`.
+        // See `write_advisory_current`. A failure here is a commit failure:
+        // the pointer Create already succeeded (the version is durable), but
+        // until the advisory lands it is not reliably discoverable, so we
+        // surface the error rather than leave a half-published version.
+        self.write_advisory_current(pointer_bytes.clone()).await?;
 
         Ok(LoadedManifest::new(
             pointer,
@@ -835,6 +871,35 @@ impl ManifestStore {
             .store
             .put_opts(path, PutPayload::from(body), opts)
             .await?)
+    }
+
+    /// Write the advisory `current.json` carrying the same body as the
+    /// just-published pointer `p<N>.json`.
+    ///
+    /// This is **not** part of the CAS contract — the Create-only pointer
+    /// family remains authoritative. It exists to close the data-loss window
+    /// in [`Self::max_pointer_version`] on eventually-consistent-LIST stores:
+    /// once the janitor reclaims `p0` (and every pointer below the retention
+    /// horizon), a stale empty LIST makes the family look empty. Without an
+    /// authoritative non-LIST signal, `load_current` fell through to a
+    /// `current.json` that post-RFC commits never wrote, returned `NotFound`,
+    /// and `WriterSession::open` re-bootstrapped a **live** namespace —
+    /// silent data loss on exactly the EC stores RFC-029 targets.
+    ///
+    /// The advisory is a plain PUT (`Overwrite`), the one universally
+    /// supported write primitive (no conditional needed), so it adds no
+    /// portability dependency. It is last-writer-wins and at worst slightly
+    /// stale; even a stale advisory points at a valid immutable manifest
+    /// body, and the forward probe in `load_pointer` then advances to the
+    /// true current. Its failure is treated as a commit failure: until it is
+    /// durable the version is not reliably findable on an EC store.
+    async fn write_advisory_current(&self, pointer_bytes: Bytes) -> Result<()> {
+        let path = self.paths.current_pointer();
+        self.store
+            .put(&path, PutPayload::from(pointer_bytes))
+            .await
+            .map_err(Error::ObjectStore)?;
+        Ok(())
     }
 }
 
@@ -1137,8 +1202,10 @@ mod tests {
 
     #[tokio::test]
     async fn commit_creates_versioned_pointer_family() {
-        // RFC-029: each commit publishes `pointer/p<N>.json` via Create and the
-        // legacy `current.json` is never written by the commit path.
+        // RFC-029: each commit publishes `pointer/p<N>.json` via Create. The
+        // advisory `current.json` (same body) is ALSO published so the version
+        // is findable via a non-LIST read on EC stores after the janitor
+        // reclaims p0 (see `max_pointer_version` / `write_advisory_current`).
         let (store, paths) = store();
         let ms = ManifestStore::new(store.clone(), paths.clone());
         let w = Uuid::now_v7();
@@ -1155,10 +1222,38 @@ mod tests {
             );
         }
         assert!(
-            store.head(&paths.current_pointer()).await.is_err(),
-            "the commit path must not write the legacy current.json"
+            store.head(&paths.current_pointer()).await.is_ok(),
+            "the advisory current.json must be published on commit"
         );
         assert_eq!(ms.load_current().await.unwrap().manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn load_current_resolves_after_p0_reclaimed_and_stale_list() {
+        // Regression for the data-loss bug: once the janitor reclaims p0
+        // (below the horizon) AND a LIST returns stale-empty, the family must
+        // STILL resolve via the advisory current.json — not fall through to
+        // NotFound and re-bootstrap a live namespace.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let w = Uuid::now_v7();
+        let mut current = ms.bootstrap(w).await.unwrap();
+        let fence = WriterFence::new(current.manifest.epoch);
+        for _ in 1u64..=3 {
+            let next = current.manifest.next_version(fence.writer_id);
+            current = ms.commit(&fence, &current, next).await.unwrap();
+        }
+        // Simulate the janitor reclaiming p0 (and below-horizon bodies/pointers).
+        store.delete(&paths.pointer_version(0)).await.unwrap();
+        // current.json advisory (written on commit) still points at version 3.
+        assert!(store.head(&paths.current_pointer()).await.is_ok());
+        // load_current must resolve to 3 (via advisory), never NotFound.
+        assert_eq!(ms.load_current().await.unwrap().manifest.version, 3);
+
+        // Even if we also deleted the advisory, the pointer family LIST (p1..p3)
+        // still resolves it the normal way; only the joint absence (p0 gone +
+        // stale empty LIST + no advisory) would fall through, and that is a
+        // truly uninitialised namespace, correctly bootstrapped by open.
     }
 
     #[tokio::test]

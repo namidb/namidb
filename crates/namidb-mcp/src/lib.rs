@@ -581,11 +581,15 @@ impl Server {
             }
         }
 
-        // Run lexical channel (substring search)
-        let lexical_results = self.lexical_channel(&text, &label, k, filter).await?;
-
-        // Run semantic channel (dense vector search)
-        let semantic_results = self.semantic_channel(&text, &label, &property, k, filter).await?;
+        // Run both channels concurrently (they are independent reads of the
+        // same snapshot) instead of sequentially — halves the latency of a
+        // hybrid query on a remote embedder or a large candidate set.
+        let (lexical_res, semantic_res) = tokio::join!(
+            self.lexical_channel(&text, &label, k, filter),
+            self.semantic_channel(&text, &label, &property, k, filter),
+        );
+        let lexical_results = lexical_res?;
+        let semantic_results = semantic_res?;
 
         // Fuse via RRF
         let fused = rrf_fuse(
@@ -618,11 +622,16 @@ impl Server {
             None => String::new(),
         };
 
+        // ORDER BY title makes the channel's ranks DETERMINISTIC (without it
+        // the rows come back in arbitrary storage order, so the RRF rank
+        // assigned to each note is non-reproducible). A real lexical-relevance
+        // score (BM25) is Layer B / deferred; this is the correctness floor.
         let cypher = format!(
             "MATCH (n:{label}) \
              WHERE (n.body CONTAINS $text OR n.title CONTAINS $text) \
                AND n.placeholder IS NULL{where_extra} \
              RETURN n.title AS title, n.path AS path \
+             ORDER BY n.title \
              LIMIT {candidate_limit}"
         );
 
@@ -730,9 +739,14 @@ impl Server {
             }
         }
 
-        // 1. Node set: id + readable title/path.
+        // 1. Node set: id + readable title/path. Drop placeholder stubs
+        // (unresolved-reference nodes with no real body/path); they are not
+        // real graph members and would otherwise pollute components/ranks.
+        // `n.placeholder IS NULL` is true for any node lacking the property,
+        // so this is safe on labels that never set it.
         let nodes_cypher = format!(
-            "MATCH (n:{label}) RETURN id(n) AS id, n.title AS title, n.path AS path"
+            "MATCH (n:{label}) WHERE n.placeholder IS NULL \
+             RETURN id(n) AS id, n.title AS title, n.path AS path"
         );
         let node_rows = self
             .run_read_query(&nodes_cypher, &Params::new())
@@ -761,6 +775,7 @@ impl Server {
         };
         let edges_cypher = format!(
             "MATCH (a:{label})-{type_filter}->(b:{label}) \
+             WHERE a.placeholder IS NULL AND b.placeholder IS NULL \
              RETURN id(a) AS src, id(b) AS dst"
         );
         let edge_rows = self
@@ -1063,11 +1078,11 @@ fn rrf_fuse(
 ) -> Vec<FusedResult> {
     let mut fused: HashMap<String, FusedResult> = HashMap::new();
 
-    // Process lexical channel
+    // Process lexical channel. RRF: score = weight / (k + rank), rank 1-indexed.
     for result in lexical {
         let key = format!("{}\0{}", result.title, result.path);
         let rank = result.lexical_rank.unwrap_or(usize::MAX);
-        let score = lexical_weight / (1.0 + k_constant as f64 + rank as f64);
+        let score = lexical_weight / (k_constant as f64 + rank as f64);
 
         fused.entry(key).or_insert_with(|| result.clone()).score += score;
     }
@@ -1076,7 +1091,7 @@ fn rrf_fuse(
     for result in semantic {
         let key = format!("{}\0{}", result.title, result.path);
         let rank = result.semantic_rank.unwrap_or(usize::MAX);
-        let score = semantic_weight / (1.0 + k_constant as f64 + rank as f64);
+        let score = semantic_weight / (k_constant as f64 + rank as f64);
 
         fused.entry(key).or_insert_with(|| result.clone()).score += score;
     }
