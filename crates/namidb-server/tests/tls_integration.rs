@@ -78,6 +78,10 @@ async fn serves_https_and_bolt_over_tls() {
         tls_cert: Some(certs.cert_path.to_path_buf()),
         tls_key: Some(certs.key_path.to_path_buf()),
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: "tls-it".to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
     let task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

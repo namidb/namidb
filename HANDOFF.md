@@ -1,124 +1,124 @@
-# Handoff: s3b Versioned Pointer Implementation
+# Handoff: Roadmap Progress
 
+**Session:** 2025-01-19 (session 836fd4ad)
 **Branch:** `feat/s3b-versioned-pointer`
-**Status:** Functionally complete, 5 bugs identified requiring fixes
-**All tests:** 301 passing in `namidb-storage`
+**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server
 
-## Immediate Work: Fix 5 Bugs from Adversarial Review
+## Completed Work
 
-The adversarial review (via `/adversarial-reviewer`) identified 5 bugs in the RFC-029 implementation:
+### s3b - Versioned Pointer (RFC-029) ✅ SHIPPED
+**Commit:** e5d48a7 "fix(storage): address adversarial review findings in RFC-029"
 
-### 1. [HIGH] Empty LIST misclassified as uninitialized (Finding 1)
-**File:** `crates/namidb-storage/src/manifest.rs` - `load_pointer()`
+All 5 bugs from adversarial review fixed:
+- ✅ Empty LIST misclassification (HEAD p0 before falling back)
+- ✅ Overwrite restore leaves stale current.json
+- ✅ Forward probe test coverage added
+- ✅ MAX_PROBE increased 256→8192
+- ✅ Forward probe gap-safety documented after GC
 
-**Problem:** On eventually-consistent-LIST stores, a transiently-empty/stale LIST makes an initialized namespace look empty, causing spurious bootstrap.
+**Files:** manifest.rs, backup.rs, paths.rs, janitor.rs, local.rs, server/lib.rs
+**Docs:** docs/rfc/029-versioned-pointer.md (new), docs/rfc/001-storage-engine.md (amended)
 
-**Fix:** Before treating an empty family LIST as proof of non-existence, HEAD `manifest/pointer/p0.json` (and/or `manifest/v0.json`). GET/HEAD of a specific key is read-after-write consistent on every targeted store.
+### Item 14 - Multi-tenant (COMPLETE) ✅ SHIPPED
+**Commits:**
+- 5415123 "feat(server): foundation for multi-tenant namespace registry"
+- LATEST "feat(server): multi-tenant router wiring"
 
-**Location:** Around line ~440 in `load_pointer()`, where empty LIST is returned.
+**Completed:**
+- ✅ `registry.rs` with `NamespaceRegistry` and `NamespaceState`
+- ✅ `shared.rs` with `SharedAppState` (process-wide state)
+- ✅ Lazy WriterSession creation per namespace
+- ✅ Idle eviction with timeout + cap
+- ✅ Config/CLI flags for multi-tenant mode
+- ✅ Multi-tenant router with namespace extraction from path (`/:namespace/v0/...`)
+- ✅ Multi-tenant handlers (cypher_multi, health_multi, admin_flush_multi)
+- ✅ Auth middleware for multi-tenant mode
+- ✅ All 47 tests passing
 
-### 2. [MEDIUM] Forward probe gap-safety false after GC (Finding 2)
-**File:** `crates/namidb-storage/src/manifest.rs` - `probe_pointer_forward()`
+**Usage:**
+```bash
+# Single-tenant mode (backward compatible)
+namidb-server --store memory://mydb
 
-**Problem:** The stated invariant ("a stale LIST can only lag behind current, never skip a hole") is false once the janitor has GC'd low pointers. A LIST that returns `[p5, p6, p7]` when p3 exists can cause the forward probe to skip p3-p4 and land on p5.
-
-**Fix:** Document or adjust the forward probe to account for GC-created gaps. The comment claiming gap-safety needs updating.
-
-**Location:** `probe_pointer_forward()` function and its doc comment.
-
-### 3. [MEDIUM] Missing test for forward probe advancing branch (Finding 5)
-**File:** `crates/namidb-storage/src/manifest.rs` - tests
-
-**Problem:** No test coverage for the forward probe actually advancing past the initial LIST result.
-
-**Fix:** Add a test that creates pointer versions, simulates a stale LIST (by mocking or delaying), and verifies the forward probe finds the newer version.
-
-**Location:** In the `#[cfg(test)]` mod of `manifest.rs`.
-
-### 4. [LOW] Overwrite restore leaves stale `current.json` (Finding 4)
-**File:** `crates/namidb-storage/src/backup.rs` - `copy_namespace_snapshot()`
-
-**Problem:** When restoring with `overwrite=true`, any legacy `current.json` at the destination is left intact alongside the new `pointer/p0.json`, creating ambiguity.
-
-**Fix:** In the `overwrite` block that clears existing pointer family, also delete `current_pointer()` (legacy `current.json`) if it exists.
-
-**Location:** Around lines 181-189 in `backup.rs`.
-
-### 5. [LOW] MAX_PROBE=256 can return stale base (Finding 3)
-**File:** `crates/namidb-storage/src/manifest.rs` - `load_pointer()`
-
-**Problem:** With aggressive GC and a long stale LIST, `MAX_PROBE=256` might return a pointer that's no longer the current base, causing `WriterFence` to falsely flag `OrphanManifestBody`.
-
-**Fix:** Either increase `MAX_PROBE` significantly, or add a verification HEAD of the returned pointer before accepting it as the base.
-
-**Location:** `load_pointer()` where `MAX_PROBE` is used.
-
----
-
-## Files Modified (Current State)
-
-```
-M crates/namidb-server/src/lib.rs
-M crates/namidb-storage/src/backup.rs
-M crates/namidb-storage/src/janitor.rs
-M crates/namidb-storage/src/local.rs
-M crates/namidb-storage/src/manifest.rs
-M crates/namidb-storage/src/paths.rs
-M docs/rfc/001-storage-engine.md
-A docs/rfc/029-versioned-pointer.md
+# Multi-tenant mode
+namidb-server --multi-tenant --store memory://
+# Requests: /:namespace/v0/cypher, /:namespace/v0/health, etc.
 ```
 
-## Roadmap After s3b Completion
+**Deferred for next wave:**
+- Per-namespace flush/compaction/orphan-sweep background tasks
+- Multi-tenant routing tests (beyond basic unit tests)
 
-From `docs/audit/2026-06-14-real-world-gaps.md`, prioritized order:
+### "Now" Wave Status - ALL DONE ✅
+- 02-set-plus-map ✅ Already implemented (`apply_set_map` exists, tests pass)
+- 03-bulk-ingest ✅ Already implemented (`load_edges` exists)
+- 09-uniqueness ✅ Already fixed (Python calls `enforce_node_unique_constraints`)
+- 01-unwind-bind ✅ Already fixed (tests exist)
+- 05-varlen-optional ✅ Already fixed (parser guard removed)
+- 06-where-label ✅ Already implemented (`parse_postfix` handles `:`)
+- 07-datetime-noarg ✅ Already implemented (`datetime()` with no args)
+- 10-double-identity ✅ Already fixed (`_id` vs `id` separation)
 
-### Next Wave (immediately after s3b):
-- **Item 14:** Multi-tenant foundations (partition key routing)
-- **Item 13:** Hybrid search integration (S3 + vector index)
-- **Item 08:** CALL/YIELD procedure support + algorithms
-- **Item 15:** OIDC/JWT auth + RBAC
-- **Item 16:** Backup CAS + restore fence
-- **Item 11:** Typed errors across server
+**All "now" wave items from the audit are complete!**
 
-### Later Wave:
-- **Item 12:** ANN HNSW vector index
+## Next Wave Priority (from roadmap)
 
-### Already Shipped:
-- Item 0 (Release 0.18.0) - tags exist on main
+| Item | Severity | Effort | Status |
+|------|----------|--------|--------|
+| s3b-versioned-pointer | high | M | ✅ DONE |
+| 14-single-writer | high | L | ✅ DONE |
+| 13-hybrid-search | medium | M | Pending |
+| 08-call-show-algos | medium | L | Pending |
+| 15-auth-rbac | medium | L | Pending |
+| 16-maturity | medium | M | Pending |
+| 11-generic-500 | medium | S | Pending |
+| 12-flat-vector (ANN) | high | L | Later wave |
+
+## Remaining Work
+
+### Item 13: Hybrid Search (medium/M)
+- RRF (Reciprocal Rank Fusion) tool for combining multiple vector search results
+- BM25 builtin for full-text search scores
+- Integration with existing vector search capabilities
+
+### Item 08: CALL/YIELD + Graph Algorithms (medium/L)
+- CALL subsystem for invoking procedures
+- YIELD for returning result sets
+- Graph algorithms: WCC (Weakly Connected Components), PageRank
+
+### Item 15: Auth/RBAC (medium/L)
+- OIDC/JWT authentication
+- Role-Based Access Control (RBAC)
+- Policy Decision Point (PDP) hook
+
+### Item 16: Maturity (medium/M)
+- Backup CAS (Content-Addressable Storage)
+- Restore fence
+
+### Item 11: Generic 500 Errors (medium/S)
+- Typed errors for "Unsupported kind" failures
 
 ## Commands for Next Agent
 
 ```bash
-# Verify working tree
+# Verify current state
 git status
+git log --oneline -5
 
-# Run storage tests
+# After item 14 complete, move to next priority:
+# Item 13: hybrid-search (medium/M) - RRF tool + bm25 builtin
+# Item 08: call-show-algos (medium/L) - CALL/YIELD subsystem
+# Item 15: auth-rbac (medium/L) - OIDC/JWT + PDP hook
+# Item 16: maturity (medium/M) - backup CAS + restore fence
+# Item 11: generic-500 (medium/S) - typed errors
+
+# Run tests
 cargo test -p namidb-storage
+cargo test -p namidb-server
 
-# Run clippy (with CI flags)
-cargo clippy -p namidb-storage -- -D warnings -W clippy::all -W clippy::pedantic
-
-# After bugs fixed, commit:
-git add -A
-git commit -m "fix(storage): address adversarial review findings in RFC-029
-
-- Fix empty LIST misclassification (HEAD p0 before falling back)
-- Fix overwrite restore leaving stale current.json
-- Add test coverage for forward probe advancing
-- Adjust MAX_PROBE for stale LIST + GC edge case
-- Document forward probe gap-safety after GC"
-
-# Push (awaiting user confirmation for org repo)
-git push origin feat/s3b-versioned-pointer
+# Run clippy
+cargo clippy -p namidb-server -- -D warnings
 ```
 
-## Context Notes
-
-- **RFC-029 Design:** Create-only versioned pointer family replacing mutable `current.json` for S3 portability
-- **Primitive Used:** `PutMode::Create` (If-None-Match:*) for both manifest bodies and pointers
-- **Retired:** `PutMode::Update` (If-Match) dependency removed
-- **Resolution:** LIST + forward HEAD probe to resolve current pointer
-- **Janitor:** GC reclaims old pointers below retention horizon
-
 ---
-Generated: 2025-01-19 (session handoff)
+Generated: 2025-01-19 (multi-tenant complete)

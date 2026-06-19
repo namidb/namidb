@@ -306,6 +306,10 @@ async fn boot_bolt_full(
         tls_cert: None,
         tls_key: None,
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: ns.to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -357,6 +361,10 @@ async fn boot_bolt_tokens(
         tls_cert: None,
         tls_key: None,
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: ns.to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -443,6 +451,10 @@ async fn bolt_create_then_match_roundtrip() {
         tls_cert: None,
         tls_key: None,
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: "bolt-test".to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
 
     let server_task = tokio::spawn(async move {
@@ -521,6 +533,10 @@ async fn bolt_bad_token_yields_failure() {
         tls_cert: None,
         tls_key: None,
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: "bolt-bad-auth".to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
 
     let server_task = tokio::spawn(async move {
@@ -663,6 +679,10 @@ async fn bolt_memgraph_introspection_populates_schema() {
         tls_cert: None,
         tls_key: None,
         slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: "bolt-introspect".to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

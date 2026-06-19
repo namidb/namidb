@@ -10,13 +10,14 @@ pub mod auth;
 pub mod bolt;
 mod introspect;
 pub mod metrics;
-mod registry;
+pub mod registry;
+pub mod shared;
 pub mod tls;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -35,6 +36,8 @@ use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, Write
 
 use crate::auth::{AuthConfig, Role};
 use crate::metrics::{Metrics, Protocol, QueryKind};
+use crate::registry::{NamespaceRegistry, NamespaceState};
+use crate::shared::SharedAppState;
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -316,6 +319,40 @@ pub fn build_router(state: AppState) -> Router {
     Router::new().merge(public).merge(private).with_state(state)
 }
 
+/// Build the multi-tenant router with namespace extraction.
+///
+/// Routes are `/:namespace/v0/...` for all v0 endpoints. The namespace is
+/// extracted from the path and used to look up (or create) a per-namespace
+/// `WriterSession` via the registry.
+///
+/// Public endpoints (no auth required):
+/// - `/:namespace/v0/livez` - liveness probe
+/// - `/:namespace/v0/health` - readiness probe with namespace info
+/// - `/v0/version` - process version (no namespace prefix)
+/// - `/v0/metrics` - Prometheus metrics (no namespace prefix)
+///
+/// Private endpoints (auth required):
+/// - `/:namespace/v0/cypher` - execute Cypher queries
+/// - `/:namespace/v0/admin/flush` - manual flush
+pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
+    let public = Router::new()
+        .route("/v0/version", get(version))
+        .route("/v0/metrics", get(metrics_handler_multi));
+
+    // Multi-tenant namespace-scoped routes: /:namespace/v0/...
+    let namespace_routes = Router::new()
+        .route("/:namespace/v0/livez", get(livez_multi))
+        .route("/:namespace/v0/health", get(health_multi))
+        .route("/:namespace/v0/cypher", post(cypher_multi))
+        .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
+        .layer(middleware::from_fn_with_state(shared.clone(), require_auth_multi));
+
+    Router::new()
+        .merge(public)
+        .merge(namespace_routes)
+        .with_state(shared)
+}
+
 /// Boot the server: parse URI, open a `WriterSession`, optionally
 /// spawn a periodic flush task, and serve until the process receives
 /// SIGINT.
@@ -344,6 +381,50 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         );
     } else {
         info!(tokens = auth.len(), "auth enabled");
+    }
+
+    // Multi-tenant mode: create a registry and build the multi-tenant router.
+    // The registry lazily creates WriterSessions per namespace on first access.
+    if config.multi_tenant {
+        let (store, _) = namidb_storage::parse_uri(&config.store_uri)
+            .map_err(|e| anyhow::anyhow!("invalid --store: {e}"))?;
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), config.slow_query_threshold);
+        let registry = NamespaceRegistry::new(
+            store,
+            String::new(), // flat layout (no root prefix)
+            config.max_namespaces,
+            config.namespace_idle_timeout,
+            metrics.clone(),
+        );
+        let registry = Arc::new(registry);
+        let shared = SharedAppState::new(
+            registry,
+            auth,
+            metrics,
+            config.query_timeout,
+            config.write_timeout,
+            config.query_row_cap,
+            config.write_stall_l0,
+            config.write_stall_delay,
+        );
+        let app = build_multi_tenant_router(shared);
+
+        // Shutdown signal.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+
+        // TLS on the serving path.
+        let tls_config: Option<Arc<rustls::ServerConfig>> = match (&config.tls_cert, &config.tls_key) {
+            (Some(cert), Some(key)) => Some(tls::load_server_config(cert, key)?),
+            (None, None) => None,
+            _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
+        };
+
+        info!(multi_tenant = true, "starting multi-tenant server");
+        return serve_http(app, config, tls_config, shutdown_rx).await;
     }
 
     let (store, paths) = namidb_storage::parse_uri(&config.store_uri)
@@ -502,7 +583,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // TLS on the serving path: when `--tls-cert` / `--tls-key` are set, both
     // the HTTP server and the Bolt listener speak TLS from one shared config;
     // otherwise the server stays plaintext.
-    let tls_config = match (&config.tls_cert, &config.tls_key) {
+    let tls_config: Option<Arc<rustls::ServerConfig>> = match (&config.tls_cert, &config.tls_key) {
         (Some(cert), Some(key)) => Some(tls::load_server_config(cert, key)?),
         (None, None) => None,
         _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
@@ -513,7 +594,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let bolt_auth = state.auth();
         let tx_timeout = config.bolt_tx_timeout;
         let bolt_shutdown = shutdown_rx.clone();
-        let bolt_tls = tls_config.clone().map(tls::acceptor);
+        let bolt_tls = tls_config.clone().map(|c| tls::acceptor(c));
         tokio::spawn(async move {
             if let Err(e) = bolt::serve(
                 bolt_state,
@@ -531,12 +612,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     let app = build_router(state);
+    serve_http(app, config, tls_config, shutdown_rx).await
+}
+
+/// Serve an HTTP router with TLS and graceful shutdown.
+async fn serve_http(
+    app: Router,
+    config: Config,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut http_shutdown = shutdown_rx;
 
     match tls_config {
         Some(server_config) => {
-            // HTTPS via axum-server. Its `Handle` drives the same SIGTERM /
-            // SIGINT drain the plaintext path gets.
             let handle = axum_server::Handle::new();
             let drain = handle.clone();
             tokio::spawn(async move {
@@ -591,6 +680,40 @@ async fn wait_for_shutdown_signal() {
 }
 
 // ── auth ──────────────────────────────────────────────────────────────
+
+async fn require_auth_multi(
+    State(shared): State<SharedAppState>,
+    mut req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    // Open mode: serve every request as read-write.
+    if shared.auth.is_open() {
+        req.extensions_mut().insert(Role::ReadWrite);
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(strip_bearer);
+    match presented.and_then(|token| shared.auth.role_for(token)) {
+        Some(role) => {
+            req.extensions_mut().insert(role);
+            next.run(req).await
+        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"namidb\""),
+            )],
+            Json(ErrorBody {
+                error: "missing or invalid bearer token".into(),
+            }),
+        )
+            .into_response(),
+    }
+}
 
 async fn require_auth(
     State(state): State<AppState>,
@@ -973,6 +1096,292 @@ async fn admin_flush(State(state): State<AppState>, Extension(role): Extension<R
         )
             .into_response(),
     }
+}
+
+// ── multi-tenant handlers ─────────────────────────────────────────────
+
+/// Liveness probe in multi-tenant mode. Same as single-tenant: no lock,
+/// no namespace state.
+async fn livez_multi() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Readiness probe in multi-tenant mode. Returns the namespace's manifest
+/// version and epoch.
+async fn health_multi(
+    Path(namespace): Path<String>,
+    State(shared): State<SharedAppState>,
+) -> impl IntoResponse {
+    match shared.registry.get_or_open(&namespace).await {
+        Ok(ns_state) => {
+            let owned = ns_state.snapshot.load();
+            let m = &owned.manifest().manifest;
+            Json(HealthResponse {
+                status: "ok",
+                namespace,
+                manifest_version: m.version,
+                epoch: m.epoch.as_u64(),
+            })
+            .into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody { error: e.to_string() }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Execute a Cypher query in multi-tenant mode.
+async fn cypher_multi(
+    Path(namespace): Path<String>,
+    State(shared): State<SharedAppState>,
+    Extension(role): Extension<Role>,
+    Json(req): Json<CypherRequest>,
+) -> Response {
+    let _in_flight = shared.metrics.track_in_flight();
+
+    // Get or create the namespace state.
+    let ns_state = match shared.registry.get_or_open(&namespace).await {
+        Ok(ns) => ns,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody { error: e.to_string() }),
+            )
+                .into_response();
+        }
+    };
+
+    let obs = run_cypher_multi(&ns_state, &shared, &req, role).await;
+    shared
+        .metrics
+        .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
+    obs.response
+}
+
+/// Run one HTTP Cypher request in multi-tenant mode.
+async fn run_cypher_multi(
+    ns_state: &NamespaceState,
+    shared: &SharedAppState,
+    req: &CypherRequest,
+    role: Role,
+) -> ObservedQuery {
+    let started = std::time::Instant::now();
+
+    let parsed = match cypher_parse(&req.query) {
+        Ok(p) => p,
+        Err(errs) => {
+            let first = &errs[0];
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("parse error: {} at {}", first.message, first.span),
+                    }),
+                )
+                    .into_response(),
+            };
+        }
+    };
+
+    let params = match params_from_json(&req.params) {
+        Ok(p) => p,
+        Err(e) => {
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response(),
+            };
+        }
+    };
+
+    // Plan against the latest published snapshot.
+    let owned = ns_state.snapshot.load();
+    let plan = {
+        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
+        match build_plan(&parsed, &catalog) {
+            Ok(p) => p,
+            Err(e) => {
+                return ObservedQuery {
+                    kind: None,
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorBody {
+                            error: format!("plan error: {e}"),
+                        }),
+                    )
+                        .into_response(),
+                };
+            }
+        }
+    };
+
+    if plan.contains_write() {
+        // A read-only token may not write.
+        if !role.allows_write() {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorBody {
+                        error: "this token is read-only; write queries are forbidden".into(),
+                    }),
+                )
+                    .into_response(),
+            };
+        }
+        let mut writer = ns_state.writer.lock().await;
+        let result = execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
+        let stall = if result.is_ok() {
+            ns_state.snapshot.store(writer.owned_snapshot());
+            shared.write_stall_for(writer.max_l0_bucket_len())
+        } else {
+            None
+        };
+        drop(writer);
+        let elapsed = started.elapsed();
+        if let Some(delay) = stall {
+            tokio::time::sleep(delay).await;
+        }
+        match result {
+            Ok(outcome) => {
+                let summary = WriteSummary::from(&outcome);
+                let (columns, rows) = rows_to_json(&outcome.rows);
+                ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: true,
+                    elapsed,
+                    response: Json(CypherResponse {
+                        columns,
+                        rows,
+                        write_outcome: Some(summary),
+                    })
+                    .into_response(),
+                }
+            }
+            Err(e) => ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("write execution failed: {e}"),
+                    }),
+                )
+                    .into_response(),
+            },
+        }
+    } else {
+        // Read path.
+        let snap = owned.borrow();
+        let result = execute_with_limits(
+            &plan,
+            &snap,
+            &params,
+            shared.query_deadline(),
+            shared.query_row_cap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        match result {
+            Ok(rows) => {
+                let (columns, rows) = rows_to_json(&rows);
+                ObservedQuery {
+                    kind: Some(QueryKind::Read),
+                    ok: true,
+                    elapsed,
+                    response: Json(CypherResponse {
+                        columns,
+                        rows,
+                        write_outcome: None,
+                    })
+                    .into_response(),
+                }
+            }
+            Err(e) => ObservedQuery {
+                kind: Some(QueryKind::Read),
+                ok: false,
+                elapsed,
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("read execution failed: {e}"),
+                    }),
+                )
+                    .into_response(),
+            },
+        }
+    }
+}
+
+/// Admin flush in multi-tenant mode.
+async fn admin_flush_multi(
+    Path(namespace): Path<String>,
+    State(shared): State<SharedAppState>,
+    Extension(role): Extension<Role>,
+) -> Response {
+    if !role.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin flush is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let ns_state = match shared.registry.get_or_open(&namespace).await {
+        Ok(ns) => ns,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody { error: e.to_string() }),
+            )
+                .into_response();
+        }
+    };
+    let mut w = ns_state.writer.lock().await;
+    let schema = w.snapshot().manifest().manifest.schema.clone();
+    match w.flush(schema).await {
+        Ok(outcome) => {
+            ns_state.snapshot.store(w.owned_snapshot());
+            Json(FlushResponse {
+                ssts_written: outcome.ssts_written,
+                bloom_sidecars_written: outcome.bloom_sidecars_written,
+                manifest_version: outcome.committed.manifest.version,
+            })
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("flush failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Prometheus metrics handler in multi-tenant mode.
+async fn metrics_handler_multi(State(shared): State<SharedAppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        shared.metrics.render(),
+    )
 }
 
 // ── value <-> json conversions ────────────────────────────────────────
