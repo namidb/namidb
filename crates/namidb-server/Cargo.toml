@@ -18,6 +18,7 @@ namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
 namidb-query = { workspace = true }
 namidb-bolt = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

@@ -2354,6 +2354,7 @@ dependencies = [
  "namidb-core",
  "namidb-query",
  "namidb-storage",
+ "object_store 0.13.2",
  "rcgen",
  "reqwest",
  "rustls",

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod bolt;
 mod introspect;
 pub mod metrics;
+mod registry;
 pub mod tls;
 
 use std::sync::Arc;
@@ -108,6 +109,23 @@ pub struct Config {
     /// counters and latency histograms at `/v0/metrics` are always on
     /// regardless of this. `Duration::ZERO` disables the slow-query log.
     pub slow_query_threshold: Duration,
+    /// Multi-tenant mode: when `true`, the server accepts a namespace via
+    /// path parameter (`/:namespace/v0/...`) or header (`X-NamiDB-Namespace`)
+    /// and routes to a per-namespace `WriterSession`. When `false`, the server
+    /// serves a single namespace (backward-compatible mode).
+    pub multi_tenant: bool,
+    /// Default namespace for backward compatibility. When `multi_tenant` is
+    /// `false`, this namespace is opened at boot and all requests go to it.
+    /// When `multi_tenant` is `true`, this is the fallback when no namespace
+    /// is specified.
+    pub default_namespace: String,
+    /// Maximum number of concurrent namespaces in multi-tenant mode. When
+    /// the cap is reached, idle namespaces are evicted oldest-first.
+    /// `0` means unlimited (use with caution).
+    pub max_namespaces: usize,
+    /// Idle eviction timeout for namespaces in multi-tenant mode. A namespace
+    /// unused for this long is eligible for eviction when at capacity.
+    pub namespace_idle_timeout: Duration,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across

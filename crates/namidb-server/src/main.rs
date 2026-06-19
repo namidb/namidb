@@ -183,6 +183,35 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     slow_query_threshold: Duration,
+
+    /// Multi-tenant mode: when `true`, the server accepts a namespace via path
+    /// parameter (`/:namespace/v0/...`) or header (`X-NamiDB-Namespace`) and
+    /// routes to a per-namespace WriterSession.
+    #[arg(long, env = "NAMIDB_MULTI_TENANT", default_value_t = false, action)]
+    multi_tenant: bool,
+
+    /// Default namespace for backward compatibility. When `multi_tenant` is
+    /// `false`, this namespace is opened at boot and all requests go to it.
+    /// When `multi_tenant` is `true`, this is the fallback when no namespace
+    /// is specified.
+    #[arg(long, env = "NAMIDB_DEFAULT_NAMESPACE", default_value = "default")]
+    default_namespace: String,
+
+    /// Maximum number of concurrent namespaces in multi-tenant mode. When
+    /// the cap is reached, idle namespaces are evicted oldest-first.
+    /// `0` means unlimited (use with caution).
+    #[arg(long, env = "NAMIDB_MAX_NAMESPACES", default_value_t = 100)]
+    max_namespaces: usize,
+
+    /// Idle eviction timeout for namespaces in multi-tenant mode. A namespace
+    /// unused for this long is eligible for eviction when at capacity.
+    #[arg(
+        long,
+        env = "NAMIDB_NAMESPACE_IDLE_TIMEOUT",
+        default_value = "1h",
+        value_parser = humantime::parse_duration,
+    )]
+    namespace_idle_timeout: Duration,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -215,6 +244,10 @@ fn main() -> anyhow::Result<()> {
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,
         slow_query_threshold: cli.slow_query_threshold,
+        multi_tenant: cli.multi_tenant,
+        default_namespace: cli.default_namespace,
+        max_namespaces: cli.max_namespaces,
+        namespace_idle_timeout: cli.namespace_idle_timeout,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
