@@ -18,12 +18,19 @@ use axum::{Json, response::IntoResponse};
 use axum::response::Response;
 use axum::http::StatusCode;
 use namidb_core::NamespaceId;
-use namidb_storage::{sweep_orphans, ManifestStore, NamespacePaths, SnapshotCell, WriterSession};
+use namidb_query::StatsCatalog;
+use namidb_storage::{
+    sweep_orphans, Manifest, ManifestStore, NamespacePaths, SnapshotCell, WriterSession,
+};
 use object_store::ObjectStore;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
 use crate::metrics::Metrics;
+
+/// `(manifest_version, catalog)` memoised behind a mutex and shared across
+/// cloned [`NamespaceState`]s. `None` until the first read query builds it.
+type CatalogCache = Arc<std::sync::Mutex<Option<(u64, Arc<StatsCatalog>)>>>;
 
 /// Per-namespace background-maintenance configuration. Mirrors the
 /// single-tenant `Config` fields that drive flush/compaction/orphan-sweep,
@@ -171,6 +178,7 @@ impl NamespaceRegistry {
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             snapshot,
             last_access: std::sync::atomic::AtomicU64::new(now),
+            catalog_cache: Arc::new(std::sync::Mutex::new(None)),
         });
 
         // Spawn per-namespace background maintenance (flush / compaction /
@@ -300,6 +308,28 @@ pub struct NamespaceState {
     /// Last access time (seconds since Unix epoch). Updated on every
     /// `get_or_open` hit by the registry.
     pub last_access: std::sync::atomic::AtomicU64,
+    /// Memoised optimizer stats, keyed by manifest version. Building the
+    /// catalog is `O(ssts)`; without this every multi-tenant read query
+    /// rebuilt it from scratch.
+    pub catalog_cache: CatalogCache,
+}
+
+impl NamespaceState {
+    /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
+    /// version and reused across queries until the next write bumps the
+    /// version. Mirrors the single-tenant `AppState::catalog_for`.
+    pub fn catalog_for(&self, manifest: &Manifest) -> Arc<StatsCatalog> {
+        let version = manifest.version;
+        let mut slot = self.catalog_cache.lock().expect("catalog cache poisoned");
+        if let Some((cached_version, catalog)) = slot.as_ref() {
+            if *cached_version == version {
+                return Arc::clone(catalog);
+            }
+        }
+        let catalog = Arc::new(StatsCatalog::from_manifest(manifest));
+        *slot = Some((version, Arc::clone(&catalog)));
+        catalog
+    }
 }
 
 /// Errors from namespace registry operations.

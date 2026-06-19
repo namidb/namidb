@@ -1283,10 +1283,12 @@ async fn run_cypher_multi(
         }
     };
 
-    // Plan against the latest published snapshot.
+    // Plan against the latest published snapshot. The optimizer catalog is
+    // memoised per manifest version on the namespace state (building it is
+    // O(ssts)), so a read-heavy namespace does not rebuild it every query.
     let owned = ns_state.snapshot.load();
     let plan = {
-        let catalog = StatsCatalog::from_manifest(&owned.manifest().manifest);
+        let catalog = ns_state.catalog_for(&owned.manifest().manifest);
         match build_plan(&parsed, &catalog) {
             Ok(p) => p,
             Err(e) => {
