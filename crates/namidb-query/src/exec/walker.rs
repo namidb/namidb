@@ -1260,6 +1260,7 @@ fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<Stri
 /// decoded column per node rather than the whole property map. Candidates with
 /// a missing/NULL embedding or a zero-magnitude vector (undefined cosine) are
 /// dropped.
+#[allow(clippy::too_many_arguments)]
 async fn flat_vector_search(
     snapshot: &Snapshot<'_>,
     label: Option<&str>,

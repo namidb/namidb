@@ -428,23 +428,14 @@ async fn compact_leveled(
 
     // VectorGraph SSTs (RFC-030 / `vector-index`). A Vamana graph is not
     // row-mergeable: on a compaction that picks up an existing VectorGraph
-    // bucket, the index must be *rebuilt* from the current merged node rows,
-    // not merged graph-to-graph. The rebuild hook (`vector_index::rebuild`)
-    // is feature-gated; off-feature no VectorGraph SST is ever written, so this
-    // bucket is empty and the pass-through below is a no-op. Either way,
-    // surviving VectorGraph SSTs (un-touched here) carry forward via
-    // `next.ssts.retain`.
-    #[cfg(feature = "vector-index")]
-    {
-        // On-feature rebuild lands in Step 5; until then these are rebuilt by
-        // the dedicated hook invoked from the node-bucket loop. Any leftover
-        // descriptors here pass through unchanged.
-        for (_index_name, _sources) in &vector_buckets {}
-    }
+    // bucket, the index is *rebuilt* from the current merged node rows by
+    // `build_vector_indexes_for_nodes` (feature-gated, invoked in the
+    // node-bucket loop), and the prior VectorGraph SSTs are marked for removal
+    // there. Surviving (not-rebuilt) VectorGraph SSTs carry forward via
+    // `next.ssts.retain`. Off-feature no VectorGraph SST is ever written, so the
+    // bucket is empty — keep a use so the binding isn't flagged unused.
     #[cfg(not(feature = "vector-index"))]
-    {
-        let _ = &vector_buckets;
-    }
+    let _ = &vector_buckets;
 
     if removed_ids.is_empty() {
         debug!("compactor found no L0 bucket with >1 SSTs; nothing to do");

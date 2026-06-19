@@ -364,7 +364,7 @@ mod tests {
         let mut total_recall = 0.0;
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         for i in 0..50 {
-            let q = perturbed(&mut rng, &space.vector((i as u32) % (clusters as u32)), 0.1);
+            let q = perturbed(&mut rng, space.vector((i as u32) % (clusters as u32)), 0.1);
             let truth = exact_topk(&space, &q, k);
             let approx: Vec<u32> = search(&space, &g, &q, k, ef).into_iter().map(|n| n.id).collect();
             total_recall += recall(&approx, &truth);
@@ -399,7 +399,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         for i in 0..50 {
             // Use the f32 ground truth, search over the int8 graph/space.
-            let q = perturbed(&mut rng, &space.vector((i as u32) % (clusters as u32)), 0.1);
+            let q = perturbed(&mut rng, space.vector((i as u32) % (clusters as u32)), 0.1);
             let truth = exact_topk(&space, &q, k);
             let approx: Vec<u32> = search(&i8space, &g, &q, k, ef).into_iter().map(|n| n.id).collect();
             total_recall += recall(&approx, &truth);
