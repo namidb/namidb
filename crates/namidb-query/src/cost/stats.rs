@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use namidb_core::{LabelDictionary, LabelId, Schema};
 use namidb_storage::manifest::KindSpecificStats;
+use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric};
 use namidb_storage::sst::hll::Hll;
 use namidb_storage::sst::stats::{HllSketchBytes, StatScalar};
 use namidb_storage::{Manifest, SstDescriptor, SstKind};
@@ -30,6 +31,10 @@ pub struct StatsCatalog {
     edge_types: BTreeMap<String, EdgeTypeStats>,
     total_nodes: u64,
     total_edges: u64,
+    /// Registered DiskANN/Vamana vector indexes (RFC-030). The optimizer's
+    /// `vector_search` rewrite looks a descriptor up by `(label, property,
+    /// metric)` to decide whether a KNN shape can use the index.
+    vector_indexes: Vec<VectorIndexDescriptor>,
 }
 
 /// Per-label aggregate stats.
@@ -112,6 +117,7 @@ impl StatsCatalog {
             edge_types: BTreeMap::new(),
             total_nodes,
             total_edges: 0,
+            vector_indexes: Vec::new(),
         }
     }
 
@@ -257,7 +263,22 @@ impl StatsCatalog {
             edge_types,
             total_nodes,
             total_edges,
+            vector_indexes: m.vector_indexes.clone(),
         }
+    }
+
+    /// The vector index for `(label, property, metric)`, if one is registered.
+    /// Used by the `vector_search` optimizer rewrite to decide whether a KNN
+    /// shape can be served by the index.
+    pub fn vector_index_for(
+        &self,
+        label: &str,
+        property: &str,
+        metric: VectorMetric,
+    ) -> Option<&VectorIndexDescriptor> {
+        self.vector_indexes
+            .iter()
+            .find(|d| d.matches(label, property, metric))
     }
 
     pub fn label(&self, name: &str) -> Option<&LabelStats> {

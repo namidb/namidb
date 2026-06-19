@@ -1278,6 +1278,20 @@ async fn flat_vector_search(
     // evaluate it once against an empty row.
     let q = evaluate(query, &Row::new(), params)?;
     let limit = k.as_const().unwrap_or(10) as usize;
+
+    // RFC-030 (`vector-index`): serve from the Vamana index when one exists for
+    // (label, property, metric). Falls through to the flat scan otherwise.
+    #[cfg(feature = "vector-index")]
+    {
+        if let Some(rows) = try_index_search(
+            snapshot, label, alias, property, &q, limit, distance, score_alias,
+        )
+        .await?
+        {
+            return Ok(rows);
+        }
+    }
+
     let labels = resolve_node_labels(snapshot, label);
     let projection = vec![property.to_string()];
 
@@ -1315,6 +1329,76 @@ async fn flat_vector_search(
         out.push(row);
     }
     Ok(out)
+}
+
+/// RFC-030 (`vector-index`): serve a `VectorSearch` from the Vamana index when
+/// one is registered for `(label, property, metric)`. Returns `Ok(None)` when
+/// no index applies (no label, euclidean metric, or no descriptor) so the
+/// caller falls through to the flat scan.
+#[cfg(feature = "vector-index")]
+#[allow(clippy::too_many_arguments)]
+async fn try_index_search(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    alias: &str,
+    property: &str,
+    q: &RuntimeValue,
+    k: usize,
+    distance: crate::plan::logical::VectorDistance,
+    score_alias: &str,
+) -> Result<Option<Vec<Row>>, ExecError> {
+    use crate::plan::logical::VectorDistance;
+    use namidb_storage::manifest::VectorMetric;
+
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    let metric = match distance {
+        VectorDistance::Cosine => VectorMetric::Cosine,
+        VectorDistance::Dot => VectorMetric::Dot,
+        VectorDistance::Euclidean => VectorMetric::Euclidean,
+    };
+    // Euclidean is not yet indexable (no L2 space in namidb-ann); flat scan.
+    if metric == VectorMetric::Euclidean {
+        return Ok(None);
+    }
+    let desc = snapshot
+        .manifest()
+        .manifest
+        .vector_indexes
+        .iter()
+        .find(|d| d.matches(label, property, metric));
+    let Some(desc) = desc else {
+        return Ok(None);
+    };
+
+    // Coerce the query to f32 for the index search.
+    let qv: Vec<f32> = match q {
+        RuntimeValue::Vector(v) => v.clone(),
+        RuntimeValue::Vector8 { codes, scale } => {
+            codes.iter().map(|&c| c as f32 * *scale).collect()
+        }
+        _ => return Ok(None),
+    };
+
+    // Beam wider than k for recall (the index reranks in full f32 precision,
+    // so a generous ef costs little and lifts recall@k).
+    let ef = k.max(64);
+    let hits = snapshot.vector_search(&desc.name, &qv, k, ef).await?;
+
+    let mut out = Vec::with_capacity(hits.len());
+    for (node_id, score) in hits {
+        if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            row.set(score_alias.to_string(), RuntimeValue::Float(score as f64));
+            out.push(row);
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Resolve the set of edge types an `Expand` operator must traverse.

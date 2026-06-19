@@ -2221,6 +2221,43 @@ impl<'mt> Snapshot<'mt> {
         self.fetch_bytes(&absolute).await
     }
 
+    /// RFC-030 (`vector-index`): approximate top-k over the `VectorGraph`
+    /// SST(s) registered for `index_name`. Returns `(NodeId, similarity)`
+    /// best-first (higher similarity = closer). Unions across every in-scope
+    /// VectorGraph SST and re-ranks — there is normally exactly one per index
+    /// for an id-primary namespace, but a partial rebuild can briefly leave
+    /// two. `ef` is the search beam width (≥ `k`).
+    #[cfg(feature = "vector-index")]
+    pub async fn vector_search(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        use crate::sst::vector::VectorGraphIndex;
+
+        let mut all: Vec<(NodeId, f32)> = Vec::new();
+        for desc in &self.manifest.manifest.ssts {
+            if desc.kind != SstKind::VectorGraph || desc.scope != index_name {
+                continue;
+            }
+            let body = self.get_sst_body(desc).await?;
+            let idx = VectorGraphIndex::decode(&body)?;
+            all.extend(
+                idx.search(query, k, ef)
+                    .into_iter()
+                    .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
+            );
+        }
+        // Best-first: higher similarity first.
+        all.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all.truncate(k);
+        Ok(all)
+    }
+
     /// Return the decoded edge property streams for the SST identified by
     /// `absolute`, hitting [`SstCache::get_edge_streams`] first and
     /// decoding via the freshly-opened `reader` on miss.

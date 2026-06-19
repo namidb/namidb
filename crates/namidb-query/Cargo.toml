@@ -12,9 +12,11 @@ readme = "README.md"
 [features]
 default = []
 # DiskANN/Vamana ANN support (RFC-030). Gates the `vector_search` optimizer
-# rewrite that produces `LogicalPlan::VectorSearch`; the variant and its flat
-# fallback are always compiled. Default off.
-vector-index = []
+# rewrite (produces `LogicalPlan::VectorSearch`) and the executor's
+# index-backed dispatch; enables the storage-side `vector-index` so the
+# `Snapshot::vector_search` reader exists. The variant + its flat fallback are
+# always compiled. Default off.
+vector-index = ["namidb-storage/vector-index"]
 
 [dependencies]
 namidb-core = { workspace = true }

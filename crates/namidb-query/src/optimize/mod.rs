@@ -36,6 +36,8 @@ pub mod parquet_pushdown;
 pub mod projection_pushdown;
 pub mod pushdown;
 pub mod unique_lookup;
+#[cfg(feature = "vector-index")]
+pub mod vector_search;
 
 pub use decorrelation::convert_semi_apply_to_hash_semi_join;
 pub use edge_count_pushdown::apply_edge_count_pushdown;
@@ -73,6 +75,13 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // already-replaced point-lookup operator and don't re-introduce
         // a Filter on top of it.
         let unique_lookup = unique_lookup::apply_unique_property_lookup(current.clone(), catalog);
+        // RFC-030 (`vector-index`): collapse a flat KNN shape into a
+        // VectorSearch when a backing index exists. Runs right after
+        // unique_lookup (also a NodeScan-shape rewrite) and before pushdown so
+        // the new leaf operator is visible to the column analysis.
+        #[cfg(feature = "vector-index")]
+        let unique_lookup =
+            vector_search::apply_vector_search(unique_lookup, catalog);
         let pushed = normalize_filters(predicate_pushdown(unique_lookup));
         let hashed = convert_cross_to_hash(pushed, catalog);
         let decorrelated = convert_semi_apply_to_hash_semi_join(hashed, catalog);
