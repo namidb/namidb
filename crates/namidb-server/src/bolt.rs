@@ -484,6 +484,14 @@ fn map_lower_err(e: LowerError) -> BackendError {
 }
 
 fn map_exec_err(e: ExecError) -> BackendError {
+    // A deliberately-unsupported feature surfaces as the typed
+    // `BackendError::Unsupported` (Neo.ClientError.Statement.NotSupported),
+    // not a generic eval/storage bucket — so a driver can tell "not
+    // implemented" from a genuine internal bug. This is the exec-side twin
+    // of `map_lower_err`'s UnsupportedFeature arm.
+    if e.is_unsupported() {
+        return BackendError::Unsupported(e.to_string());
+    }
     match e {
         // A constraint violation has its own Neo4j error class so drivers
         // can distinguish it from an ordinary evaluation error.

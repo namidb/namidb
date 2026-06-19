@@ -65,6 +65,19 @@ impl fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
+impl ExecError {
+    /// `true` if this error is a deliberately-unsupported feature (unknown
+    /// function, unimplemented expression form) rather than an internal bug.
+    /// Transports use this to surface a typed "not supported" error instead
+    /// of a bare 500 / generic storage/eval bucket.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            ExecError::Eval(e) if e.kind == super::expr::EvalErrorKind::Unsupported
+        )
+    }
+}
+
 impl From<EvalError> for ExecError {
     fn from(e: EvalError) -> Self {
         ExecError::Eval(e)

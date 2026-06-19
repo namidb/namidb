@@ -12,12 +12,26 @@ use super::row::Row;
 use super::value::RuntimeValue;
 use crate::parser::{BinaryOp, Expression, ExpressionKind, Literal, SourceSpan, StringOp, UnaryOp};
 
+/// Classification of an [`EvalError`]. `Unsupported` distinguishes a feature
+/// the engine deliberately does not implement (e.g. an unknown function) from
+/// a genuine internal bug, so transports can surface a typed "not supported"
+/// error instead of a bare 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalErrorKind {
+    /// Anything not specifically classified — treated as an internal error.
+    Generic,
+    /// A feature the engine does not support (unknown function, unsupported
+    /// expression form). Maps to a "not supported" error on every transport.
+    Unsupported,
+}
+
 /// Runtime error returned by expression / executor code. Carries a span
-/// for diagnostics.
+/// for diagnostics and a [`EvalErrorKind`] for typed classification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalError {
     pub message: String,
     pub span: SourceSpan,
+    pub kind: EvalErrorKind,
 }
 
 impl EvalError {
@@ -25,6 +39,16 @@ impl EvalError {
         Self {
             message: msg.into(),
             span,
+            kind: EvalErrorKind::Generic,
+        }
+    }
+
+    /// Construct an `Unsupported` error (unknown function, unimplemented form).
+    pub fn unsupported(msg: impl Into<String>, span: SourceSpan) -> Self {
+        Self {
+            message: msg.into(),
+            span,
+            kind: EvalErrorKind::Unsupported,
         }
     }
 }
@@ -904,7 +928,7 @@ fn call_scalar_function(
             )),
         },
 
-        _ => Err(EvalError::new(
+        _ => Err(EvalError::unsupported(
             format!("function `{}` is not supported in v0", name),
             span,
         )),

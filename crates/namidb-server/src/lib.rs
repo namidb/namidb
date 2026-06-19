@@ -792,6 +792,34 @@ struct ErrorBody {
     error: String,
 }
 
+/// Classify an executor error for the HTTP response: the status code and the
+/// machine-readable `code`. A deliberately-unsupported feature is a 400 with
+/// `code: "unsupported"` (not a 500), so clients can tell "not implemented"
+/// from a genuine server bug.
+fn exec_error_classification(e: &namidb_query::exec::ExecError) -> (StatusCode, Option<&'static str>) {
+    use namidb_query::exec::ExecError;
+    match e {
+        ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+        ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
+        other if other.is_unsupported() => (StatusCode::BAD_REQUEST, Some("unsupported")),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
+    }
+}
+
+/// Build an HTTP error response from an executor failure, classifying it so a
+/// deliberately-unsupported feature surfaces as 400/`unsupported` instead of
+/// a bare 500. The `code` field is emitted only when classified, so existing
+/// clients that deserialize the body loosely see no change on plain 500s.
+fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Response {
+    let (status, code) = exec_error_classification(e);
+    let error = format!("{prefix}: {e}");
+    let body = match code {
+        Some(c) => Json(serde_json::json!({ "error": error, "code": c })),
+        None => Json(serde_json::json!({ "error": error })),
+    };
+    (status, body).into_response()
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -1031,13 +1059,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> Observ
                 kind: Some(QueryKind::Write),
                 ok: false,
                 elapsed,
-                response: (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorBody {
-                        error: format!("write execution failed: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: exec_failure_response("write execution failed", &e),
             },
         }
     } else {
@@ -1073,13 +1095,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> Observ
                 kind: Some(QueryKind::Read),
                 ok: false,
                 elapsed,
-                response: (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorBody {
-                        error: format!("read execution failed: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: exec_failure_response("read execution failed", &e),
             },
         }
     }
@@ -1339,13 +1355,7 @@ async fn run_cypher_multi(
                 kind: Some(QueryKind::Write),
                 ok: false,
                 elapsed,
-                response: (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorBody {
-                        error: format!("write execution failed: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: exec_failure_response("write execution failed", &e),
             },
         }
     } else {
@@ -1379,13 +1389,7 @@ async fn run_cypher_multi(
                 kind: Some(QueryKind::Read),
                 ok: false,
                 elapsed,
-                response: (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorBody {
-                        error: format!("read execution failed: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: exec_failure_response("read execution failed", &e),
             },
         }
     }
@@ -2049,6 +2053,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unsupported_function_is_typed_400_not_500() {
+        // An unknown function is a deliberately-unsupported feature, not an
+        // internal bug — it must surface as 400 with code:"unsupported", not
+        // a bare 500 (item 11: typed "not supported" errors).
+        let app = fixture(None).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "query": "RETURN bogus_function(1) AS x"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "unsupported", "body was: {v}");
     }
 
     /// Build a multi-tenant router over a fresh memory store with the given
