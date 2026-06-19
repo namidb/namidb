@@ -101,6 +101,7 @@ fn synth_record(i: u64) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        labels: Vec::new(),
     }
 }
 

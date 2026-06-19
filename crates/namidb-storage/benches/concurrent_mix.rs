@@ -132,6 +132,7 @@ fn synth_record(i: u64) -> NodeWriteRecord {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        labels: Vec::new(),
     }
 }
 
@@ -274,7 +275,7 @@ async fn run_concurrent_mix(
                 .load_current()
                 .await
                 .expect("ManifestStore::load_current (reader init)");
-            let empty = Memtable::new();
+            let empty = Memtable::new().snapshot_view();
             let mut rng = Xorshift64::new(0xC0FFEE_u64);
             let mut count: u64 = 0;
 

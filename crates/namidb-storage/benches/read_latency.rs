@@ -110,6 +110,7 @@ fn synth_payload(i: u64) -> Bytes {
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
+        labels: Vec::new(),
     }
     .encode()
     .unwrap()
@@ -162,10 +163,7 @@ async fn build_fixture(node_count: u64) -> Fixture {
             let id = synth_node_id(i);
             ids.push(id);
             mt.apply(
-                MemKey::Node {
-                    label: "Person".into(),
-                    id,
-                },
+                MemKey::Node { id },
                 i + 1,
                 MemOp::Upsert(synth_payload(i)),
             );
@@ -224,7 +222,7 @@ fn lookup_cold(c: &mut Criterion) {
                 |id| {
                     let fx = fx.clone();
                     async move {
-                        let memtable = Memtable::new();
+                        let memtable = Memtable::new().snapshot_view();
                         let snap = Snapshot::new(
                             fx.committed.clone(),
                             &memtable,
@@ -259,7 +257,7 @@ fn lookup_cold(c: &mut Criterion) {
                     let fx = fx.clone();
                     let cache = ranged_cache.clone();
                     async move {
-                        let memtable = Memtable::new();
+                        let memtable = Memtable::new().snapshot_view();
                         let snap = Snapshot::new(
                             fx.committed.clone(),
                             &memtable,
@@ -279,7 +277,7 @@ fn lookup_cold(c: &mut Criterion) {
     // ── Warm: SstCache attached, pre-warmed window ────────────────────
     let warm_cache = SstCache::new(cache_capacity_bytes());
     {
-        let memtable = Memtable::new();
+        let memtable = Memtable::new().snapshot_view();
         let snap = Snapshot::new(
             fx.committed.clone(),
             &memtable,
@@ -308,7 +306,7 @@ fn lookup_cold(c: &mut Criterion) {
                     let fx = fx.clone();
                     let cache = warm_cache.clone();
                     async move {
-                        let memtable = Memtable::new();
+                        let memtable = Memtable::new().snapshot_view();
                         let snap = Snapshot::new(
                             fx.committed.clone(),
                             &memtable,

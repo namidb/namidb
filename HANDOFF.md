@@ -169,14 +169,6 @@ return); isolates dropped (build only calls `add_edge`, never enumerates nodes);
 EXPLAIN soft-keyword precedent.
 
 ### Deferred bug follow-ups (lower severity, documented)
-- **`namidb-storage` benches don't compile** (`ingest_throughput`,
-  `read_latency`, `concurrent_mix`, `recovery_replay`) — they reference the
-  pre-multi-label API (`NodeWriteRecord` missing `labels`, `MemKey::Node`
-  field `label`, `Snapshot::new(&Memtable)` now wants `&MemtableSnapshot`).
-  Surfaces only under `cargo clippy/build --all-targets` (the repo's `cargo
-  test` + `cargo clippy --workspace` bar doesn't compile benches, so it stays
-  green). Pre-existing from the multi-label branch work, unrelated to the
-  vector-index DDL. Mechanical fix across ~4 bench files.
 - s3b forward-probe `MAX_PROBE` gap-safety after GC (commented as best-effort;
   under sustained >8192-version write lag a stale pointer can be served).
 - s3b bootstrap crash-atomicity (crash between v0.json and p0.json wedges).
