@@ -2,7 +2,7 @@
 
 **Session:** 2025-01-19 (session 836fd4ad)
 **Branch:** `feat/s3b-versioned-pointer`
-**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server
+**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server, 17 passing in namidb-mcp
 
 ## Completed Work
 
@@ -49,6 +49,37 @@ namidb-server --multi-tenant --store memory://
 - Per-namespace flush/compaction/orphan-sweep background tasks
 - Multi-tenant routing tests (beyond basic unit tests)
 
+### Item 13 - Hybrid Search (Layer A COMPLETE) ✅ SHIPPED
+**Commit:** LATEST "feat(mcp): hybrid search with RRF fusion"
+
+**Completed (Layer A - MCP-only, no engine change):**
+- ✅ `hybrid_search` MCP tool combining lexical + semantic channels
+- ✅ RRF (Reciprocal Rank Fusion) with formula: `weight / (k + rank)`, k=60
+- ✅ Lexical channel: substring search in title/body with LIMIT 3*k
+- ✅ Semantic channel: cosine KNN with LIMIT 3*k
+- ✅ Configurable weights: `lexical_weight` and `semantic_weight` (default 1.0)
+- ✅ Optional `where` pre-filter for metadata constraints
+- ✅ All 17 tests passing
+
+**Usage:**
+```json
+{
+  "name": "hybrid_search",
+  "arguments": {
+    "query": "graph database",
+    "k": 10,
+    "lexical_weight": 1.0,
+    "semantic_weight": 1.0,
+    "where": "n.path STARTS WITH 'work/'"
+  }
+}
+```
+
+**Deferred (Layer B):**
+- `bm25(text, query)` builtin in expr.rs
+- Tantivy-backed full-text index
+- `CREATE FULLTEXT INDEX` / `fulltext_search` tool
+
 ### "Now" Wave Status - ALL DONE ✅
 - 02-set-plus-map ✅ Already implemented (`apply_set_map` exists, tests pass)
 - 03-bulk-ingest ✅ Already implemented (`load_edges` exists)
@@ -67,7 +98,7 @@ namidb-server --multi-tenant --store memory://
 |------|----------|--------|--------|
 | s3b-versioned-pointer | high | M | ✅ DONE |
 | 14-single-writer | high | L | ✅ DONE |
-| 13-hybrid-search | medium | M | Pending |
+| 13-hybrid-search | medium | M | ✅ Layer A DONE |
 | 08-call-show-algos | medium | L | Pending |
 | 15-auth-rbac | medium | L | Pending |
 | 16-maturity | medium | M | Pending |

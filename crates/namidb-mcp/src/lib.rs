@@ -19,7 +19,7 @@
 
 #![warn(rust_2018_idioms)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -246,6 +246,9 @@ impl Server {
         // mismatch, so it runs its own query rather than the shared path below.
         if name == "vector_search" {
             return self.vector_search(args).await;
+        }
+        if name == "hybrid_search" {
+            return self.hybrid_search(args).await;
         }
         let (cypher, params): (String, Params) = match name {
             "list_notes" => (
@@ -528,6 +531,160 @@ impl Server {
             .map(str::to_string))
     }
 
+    /// Hybrid search: run lexical and dense channels, then fuse via Reciprocal Rank Fusion (RRF).
+    /// RRF formula: `score(channel, rank) = weight / (k + rank)` where k=60 is the standard constant.
+    /// Each channel is queried with `LIMIT 3 * k` to get enough candidates for fusion.
+    async fn hybrid_search(&self, args: &Value) -> Result<String, String> {
+        let text = str_arg(args, "query")?;
+        let label = ident_arg(args, "label", "Note")?;
+        let property = ident_arg(args, "property", "embedding")?;
+        let k = args
+            .get("k")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 100);
+        let lexical_weight = args
+            .get("lexical_weight")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        let semantic_weight = args
+            .get("semantic_weight")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        let filter = args
+            .get("where")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Validate weights are positive
+        if lexical_weight <= 0.0 || semantic_weight <= 0.0 {
+            return Err("lexical_weight and semantic_weight must be positive".to_string());
+        }
+
+        // Embedder mismatch guard (same as vector_search)
+        let current = self.embedder.id();
+        if let Some(stored) = self.cached_stored_embedder_id(&label, &property).await? {
+            if stored != current {
+                return Err(format!(
+                    "this namespace was embedded with `{stored}`, but the server's \
+                     embedder is `{current}`. Re-embed the vault (load it with the \
+                     matching embedder) before searching."
+                ));
+            }
+        }
+
+        // Run lexical channel (substring search)
+        let lexical_results = self.lexical_channel(&text, &label, k, filter).await?;
+
+        // Run semantic channel (dense vector search)
+        let semantic_results = self.semantic_channel(&text, &label, &property, k, filter).await?;
+
+        // Fuse via RRF
+        let fused = rrf_fuse(
+            &lexical_results,
+            &semantic_results,
+            60, // k constant for RRF
+            lexical_weight,
+            semantic_weight,
+        );
+
+        // Return top-k results
+        let top_k: Vec<_> = fused.into_iter().take(k as usize).collect();
+        serde_json::to_string_pretty(&top_k).map_err(|e| e.to_string())
+    }
+
+    /// Lexical channel: substring search in title/body.
+    async fn lexical_channel(
+        &self,
+        text: &str,
+        label: &str,
+        k: u64,
+        filter: Option<&str>,
+    ) -> Result<Vec<FusedResult>, String> {
+        let candidate_limit = 3 * k;
+        let mut p = Params::new();
+        p.insert("text".to_string(), RuntimeValue::String(text.to_string()));
+
+        let where_extra = match filter {
+            Some(f) => format!(" AND ({f})"),
+            None => String::new(),
+        };
+
+        let cypher = format!(
+            "MATCH (n:{label}) \
+             WHERE (n.body CONTAINS $text OR n.title CONTAINS $text) \
+               AND n.placeholder IS NULL{where_extra} \
+             RETURN n.title AS title, n.path AS path \
+             LIMIT {candidate_limit}"
+        );
+
+        let rows = self
+            .run_read_query(&cypher, &p)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(rank, row)| FusedResult {
+                title: row.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+                path: row.get("path").and_then(Value::as_str).unwrap_or("").to_string(),
+                lexical_rank: Some(rank + 1), // 1-indexed
+                semantic_rank: None,
+                score: 0.0,
+            })
+            .collect())
+    }
+
+    /// Semantic channel: dense vector cosine similarity search.
+    async fn semantic_channel(
+        &self,
+        text: &str,
+        label: &str,
+        property: &str,
+        k: u64,
+        filter: Option<&str>,
+    ) -> Result<Vec<FusedResult>, String> {
+        let candidate_limit = 3 * k;
+        let vector = self.embed_query_cached(text).await?;
+        let mut p = Params::new();
+        p.insert("query".to_string(), RuntimeValue::Vector(vector));
+
+        let where_extra = match filter {
+            Some(f) => format!(" AND ({f})"),
+            None => String::new(),
+        };
+
+        let cypher = format!(
+            "MATCH (n:{label}) \
+             WHERE n.{property} IS NOT NULL AND n.placeholder IS NULL{where_extra} \
+             RETURN n.title AS title, n.path AS path, \
+                    cosine_similarity(n.{property}, $query) AS score \
+             ORDER BY score DESC LIMIT {candidate_limit}"
+        );
+
+        let rows = self
+            .run_read_query(&cypher, &p)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(rank, row)| {
+                let score = row.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+                FusedResult {
+                    title: row.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+                    path: row.get("path").and_then(Value::as_str).unwrap_or("").to_string(),
+                    lexical_rank: None,
+                    semantic_rank: Some(rank + 1), // 1-indexed
+                    score,
+                }
+            })
+            .collect())
+    }
+
     /// Parse, plan, and execute a read-only Cypher query, returning rows as
     /// JSON objects. Rejects write plans.
     async fn run_read_query(&self, cypher: &str, params: &Params) -> anyhow::Result<Vec<Value>> {
@@ -678,6 +835,60 @@ fn fmt_parse_errs(errs: &[ParseError]) -> String {
     }
 }
 
+/// Result from a single search channel (lexical or semantic) for RRF fusion.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FusedResult {
+    /// Note title.
+    title: String,
+    /// Note path (key).
+    path: String,
+    /// Rank in lexical channel (1-indexed), if present.
+    lexical_rank: Option<usize>,
+    /// Rank in semantic channel (1-indexed), if present.
+    semantic_rank: Option<usize>,
+    /// Fused RRF score (populated after fusion).
+    score: f64,
+}
+
+/// Reciprocal Rank Fusion (RRF): combine ranked lists from multiple search channels.
+///
+/// RRF formula: `score(rank) = weight / (k + rank)` where k=60 is the standard constant.
+/// This rank-based fusion sidesteps comparing incompatible score ranges (BM25 vs cosine).
+///
+/// Returns results sorted by fused score (descending).
+fn rrf_fuse(
+    lexical: &[FusedResult],
+    semantic: &[FusedResult],
+    k_constant: usize,
+    lexical_weight: f64,
+    semantic_weight: f64,
+) -> Vec<FusedResult> {
+    let mut fused: HashMap<String, FusedResult> = HashMap::new();
+
+    // Process lexical channel
+    for result in lexical {
+        let key = format!("{}\0{}", result.title, result.path);
+        let rank = result.lexical_rank.unwrap_or(usize::MAX);
+        let score = lexical_weight / (1.0 + k_constant as f64 + rank as f64);
+
+        fused.entry(key).or_insert_with(|| result.clone()).score += score;
+    }
+
+    // Process semantic channel
+    for result in semantic {
+        let key = format!("{}\0{}", result.title, result.path);
+        let rank = result.semantic_rank.unwrap_or(usize::MAX);
+        let score = semantic_weight / (1.0 + k_constant as f64 + rank as f64);
+
+        fused.entry(key).or_insert_with(|| result.clone()).score += score;
+    }
+
+    // Sort by fused score descending
+    let mut results: Vec<_> = fused.into_values().collect();
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
 fn tool_specs() -> Vec<Value> {
     let note_arg = json!({
         "type": "object",
@@ -768,6 +979,23 @@ fn tool_specs() -> Vec<Value> {
                     "label": { "type": "string", "description": "Node label to search (default \"Note\")" },
                     "property": { "type": "string", "description": "Embedding property name (default \"embedding\")" },
                     "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" },
+                    "where": { "type": "string", "description": "Optional Cypher predicate over the matched node `n` to pre-filter the candidate set before ranking, e.g. `n.path STARTS WITH 'work/'`. Read-only." }
+                },
+                "required": ["query"],
+            },
+        }),
+        json!({
+            "name": "hybrid_search",
+            "description": "Hybrid search: combine lexical (keyword) and semantic (meaning) search using Reciprocal Rank Fusion (RRF). The lexical channel matches substring in title/body; the semantic channel uses vector cosine similarity. Both channels retrieve 3*k candidates and are fused by rank with configurable weights. Returns title, path, and fused RRF score, highest first. This is the recommended tool for RAG/agent workloads where both keyword precision and semantic recall matter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search text for both lexical and semantic channels" },
+                    "label": { "type": "string", "description": "Node label to search (default \"Note\")" },
+                    "property": { "type": "string", "description": "Embedding property name for semantic channel (default \"embedding\")" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results to return (default 10)" },
+                    "lexical_weight": { "type": "number", "description": "Weight for lexical channel in RRF fusion (default 1.0)" },
+                    "semantic_weight": { "type": "number", "description": "Weight for semantic channel in RRF fusion (default 1.0)" },
                     "where": { "type": "string", "description": "Optional Cypher predicate over the matched node `n` to pre-filter the candidate set before ranking, e.g. `n.path STARTS WITH 'work/'`. Read-only." }
                 },
                 "required": ["query"],
@@ -890,7 +1118,7 @@ mod tests {
         let init = server.dispatch("initialize", &Value::Null).await.unwrap();
         assert_eq!(init["protocolVersion"], json!(PROTOCOL_VERSION));
         let list = server.dispatch("tools/list", &Value::Null).await.unwrap();
-        assert_eq!(list["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 13);
     }
 
     #[tokio::test]
