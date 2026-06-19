@@ -1,185 +1,124 @@
 # Handoff: Roadmap Progress
 
-**Session:** 2025-01-19 (session 836fd4ad)
+**Session:** 2026-06-18/19 (session 836fd4ad)
 **Branch:** `feat/s3b-versioned-pointer`
-**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server, 20 passing in namidb-mcp, 8 passing in namidb-graph
+**Method:** ultracode — 94-agent orchestration (68-agent adversarial review + 26-agent research/design) driving implementation.
 
-## Completed Work
+## Test status (all green)
 
-### s3b - Versioned Pointer (RFC-029) ✅ SHIPPED
-**Commit:** e5d48a7 "fix(storage): address adversarial review findings in RFC-029"
+| Crate | Tests |
+|-------|-------|
+| namidb-storage | 304 |
+| namidb-server | 31 (+ integration suites) |
+| namidb-mcp | 20 |
+| namidb-graph | 10 |
 
-All 5 bugs from adversarial review fixed:
-- ✅ Empty LIST misclassification (HEAD p0 before falling back)
-- ✅ Overwrite restore leaves stale current.json
-- ✅ Forward probe test coverage added
-- ✅ MAX_PROBE increased 256→8192
-- ✅ Forward probe gap-safety documented after GC
+## Completed this session
 
-**Files:** manifest.rs, backup.rs, paths.rs, janitor.rs, local.rs, server/lib.rs
-**Docs:** docs/rfc/029-versioned-pointer.md (new), docs/rfc/001-storage-engine.md (amended)
+### Adversarial-review fixes (68 agents → 41 confirmed bugs)
+**Commit `b347038`** + follow-ups. The review found 4 critical / 15 high bugs; the
+criticals and most highs are fixed:
 
-### Item 14 - Multi-tenant (COMPLETE) ✅ SHIPPED
-**Commits:**
-- 5415123 "feat(server): foundation for multi-tenant namespace registry"
-- LATEST "feat(server): multi-tenant router wiring"
+- **CRITICAL s3b data loss on EC-LIST stores** — once the janitor reclaims `p0`
+  below the horizon, a stale empty LIST made the pointer family look empty,
+  `load_current` fell through to a `current.json` post-RFC commits never wrote,
+  and `WriterSession::open` **re-bootstrapped a live namespace** (silent data
+  loss on exactly the EC stores RFC-029 targets). **Fix:** publish an advisory
+  `current.json` (plain PUT, universally supported) on every commit/bootstrap;
+  `max_pointer_version` recovers the version via that advisory when LIST is
+  empty AND p0 is gone. +regression test.
+- **CRITICAL multi-tenant idle eviction never fired** — `last_access` stored
+  `Instant::now().elapsed()` (always ~0). Fixed to anchor-relative seconds.
+- **CRITICAL `max_namespaces=0` (documented "unlimited") failed the first
+  open.** Fixed: 0 = no cap.
+- **HIGH RRF off-by-one** — denominator had a spurious `+1` vs standard
+  `1/(k+rank)`. Fixed.
+- **HIGH hybrid channels sequential** → now `tokio::join`'d concurrently.
+- **HIGH lexical channel no ORDER BY** → ranks were non-deterministic. Fixed.
+- **HIGH PageRank mass conservation** — weighted edges normalized by count not
+  weight-sum → scores diverged from 1.0. Fixed (normalize by Σw) + test.
+- **HIGH graph_algorithm included placeholder stubs** → filtered.
 
-**Completed:**
-- ✅ `registry.rs` with `NamespaceRegistry` and `NamespaceState`
-- ✅ `shared.rs` with `SharedAppState` (process-wide state)
-- ✅ Lazy WriterSession creation per namespace
-- ✅ Idle eviction with timeout + cap
-- ✅ Config/CLI flags for multi-tenant mode
-- ✅ Multi-tenant router with namespace extraction from path (`/:namespace/v0/...`)
-- ✅ Multi-tenant handlers (cypher_multi, health_multi, admin_flush_multi)
-- ✅ Auth middleware for multi-tenant mode
-- ✅ All 47 tests passing
+### Multi-tenant (item 14) — production-hardened
+- `07271b9` per-namespace maintenance tasks (flush/compaction/orphan-sweep) —
+  closed the data-loss-on-crash / unbounded-read-amplification gap.
+- `9a76870` X-NamiDB-Namespace header + default-namespace fallback (were
+  documented but unimplemented) + namespace-isolation test.
+- `7fc9500` per-namespace catalog cache (was rebuilt every multi-tenant query).
 
-**Usage:**
-```bash
-# Single-tenant mode (backward compatible)
-namidb-server --store memory://mydb
+### Item 11 — typed "unsupported" errors (SHIPPED, `029fb84`)
+EvalErrorKind{Generic,Unsupported} → ExecError::is_unsupported() → HTTP 400
+`code:"unsupported"` + Bolt BackendError::Unsupported. +test.
 
-# Multi-tenant mode
-namidb-server --multi-tenant --store memory://
-# Requests: /:namespace/v0/cypher, /:namespace/v0/health, etc.
-```
+### Item 16 — backup/restore maturity (SHIPPED safe subset, `fbc44cf`)
+No-clobber is now a real `PutMode::Create` CAS (closes the TOCTOU); `--verify`
+re-heads every referenced object; advisory pointer published on restore.
 
-**Deferred for next wave:**
-- Per-namespace flush/compaction/orphan-sweep background tasks
-- Multi-tenant routing tests (beyond basic unit tests)
+### Item 13 — hybrid search (Layer A SHIPPED, `362bdac` + fixes)
+RRF fusion of lexical + semantic channels, concurrent, configurable weights.
 
-### Item 13 - Hybrid Search (Layer A COMPLETE) ✅ SHIPPED
-**Commit:** LATEST "feat(mcp): hybrid search with RRF fusion"
+### Item 08 — graph algorithms (MCP wedge SHIPPED, `45a15c7` + fixes)
+WCC (union-find) + PageRank (power iteration, mass-conserving) in namidb-graph;
+`graph_algorithm` MCP tool.
 
-**Completed (Layer A - MCP-only, no engine change):**
-- ✅ `hybrid_search` MCP tool combining lexical + semantic channels
-- ✅ RRF (Reciprocal Rank Fusion) with formula: `weight / (k + rank)`, k=60
-- ✅ Lexical channel: substring search in title/body with LIMIT 3*k
-- ✅ Semantic channel: cosine KNN with LIMIT 3*k
-- ✅ Configurable weights: `lexical_weight` and `semantic_weight` (default 1.0)
-- ✅ Optional `where` pre-filter for metadata constraints
-- ✅ All 17 tests passing
+### Earlier this branch
+- s3b versioned pointer RFC-029 (`e5d48a7`); multi-tenant foundation (`5415123`).
 
-**Usage:**
-```json
-{
-  "name": "hybrid_search",
-  "arguments": {
-    "query": "graph database",
-    "k": 10,
-    "lexical_weight": 1.0,
-    "semantic_weight": 1.0,
-    "where": "n.path STARTS WITH 'work/'"
-  }
-}
-```
+## Remaining work (with verified design plans)
 
-**Deferred (Layer B):**
-- `bm25(text, query)` builtin in expr.rs
-- Tantivy-backed full-text index
-- `CREATE FULLTEXT INDEX` / `fulltext_search` tool
+The 26-agent design workflow produced file:line plans for the remaining items.
+They are L-effort and need their own focused sessions. **Designs live in the
+workflow output** (`/tmp/.../tasks/wu89feu6l.output`, run ID
+`wf_e869ca77-7c5`); key decisions:
 
-### Item 08 - Graph Algorithms (MCP wedge COMPLETE) ✅ SHIPPED
-**Commit:** LATEST "feat(graph,mcp): WCC + PageRank graph algorithms"
+### Item 12 — ANN HNSW (L) — design winner: **DiskANN/Vamana** (judge score 97)
+Beat HNSW-on-CSR (66) and IVF-Flat-PQ (65). Synthesized plan: object-store-native
+Vamana graph as a new `SstKind::VectorGraph`, int8 short-vectors in RAM reusing
+`quantize.rs` (asymmetric int8 scorer added there FIRST — shared by scorer +
+bench), FreshDiskANN-style L0 delta covered by the existing flat-scan, full-
+precision rerank, built during the compaction sweep (no new background task),
+`CREATE VECTOR INDEX` DDL, optimizer rewrite to `LogicalPlan::VectorSearch`
+falling through to the flat path when no descriptor, gated behind Cargo feature
+`vector-index` + env `NAMIDB_VECTOR_INDEX` (default off), recall@k validated via
+`namidb-bench/vector_recall`. **Step 1 (load-bearing, unblocks all): add
+`dot_i8_asymmetric`/`norm_i8` to `quantize.rs` and rewire the bench's private
+copy at `vector_recall.rs:96-100`.**
 
-**Completed (PR2 - MCP-only kernel, per audit recommendation):**
-- ✅ `namidb-graph/src/algo.rs`: `Graph` in-memory adjacency structure
-- ✅ WCC (Weakly Connected Components) via union-find (path halving + union by rank)
-- ✅ PageRank via power iteration (dangling-node mass redistribution, L1 convergence)
-- ✅ 8 unit tests in namidb-graph (all passing)
-- ✅ MCP `graph_algorithm` tool: builds subgraph from Cypher, runs kernel, joins results
-- ✅ 3 end-to-end tests in namidb-mcp (WCC, PageRank, error handling)
-- ✅ Optional `edge_types` allowlist, configurable `damping`/`max_iterations`
+### Item 15 — auth/RBAC (L) — ship-with-fixes
+Wave A OIDC/JWT (jsonwebtoken + JWKS, pinned-alg, group-claim→role, thread a
+Principal on HTTP+Bolt) + Wave B AuthzHook PDP (OPA/Cedar). **Design holes to
+address:** Role is `Copy` (7 by-value sites) — wrapping in `Arc<str>` loses Copy,
+needs `.clone()` at pass-sites; Bolt `Authenticator` trait has no Principal
+return channel; `serve()`/`make_policy` signatures change; reqwest must be a
+feature-gated dep (not unconditional); default fail-closed for PDP. Gate behind
+feature `jwt`.
 
-**Usage:**
-```json
-{
-  "name": "graph_algorithm",
-  "arguments": {
-    "algorithm": "wcc",
-    "label": "Note",
-    "edge_types": ["LINKS_TO", "EMBEDS"],
-    "k": 10
-  }
-}
-```
+### Item 08 PR1 — CALL/YIELD (L) — **needs rework (design verdict)**
+Lexer/AST/grammar → CallProcedure logical node → ProcRegistry source operator
+exposing `algo.wcc`/`algo.pagerank`. **Blocking holes:** a cfg strategy that
+keeps `Clause::Call` always-present but gates the lower arm **will not compile**
+(exhaustive match, no wildcard); P0 query-timeout is over-claimed (the kernels
+are synchronous CPU loops with no `.await`, so the deadline only fires after
+return); isolates dropped (build only calls `add_edge`, never enumerates nodes);
+`neighbours_of` does not exist on Snapshot (real API is `out_edges`); soft-keyword
+(Call/Yield) not reserved to avoid breaking `CALL` as an identifier. Use the
+EXPLAIN soft-keyword precedent.
 
-**Deferred (PR1 - CALL/YIELD Cypher surface):**
-- CALL/YIELD clause in Cypher parser
-- `CallProcedure` logical node
-- `ProcRegistry` for named procedures
+### Deferred bug follow-ups (lower severity, documented)
+- s3b forward-probe `MAX_PROBE` gap-safety after GC (commented as best-effort;
+  under sustained >8192-version write lag a stale pointer can be served).
+- s3b bootstrap crash-atomicity (crash between v0.json and p0.json wedges).
+- multi-tenant auth is global, not per-namespace (any valid token reaches any
+  namespace) — needs per-namespace token scoping (Wave B of item 15).
+- hybrid-search bm25 builtin (Layer B) for real lexical relevance.
 
-### "Now" Wave Status - ALL DONE ✅
-- 02-set-plus-map ✅ Already implemented (`apply_set_map` exists, tests pass)
-- 03-bulk-ingest ✅ Already implemented (`load_edges` exists)
-- 09-uniqueness ✅ Already fixed (Python calls `enforce_node_unique_constraints`)
-- 01-unwind-bind ✅ Already fixed (tests exist)
-- 05-varlen-optional ✅ Already fixed (parser guard removed)
-- 06-where-label ✅ Already implemented (`parse_postfix` handles `:`)
-- 07-datetime-noarg ✅ Already implemented (`datetime()` with no args)
-- 10-double-identity ✅ Already fixed (`_id` vs `id` separation)
-
-**All "now" wave items from the audit are complete!**
-
-## Next Wave Priority (from roadmap)
-
-| Item | Severity | Effort | Status |
-|------|----------|--------|--------|
-| s3b-versioned-pointer | high | M | ✅ DONE |
-| 14-single-writer | high | L | ✅ DONE |
-| 13-hybrid-search | medium | M | ✅ Layer A DONE |
-| 08-call-show-algos | medium | L | ✅ MCP wedge DONE |
-| 15-auth-rbac | medium | L | Pending |
-| 16-maturity | medium | M | Pending |
-| 11-generic-500 | medium | S | Pending |
-| 12-flat-vector (ANN) | high | L | Later wave |
-
-## Remaining Work
-
-### Item 13: Hybrid Search (medium/M)
-- RRF (Reciprocal Rank Fusion) tool for combining multiple vector search results
-- BM25 builtin for full-text search scores
-- Integration with existing vector search capabilities
-
-### Item 08: CALL/YIELD + Graph Algorithms (medium/L)
-- CALL subsystem for invoking procedures
-- YIELD for returning result sets
-- Graph algorithms: WCC (Weakly Connected Components), PageRank
-
-### Item 15: Auth/RBAC (medium/L)
-- OIDC/JWT authentication
-- Role-Based Access Control (RBAC)
-- Policy Decision Point (PDP) hook
-
-### Item 16: Maturity (medium/M)
-- Backup CAS (Content-Addressable Storage)
-- Restore fence
-
-### Item 11: Generic 500 Errors (medium/S)
-- Typed errors for "Unsupported kind" failures
-
-## Commands for Next Agent
+## Commands
 
 ```bash
-# Verify current state
-git status
-git log --oneline -5
-
-# After item 14 complete, move to next priority:
-# Item 13: hybrid-search (medium/M) - RRF tool + bm25 builtin
-# Item 08: call-show-algos (medium/L) - CALL/YIELD subsystem
-# Item 15: auth-rbac (medium/L) - OIDC/JWT + PDP hook
-# Item 16: maturity (medium/M) - backup CAS + restore fence
-# Item 11: generic-500 (medium/S) - typed errors
-
-# Run tests
-cargo test -p namidb-storage
-cargo test -p namidb-server
-
-# Run clippy
-cargo clippy -p namidb-server -- -D warnings
+cargo test --workspace          # all green
+cargo clippy --workspace -- -D warnings
+git log --oneline -12           # this session's commits
 ```
 
 ---
-Generated: 2025-01-19 (multi-tenant complete)
+Generated: 2026-06-19 (post-ultracode: 5 roadmap items shipped + 41-bug review fixed).
