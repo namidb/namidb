@@ -36,6 +36,10 @@ pub struct SharedAppState {
     pub write_stall_l0: usize,
     /// Soft write-stall delay when L0 is above the threshold.
     pub write_stall_delay: Duration,
+    /// Default namespace for unprefixed requests (`/v0/...` without a
+    /// `/:namespace/` segment) and for requests that omit the
+    /// `X-NamiDB-Namespace` header.
+    pub default_namespace: String,
 }
 
 impl SharedAppState {
@@ -49,6 +53,7 @@ impl SharedAppState {
         query_row_cap: usize,
         write_stall_l0: usize,
         write_stall_delay: Duration,
+        default_namespace: String,
     ) -> Self {
         Self {
             registry,
@@ -59,6 +64,7 @@ impl SharedAppState {
             query_row_cap,
             write_stall_l0,
             write_stall_delay,
+            default_namespace,
         }
     }
 

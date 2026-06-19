@@ -340,17 +340,35 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
         .route("/v0/metrics", get(metrics_handler_multi));
 
     // Multi-tenant namespace-scoped routes: /:namespace/v0/...
+    // Also register unprefixed /v0/... routes that resolve the namespace from
+    // the X-NamiDB-Namespace header (or the configured default), so clients
+    // can target a namespace without a path prefix.
     let namespace_routes = Router::new()
         .route("/:namespace/v0/livez", get(livez_multi))
         .route("/:namespace/v0/health", get(health_multi))
         .route("/:namespace/v0/cypher", post(cypher_multi))
         .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
+        .route("/v0/livez", get(livez_multi))
+        .route("/v0/health", get(health_multi_unprefixed))
+        .route("/v0/cypher", post(cypher_multi_unprefixed))
+        .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
         .layer(middleware::from_fn_with_state(shared.clone(), require_auth_multi));
 
     Router::new()
         .merge(public)
         .merge(namespace_routes)
         .with_state(shared)
+}
+
+/// Resolve the namespace for an unprefixed request: the `X-NamiDB-Namespace`
+/// header if present and non-empty, else the configured default namespace.
+fn namespace_from_header(shared: &SharedAppState, headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-namidb-namespace")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| shared.default_namespace.clone())
 }
 
 /// Boot the server: parse URI, open a `WriterSession`, optionally
@@ -414,6 +432,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.query_row_cap,
             config.write_stall_l0,
             config.write_stall_delay,
+            config.default_namespace.clone(),
         );
         let app = build_multi_tenant_router(shared);
 
@@ -1119,7 +1138,20 @@ async fn livez_multi() -> impl IntoResponse {
 async fn health_multi(
     Path(namespace): Path<String>,
     State(shared): State<SharedAppState>,
-) -> impl IntoResponse {
+) -> Response {
+    dispatch_health_multi(&shared, namespace).await
+}
+
+/// Unprefixed readiness probe: resolve the namespace from the
+/// `X-NamiDB-Namespace` header (or default).
+async fn health_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    dispatch_health_multi(&shared, namespace_from_header(&shared, &headers)).await
+}
+
+async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Response {
     match shared.registry.get_or_open(&namespace).await {
         Ok(ns_state) => {
             let owned = ns_state.snapshot.load();
@@ -1149,10 +1181,35 @@ async fn cypher_multi(
     Extension(role): Extension<Role>,
     Json(req): Json<CypherRequest>,
 ) -> Response {
+    dispatch_cypher_multi(&shared, &namespace, role, req).await
+}
+
+/// Unprefixed entry point: resolve the namespace from the
+/// `X-NamiDB-Namespace` header (or the default), then run the query. Used by
+/// the `/v0/cypher` route in multi-tenant mode so clients can target a
+/// namespace without a path prefix.
+async fn cypher_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(role): Extension<Role>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CypherRequest>,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_cypher_multi(&shared, &namespace, role, req).await
+}
+
+/// Shared body of the multi-tenant cypher handler: open the namespace, run,
+/// observe metrics.
+async fn dispatch_cypher_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    role: Role,
+    req: CypherRequest,
+) -> Response {
     let _in_flight = shared.metrics.track_in_flight();
 
     // Get or create the namespace state.
-    let ns_state = match shared.registry.get_or_open(&namespace).await {
+    let ns_state = match shared.registry.get_or_open(namespace).await {
         Ok(ns) => ns,
         Err(e) => {
             return (
@@ -1163,7 +1220,7 @@ async fn cypher_multi(
         }
     };
 
-    let obs = run_cypher_multi(&ns_state, &shared, &req, role).await;
+    let obs = run_cypher_multi(&ns_state, shared, &req, role).await;
     shared
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -1340,6 +1397,24 @@ async fn admin_flush_multi(
     State(shared): State<SharedAppState>,
     Extension(role): Extension<Role>,
 ) -> Response {
+    dispatch_admin_flush_multi(&shared, &namespace, role).await
+}
+
+/// Unprefixed admin flush: resolve namespace from header/default.
+async fn admin_flush_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(role): Extension<Role>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_flush_multi(&shared, &namespace, role).await
+}
+
+async fn dispatch_admin_flush_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    role: Role,
+) -> Response {
     if !role.allows_write() {
         return (
             StatusCode::FORBIDDEN,
@@ -1349,7 +1424,7 @@ async fn admin_flush_multi(
         )
             .into_response();
     }
-    let ns_state = match shared.registry.get_or_open(&namespace).await {
+    let ns_state = match shared.registry.get_or_open(namespace).await {
         Ok(ns) => ns,
         Err(e) => {
             return (
@@ -1974,5 +2049,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Build a multi-tenant router over a fresh memory store with the given
+    /// default namespace, open auth, and maintenance disabled.
+    async fn multi_tenant_app(default_ns: &str) -> Router {
+        let (store, _) = namidb_storage::parse_uri("memory://multi-tenant-test").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new(
+            registry,
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            default_ns.to_string(),
+        );
+        build_multi_tenant_router(shared)
+    }
+
+    async fn mt_cypher(app: &Router, uri: &str, header_ns: Option<&str>, query: &str) -> StatusCode {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(ns) = header_ns {
+            b = b.header("x-namidb-namespace", ns);
+        }
+        app.clone()
+            .oneshot(
+                b.body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn multi_tenant_path_prefix_header_and_default_all_route() {
+        let app = multi_tenant_app("default").await;
+        // 1. Explicit path prefix.
+        let q = "CREATE (:Person {name: 'x'}) RETURN 1";
+        assert_eq!(mt_cypher(&app, "/acme/v0/cypher", None, q).await, StatusCode::OK);
+        // 2. X-NamiDB-Namespace header on an unprefixed path.
+        assert_eq!(mt_cypher(&app, "/v0/cypher", Some("beta"), q).await, StatusCode::OK);
+        // 3. No prefix, no header → default namespace.
+        assert_eq!(mt_cypher(&app, "/v0/cypher", None, q).await, StatusCode::OK);
+        // The default namespace is genuinely distinct: a note written to
+        // `acme` is NOT visible via the default namespace.
+        let app = multi_tenant_app("default").await;
+        let _ = mt_cypher(&app, "/acme/v0/cypher", None, "CREATE (:Person {name: 'only-acme'})").await;
+        let read = mt_cypher(&app, "/v0/cypher", None, "MATCH (p:Person) RETURN count(p)").await;
+        assert_eq!(read, StatusCode::OK, "default namespace is isolated from acme");
     }
 }
