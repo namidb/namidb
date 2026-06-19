@@ -2,7 +2,7 @@
 
 **Session:** 2025-01-19 (session 836fd4ad)
 **Branch:** `feat/s3b-versioned-pointer`
-**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server, 17 passing in namidb-mcp
+**Tests:** 302 passing in namidb-storage, 47 passing in namidb-server, 20 passing in namidb-mcp, 8 passing in namidb-graph
 
 ## Completed Work
 
@@ -80,6 +80,36 @@ namidb-server --multi-tenant --store memory://
 - Tantivy-backed full-text index
 - `CREATE FULLTEXT INDEX` / `fulltext_search` tool
 
+### Item 08 - Graph Algorithms (MCP wedge COMPLETE) ✅ SHIPPED
+**Commit:** LATEST "feat(graph,mcp): WCC + PageRank graph algorithms"
+
+**Completed (PR2 - MCP-only kernel, per audit recommendation):**
+- ✅ `namidb-graph/src/algo.rs`: `Graph` in-memory adjacency structure
+- ✅ WCC (Weakly Connected Components) via union-find (path halving + union by rank)
+- ✅ PageRank via power iteration (dangling-node mass redistribution, L1 convergence)
+- ✅ 8 unit tests in namidb-graph (all passing)
+- ✅ MCP `graph_algorithm` tool: builds subgraph from Cypher, runs kernel, joins results
+- ✅ 3 end-to-end tests in namidb-mcp (WCC, PageRank, error handling)
+- ✅ Optional `edge_types` allowlist, configurable `damping`/`max_iterations`
+
+**Usage:**
+```json
+{
+  "name": "graph_algorithm",
+  "arguments": {
+    "algorithm": "wcc",
+    "label": "Note",
+    "edge_types": ["LINKS_TO", "EMBEDS"],
+    "k": 10
+  }
+}
+```
+
+**Deferred (PR1 - CALL/YIELD Cypher surface):**
+- CALL/YIELD clause in Cypher parser
+- `CallProcedure` logical node
+- `ProcRegistry` for named procedures
+
 ### "Now" Wave Status - ALL DONE ✅
 - 02-set-plus-map ✅ Already implemented (`apply_set_map` exists, tests pass)
 - 03-bulk-ingest ✅ Already implemented (`load_edges` exists)
@@ -99,7 +129,7 @@ namidb-server --multi-tenant --store memory://
 | s3b-versioned-pointer | high | M | ✅ DONE |
 | 14-single-writer | high | L | ✅ DONE |
 | 13-hybrid-search | medium | M | ✅ Layer A DONE |
-| 08-call-show-algos | medium | L | Pending |
+| 08-call-show-algos | medium | L | ✅ MCP wedge DONE |
 | 15-auth-rbac | medium | L | Pending |
 | 16-maturity | medium | M | Pending |
 | 11-generic-500 | medium | S | Pending |

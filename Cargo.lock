@@ -2252,6 +2252,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2283,6 +2284,8 @@ version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
+ "namidb-core",
+ "namidb-graph",
  "namidb-markdown",
  "namidb-query",
  "namidb-storage",

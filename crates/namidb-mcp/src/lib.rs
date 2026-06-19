@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -29,6 +30,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use namidb_markdown::Embedder;
+use namidb_graph::algo::{
+    pagerank, weakly_connected_components, Graph, PageRankOptions,
+};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute, parse as cypher_parse, plan as build_plan, Params, ParseError, Row, RuntimeValue,
@@ -249,6 +253,9 @@ impl Server {
         }
         if name == "hybrid_search" {
             return self.hybrid_search(args).await;
+        }
+        if name == "graph_algorithm" {
+            return self.graph_algorithm(args).await;
         }
         let (cypher, params): (String, Params) = match name {
             "list_notes" => (
@@ -685,6 +692,197 @@ impl Server {
             .collect())
     }
 
+    /// Graph algorithm tool: run an analytical kernel (WCC or PageRank) over
+    /// the subgraph induced by `label` nodes. Builds an in-memory
+    /// [`Graph`] from snapshot edges, runs the kernel, and returns results
+    /// joined back to readable node titles/paths.
+    ///
+    /// This is the MCP wedge for native graph algorithms (the CALL/YIELD
+    /// Cypher surface is a fast-follow). Read-only like every MCP tool.
+    async fn graph_algorithm(&self, args: &Value) -> Result<String, String> {
+        let algorithm = str_arg(args, "algorithm")?;
+        let label = ident_arg(args, "label", "Note")?;
+        // Optional edge-type allowlist. When omitted, every edge type between
+        // `label` nodes is included.
+        let edge_types: Vec<String> = args
+            .get("edge_types")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_k = args
+            .get("k")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 1000) as usize;
+
+        // Validate edge type names as identifiers (they interpolate into the
+        // query text).
+        for et in &edge_types {
+            let mut chars = et.chars();
+            let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ok {
+                return Err("edge_types entries must be simple identifiers".to_string());
+            }
+        }
+
+        // 1. Node set: id + readable title/path.
+        let nodes_cypher = format!(
+            "MATCH (n:{label}) RETURN id(n) AS id, n.title AS title, n.path AS path"
+        );
+        let node_rows = self
+            .run_read_query(&nodes_cypher, &Params::new())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // id string -> (NodeId, title, path) for result joining.
+        let mut id_meta: HashMap<String, (String, String)> = HashMap::new();
+        for row in &node_rows {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let title = row.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+            let path = row.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+            id_meta.insert(id, (title, path));
+        }
+
+        // 2. Edges: all types between `label` nodes (optionally filtered).
+        let type_filter = if edge_types.is_empty() {
+            String::new()
+        } else {
+            let alts = edge_types
+                .iter()
+                .map(|t| format!(":{t}"))
+                .collect::<Vec<_>>()
+                .join("|");
+            format!("[{alts}]")
+        };
+        let edges_cypher = format!(
+            "MATCH (a:{label})-{type_filter}->(b:{label}) \
+             RETURN id(a) AS src, id(b) AS dst"
+        );
+        let edge_rows = self
+            .run_read_query(&edges_cypher, &Params::new())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 3. Build the in-memory graph.
+        let mut graph = Graph::new();
+        for row in &node_rows {
+            if let Some(id_str) = row.get("id").and_then(Value::as_str) {
+                if let Ok(nid) = namidb_core::NodeId::from_str(id_str) {
+                    graph.add_node(nid);
+                }
+            }
+        }
+        for row in &edge_rows {
+            let src = row.get("src").and_then(Value::as_str);
+            let dst = row.get("dst").and_then(Value::as_str);
+            if let (Some(s), Some(d)) = (src, dst) {
+                if let (Ok(src_id), Ok(dst_id)) = (
+                    namidb_core::NodeId::from_str(s),
+                    namidb_core::NodeId::from_str(d),
+                ) {
+                    graph.add_edge(src_id, dst_id, None);
+                }
+            }
+        }
+
+        // 4. Run the kernel.
+        let algo = algorithm.as_str();
+        let result = match algo {
+            "wcc" | "weakly_connected_components" => {
+                let comps = weakly_connected_components(&graph);
+                // Group nodes by component, then return the top-K largest.
+                let mut by_comp: HashMap<usize, Vec<String>> = HashMap::new();
+                for (id_str, _) in &id_meta {
+                    if let Ok(nid) = namidb_core::NodeId::from_str(id_str) {
+                        if let Some(&c) = comps.assignment.get(&nid) {
+                            by_comp.entry(c).or_default().push(id_str.clone());
+                        }
+                    }
+                }
+                let mut groups: Vec<(usize, Vec<String>)> = by_comp.into_iter().collect();
+                groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+                let components: Vec<Value> = groups
+                    .into_iter()
+                    .take(top_k)
+                    .map(|(_comp, ids)| {
+                        let members: Vec<Value> = ids
+                            .iter()
+                            .take(50) // cap members per component for readability
+                            .filter_map(|id| {
+                                id_meta.get(id).map(|(title, path)| {
+                                    json!({ "id": id, "title": title, "path": path })
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "size": ids.len(),
+                            "members": members,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "wcc",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "component_count": comps.count,
+                    "components": components,
+                })
+            }
+            "pagerank" | "page_rank" => {
+                let mut opts = PageRankOptions::default();
+                if let Some(d) = args.get("damping").and_then(Value::as_f64) {
+                    opts.damping = d;
+                }
+                if let Some(m) = args.get("max_iterations").and_then(Value::as_u64) {
+                    opts.max_iterations = m as usize;
+                }
+                let pr = pagerank(&graph, &opts);
+                let mut ranked: Vec<(String, f64)> = id_meta
+                    .keys()
+                    .filter_map(|id| {
+                        namidb_core::NodeId::from_str(id)
+                            .ok()
+                            .and_then(|nid| pr.scores.get(&nid).map(|&s| (id.clone(), s)))
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let scores: Vec<Value> = ranked
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(id, score)| {
+                        id_meta.get(&id).map(|(title, path)| {
+                            json!({
+                                "id": id,
+                                "title": title,
+                                "path": path,
+                                "score": score,
+                            })
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "pagerank",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "iterations": pr.iterations,
+                    "converged": pr.converged,
+                    "scores": scores,
+                })
+            }
+            other => {
+                return Err(format!(
+                    "unknown algorithm `{other}`; supported: wcc, pagerank"
+                ));
+            }
+        };
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+
     /// Parse, plan, and execute a read-only Cypher query, returning rows as
     /// JSON objects. Rejects write plans.
     async fn run_read_query(&self, cypher: &str, params: &Params) -> anyhow::Result<Vec<Value>> {
@@ -1002,6 +1200,22 @@ fn tool_specs() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "graph_algorithm",
+            "description": "Run a native graph algorithm over the subgraph induced by a node label. Two algorithms: `wcc` (Weakly Connected Components — partitions nodes into reachability clusters, undirected) and `pagerank` (PageRank — ranks nodes by structural importance via power iteration, directed). Returns algorithm-specific results joined to readable titles/paths. Read-only. This is the agent wedge for native graph analytics; the CALL/YIELD Cypher surface is a fast-follow.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "algorithm": { "type": "string", "enum": ["wcc", "pagerank"], "description": "Algorithm to run: `wcc` or `pagerank`" },
+                    "label": { "type": "string", "description": "Node label to build the subgraph from (default \"Note\")" },
+                    "edge_types": { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of edge types to traverse (default: all edge types between label nodes)" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For wcc: number of largest components to return (default 10). For pagerank: number of top-ranked nodes to return (default 10)." },
+                    "damping": { "type": "number", "description": "PageRank damping factor (default 0.85). Ignored for wcc." },
+                    "max_iterations": { "type": "integer", "description": "PageRank iteration cap (default 100). Ignored for wcc." }
+                },
+                "required": ["algorithm"],
+            },
+        }),
+        json!({
             "name": "cypher",
             "description": "Run an arbitrary read-only Cypher query against the graph (nodes `:Note`/`:Tag`, edges `:LINKS_TO`/`:EMBEDS`/`:TAGGED`/`:SUBTAG_OF`). Write queries are rejected.",
             "inputSchema": {
@@ -1118,7 +1332,7 @@ mod tests {
         let init = server.dispatch("initialize", &Value::Null).await.unwrap();
         assert_eq!(init["protocolVersion"], json!(PROTOCOL_VERSION));
         let list = server.dispatch("tools/list", &Value::Null).await.unwrap();
-        assert_eq!(list["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(list["tools"].as_array().unwrap().len(), 14);
     }
 
     #[tokio::test]
@@ -1227,6 +1441,69 @@ mod tests {
             .filter_map(|r| r["title"].as_str())
             .collect();
         assert!(n.contains(&"Beta") && n.contains(&"Gamma"));
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_wcc_finds_components() {
+        // A -> B, A -> C, B -> C  (a connected cluster); D isolated.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]] and [[C]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        write(dir.path(), "D.md", "isolated\n");
+        let server = Server::open("memory://mcp-wcc").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(&server, "graph_algorithm", json!({ "algorithm": "wcc", "label": "Note" })).await;
+        // Two components: {A,B,C} and {D}.
+        assert_eq!(res["algorithm"], "wcc");
+        assert_eq!(res["component_count"], 2);
+        assert_eq!(res["edge_count"], 3);
+        // The largest component has size 3 (A, B, C).
+        assert_eq!(res["components"][0]["size"], 3);
+        assert_eq!(res["components"][1]["size"], 1);
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_pagerank_ranks_hub_highest() {
+        // Same graph: C has two in-links (from A and B) → highest PageRank.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]] and [[C]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        let server = Server::open("memory://mcp-pr").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "pagerank", "label": "Note", "k": 3 }),
+        )
+        .await;
+        assert_eq!(res["algorithm"], "pagerank");
+        assert_eq!(res["converged"], true);
+        // Top-ranked node is C (two in-links).
+        assert_eq!(res["scores"][0]["title"], "C");
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_rejects_unknown_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]]\n");
+        write(dir.path(), "B.md", "body\n");
+        let server = Server::open("memory://mcp-badalgo").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "graph_algorithm", "arguments": { "algorithm": "bogus" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unknown algorithm"), "got: {text}");
     }
 
     #[tokio::test]

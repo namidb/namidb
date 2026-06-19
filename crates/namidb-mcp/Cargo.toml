@@ -17,9 +17,11 @@ name = "namidb-mcp"
 path = "src/bin/namidb-mcp.rs"
 
 [dependencies]
+namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
 namidb-query = { workspace = true }
 namidb-markdown = { workspace = true }
+namidb-graph = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
