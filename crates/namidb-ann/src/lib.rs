@@ -15,7 +15,7 @@ pub mod graph;
 pub mod search;
 pub mod space;
 
-pub use build::{build, BuildParams, InitStrategy};
+pub use build::{build, build_with_seed, BuildParams, InitStrategy};
 pub use graph::VamanaGraph;
 pub use search::search;
 pub use space::{F32CosineSpace, Int8Space, VectorSpace};

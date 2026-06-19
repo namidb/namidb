@@ -2415,6 +2415,8 @@ dependencies = [
  "object_store 0.13.2",
  "parquet",
  "proptest",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "rustls",
  "serde",
  "serde_json",

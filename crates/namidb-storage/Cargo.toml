@@ -52,6 +52,9 @@ vector-index = ["dep:namidb-ann"]
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# `vector-index` test fixtures (clustered synthetic vectors) need RNG.
+rand = "0.8"
+rand_chacha = "0.3"
 # Bench-only: install aws-lc-rs as the rustls crypto provider so the S3
 # client can negotiate TLS 1.3 against Cloudflare R2 (which rejects the
 # default `ring` provider's ClientHello — likely a signature-algorithm

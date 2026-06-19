@@ -14,6 +14,8 @@ pub mod hll;
 pub mod nodes;
 pub mod predicates;
 pub mod stats;
+#[cfg(feature = "vector-index")]
+pub mod vector;
 
 pub use bloom::{BloomDescriptor, BloomFilter, BLOOM_OMIT_THRESHOLD_BYTES, DEFAULT_BITS_PER_KEY};
 pub use edges::{

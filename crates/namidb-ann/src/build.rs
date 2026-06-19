@@ -13,6 +13,8 @@
 
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::Rng;
+use rand_chacha::ChaCha8Rng;
+use rand::SeedableRng;
 
 use crate::graph::VamanaGraph;
 use crate::search::beam_search;
@@ -190,6 +192,19 @@ pub fn build<S: VectorSpace, R: Rng>(
     }
 
     VamanaGraph::new(adj, entry)
+}
+
+/// Build with a deterministic `ChaCha8Rng` seeded from `seed`. Convenience for
+/// callers (storage compaction, the recall harness) that want reproducible
+/// builds without constructing an RNG themselves — same `(data, params, seed)`
+/// always yields the same graph.
+pub fn build_with_seed<S: VectorSpace>(
+    space: &S,
+    params: BuildParams,
+    seed: u64,
+) -> VamanaGraph {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    build(space, params, &mut rng)
 }
 
 /// Approximate medoid: the sample member minimizing total distance to the

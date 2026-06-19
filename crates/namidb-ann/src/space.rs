@@ -53,7 +53,7 @@ pub trait VectorSpace {
 /// optional. For embedding recall workloads the caller pre-normalizes, but the
 /// math is identical either way because the `|x|·|y|` factor cancels into the
 /// ranking only through the per-query constant `|q|`, which cosine divides out.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct F32CosineSpace {
     vecs: Vec<Vec<f32>>,
 }
@@ -134,7 +134,7 @@ impl VectorSpace for F32CosineSpace {
 /// `quantize` primitives (one definition of the score) and lets the scale
 /// cancel in the division — exact in f32, since the same `scale` multiplies
 /// both terms.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Int8Space {
     /// `(codes, scale)` per member.
     members: Vec<(Vec<i8>, f32)>,

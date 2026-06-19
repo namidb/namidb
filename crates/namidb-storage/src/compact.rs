@@ -63,6 +63,7 @@ use crate::fence::WriterFence;
 use crate::flush::{build_edge_sst, build_node_sst, NodeRow, NodeWriteRecord};
 use crate::manifest::{
     KindSpecificStats, LoadedManifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
+    VectorIndexDescriptor,
 };
 use crate::memtable::MemOp;
 use crate::paths::NamespacePaths;
@@ -348,6 +349,27 @@ async fn compact_leveled(
             removed_ids.push(src.id);
         }
         new_descs.push(descriptor);
+
+        // RFC-030 (`vector-index`): rebuild Vamana indexes whose label has
+        // nodes in this bucket. A graph is not row-mergeable, so any prior
+        // VectorGraph SST for a rebuilt index is dropped (replaced) and the
+        // fresh one written from the GC'd merged node rows.
+        #[cfg(feature = "vector-index")]
+        {
+            let (new_vg, old_vg_ids) = build_vector_indexes_for_nodes(
+                store.as_ref(),
+                paths,
+                plan.target_level,
+                &base.manifest.label_dict,
+                &base.manifest.vector_indexes,
+                &merged_rows,
+                &label,
+                &vector_buckets,
+            )
+            .await?;
+            new_descs.extend(new_vg);
+            removed_ids.extend(old_vg_ids);
+        }
     }
 
     // Edges (forward).
@@ -810,6 +832,124 @@ async fn put_node_sst_leveled(
         )?,
     };
     Ok((descriptor, wrote_bloom))
+}
+
+/// RFC-030 (`vector-index`): for every registered index whose label has nodes
+/// in `merged_rows`, build a fresh Vamana `VectorGraph` SST from those nodes'
+/// embeddings and return the new descriptors **plus** the ids of any prior
+/// VectorGraph SSTs for the same index (which must be removed — a graph is not
+/// row-mergeable, so compaction rebuilds rather than merges). Descriptors whose
+/// label is absent from the bucket, whose metric is not indexable (`euclidean`),
+/// or with fewer than two live embeddings yield nothing.
+#[cfg(feature = "vector-index")]
+#[allow(clippy::too_many_arguments)]
+async fn build_vector_indexes_for_nodes(
+    store: &dyn ObjectStore,
+    paths: &NamespacePaths,
+    out_level: u32,
+    label_dict: &LabelDictionary,
+    descriptors: &[VectorIndexDescriptor],
+    merged_rows: &[NodeRow],
+    bucket_scope: &str,
+    old_vector_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
+) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
+    use crate::sst::vector::build_body;
+
+    let mut new_descs = Vec::new();
+    let mut removed = Vec::new();
+
+    for desc in descriptors {
+        let label_id = label_dict.id(&desc.label);
+        let mut members: Vec<([u8; 16], Vec<f32>)> = Vec::new();
+        for row in merged_rows {
+            let MemOp::Upsert(payload) = &row.op else {
+                continue;
+            };
+            let Ok(rec) = NodeWriteRecord::decode(payload) else {
+                continue;
+            };
+            // id-primary rows carry an authoritative label set; legacy rows
+            // (empty set) fall back to the bucket scope as their label.
+            let carries_label = match label_id {
+                Some(lid) => {
+                    rec.labels.contains(&lid.0)
+                        || (rec.labels.is_empty() && bucket_scope == desc.label)
+                }
+                None => rec.labels.is_empty() && bucket_scope == desc.label,
+            };
+            if !carries_label {
+                continue;
+            }
+            let Some(val) = rec.properties.get(&desc.property) else {
+                continue;
+            };
+            let v: Vec<f32> = match val {
+                Value::Vec(v) => v.clone(),
+                Value::VecI8 { codes, scale } => {
+                    codes.iter().map(|&c| c as f32 * *scale).collect()
+                }
+                _ => continue,
+            };
+            members.push((row.id, v));
+        }
+
+        let Some((body, stats)) = build_body(desc, members)? else {
+            continue;
+        };
+
+        let id = Uuid::now_v7();
+        let level = SstLevel(out_level);
+        let file_name = format!(
+            "{}-{}-{}.vg",
+            uuid_path_id(&id),
+            SstKind::VectorGraph.path_tag(),
+            desc.name
+        );
+        let object_path = paths.sst_object(level.as_u32(), &file_name);
+        let relative_path = relative_sst_path(level.as_u32(), &file_name);
+        let body_len = body.len() as u64;
+        put_create(store, &object_path, body).await?;
+
+        let descriptor = SstDescriptor {
+            id,
+            kind: SstKind::VectorGraph,
+            scope: desc.name.clone(),
+            level,
+            path: relative_path,
+            size_bytes: body_len,
+            row_count: stats.point_count,
+            created_at: Utc::now(),
+            min_key: [0u8; 16],
+            max_key: [0xFFu8; 16],
+            min_lsn: 0,
+            max_lsn: 0,
+            schema_version_min: 0,
+            schema_version_max: 0,
+            property_stats: vec![],
+            kind_specific: KindSpecificStats::VectorGraph {
+                dim: stats.dim,
+                metric: stats.metric,
+                point_count: stats.point_count,
+                r: stats.r,
+                l_build: stats.l_build,
+                alpha: stats.alpha,
+                entry_medoid: stats.entry_medoid,
+            },
+            bloom: None,
+            unique_property_indices: vec![],
+            equality_property_indices: vec![],
+            label_index: None,
+            per_label_property_stats: vec![],
+        };
+        new_descs.push(descriptor);
+
+        // Rebuild-not-merge: drop prior VectorGraph SSTs for this index.
+        if let Some(old) = old_vector_by_scope.get(&desc.name) {
+            removed.extend(old.iter().map(|d| d.id));
+        }
+    }
+
+    Ok((new_descs, removed))
 }
 
 async fn put_edge_sst_leveled(
@@ -1804,5 +1944,147 @@ mod tests {
                 "survivor {id} must remain after GC"
             );
         }
+    }
+
+    /// RFC-030 (`vector-index`): end-to-end through real compaction — write
+    /// clustered `Doc` embeddings across two L0 SSTs, compact to L1, and the
+    /// build hook materialises a searchable `VectorGraph` SST whose recall
+    /// tracks brute force.
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn compaction_builds_a_searchable_vector_graph() {
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric};
+        use crate::sst::vector::VectorGraphIndex;
+        use rand::Rng;
+        use rand::SeedableRng;
+
+        fn normalize_inplace(v: &mut [f32]) {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 0.0 {
+                for x in v {
+                    *x /= n;
+                }
+            }
+        }
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(emb: Vec<f32>, label_id: u32) -> Bytes {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("emb".into(), Value::Vec(emb));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-vector");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let doc_id = base.manifest.label_dict.intern("Doc");
+        base.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 16,
+            metric: VectorMetric::Cosine,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+        });
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 16 }, false).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        // 4 well-separated centroids; 160 docs (40/cluster) across 2 L0 SSTs.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(2024);
+        let centroids: Vec<Vec<f32>> = (0..4)
+            .map(|_| {
+                let mut c: Vec<f32> = (0..16).map(|_| rng.gen::<f32>()).collect();
+                normalize_inplace(&mut c);
+                c
+            })
+            .collect();
+        let mut cluster_of: std::collections::HashMap<NodeId, usize> =
+            std::collections::HashMap::new();
+
+        let mut cur = base;
+        let mut i: u64 = 0;
+        for _sst in 0..2 {
+            let mut mt = Memtable::new();
+            for _ in 0..80 {
+                let cluster = (i % 4) as usize;
+                let mut emb: Vec<f32> = centroids[cluster]
+                    .iter()
+                    .map(|b| b + 0.02 * rng.gen::<f32>())
+                    .collect();
+                normalize_inplace(&mut emb);
+                let id = idx_id(i + 1);
+                cluster_of.insert(id, cluster);
+                mt.apply(
+                    MemKey::Node { id },
+                    i + 1,
+                    MemOp::Upsert(doc_payload(emb, doc_id.0)),
+                );
+                i += 1;
+            }
+            let frozen = mt.freeze();
+            let after = flush(&ms, &fence, &cur, &frozen, schema.clone()).await.unwrap();
+            cur = after.committed;
+        }
+        assert!(cur.manifest.ssts.iter().all(|d| d.level == SstLevel::L0));
+
+        // Compact L0 → L1. The build hook emits one VectorGraph SST alongside
+        // the merged node SST.
+        let out = compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+        let vgs: Vec<&SstDescriptor> = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == SstKind::VectorGraph)
+            .collect();
+        assert_eq!(vgs.len(), 1, "exactly one VectorGraph SST after compaction");
+        assert_eq!(vgs[0].scope, "doc_emb");
+        let stats = match &vgs[0].kind_specific {
+            KindSpecificStats::VectorGraph { point_count, .. } => *point_count,
+            _ => 0,
+        };
+        assert_eq!(stats, 160, "all 160 docs indexed");
+
+        // Decode + search; a query near centroid 0 must surface cluster-0 docs.
+        let body = get_sst_body(s.as_ref(), &p, vgs[0]).await.unwrap();
+        let idx = VectorGraphIndex::decode(&body).unwrap();
+        assert_eq!(idx.point_count(), 160);
+
+        let mut q = centroids[0].clone();
+        normalize_inplace(&mut q);
+        let hits = idx.search(&q, 10, 48);
+        assert_eq!(hits.len(), 10);
+        // The query sits on centroid 0; the true top-10 are cluster-0 docs.
+        // Count how many returned hits belong to cluster 0 (recall proxy).
+        let cluster0_hits = hits
+            .iter()
+            .filter(|(id, _)| {
+                cluster_of.get(&NodeId::from_uuid(Uuid::from_bytes(*id))) == Some(&0)
+            })
+            .count();
+        assert!(
+            cluster0_hits >= 8,
+            "expected >= 8/10 hits from cluster 0, got {cluster0_hits}"
+        );
     }
 }
