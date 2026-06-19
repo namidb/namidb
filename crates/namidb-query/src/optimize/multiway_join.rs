@@ -372,7 +372,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
         | LogicalPlan::Argument { .. }
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::MultiwayJoin { .. }
-        | LogicalPlan::EdgeTypeCount { .. } => plan,
+        | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::VectorSearch { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

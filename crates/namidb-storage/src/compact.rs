@@ -252,6 +252,7 @@ async fn compact_leveled(
     let mut node_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut fwd_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut inv_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
+    let mut vector_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     for desc in &base.manifest.ssts {
         match desc.kind {
             SstKind::Nodes => node_buckets
@@ -263,6 +264,13 @@ async fn compact_leveled(
                 .or_default()
                 .push(desc),
             SstKind::EdgesInv => inv_buckets
+                .entry(desc.scope.clone())
+                .or_default()
+                .push(desc),
+            // VectorGraph SSTs (RFC-030 / `vector-index`). Bucketed per index
+            // name (the descriptor scope). With the feature off none are ever
+            // written, so this stays empty.
+            SstKind::VectorGraph => vector_buckets
                 .entry(desc.scope.clone())
                 .or_default()
                 .push(desc),
@@ -394,6 +402,26 @@ async fn compact_leveled(
         if let Some(d) = desc {
             new_descs.push(d);
         }
+    }
+
+    // VectorGraph SSTs (RFC-030 / `vector-index`). A Vamana graph is not
+    // row-mergeable: on a compaction that picks up an existing VectorGraph
+    // bucket, the index must be *rebuilt* from the current merged node rows,
+    // not merged graph-to-graph. The rebuild hook (`vector_index::rebuild`)
+    // is feature-gated; off-feature no VectorGraph SST is ever written, so this
+    // bucket is empty and the pass-through below is a no-op. Either way,
+    // surviving VectorGraph SSTs (un-touched here) carry forward via
+    // `next.ssts.retain`.
+    #[cfg(feature = "vector-index")]
+    {
+        // On-feature rebuild lands in Step 5; until then these are rebuilt by
+        // the dedicated hook invoked from the node-bucket loop. Any leftover
+        // descriptors here pass through unchanged.
+        for (_index_name, _sources) in &vector_buckets {}
+    }
+    #[cfg(not(feature = "vector-index"))]
+    {
+        let _ = &vector_buckets;
     }
 
     if removed_ids.is_empty() {

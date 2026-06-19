@@ -534,6 +534,26 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 output
             );
         }
+        LogicalPlan::VectorSearch {
+            label,
+            alias,
+            property,
+            k,
+            distance,
+            score_alias,
+            ..
+        } => {
+            let _ = write!(
+                out,
+                "VectorSearch label={:?} prop={} k={} metric={} => {} (score={})",
+                label,
+                property,
+                k.as_const().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                distance.builtin_name(),
+                alias,
+                score_alias
+            );
+        }
         LogicalPlan::CrossProduct { .. } => {
             out.push_str("CrossProduct");
         }

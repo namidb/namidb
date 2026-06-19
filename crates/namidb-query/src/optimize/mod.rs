@@ -260,6 +260,12 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         LogicalPlan::EdgeTypeCount { output, .. } => {
             out.insert(output.clone());
         }
+        LogicalPlan::VectorSearch {
+            alias, score_alias, ..
+        } => {
+            out.insert(alias.clone());
+            out.insert(score_alias.clone());
+        }
         LogicalPlan::Argument { bindings } => {
             for b in bindings {
                 out.insert(b.clone());

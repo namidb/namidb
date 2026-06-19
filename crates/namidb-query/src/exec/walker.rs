@@ -278,6 +278,29 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     .to_string(),
             )),
 
+            LogicalPlan::VectorSearch {
+                label,
+                alias,
+                property,
+                query,
+                k,
+                distance,
+                score_alias,
+            } => {
+                flat_vector_search(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    property,
+                    query,
+                    k,
+                    *distance,
+                    score_alias,
+                    params,
+                )
+                .await
+            }
+
             LogicalPlan::PatternList {
                 input,
                 subplan,
@@ -1226,6 +1249,73 @@ fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<Stri
     }
 }
 
+/// Flat (no-index) top-k vector search over `label`'s `property` embeddings
+/// (RFC-030). Scans every node of `label` (or all labels when `None`), scoring
+/// each against `query`, and emits the `k` best as rows binding `alias` to the
+/// node and `score_alias` to the metric value. This is the universal fallback
+/// for [`LogicalPlan::VectorSearch`]; the `vector-index` feature adds an
+/// index-backed path (Step 8) that calls this only when no descriptor matches.
+///
+/// The scan projects only the embedding column, so a large label costs one
+/// decoded column per node rather than the whole property map. Candidates with
+/// a missing/NULL embedding or a zero-magnitude vector (undefined cosine) are
+/// dropped.
+async fn flat_vector_search(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    alias: &str,
+    property: &str,
+    query: &Expression,
+    k: &RowCount,
+    distance: crate::plan::logical::VectorDistance,
+    score_alias: &str,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::exec::expr::vector_score;
+
+    // The query expression carries no row bindings (literal vector or $param);
+    // evaluate it once against an empty row.
+    let q = evaluate(query, &Row::new(), params)?;
+    let limit = k.as_const().unwrap_or(10) as usize;
+    let labels = resolve_node_labels(snapshot, label);
+    let projection = vec![property.to_string()];
+
+    // (sort_key, score_value, node) — sort_key is "lower is better" (higher-is-
+    // better metrics are negated), so an ascending sort yields the top-k.
+    let mut scored: Vec<(f64, f64, NodeValue)> = Vec::new();
+    for label_name in &labels {
+        let nodes = snapshot
+            .scan_label_with_predicates_and_projection(label_name, &[], Some(&projection))
+            .await?;
+        for n in nodes {
+            crate::exec::limits::check_deadline()?;
+            let node = NodeValue::from(n);
+            let Some(emb) = node.properties.get(property) else {
+                continue;
+            };
+            let Some((score, higher_is_better)) =
+                vector_score(distance, emb, &q, query.span)?
+            else {
+                continue;
+            };
+            let sort_key = if higher_is_better { -score } else { score };
+            scored.push((sort_key, score, node));
+        }
+    }
+
+    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    scored.truncate(limit);
+
+    let mut out = Vec::with_capacity(scored.len());
+    for (_sort_key, score, node) in scored {
+        let mut row = Row::new();
+        row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
+        row.set(score_alias.to_string(), RuntimeValue::Float(score));
+        out.push(row);
+    }
+    Ok(out)
+}
+
 /// Resolve the set of edge types an `Expand` operator must traverse.
 ///
 /// `Some(types)` → traverse only the listed types (union for
@@ -1900,6 +1990,32 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
         match plan {
             // Operators that benefit directly: keep everything factorised.
             LogicalPlan::Empty => Ok(FactorRowSet::singleton_root()),
+
+            // VectorSearch is a leaf that drives its own read; run the flat
+            // fallback and wrap it (no factorisation benefit for a top-k scan).
+            LogicalPlan::VectorSearch {
+                label,
+                alias,
+                property,
+                query,
+                k,
+                distance,
+                score_alias,
+            } => {
+                let rows = flat_vector_search(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    property,
+                    query,
+                    k,
+                    *distance,
+                    score_alias,
+                    params,
+                )
+                .await?;
+                Ok(FactorRowSet::from_flat(rows))
+            }
 
             LogicalPlan::NodeScan {
                 label,
@@ -3497,6 +3613,9 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         }
         LogicalPlan::NodeByPropertyValue { value, .. } => {
             collect_referenced_variables(value, out);
+        }
+        LogicalPlan::VectorSearch { query, .. } => {
+            collect_referenced_variables(query, out);
         }
         LogicalPlan::Unwind { list, .. } => {
             collect_referenced_variables(list, out);

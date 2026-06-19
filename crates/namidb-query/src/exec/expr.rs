@@ -1027,6 +1027,60 @@ fn vec_dot_f64(a: &[f32], b: &[f32]) -> f64 {
     a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
 }
 
+/// Score a candidate vector against a query for the `VectorSearch` flat
+/// fallback (RFC-030). Mirrors the `cosine_similarity` / `dot_product` /
+/// `euclidean_distance` builtins but returns the value the score column should
+/// hold **plus** `true` when higher-is-better (cosine/dot similarity) so the
+/// caller can rank correctly. `None` ⇒ drop the candidate (NULL operand, or a
+/// zero-magnitude vector making cosine undefined). A dimension mismatch is a
+/// usage error.
+pub(crate) fn vector_score(
+    distance: crate::plan::logical::VectorDistance,
+    a: &RuntimeValue,
+    b: &RuntimeValue,
+    span: SourceSpan,
+) -> Result<Option<(f64, bool)>, EvalError> {
+    use crate::plan::logical::VectorDistance;
+    let Some(av) = coerce_vector(a, "vector", span)? else {
+        return Ok(None);
+    };
+    let Some(bv) = coerce_vector(b, "vector", span)? else {
+        return Ok(None);
+    };
+    if av.len() != bv.len() {
+        return Err(EvalError::new(
+            format!(
+                "vector dimension mismatch ({} vs {})",
+                av.len(),
+                bv.len()
+            ),
+            span,
+        ));
+    }
+    Ok(Some(match distance {
+        VectorDistance::Dot => (vec_dot_f64(&av, &bv), true),
+        VectorDistance::Euclidean => {
+            let sum: f64 = av
+                .iter()
+                .zip(&bv)
+                .map(|(x, y)| {
+                    let d = *x as f64 - *y as f64;
+                    d * d
+                })
+                .sum();
+            (sum.sqrt(), false)
+        }
+        VectorDistance::Cosine => {
+            let na = vec_dot_f64(&av, &av).sqrt();
+            let nb = vec_dot_f64(&bv, &bv).sqrt();
+            if na == 0.0 || nb == 0.0 {
+                return Ok(None);
+            }
+            (vec_dot_f64(&av, &bv) / (na * nb), true)
+        }
+    }))
+}
+
 /// Coerce a similarity/distance operand into a vector. Accepts a stored
 /// `Vector` or a numeric `List` (so a `$param` array works without an explicit
 /// `vector()` wrap). `Null` yields `Ok(None)` so the caller can propagate NULL;

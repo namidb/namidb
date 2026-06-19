@@ -9,6 +9,13 @@ homepage.workspace = true
 description = "Cypher/GQL parser, optimizer, and executor for NamiDB"
 readme = "README.md"
 
+[features]
+default = []
+# DiskANN/Vamana ANN support (RFC-030). Gates the `vector_search` optimizer
+# rewrite that produces `LogicalPlan::VectorSearch`; the variant and its flat
+# fallback are always compiled. Default off.
+vector-index = []
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-graph = { workspace = true }

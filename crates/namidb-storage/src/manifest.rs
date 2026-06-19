@@ -70,6 +70,13 @@ pub struct Manifest {
     /// unchanged).
     #[serde(default)]
     pub label_dict: LabelDictionary,
+    /// Registered DiskANN/Vamana vector indexes (RFC-030, `vector-index`
+    /// feature). `CREATE VECTOR INDEX` appends here; the compaction build hook
+    /// and the query optimizer both discover indexes by matching
+    /// `(label, property)`. `serde(default)` keeps pre-feature manifests
+    /// loading unchanged.
+    #[serde(default)]
+    pub vector_indexes: Vec<VectorIndexDescriptor>,
 }
 
 impl Manifest {
@@ -84,6 +91,7 @@ impl Manifest {
             ssts: Vec::new(),
             wal_segments: Vec::new(),
             label_dict: LabelDictionary::new(),
+            vector_indexes: Vec::new(),
         }
     }
 
@@ -100,6 +108,7 @@ impl Manifest {
             ssts: self.ssts.clone(),
             wal_segments: self.wal_segments.clone(),
             label_dict: self.label_dict.clone(),
+            vector_indexes: self.vector_indexes.clone(),
         }
     }
 }
@@ -116,7 +125,8 @@ pub struct ManifestPointer {
 /// What kind of artefact an SST contains.
 ///
 /// RFC-002 §4.1: `Edges` was split into `EdgesFwd` and `EdgesInv` (forward
-/// and inverse partner CSRs). `Vector` lands with RFC-007.
+/// and inverse partner CSRs). `VectorGraph` is a DiskANN/Vamana ANN search
+/// graph body (see `namidb-ann` + the `vector-index` Cargo feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SstKind {
     /// Property-column SST for a node label (Parquet).
@@ -125,6 +135,11 @@ pub enum SstKind {
     EdgesFwd,
     /// CSR adjacency SST for an edge type, sorted by `dst_id` (inverse partner).
     EdgesInv,
+    /// DiskANN/Vamana ANN search-graph body for one vector index. Self-contained
+    /// (vectors + graph serialized inline), built during compaction. Has no
+    /// meaningful lexicographic key range, so its descriptors carry full-range
+    /// `min_key/max_key` and are looked up by `(kind, scope=index_name)`.
+    VectorGraph,
 }
 
 impl SstKind {
@@ -134,6 +149,7 @@ impl SstKind {
             SstKind::Nodes => "nodes",
             SstKind::EdgesFwd => "edges-fwd",
             SstKind::EdgesInv => "edges-inv",
+            SstKind::VectorGraph => "vector-graph",
         }
     }
 }
@@ -165,6 +181,25 @@ pub enum KindSpecificStats {
         key_count: u64,
         tombstone_count: u64,
         degree_histogram: Box<DegreeHistogram>,
+    },
+    /// Stats for a `VectorGraph` (DiskANN/Vamana) SST. Records the build
+    /// parameters and the graph shape so the read path and observability can
+    /// reason about it without decoding the body.
+    VectorGraph {
+        /// Embedding dimensionality.
+        dim: u32,
+        /// Distance metric the index was built for (`"cosine"`/`"dot"`/`"euclidean"`).
+        metric: String,
+        /// Number of vectors (graph nodes) indexed in this SST.
+        point_count: u64,
+        /// Vamana max out-degree (`R`).
+        r: usize,
+        /// Vamana build beam (`L_build`).
+        l_build: usize,
+        /// Vamana α diversification.
+        alpha: f32,
+        /// Entry-point medoid id.
+        entry_medoid: u32,
     },
 }
 
@@ -339,6 +374,67 @@ pub struct LabelIndexDescriptor {
     /// (`serde(default)` round-trips them unchanged).
     #[serde(default)]
     pub per_label_counts: Vec<(u32, u64)>,
+}
+
+/// Distance metric a vector index is built for. The build and search must use
+/// the same metric; the optimizer matches it against the query's distance
+/// function when deciding whether the index can serve the lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorMetric {
+    Cosine,
+    Dot,
+    Euclidean,
+}
+
+impl VectorMetric {
+    /// The builtin Cypher function name that computes this metric
+    /// (`cosine_similarity` / `dot_product` / `euclidean_distance`), so the
+    /// optimizer rewrite can match a query against the index.
+    pub fn builtin_name(self) -> &'static str {
+        match self {
+            VectorMetric::Cosine => "cosine_similarity",
+            VectorMetric::Dot => "dot_product",
+            VectorMetric::Euclidean => "euclidean_distance",
+        }
+    }
+}
+
+/// A registered DiskANN/Vamana vector index over one `(label, property)`.
+///
+/// `CREATE VECTOR INDEX` appends one of these to [`Manifest::vector_indexes`];
+/// the compaction build hook then materializes a `SstKind::VectorGraph` body for
+/// it, and the query optimizer rewrites a matching KNN pattern into a
+/// `VectorSearch` when (and only when) a descriptor for `(label, property)`
+/// with the right metric exists. The index's dimensionality is the source of
+/// truth on the schema's `DataType::FloatVector`/`Int8Vector` for the property;
+/// `dim` is recorded here for convenience and validated against the schema at
+/// build time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorIndexDescriptor {
+    /// Index name (unique within the namespace).
+    pub name: String,
+    /// Node label whose embeddings are indexed.
+    pub label: String,
+    /// Property holding the embedding vector.
+    pub property: String,
+    /// Embedding dimensionality.
+    pub dim: u32,
+    /// Distance metric.
+    pub metric: VectorMetric,
+    /// Vamana max out-degree (`R`).
+    pub r: usize,
+    /// Vamana build beam (`L_build`).
+    pub l_build: usize,
+    /// Vamana α diversification.
+    pub alpha: f32,
+}
+
+impl VectorIndexDescriptor {
+    /// `true` iff this index covers `(label, property)` with `metric`.
+    pub fn matches(&self, label: &str, property: &str, metric: VectorMetric) -> bool {
+        self.label == label && self.property == property && self.metric == metric
+    }
 }
 
 /// JSON serde helper: `[u8; 16]` ↔ base64-standard string.

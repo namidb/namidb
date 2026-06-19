@@ -11,6 +11,9 @@ readme = "README.md"
 
 [dependencies]
 namidb-core = { workspace = true }
+# Optional: the DiskANN/Vamana algorithm crate. Only pulled in behind the
+# `vector-index` feature; the rest of the crate must compile without it.
+namidb-ann = { workspace = true, optional = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -38,6 +41,13 @@ fs2 = { workspace = true }
 url = { workspace = true }
 anyhow = { workspace = true }
 arrow-ipc = "55"
+
+[features]
+default = []
+# DiskANN/Vamana ANN support (RFC-030). Enables the compaction-time graph
+# build hook and the VectorGraph SST reader. Default off — existing namespaces
+# stay byte-for-byte identical with it disabled.
+vector-index = ["dep:namidb-ann"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

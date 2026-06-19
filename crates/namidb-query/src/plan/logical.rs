@@ -24,6 +24,28 @@ pub enum ShortestMode {
     All,
 }
 
+/// Vector distance metric for [`LogicalPlan::VectorSearch`] (RFC-030). Mirrors
+/// the builtins `cosine_similarity` / `dot_product` / `euclidean_distance` —
+/// the optimizer matches a query's distance function against this to decide
+/// whether a `VectorIndexDescriptor` can serve the lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VectorDistance {
+    Cosine,
+    Dot,
+    Euclidean,
+}
+
+impl VectorDistance {
+    /// The builtin Cypher function name that computes this metric.
+    pub fn builtin_name(self) -> &'static str {
+        match self {
+            VectorDistance::Cosine => "cosine_similarity",
+            VectorDistance::Dot => "dot_product",
+            VectorDistance::Euclidean => "euclidean_distance",
+        }
+    }
+}
+
 /// Tree of relational/graph operators produced by lowering the AST and
 /// consumed by the executor. See RFC-008.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -358,6 +380,35 @@ pub enum LogicalPlan {
         /// aggregation this pass replaced (`count(r) AS n` ⇒ `"n"`).
         output: String,
     },
+
+    /// Approximate-nearest-neighbour lookup over a node-label embedding
+    /// property (RFC-030, `vector-index`). A leaf operator: it drives its own
+    /// reads — the flat path (`NodeScan` of `label`, per-row distance, sort,
+    /// take `k`) when no backing `VectorIndexDescriptor` exists, or the
+    /// DiskANN/Vamana graph when one does. Emits `k` rows binding `alias` to
+    /// each hit NodeId and `score_alias` to the (lower-is-closer) distance to
+    /// the query. The optimizer rewrites a matching KNN shape into this only
+    /// when an index is available; otherwise the flat shape already ranks
+    /// correctly, so this variant is produced solely by the `vector_search`
+    /// rewrite (feature-gated call site).
+    VectorSearch {
+        /// `Some(label)` scopes the scan/index to one label; `None` fans out
+        /// across every label carrying `property` (flat path only — an index is
+        /// per-label, so the rewrite requires a label).
+        label: Option<String>,
+        /// Binding for the hit node id in each output row.
+        alias: String,
+        /// Embedding property holding the vector.
+        property: String,
+        /// Query vector expression (evaluated to a FloatVector at run time).
+        query: Expression,
+        /// How many nearest rows to emit.
+        k: RowCount,
+        /// Distance metric / builtin to rank by.
+        distance: VectorDistance,
+        /// Output column for the (lower-is-closer) distance score.
+        score_alias: String,
+    },
 }
 
 /// One participating variable in a [`LogicalPlan::MultiwayJoin`]
@@ -400,7 +451,8 @@ impl LogicalPlan {
             | LogicalPlan::Empty
             | LogicalPlan::Argument { .. }
             | LogicalPlan::MultiwayJoin { .. }
-            | LogicalPlan::EdgeTypeCount { .. } => {
+            | LogicalPlan::EdgeTypeCount { .. }
+            | LogicalPlan::VectorSearch { .. } => {
                 vec![]
             }
             LogicalPlan::NodeById { input, .. }
@@ -514,6 +566,7 @@ impl LogicalPlan {
             }
             LogicalPlan::MultiwayJoin { .. } => "MultiwayJoin",
             LogicalPlan::EdgeTypeCount { .. } => "EdgeTypeCount",
+            LogicalPlan::VectorSearch { .. } => "VectorSearch",
         }
     }
 }

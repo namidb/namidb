@@ -2410,6 +2410,7 @@ dependencies = [
  "foyer",
  "fs2",
  "futures",
+ "namidb-ann",
  "namidb-core",
  "object_store 0.13.2",
  "parquet",

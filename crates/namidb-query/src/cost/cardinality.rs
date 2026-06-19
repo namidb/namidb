@@ -72,6 +72,21 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             b.insert(output.clone(), BindingMeta::default());
             leaf(plan, 1.0, b)
         }
+        // A vector search emits exactly `k` rows (one per nearest neighbour),
+        // binding the hit alias and its score column. `k` may be a `$param`
+        // (RowCount::Param); fall back to a small constant so the cost model
+        // still produces a finite, ordering-meaningful estimate.
+        LogicalPlan::VectorSearch {
+            alias,
+            score_alias,
+            k,
+            ..
+        } => {
+            let mut b = BTreeMap::new();
+            b.insert(alias.clone(), BindingMeta::default());
+            b.insert(score_alias.clone(), BindingMeta::default());
+            leaf(plan, k.as_const().unwrap_or(10) as f64, b)
+        }
         LogicalPlan::Argument { bindings } => {
             let mut b = BTreeMap::new();
             for name in bindings {
