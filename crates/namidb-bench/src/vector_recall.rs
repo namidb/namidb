@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use namidb_core::quantize::quantize_i8;
+use namidb_core::quantize::{dot_i8_asymmetric, quantize_i8};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
@@ -91,12 +91,6 @@ fn perturbed_unit_vector(rng: &mut ChaCha8Rng, base: &[f32], spread: f32) -> Vec
 
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// Asymmetric score, per-vector scale: `scale * Σ query_i * code_i`. The
-/// stored side is never expanded to f32.
-fn dot_f32_i8_scaled(q: &[f32], codes: &[i8], scale: f32) -> f32 {
-    scale * q.iter().zip(codes).map(|(x, &c)| x * c as f32).sum::<f32>()
 }
 
 /// Naive fixed-127 quantize + score, for the comparison column.
@@ -195,7 +189,7 @@ pub fn run(
         let t = Instant::now();
         let scaled_scores: Vec<f32> = stored_scaled
             .iter()
-            .map(|(codes, scale)| dot_f32_i8_scaled(q, codes, *scale))
+            .map(|(codes, scale)| dot_i8_asymmetric(q, codes, *scale))
             .collect();
         let scaled_top = top_k(&scaled_scores, k);
         int8_us.push(t.elapsed().as_micros());

@@ -51,6 +51,39 @@ pub fn dequantize_i8(codes: &[i8], scale: f32) -> Vec<f32> {
     codes.iter().map(|&c| c as f32 * scale).collect()
 }
 
+/// Asymmetric int8 dot product — the single definition of the score the engine
+/// uses. The query stays in f32; the stored side is int8 codes with a
+/// per-vector scale, and the scale is folded into the sum:
+/// `dot(query, stored) = scale * Σ query_i * codes_i`, where
+/// `stored_i ≈ codes_i * scale`. The stored vector is never expanded back to
+/// f32, so a 1536-dim vector costs 1536 `f32*i8` multiply-adds plus one
+/// `f32*scale` regardless of dimension magnitude.
+///
+/// Length handling mirrors the exact f32 dot (`zip` truncates to the shorter
+/// side); the scale still applies to whatever prefix was scored. The stored
+/// side is finite by construction (`quantize_i8` guarantees a finite scale and
+/// zero-coded non-finites), so the only way the result is non-finite is a
+/// non-finite query component — the caller's responsibility.
+pub fn dot_i8_asymmetric(query: &[f32], codes: &[i8], scale: f32) -> f32 {
+    let sum = query
+        .iter()
+        .zip(codes)
+        .map(|(&q, &c)| q * c as f32)
+        .sum::<f32>();
+    scale * sum
+}
+
+/// L2 norm of a stored (quantized) vector without expanding it to f32:
+/// `|stored| = scale * sqrt(Σ codes_i²)` (since `stored_i ≈ codes_i * scale`
+/// and `scale ≥ 0`). Returns `0.0` for all-zero codes and/or `scale == 0`, so
+/// a zero vector's norm is finite and usable. The score side of cosine
+/// similarity is `dot_i8_asymmetric(q, codes, scale) / norm_i8(codes, scale)`
+/// (the query norm is a plain f32).
+pub fn norm_i8(codes: &[i8], scale: f32) -> f32 {
+    let sum_sq: f32 = codes.iter().map(|&c| (c as f32) * (c as f32)).sum();
+    scale * sum_sq.sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +158,69 @@ mod tests {
         let (codes, scale) = quantize_i8(&[f32::INFINITY, f32::NAN, f32::NEG_INFINITY]);
         assert_eq!(codes, vec![0, 0, 0]);
         assert_eq!(scale, 0.0);
+    }
+
+    #[test]
+    fn asymmetric_dot_matches_dequantize_then_f32_dot() {
+        // The folded-scale asymmetric score equals the f32 dot of the query
+        // with the fully dequantized vector — the invariant that lets one
+        // definition serve write path, scorer, and harness.
+        let stored: Vec<f32> = [0.5, -0.25, 0.1, 0.4, -0.05].to_vec();
+        let (codes, scale) = quantize_i8(&stored);
+        let query: Vec<f32> = [0.3, 0.2, -0.1, 0.6, 0.0].to_vec();
+
+        let direct = dot_i8_asymmetric(&query, &codes, scale);
+        let deq = dequantize_i8(&codes, scale);
+        let via_f32: f32 = query.iter().zip(&deq).map(|(q, s)| q * s).sum();
+        assert!(
+            (direct - via_f32).abs() < 1e-5,
+            "asymmetric {direct} != f32 {via_f32}"
+        );
+    }
+
+    #[test]
+    fn asymmetric_dot_self_recovers_stored_norm_squared() {
+        // dot(x, x) = |x|². Score the stored vector against itself (dequantized
+        // to f32 for the query) and compare to norm_i8².
+        let stored: Vec<f32> = [0.4, -0.3, 0.2].to_vec();
+        let (codes, scale) = quantize_i8(&stored);
+        let query = dequantize_i8(&codes, scale);
+        let self_score = dot_i8_asymmetric(&query, &codes, scale);
+        let norm = norm_i8(&codes, scale);
+        assert!(
+            (self_score - norm * norm).abs() < 1e-4,
+            "self-score {self_score} != |x|²={}",
+            norm * norm
+        );
+    }
+
+    #[test]
+    fn norm_i8_matches_dequantized_norm_and_is_finite() {
+        let stored: Vec<f32> = [0.7, -0.1, 0.5, 0.3].to_vec();
+        let (codes, scale) = quantize_i8(&stored);
+        let deq = dequantize_i8(&codes, scale);
+        let exact: f32 = deq.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let fast = norm_i8(&codes, scale);
+        assert!((fast - exact).abs() < 1e-5, "{fast} != {exact}");
+        assert!(fast.is_finite());
+    }
+
+    #[test]
+    fn norm_i8_zero_vector_is_zero() {
+        let (codes, scale) = quantize_i8(&[0.0, 0.0]);
+        assert_eq!(norm_i8(&codes, scale), 0.0);
+        // Explicitly zero codes with a nonzero scale must still be zero.
+        assert_eq!(norm_i8(&[0, 0, 0], 3.5), 0.0);
+    }
+
+    #[test]
+    fn asymmetric_dot_truncates_to_overlapping_prefix_like_zip() {
+        // query longer than codes: only the prefix is scored, scale applied.
+        let codes = [1i8, 2, 3];
+        let scale = 0.5f32;
+        let query = [2.0f32, 4.0, 6.0, 100.0];
+        let got = dot_i8_asymmetric(&query, &codes, scale);
+        let prefix = 0.5 * (2.0 * 1.0 + 4.0 * 2.0 + 6.0 * 3.0);
+        assert!((got - prefix).abs() < 1e-6, "{got} != {prefix}");
     }
 }
