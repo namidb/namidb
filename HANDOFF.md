@@ -8,12 +8,57 @@
 
 | Crate | Tests |
 |-------|-------|
-| namidb-storage | 304 |
+| namidb-storage | 309 (304 + 5 vector, behind `vector-index`) |
+| namidb-query | 462 (458 + 4 vector rewrite, behind `vector-index`) |
+| namidb-ann | 21 (new) |
 | namidb-server | 31 (+ integration suites) |
 | namidb-mcp | 20 |
 | namidb-graph | 10 |
 
-## Completed this session
+## Item 12 — DiskANN/Vamana ANN (mostly shipped this session)
+
+8 of 9 steps done, behind Cargo feature `vector-index` (default off — existing
+namespaces stay byte-identical). Commits `9c85c22` → `b74cc3d`:
+
+1. **namidb-ann crate** (`39d3210`): Vamana graph build (α-robust prune,
+   medoid entry, Auto/BruteForce/Random init) + greedy beam search
+   (candidate min-heap, result max-heap, visited bitset, converged
+   termination). `VectorSpace` trait with `F32CosineSpace` (recall-golden)
+   + `Int8Space` (shipped path, cosine on int8 is scale-invariant). Recall
+   validated: f32 ≥0.90, int8 ≥0.80 on clustered unit vectors. 21 tests.
+2. **Storage scaffolding** (`ba6d324`): `SstKind::VectorGraph` +
+   `KindSpecificStats::VectorGraph`, `Manifest.vector_indexes` +
+   `VectorIndexDescriptor`/`VectorMetric` (with the CRITICAL
+   `next_version()` clone-forward), `compact.rs` VectorGraph bucketing.
+3. **Query scaffolding** (`ba6d324`): `LogicalPlan::VectorSearch` +
+   `VectorDistance`, all ~17 forced match arms, `flat_vector_search` fallback
+   (scan + project-embedding-only + score + top-k) on both flat & factor
+   paths, `exec/expr::vector_score` shared helper.
+4. **Build hook + reader** (`8e7e787`): compaction rebuilds Vamana indexes
+   from GC'd merged node rows (id-primary label filtering via `label_dict`;
+   rebuild-not-merge). `sst/vector.rs` self-contained `.vg` body
+   (magic + bincode) + `VectorGraphIndex::decode/search` (full-precision
+   rerank). End-to-end compaction test: 160 clustered docs → searchable
+   index, ≥8/10 hits from the queried cluster.
+5. **Optimizer rewrite** (`b74cc3d`): `optimize/vector_search.rs` collapses
+   the flat KNN shape `TopN(Project([Filter]NodeScan))` into `VectorSearch`
+   when a backing index exists (conservative: SKIP/non-DESC/multi-key/
+   DISTINCT/metric-mismatch/no-index ⇒ unchanged). `StatsCatalog.vector_indexes`
+   + `vector_index_for(...)` lookup. 4 unit tests.
+6. **Executor dispatch** (`b74cc3d`): `Snapshot::vector_search` (unions
+   in-scope `.vg` SSTs, re-ranks) + `try_index_search` serves the
+   `VectorSearch` arm from the index, falling back to flat when none applies.
+
+**Remaining: Step 9 — `CREATE VECTOR INDEX` DDL.** Greenfield (no prior code).
+Needs: a `WriterSession::register_vector_index(desc)` method (commits a new
+manifest version with the descriptor pushed — the execution half; the storage
+test mutates the manifest directly today), the parser (soft-keyword `VECTOR`/
+`INDEX` like `EXPLAIN`), `Clause::CreateVectorIndex` (always-present, gates
+per C5), and a third server dispatch branch (DDL is neither read nor row-write;
+routing through `execute_write` would stage memtable rows — wrong). Until then
+indexes are registered programmatically (the compaction test shows how).
+
+## Completed earlier this session
 
 ### Adversarial-review fixes (68 agents → 41 confirmed bugs)
 **Commit `b347038`** + follow-ups. The review found 4 critical / 15 high bugs; the
