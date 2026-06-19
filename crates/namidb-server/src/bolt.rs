@@ -82,6 +82,59 @@ impl ServerBackend {
         })
     }
 
+    /// Bolt shape for `CREATE VECTOR INDEX`: gate on role, run the DDL via
+    /// the shared storage helper, return an empty `RunOutcome` tagged
+    /// `Schema`. Auto-commit only — the in-transaction path rejects DDL
+    /// (a schema command commits immediately and cannot be rolled back).
+    #[cfg(feature = "vector-index")]
+    async fn run_create_vector_index(
+        &self,
+        cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
+        started: std::time::Instant,
+    ) -> RunObservation {
+        if let Some(err) = self.write_forbidden() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
+        let mut writer = self.state.writer.lock().await;
+        let result = crate::apply_create_vector_index(&mut writer, &self.state.snapshot, cvi).await;
+        drop(writer);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed,
+                result: Ok(RunOutcome {
+                    fields: vec![],
+                    rows: vec![],
+                    statement_type: StatementType::Schema,
+                    counters: BTreeMap::new(),
+                }),
+            },
+            Err(e) => {
+                // A duplicate name/target is a user (semantic) error; a fence
+                // or lost CAS is a transient storage error.
+                let is_user = matches!(
+                    &e,
+                    namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_)
+                );
+                let err = if is_user {
+                    BackendError::Semantic(e.to_string())
+                } else {
+                    map_storage_err(e)
+                };
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Err(err),
+                }
+            }
+        }
+    }
+
     /// Auto-commit query: parse, plan, and execute against the published
     /// snapshot (reads) or the writer lock (writes), timing the work for the
     /// metrics. Mirrors the HTTP `run_cypher`. The stopwatch stops at the end
@@ -104,6 +157,12 @@ impl ServerBackend {
                 };
             }
         };
+        // `CREATE VECTOR INDEX` is schema DDL: intercept before planning.
+        #[cfg(feature = "vector-index")]
+        if let Some(cvi) = parsed.as_create_vector_index() {
+            return self.run_create_vector_index(cvi, started).await;
+        }
+
         // Plan against the latest published snapshot — no writer lock.
         let owned = self.state.snapshot.load();
         let catalog = self.state.catalog_for(&owned.manifest().manifest);
@@ -206,6 +265,18 @@ impl ServerBackend {
                 };
             }
         };
+        // DDL commits immediately and cannot be rolled back, so it is
+        // rejected inside an explicit transaction (auto-commit only).
+        #[cfg(feature = "vector-index")]
+        if parsed.as_create_vector_index().is_some() {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Unsupported(
+                    "CREATE VECTOR INDEX cannot run inside a transaction".into(),
+                )),
+            };
+        }
         let owned = self.state.snapshot.load();
         let catalog = self.state.catalog_for(&owned.manifest().manifest);
         let plan = match build_plan(&parsed, &catalog).map_err(map_lower_err) {

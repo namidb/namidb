@@ -8,17 +8,17 @@
 
 | Crate | Tests |
 |-------|-------|
-| namidb-storage | 309 (304 + 5 vector, behind `vector-index`) |
-| namidb-query | 462 (458 + 4 vector rewrite, behind `vector-index`) |
+| namidb-storage | 310 (304 + 5 vector build + 1 DDL register, behind `vector-index`) |
+| namidb-query | 468 (458 + 4 vector rewrite + 5 DDL parse + 1, behind `vector-index`) |
 | namidb-ann | 21 (new) |
-| namidb-server | 31 (+ integration suites) |
+| namidb-server | 32 (+ integration suites, +1 DDL HTTP behind `vector-index`) |
 | namidb-mcp | 20 |
 | namidb-graph | 10 |
 
-## Item 12 — DiskANN/Vamana ANN (mostly shipped this session)
+## Item 12 — DiskANN/Vamana ANN (shipped this session, 9/9)
 
-8 of 9 steps done, behind Cargo feature `vector-index` (default off — existing
-namespaces stay byte-identical). Commits `9c85c22` → `b74cc3d`:
+All 9 steps done, behind Cargo feature `vector-index` (default off — existing
+namespaces stay byte-identical). Commits `9c85c22` → `<this commit>`:
 
 1. **namidb-ann crate** (`39d3210`): Vamana graph build (α-robust prune,
    medoid entry, Auto/BruteForce/Random init) + greedy beam search
@@ -48,15 +48,34 @@ namespaces stay byte-identical). Commits `9c85c22` → `b74cc3d`:
 6. **Executor dispatch** (`b74cc3d`): `Snapshot::vector_search` (unions
    in-scope `.vg` SSTs, re-ranks) + `try_index_search` serves the
    `VectorSearch` arm from the index, falling back to flat when none applies.
+7. **`CREATE VECTOR INDEX` DDL** (`<this commit>`): the missing queryability
+   layer. `WriterSession::register_vector_index(desc)` — a metadata-only
+   manifest commit (mirrors `attach_ssts`: `next_version` → push →
+   `manifest_store.commit` → `refresh_published`; no WAL, no memtable rows),
+   rejecting duplicate name / duplicate `(label, property, metric)`. The
+   parser gains `Clause::CreateVectorIndex` (always-present variant per C5)
+   + `parse_create_vector_index` for `CREATE VECTOR INDEX <name> ON
+   :Label(property) METRIC <m> DIMENSION <n> [WITH {r, l_build, alpha}]`
+   (soft-keywords VECTOR/INDEX/METRIC/DIMENSION; reserved `WITH`/`ON`). The
+   DDL never lowers to a `LogicalPlan` — `Query::as_create_vector_index()`
+   lets the server **intercept it pre-plan** (like Bolt's `try_introspect`),
+   so it needs no third dispatch branch nor a new `LogicalPlan` variant
+   (avoids the C5 tax of ~12 exhaustive matches). Wired in all four
+   read/write chokepoints: `run_cypher` + `run_cypher_multi` (HTTP),
+   `run_query` (Bolt auto-commit, `StatementType::Schema`), and
+   `run_query_in_tx` (Bolt, rejects DDL — it commits immediately and can't
+   roll back). Feature-gated: feature off → DDL reaches the lowerer and is
+   rejected (HTTP 400 / Bolt NotSupported); feature on → registers + the
+   compaction hook builds + the optimizer accelerates. Read-only tokens are
+   forbidden (DDL mutates durable schema). HTTP test: success (200) +
+   duplicate (400) + read-only (403).
 
-**Remaining: Step 9 — `CREATE VECTOR INDEX` DDL.** Greenfield (no prior code).
-Needs: a `WriterSession::register_vector_index(desc)` method (commits a new
-manifest version with the descriptor pushed — the execution half; the storage
-test mutates the manifest directly today), the parser (soft-keyword `VECTOR`/
-`INDEX` like `EXPLAIN`), `Clause::CreateVectorIndex` (always-present, gates
-per C5), and a third server dispatch branch (DDL is neither read nor row-write;
-routing through `execute_write` would stage memtable rows — wrong). Until then
-indexes are registered programmatically (the compaction test shows how).
+   Design note: the DDL is out-of-band, NOT a query, so it deliberately
+   skips `contains_write()` / the writer's `execute_write` row path (which
+   would stage an empty memtable batch). The server builds the
+   `VectorIndexDescriptor` (Vamana defaults R=64/L=128/α=1.2, overridable
+   via `WITH`) and republishes the snapshot; `catalog_for` rebuilds on the
+   version bump so the next query's optimizer sees the new index.
 
 ## Completed earlier this session
 
@@ -150,6 +169,14 @@ return); isolates dropped (build only calls `add_edge`, never enumerates nodes);
 EXPLAIN soft-keyword precedent.
 
 ### Deferred bug follow-ups (lower severity, documented)
+- **`namidb-storage` benches don't compile** (`ingest_throughput`,
+  `read_latency`, `concurrent_mix`, `recovery_replay`) — they reference the
+  pre-multi-label API (`NodeWriteRecord` missing `labels`, `MemKey::Node`
+  field `label`, `Snapshot::new(&Memtable)` now wants `&MemtableSnapshot`).
+  Surfaces only under `cargo clippy/build --all-targets` (the repo's `cargo
+  test` + `cargo clippy --workspace` bar doesn't compile benches, so it stays
+  green). Pre-existing from the multi-label branch work, unrelated to the
+  vector-index DDL. Mechanical fix across ~4 bench files.
 - s3b forward-probe `MAX_PROBE` gap-safety after GC (commented as best-effort;
   under sustained >8192-version write lag a stale pointer can be served).
 - s3b bootstrap crash-atomicity (crash between v0.json and p0.json wedges).

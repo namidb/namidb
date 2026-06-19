@@ -134,6 +134,19 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
                 let base = require_input(plan.take(), clause.span())?;
                 plan = Some(lower_delete(d, base, &mut ctx)?);
             }
+            // `CREATE VECTOR INDEX` is schema DDL, not a query operator: the
+            // server intercepts a standalone one before lowering (see
+            // `Query::as_create_vector_index`). Reaching this arm means the
+            // DDL was combined with other clauses or lowered directly via the
+            // library API — reject it rather than silently dropping it.
+            Clause::CreateVectorIndex(_) => {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "CREATE VECTOR INDEX is a schema command and must be the \
+                     sole statement; it cannot be lowered to a query plan",
+                    clause.span(),
+                ));
+            }
         }
     }
 

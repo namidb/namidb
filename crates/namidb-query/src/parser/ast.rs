@@ -68,6 +68,13 @@ pub enum Clause {
     Set(SetClause),
     Remove(RemoveClause),
     Delete(DeleteClause),
+    /// `CREATE VECTOR INDEX` — schema DDL (RFC-030). Always present as a
+    /// variant (per the codebase convention); the parse arm and the
+    /// out-of-band server execution are gated behind the `vector-index`
+    /// Cargo feature. Unlike the read/write clauses it never lowers to a
+    /// `LogicalPlan` — the server intercepts it via
+    /// [`Query::as_create_vector_index`].
+    CreateVectorIndex(CreateVectorIndexClause),
 }
 
 impl Clause {
@@ -83,7 +90,28 @@ impl Clause {
             Clause::Set(c) => c.span,
             Clause::Remove(c) => c.span,
             Clause::Delete(c) => c.span,
+            Clause::CreateVectorIndex(c) => c.span,
         }
+    }
+}
+
+impl Query {
+    /// If this query is a standalone `CREATE VECTOR INDEX` statement — the
+    /// sole clause, no `UNION`, no `EXPLAIN` prefix — return it.
+    ///
+    /// `CREATE VECTOR INDEX` is schema DDL, not a read or a row write, so the
+    /// server intercepts it *before* planning (it never builds a
+    /// `LogicalPlan`). This accessor is the hook that lets the server tell a
+    /// DDL query apart from an ordinary one without re-walking the AST. Any
+    /// other shape (a `RETURN` after it, a `UNION`, an `EXPLAIN` prefix)
+    /// falls through to the normal plan path, where the lowerer rejects it.
+    pub fn as_create_vector_index(&self) -> Option<&CreateVectorIndexClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::CreateVectorIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
     }
 }
 
@@ -135,6 +163,68 @@ pub struct UnwindClause {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateClause {
     pub patterns: Vec<PatternPart>,
+    pub span: SourceSpan,
+}
+
+/// Distance metric named in `CREATE VECTOR INDEX ... METRIC <m>` (RFC-030).
+///
+/// This is the parser's own vocabulary so the AST stays free of storage
+/// types; the server converts it to `namidb_storage::manifest::VectorMetric`
+/// when it builds the [`VectorIndexDescriptor`]. The three values mirror the
+/// vector-distance builtins (`cosine_similarity`, `dot_product`,
+/// `euclidean_distance`).
+///
+/// [`VectorIndexDescriptor`]: namidb_storage::manifest::VectorIndexDescriptor
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorMetric {
+    Cosine,
+    Dot,
+    Euclidean,
+}
+
+impl VectorMetric {
+    /// `cosine` / `dot` / `euclidean` (case-insensitive) → the metric, else `None`.
+    pub fn from_keyword(word: &str) -> Option<Self> {
+        match word.to_ascii_lowercase().as_str() {
+            "cosine" => Some(VectorMetric::Cosine),
+            "dot" => Some(VectorMetric::Dot),
+            "euclidean" => Some(VectorMetric::Euclidean),
+            _ => None,
+        }
+    }
+
+    /// Canonical source spelling (for [`fmt::Display`](std::fmt::Display)).
+    pub fn as_keyword(self) -> &'static str {
+        match self {
+            VectorMetric::Cosine => "cosine",
+            VectorMetric::Dot => "dot",
+            VectorMetric::Euclidean => "euclidean",
+        }
+    }
+}
+
+/// `CREATE VECTOR INDEX <name> FOR (<alias>:<Label>) ON <alias>.<property>
+/// METRIC <m> DIMENSION <n> [WITH {r, l_build, alpha}]` (RFC-030).
+///
+/// A standalone schema command: the parser only emits it as the sole clause
+/// of a query, and the server executes it out-of-band (see
+/// [`Query::as_create_vector_index`]) — it never becomes a `LogicalPlan`. The
+/// Vamana build parameters (`r`, `l_build`, `alpha`) are optional overrides;
+/// `None` means "use the engine defaults".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateVectorIndexClause {
+    pub name: Identifier,
+    pub label: Identifier,
+    pub property: Identifier,
+    pub dim: u32,
+    pub metric: VectorMetric,
+    /// Optional `WITH {r: …}` override of the Vamana max out-degree.
+    pub r: Option<usize>,
+    /// Optional `WITH {l_build: …}` override of the Vamana build beam.
+    pub l_build: Option<usize>,
+    /// Optional `WITH {alpha: …}` override of the Vamana diversification.
+    pub alpha: Option<f32>,
     pub span: SourceSpan,
 }
 

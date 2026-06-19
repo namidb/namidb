@@ -114,6 +114,33 @@ impl<'src> Parser<'src> {
             .map_err(|e| e.with_help(format!("while parsing {ctx}")))
     }
 
+    /// Consume a case-insensitive *soft* keyword — a word the lexer surfaces
+    /// as an `Ident` because it is not reserved (`VECTOR`/`INDEX`/`METRIC`/
+    /// `DIMENSION`/`WITH`, like `EXPLAIN`). Errors if the next token is not
+    /// `Ident(kw)` ignoring case.
+    fn expect_soft_keyword(&mut self, kw: &str) -> Result<SourceSpan, ParseError> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            if name.eq_ignore_ascii_case(kw) {
+                let span = self.peek_span();
+                self.bump();
+                return Ok(span);
+            }
+        }
+        let actual = self
+            .peek()
+            .map(|t| t.label().to_string())
+            .unwrap_or_else(|| "<eof>".to_string());
+        Err(ParseError::new(
+            if self.peek().is_none() {
+                ErrorCode::UnexpectedEof
+            } else {
+                ErrorCode::UnexpectedToken
+            },
+            format!("expected `{kw}`, found `{actual}`"),
+            self.peek_span(),
+        ))
+    }
+
     fn expect_eof(&mut self) -> Result<(), Vec<ParseError>> {
         if let Some(tok) = self.peek() {
             let span = self.peek_span();
@@ -293,7 +320,19 @@ impl<'src> Parser<'src> {
             Some(Token::Return) => self.parse_return_clause().map(Clause::Return),
             Some(Token::With) => self.parse_with_clause().map(Clause::With),
             Some(Token::Unwind) => self.parse_unwind_clause().map(Clause::Unwind),
-            Some(Token::Create) => self.parse_create_clause().map(Clause::Create),
+            Some(Token::Create) => {
+                // `CREATE VECTOR INDEX …` is schema DDL and parses very
+                // differently from a graph `CREATE (pattern)`. VECTOR is a
+                // soft keyword (an `Ident`), so peek one ahead to route.
+                if matches!(
+                    self.peek_at(1),
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("VECTOR")
+                ) {
+                    self.parse_create_vector_index().map(Clause::CreateVectorIndex)
+                } else {
+                    self.parse_create_clause().map(Clause::Create)
+                }
+            }
             Some(Token::Merge) => self.parse_merge_clause().map(Clause::Merge),
             Some(Token::Set) => self.parse_set_clause().map(Clause::Set),
             Some(Token::Remove) => self.parse_remove_clause().map(Clause::Remove),
@@ -483,6 +522,186 @@ impl<'src> Parser<'src> {
             patterns,
             span: SourceSpan::new(start, end),
         })
+    }
+
+    /// `CREATE VECTOR INDEX <name> ON :<Label>(<property>) METRIC <m>
+    /// DIMENSION <n> [WITH { r: …, l_build: …, alpha: … }]` (RFC-030).
+    ///
+    /// A standalone schema command — `parse_clause` only routes here for the
+    /// `CREATE VECTOR` two-token prefix. The parsed clause never reaches the
+    /// lowerer; the server intercepts it via `Query::as_create_vector_index`.
+    fn parse_create_vector_index(&mut self) -> Result<CreateVectorIndexClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect(&Token::Create)?;
+        self.expect_soft_keyword("VECTOR")?;
+        self.expect_soft_keyword("INDEX")?;
+        let name = self.expect_identifier()?;
+        self.expect_in(&Token::On, "vector-index target")?;
+        self.expect(&Token::Colon)?;
+        let label = self.expect_identifier()?;
+        self.expect(&Token::LParen)?;
+        let property = self
+            .expect_identifier()
+            .map_err(|e| e.with_help("vector-index property goes in parentheses"))?;
+        self.expect(&Token::RParen)?;
+        self.expect_soft_keyword("METRIC")?;
+        let metric = self.parse_vector_metric()?;
+        self.expect_soft_keyword("DIMENSION")?;
+        let dim = self.parse_dimension()?;
+        let (r, l_build, alpha) = self.parse_optional_vector_with()?;
+        // `self.pos` now points just past the last consumed token.
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(CreateVectorIndexClause {
+            name,
+            label,
+            property,
+            dim,
+            metric,
+            r,
+            l_build,
+            alpha,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    fn parse_vector_metric(&mut self) -> Result<VectorMetric, ParseError> {
+        let next = self.bump().ok_or_else(|| {
+            ParseError::new(
+                ErrorCode::UnexpectedEof,
+                "expected a metric (cosine, dot, or euclidean), found end of input",
+                SourceSpan::point(self.src.len()),
+            )
+        })?;
+        if let Token::Ident(name) = &next.value {
+            if let Some(m) = VectorMetric::from_keyword(name) {
+                return Ok(m);
+            }
+        }
+        Err(ParseError::new(
+            ErrorCode::UnexpectedToken,
+            format!(
+                "expected a metric (cosine, dot, or euclidean), found `{}`",
+                next.value.label()
+            ),
+            next.span,
+        ))
+    }
+
+    fn parse_dimension(&mut self) -> Result<u32, ParseError> {
+        let next = self.bump().ok_or_else(|| {
+            ParseError::new(
+                ErrorCode::UnexpectedEof,
+                "expected DIMENSION integer, found end of input",
+                SourceSpan::point(self.src.len()),
+            )
+        })?;
+        if let Token::Integer(n) = next.value {
+            return u32::try_from(n).map_err(|_| {
+                ParseError::new(
+                    ErrorCode::InvalidNumber,
+                    format!("DIMENSION must be a non-negative integer that fits in u32, got {n}"),
+                    next.span,
+                )
+            });
+        }
+        Err(ParseError::new(
+            ErrorCode::UnexpectedToken,
+            format!("expected DIMENSION integer, found `{}`", next.value.label()),
+            next.span,
+        ))
+    }
+
+    /// Optional `WITH { r: …, l_build: …, alpha: … }` build overrides.
+    /// Returns all-`None` when the clause is absent. `WITH` is a reserved
+    /// keyword (`Token::With`), unlike the other DDL words which are soft.
+    fn parse_optional_vector_with(
+        &mut self,
+    ) -> Result<(Option<usize>, Option<usize>, Option<f32>), ParseError> {
+        if !self.check(&Token::With) {
+            return Ok((None, None, None));
+        }
+        self.bump(); // WITH
+        self.expect(&Token::LBrace)?;
+        let mut r = None;
+        let mut l_build = None;
+        let mut alpha = None;
+        loop {
+            let key = self.expect_identifier()?;
+            self.expect(&Token::Colon)?;
+            match key.name.to_ascii_lowercase().as_str() {
+                "r" => {
+                    r = Some(self.parse_vector_option_int("r")?);
+                }
+                "l_build" => {
+                    l_build = Some(self.parse_vector_option_int("l_build")?);
+                }
+                "alpha" => {
+                    alpha = Some(self.parse_vector_option_float("alpha")?);
+                }
+                other => {
+                    return Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        format!(
+                            "unknown vector-index option `{other}` (expected r, l_build, or alpha)"
+                        ),
+                        key.span,
+                    ));
+                }
+            }
+            if self.eat(&Token::Comma).is_some() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace)?;
+        Ok((r, l_build, alpha))
+    }
+
+    fn parse_vector_option_int(&mut self, ctx: &str) -> Result<usize, ParseError> {
+        let next = self.bump().ok_or_else(|| {
+            ParseError::new(
+                ErrorCode::UnexpectedEof,
+                format!("expected {ctx} integer, found end of input"),
+                SourceSpan::point(self.src.len()),
+            )
+        })?;
+        if let Token::Integer(n) = next.value {
+            return usize::try_from(n).map_err(|_| {
+                ParseError::new(
+                    ErrorCode::InvalidNumber,
+                    format!("{ctx} must be a non-negative integer, got {n}"),
+                    next.span,
+                )
+            });
+        }
+        Err(ParseError::new(
+            ErrorCode::UnexpectedToken,
+            format!("expected {ctx} integer, found `{}`", next.value.label()),
+            next.span,
+        ))
+    }
+
+    fn parse_vector_option_float(&mut self, ctx: &str) -> Result<f32, ParseError> {
+        let next = self.bump().ok_or_else(|| {
+            ParseError::new(
+                ErrorCode::UnexpectedEof,
+                format!("expected {ctx} number, found end of input"),
+                SourceSpan::point(self.src.len()),
+            )
+        })?;
+        match next.value {
+            Token::Integer(n) => Ok(n as f32),
+            Token::Float(x) => Ok(x as f32),
+            _ => Err(ParseError::new(
+                ErrorCode::UnexpectedToken,
+                format!("expected {ctx} number, found `{}`", next.value.label()),
+                next.span,
+            )),
+        }
     }
 
     fn parse_merge_clause(&mut self) -> Result<MergeClause, ParseError> {
@@ -1900,6 +2119,89 @@ mod tests {
         assert_eq!(q.head.clauses.len(), 3);
         assert!(matches!(q.head.clauses[0], Clause::Create(_)));
         assert!(matches!(q.head.clauses[1], Clause::Set(_)));
+    }
+
+    #[test]
+    fn create_vector_index_parses() {
+        let q = ok("CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16");
+        assert_eq!(q.head.clauses.len(), 1);
+        let c = match &q.head.clauses[0] {
+            Clause::CreateVectorIndex(c) => c,
+            other => panic!("expected CreateVectorIndex, got {other:?}"),
+        };
+        assert_eq!(c.name.name, "doc_emb");
+        assert_eq!(c.label.name, "Doc");
+        assert_eq!(c.property.name, "emb");
+        assert_eq!(c.dim, 16);
+        assert_eq!(c.metric, VectorMetric::Cosine);
+        assert!(c.r.is_none() && c.l_build.is_none() && c.alpha.is_none());
+        // The server-side DDL hook recognises a standalone statement.
+        assert!(q.as_create_vector_index().is_some());
+    }
+
+    #[test]
+    fn create_vector_index_with_options_and_other_metrics() {
+        let q = ok(
+            "CREATE VECTOR INDEX ix ON :Doc(emb) METRIC dot DIMENSION 8 \
+             WITH { r: 32, l_build: 64, alpha: 1.2 }",
+        );
+        let c = match &q.head.clauses[0] {
+            Clause::CreateVectorIndex(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.metric, VectorMetric::Dot);
+        assert_eq!(c.dim, 8);
+        assert_eq!(c.r, Some(32));
+        assert_eq!(c.l_build, Some(64));
+        assert_eq!(c.alpha, Some(1.2));
+    }
+
+    #[test]
+    fn create_vector_index_roundtrips() {
+        // parse → format → parse must yield the same AST modulo spans.
+        let cases = [
+            "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16",
+            "CREATE VECTOR INDEX ix ON :Doc(emb) METRIC dot DIMENSION 8 \
+             WITH { r: 32, l_build: 64, alpha: 1.2 }",
+        ];
+        for src in cases {
+            let q1 = ok(src);
+            let rendered = format!("{}", q1);
+            let q2 = ok(&rendered);
+            // Compare clause-by-clause (spans differ, so compare the struct
+            // fields the AST carries by re-displaying both).
+            assert_eq!(
+                format!("{}", q1),
+                format!("{}", q2),
+                "round-trip diverged for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_still_parses_after_vector_route() {
+        // The VECTOR peek must not steal the plain graph `CREATE (n)`.
+        let q = ok("CREATE (a:Person {name: 'Ada'}) RETURN a");
+        assert!(matches!(q.head.clauses[0], Clause::Create(_)));
+    }
+
+    #[test]
+    fn create_vector_index_rejects_bad_metric() {
+        assert_eq!(
+            err_code("CREATE VECTOR INDEX ix ON :Doc(emb) METRIC hamming DIMENSION 8"),
+            ErrorCode::UnexpectedToken
+        );
+    }
+
+    #[test]
+    fn create_vector_index_combined_with_return_is_not_standalone() {
+        // DDL is standalone-only; a following RETURN means the server hook
+        // does not fire and the lowerer rejects it.
+        let q = ok("CREATE VECTOR INDEX ix ON :Doc(emb) METRIC cosine DIMENSION 16 RETURN ix");
+        assert!(
+            q.as_create_vector_index().is_none(),
+            "a non-standalone DDL must not be intercepted"
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ impl fmt::Display for Clause {
             Clause::Set(s) => fmt::Display::fmt(s, f),
             Clause::Remove(r) => fmt::Display::fmt(r, f),
             Clause::Delete(d) => fmt::Display::fmt(d, f),
+            Clause::CreateVectorIndex(c) => fmt::Display::fmt(c, f),
         }
     }
 }
@@ -112,6 +113,40 @@ impl fmt::Display for CreateClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CREATE ")?;
         write_list(f, &self.patterns, ", ")
+    }
+}
+
+impl fmt::Display for VectorMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_keyword())
+    }
+}
+
+impl fmt::Display for CreateVectorIndexClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CREATE VECTOR INDEX {} ON :{}({}) METRIC {} DIMENSION {}",
+            self.name, self.label, self.property, self.metric, self.dim
+        )?;
+        // Render WITH only when at least one build override is present, so a
+        // defaults-only index round-trips without a trailing `WITH {}`.
+        if self.r.is_some() || self.l_build.is_some() || self.alpha.is_some() {
+            f.write_str(" WITH {")?;
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = self.r {
+                parts.push(format!("r: {v}"));
+            }
+            if let Some(v) = self.l_build {
+                parts.push(format!("l_build: {v}"));
+            }
+            if let Some(v) = self.alpha {
+                parts.push(format!("alpha: {v}"));
+            }
+            write!(f, "{}", parts.join(", "))?;
+            f.write_str("}")?;
+        }
+        Ok(())
     }
 }
 

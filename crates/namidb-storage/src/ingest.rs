@@ -61,7 +61,8 @@ use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
 use crate::manifest::{
-    LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, WalSegmentDescriptor,
+    LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, VectorIndexDescriptor,
+    WalSegmentDescriptor,
 };
 use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
@@ -1018,6 +1019,66 @@ impl WriterSession {
         })
     }
 
+    /// Register a DiskANN/Vamana vector index — the execution half of
+    /// `CREATE VECTOR INDEX` (RFC-030).
+    ///
+    /// This is a **metadata-only** manifest commit: it appends `desc` to
+    /// [`Manifest::vector_indexes`] and commits one new manifest version,
+    /// staging **no** memtable rows and writing **no** WAL segment. (It is
+    /// DDL, not a row write; routing it through [`commit_batch`](Self::commit_batch)
+    /// would stage an empty batch and burn a WAL seq for nothing.) The
+    /// compaction build hook materializes the matching `SstKind::VectorGraph`
+    /// body lazily on the next sweep — registering the descriptor does not
+    /// build the graph.
+    ///
+    /// Rejects a duplicate index (same `name`, or the same
+    /// `(label, property, metric)` target already covered) so two
+    /// `CREATE VECTOR INDEX` statements for one property cannot race to build
+    /// two graphs over it.
+    ///
+    /// Returns the new manifest version. Error contract mirrors
+    /// [`attach_ssts`](Self::attach_ssts): [`Error::Fenced`] ⇒ abort and drop
+    /// the session; a lost manifest CAS ⇒ retryable.
+    pub async fn register_vector_index(
+        &mut self,
+        desc: VectorIndexDescriptor,
+    ) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        for existing in &self.current.manifest.vector_indexes {
+            if existing.name == desc.name {
+                return Err(Error::precondition(format!(
+                    "a vector index named `{}` already exists",
+                    desc.name
+                )));
+            }
+            if existing.matches(&desc.label, &desc.property, desc.metric) {
+                return Err(Error::precondition(format!(
+                    "a vector index on ({}:{}) with metric `{}` already exists: `{}`",
+                    desc.label,
+                    desc.property,
+                    desc.metric.builtin_name(),
+                    existing.name
+                )));
+            }
+        }
+
+        // Mirror attach_ssts/flush: derive the next version (next_version
+        // clones vector_indexes forward), push the descriptor, commit, then
+        // refresh the published view so subsequent reads plan against the new
+        // catalog.
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.vector_indexes.push(desc);
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
+    }
+
     fn alloc_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
         self.next_lsn = self.next_lsn.saturating_add(1);
@@ -1122,6 +1183,68 @@ mod tests {
         assert_eq!(session.manifest_version(), 0);
         assert_eq!(session.next_lsn(), 1);
         assert_eq!(session.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_vector_index_commits_descriptor_and_rejects_duplicates() {
+        use crate::manifest::VectorMetric;
+
+        let store = make_store();
+        let paths = make_paths("ingest-vecidx");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        assert!(
+            session.snapshot().manifest().manifest.vector_indexes.is_empty(),
+            "fresh namespace has no vector indexes"
+        );
+
+        let desc = VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 16,
+            metric: VectorMetric::Cosine,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+        };
+        // Metadata-only commit: no rows staged, manifest version bumps to 1.
+        assert_eq!(session.pending_len(), 0);
+        let v = session.register_vector_index(desc.clone()).await.unwrap();
+        assert_eq!(v, 1);
+        assert_eq!(session.pending_len(), 0, "DDL stages no memtable rows");
+        let snap = session.snapshot();
+        let registered = &snap.manifest().manifest.vector_indexes;
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].name, "doc_emb");
+        assert_eq!(registered[0].metric, VectorMetric::Cosine);
+        drop(snap);
+
+        // Same name → rejected, version unchanged.
+        let err = session
+            .register_vector_index(desc.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        assert_eq!(session.manifest_version(), 1);
+
+        // Same (label, property, metric) target under a new name → rejected.
+        let dup_target = VectorIndexDescriptor {
+            name: "doc_emb2".into(),
+            ..desc.clone()
+        };
+        let err = session.register_vector_index(dup_target).await.unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+
+        // A different metric over the same property is a distinct index.
+        let other = VectorIndexDescriptor {
+            name: "doc_dot".into(),
+            metric: VectorMetric::Dot,
+            ..desc
+        };
+        let v2 = session.register_vector_index(other).await.unwrap();
+        assert_eq!(v2, 2);
+        let snap = session.snapshot();
+        assert_eq!(snap.manifest().manifest.vector_indexes.len(), 2);
     }
 
     #[tokio::test]

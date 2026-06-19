@@ -925,6 +925,117 @@ struct ObservedQuery {
     response: Response,
 }
 
+// ───────────────────── CREATE VECTOR INDEX (DDL) ──────────────────────
+//
+// `CREATE VECTOR INDEX` is schema DDL — neither a read nor a row write — so
+// the server intercepts it after parsing and before planning (it never
+// becomes a `LogicalPlan`). The whole path is feature-gated: with
+// `vector-index` off the intercept is compiled out and the DDL reaches the
+// lowerer, which rejects it (HTTP 400 / Bolt NotSupported). On, it calls
+// `WriterSession::register_vector_index` (a metadata-only manifest commit)
+// and republishes the snapshot so the next query plans against the new
+// catalog. The compaction build hook materializes the `.vg` graph lazily.
+
+#[cfg(feature = "vector-index")]
+fn vector_index_descriptor_from(
+    cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
+) -> namidb_storage::manifest::VectorIndexDescriptor {
+    use namidb_query::parser::ast::VectorMetric as M;
+    let metric = match cvi.metric {
+        M::Cosine => namidb_storage::manifest::VectorMetric::Cosine,
+        M::Dot => namidb_storage::manifest::VectorMetric::Dot,
+        M::Euclidean => namidb_storage::manifest::VectorMetric::Euclidean,
+    };
+    // Vamana build defaults mirror `namidb_ann::BuildParams::default()`
+    // (R=64, L_build=128, α=1.2); the user's `WITH {…}` overrides win.
+    namidb_storage::manifest::VectorIndexDescriptor {
+        name: cvi.name.name.clone(),
+        label: cvi.label.name.clone(),
+        property: cvi.property.name.clone(),
+        dim: cvi.dim,
+        metric,
+        r: cvi.r.unwrap_or(64),
+        l_build: cvi.l_build.unwrap_or(128),
+        alpha: cvi.alpha.unwrap_or(1.2),
+    }
+}
+
+/// Build the descriptor, commit it via the writer (metadata-only), and
+/// republish the snapshot so subsequent reads see the new index. Shared by
+/// the HTTP and Bolt DDL paths.
+#[cfg(feature = "vector-index")]
+async fn apply_create_vector_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
+) -> Result<u64, namidb_storage::Error> {
+    let desc = vector_index_descriptor_from(cvi);
+    let version = writer.register_vector_index(desc).await?;
+    // Refresh the published snapshot (catalog_for rebuilds on version bump).
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// HTTP shape for a `CREATE VECTOR INDEX`: classify (write), gate on role,
+/// run the DDL, return an empty `CypherResponse` on success. Shared by the
+/// single- and multi-tenant paths, which pass their own writer/snapshot.
+#[cfg(feature = "vector-index")]
+async fn run_create_vector_index(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
+    role: Role,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    // DDL mutates durable schema state, so a read-only token may not run it.
+    if !role.allows_write() {
+        return ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: "this token is read-only; schema commands are forbidden".into(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let mut w = writer.lock().await;
+    let result = apply_create_vector_index(&mut w, snapshot, cvi).await;
+    drop(w);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
+        Err(e) => {
+            // A duplicate name/target is a user error (400); a fence or lost
+            // CAS is a server-side condition (503).
+            let status = match &e {
+                namidb_storage::Error::Precondition(_)
+                | namidb_storage::Error::Invariant(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (status, Json(ErrorBody { error: e.to_string() })).into_response(),
+            }
+        }
+    }
+}
+
 async fn cypher(
     State(state): State<AppState>,
     Extension(role): Extension<Role>,
@@ -976,6 +1087,12 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> Observ
             };
         }
     };
+
+    // `CREATE VECTOR INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "vector-index")]
+    if let Some(cvi) = parsed.as_create_vector_index() {
+        return run_create_vector_index(&state.writer, &state.snapshot, cvi, role, started).await;
+    }
 
     // Plan against the latest published snapshot — no writer lock yet.
     let owned = state.snapshot.load();
@@ -1282,6 +1399,19 @@ async fn run_cypher_multi(
             };
         }
     };
+
+    // `CREATE VECTOR INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "vector-index")]
+    if let Some(cvi) = parsed.as_create_vector_index() {
+        return run_create_vector_index(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            cvi,
+            role,
+            started,
+        )
+        .await;
+    }
 
     // Plan against the latest published snapshot. The optimizer catalog is
     // memoised per manifest version on the namespace state (building it is
@@ -1697,6 +1827,30 @@ mod tests {
         let app = fixture_with_tokens("authz-rw", ROLE_TOKENS).await;
         let write = post_cypher(&app, Some("wkey"), "CREATE (:Person {name: 'x'}) RETURN 1").await;
         assert_eq!(write.status(), StatusCode::OK);
+    }
+
+    /// `CREATE VECTOR INDEX` end-to-end over HTTP: registers a descriptor,
+    /// rejects a duplicate with 400, and is forbidden for a read-only token.
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn create_vector_index_registers_and_reports_duplicate() {
+        let app = fixture(None).await;
+
+        let q = "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16";
+        let r = post_cypher(&app, None, q).await;
+        assert_eq!(r.status(), StatusCode::OK, "first create should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["rows"].as_array().unwrap().is_empty());
+
+        // Same name (or same target) again is a duplicate → 400.
+        let dup = post_cypher(&app, None, q).await;
+        assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+
+        // A read-only token may not run schema DDL.
+        let app_ro = fixture_with_tokens("vecidx-ro", ROLE_TOKENS).await;
+        let ro = post_cypher(&app_ro, Some("rkey"), q).await;
+        assert_eq!(ro.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

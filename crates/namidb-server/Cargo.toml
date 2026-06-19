@@ -9,6 +9,15 @@ homepage.workspace = true
 description = "HTTP server exposing a NamiDB namespace over REST"
 readme = "README.md"
 
+[features]
+default = []
+# DiskANN/Vamana ANN end-to-end (RFC-030): routes `CREATE VECTOR INDEX` DDL
+# to `WriterSession::register_vector_index` (pre-plan intercept) AND turns on
+# the storage build hook + the query optimizer/executor acceleration paths,
+# so a registered index is actually built and used. With the feature off the
+# DDL is rejected at the lowerer (HTTP 400 / Bolt NotSupported).
+vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+
 [[bin]]
 name = "namidb-server"
 path = "src/main.rs"

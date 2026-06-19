@@ -63,8 +63,9 @@ use crate::fence::WriterFence;
 use crate::flush::{build_edge_sst, build_node_sst, NodeRow, NodeWriteRecord};
 use crate::manifest::{
     KindSpecificStats, LoadedManifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
-    VectorIndexDescriptor,
 };
+#[cfg(feature = "vector-index")]
+use crate::manifest::VectorIndexDescriptor;
 use crate::memtable::MemOp;
 use crate::paths::NamespacePaths;
 use crate::read::arrow_value_to_value;
