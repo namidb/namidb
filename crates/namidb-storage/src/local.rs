@@ -1,8 +1,20 @@
-//! Local-filesystem [`ObjectStore`] with manifest-CAS support.
+//! Local-filesystem [`ObjectStore`] with conditional-write support.
+//!
+//! ## Status after RFC-029
+//!
+//! The manifest commit protocol no longer issues [`PutMode::Update`]: the
+//! pointer is now a Create-only versioned family (`manifest/pointer/p<N>.json`),
+//! so commits depend only on `If-None-Match: *` (PUT-if-absent), which
+//! `LocalFileSystem` supports natively via `O_CREAT|O_EXCL`. The advisory
+//! `flock` CAS below is therefore **no longer load-bearing for commits**. It is
+//! retained as a faithful `ObjectStore` implementation (and is still exercised
+//! by this module's `PutMode::Update` contract tests); fully removing it is a
+//! follow-up once we confirm nothing external relies on local conditional
+//! overwrite.
 //!
 //! `object_store::local::LocalFileSystem` does not implement
-//! [`PutMode::Update`] — it returns `NotImplemented` — so it cannot
-//! drive the NamiDB manifest commit protocol on its own. This wrapper
+//! [`PutMode::Update`] — it returns `NotImplemented` — so it could not
+//! drive the pre-RFC-029 pointer overwrite on its own. This wrapper
 //! plugs the gap:
 //!
 //! - [`PutMode::Create`] is delegated as-is. `LocalFileSystem` already

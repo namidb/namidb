@@ -143,7 +143,14 @@ When the writer wants to advance the database from version `v` to `v+1`:
 2. Read `manifest/v<v>.json` → previous state.
 3. Build the new manifest in memory, incrementing `version` to `v+1` and updating `epoch` if needed.
 4. **PUT** `manifest/v<v+1>.json` with `PutMode::Create` (i.e. `If-None-Match: *`). If this fails, another writer has the same version assigned; abort, reload, retry.
-5. **PUT** `current.json` with `PutMode::Update(version = current_etag)` (i.e. `If-Match: <current_etag>`). If this fails, another writer raced ahead; abort, reload, retry.
+5. **PUT** the pointer. _Amended by RFC-029:_ the pointer is now a Create-only
+   versioned family — **PUT** `manifest/pointer/p<v+1>.json` with
+   `PutMode::Create` (`If-None-Match: *`), and the current pointer is the
+   highest `N` present, found via LIST. The original design wrote
+   `current.json` with `PutMode::Update` (`If-Match: <current_etag>`); that
+   depended on the spottily-supported `If-Match` overwrite, so it was replaced
+   with the same PUT-if-absent primitive step 4 uses. If the create fails,
+   another writer raced ahead; abort, reload, retry. See RFC-029.
 
 This sequence ensures:
 

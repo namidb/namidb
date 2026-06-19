@@ -92,6 +92,18 @@ pub struct JanitorReport {
     /// Bytes held by the manifest snapshots in `manifest_snapshots_reclaimed`
     /// (freed when `delete = true`, otherwise what *would* be freed).
     pub manifest_bytes_freed: u64,
+    /// Superseded pointer files (`manifest/pointer/p<N>.json` strictly below the
+    /// retention horizon, RFC-029) reclaimable this sweep. Counted separately
+    /// from `manifest_snapshots_reclaimed` for the same reason: a retired
+    /// pointer is not an orphan, it is a version no live reader can still load.
+    /// Keeping every pointer at or above the horizon also keeps the family
+    /// contiguous, which is what makes `load_current`'s forward HEAD probe
+    /// gap-safe. Populated in dry-run too; bodies removed only when
+    /// `delete = true`.
+    pub pointer_files_reclaimed: usize,
+    /// Bytes held by the pointer files in `pointer_files_reclaimed` (freed when
+    /// `delete = true`, otherwise what *would* be freed).
+    pub pointer_bytes_freed: u64,
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
@@ -225,30 +237,42 @@ pub async fn sweep_orphans(
     let manifest_dir = paths.manifest_dir();
     let mut manifests = store.list(Some(&manifest_dir));
     while let Some(meta) = manifests.try_next().await.map_err(Error::ObjectStore)? {
-        // Parse the version out of a `v{16-hex}.json` body. The pointer
-        // (`current.json`) and anything that is not a versioned snapshot fail
-        // the parse and are left untouched.
-        let Some(version) = meta
-            .location
-            .filename()
-            .and_then(|f| f.strip_prefix('v'))
-            .and_then(|f| f.strip_suffix(".json"))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        // Classify by filename. Manifest bodies are `v{16-hex}.json` directly
+        // under `manifest/`; pointer files (RFC-029) are `p{16-hex}.json` under
+        // `manifest/pointer/`, which this recursive LIST also returns. The
+        // legacy `current.json` and anything else fail both parses and are left
+        // untouched.
+        let Some(filename) = meta.location.filename() else {
+            continue;
+        };
+        let Some((is_pointer, version)) = filename
+            .strip_prefix('v')
+            .map(|rest| (false, rest))
+            .or_else(|| filename.strip_prefix('p').map(|rest| (true, rest)))
+            .and_then(|(is_pointer, rest)| rest.strip_suffix(".json").map(|h| (is_pointer, h)))
+            .and_then(|(is_pointer, hex)| u64::from_str_radix(hex, 16).ok().map(|v| (is_pointer, v)))
         else {
             continue;
         };
-        // Keep current and every version a pinned reader could still load.
+        // Keep current and every version a pinned reader could still load. For
+        // pointers this also keeps the family contiguous over [horizon,
+        // current], which load_current's forward HEAD probe relies on.
         if version >= horizon {
             continue;
         }
         let age_secs = (now - meta.last_modified).num_seconds();
         if age_secs < min_age_secs {
             report.skipped_too_young += 1;
-            debug!(path = %meta.location, age_secs, "manifest snapshot too young, deferring");
+            debug!(path = %meta.location, age_secs, "retired manifest/pointer object too young, deferring");
             continue;
         }
-        report.manifest_snapshots_reclaimed += 1;
-        report.manifest_bytes_freed = report.manifest_bytes_freed.saturating_add(meta.size);
+        if is_pointer {
+            report.pointer_files_reclaimed += 1;
+            report.pointer_bytes_freed = report.pointer_bytes_freed.saturating_add(meta.size);
+        } else {
+            report.manifest_snapshots_reclaimed += 1;
+            report.manifest_bytes_freed = report.manifest_bytes_freed.saturating_add(meta.size);
+        }
         if delete {
             store
                 .delete(&meta.location)
@@ -486,6 +510,10 @@ mod tests {
             .unwrap();
         assert_eq!(report.manifest_snapshots_reclaimed, 3);
         assert!(report.manifest_bytes_freed > 0);
+        // RFC-029: the retired pointer files p0..p2 are reclaimed alongside the
+        // manifest snapshots, counted on their own report fields.
+        assert_eq!(report.pointer_files_reclaimed, 3);
+        assert!(report.pointer_bytes_freed > 0);
         // The accumulating flushes leave every SST referenced by current, so no
         // SST orphans — only the retired manifest snapshots are reclaimed.
         assert_eq!(report.orphans_found, 0);
@@ -495,12 +523,16 @@ mod tests {
                 store.head(&paths.manifest_version(v)).await.is_err(),
                 "retired snapshot v{v} must be reclaimed"
             );
+            assert!(
+                store.head(&paths.pointer_version(v)).await.is_err(),
+                "retired pointer p{v} must be reclaimed"
+            );
         }
         assert!(
             store.head(&paths.manifest_version(current)).await.is_ok(),
             "the current snapshot must survive"
         );
-        assert!(store.head(&paths.current_pointer()).await.is_ok());
+        assert!(store.head(&paths.pointer_version(current)).await.is_ok());
         assert_eq!(ms.load_current().await.unwrap().manifest.version, current);
 
         // Idempotent: a second sweep reclaims nothing.
@@ -548,6 +580,6 @@ mod tests {
             store.head(&paths.manifest_version(current)).await.is_ok(),
             "the current snapshot must survive"
         );
-        assert!(store.head(&paths.current_pointer()).await.is_ok());
+        assert!(store.head(&paths.pointer_version(current)).await.is_ok());
     }
 }

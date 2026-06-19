@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
@@ -82,13 +83,22 @@ pub async fn copy_namespace_snapshot(
     version: Option<u64>,
     overwrite: bool,
 ) -> Result<SnapshotCopyReport> {
-    // Refuse to stomp a live destination unless explicitly told to.
-    if !overwrite && dst_store.head(&dst_paths.current_pointer()).await.is_ok() {
-        return Err(Error::precondition(format!(
-            "destination namespace '{}' already has {} — pass overwrite/--force to replace it",
-            dst_paths.namespace(),
-            dst_paths.current_pointer()
-        )));
+    // Refuse to stomp a live destination unless explicitly told to. A live
+    // namespace is identified by its pointer: the Create-only family
+    // (`manifest/pointer/p<N>.json`, RFC-029) for current namespaces, or the
+    // legacy `manifest/current.json` for ones bootstrapped before it.
+    if !overwrite {
+        let has_family = {
+            let mut s = dst_store.list(Some(&dst_paths.pointer_dir()));
+            s.try_next().await.map_err(Error::ObjectStore)?.is_some()
+        };
+        let has_legacy = dst_store.head(&dst_paths.current_pointer()).await.is_ok();
+        if has_family || has_legacy {
+            return Err(Error::precondition(format!(
+                "destination namespace '{}' already has a manifest pointer — pass overwrite/--force to replace it",
+                dst_paths.namespace()
+            )));
+        }
     }
 
     // Pin the manifest version to copy.
@@ -163,7 +173,30 @@ pub async fn copy_namespace_snapshot(
 
     // 4. The pointer LAST, so the destination commits atomically from a
     //    reader's view. Its `manifest_path` is absolute, so it is rebased onto
-    //    the destination's own key.
+    //    the destination's own key. RFC-029: written into the Create-only
+    //    family as `pointer/p0.json`. On an `overwrite` restore, clear any
+    //    existing family first so the renumbered version-0 pointer is the
+    //    authoritative maximum (a leftover higher `p<N>` would otherwise shadow
+    //    the restore). Also delete the legacy `current.json` if present to avoid
+    //    leaving a stale pointer that would shadow the new family.
+    if overwrite {
+        let mut leftovers = Vec::new();
+        let mut s = dst_store.list(Some(&dst_paths.pointer_dir()));
+        while let Some(meta) = s.try_next().await.map_err(Error::ObjectStore)? {
+            leftovers.push(meta.location);
+        }
+        for loc in leftovers {
+            dst_store.delete(&loc).await.map_err(Error::ObjectStore)?;
+        }
+        // Delete legacy current.json if present — it would shadow the new
+        // pointer family on load (legacy fallback takes precedence when both exist).
+        if dst_store.head(&dst_paths.current_pointer()).await.is_ok() {
+            dst_store
+                .delete(&dst_paths.current_pointer())
+                .await
+                .map_err(Error::ObjectStore)?;
+        }
+    }
     let pointer = ManifestPointer {
         version: 0,
         epoch: Epoch::ZERO,
@@ -171,7 +204,7 @@ pub async fn copy_namespace_snapshot(
     };
     dst_store
         .put_opts(
-            &dst_paths.current_pointer(),
+            &dst_paths.pointer_version(0),
             PutPayload::from(serde_json::to_vec(&pointer)?),
             PutOptions::from(PutMode::Overwrite),
         )

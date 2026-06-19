@@ -3,9 +3,11 @@
 //! Layout (everything under `<root_prefix>/<namespace>/`):
 //!
 //! ```text
-//! manifest/current.json
+//! manifest/current.json            (legacy pointer; read fallback only)
 //! manifest/v00000001.json
 //! manifest/v00000002.json
+//! manifest/pointer/p00000001.json  (Create-only pointer family, RFC-029)
+//! manifest/pointer/p00000002.json
 //! wal/00000001.wal
 //! wal/00000002.wal
 //! sst/level0/01J5XY7K...-nodes-Person.parquet
@@ -61,11 +63,27 @@ impl NamespacePaths {
     pub fn manifest_dir(&self) -> Path {
         self.join(&["manifest"])
     }
+    /// Legacy single mutable pointer (`manifest/current.json`). No longer
+    /// written by the commit path after RFC-029; kept for reading namespaces
+    /// bootstrapped before the pointer family and snapshots produced by the
+    /// pre-RFC backup path.
     pub fn current_pointer(&self) -> Path {
         self.join(&["manifest", "current.json"])
     }
     pub fn manifest_version(&self, version: u64) -> Path {
         self.join(&["manifest", &format!("v{}.json", pad_hex(version, 16))])
+    }
+    /// Directory holding the Create-only versioned pointer family
+    /// (`manifest/pointer/p<N>.json`, RFC-029). Used as the LIST prefix when
+    /// resolving the current pointer (the highest `N` present).
+    pub fn pointer_dir(&self) -> Path {
+        self.join(&["manifest", "pointer"])
+    }
+    /// Pointer object for manifest `version` (`manifest/pointer/p<16hex>.json`,
+    /// RFC-029). Created write-once with `PutMode::Create`; `version` matches
+    /// the manifest body the pointer names.
+    pub fn pointer_version(&self, version: u64) -> Path {
+        self.join(&["manifest", "pointer", &format!("p{}.json", pad_hex(version, 16))])
     }
     pub fn wal_dir(&self) -> Path {
         self.join(&["wal"])
@@ -133,6 +151,11 @@ mod tests {
         assert_eq!(
             p.manifest_version(1).as_ref(),
             "tenants/acme/manifest/v0000000000000001.json"
+        );
+        assert_eq!(p.pointer_dir().as_ref(), "tenants/acme/manifest/pointer");
+        assert_eq!(
+            p.pointer_version(1).as_ref(),
+            "tenants/acme/manifest/pointer/p0000000000000001.json"
         );
         assert_eq!(
             p.wal_segment(42).as_ref(),

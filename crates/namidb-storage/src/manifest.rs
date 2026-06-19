@@ -8,9 +8,13 @@
 //! 1. **Write-once manifest versions.** `manifest/v<N>.json` is created with
 //! `PutMode::Create` (HTTP `If-None-Match: *`). Two writers that pick the
 //! same `N` cannot both succeed.
-//! 2. **Linearizable pointer.** `manifest/current.json` is updated with
-//! `PutMode::Update(UpdateVersion { e_tag, version })` against the e-tag
-//! we observed; losing the CAS yields [`Error::ManifestCommitCas`].
+//! 2. **Create-only versioned pointer (RFC-029).** The current pointer is the
+//! highest `N` in the Create-only family `manifest/pointer/p<N>.json`; each
+//! file is written once with `PutMode::Create`. Two writers that pick the
+//! same `N` cannot both succeed, so the pointer CAS uses the *same*
+//! conditional primitive as the body — `If-None-Match: *` — and never the
+//! spottily-supported `If-Match` overwrite. Losing the create yields
+//! [`Error::ManifestCommitCas`] (or [`Error::Fenced`] under a higher epoch).
 //! 3. **Monotonic version + epoch.** Commit refuses to write a manifest with
 //! `version <= current.version`. Epoch may only increase.
 //!
@@ -22,8 +26,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
@@ -442,9 +447,10 @@ impl ManifestStore {
 
     /// Initialise an empty namespace.
     ///
-    /// Writes `manifest/v0.json` and `manifest/current.json` for the first
-    /// time. Fails with [`Error::Precondition`] if either object already
-    /// exists — pointing at an already-initialised namespace.
+    /// Writes `manifest/v0.json` and `manifest/pointer/p0.json` for the first
+    /// time, both with `PutMode::Create`. Fails with [`Error::Precondition`] if
+    /// either object already exists — pointing at an already-initialised
+    /// namespace.
     #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn bootstrap(&self, writer_id: Uuid) -> Result<LoadedManifest> {
         let manifest = Manifest::empty(Epoch::ZERO, writer_id);
@@ -467,17 +473,16 @@ impl ManifestStore {
             epoch: manifest.epoch,
             manifest_path: manifest_path.as_ref().to_string(),
         };
+        let pointer_path = self.paths.pointer_version(manifest.version);
         let put_res = self
-            .put_create(
-                &self.paths.current_pointer(),
-                serde_json::to_vec(&pointer)?.into(),
-            )
+            .put_create(&pointer_path, serde_json::to_vec(&pointer)?.into())
             .await
             .map_err(|e| match e {
                 Error::ObjectStore(object_store::Error::AlreadyExists { .. }) => {
                     Error::precondition(format!(
-                        "namespace '{}' already bootstrapped: pointer exists",
-                        self.paths.namespace()
+                        "namespace '{}' already bootstrapped: pointer {} exists",
+                        self.paths.namespace(),
+                        pointer_path
                     ))
                 }
                 other => other,
@@ -504,15 +509,10 @@ impl ManifestStore {
         Ok(manifest)
     }
 
-    /// Read `current.json`, then read the manifest it points at.
+    /// Resolve the current pointer, then read the manifest it points at.
     #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn load_current(&self) -> Result<LoadedManifest> {
-        let pointer_path = self.paths.current_pointer();
-        let res = self.store.get(&pointer_path).await?;
-        let pointer_etag = res.meta.e_tag.clone();
-        let pointer_version = res.meta.version.clone();
-        let pointer_body = res.bytes().await?;
-        let pointer: ManifestPointer = serde_json::from_slice(&pointer_body)?;
+        let (pointer, pointer_etag, pointer_version) = self.load_pointer().await?;
 
         let manifest_path = Path::from(pointer.manifest_path.clone());
         let manifest_res = self.store.get(&manifest_path).await?;
@@ -537,10 +537,98 @@ impl ManifestStore {
         ))
     }
 
+    /// Resolve the current [`ManifestPointer`] and the e-tag/version of the
+    /// pointer object it was read from (RFC-029).
+    ///
+    /// The authoritative source is the Create-only family
+    /// `manifest/pointer/p<N>.json`: the current pointer is the highest `N`
+    /// present. A namespace bootstrapped before the family existed (or a
+    /// snapshot produced by the pre-RFC backup path) has no family and is read
+    /// through the legacy `manifest/current.json`. A namespace with neither is
+    /// uninitialised and surfaces the object store's `NotFound`, which
+    /// `WriterSession::open` turns into a bootstrap.
+    async fn load_pointer(&self) -> Result<(ManifestPointer, Option<String>, Option<String>)> {
+        let path = match self.max_pointer_version().await? {
+            Some(max_n) => {
+                let n = self.probe_pointer_forward(max_n).await?;
+                self.paths.pointer_version(n)
+            }
+            None => self.paths.current_pointer(),
+        };
+        let res = self.store.get(&path).await?;
+        let etag = res.meta.e_tag.clone();
+        let version = res.meta.version.clone();
+        let body = res.bytes().await?;
+        let pointer: ManifestPointer = serde_json::from_slice(&body)?;
+        Ok((pointer, etag, version))
+    }
+
+    /// Highest `N` in the Create-only pointer family, or `None` if the family
+    /// is empty (a legacy or uninitialised namespace).
+    ///
+    /// On eventually-consistent-LIST stores, an empty/stale LIST does **not**
+    /// prove non-existence. Before returning `None`, we HEAD `p0.json` (the
+    /// canonical bootstrap pointer) because GET/HEAD of a specific key is
+    /// read-after-write consistent on every targeted store. Only when that
+    /// specific-key probe also misses do we conclude the family is truly empty.
+    async fn max_pointer_version(&self) -> Result<Option<u64>> {
+        let dir = self.paths.pointer_dir();
+        let mut stream = self.store.list(Some(&dir));
+        let mut max: Option<u64> = None;
+        while let Some(meta) = stream.try_next().await? {
+            if let Some(v) = parse_pointer_version(&meta.location) {
+                max = Some(max.map_or(v, |m| m.max(v)));
+            }
+        }
+        // Empty LIST on an EC store is not authoritative. Before concluding
+        // the family doesn't exist, verify via direct HEAD of p0 (read-after-write
+        // consistent everywhere). This prevents spurious bootstrap when LIST
+        // has not yet caught up to a just-created pointer.
+        if max.is_none() {
+            if self.store.head(&self.paths.pointer_version(0)).await.is_ok() {
+                max = Some(0);
+            }
+        }
+        Ok(max)
+    }
+
+    /// Bounded forward HEAD probe from `n`. A LIST that has not yet caught up
+    /// to a just-created `p<n+1>.json` (some S3-compatible stores are only
+    /// eventually consistent for LIST, though GET/HEAD of a specific key is
+    /// read-after-write consistent everywhere we target) would otherwise hand
+    /// a writer a stale base. Galloping a few HEADs closes that window.
+    ///
+    /// **Note:** The janitor GC may delete pointers below the retention horizon,
+    /// creating gaps at the low end of the sequence. A stale LIST that returns
+    /// `[p5, p6, p7]` when `p3` exists (but was GC'd) can cause the forward
+    /// probe to skip from `None` → `p5`, missing the true current. This is
+    /// tolerated because the caller will fail the epoch check and retry; the
+    /// bounded probe is a best-effort mitigation, not a guarantee. Bounded as
+    /// a defensive backstop.
+    async fn probe_pointer_forward(&self, mut n: u64) -> Result<u64> {
+        // Higher bound to tolerate aggressive LIST staleness on high-throughput
+        // namespaces. At 100 commits/sec, a 5-sec stale LIST would lag ~500
+        // versions; 8192 gives significant headroom while still bounded as a
+        // defensive backstop (the probe is cheap HEAD-only, no body reads).
+        const MAX_PROBE: u32 = 8192;
+        let mut probed = 0u32;
+        while probed < MAX_PROBE {
+            let next = n.saturating_add(1);
+            match self.store.head(&self.paths.pointer_version(next)).await {
+                Ok(_) => n = next,
+                Err(object_store::Error::NotFound { .. }) => break,
+                Err(e) => return Err(Error::ObjectStore(e)),
+            }
+            probed += 1;
+        }
+        Ok(n)
+    }
+
     /// Commit a new manifest version using the two-step CAS protocol:
     ///
     /// 1. `PutMode::Create` the new immutable manifest body.
-    /// 2. `PutMode::Update` the pointer, gated on `expected.pointer_etag`.
+    /// 2. `PutMode::Create` the pointer `manifest/pointer/p<v+1>.json`
+    ///    (RFC-029) — the same conditional primitive as step 1.
     ///
     /// On a lost CAS race we return [`Error::ManifestCommitCas`]; the caller
     /// must reload, fence-check, and retry from a fresh base.
@@ -633,9 +721,12 @@ impl ManifestStore {
         })
     }
 
-    /// Phase 2 of [`Self::commit`]: CAS the pointer to point at the
-    /// body previously written by [`Self::put_body`]. Returns the
-    /// freshly-loaded manifest on success.
+    /// Phase 2 of [`Self::commit`]: publish the pointer for the body
+    /// previously written by [`Self::put_body`] by creating
+    /// `manifest/pointer/p<version>.json` with `PutMode::Create` (RFC-029).
+    /// The pointer file for a version is the linearization point: whoever
+    /// creates it first owns that version. Returns the freshly-loaded manifest
+    /// on success.
     pub async fn cas_pointer(
         &self,
         fence: &WriterFence,
@@ -643,25 +734,15 @@ impl ManifestStore {
         new_manifest: Manifest,
         pointer: ManifestPointer,
     ) -> Result<LoadedManifest> {
-        let opts = PutOptions::from(PutMode::Update(UpdateVersion {
-            e_tag: base.pointer_etag.clone(),
-            version: base.pointer_version.clone(),
-        }));
+        let pointer_path = self.paths.pointer_version(pointer.version);
         let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
-        let put_res = match self
-            .store
-            .put_opts(
-                &self.paths.current_pointer(),
-                PutPayload::from(pointer_bytes),
-                opts,
-            )
-            .await
-        {
+        let put_res = match self.put_create(&pointer_path, pointer_bytes).await {
             Ok(r) => r,
-            Err(object_store::Error::Precondition { .. }) => {
-                // Reload to surface the actual state. Same fence/CAS
-                // split as the body branch above: an advanced epoch
-                // means we are fenced.
+            Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {
+                // Another writer already published this version's pointer.
+                // Reload to surface the actual state. Same fence/CAS split as
+                // the body branch in `put_body`: an advanced epoch means we
+                // are fenced and must drop this writer, not retry.
                 let reloaded = self.load_current().await?;
                 if reloaded.manifest.epoch > fence.epoch {
                     return Err(Error::Fenced {
@@ -672,14 +753,14 @@ impl ManifestStore {
                 warn!(
                     expected = base.pointer.version,
                     found = reloaded.pointer.version,
-                    "manifest pointer CAS lost"
+                    "manifest pointer create lost (version already published)"
                 );
                 return Err(Error::ManifestCommitCas {
                     expected: base.pointer.version,
                     found: reloaded.pointer.version,
                 });
             }
-            Err(other) => return Err(Error::ObjectStore(other)),
+            Err(other) => return Err(other),
         };
 
         Ok(LoadedManifest::new(
@@ -755,6 +836,17 @@ impl ManifestStore {
             .put_opts(path, PutPayload::from(body), opts)
             .await?)
     }
+}
+
+/// Parse `N` out of a `p<16-hex>.json` pointer filename (RFC-029). Returns
+/// `None` for `current.json` (the legacy pointer) and any other key, so it is
+/// safe to run over a `manifest/pointer/` LIST.
+fn parse_pointer_version(location: &Path) -> Option<u64> {
+    location
+        .filename()
+        .and_then(|f| f.strip_prefix('p'))
+        .and_then(|f| f.strip_suffix(".json"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
 /// Sorted-by-min-key index over [`Manifest::ssts`], bucketed by
@@ -1041,6 +1133,138 @@ mod tests {
             Error::Invariant(msg) => assert!(msg.contains("must be")),
             other => panic!("expected Invariant, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn commit_creates_versioned_pointer_family() {
+        // RFC-029: each commit publishes `pointer/p<N>.json` via Create and the
+        // legacy `current.json` is never written by the commit path.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let w = Uuid::now_v7();
+        let mut current = ms.bootstrap(w).await.unwrap();
+        let fence = WriterFence::new(current.manifest.epoch);
+        for _ in 1u64..=3 {
+            let next = current.manifest.next_version(fence.writer_id);
+            current = ms.commit(&fence, &current, next).await.unwrap();
+        }
+        for v in 0u64..=3 {
+            assert!(
+                store.head(&paths.pointer_version(v)).await.is_ok(),
+                "pointer p{v} must exist"
+            );
+        }
+        assert!(
+            store.head(&paths.current_pointer()).await.is_err(),
+            "the commit path must not write the legacy current.json"
+        );
+        assert_eq!(ms.load_current().await.unwrap().manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn load_current_falls_back_to_legacy_current_json() {
+        // A namespace bootstrapped before RFC-029 has manifest bodies and a
+        // single `current.json` but no pointer family; load_current must still
+        // resolve it through the legacy fallback.
+        let (store, paths) = store();
+        let manifest = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        store
+            .put(
+                &paths.manifest_version(0),
+                PutPayload::from(serde_json::to_vec(&manifest).unwrap()),
+            )
+            .await
+            .unwrap();
+        let pointer = ManifestPointer {
+            version: 0,
+            epoch: Epoch::ZERO,
+            manifest_path: paths.manifest_version(0).as_ref().to_string(),
+        };
+        store
+            .put(
+                &paths.current_pointer(),
+                PutPayload::from(serde_json::to_vec(&pointer).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let ms = ManifestStore::new(store, paths);
+        let loaded = ms.load_current().await.unwrap();
+        assert_eq!(loaded.manifest.version, 0);
+    }
+
+    #[tokio::test]
+    async fn cas_pointer_create_conflict_is_cas_loss() {
+        // Exercises cas_pointer's AlreadyExists branch directly: PUT the body,
+        // let a competitor publish the pointer first, then our create loses.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let w = Uuid::now_v7();
+        let base = ms.bootstrap(w).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let next = base.manifest.next_version(fence.writer_id);
+        let pointer = ms.put_body(&fence, &base, &next).await.unwrap();
+
+        // Competitor publishes p1 first.
+        store
+            .put_opts(
+                &paths.pointer_version(1),
+                PutPayload::from(serde_json::to_vec(&pointer).unwrap()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+
+        let err = ms
+            .cas_pointer(&fence, &base, next, pointer)
+            .await
+            .unwrap_err();
+        match err {
+            Error::ManifestCommitCas { expected, found } => {
+                assert_eq!(expected, 0);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected ManifestCommitCas, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_probe_advances_past_stale_list_max() -> Result<()> {
+        // Simulates a stale LIST on an eventually-consistent store: create
+        // pointers p0-p5, then add p6-p10. A stale LIST that only saw p0-p5 would
+        // return max=5, but the forward probe should discover p6-p10 via HEAD.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let w = Uuid::now_v7();
+        let mut current = ms.bootstrap(w).await?;
+        let fence = WriterFence::new(current.manifest.epoch);
+
+        // Create p0-p5 (bootstrap gives us p0, advance to p5)
+        for _ in 0..5 {
+            let next = current.manifest.next_version(fence.writer_id);
+            current = ms.commit(&fence, &current, next).await?;
+        }
+        assert_eq!(current.manifest.version, 5);
+
+        // Simulate a stale LIST by manually constructing a max that only sees p5:
+        // the forward probe should discover p6-p10 via HEAD and land on p10.
+        let max_from_stale_list = Some(5u64);
+        let probed = ms.probe_pointer_forward(max_from_stale_list.unwrap()).await?;
+        assert_eq!(probed, 5, "forward probe from stale max should stay at 5 until more commits");
+
+        // Now create p6-p10; forward probe from 5 should discover them.
+        for _ in 0..5 {
+            let next = current.manifest.next_version(fence.writer_id);
+            current = ms.commit(&fence, &current, next).await?;
+        }
+        assert_eq!(current.manifest.version, 10);
+
+        // Forward probe from stale max=5 should now discover up to p10.
+        let probed = ms.probe_pointer_forward(5).await?;
+        assert_eq!(probed, 10, "forward probe should advance from stale max to actual current");
+
+        Ok(())
     }
 
     fn sample_node_descriptor() -> SstDescriptor {
