@@ -389,12 +389,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let (store, _) = namidb_storage::parse_uri(&config.store_uri)
             .map_err(|e| anyhow::anyhow!("invalid --store: {e}"))?;
         let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), config.slow_query_threshold);
+        let maintenance = registry::MaintenanceConfig {
+            flush_interval: config.flush_interval,
+            compaction_interval: config.compaction_interval,
+            sweep_min_age: config.sweep_min_age,
+            sweep_delete: config.sweep_delete,
+            compaction_l0_trigger: config.compaction_l0_trigger,
+        };
         let registry = NamespaceRegistry::new(
             store,
             String::new(), // flat layout (no root prefix)
             config.max_namespaces,
             config.namespace_idle_timeout,
             metrics.clone(),
+            maintenance,
         );
         let registry = Arc::new(registry);
         let shared = SharedAppState::new(

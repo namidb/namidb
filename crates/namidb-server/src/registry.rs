@@ -18,11 +18,39 @@ use axum::{Json, response::IntoResponse};
 use axum::response::Response;
 use axum::http::StatusCode;
 use namidb_core::NamespaceId;
-use namidb_storage::{NamespacePaths, SnapshotCell, WriterSession};
+use namidb_storage::{sweep_orphans, ManifestStore, NamespacePaths, SnapshotCell, WriterSession};
 use object_store::ObjectStore;
 use tokio::sync::{Mutex, RwLock};
+use tracing::{error, info};
 
 use crate::metrics::Metrics;
+
+/// Per-namespace background-maintenance configuration. Mirrors the
+/// single-tenant `Config` fields that drive flush/compaction/orphan-sweep,
+/// so a multi-tenant namespace gets the same durability guarantees as a
+/// single-tenant process. Zero intervals disable the corresponding task.
+#[derive(Clone, Copy)]
+pub struct MaintenanceConfig {
+    pub flush_interval: Duration,
+    pub compaction_interval: Duration,
+    pub sweep_min_age: Duration,
+    pub sweep_delete: bool,
+    /// L0-count high-water mark per bucket that triggers a reactive
+    /// compaction on flush. `0` disables it.
+    pub compaction_l0_trigger: usize,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            flush_interval: Duration::ZERO,
+            compaction_interval: Duration::ZERO,
+            sweep_min_age: Duration::ZERO,
+            sweep_delete: false,
+            compaction_l0_trigger: 0,
+        }
+    }
+}
 
 /// In-process registry of namespace sessions.
 ///
@@ -52,16 +80,22 @@ pub struct NamespaceRegistry {
     anchor: Instant,
     /// Process-wide metrics (flush, compaction, orphan-sweep increments).
     metrics: Arc<Metrics>,
+    /// Per-namespace background-maintenance schedule (flush/compaction/sweep).
+    /// Without this, a multi-tenant namespace never flushed or compacted — a
+    /// durability and read-amplification gap vs the single-tenant path.
+    maintenance: MaintenanceConfig,
 }
 
 impl NamespaceRegistry {
-    /// Create a new registry with the given store, root prefix, and limits.
+    /// Create a new registry with the given store, root prefix, limits, and
+    /// per-namespace maintenance schedule.
     pub fn new(
         store: Arc<dyn ObjectStore>,
         root: String,
         max_namespaces: usize,
         idle_timeout: Duration,
         metrics: Arc<Metrics>,
+        maintenance: MaintenanceConfig,
     ) -> Self {
         Self {
             store,
@@ -71,6 +105,7 @@ impl NamespaceRegistry {
             idle_timeout,
             anchor: Instant::now(),
             metrics,
+            maintenance,
         }
     }
 
@@ -138,9 +173,95 @@ impl NamespaceRegistry {
             last_access: std::sync::atomic::AtomicU64::new(now),
         });
 
+        // Spawn per-namespace background maintenance (flush / compaction /
+        // orphan sweep) so a multi-tenant namespace is as durable and
+        // read-amplification-bounded as a single-tenant process. The tasks
+        // hold their own Arc clones and run for the lifetime of the state.
+        self.spawn_maintenance(Arc::clone(&state), paths);
+
         sessions.insert(namespace.to_string(), Arc::clone(&state));
         tracing::info!("opened namespace: {} (total: {})", namespace, sessions.len());
         Ok(state)
+    }
+
+    /// Spawn the periodic flush and compaction+sweep tasks for one namespace,
+    /// mirroring the single-tenant `run()` maintenance. Each task takes its
+    /// own `Arc<NamespaceState>` clone and a per-namespace `ManifestStore`
+    /// (for the lock-free orphan sweep). A zero interval disables that task.
+    fn spawn_maintenance(&self, state: Arc<NamespaceState>, paths: NamespacePaths) {
+        let maint = self.maintenance;
+        let maint_store = Arc::new(ManifestStore::new(self.store.clone(), paths));
+
+        // Periodic flush (+ reactive compaction on L0 high-water).
+        if maint.flush_interval > Duration::ZERO {
+            let s = Arc::clone(&state);
+            let interval = maint.flush_interval;
+            let l0_trigger = maint.compaction_l0_trigger;
+            let ns = state.namespace.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await; // first tick fires immediately; skip
+                loop {
+                    tick.tick().await;
+                    let mut w = s.writer.lock().await;
+                    let schema = w.snapshot().manifest().manifest.schema.clone();
+                    match w.flush(schema.clone()).await {
+                        Ok(_) => {
+                            s.snapshot.store(w.owned_snapshot());
+                            if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
+                                if let Err(e) = w.compact_l0(&schema).await {
+                                    error!(namespace = %ns, error = %e, "reactive compaction failed");
+                                } else {
+                                    s.snapshot.store(w.owned_snapshot());
+                                }
+                            }
+                        }
+                        Err(e) => error!(namespace = %ns, error = %e, "periodic flush failed"),
+                    }
+                }
+            });
+        }
+
+        // Periodic compaction (L0->L1) + orphan sweep.
+        if maint.compaction_interval > Duration::ZERO {
+            let s = Arc::clone(&state);
+            let ms = Arc::clone(&maint_store);
+            let interval = maint.compaction_interval;
+            let sweep_min_age = maint.sweep_min_age;
+            let sweep_delete = maint.sweep_delete;
+            let ns = state.namespace.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await; // first tick fires immediately; skip
+                loop {
+                    tick.tick().await;
+                    {
+                        let mut w = s.writer.lock().await;
+                        let schema = w.snapshot().manifest().manifest.schema.clone();
+                        match w.compact_l0(&schema).await {
+                            Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                s.snapshot.store(w.owned_snapshot());
+                                info!(
+                                    namespace = %ns,
+                                    removed = outcome.source_ssts_removed,
+                                    written = outcome.new_ssts_written,
+                                    "compacted L0 into L1"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!(namespace = %ns, error = %e, "periodic compaction failed"),
+                        }
+                    }
+                    // Orphan sweep — no writer lock; the retention horizon
+                    // (RFC-027) keeps it from deleting a body a live reader
+                    // still references.
+                    let horizon = s.snapshot.retention_horizon();
+                    if let Err(e) = sweep_orphans(&ms, horizon, sweep_min_age, 1, sweep_delete).await {
+                        error!(namespace = %ns, error = %e, "orphan sweep failed");
+                    }
+                }
+            });
+        }
     }
 
     /// Find the oldest idle namespace (unused for > idle_timeout). Returns
