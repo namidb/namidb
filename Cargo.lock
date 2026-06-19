@@ -2159,6 +2159,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "namidb-ann"
+version = "0.18.0"
+dependencies = [
+ "namidb-core",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "namidb-bench"
 version = "0.18.0"
 dependencies = [

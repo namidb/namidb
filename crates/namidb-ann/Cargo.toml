@@ -1,0 +1,21 @@
+[package]
+name = "namidb-ann"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "DiskANN/Vamana approximate-nearest-neighbor index for NamiDB vector search"
+readme = "README.md"
+
+[dependencies]
+namidb-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = "0.8"
+
+[dev-dependencies]
+rand_chacha = "0.3"
+serde_json = { workspace = true }
