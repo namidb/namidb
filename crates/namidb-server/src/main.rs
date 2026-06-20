@@ -74,6 +74,14 @@ struct Cli {
     #[arg(long, env = "NAMIDB_JWT_NAMESPACES_CLAIM")]
     jwt_namespaces_claim: Option<String>,
 
+    /// External policy-decision-point URL (OPA-style data API), e.g.
+    /// `http://opa:8181/v0/data/namidb/allow`. When set, every query and DDL
+    /// is checked against the policy (fail-closed). Requires the `pdp` build
+    /// feature; unset = no external policy.
+    #[cfg(feature = "pdp")]
+    #[arg(long, env = "NAMIDB_PDP_URL")]
+    pdp_url: Option<String>,
+
     /// Interval at which the memtable is flushed to L0 SSTs in the
     /// background. Set to `0s` to disable periodic flush (callers
     /// must POST /v0/admin/flush manually).
@@ -272,6 +280,8 @@ fn main() -> anyhow::Result<()> {
             read_group: cli.jwt_read_group,
             namespaces_claim: cli.jwt_namespaces_claim,
         }),
+        #[cfg(feature = "pdp")]
+        pdp_url: cli.pdp_url,
         flush_interval: cli.flush_interval,
         compaction_interval: cli.compaction_interval,
         sweep_min_age: cli.sweep_min_age,

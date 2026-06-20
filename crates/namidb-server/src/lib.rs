@@ -18,6 +18,10 @@ pub mod tls;
 // with the `jwt` Cargo feature, which adds reqwest + jsonwebtoken.
 #[cfg(feature = "jwt")]
 pub mod jwt;
+// External policy decision point (RFC-015 Wave B). Optional: only compiled with
+// the `pdp` Cargo feature (adds reqwest). An OPA-backed `AuthzHook`.
+#[cfg(feature = "pdp")]
+pub mod pdp;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +66,10 @@ pub struct Config {
     /// or open mode). Only present under the `jwt` feature.
     #[cfg(feature = "jwt")]
     pub jwt: Option<crate::jwt::JwtConfig>,
+    /// External policy-decision-point URL (OPA-style). `None` = no PDP
+    /// (allow-all NoOp). Only present under the `pdp` feature.
+    #[cfg(feature = "pdp")]
+    pub pdp_url: Option<String>,
     pub flush_interval: Duration,
     /// Interval for the background maintenance task (L0->L1 compaction +
     /// orphan sweep). `Duration::ZERO` disables it.
@@ -464,6 +472,27 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         info!(tokens = auth.len(), "auth enabled");
     }
 
+    // Resolve the authorization hook (RFC-015 Wave B). With the `pdp` feature
+    // and a configured endpoint, every query/DDL is checked against an external
+    // OPA-style policy (fail-closed); otherwise the allow-all NoOp keeps
+    // behavior identical. Built once and shared across both serving paths.
+    let authz: Arc<dyn authz::AuthzHook> = {
+        #[cfg(feature = "pdp")]
+        {
+            match &config.pdp_url {
+                Some(url) => {
+                    info!(endpoint = %url, "external policy decision point (PDP) enabled");
+                    Arc::new(crate::pdp::OpaAuthz::new(url.clone())?)
+                }
+                None => Arc::new(authz::NoOpAuthz),
+            }
+        }
+        #[cfg(not(feature = "pdp"))]
+        {
+            Arc::new(authz::NoOpAuthz)
+        }
+    };
+
     // Multi-tenant mode: create a registry and build the multi-tenant router.
     // The registry lazily creates WriterSessions per namespace on first access.
     if config.multi_tenant {
@@ -496,7 +525,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.write_stall_l0,
             config.write_stall_delay,
             config.default_namespace.clone(),
-        );
+        )
+        .with_authz(authz.clone());
         let app = build_multi_tenant_router(shared);
 
         // Shutdown signal.
@@ -533,6 +563,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let state = AppState::new(writer, None, namespace)
         .with_auth(auth)
+        .with_authz(authz.clone())
         .with_query_timeout(config.query_timeout)
         .with_write_timeout(config.write_timeout)
         .with_query_row_cap(config.query_row_cap)

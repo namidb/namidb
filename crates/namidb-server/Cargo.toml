@@ -23,6 +23,11 @@ vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
 # with no signature changes. reqwest (JWKS fetch) + jsonwebtoken are optional.
 # Default off; with it off, behavior is byte-identical (static-token auth only).
 jwt = ["dep:reqwest", "dep:jsonwebtoken"]
+# External policy decision point (RFC-015 Wave B): an `AuthzHook` impl that
+# POSTs the principal + action + plan to an OPA-style HTTP endpoint and denies
+# unless it returns `{"result":{"allow":true}}`. Fail-closed on any error.
+# Optional reqwest; default off (NoOpAuthz allow-all when absent).
+pdp = ["dep:reqwest"]
 
 [[bin]]
 name = "namidb-server"

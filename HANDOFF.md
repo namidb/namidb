@@ -148,7 +148,7 @@ falling through to the flat path when no descriptor, gated behind Cargo feature
 `dot_i8_asymmetric`/`norm_i8` to `quantize.rs` and rewire the bench's private
 copy at `vector_recall.rs:96-100`.**
 
-### Item 15 — auth/RBAC — Wave A SHIPPED this session; Wave B (PDP) pending
+### Item 15 — auth/RBAC — COMPLETE (Wave A JWT + Wave B scoping/Principal/AuthzHook/PDP)
 OIDC/JWT bearer-token auth, behind the `jwt` Cargo feature (default off).
 **Wave A (done):** a `JwtValidator` (`src/jwt.rs`) fetches a JWKS URL (reqwest,
 refreshed hourly), validates bearer tokens (RS/ES* signature, `exp`, optional
@@ -277,8 +277,14 @@ work confirmed 4 real bugs (verified against pinned axum/matchit); all fixed:
 - ✅ Item 15 Wave B Principal + AuthzHook — `Principal {subject, role, groups}`
   threaded through HTTP (Extension) + Bolt (per-conn Mutex); a pre-execution
   `AuthzHook::check(principal, plan)` (NoOp default, behavior-preserving) that
-  can deny even reads. A real OPA/Cedar PDP behind a `pdp` feature is the only
-  remaining sub-item.
+  can deny even reads.
+- ✅ Item 15 Wave B **PDP (OPA)** — `pdp.rs` `OpaAuthz`: an `AuthzHook` that
+  POSTs `{subject, role, groups, action, operators}` (or a schema op) to an
+  OPA-style endpoint and denies unless `{"result":{"allow":true}}`.
+  **Fail-closed** on any error (unreachable / non-2xx / malformed / missing
+  `allow`). Behind the `pdp` Cargo feature (optional reqwest); `--pdp-url` CLI
+  flag wires it on both serving paths. Pure `decide()` + 7 tests incl. a live
+  OPA-fake (allow/deny/fail-closed/check_schema). **Item 15 is now complete.**
 - ✅ bm25 lexical builtin (hybrid Layer B) — `bm25(document, query)` scalar
   builtin (TF saturation + field-length norm; `exec/text_scoring.rs`) wired
   into the MCP hybrid lexical channel (ranks by relevance, not title order).
