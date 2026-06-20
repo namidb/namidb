@@ -486,7 +486,8 @@ fn execute_write_inner<'a>(
             | LogicalPlan::SemiApply { .. }
             | LogicalPlan::PatternList { .. }
             | LogicalPlan::MultiwayJoin { .. }
-            | LogicalPlan::VectorSearch { .. } => {
+            | LogicalPlan::VectorSearch { .. }
+            | LogicalPlan::CallProcedure { .. } => {
                 let snap = writer.overlay_snapshot();
                 execute_inner(plan, &snap, params, None).await
             }

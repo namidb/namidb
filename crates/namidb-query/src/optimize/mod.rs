@@ -275,6 +275,11 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
             out.insert(alias.clone());
             out.insert(score_alias.clone());
         }
+        LogicalPlan::CallProcedure { yield_items, .. } => {
+            for (_, bind) in yield_items {
+                out.insert(bind.clone());
+            }
+        }
         LogicalPlan::Argument { bindings } => {
             for b in bindings {
                 out.insert(b.clone());

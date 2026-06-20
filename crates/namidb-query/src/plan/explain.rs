@@ -554,6 +554,35 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 score_alias
             );
         }
+        LogicalPlan::CallProcedure {
+            namespace,
+            name,
+            args,
+            yield_items,
+        } => {
+            let _ = write!(
+                out,
+                "CallProcedure {}.{}(",
+                namespace.as_deref().unwrap_or(""),
+                name
+            );
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{a}"));
+            }
+            out.push(')');
+            if !yield_items.is_empty() {
+                out.push_str(" YIELD ");
+                for (i, (_, bind)) in yield_items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(bind);
+                }
+            }
+        }
         LogicalPlan::CrossProduct { .. } => {
             out.push_str("CrossProduct");
         }

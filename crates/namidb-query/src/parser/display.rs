@@ -58,6 +58,7 @@ impl fmt::Display for Clause {
             Clause::Remove(r) => fmt::Display::fmt(r, f),
             Clause::Delete(d) => fmt::Display::fmt(d, f),
             Clause::CreateVectorIndex(c) => fmt::Display::fmt(c, f),
+            Clause::Call(c) => fmt::Display::fmt(c, f),
         }
     }
 }
@@ -145,6 +146,36 @@ impl fmt::Display for CreateVectorIndexClause {
             }
             write!(f, "{}", parts.join(", "))?;
             f.write_str("}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CallClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CALL ")?;
+        if let Some(ns) = &self.namespace {
+            write!(f, "{ns}.")?;
+        }
+        write!(f, "{}(", self.name)?;
+        for (i, a) in self.args.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{a}")?;
+        }
+        f.write_str(")")?;
+        if !self.yield_items.is_empty() {
+            f.write_str(" YIELD ")?;
+            for (i, it) in self.yield_items.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", it.name)?;
+                if let Some(a) = &it.alias {
+                    write!(f, " AS {a}")?;
+                }
+            }
         }
         Ok(())
     }

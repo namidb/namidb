@@ -75,6 +75,12 @@ pub enum Clause {
     /// `LogicalPlan` — the server intercepts it via
     /// [`Query::as_create_vector_index`].
     CreateVectorIndex(CreateVectorIndexClause),
+    /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in procedure
+    /// (RFC-008 PR1). A leading source clause: it introduces bindings (the
+    /// YIELD columns) like `MATCH` does. Always-on (graph algorithms are
+    /// core, not experimental), so unlike `CreateVectorIndex` this one
+    /// lowers to a `LogicalPlan::CallProcedure` and the executor runs it.
+    Call(CallClause),
 }
 
 impl Clause {
@@ -91,6 +97,7 @@ impl Clause {
             Clause::Remove(c) => c.span,
             Clause::Delete(c) => c.span,
             Clause::CreateVectorIndex(c) => c.span,
+            Clause::Call(c) => c.span,
         }
     }
 }
@@ -226,6 +233,44 @@ pub struct CreateVectorIndexClause {
     /// Optional `WITH {alpha: …}` override of the Vamana diversification.
     pub alpha: Option<f32>,
     pub span: SourceSpan,
+}
+
+/// `CALL <namespace>.<name>([args]) [YIELD <items>]` (RFC-008 PR1) — invoke a
+/// built-in procedure (`algo.wcc`, `algo.pagerank`, …) and yield its result
+/// rows. A leading source clause: it introduces bindings (the YIELD columns)
+/// like `MATCH`. `YIELD` is optional — without it the procedure's canonical
+/// output columns are emitted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallClause {
+    /// Procedure namespace (before the dot), e.g. `algo`. `None` for an
+    /// unqualified call.
+    pub namespace: Option<String>,
+    /// Procedure name (after the dot, or the whole call).
+    pub name: String,
+    /// Positional argument expressions (may be empty).
+    pub args: Vec<Expression>,
+    /// `YIELD` projection items; empty when `YIELD` was omitted.
+    pub yield_items: Vec<YieldItem>,
+    pub span: SourceSpan,
+}
+
+/// One `YIELD` column: a procedure output name, optionally renamed with `AS`.
+/// Unlike a projection item, YIELD columns are plain names (no expressions).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct YieldItem {
+    /// The procedure's output column name being selected.
+    pub name: Identifier,
+    /// Optional `AS <alias>` rename.
+    pub alias: Option<Identifier>,
+    pub span: SourceSpan,
+}
+
+impl YieldItem {
+    /// The binding name this item produces in downstream scope: the alias if
+    /// given, else the column name itself.
+    pub fn binding_name(&self) -> &str {
+        self.alias.as_ref().map(|a| a.name.as_str()).unwrap_or(&self.name.name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

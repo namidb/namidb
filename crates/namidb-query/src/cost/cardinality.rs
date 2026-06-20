@@ -87,6 +87,15 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             b.insert(score_alias.clone(), BindingMeta::default());
             leaf(plan, k.as_const().unwrap_or(10) as f64, b)
         }
+        LogicalPlan::CallProcedure { yield_items, .. } => {
+            let mut b = BTreeMap::new();
+            for (_, bind) in yield_items {
+                b.insert(bind.clone(), BindingMeta::default());
+            }
+            // The graph algorithms emit one row per node; without stats we
+            // estimate a rough default (the exact count is materialised later).
+            leaf(plan, 1000.0, b)
+        }
         LogicalPlan::Argument { bindings } => {
             let mut b = BTreeMap::new();
             for name in bindings {

@@ -409,6 +409,18 @@ pub enum LogicalPlan {
         /// Output column for the (lower-is-closer) distance score.
         score_alias: String,
     },
+    /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in graph
+    /// procedure (RFC-008 PR1). A source leaf: no input, yields one row per
+    /// procedure output record (e.g. one row per node for `algo.wcc` /
+    /// `algo.pagerank`). The executor dispatches on `(namespace, name)`.
+    CallProcedure {
+        namespace: Option<String>,
+        name: String,
+        args: Vec<Expression>,
+        /// `(source_column, binding_name)` pairs; empty → emit the procedure's
+        /// canonical columns verbatim.
+        yield_items: Vec<(String, String)>,
+    },
 }
 
 /// One participating variable in a [`LogicalPlan::MultiwayJoin`]
@@ -452,7 +464,8 @@ impl LogicalPlan {
             | LogicalPlan::Argument { .. }
             | LogicalPlan::MultiwayJoin { .. }
             | LogicalPlan::EdgeTypeCount { .. }
-            | LogicalPlan::VectorSearch { .. } => {
+            | LogicalPlan::VectorSearch { .. }
+            | LogicalPlan::CallProcedure { .. } => {
                 vec![]
             }
             LogicalPlan::NodeById { input, .. }
@@ -567,6 +580,7 @@ impl LogicalPlan {
             LogicalPlan::MultiwayJoin { .. } => "MultiwayJoin",
             LogicalPlan::EdgeTypeCount { .. } => "EdgeTypeCount",
             LogicalPlan::VectorSearch { .. } => "VectorSearch",
+            LogicalPlan::CallProcedure { .. } => "CallProcedure",
         }
     }
 }

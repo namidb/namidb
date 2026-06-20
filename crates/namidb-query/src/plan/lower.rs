@@ -147,6 +147,18 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
                     clause.span(),
                 ));
             }
+            Clause::Call(c) => {
+                // CALL is a leading source clause (like MATCH). For v0 it must
+                // be the first clause — a CALL after a WITH/MATCH is rejected.
+                if plan.is_some() {
+                    return Err(LowerError::new(
+                        LowerErrorKind::InvalidPattern,
+                        "CALL must be the first clause in a query",
+                        clause.span(),
+                    ));
+                }
+                plan = Some(lower_call(c, &mut ctx)?);
+            }
         }
     }
 
@@ -166,6 +178,26 @@ fn require_input(p: Option<LogicalPlan>, span: SourceSpan) -> Result<LogicalPlan
             "this clause requires a preceding MATCH/WITH/UNWIND",
             span,
         )
+    })
+}
+
+/// Lower a `CALL` source clause to a `CallProcedure` leaf. Normalises the
+/// YIELD items into `(source_column, binding_name)` and introduces the
+/// binding names so a following `RETURN`/`WITH` can see them.
+fn lower_call(c: &ast::CallClause, ctx: &mut LowerCtx) -> Result<LogicalPlan, LowerError> {
+    let yield_items: Vec<(String, String)> = c
+        .yield_items
+        .iter()
+        .map(|y| (y.name.name.clone(), y.binding_name().to_string()))
+        .collect();
+    for (_, bind) in &yield_items {
+        ctx.introduce(bind, c.span)?;
+    }
+    Ok(LogicalPlan::CallProcedure {
+        namespace: c.namespace.clone(),
+        name: c.name.clone(),
+        args: c.args.clone(),
+        yield_items,
     })
 }
 

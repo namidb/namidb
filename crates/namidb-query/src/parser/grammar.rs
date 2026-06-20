@@ -339,6 +339,11 @@ impl<'src> Parser<'src> {
             Some(Token::Delete) | Some(Token::Detach) => {
                 self.parse_delete_clause().map(Clause::Delete)
             }
+            // `CALL` is a soft keyword (a non-reserved `Ident`), so it must be
+            // matched before the fall-through "expected a clause keyword" arm.
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CALL") => {
+                self.parse_call_clause().map(Clause::Call)
+            }
             Some(other) => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 format!("expected a clause keyword, found `{}`", other.label()),
@@ -702,6 +707,86 @@ impl<'src> Parser<'src> {
                 next.span,
             )),
         }
+    }
+
+    /// `CALL <namespace>.<name>([args]) [YIELD <item>, …]` (RFC-008 PR1).
+    /// `CALL`/`YIELD` are soft keywords (non-reserved `Ident`s). A leading
+    /// source clause; the lowerer turns it into a `LogicalPlan::CallProcedure`.
+    fn parse_call_clause(&mut self) -> Result<CallClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("CALL")?;
+        // Qualified procedure name: <ident> (.<ident>)* → (namespace?, name).
+        let mut parts = vec![self.expect_identifier()?.name];
+        while self.eat(&Token::Dot).is_some() {
+            parts.push(self.expect_identifier()?.name);
+        }
+        let (namespace, name) = if parts.len() == 1 {
+            (None, parts.pop().unwrap())
+        } else {
+            let name = parts.pop().unwrap();
+            (Some(parts.join(".")), name)
+        };
+        // Arguments: `( expr, … )`. Empty parens allowed; missing parens = no args.
+        let args = if self.eat(&Token::LParen).is_some() {
+            let mut a = Vec::new();
+            if !self.check(&Token::RParen) {
+                a.push(self.parse_expression()?);
+                while self.eat(&Token::Comma).is_some() {
+                    a.push(self.parse_expression()?);
+                }
+            }
+            self.expect(&Token::RParen)?;
+            a
+        } else {
+            Vec::new()
+        };
+        // Optional `YIELD <item>, …`.
+        let yield_items = if matches!(
+            self.peek(),
+            Some(Token::Ident(n)) if n.eq_ignore_ascii_case("YIELD")
+        ) {
+            self.bump();
+            self.parse_yield_list()?
+        } else {
+            Vec::new()
+        };
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(CallClause {
+            namespace,
+            name,
+            args,
+            yield_items,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    fn parse_yield_list(&mut self) -> Result<Vec<YieldItem>, ParseError> {
+        let mut items = Vec::new();
+        items.push(self.parse_yield_item()?);
+        while self.eat(&Token::Comma).is_some() {
+            items.push(self.parse_yield_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_yield_item(&mut self) -> Result<YieldItem, ParseError> {
+        let name = self.expect_identifier()?;
+        let alias = if self.eat(&Token::As).is_some() {
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        let name_start = name.span.start;
+        let end = alias.as_ref().map(|a| a.span.end).unwrap_or(name.span.end);
+        Ok(YieldItem {
+            name,
+            alias,
+            span: SourceSpan::new(name_start, end),
+        })
     }
 
     fn parse_merge_clause(&mut self) -> Result<MergeClause, ParseError> {
@@ -2202,6 +2287,59 @@ mod tests {
             q.as_create_vector_index().is_none(),
             "a non-standalone DDL must not be intercepted"
         );
+    }
+
+    #[test]
+    fn call_clause_parses_qualified_with_yield() {
+        let q = ok("CALL algo.wcc() YIELD node_id, component RETURN node_id, component");
+        let c = match &q.head.clauses[0] {
+            Clause::Call(c) => c,
+            other => panic!("expected Call, got {other:?}"),
+        };
+        assert_eq!(c.namespace.as_deref(), Some("algo"));
+        assert_eq!(c.name, "wcc");
+        assert!(c.args.is_empty());
+        assert_eq!(c.yield_items.len(), 2);
+        assert_eq!(c.yield_items[0].name.name, "node_id");
+        assert_eq!(c.yield_items[1].name.name, "component");
+    }
+
+    #[test]
+    fn call_clause_parses_unqualified_no_yield_and_with_alias() {
+        // No namespace, no parens, no YIELD, and an aliased YIELD item.
+        let q = ok("CALL pagerank YIELD node_id AS n, score");
+        let c = match &q.head.clauses[0] {
+            Clause::Call(c) => c,
+            _ => panic!(),
+        };
+        assert!(c.namespace.is_none());
+        assert_eq!(c.name, "pagerank");
+        assert_eq!(c.yield_items[0].binding_name(), "n");
+        assert_eq!(c.yield_items[1].binding_name(), "score");
+    }
+
+    #[test]
+    fn call_clause_roundtrips() {
+        let src = "CALL algo.wcc() YIELD node_id, component AS comp";
+        let q1 = ok(src);
+        assert_eq!(format!("{}", q1), format!("{}", ok(&format!("{}", q1))));
+        // Sanity: the rendered form re-parses to the same shape.
+        let q2 = ok(&format!("{}", q1));
+        match &q2.head.clauses[0] {
+            Clause::Call(c) => {
+                assert_eq!(c.namespace.as_deref(), Some("algo"));
+                assert_eq!(c.name, "wcc");
+                assert_eq!(c.yield_items[1].binding_name(), "comp");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn call_as_identifier_still_works() {
+        // `CALL` is a soft keyword; a variable/label named `call` elsewhere
+        // must still parse (it only routes to CALL at clause start).
+        let _ = ok("MATCH (n:call) RETURN n");
     }
 
     #[test]

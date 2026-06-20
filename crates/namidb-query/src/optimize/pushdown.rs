@@ -28,7 +28,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
         | LogicalPlan::Argument { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
-        | LogicalPlan::VectorSearch { .. } => {
+        | LogicalPlan::VectorSearch { .. } | LogicalPlan::CallProcedure { .. } => {
             // The detection pass folds predicates over participating
             // variables into `NodeBinding.predicates` before emitting,
             // so by the time this pass reaches a MultiwayJoin there

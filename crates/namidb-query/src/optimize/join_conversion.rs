@@ -34,7 +34,7 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
-        | LogicalPlan::VectorSearch { .. } => plan,
+        | LogicalPlan::VectorSearch { .. } | LogicalPlan::CallProcedure { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

@@ -9,7 +9,7 @@
 | Crate | Tests |
 |-------|-------|
 | namidb-storage | 310 (304 + 5 vector build + 1 DDL register, behind `vector-index`) |
-| namidb-query | 468 (458 + 4 vector rewrite + 5 DDL parse + 1, behind `vector-index`) |
+| namidb-query | 462 default (+ 4 CALL parse, + 3 CALL e2e) → 471 with `vector-index` (adds 4 vector rewrite + 5 DDL parse + 1) |
 | namidb-ann | 21 (new) |
 | namidb-server | 32 (+ integration suites, +1 DDL HTTP behind `vector-index`) |
 | namidb-mcp | 20 |
@@ -157,10 +157,25 @@ return channel; `serve()`/`make_policy` signatures change; reqwest must be a
 feature-gated dep (not unconditional); default fail-closed for PDP. Gate behind
 feature `jwt`.
 
-### Item 08 PR1 — CALL/YIELD (L) — design verified, ready to implement
-Lexer/AST/grammar → `CallProcedure` source leaf → executor runs `algo.wcc`/
-`algo.pagerank`. The four "blocking holes" from the prior verdict are now
-**resolved against code** (3-agent explore):
+### Item 08 PR1 — CALL/YIELD (SHIPPED this session)
+`CALL <ns>.<name>() [YIELD col [AS a], …]` → `LogicalPlan::CallProcedure`
+source leaf → executor runs `algo.wcc` / `algo.pagerank` over the full
+snapshot. **Working end-to-end**: a 2-pairs-plus-isolate graph yields 3 WCC
+components (isolate kept) and PageRank scores summing to ~1.0; unknown
+procedures surface as a typed `unsupported` error. CALL flows through the
+server's existing read path (`contains_write()` is false for it), so no
+server changes were needed. +3 e2e tests (`tests/exec_call.rs`), +4 parse tests.
+
+What shipped: `Clause::Call`/`CallClause`/`YieldItem` AST (CALL/YIELD soft
+keywords — non-reserved, like EXPLAIN); `parse_call_clause` (qualified names,
+optional parens/args, optional YIELD); `LogicalPlan::CallProcedure` leaf +
+the C5 arms (cardinality, explain, walker flat+factor, writer delegate,
+collect_produced, collect_plan_referenced_variables, the optimizer leaf
+groups); the `flat_call_procedure` executor + `snapshot_to_algo_graph` bridge
+(nodes via `observed_labels`+`scan_label` so isolates are kept; edges via
+`observed_edge_types`+`scan_edge_type` so weights are carried).
+
+The four prior "blocking holes", resolved against code (3-agent explore):
 
 - **cfg/exhaustive-match** → CALL is **in-band, always-on** (not feature-gated,
   not out-of-band): `Clause::Call` + `LogicalPlan::CallProcedure` are

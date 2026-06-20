@@ -301,6 +301,13 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 .await
             }
 
+            LogicalPlan::CallProcedure {
+                namespace,
+                name,
+                args,
+                yield_items,
+            } => flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot).await,
+
             LogicalPlan::PatternList {
                 input,
                 subplan,
@@ -1258,6 +1265,152 @@ fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<Stri
 ///
 /// The scan projects only the embedding column, so a large label costs one
 /// decoded column per node rather than the whole property map. Candidates with
+/// `CALL algo.<name>() [YIELD …]` — run a built-in graph procedure over the
+/// full snapshot and emit one row per result record (RFC-008 PR1).
+///
+/// The kernels in `namidb_graph::algo` operate on an in-memory `Graph`; this
+/// builds that graph from the snapshot — every node via `scan_label` (so
+/// isolated nodes keep their own component / get a score) and every edge via
+/// `scan_edge_type` (which carries properties, for edge weights) — runs the
+/// kernel, then projects the canonical output columns to the YIELD bindings
+/// (or the canonical names when `YIELD` was omitted).
+async fn flat_call_procedure(
+    namespace: Option<&str>,
+    name: &str,
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+) -> Result<Vec<Row>, ExecError> {
+    if !matches!(namespace, Some("algo") | None) {
+        return Err(proc_unsupported(format!(
+            "unknown procedure namespace `{}` (supported: `algo`)",
+            namespace.unwrap_or("")
+        )));
+    }
+    // Procedure arguments are not wired yet (RFC-008 PR2); reject so a caller
+    // does not silently get defaults for parameters they passed.
+    if !args.is_empty() {
+        return Err(proc_unsupported(
+            "procedure arguments are not yet supported; call with no arguments",
+        ));
+    }
+
+    let graph = snapshot_to_algo_graph(snapshot).await?;
+
+    // Canonical output: column names + one RuntimeValue per column per row.
+    let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match name {
+        "wcc" => {
+            let comps = namidb_graph::algo::weakly_connected_components(&graph);
+            let mut entries: Vec<(NodeId, usize)> = comps.assignment.into_iter().collect();
+            // Deterministic order: by component id, then by node id.
+            entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let raw = entries
+                .into_iter()
+                .map(|(id, c)| vec![node_runtime(id), RuntimeValue::Integer(c as i64)])
+                .collect();
+            (vec!["node_id", "component"], raw)
+        }
+        "pagerank" => {
+            let pr = namidb_graph::algo::pagerank(
+                &graph,
+                &namidb_graph::algo::PageRankOptions::default(),
+            );
+            let mut entries: Vec<(NodeId, f64)> = pr.scores.into_iter().collect();
+            // Descending by score, then by node id for stability.
+            entries.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let raw = entries
+                .into_iter()
+                .map(|(id, s)| vec![node_runtime(id), RuntimeValue::Float(s)])
+                .collect();
+            (vec!["node_id", "score"], raw)
+        }
+        other => {
+            return Err(proc_unsupported(format!(
+                "unknown procedure `algo.{other}` (supported: algo.wcc, algo.pagerank)"
+            )));
+        }
+    };
+
+    // Project canonical columns → binding names (YIELD, or canonical names).
+    let projection: Vec<(usize, String)> = if yield_items.is_empty() {
+        cols.iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.to_string()))
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(yield_items.len());
+        for (src, bind) in yield_items {
+            match cols.iter().position(|c| *c == src.as_str()) {
+                Some(i) => out.push((i, bind.clone())),
+                None => {
+                    return Err(proc_unsupported(format!(
+                        "procedure `algo.{name}` has no output column `{src}` \
+                         (available: {})",
+                        cols.join(", ")
+                    )));
+                }
+            }
+        }
+        out
+    };
+
+    let mut rows = Vec::with_capacity(raw.len());
+    for record in raw {
+        let mut row = Row::new();
+        for (i, bind) in &projection {
+            row = row.with(bind.clone(), record[*i].clone());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn proc_unsupported(msg: impl Into<String>) -> ExecError {
+    ExecError::Eval(EvalError::unsupported(msg, SourceSpan::point(0)))
+}
+
+/// A `node_id` YIELD value: a node carrying just its id (labels/properties
+/// empty — the procedure output is about identity + score/component).
+fn node_runtime(id: NodeId) -> RuntimeValue {
+    RuntimeValue::Node(Box::new(NodeValue {
+        id,
+        labels: BTreeSet::new(),
+        properties: std::collections::BTreeMap::new(),
+    }))
+}
+
+/// Build an in-memory `algo::Graph` from the snapshot: every node (isolates
+/// included) and every edge (with an optional `weight` property).
+async fn snapshot_to_algo_graph(
+    snapshot: &Snapshot<'_>,
+) -> Result<namidb_graph::algo::Graph, ExecError> {
+    let mut g = namidb_graph::algo::Graph::new();
+    for label in snapshot.observed_labels() {
+        for n in snapshot.scan_label(&label).await? {
+            g.add_node(n.id);
+        }
+    }
+    for et in snapshot.observed_edge_types() {
+        for e in snapshot.scan_edge_type(&et).await? {
+            let w = e.properties.get("weight").and_then(numeric_weight);
+            g.add_edge(e.src, e.dst, w);
+        }
+    }
+    Ok(g)
+}
+
+fn numeric_weight(v: &namidb_core::Value) -> Option<f64> {
+    match v {
+        namidb_core::Value::F64(x) => Some(*x),
+        namidb_core::Value::I64(x) => Some(*x as f64),
+        _ => None,
+    }
+}
+
 /// a missing/NULL embedding or a zero-magnitude vector (undefined cosine) are
 /// dropped.
 #[allow(clippy::too_many_arguments)]
@@ -2099,6 +2252,19 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     params,
                 )
                 .await?;
+                Ok(FactorRowSet::from_flat(rows))
+            }
+
+            // CallProcedure is a source leaf; run the flat helper and wrap it.
+            LogicalPlan::CallProcedure {
+                namespace,
+                name,
+                args,
+                yield_items,
+            } => {
+                let rows =
+                    flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot)
+                        .await?;
                 Ok(FactorRowSet::from_flat(rows))
             }
 
@@ -3701,6 +3867,11 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         }
         LogicalPlan::VectorSearch { query, .. } => {
             collect_referenced_variables(query, out);
+        }
+        LogicalPlan::CallProcedure { args, .. } => {
+            for a in args {
+                collect_referenced_variables(a, out);
+            }
         }
         LogicalPlan::Unwind { list, .. } => {
             collect_referenced_variables(list, out);
