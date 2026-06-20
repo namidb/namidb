@@ -22,7 +22,7 @@ use crate::plan::logical::{LogicalPlan, OrderKey, RowCount, VectorDistance};
 
 /// Run the rewrite over `plan`. No-op when no index matches.
 pub fn apply_vector_search(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
-    let plan = recurse(plan, catalog);
+    let plan = recurse(plan);
     if let Some(vs) = try_match(&plan, catalog) {
         vs
     } else {
@@ -32,8 +32,9 @@ pub fn apply_vector_search(plan: LogicalPlan, catalog: &StatsCatalog) -> Logical
 
 /// Bottom-up recursion through the single-input operators that wrap a KNN
 /// (TopN / Project / Filter). A KNN is a single-chain shape, so this is enough
-/// to catch one nested under an outer clause.
-fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
+/// to catch one nested under an outer clause. (Pure structural rebuild; the
+/// index match is decided in `try_match` against the catalog.)
+fn recurse(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::TopN {
             input,
@@ -41,7 +42,7 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             skip,
             limit,
         } => LogicalPlan::TopN {
-            input: Box::new(recurse(*input, catalog)),
+            input: Box::new(recurse(*input)),
             keys,
             skip,
             limit,
@@ -52,13 +53,13 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         } => LogicalPlan::Project {
-            input: Box::new(recurse(*input, catalog)),
+            input: Box::new(recurse(*input)),
             items,
             distinct,
             discard_input_bindings,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(recurse(*input, catalog)),
+            input: Box::new(recurse(*input)),
             predicate,
         },
         other => other,
@@ -118,12 +119,7 @@ fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> 
     }
 
     // Index must exist for (label, prop, metric).
-    if catalog
-        .vector_index_for(label, &prop, metric_to_storage(distance))
-        .is_none()
-    {
-        return None;
-    }
+    catalog.vector_index_for(label, &prop, metric_to_storage(distance))?;
 
     Some(LogicalPlan::VectorSearch {
         label: Some(label.clone()),
