@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::AuthConfig;
+use crate::authz::{AuthzHook, NoOpAuthz};
 use crate::metrics::Metrics;
 use crate::registry::NamespaceRegistry;
 
@@ -40,6 +41,9 @@ pub struct SharedAppState {
     /// `/:namespace/` segment) and for requests that omit the
     /// `X-NamiDB-Namespace` header.
     pub default_namespace: String,
+    /// Pre-execution authorization hook (RFC-015 Wave B), shared across all
+    /// namespaces. Defaults to allow-all ([`NoOpAuthz`]).
+    pub authz: Arc<dyn AuthzHook>,
 }
 
 impl SharedAppState {
@@ -65,7 +69,15 @@ impl SharedAppState {
             write_stall_l0,
             write_stall_delay,
             default_namespace,
+            authz: Arc::new(NoOpAuthz),
         }
+    }
+
+    /// Attach a pre-execution authorization hook (builder style). Defaults to
+    /// allow-all ([`NoOpAuthz`]).
+    pub fn with_authz(mut self, authz: Arc<dyn AuthzHook>) -> Self {
+        self.authz = authz;
+        self
     }
 
     /// Deadline for a read query starting now, or `None` when disabled.

@@ -23,7 +23,7 @@ use std::time::Duration;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
-use crate::auth::Role;
+use crate::auth::{Principal, Role};
 
 /// The accepted asymmetric algorithms (JWKS = public keys).
 const ACCEPTED_ALGS: &[Algorithm] = &[
@@ -134,7 +134,7 @@ impl JwtValidator {
     /// `None` (fail-closed) on any failure. Namespace-agnostic (the single-
     /// tenant / Bolt path).
     pub fn validate(&self, token: &str) -> Option<Role> {
-        self.validate_inner(token, None)
+        self.validate_principal(token).map(|p| p.role)
     }
 
     /// Like [`validate`](Self::validate) but additionally requires the token's
@@ -142,10 +142,21 @@ impl JwtValidator {
     /// `namespace`. Unconfigured → unscoped (back-compat). Used by the
     /// multi-tenant path.
     pub fn validate_in(&self, token: &str, namespace: &str) -> Option<Role> {
+        self.validate_principal_in(token, namespace)
+            .map(|p| p.role)
+    }
+
+    /// Full principal (subject + role + groups) for `token`, namespace-agnostic.
+    pub fn validate_principal(&self, token: &str) -> Option<Principal> {
+        self.validate_inner(token, None)
+    }
+
+    /// [`validate_principal`](Self::validate_principal) with a namespace scope.
+    pub fn validate_principal_in(&self, token: &str, namespace: &str) -> Option<Principal> {
         self.validate_inner(token, Some(namespace))
     }
 
-    fn validate_inner(&self, token: &str, namespace: Option<&str>) -> Option<Role> {
+    fn validate_inner(&self, token: &str, namespace: Option<&str>) -> Option<Principal> {
         let header = decode_header(token).ok()?;
         if !ACCEPTED_ALGS.contains(&header.alg) {
             return None; // refuse symmetric / "none" / unknown algs
@@ -168,15 +179,16 @@ impl JwtValidator {
         }
     }
 
-    /// Decode against one key; on success, extract the group claim (and the
-    /// namespaces claim when a namespace is being checked), and map to a Role.
+    /// Decode against one key; on success, extract subject + group claim (and
+    /// check the namespaces claim when a namespace is being checked), and map
+    /// to a [`Principal`].
     fn try_decode(
         &self,
         token: &str,
         key: &DecodingKey,
         validation: &Validation,
         namespace: Option<&str>,
-    ) -> Option<Role> {
+    ) -> Option<Principal> {
         // Decode to a generic JSON value so the claims can live anywhere.
         let data = decode::<serde_json::Value>(token, key, validation).ok()?;
 
@@ -199,17 +211,39 @@ impl JwtValidator {
             .get(&self.config.groups_claim)
             .and_then(extract_group_strings)?;
         // Write group wins over read group (most-permissive).
-        if let Some(wg) = &self.config.write_group {
+        let role = if let Some(wg) = &self.config.write_group {
             if groups.iter().any(|g| g == wg) {
-                return Some(Role::ReadWrite);
+                Role::ReadWrite
+            } else if let Some(rg) = &self.config.read_group {
+                if groups.iter().any(|g| g == rg) {
+                    Role::ReadOnly
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
             }
-        }
-        if let Some(rg) = &self.config.read_group {
+        } else if let Some(rg) = &self.config.read_group {
             if groups.iter().any(|g| g == rg) {
-                return Some(Role::ReadOnly);
+                Role::ReadOnly
+            } else {
+                return None;
             }
-        }
-        None
+        } else {
+            return None;
+        };
+
+        let subject = data
+            .claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        Some(Principal {
+            subject,
+            role,
+            groups,
+        })
     }
 
     fn validation_for(&self, alg: Algorithm) -> Validation {

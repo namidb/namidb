@@ -7,6 +7,7 @@
 //! the end-to-end boot procedure.
 
 pub mod auth;
+pub mod authz;
 pub mod bolt;
 mod introspect;
 pub mod metrics;
@@ -38,7 +39,7 @@ use namidb_query::{
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
-use crate::auth::{AuthConfig, Role};
+use crate::auth::{AuthConfig, Principal};
 use crate::metrics::{Metrics, Protocol, QueryKind};
 use crate::registry::{NamespaceRegistry, NamespaceState};
 use crate::shared::SharedAppState;
@@ -182,6 +183,10 @@ pub struct AppState {
     /// slow-query log. Defaults to a registry with the slow-query log
     /// disabled; the server sets the threshold from [`Config`] at boot.
     pub metrics: Arc<Metrics>,
+    /// Pre-execution authorization hook (RFC-015 Wave B). Defaults to
+    /// [`authz::NoOpAuthz`] (allow-all), so the gate is behavior-preserving
+    /// until a real policy is configured.
+    authz: Arc<dyn authz::AuthzHook>,
 }
 
 impl AppState {
@@ -207,7 +212,15 @@ impl AppState {
             write_stall_l0: 0,
             write_stall_delay: Duration::ZERO,
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
+            authz: Arc::new(authz::NoOpAuthz),
         }
+    }
+
+    /// Attach a pre-execution authorization hook (builder style). Defaults to
+    /// allow-all ([`authz::NoOpAuthz`]).
+    pub fn with_authz(mut self, authz: Arc<dyn authz::AuthzHook>) -> Self {
+        self.authz = authz;
+        self
     }
 
     /// Set the slow-query threshold (builder style). `Duration::ZERO` leaves
@@ -792,9 +805,9 @@ async fn require_auth_multi(
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Open mode: serve every request as read-write.
+    // Open mode: serve every request as an anonymous read-write principal.
     if shared.auth.is_open() {
-        req.extensions_mut().insert(Role::ReadWrite);
+        req.extensions_mut().insert(Principal::anonymous_rw());
         return next.run(req).await;
     }
     let presented = req
@@ -805,9 +818,9 @@ async fn require_auth_multi(
     // Resolve the target namespace HERE (before auth) so a token scoped to
     // other namespaces is rejected even though it is a valid token overall.
     let namespace = resolve_request_namespace(&shared, &req);
-    match presented.and_then(|token| shared.auth.role_for_in(token, &namespace)) {
-        Some(role) => {
-            req.extensions_mut().insert(role);
+    match presented.and_then(|token| shared.auth.principal_for_in(token, &namespace)) {
+        Some(principal) => {
+            req.extensions_mut().insert(principal);
             next.run(req).await
         }
         None => (
@@ -830,10 +843,9 @@ async fn require_auth(
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Open mode: serve every request as read-write, recording the role so the
-    // handler's write gate has a value to read uniformly.
+    // Open mode: serve every request as an anonymous read-write principal.
     if state.auth.is_open() {
-        req.extensions_mut().insert(Role::ReadWrite);
+        req.extensions_mut().insert(Principal::anonymous_rw());
         return next.run(req).await;
     }
     let presented = req
@@ -841,10 +853,10 @@ async fn require_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(strip_bearer);
-    match presented.and_then(|token| state.auth.role_for(token)) {
-        Some(role) => {
-            // Carry the matched token's role to the handler, which gates writes.
-            req.extensions_mut().insert(role);
+    match presented.and_then(|token| state.auth.principal_for(token)) {
+        Some(principal) => {
+            // Carry the resolved principal to the handler (write gate + authz hook).
+            req.extensions_mut().insert(principal);
             next.run(req).await
         }
         None => (
@@ -1067,11 +1079,11 @@ async fn run_create_vector_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
-    role: Role,
+    principal: &Principal,
     started: std::time::Instant,
 ) -> ObservedQuery {
     // DDL mutates durable schema state, so a read-only token may not run it.
-    if !role.allows_write() {
+    if !principal.allows_write() {
         return ObservedQuery {
             kind: Some(QueryKind::Write),
             ok: false,
@@ -1121,13 +1133,13 @@ async fn run_create_vector_index(
 
 async fn cypher(
     State(state): State<AppState>,
-    Extension(role): Extension<Role>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<CypherRequest>,
 ) -> Response {
     // The guard drops at the end of the handler, so the in-flight gauge is
     // correct even on an early error return.
     let _in_flight = state.metrics.track_in_flight();
-    let obs = run_cypher(&state, &req, role).await;
+    let obs = run_cypher(&state, &req, &principal).await;
     state
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -1137,7 +1149,7 @@ async fn cypher(
 /// Run one HTTP Cypher request and classify it for metrics. Mirrors the Bolt
 /// `ServerBackend::run` path; the two do not share a chokepoint, so the
 /// parse/plan/execute logic is intentionally parallel.
-async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> ObservedQuery {
+async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal) -> ObservedQuery {
     let started = std::time::Instant::now();
 
     let parsed = match cypher_parse(&req.query) {
@@ -1174,7 +1186,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> Observ
     // `CREATE VECTOR INDEX` is schema DDL: intercept before planning.
     #[cfg(feature = "vector-index")]
     if let Some(cvi) = parsed.as_create_vector_index() {
-        return run_create_vector_index(&state.writer, &state.snapshot, cvi, role, started).await;
+        return run_create_vector_index(&state.writer, &state.snapshot, cvi, principal, started)
+            .await;
     }
 
     // Plan against the latest published snapshot — no writer lock yet.
@@ -1200,10 +1213,28 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, role: Role) -> Observ
         }
     };
 
+    // Pre-execution authorization hook (RFC-015 Wave B): a policy may deny the
+    // request based on the principal + plan, before the writer lock or any
+    // execution. NoOp by default (allow-all), so this is behavior-preserving.
+    if let Err(denied) = state.authz.check(principal, &plan).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+
     if plan.contains_write() {
         // A read-only token may not write. Reject before taking the writer
         // lock so a forbidden write costs nothing.
-        if !role.allows_write() {
+        if !principal.allows_write() {
             return ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
@@ -1308,9 +1339,12 @@ struct FlushResponse {
     manifest_version: u64,
 }
 
-async fn admin_flush(State(state): State<AppState>, Extension(role): Extension<Role>) -> Response {
+async fn admin_flush(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
     // A flush mutates durable state, so a read-only token may not trigger it.
-    if !role.allows_write() {
+    if !principal.allows_write() {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorBody {
@@ -1394,10 +1428,10 @@ async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Re
 async fn cypher_multi(
     Path(namespace): Path<String>,
     State(shared): State<SharedAppState>,
-    Extension(role): Extension<Role>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<CypherRequest>,
 ) -> Response {
-    dispatch_cypher_multi(&shared, &namespace, role, req).await
+    dispatch_cypher_multi(&shared, &namespace, &principal, req).await
 }
 
 /// Unprefixed entry point: resolve the namespace from the
@@ -1406,12 +1440,12 @@ async fn cypher_multi(
 /// namespace without a path prefix.
 async fn cypher_multi_unprefixed(
     State(shared): State<SharedAppState>,
-    Extension(role): Extension<Role>,
+    Extension(principal): Extension<Principal>,
     headers: axum::http::HeaderMap,
     Json(req): Json<CypherRequest>,
 ) -> Response {
     let namespace = namespace_from_header(&shared, &headers);
-    dispatch_cypher_multi(&shared, &namespace, role, req).await
+    dispatch_cypher_multi(&shared, &namespace, &principal, req).await
 }
 
 /// Shared body of the multi-tenant cypher handler: open the namespace, run,
@@ -1419,7 +1453,7 @@ async fn cypher_multi_unprefixed(
 async fn dispatch_cypher_multi(
     shared: &SharedAppState,
     namespace: &str,
-    role: Role,
+    principal: &Principal,
     req: CypherRequest,
 ) -> Response {
     let _in_flight = shared.metrics.track_in_flight();
@@ -1436,7 +1470,7 @@ async fn dispatch_cypher_multi(
         }
     };
 
-    let obs = run_cypher_multi(&ns_state, shared, &req, role).await;
+    let obs = run_cypher_multi(&ns_state, shared, &req, principal).await;
     shared
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -1448,7 +1482,7 @@ async fn run_cypher_multi(
     ns_state: &NamespaceState,
     shared: &SharedAppState,
     req: &CypherRequest,
-    role: Role,
+    principal: &Principal,
 ) -> ObservedQuery {
     let started = std::time::Instant::now();
 
@@ -1490,7 +1524,7 @@ async fn run_cypher_multi(
             &ns_state.writer,
             &ns_state.snapshot,
             cvi,
-            role,
+            principal,
             started,
         )
         .await;
@@ -1521,9 +1555,25 @@ async fn run_cypher_multi(
         }
     };
 
+    // Pre-execution authorization hook (RFC-015 Wave B); NoOp by default.
+    if let Err(denied) = shared.authz.check(principal, &plan).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+
     if plan.contains_write() {
         // A read-only token may not write.
-        if !role.allows_write() {
+        if !principal.allows_write() {
             return ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
@@ -1614,27 +1664,27 @@ async fn run_cypher_multi(
 async fn admin_flush_multi(
     Path(namespace): Path<String>,
     State(shared): State<SharedAppState>,
-    Extension(role): Extension<Role>,
+    Extension(principal): Extension<Principal>,
 ) -> Response {
-    dispatch_admin_flush_multi(&shared, &namespace, role).await
+    dispatch_admin_flush_multi(&shared, &namespace, &principal).await
 }
 
 /// Unprefixed admin flush: resolve namespace from header/default.
 async fn admin_flush_multi_unprefixed(
     State(shared): State<SharedAppState>,
-    Extension(role): Extension<Role>,
+    Extension(principal): Extension<Principal>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let namespace = namespace_from_header(&shared, &headers);
-    dispatch_admin_flush_multi(&shared, &namespace, role).await
+    dispatch_admin_flush_multi(&shared, &namespace, &principal).await
 }
 
 async fn dispatch_admin_flush_multi(
     shared: &SharedAppState,
     namespace: &str,
-    role: Role,
+    principal: &Principal,
 ) -> Response {
-    if !role.allows_write() {
+    if !principal.allows_write() {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorBody {
@@ -1879,6 +1929,45 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    // A hook that denies every request — proves the dispatcher honours a deny
+    // decision, including for READS (which the allows_write gate cannot block).
+    struct DenyAllAuthz;
+    #[async_trait::async_trait]
+    impl crate::authz::AuthzHook for DenyAllAuthz {
+        async fn check(
+            &self,
+            _p: &Principal,
+            _plan: &namidb_query::LogicalPlan,
+        ) -> Result<(), crate::authz::Denied> {
+            Err(crate::authz::Denied::new("denied by test policy"))
+        }
+    }
+
+    #[tokio::test]
+    async fn authz_hook_can_deny_reads() {
+        // Open mode (no token) + a deny-all hook: a plain read is rejected 403,
+        // proving the hook runs and can deny what the role gate would allow.
+        let (store, paths) = namidb_storage::parse_uri("memory://authz-deny").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into())
+            .with_authz(Arc::new(DenyAllAuthz));
+        let app = build_router(state);
+
+        let resp = post_cypher(&app, None, "MATCH (n) RETURN n").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("denied by test policy"));
+    }
+
+    #[tokio::test]
+    async fn default_authz_is_allow_all() {
+        // The default NoOpAuthz must not change behavior: a read still succeeds.
+        let app = fixture(None).await;
+        let resp = post_cypher(&app, None, "MATCH (n) RETURN n").await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     const ROLE_TOKENS: &str = r#"{ "tokens": [

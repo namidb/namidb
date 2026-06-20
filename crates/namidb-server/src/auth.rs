@@ -32,6 +32,44 @@ impl Role {
     }
 }
 
+/// The authenticated identity behind a request: who (subject), what they may
+/// do (role), and what groups they belong to. Richer than [`Role`] (a 1-bit
+/// projection) so a future authorization hook can make group/subject-aware
+/// decisions. Role stays `Copy`; `Principal` composes it and is `Clone` (it
+/// owns Strings), so existing `role.allows_write()` sites keep working via
+/// [`Principal::allows_write`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Principal {
+    /// Who the caller is — a static token's name, or a JWT `sub` claim.
+    pub subject: String,
+    /// The resolved permission level.
+    pub role: Role,
+    /// Group memberships (a JWT's group claim; empty for static tokens).
+    pub groups: Vec<String>,
+}
+
+impl Principal {
+    /// Convenience: same 1-bit decision as [`Role::allows_write`].
+    pub fn allows_write(&self) -> bool {
+        self.role.allows_write()
+    }
+
+    /// The principal granted in open mode (no auth): an anonymous read-write
+    /// caller. Used by the middleware when `AuthConfig::is_open()`.
+    pub fn anonymous_rw() -> Self {
+        Principal {
+            subject: "anonymous".to_string(),
+            role: Role::ReadWrite,
+            groups: Vec::new(),
+        }
+    }
+
+    /// `true` if the principal belongs to `group`.
+    pub fn in_group(&self, group: &str) -> bool {
+        self.groups.iter().any(|g| g == group)
+    }
+}
+
 /// One accepted token and the role it grants. The secret is never logged; the
 /// `name` is a human label for diagnostics.
 #[derive(Clone)]
@@ -166,6 +204,59 @@ impl AuthConfig {
     /// namespace each), so a token's namespace scope is intentionally ignored.
     pub fn role_for(&self, presented: &str) -> Option<Role> {
         self.role_for_in(presented, "")
+    }
+
+    /// The full [`Principal`] for `presented` (namespace-agnostic), or `None`.
+    /// The single resolution path for identity: `role_for` delegates here via
+    /// `.map(|p| p.role)`. Static tokens yield `subject = token name`,
+    /// `groups = []`; a JWT yields the `sub` claim and the full group list.
+    pub fn principal_for(&self, presented: &str) -> Option<Principal> {
+        self.principal_for_in(presented, "")
+    }
+
+    /// [`principal_for`](Self::principal_for) with a namespace scope: returns
+    /// `None` when the matched token/JWT isn't scoped to `namespace`.
+    #[cfg(feature = "jwt")]
+    pub fn principal_for_in(&self, presented: &str, namespace: &str) -> Option<Principal> {
+        let single_tenant = namespace.is_empty();
+        if let Some(jwt) = &self.jwt {
+            let ok = if single_tenant {
+                jwt.validate_principal(presented)
+            } else {
+                jwt.validate_principal_in(presented, namespace)
+            };
+            if let Some(p) = ok {
+                return Some(p);
+            }
+        }
+        self.token_principal(presented, namespace)
+    }
+
+    #[cfg(not(feature = "jwt"))]
+    pub fn principal_for_in(&self, presented: &str, namespace: &str) -> Option<Principal> {
+        self.token_principal(presented, namespace)
+    }
+
+    /// Static-token resolution into a [`Principal`] (subject = the token's
+    /// name, groups empty), honouring the namespace scope.
+    fn token_principal(&self, presented: &str, namespace: &str) -> Option<Principal> {
+        let single_tenant = namespace.is_empty();
+        let mut granted: Option<&AuthToken> = None;
+        for t in &self.tokens {
+            if constant_time_eq(presented.as_bytes(), t.secret.as_bytes())
+                && (single_tenant
+                    || t.namespaces
+                        .as_ref()
+                        .map_or(true, |ns| ns.iter().any(|n| n == namespace)))
+            {
+                granted = Some(t);
+            }
+        }
+        granted.map(|t| Principal {
+            subject: t.name.clone(),
+            role: t.role,
+            groups: Vec::new(),
+        })
     }
 
     /// The role granted to `presented` for `namespace`, or `None` when nothing
