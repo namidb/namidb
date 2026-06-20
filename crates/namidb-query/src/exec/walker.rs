@@ -1297,7 +1297,13 @@ async fn flat_call_procedure(
             if !args.is_empty() {
                 return Err(proc_unsupported("algo.wcc takes no arguments"));
             }
-            let comps = namidb_graph::algo::weakly_connected_components(&graph);
+            // Poll the query deadline mid-computation so a runaway CALL on a
+            // huge graph is interruptible, not just at the operator boundary.
+            let comps = namidb_graph::algo::weakly_connected_components_cancellable(
+                &graph,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
             let mut entries: Vec<(NodeId, usize)> = comps.assignment.into_iter().collect();
             // Deterministic order: by component id, then by node id.
             entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -1309,7 +1315,12 @@ async fn flat_call_procedure(
         }
         "pagerank" => {
             let opts = pagerank_options(args, params)?;
-            let pr = namidb_graph::algo::pagerank(&graph, &opts);
+            let pr = namidb_graph::algo::pagerank_cancellable(
+                &graph,
+                &opts,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
             let mut entries: Vec<(NodeId, f64)> = pr.scores.into_iter().collect();
             // Descending by score, then by node id for stability.
             entries.sort_by(|a, b| {
