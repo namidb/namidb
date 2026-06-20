@@ -11,6 +11,7 @@ pub mod factor;
 pub mod leapfrog;
 pub mod limits;
 pub mod row;
+pub mod text_scoring;
 pub mod value;
 pub mod walker;
 pub mod writer;

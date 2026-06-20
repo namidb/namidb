@@ -622,16 +622,18 @@ impl Server {
             None => String::new(),
         };
 
-        // ORDER BY title makes the channel's ranks DETERMINISTIC (without it
-        // the rows come back in arbitrary storage order, so the RRF rank
-        // assigned to each note is non-reproducible). A real lexical-relevance
-        // score (BM25) is Layer B / deferred; this is the correctness floor.
+        // Rank candidates by BM25 lexical relevance (Item 13 Layer B): the
+        // `bm25(document, query)` builtin scores term-frequency saturation +
+        // field-length normalization, so a note with more/denser matches of the
+        // query terms ranks higher. The tie-break on title keeps ranks
+        // DETERMINISTIC (reproducible RRF ranks) when two notes score equally.
         let cypher = format!(
             "MATCH (n:{label}) \
              WHERE (n.body CONTAINS $text OR n.title CONTAINS $text) \
                AND n.placeholder IS NULL{where_extra} \
-             RETURN n.title AS title, n.path AS path \
-             ORDER BY n.title \
+             RETURN n.title AS title, n.path AS path, \
+                    bm25(coalesce(n.body, '') + ' ' + coalesce(n.title, ''), $text) AS lex_score \
+             ORDER BY lex_score DESC, n.title \
              LIMIT {candidate_limit}"
         );
 
@@ -812,7 +814,7 @@ impl Server {
                 let comps = weakly_connected_components(&graph);
                 // Group nodes by component, then return the top-K largest.
                 let mut by_comp: HashMap<usize, Vec<String>> = HashMap::new();
-                for (id_str, _) in &id_meta {
+                for id_str in id_meta.keys() {
                     if let Ok(nid) = namidb_core::NodeId::from_str(id_str) {
                         if let Some(&c) = comps.assignment.get(&nid) {
                             by_comp.entry(c).or_default().push(id_str.clone());
@@ -820,7 +822,7 @@ impl Server {
                     }
                 }
                 let mut groups: Vec<(usize, Vec<String>)> = by_comp.into_iter().collect();
-                groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+                groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
                 let components: Vec<Value> = groups
                     .into_iter()
                     .take(top_k)

@@ -871,6 +871,20 @@ fn call_scalar_function(
             }
         }
 
+        // BM25 lexical relevance (hybrid search, Item 13 Layer B):
+        // `bm25(document, query) -> Float`. NULL if either arg is NULL
+        // (three-valued logic). See `exec::text_scoring`.
+        "bm25" => match args {
+            [RuntimeValue::Null, _] | [_, RuntimeValue::Null] => Ok(RuntimeValue::Null),
+            [RuntimeValue::String(doc), RuntimeValue::String(query)] => Ok(RuntimeValue::Float(
+                crate::exec::text_scoring::bm25_score(doc, query),
+            )),
+            _ => Err(EvalError::new(
+                "bm25(document, query) expects two strings",
+                span,
+            )),
+        },
+
         // --- Lowering helpers (internal)
         "__path" => Ok(RuntimeValue::Path(args.to_vec())),
         "__label_eq" => match args {
@@ -2078,6 +2092,32 @@ mod tests {
     fn builtin_vector_zero_magnitude_is_null() {
         // Cosine is undefined when a vector has zero magnitude.
         assert!(s("cosine_similarity(vector([0.0, 0.0]), vector([1.0, 1.0]))").is_null());
+    }
+
+    #[test]
+    fn builtin_bm25_scores_and_propagates_null() {
+        // A matching term scores positive; no match is zero.
+        match s("bm25('the quick brown fox', 'fox')") {
+            RuntimeValue::Float(x) => assert!(x > 0.0, "expected positive, got {x}"),
+            other => panic!("expected Float, got {other:?}"),
+        }
+        match s("bm25('the quick brown fox', 'elephant')") {
+            RuntimeValue::Float(x) => assert_eq!(x, 0.0),
+            other => panic!("expected Float, got {other:?}"),
+        }
+        // NULL propagates (three-valued logic).
+        assert!(s("bm25(NULL, 'fox')").is_null());
+        assert!(s("bm25('fox', NULL)").is_null());
+    }
+
+    #[test]
+    fn builtin_bm25_type_error() {
+        let err = eval_expr_err("bm25('doc', 42)");
+        assert!(
+            err.message.contains("two strings"),
+            "unexpected message: {}",
+            err.message
+        );
     }
 
     #[test]
