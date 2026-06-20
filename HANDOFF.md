@@ -238,11 +238,11 @@ documented limitation (a runaway kernel isn't interruptible mid-iteration;
 follow-up: thread `cancel::deadline_exceeded()` into the kernel loops).
 
 ### Deferred bug follow-ups (lower severity, documented)
-- hybrid-search bm25 builtin (Layer B) for real lexical relevance.
-- CALL/YIELD cooperative deadline: the algo kernels are sync CPU loops, so a
-  runaway `CALL` isn't interruptible mid-iteration (the query deadline fires
-  only around the operator). Follow-up: thread `cancel::deadline_exceeded()`
-  into the union-find / power-iteration loops.
+- **All previously-deferred follow-ups are now done** (see "Fixed" below). The
+  remaining known limitation is BM25 IDF: the `bm25()` builtin uses a
+  single-document subset (TF saturation + length norm, IDF=1.0) because no
+  corpus text-statistics (per-term document frequency, avg doc length) exist
+  yet. Real IDF needs an inverted index — a future Layer C, not a bug.
 
 ### Fixed this turn (2026-06-20)
 - ✅ s3b forward-probe `MAX_PROBE` gap-safety — now fail-closed when the
@@ -254,6 +254,21 @@ follow-up: thread `cancel::deadline_exceeded()` into the kernel loops).
   cross-namespace reach gap. `6f9c5d3`.
 - ✅ CALL algo.pagerank options map (Item 8 PR2) — `{damping, max_iterations,
   tolerance}` overrides. `32e5902`.
+- ✅ Item 15 Wave B Principal + AuthzHook — `Principal {subject, role, groups}`
+  threaded through HTTP (Extension) + Bolt (per-conn Mutex); a pre-execution
+  `AuthzHook::check(principal, plan)` (NoOp default, behavior-preserving) that
+  can deny even reads. A real OPA/Cedar PDP behind a `pdp` feature is the only
+  remaining sub-item.
+- ✅ bm25 lexical builtin (hybrid Layer B) — `bm25(document, query)` scalar
+  builtin (TF saturation + field-length norm; `exec/text_scoring.rs`) wired
+  into the MCP hybrid lexical channel (ranks by relevance, not title order).
+- ✅ CALL/YIELD cooperative deadline — `weakly_connected_components_cancellable`
+  / `pagerank_cancellable` poll `cancel::deadline_exceeded()` mid-loop; the
+  executor passes it so a runaway CALL is interruptible. Public kernel
+  signatures unchanged (delegate with a never-cancel callback).
+- ✅ Clippy clean — `cargo clippy --workspace --all-targets -- -D warnings` is
+  green (real style lints fixed; cosmetic `doc_lazy_continuation` allowed via
+  `[lints]` in storage/query, `#![allow]` in the cli/bench bins).
 
 ## Commands
 
