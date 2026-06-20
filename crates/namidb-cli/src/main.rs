@@ -12,6 +12,9 @@
 //! supported scheme (s3, gs, az), state is durable on the
 //! configured backend.
 
+// Cosmetic doc-rendering nit (lazy markdown list continuation); allow it.
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};

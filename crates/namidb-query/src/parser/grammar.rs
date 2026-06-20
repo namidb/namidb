@@ -23,6 +23,10 @@ pub fn parse_query(src: &str, tokens: Vec<Spanned<Token>>) -> ParseResult<Query>
 /// to at most this depth).
 const MAX_EXPRESSION_DEPTH: usize = 128;
 
+/// Optional Vamana build overrides from `CREATE VECTOR INDEX … WITH {…}`:
+/// `(r, l_build, alpha)`, each `None` when the key was omitted.
+type VectorBuildOverrides = (Option<usize>, Option<usize>, Option<f32>);
+
 struct Parser<'src> {
     src: &'src str,
     tokens: Vec<Spanned<Token>>,
@@ -623,9 +627,7 @@ impl<'src> Parser<'src> {
     /// Optional `WITH { r: …, l_build: …, alpha: … }` build overrides.
     /// Returns all-`None` when the clause is absent. `WITH` is a reserved
     /// keyword (`Token::With`), unlike the other DDL words which are soft.
-    fn parse_optional_vector_with(
-        &mut self,
-    ) -> Result<(Option<usize>, Option<usize>, Option<f32>), ParseError> {
+    fn parse_optional_vector_with(&mut self) -> Result<VectorBuildOverrides, ParseError> {
         if !self.check(&Token::With) {
             return Ok((None, None, None));
         }

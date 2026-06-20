@@ -9,6 +9,12 @@ homepage.workspace = true
 description = "LSM storage engine on object storage for NamiDB"
 readme = "README.md"
 
+# Cosmetic doc-rendering nit (lazy markdown list continuation in doc comments);
+# allowed crate-wide (covers lib + benches + tests) rather than reflowing ~120
+# comments. Applied via [lints] so `--all-targets` is clean too.
+[lints.clippy]
+doc_lazy_continuation = "allow"
+
 [dependencies]
 namidb-core = { workspace = true }
 # Optional: the DiskANN/Vamana algorithm crate. Only pulled in behind the

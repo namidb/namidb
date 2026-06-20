@@ -713,7 +713,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let bolt_auth = state.auth();
         let tx_timeout = config.bolt_tx_timeout;
         let bolt_shutdown = shutdown_rx.clone();
-        let bolt_tls = tls_config.clone().map(|c| tls::acceptor(c));
+        let bolt_tls = tls_config.clone().map(tls::acceptor);
         tokio::spawn(async move {
             if let Err(e) = bolt::serve(
                 bolt_state,

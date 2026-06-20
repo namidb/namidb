@@ -9,6 +9,11 @@ homepage.workspace = true
 description = "Cypher/GQL parser, optimizer, and executor for NamiDB"
 readme = "README.md"
 
+# Cosmetic doc-rendering nit (lazy markdown list continuation); allowed
+# crate-wide (covers lib + tests) rather than reflowing the doc comments.
+[lints.clippy]
+doc_lazy_continuation = "allow"
+
 [features]
 default = []
 # DiskANN/Vamana ANN support (RFC-030). Gates the `vector_search` optimizer

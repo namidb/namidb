@@ -247,7 +247,7 @@ impl AuthConfig {
                 && (single_tenant
                     || t.namespaces
                         .as_ref()
-                        .map_or(true, |ns| ns.iter().any(|n| n == namespace)))
+                        .is_none_or(|ns| ns.iter().any(|n| n == namespace)))
             {
                 granted = Some(t);
             }
@@ -292,7 +292,7 @@ impl AuthConfig {
                 && (single_tenant
                     || t.namespaces
                         .as_ref()
-                        .map_or(true, |ns| ns.iter().any(|n| n == namespace)))
+                        .is_none_or(|ns| ns.iter().any(|n| n == namespace)))
             {
                 granted = Some(t.role);
             }

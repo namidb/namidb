@@ -8,6 +8,9 @@
 //!
 //! See `bench/README.md` for the full workflow + paired Kuzu runner.
 
+// Cosmetic doc-rendering nit (lazy markdown list continuation); allow it.
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::path::PathBuf;
 
 use anyhow::Result;

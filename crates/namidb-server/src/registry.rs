@@ -86,6 +86,9 @@ pub struct NamespaceRegistry {
     /// eviction entirely.
     anchor: Instant,
     /// Process-wide metrics (flush, compaction, orphan-sweep increments).
+    /// Held for the per-namespace maintenance tasks to increment; retained on
+    /// the struct even when a build configuration doesn't read it directly.
+    #[allow(dead_code)]
     metrics: Arc<Metrics>,
     /// Per-namespace background-maintenance schedule (flush/compaction/sweep).
     /// Without this, a multi-tenant namespace never flushed or compacted — a
@@ -283,7 +286,7 @@ impl NamespaceRegistry {
         for (ns, state) in sessions.iter() {
             let last_secs = state.last_access.load(std::sync::atomic::Ordering::Relaxed);
             let idle_secs = now_secs.saturating_sub(last_secs);
-            if idle_secs > idle_timeout_secs && oldest.map_or(true, |(_, t)| idle_secs > t) {
+            if idle_secs > idle_timeout_secs && oldest.is_none_or(|(_, t)| idle_secs > t) {
                 oldest = Some((ns.as_str(), idle_secs));
             }
         }
@@ -293,6 +296,11 @@ impl NamespaceRegistry {
     /// Total number of active namespaces.
     pub async fn len(&self) -> usize {
         self.sessions.read().await.len()
+    }
+
+    /// `true` when no namespaces are active.
+    pub async fn is_empty(&self) -> bool {
+        self.sessions.read().await.is_empty()
     }
 }
 

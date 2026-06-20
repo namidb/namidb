@@ -1489,8 +1489,8 @@ mod tests {
 
         // Simulate a stale LIST by manually constructing a max that only sees p5:
         // the forward probe should discover p6-p10 via HEAD and land on p10.
-        let max_from_stale_list = Some(5u64);
-        let probed = ms.probe_pointer_forward(max_from_stale_list.unwrap()).await?;
+        let max_from_stale_list = 5u64;
+        let probed = ms.probe_pointer_forward(max_from_stale_list).await?;
         assert_eq!(probed, 5, "forward probe from stale max should stay at 5 until more commits");
 
         // Now create p6-p10; forward probe from 5 should discover them.

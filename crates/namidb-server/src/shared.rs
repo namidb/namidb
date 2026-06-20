@@ -48,6 +48,7 @@ pub struct SharedAppState {
 
 impl SharedAppState {
     /// Create a new shared state for multi-tenant mode.
+    #[allow(clippy::too_many_arguments)] // process-wide config assembled once at boot
     pub fn new(
         registry: Arc<NamespaceRegistry>,
         auth: Arc<AuthConfig>,
