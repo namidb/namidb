@@ -267,12 +267,20 @@ pub fn pagerank_cancellable(
         }
         iterations += 1;
 
-        // Collect dangling mass (nodes with no out-edges) and redistribute
-        // uniformly so probability is conserved.
+        // Collect dangling mass and redistribute uniformly so probability is
+        // conserved. A node is "dangling" if it has NO usable out-mass path:
+        // no out-edges, OR a non-positive out-edge weight sum (a degenerate
+        // case the push loop below skips). Counting the latter as dangling is
+        // load-bearing — without it that node's rank would simply vanish each
+        // iteration and the scores would stop summing to 1.
+        let is_dangling = |n: &NodeId| match graph.out_edges(*n) {
+            None | Some([]) => true,
+            Some(e) => e.iter().map(|&(_, w)| w).sum::<f64>() <= 0.0,
+        };
         let dangling_mass: f64 = graph
             .nodes()
             .iter()
-            .filter(|&&n| graph.out_edges(n).is_none_or(|e| e.is_empty()))
+            .filter(|n| is_dangling(n))
             .map(|n| scores[n])
             .sum();
         let dangling_share = d * dangling_mass / n as f64;
@@ -285,8 +293,9 @@ pub fn pagerank_cancellable(
         // exactly `d * PR(src)` to conserve probability, so the per-edge share
         // is `d * PR(src) * (w / Σw)` — normalized by the WEIGHT SUM, not the
         // edge count. (Dividing by count and multiplying by w leaks mass when
-        // weights are not all 1.0.) A non-positive weight sum is degenerate;
-        // skip it rather than divide by zero / produce NaN.
+        // weights are not all 1.0.) A non-positive weight sum is degenerate and
+        // was already counted as dangling above (its mass is redistributed), so
+        // skip it here rather than divide by zero / produce NaN.
         for (&src, nbrs) in &graph.out {
             if nbrs.is_empty() {
                 continue;
@@ -472,6 +481,31 @@ mod tests {
             "PageRank scores should sum to ~1.0, got {total}"
         );
         assert!(pr.converged, "should converge within the iteration cap");
+    }
+
+    #[test]
+    fn pagerank_conserves_mass_with_nonpositive_weight_sum() {
+        // A node whose only out-edge has a non-positive weight has no usable
+        // out-mass path; it must be treated as dangling (its rank redistributed)
+        // or probability leaks and the scores stop summing to 1.
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let c = nid([3; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, Some(1.0));
+        // `a` also points to c with a negative weight; b -> a with weight 0.
+        g.add_edge(c, a, Some(-2.0)); // c's weight sum is negative → degenerate
+        g.add_edge(b, a, Some(0.0)); // b's weight sum is zero → degenerate
+        g.add_node(c);
+
+        let pr = pagerank(&g, &PageRankOptions::default());
+        let total: f64 = pr.scores.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "PageRank must conserve mass even with non-positive weight sums, got {total}"
+        );
+        // No NaN/negative leaked in.
+        assert!(pr.scores.values().all(|s| s.is_finite() && *s >= 0.0));
     }
 
     #[test]
