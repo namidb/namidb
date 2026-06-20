@@ -17,6 +17,12 @@ default = []
 # so a registered index is actually built and used. With the feature off the
 # DDL is rejected at the lowerer (HTTP 400 / Bolt NotSupported).
 vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+# OIDC/JWT bearer-token auth (RFC-015 Wave A). Adds a JWT validator that
+# verifies bearer tokens against a JWKS URL and maps a group claim to a Role.
+# It plugs into AuthConfig::role_for, so both HTTP and Bolt become JWT-aware
+# with no signature changes. reqwest (JWKS fetch) + jsonwebtoken are optional.
+# Default off; with it off, behavior is byte-identical (static-token auth only).
+jwt = ["dep:reqwest", "dep:jsonwebtoken"]
 
 [[bin]]
 name = "namidb-server"
@@ -50,6 +56,10 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+# JWT (OIDC) auth — optional, behind the `jwt` feature. reqwest fetches the
+# JWKS; jsonwebtoken verifies tokens. Both absent when the feature is off.
+reqwest = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

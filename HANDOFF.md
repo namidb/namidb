@@ -11,7 +11,7 @@
 | namidb-storage | 310 (304 + 5 vector build + 1 DDL register, behind `vector-index`) |
 | namidb-query | 462 default (+ 4 CALL parse, + 3 CALL e2e) → 471 with `vector-index` (adds 4 vector rewrite + 5 DDL parse + 1) |
 | namidb-ann | 21 (new) |
-| namidb-server | 32 (+ integration suites, +1 DDL HTTP behind `vector-index`) |
+| namidb-server | 32 default (+1 DDL HTTP behind `vector-index`) → 41 with `jwt` (+9 JWT unit tests) |
 | namidb-mcp | 20 |
 | namidb-graph | 10 |
 
@@ -148,14 +148,29 @@ falling through to the flat path when no descriptor, gated behind Cargo feature
 `dot_i8_asymmetric`/`norm_i8` to `quantize.rs` and rewire the bench's private
 copy at `vector_recall.rs:96-100`.**
 
-### Item 15 — auth/RBAC (L) — ship-with-fixes
-Wave A OIDC/JWT (jsonwebtoken + JWKS, pinned-alg, group-claim→role, thread a
-Principal on HTTP+Bolt) + Wave B AuthzHook PDP (OPA/Cedar). **Design holes to
-address:** Role is `Copy` (7 by-value sites) — wrapping in `Arc<str>` loses Copy,
-needs `.clone()` at pass-sites; Bolt `Authenticator` trait has no Principal
-return channel; `serve()`/`make_policy` signatures change; reqwest must be a
-feature-gated dep (not unconditional); default fail-closed for PDP. Gate behind
-feature `jwt`.
+### Item 15 — auth/RBAC — Wave A SHIPPED this session; Wave B (PDP) pending
+OIDC/JWT bearer-token auth, behind the `jwt` Cargo feature (default off).
+**Wave A (done):** a `JwtValidator` (`src/jwt.rs`) fetches a JWKS URL (reqwest,
+refreshed hourly), validates bearer tokens (RS/ES* signature, `exp`, optional
+`iss`/`aud`), and maps a configured group claim → `Role`. It plugs into
+`AuthConfig::role_for` (tried first; static tokens are the fallback), so **both
+HTTP and Bolt become JWT-aware with zero signature changes** — sidestepping the
+"Role loses Copy", "Bolt has no Principal channel", and "serve()/make_policy
+change" design holes entirely (Role stays a 2-variant Copy enum; the per-conn
+Bolt `read_only: AtomicBool` already projects `Role::allows_write`).
+
+CLI: `--jwt-jwks-url` (enables), `--jwt-issuer`, `--jwt-audience`,
+`--jwt-groups-claim` (default `groups`), `--jwt-write-group`, `--jwt-read-group`
+(write wins). Fail-closed: any validation failure → `None` → 401; an unreachable
+JWKS at boot `bail!`s before binding. Symmetric HS* algs are refused (a
+public-key-confusion guard). +9 unit tests (mint with a test RSA keypair →
+validate → role; tampered/wrong-iss/wrong-aud/no-group → denied).
+
+**Wave B (pending):** AuthzHook PDP (OPA/Cedar), per-namespace token scoping,
+and a richer Principal (subject+groups) beyond the 1-bit read/write gate. The
+`jwt` module returns only a `Role` today; threading a Principal for group-based
+authorization is the follow-on. reqwest + jsonwebtoken are optional deps under
+`jwt` (the default build is byte-identical to before).
 
 ### Item 08 PR1 — CALL/YIELD (SHIPPED this session)
 `CALL <ns>.<name>() [YIELD col [AS a], …]` → `LogicalPlan::CallProcedure`

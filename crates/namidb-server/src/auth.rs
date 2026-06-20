@@ -55,6 +55,11 @@ impl std::fmt::Debug for AuthToken {
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     tokens: Vec<AuthToken>,
+    /// Optional OIDC/JWT validator. When present, a bearer token is first
+    /// attempted as a JWT (mapped from a group claim); static tokens are the
+    /// fallback. Only compiled under the `jwt` feature.
+    #[cfg(feature = "jwt")]
+    jwt: Option<Arc<crate::jwt::JwtValidator>>,
 }
 
 impl AuthConfig {
@@ -64,6 +69,7 @@ impl AuthConfig {
     }
 
     /// A single read-write token — the back-compat `--auth-token` path.
+    #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
     pub fn single_read_write(secret: impl Into<String>) -> Self {
         Self {
             tokens: vec![AuthToken {
@@ -71,6 +77,7 @@ impl AuthConfig {
                 secret: Arc::from(secret.into()),
                 role: Role::ReadWrite,
             }],
+            ..Default::default()
         }
     }
 
@@ -86,6 +93,7 @@ impl AuthConfig {
     /// `role` defaults to `read-write` and `name` to `token-<i>`. A file with
     /// an empty `tokens` array is rejected — that would silently disable auth;
     /// omit the flag to run open on purpose.
+    #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
     pub fn load_file(path: &Path) -> anyhow::Result<Self> {
         let body = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading auth tokens file {}: {e}", path.display()))?;
@@ -115,22 +123,50 @@ impl AuthConfig {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { tokens })
+        Ok(Self {
+            tokens,
+            ..Default::default()
+        })
     }
 
-    /// `true` when no tokens are configured, so the server runs open.
+    /// Attach a JWT validator. Bearer tokens are then first interpreted as
+    /// JWTs; static tokens remain the fallback. (Only under `jwt`.)
+    #[cfg(feature = "jwt")]
+    pub fn with_jwt(mut self, jwt: Arc<crate::jwt::JwtValidator>) -> Self {
+        self.jwt = Some(jwt);
+        self
+    }
+
+    /// `true` when no auth is configured (no tokens and no JWT validator), so
+    /// the server runs open.
     pub fn is_open(&self) -> bool {
-        self.tokens.is_empty()
+        let jwt_active = self.jwt_active();
+        self.tokens.is_empty() && !jwt_active
     }
 
-    /// The role granted to `presented`, or `None` when no token matches.
+    #[cfg(feature = "jwt")]
+    fn jwt_active(&self) -> bool {
+        self.jwt.is_some()
+    }
+    #[cfg(not(feature = "jwt"))]
+    fn jwt_active(&self) -> bool {
+        false
+    }
+
+    /// The role granted to `presented`, or `None` when nothing matches.
     ///
-    /// Walks every token (no early return on a match) and uses a constant-time
-    /// byte compare, so neither the number of tokens nor the matching position
-    /// leaks through timing. A length mismatch still short-circuits, exactly as
-    /// the single-token path always has. If two tokens share the same secret
-    /// (a config mistake), the last one's role wins.
+    /// A JWT validator (if configured) is tried first; static tokens are the
+    /// fallback. The static-token walk uses a constant-time byte compare (no
+    /// early return), so neither the token count nor the matching position
+    /// leaks through timing; a length mismatch still short-circuits. If two
+    /// tokens share a secret (a config mistake), the last one's role wins.
     pub fn role_for(&self, presented: &str) -> Option<Role> {
+        #[cfg(feature = "jwt")]
+        if let Some(jwt) = &self.jwt {
+            if let Some(role) = jwt.validate(presented) {
+                return Some(role);
+            }
+        }
         let mut granted = None;
         for t in &self.tokens {
             if constant_time_eq(presented.as_bytes(), t.secret.as_bytes()) {
@@ -212,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_update)]
     fn role_for_distinguishes_read_only_and_read_write() {
         let c = AuthConfig {
             tokens: vec![
@@ -226,6 +263,7 @@ mod tests {
                     role: Role::ReadOnly,
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(c.role_for("write-key"), Some(Role::ReadWrite));
         assert_eq!(c.role_for("read-key"), Some(Role::ReadOnly));

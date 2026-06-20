@@ -13,6 +13,10 @@ pub mod metrics;
 pub mod registry;
 pub mod shared;
 pub mod tls;
+// OIDC/JWT bearer-token validation (RFC-015 Wave A). Optional: only compiled
+// with the `jwt` Cargo feature, which adds reqwest + jsonwebtoken.
+#[cfg(feature = "jwt")]
+pub mod jwt;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +57,10 @@ pub struct Config {
     /// `read-write` role. Takes precedence over `auth_token` when set. `None`
     /// falls back to `auth_token` (or no auth when that is also `None`).
     pub auth_tokens_file: Option<std::path::PathBuf>,
+    /// OIDC/JWT validation config. `None` = JWT auth disabled (static tokens
+    /// or open mode). Only present under the `jwt` feature.
+    #[cfg(feature = "jwt")]
+    pub jwt: Option<crate::jwt::JwtConfig>,
     pub flush_interval: Duration,
     /// Interval for the background maintenance task (L0->L1 compaction +
     /// orphan sweep). `Duration::ZERO` disables it.
@@ -378,7 +386,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
-        (Some(path), _) => Arc::new(AuthConfig::load_file(path)?),
+        (Some(path), _) => AuthConfig::load_file(path)?,
         // Refuse an empty `--auth-token`: it logs as "auth enabled" but a
         // `Bearer ` request would match the empty secret. Omit it to run open.
         (None, Some(secret)) if secret.is_empty() => {
@@ -386,9 +394,26 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 "--auth-token is empty; omit it (and NAMIDB_AUTH_TOKEN) to run without auth"
             )
         }
-        (None, Some(secret)) => Arc::new(AuthConfig::single_read_write(secret.clone())),
-        (None, None) => Arc::new(AuthConfig::open()),
+        (None, Some(secret)) => AuthConfig::single_read_write(secret.clone()),
+        (None, None) => AuthConfig::open(),
     };
+    // OIDC/JWT: build the validator (fail-fast on an unreachable JWKS) and
+    // attach it. A bearer token is then first interpreted as a JWT.
+    #[cfg(feature = "jwt")]
+    let (auth, jwt_validator) = match config.jwt.as_ref() {
+        Some(jwt_cfg) => {
+            let v = Arc::new(crate::jwt::JwtValidator::new(jwt_cfg.clone()).await?);
+            (auth.with_jwt(Arc::clone(&v)), Some(v))
+        }
+        None => (auth, None),
+    };
+    let auth = Arc::new(auth);
+    // Refresh the JWKS hourly so keys can rotate without a restart.
+    #[cfg(feature = "jwt")]
+    if let Some(v) = &jwt_validator {
+        v.spawn_refresh(Duration::from_secs(3600));
+        info!("JWT auth enabled (JWKS refreshes hourly)");
+    }
     if auth.is_open() {
         warn!(
             "⚠️  namidb-server is running WITHOUT auth. Anyone who can reach \

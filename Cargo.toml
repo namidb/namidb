@@ -64,6 +64,10 @@ prost = "0.13"
 # second TLS stack and a C toolchain; one source of truth for server + markdown.
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+# JWT (OIDC bearer-token) validation for namidb-server's optional `jwt` auth
+# feature. Uses the `ring` crypto provider already in the lock via rustls.
+jsonwebtoken = "9"
+
 # Compression
 zstd = "0.13"
 lz4_flex = "0.11"

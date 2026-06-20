@@ -40,6 +40,35 @@ struct Cli {
     #[arg(long, env = "NAMIDB_AUTH_TOKENS_FILE")]
     auth_tokens_file: Option<std::path::PathBuf>,
 
+    // ── OIDC/JWT auth (only compiled with the `jwt` feature) ──────────
+    /// JWKS URL to fetch signing keys for bearer-token JWT validation.
+    /// Setting `--jwt-jwks-url` enables JWT auth: a bearer token is first
+    /// validated as a JWT (sig + exp + iss + aud), then its group claim is
+    /// mapped to a role. Requires the `jwt` build feature.
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_JWKS_URL")]
+    jwt_jwks_url: Option<String>,
+    /// Expected JWT `iss` claim. [env: NAMIDB_JWT_ISSUER=]
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_ISSUER")]
+    jwt_issuer: Option<String>,
+    /// Expected JWT `aud` claim. [env: NAMIDB_JWT_AUDIENCE=]
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_AUDIENCE")]
+    jwt_audience: Option<String>,
+    /// JWT claim holding the user's groups (default `groups`).
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_GROUPS_CLAIM", default_value = "groups")]
+    jwt_groups_claim: String,
+    /// Group that grants read-write access.
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_WRITE_GROUP")]
+    jwt_write_group: Option<String>,
+    /// Group that grants read-only access (write group wins if both match).
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_READ_GROUP")]
+    jwt_read_group: Option<String>,
+
     /// Interval at which the memtable is flushed to L0 SSTs in the
     /// background. Set to `0s` to disable periodic flush (callers
     /// must POST /v0/admin/flush manually).
@@ -228,6 +257,15 @@ fn main() -> anyhow::Result<()> {
         listen: cli.listen,
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
+        #[cfg(feature = "jwt")]
+        jwt: cli.jwt_jwks_url.map(|jwks_url| namidb_server::jwt::JwtConfig {
+            jwks_url,
+            issuer: cli.jwt_issuer,
+            audience: cli.jwt_audience,
+            groups_claim: cli.jwt_groups_claim,
+            write_group: cli.jwt_write_group,
+            read_group: cli.jwt_read_group,
+        }),
         flush_interval: cli.flush_interval,
         compaction_interval: cli.compaction_interval,
         sweep_min_age: cli.sweep_min_age,
