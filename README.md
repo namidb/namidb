@@ -30,7 +30,7 @@ What you get out of the box:
 - **A property graph** you query with Cypher / GQL.
 - **Vector search** — store embeddings as node properties, rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN.
 - **Hybrid search** — BM25 lexical + semantic, fused with reciprocal rank fusion, in one call.
-- **Graph algorithms** — weakly-connected components and PageRank over `CALL algo.*`.
+- **Graph algorithms** — connected components and PageRank over `CALL algo.*`.
 - **Obsidian / Markdown ingestion** — turn a folder of notes into a live graph (wikilinks, embeds, tags, frontmatter) in one command.
 - **Auth that's real** — static tokens, OIDC/JWT, per-namespace scoping, and an external policy hook (OPA).
 
