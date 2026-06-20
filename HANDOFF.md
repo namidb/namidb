@@ -238,12 +238,22 @@ documented limitation (a runaway kernel isn't interruptible mid-iteration;
 follow-up: thread `cancel::deadline_exceeded()` into the kernel loops).
 
 ### Deferred bug follow-ups (lower severity, documented)
-- s3b forward-probe `MAX_PROBE` gap-safety after GC (commented as best-effort;
-  under sustained >8192-version write lag a stale pointer can be served).
-- s3b bootstrap crash-atomicity (crash between v0.json and p0.json wedges).
-- multi-tenant auth is global, not per-namespace (any valid token reaches any
-  namespace) — needs per-namespace token scoping (Wave B of item 15).
 - hybrid-search bm25 builtin (Layer B) for real lexical relevance.
+- CALL/YIELD cooperative deadline: the algo kernels are sync CPU loops, so a
+  runaway `CALL` isn't interruptible mid-iteration (the query deadline fires
+  only around the operator). Follow-up: thread `cancel::deadline_exceeded()`
+  into the union-find / power-iteration loops.
+
+### Fixed this turn (2026-06-20)
+- ✅ s3b forward-probe `MAX_PROBE` gap-safety — now fail-closed when the
+  8192-version window is exhausted (no stale pointer served). `d796f6a`.
+- ✅ s3b bootstrap crash-atomicity — `bootstrap()` recovers a half-written
+  state (v0.json present, p0.json missing) instead of wedging. `d796f6a`.
+- ✅ Per-namespace token scoping (Item 15 Wave B) — a token (or JWT claim)
+  scoped to a namespace set is 401'd on other namespaces; closes the
+  cross-namespace reach gap. `6f9c5d3`.
+- ✅ CALL algo.pagerank options map (Item 8 PR2) — `{damping, max_iterations,
+  tolerance}` overrides. `32e5902`.
 
 ## Commands
 
