@@ -306,7 +306,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 name,
                 args,
                 yield_items,
-            } => flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot).await,
+            } => flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot, params).await,
 
             LogicalPlan::PatternList {
                 input,
@@ -1280,6 +1280,7 @@ async fn flat_call_procedure(
     args: &[Expression],
     yield_items: &[(String, String)],
     snapshot: &Snapshot<'_>,
+    params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     if !matches!(namespace, Some("algo") | None) {
         return Err(proc_unsupported(format!(
@@ -1287,19 +1288,15 @@ async fn flat_call_procedure(
             namespace.unwrap_or("")
         )));
     }
-    // Procedure arguments are not wired yet (RFC-008 PR2); reject so a caller
-    // does not silently get defaults for parameters they passed.
-    if !args.is_empty() {
-        return Err(proc_unsupported(
-            "procedure arguments are not yet supported; call with no arguments",
-        ));
-    }
 
     let graph = snapshot_to_algo_graph(snapshot).await?;
 
     // Canonical output: column names + one RuntimeValue per column per row.
     let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match name {
         "wcc" => {
+            if !args.is_empty() {
+                return Err(proc_unsupported("algo.wcc takes no arguments"));
+            }
             let comps = namidb_graph::algo::weakly_connected_components(&graph);
             let mut entries: Vec<(NodeId, usize)> = comps.assignment.into_iter().collect();
             // Deterministic order: by component id, then by node id.
@@ -1311,10 +1308,8 @@ async fn flat_call_procedure(
             (vec!["node_id", "component"], raw)
         }
         "pagerank" => {
-            let pr = namidb_graph::algo::pagerank(
-                &graph,
-                &namidb_graph::algo::PageRankOptions::default(),
-            );
+            let opts = pagerank_options(args, params)?;
+            let pr = namidb_graph::algo::pagerank(&graph, &opts);
             let mut entries: Vec<(NodeId, f64)> = pr.scores.into_iter().collect();
             // Descending by score, then by node id for stability.
             entries.sort_by(|a, b| {
@@ -1407,6 +1402,66 @@ fn numeric_weight(v: &namidb_core::Value) -> Option<f64> {
     match v {
         namidb_core::Value::F64(x) => Some(*x),
         namidb_core::Value::I64(x) => Some(*x as f64),
+        _ => None,
+    }
+}
+
+/// Resolve `algo.pagerank` options from its optional single map argument:
+/// `CALL algo.pagerank({damping: 0.9, max_iterations: 50, tolerance: 1e-6})`.
+/// Omitted keys keep the engine defaults; wrong types are rejected.
+fn pagerank_options(
+    args: &[Expression],
+    params: &Params,
+) -> Result<namidb_graph::algo::PageRankOptions, ExecError> {
+    let mut opts = namidb_graph::algo::PageRankOptions::default();
+    match args {
+        [] => {}
+        [arg] => {
+            let val = evaluate(arg, &Row::new(), params)?;
+            let map = match val {
+                RuntimeValue::Map(m) => m,
+                _ => {
+                    return Err(proc_unsupported(
+                        "algo.pagerank expects a single map argument, e.g. {damping: 0.9}",
+                    ));
+                }
+            };
+            if let Some(d) = map.get("damping") {
+                opts.damping = as_f64(d).ok_or_else(|| {
+                    proc_unsupported("algo.pagerank `damping` must be a number")
+                })?;
+            }
+            if let Some(m) = map.get("max_iterations") {
+                opts.max_iterations = as_usize(m).ok_or_else(|| {
+                    proc_unsupported("algo.pagerank `max_iterations` must be a non-negative integer")
+                })?;
+            }
+            if let Some(t) = map.get("tolerance") {
+                opts.tolerance = as_f64(t).ok_or_else(|| {
+                    proc_unsupported("algo.pagerank `tolerance` must be a number")
+                })?;
+            }
+        }
+        _ => {
+            return Err(proc_unsupported(
+                "algo.pagerank takes at most one (map) argument",
+            ));
+        }
+    }
+    Ok(opts)
+}
+
+fn as_f64(v: &RuntimeValue) -> Option<f64> {
+    match v {
+        RuntimeValue::Float(x) => Some(*x),
+        RuntimeValue::Integer(x) => Some(*x as f64),
+        _ => None,
+    }
+}
+
+fn as_usize(v: &RuntimeValue) -> Option<usize> {
+    match v {
+        RuntimeValue::Integer(x) => usize::try_from(*x).ok(),
         _ => None,
     }
 }
@@ -2262,9 +2317,15 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 args,
                 yield_items,
             } => {
-                let rows =
-                    flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot)
-                        .await?;
+                let rows = flat_call_procedure(
+                    namespace.as_deref(),
+                    name,
+                    args,
+                    yield_items,
+                    snapshot,
+                    params,
+                )
+                .await?;
                 Ok(FactorRowSet::from_flat(rows))
             }
 

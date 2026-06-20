@@ -155,3 +155,46 @@ async fn call_unknown_procedure_is_unsupported() {
         "unknown procedure should surface as an unsupported error, got {err}"
     );
 }
+
+#[tokio::test]
+async fn call_pagerank_accepts_options_map() {
+    let mut writer = WriterSession::open(store(), paths("call-pr-opts"))
+        .await
+        .unwrap();
+    build(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // A map argument overrides defaults; omitted keys keep them.
+    let rows = run(
+        &snapshot,
+        "CALL algo.pagerank({damping: 0.9, max_iterations: 50, tolerance: 1e-6}) YIELD node_id, score",
+    )
+    .await;
+    assert_eq!(rows.len(), 5, "one row per node");
+    let sum: f64 = rows
+        .iter()
+        .map(|r| match r.get("score") {
+            Some(RuntimeValue::Float(s)) => *s,
+            _ => 0.0,
+        })
+        .sum();
+    assert!((sum - 1.0).abs() < 1e-6, "scores still sum to ~1.0, got {sum}");
+}
+
+#[tokio::test]
+async fn call_wcc_rejects_arguments() {
+    let mut writer = WriterSession::open(store(), paths("call-wcc-args"))
+        .await
+        .unwrap();
+    build(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse("CALL algo.wcc({}) YIELD node_id, component").unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+    assert!(
+        err.is_unsupported(),
+        "algo.wcc takes no arguments — should be unsupported, got {err}"
+    );
+}
