@@ -551,18 +551,21 @@ impl ManifestStore {
     pub async fn bootstrap(&self, writer_id: Uuid) -> Result<LoadedManifest> {
         let manifest = Manifest::empty(Epoch::ZERO, writer_id);
         let manifest_path = self.paths.manifest_version(manifest.version);
-        self.put_create(&manifest_path, serde_json::to_vec(&manifest)?.into())
+        // Body PUT: tolerate `AlreadyExists`. A prior bootstrap may have
+        // written `v0.json` and then crashed BEFORE the pointer landed — the
+        // half-write this method must complete rather than wedge on (without
+        // this, that namespace could neither bootstrap nor load: `v0.json`
+        // exists so bootstrap errored, but no pointer exists so load_current
+        // returned NotFound). The pointer PUT below still guards a genuinely
+        // bootstrapped namespace.
+        match self
+            .put_create(&manifest_path, serde_json::to_vec(&manifest)?.into())
             .await
-            .map_err(|e| match e {
-                Error::ObjectStore(object_store::Error::AlreadyExists { .. }) => {
-                    Error::precondition(format!(
-                        "namespace '{}' already bootstrapped: {} exists",
-                        self.paths.namespace(),
-                        manifest_path
-                    ))
-                }
-                other => other,
-            })?;
+        {
+            Ok(_) => {}
+            Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {}
+            Err(other) => return Err(other),
+        }
 
         let pointer = ManifestPointer {
             version: manifest.version,
@@ -575,6 +578,10 @@ impl ManifestStore {
             .put_create(&pointer_path, pointer_bytes.clone())
             .await
             .map_err(|e| match e {
+                // The pointer already exists: this is a genuinely bootstrapped
+                // (in-use) namespace, NOT the half-write we just recovered.
+                // Refuse to hand back a v0 LoadedManifest that would shadow
+                // any higher versions.
                 Error::ObjectStore(object_store::Error::AlreadyExists { .. }) => {
                     Error::precondition(format!(
                         "namespace '{}' already bootstrapped: pointer {} exists",
@@ -735,6 +742,7 @@ impl ManifestStore {
         // versions; 8192 gives significant headroom while still bounded as a
         // defensive backstop (the probe is cheap HEAD-only, no body reads).
         const MAX_PROBE: u32 = 8192;
+        let start = n;
         let mut probed = 0u32;
         while probed < MAX_PROBE {
             let next = n.saturating_add(1);
@@ -744,6 +752,20 @@ impl ManifestStore {
                 Err(e) => return Err(Error::ObjectStore(e)),
             }
             probed += 1;
+        }
+        if probed >= MAX_PROBE {
+            // The probe ran the full window WITHOUT finding a gap, which means
+            // the true current pointer is >8192 versions ahead of the lower
+            // bound (`start`) we began from. Handing back `n` would serve a
+            // stale pointer (and a stale manifest). Fail closed instead: the
+            // caller retries, and by then the LIST / advisory `current.json`
+            // (read-after-write consistent) has advanced the lower bound close
+            // enough to current that the probe terminates.
+            return Err(Error::precondition(format!(
+                "manifest pointer forward-probe exhausted its {MAX_PROBE}-version window \
+                 from v{start}: the namespace is too far ahead of the cached lower bound to \
+                 resolve safely — retry"
+            )));
         }
         Ok(n)
     }
@@ -1172,6 +1194,33 @@ mod tests {
             Error::Precondition(_) => {}
             other => panic!("expected Precondition, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recovers_from_half_written_state() {
+        // Simulate a bootstrap that wrote v0.json then crashed BEFORE the
+        // pointer landed (the wedge case): a later bootstrap must complete the
+        // pointer rather than error "v0 exists". Before the fix this namespace
+        // could neither bootstrap (v0 exists) nor load (no pointer) — wedged.
+        let (store, paths) = store();
+        let w = Uuid::now_v7();
+        let manifest = Manifest::empty(Epoch::ZERO, w);
+        let v0 = paths.manifest_version(0);
+        let ms = ManifestStore::new(store, paths);
+        ms.put_create(&v0, serde_json::to_vec(&manifest).unwrap().into())
+            .await
+            .unwrap();
+        // p0.json is deliberately absent (the crash).
+
+        let loaded = ms
+            .bootstrap(w)
+            .await
+            .expect("bootstrap must recover a half-written state");
+        assert_eq!(loaded.manifest.version, 0);
+
+        // Pointer + advisory are now in place; load_current resolves.
+        let reloaded = ms.load_current().await.unwrap();
+        assert_eq!(reloaded.manifest.version, 0);
     }
 
     #[tokio::test]
