@@ -31,7 +31,9 @@ use tokio::sync::Mutex;
 
 use namidb_markdown::Embedder;
 use namidb_graph::algo::{
-    pagerank, weakly_connected_components, Graph, PageRankOptions,
+    degrees, label_propagation, pagerank, shortest_paths, strongly_connected_components,
+    triangle_count, weakly_connected_components, Graph, PageRankOptions,
+    LABEL_PROPAGATION_DEFAULT_ITERS,
 };
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
@@ -813,35 +815,7 @@ impl Server {
             "wcc" | "weakly_connected_components" => {
                 let comps = weakly_connected_components(&graph);
                 // Group nodes by component, then return the top-K largest.
-                let mut by_comp: HashMap<usize, Vec<String>> = HashMap::new();
-                for id_str in id_meta.keys() {
-                    if let Ok(nid) = namidb_core::NodeId::from_str(id_str) {
-                        if let Some(&c) = comps.assignment.get(&nid) {
-                            by_comp.entry(c).or_default().push(id_str.clone());
-                        }
-                    }
-                }
-                let mut groups: Vec<(usize, Vec<String>)> = by_comp.into_iter().collect();
-                groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
-                let components: Vec<Value> = groups
-                    .into_iter()
-                    .take(top_k)
-                    .map(|(_comp, ids)| {
-                        let members: Vec<Value> = ids
-                            .iter()
-                            .take(50) // cap members per component for readability
-                            .filter_map(|id| {
-                                id_meta.get(id).map(|(title, path)| {
-                                    json!({ "id": id, "title": title, "path": path })
-                                })
-                            })
-                            .collect();
-                        json!({
-                            "size": ids.len(),
-                            "members": members,
-                        })
-                    })
-                    .collect();
+                let components = group_top_k(&comps.assignment, &id_meta, top_k);
                 json!({
                     "algorithm": "wcc",
                     "node_count": graph.node_count(),
@@ -867,7 +841,13 @@ impl Server {
                             .and_then(|nid| pr.scores.get(&nid).map(|&s| (id.clone(), s)))
                     })
                     .collect();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Score desc, node id asc for a deterministic tie-break (so the
+                // top-k truncation is reproducible when scores are equal).
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
                 let scores: Vec<Value> = ranked
                     .into_iter()
                     .take(top_k)
@@ -891,9 +871,151 @@ impl Server {
                     "scores": scores,
                 })
             }
+            "scc" | "strongly_connected_components" => {
+                let comps = strongly_connected_components(&graph);
+                let components = group_top_k(&comps.assignment, &id_meta, top_k);
+                json!({
+                    "algorithm": "scc",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "component_count": comps.count,
+                    "components": components,
+                })
+            }
+            "label_propagation" | "community" => {
+                let iters = args
+                    .get("max_iterations")
+                    .and_then(Value::as_u64)
+                    .map(|m| m as usize)
+                    .unwrap_or(LABEL_PROPAGATION_DEFAULT_ITERS);
+                let comm = label_propagation(&graph, iters);
+                let communities = group_top_k(&comm.assignment, &id_meta, top_k);
+                json!({
+                    "algorithm": "label_propagation",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "community_count": comm.count,
+                    "communities": communities,
+                })
+            }
+            "degree" | "degree_centrality" => {
+                let deg = degrees(&graph);
+                let mut ranked: Vec<(String, usize, usize, usize)> = id_meta
+                    .keys()
+                    .filter_map(|id| {
+                        namidb_core::NodeId::from_str(id).ok().map(|nid| {
+                            let ind = deg.in_degree.get(&nid).copied().unwrap_or(0);
+                            let outd = deg.out_degree.get(&nid).copied().unwrap_or(0);
+                            (id.clone(), ind, outd, ind + outd)
+                        })
+                    })
+                    .collect();
+                // Total degree desc, node id asc for a deterministic tie-break.
+                ranked.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+                let scores: Vec<Value> = ranked
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(id, ind, outd, tot)| {
+                        id_meta.get(&id).map(|(title, path)| {
+                            json!({
+                                "id": id, "title": title, "path": path,
+                                "in_degree": ind, "out_degree": outd, "degree": tot,
+                            })
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "degree",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "scores": scores,
+                })
+            }
+            "triangle_count" | "triangles" => {
+                let tri = triangle_count(&graph);
+                let mut ranked: Vec<(String, usize, f64)> = id_meta
+                    .keys()
+                    .filter_map(|id| {
+                        namidb_core::NodeId::from_str(id).ok().map(|nid| {
+                            let t = tri.per_node.get(&nid).copied().unwrap_or(0);
+                            let c = tri.coefficient.get(&nid).copied().unwrap_or(0.0);
+                            (id.clone(), t, c)
+                        })
+                    })
+                    .collect();
+                // Triangle count desc, node id asc for a deterministic tie-break.
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let scores: Vec<Value> = ranked
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(id, t, c)| {
+                        id_meta.get(&id).map(|(title, path)| {
+                            json!({
+                                "id": id, "title": title, "path": path,
+                                "triangles": t, "coefficient": c,
+                            })
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "triangle_count",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "total_triangles": tri.total,
+                    "scores": scores,
+                })
+            }
+            "shortest_path" | "shortest_paths" => {
+                let source_str = args
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "shortest_path requires a `source` node id".to_string())?;
+                let source = namidb_core::NodeId::from_str(source_str)
+                    .map_err(|_| format!("`source` is not a valid node id: {source_str}"))?;
+                // The induced subgraph carries no edge weights, so this is BFS
+                // (hop count); each reachable node appears once.
+                let sp = shortest_paths(&graph, source, false);
+                let mut ranked: Vec<(String, f64, usize)> = id_meta
+                    .keys()
+                    .filter_map(|id| {
+                        namidb_core::NodeId::from_str(id).ok().and_then(|nid| {
+                            sp.distance.get(&nid).map(|&d| {
+                                (id.clone(), d, sp.hops.get(&nid).copied().unwrap_or(0))
+                            })
+                        })
+                    })
+                    .collect();
+                // Distance asc, node id asc for a deterministic tie-break.
+                ranked.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let paths: Vec<Value> = ranked
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(id, d, h)| {
+                        id_meta.get(&id).map(|(title, path)| {
+                            json!({
+                                "id": id, "title": title, "path": path,
+                                "distance": d, "hops": h,
+                            })
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "shortest_path",
+                    "source": source_str,
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "reachable": paths.len(),
+                    "paths": paths,
+                })
+            }
             other => {
                 return Err(format!(
-                    "unknown algorithm `{other}`; supported: wcc, pagerank"
+                    "unknown algorithm `{other}`; supported: wcc, scc, pagerank, degree, \
+                     triangle_count, label_propagation, shortest_path"
                 ));
             }
         };
@@ -1065,6 +1187,56 @@ struct FusedResult {
     score: f64,
 }
 
+/// Group a component/community assignment into the `top_k` largest groups,
+/// each joined to readable titles/paths (≤ 50 members shown). Shared by the
+/// `wcc`, `scc`, and `label_propagation` graph algorithms.
+fn group_top_k(
+    assignment: &HashMap<namidb_core::NodeId, usize>,
+    id_meta: &HashMap<String, (String, String)>,
+    top_k: usize,
+) -> Vec<Value> {
+    let mut by_comp: HashMap<usize, Vec<String>> = HashMap::new();
+    for id_str in id_meta.keys() {
+        if let Ok(nid) = namidb_core::NodeId::from_str(id_str) {
+            if let Some(&c) = assignment.get(&nid) {
+                by_comp.entry(c).or_default().push(id_str.clone());
+            }
+        }
+    }
+    let mut groups: Vec<(usize, Vec<String>)> = by_comp.into_iter().collect();
+    // Sort members (stable node-id strings) within each group first, so both
+    // the tie-break below and the `take(50)` member cap are reproducible.
+    for g in &mut groups {
+        g.1.sort();
+    }
+    // Size desc, then smallest member id asc. The member-id tie-break is fully
+    // deterministic regardless of HashMap iteration order or the arbitrary
+    // component-id integers; without it, equal-sized groups would be emitted in
+    // randomized order and the `take(top_k)` truncation could return a different
+    // SET of groups each run, not merely a different order.
+    groups.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| a.1.first().cmp(&b.1.first()))
+    });
+    groups
+        .into_iter()
+        .take(top_k)
+        .map(|(_c, ids)| {
+            let members: Vec<Value> = ids
+                .iter()
+                .take(50)
+                .filter_map(|id| {
+                    id_meta
+                        .get(id)
+                        .map(|(title, path)| json!({ "id": id, "title": title, "path": path }))
+                })
+                .collect();
+            json!({ "size": ids.len(), "members": members })
+        })
+        .collect()
+}
+
 /// Reciprocal Rank Fusion (RRF): combine ranked lists from multiple search channels.
 ///
 /// RRF formula: `score(rank) = weight / (k + rank)` where k=60 is the standard constant.
@@ -1218,16 +1390,17 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "graph_algorithm",
-            "description": "Run a native graph algorithm over the subgraph induced by a node label. Two algorithms: `wcc` (Weakly Connected Components — partitions nodes into reachability clusters, undirected) and `pagerank` (PageRank — ranks nodes by structural importance via power iteration, directed). Returns algorithm-specific results joined to readable titles/paths. Read-only. This is the agent wedge for native graph analytics; the CALL/YIELD Cypher surface is a fast-follow.",
+            "description": "Run a native graph algorithm over the subgraph induced by a node label. Algorithms: `wcc` (Weakly Connected Components — undirected reachability clusters), `scc` (Strongly Connected Components — directed cycles), `pagerank` (structural importance via power iteration), `degree` (in/out/total degree centrality), `triangle_count` (triangles + local clustering coefficient), `label_propagation` (community detection), and `shortest_path` (BFS hop distances from a `source` node id). Returns algorithm-specific results joined to readable titles/paths. Read-only. The same algorithms are available in Cypher via `CALL algo.<name>()`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "algorithm": { "type": "string", "enum": ["wcc", "pagerank"], "description": "Algorithm to run: `wcc` or `pagerank`" },
+                    "algorithm": { "type": "string", "enum": ["wcc", "scc", "pagerank", "degree", "triangle_count", "label_propagation", "shortest_path"], "description": "Algorithm to run" },
                     "label": { "type": "string", "description": "Node label to build the subgraph from (default \"Note\")" },
                     "edge_types": { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of edge types to traverse (default: all edge types between label nodes)" },
-                    "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For wcc: number of largest components to return (default 10). For pagerank: number of top-ranked nodes to return (default 10)." },
-                    "damping": { "type": "number", "description": "PageRank damping factor (default 0.85). Ignored for wcc." },
-                    "max_iterations": { "type": "integer", "description": "PageRank iteration cap (default 100). Ignored for wcc." }
+                    "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For partitioning algos (wcc/scc/label_propagation): number of largest groups to return. For ranking algos (pagerank/degree/triangle_count/shortest_path): number of top results to return. Default 10." },
+                    "damping": { "type": "number", "description": "PageRank damping factor (default 0.85)." },
+                    "max_iterations": { "type": "integer", "description": "Iteration cap for pagerank (default 100) and label_propagation (default 10)." },
+                    "source": { "type": "string", "description": "Required for shortest_path: the source node id to compute hop distances from." }
                 },
                 "required": ["algorithm"],
             },
@@ -1501,6 +1674,76 @@ mod tests {
         assert_eq!(res["converged"], true);
         // Top-ranked node is C (two in-links).
         assert_eq!(res["scores"][0]["title"], "C");
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_degree_ranks_hub_highest() {
+        // C is linked from both A and B → highest total degree.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]] and [[C]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        let server = Server::open("memory://mcp-degree").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "degree", "label": "Note", "k": 3 }),
+        )
+        .await;
+        assert_eq!(res["algorithm"], "degree");
+        // C is linked from both A and B → in_degree 2. (Total degree ties at 2
+        // across all three nodes, so locate C by title rather than by rank.)
+        let c = res["scores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["title"] == "C")
+            .expect("C present");
+        assert_eq!(c["in_degree"], 2);
+        assert_eq!(c["out_degree"], 0);
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_scc_separates_acyclic_links() {
+        // A -> B -> C with no back-edges: three singleton SCCs.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        let server = Server::open("memory://mcp-scc").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "scc", "label": "Note" }),
+        )
+        .await;
+        assert_eq!(res["algorithm"], "scc");
+        // No directed cycles → every node is its own strongly connected component.
+        assert_eq!(res["component_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_shortest_path_requires_source() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]]\n");
+        write(dir.path(), "B.md", "body\n");
+        let server = Server::open("memory://mcp-sp-nosrc").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "graph_algorithm", "arguments": { "algorithm": "shortest_path", "label": "Note" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("source"), "got: {text}");
     }
 
     #[tokio::test]

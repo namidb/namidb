@@ -1334,9 +1334,131 @@ async fn flat_call_procedure(
                 .collect();
             (vec!["node_id", "score"], raw)
         }
+        "degree" => {
+            if !args.is_empty() {
+                return Err(proc_unsupported("algo.degree takes no arguments"));
+            }
+            let deg = namidb_graph::algo::degrees_cancellable(
+                &graph,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut ids: Vec<NodeId> = graph.nodes().to_vec();
+            // Deterministic: by total degree desc, then node id.
+            ids.sort_by(|a, b| deg.total(b).cmp(&deg.total(a)).then_with(|| a.cmp(b)));
+            let raw = ids
+                .into_iter()
+                .map(|id| {
+                    vec![
+                        node_runtime(id),
+                        RuntimeValue::Integer(
+                            deg.in_degree.get(&id).copied().unwrap_or(0) as i64,
+                        ),
+                        RuntimeValue::Integer(
+                            deg.out_degree.get(&id).copied().unwrap_or(0) as i64,
+                        ),
+                        RuntimeValue::Integer(deg.total(&id) as i64),
+                    ]
+                })
+                .collect();
+            (vec!["node_id", "in_degree", "out_degree", "degree"], raw)
+        }
+        "scc" => {
+            if !args.is_empty() {
+                return Err(proc_unsupported("algo.scc takes no arguments"));
+            }
+            let comps = namidb_graph::algo::strongly_connected_components_cancellable(
+                &graph,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut entries: Vec<(NodeId, usize)> = comps.assignment.into_iter().collect();
+            entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let raw = entries
+                .into_iter()
+                .map(|(id, c)| vec![node_runtime(id), RuntimeValue::Integer(c as i64)])
+                .collect();
+            (vec!["node_id", "component"], raw)
+        }
+        "triangle_count" => {
+            if !args.is_empty() {
+                return Err(proc_unsupported("algo.triangle_count takes no arguments"));
+            }
+            let tri = namidb_graph::algo::triangle_count_cancellable(
+                &graph,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut ids: Vec<NodeId> = graph.nodes().to_vec();
+            // Deterministic: by triangle count desc, then node id.
+            ids.sort_by(|a, b| {
+                let ta = tri.per_node.get(a).copied().unwrap_or(0);
+                let tb = tri.per_node.get(b).copied().unwrap_or(0);
+                tb.cmp(&ta).then_with(|| a.cmp(b))
+            });
+            let raw = ids
+                .into_iter()
+                .map(|id| {
+                    vec![
+                        node_runtime(id),
+                        RuntimeValue::Integer(
+                            tri.per_node.get(&id).copied().unwrap_or(0) as i64,
+                        ),
+                        RuntimeValue::Float(tri.coefficient.get(&id).copied().unwrap_or(0.0)),
+                    ]
+                })
+                .collect();
+            (vec!["node_id", "triangles", "coefficient"], raw)
+        }
+        "label_propagation" => {
+            let max_iters = label_propagation_options(args, params)?;
+            let comm = namidb_graph::algo::label_propagation_cancellable(
+                &graph,
+                max_iters,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut entries: Vec<(NodeId, usize)> = comm.assignment.into_iter().collect();
+            entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let raw = entries
+                .into_iter()
+                .map(|(id, c)| vec![node_runtime(id), RuntimeValue::Integer(c as i64)])
+                .collect();
+            (vec!["node_id", "community"], raw)
+        }
+        "shortest_path" => {
+            let (source, weighted) = shortest_path_options(args, params)?;
+            let sp = namidb_graph::algo::shortest_paths_cancellable(
+                &graph,
+                source,
+                weighted,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut entries: Vec<(NodeId, f64)> = sp.distance.into_iter().collect();
+            // Ascending by distance, then node id.
+            entries.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let raw = entries
+                .into_iter()
+                .map(|(id, dist)| {
+                    vec![
+                        node_runtime(id),
+                        RuntimeValue::Float(dist),
+                        RuntimeValue::Integer(sp.hops.get(&id).copied().unwrap_or(0) as i64),
+                    ]
+                })
+                .collect();
+            (vec!["node_id", "distance", "hops"], raw)
+        }
         other => {
             return Err(proc_unsupported(format!(
-                "unknown procedure `algo.{other}` (supported: algo.wcc, algo.pagerank)"
+                "unknown procedure `algo.{other}` (supported: algo.wcc, algo.scc, \
+                 algo.pagerank, algo.degree, algo.triangle_count, \
+                 algo.label_propagation, algo.shortest_path)"
             )));
         }
     };
@@ -1460,6 +1582,92 @@ fn pagerank_options(
         }
     }
     Ok(opts)
+}
+
+/// Resolve `algo.label_propagation` options from its optional single map arg:
+/// `CALL algo.label_propagation({max_iterations: 20})`. Omitted → the engine
+/// default iteration cap.
+fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usize, ExecError> {
+    let mut max_iters = namidb_graph::algo::LABEL_PROPAGATION_DEFAULT_ITERS;
+    match args {
+        [] => {}
+        [arg] => {
+            let map = match evaluate(arg, &Row::new(), params)? {
+                RuntimeValue::Map(m) => m,
+                _ => {
+                    return Err(proc_unsupported(
+                        "algo.label_propagation expects a single map argument, e.g. {max_iterations: 20}",
+                    ));
+                }
+            };
+            if let Some(m) = map.get("max_iterations") {
+                max_iters = as_usize(m).ok_or_else(|| {
+                    proc_unsupported(
+                        "algo.label_propagation `max_iterations` must be a non-negative integer",
+                    )
+                })?;
+            }
+        }
+        _ => {
+            return Err(proc_unsupported(
+                "algo.label_propagation takes at most one (map) argument",
+            ));
+        }
+    }
+    Ok(max_iters)
+}
+
+/// Resolve `algo.shortest_path` options from its required single map arg:
+/// `CALL algo.shortest_path({source: "<uuid>", weighted: true})`. `source` is
+/// required (a node-id string or a node value); `weighted` defaults to false
+/// (BFS hop count) and, when true, runs Dijkstra over non-negative `weight`s.
+fn shortest_path_options(
+    args: &[Expression],
+    params: &Params,
+) -> Result<(NodeId, bool), ExecError> {
+    let map = match args {
+        [arg] => match evaluate(arg, &Row::new(), params)? {
+            RuntimeValue::Map(m) => m,
+            _ => {
+                return Err(proc_unsupported(
+                    "algo.shortest_path expects a single map argument, e.g. {source: \"<uuid>\"}",
+                ));
+            }
+        },
+        _ => {
+            return Err(proc_unsupported(
+                "algo.shortest_path requires one map argument with a `source`, e.g. {source: \"<uuid>\"}",
+            ));
+        }
+    };
+    let source = match map.get("source") {
+        Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map_err(|_| {
+            proc_unsupported(format!(
+                "algo.shortest_path `source` is not a valid node id: {s}"
+            ))
+        })?,
+        Some(RuntimeValue::Node(n)) => n.id,
+        Some(_) => {
+            return Err(proc_unsupported(
+                "algo.shortest_path `source` must be a node-id string or a node",
+            ));
+        }
+        None => {
+            return Err(proc_unsupported(
+                "algo.shortest_path requires a `source` (node-id string or node)",
+            ));
+        }
+    };
+    let weighted = match map.get("weighted") {
+        None => false,
+        Some(RuntimeValue::Bool(b)) => *b,
+        Some(_) => {
+            return Err(proc_unsupported(
+                "algo.shortest_path `weighted` must be a boolean",
+            ));
+        }
+    };
+    Ok((source, weighted))
 }
 
 fn as_f64(v: &RuntimeValue) -> Option<f64> {

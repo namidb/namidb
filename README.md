@@ -30,7 +30,7 @@ What you get out of the box:
 - **A property graph** you query with Cypher / GQL.
 - **Vector search** — store embeddings as node properties, rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN.
 - **Hybrid search** — BM25 lexical + semantic, fused with reciprocal rank fusion, in one call.
-- **Graph algorithms** — connected components and PageRank over `CALL algo.*`.
+- **Graph algorithms** — connected components (weak & strong), PageRank, degree centrality, triangle count, community detection, and shortest paths over `CALL algo.*`.
 - **Obsidian / Markdown ingestion** — turn a folder of notes into a live graph (wikilinks, embeds, tags, frontmatter) in one command.
 - **Auth that's real** — static tokens, OIDC/JWT, per-namespace scoping, and an external policy hook (OPA).
 
@@ -127,6 +127,35 @@ Re-run with `--prune` to mirror the vault (delete notes you removed) or `--watch
 
 <br />
 
+## Quick win: graph algorithms
+
+Run analytics over the whole graph with `CALL algo.<name>()`. Every procedure yields one row per node, so you compose it with `YIELD` / `RETURN` / `ORDER BY` like any other query — no separate analytics job, no export.
+
+```cypher
+-- Which notes are the hubs? (authority via PageRank)
+CALL algo.pagerank() YIELD node_id, score
+RETURN node_id, score ORDER BY score DESC LIMIT 10;
+
+-- Most-connected notes (degree centrality).
+CALL algo.degree() YIELD node_id, in_degree, out_degree, degree
+RETURN node_id, degree ORDER BY degree DESC LIMIT 10;
+
+-- Communities, and clusters of mutual reachability.
+CALL algo.label_propagation() YIELD node_id, community RETURN node_id, community;
+CALL algo.wcc() YIELD node_id, component RETURN node_id, component;   -- undirected
+CALL algo.scc() YIELD node_id, component RETURN node_id, component;   -- directed cycles
+
+-- How tightly knit is each node? (triangles + clustering coefficient)
+CALL algo.triangle_count() YIELD node_id, triangles, coefficient RETURN *;
+
+-- Hop distance from a starting node (BFS; pass weighted: true for Dijkstra).
+CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops RETURN *;
+```
+
+The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `shortest_path`. They run exact (no sampling) and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
+
+<br />
+
 ## Quick win: vector & hybrid search
 
 Store embeddings as a `list[float]` property and rank with the built-in distance functions — no extra service:
@@ -192,7 +221,7 @@ The tools it exposes:
 | `list_tags`, `notes_by_tag`, `subtags`, `tags_of` | Tag queries over the `:Tag` tree |
 | `vector_search` | Semantic K-NN by cosine similarity |
 | `hybrid_search` | BM25 lexical + semantic, fused with reciprocal rank fusion |
-| `graph_algorithm` | Run `wcc` (connected components) or `pagerank` over a subgraph |
+| `graph_algorithm` | Run `wcc`/`scc`/`pagerank`/`degree`/`triangle_count`/`label_propagation`/`shortest_path` over a subgraph |
 | `cypher` | Read-only Cypher escape hatch |
 
 <br />
@@ -326,7 +355,7 @@ The defaults are fine for almost everything; reach for these when chasing a perf
 crates/
 ├── namidb-core/        # Common types, errors, schema
 ├── namidb-storage/     # LSM, WAL, manifest CAS, SST, URI parser, file:// CAS
-├── namidb-graph/       # Property columns, CSR adjacency, WCC + PageRank
+├── namidb-graph/       # Property columns, CSR adjacency, graph algorithm kernels
 ├── namidb-ann/         # DiskANN / Vamana vector index
 ├── namidb-query/       # Cypher / GQL parser, optimizer, executor, BM25
 ├── namidb-markdown/    # Obsidian / Markdown vault → graph (+ embedders)
