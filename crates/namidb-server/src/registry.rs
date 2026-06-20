@@ -170,7 +170,15 @@ impl NamespaceRegistry {
 
         let writer = WriterSession::open(self.store.clone(), paths.clone())
             .await
-            .map_err(|e| RegistryError::OpenFailed(e.to_string()))?;
+            .map_err(|e| match e {
+                // A momentarily-stale pointer resolution is retryable (503),
+                // not a server bug (500). Classify it before flattening the
+                // rest of the typed storage errors into OpenFailed.
+                namidb_storage::Error::PointerResolveStale => {
+                    RegistryError::Unavailable(e.to_string())
+                }
+                other => RegistryError::OpenFailed(other.to_string()),
+            })?;
 
         // Create the snapshot from the writer's owned snapshot (required by
         // SnapshotCell::new).
@@ -349,6 +357,10 @@ pub enum RegistryError {
     OpenFailed(String),
     /// Registry is at capacity and no idle namespace to evict.
     AtCapacity,
+    /// A transient condition (e.g. the pointer family is momentarily stale);
+    /// the client should retry. Mapped to 503, distinct from `OpenFailed`'s
+    /// 500 so a retryable race is not reported as a server bug.
+    Unavailable(String),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -357,6 +369,7 @@ impl std::fmt::Display for RegistryError {
             Self::InvalidNamespace(msg) => write!(f, "invalid namespace: {}", msg),
             Self::OpenFailed(msg) => write!(f, "failed to open namespace: {}", msg),
             Self::AtCapacity => write!(f, "namespace registry at capacity"),
+            Self::Unavailable(msg) => write!(f, "namespace temporarily unavailable: {}", msg),
         }
     }
 }
@@ -369,6 +382,7 @@ impl IntoResponse for RegistryError {
             Self::InvalidNamespace(msg) => (StatusCode::BAD_REQUEST, msg),
             Self::OpenFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             Self::AtCapacity => (StatusCode::SERVICE_UNAVAILABLE, "namespace registry at capacity".to_string()),
+            Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

@@ -85,6 +85,20 @@ impl ServerBackend {
             .unwrap_or_else(Principal::anonymous_rw)
     }
 
+    /// Consult the pre-execution authorization hook for `plan`. Returns
+    /// `Some(Forbidden)` to deny (mapped to a Bolt `Forbidden` error), `None`
+    /// to allow. Mirrors the HTTP `authz.check` call so the Bolt path is NOT a
+    /// policy bypass (NoOp default ⇒ always allows).
+    async fn authz_denied(
+        &self,
+        plan: &namidb_query::LogicalPlan,
+    ) -> Option<BackendError> {
+        match self.state.authz.check(&self.principal(), plan).await {
+            Ok(()) => None,
+            Err(denied) => Some(BackendError::Forbidden(denied.to_string())),
+        }
+    }
+
     /// `Some(error)` when the connection's principal may not write, to reject a
     /// write before it touches the writer lock.
     fn write_forbidden(&self) -> Option<BackendError> {
@@ -108,6 +122,19 @@ impl ServerBackend {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
                 result: Err(err),
+            };
+        }
+        // Authorization hook for the schema op (DDL is intercepted pre-plan).
+        let op = crate::authz::SchemaOp::CreateVectorIndex {
+            name: &cvi.name.name,
+            label: &cvi.label.name,
+            property: &cvi.property.name,
+        };
+        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
         let mut writer = self.state.writer.lock().await;
@@ -187,6 +214,17 @@ impl ServerBackend {
                 };
             }
         };
+
+        // Pre-execution authorization hook (RFC-015 Wave B): a policy may deny
+        // before execution. NoOp by default. Mirrors the HTTP path so Bolt is
+        // not a policy bypass.
+        if let Some(err) = self.authz_denied(&plan).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
 
         if plan.contains_write() {
             // A read-only token may not write — reject before the writer lock.
@@ -300,6 +338,15 @@ impl ServerBackend {
                 };
             }
         };
+
+        // Pre-execution authorization hook (RFC-015 Wave B); NoOp by default.
+        if let Some(err) = self.authz_denied(&plan).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
 
         if plan.contains_write() {
             // A read-only token may not write, even inside an open transaction.
@@ -420,6 +467,15 @@ impl Backend for ServerBackend {
             cypher,
         );
         obs.result
+    }
+
+    async fn logoff(&self) {
+        // Clear the per-connection identity so a subsequent request on this
+        // connection cannot reuse the logged-off principal. Without auth
+        // re-established it falls back to anonymous (open mode) or is rejected
+        // at the next write/authz gate. (The Authenticator trait documents
+        // that an embedder binding identity out-of-band should reset it here.)
+        *self.principal.lock().expect("bolt principal lock poisoned") = None;
     }
 
     async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
@@ -741,4 +797,74 @@ async fn run_session<S>(
 #[allow(dead_code)]
 fn parse_err_to_string(e: &ParseError) -> String {
     format!("{} at {}", e.message, e.span)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Role;
+    use std::sync::Arc;
+
+    // A hook that denies everything — to prove the Bolt path consults it (the
+    // gap the adversarial review found: Bolt used to skip the AuthzHook).
+    struct DenyAll;
+    #[async_trait]
+    impl crate::authz::AuthzHook for DenyAll {
+        async fn check(
+            &self,
+            _p: &Principal,
+            _plan: &namidb_query::LogicalPlan,
+        ) -> Result<(), crate::authz::Denied> {
+            Err(crate::authz::Denied::new("denied by test policy"))
+        }
+    }
+
+    async fn backend_with_authz(authz: Arc<dyn crate::authz::AuthzHook>) -> ServerBackend {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-authz-test").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "test".into()).with_authz(authz);
+        // Authenticated read-write principal, so the deny can't be attributed
+        // to the role gate — it must come from the AuthzHook.
+        let principal = Arc::new(std::sync::Mutex::new(Some(Principal {
+            subject: "tester".into(),
+            role: Role::ReadWrite,
+            groups: vec![],
+        })));
+        ServerBackend::new(state, principal)
+    }
+
+    #[tokio::test]
+    async fn bolt_run_query_consults_authz_hook_and_can_deny_reads() {
+        let backend = backend_with_authz(Arc::new(DenyAll)).await;
+        // A plain READ — the role gate would allow it; the hook must deny.
+        let err = backend
+            .run("MATCH (n) RETURN n", Params::new())
+            .await
+            .expect_err("deny-all hook must reject the read over Bolt");
+        assert!(matches!(err, BackendError::Forbidden(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn bolt_default_authz_allows_reads() {
+        // NoOp default must not change behavior: the read succeeds.
+        let backend = backend_with_authz(Arc::new(crate::authz::NoOpAuthz)).await;
+        let out = backend.run("MATCH (n) RETURN n", Params::new()).await;
+        assert!(out.is_ok(), "default authz should allow: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn bolt_logoff_clears_principal() {
+        let backend = backend_with_authz(Arc::new(crate::authz::NoOpAuthz)).await;
+        // A principal is set; after LOGOFF it must be cleared (falls back to
+        // anonymous, so a stale identity can't be reused).
+        assert_eq!(backend.principal().subject, "tester");
+        backend.logoff().await;
+        assert_eq!(
+            backend.principal().subject,
+            Principal::anonymous_rw().subject,
+            "logoff must clear the per-connection principal"
+        );
+    }
 }

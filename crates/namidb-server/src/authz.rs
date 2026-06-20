@@ -50,6 +50,27 @@ impl std::error::Error for Denied {}
 pub trait AuthzHook: Send + Sync {
     /// Decide whether `principal` may run `plan`. `Ok(())` allows; `Err` denies.
     async fn check(&self, principal: &Principal, plan: &LogicalPlan) -> Result<(), Denied>;
+
+    /// Decide whether `principal` may run a schema (DDL) operation. DDL is
+    /// intercepted before planning, so it has no `LogicalPlan`; this is the
+    /// hook entrypoint for the most-privileged operations (e.g.
+    /// `CREATE VECTOR INDEX`). The default delegates nothing and allows — a
+    /// real PDP overrides it to gate schema changes. `Ok(())` allows; `Err`
+    /// denies.
+    async fn check_schema(&self, _principal: &Principal, _op: SchemaOp<'_>) -> Result<(), Denied> {
+        Ok(())
+    }
+}
+
+/// A schema (DDL) operation presented to [`AuthzHook::check_schema`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaOp<'a> {
+    /// `CREATE VECTOR INDEX <name>` over `(label, property)`.
+    CreateVectorIndex {
+        name: &'a str,
+        label: &'a str,
+        property: &'a str,
+    },
 }
 
 /// The default hook: allows every request. Wiring it is behavior-preserving —

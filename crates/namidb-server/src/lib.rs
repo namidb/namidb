@@ -393,57 +393,28 @@ fn namespace_from_header(shared: &SharedAppState, headers: &axum::http::HeaderMa
 }
 
 /// Resolve the namespace a multi-tenant request targets, for the auth
-/// middleware's per-namespace scoping check. Prefixed routes
-/// (`/<namespace>/v0/...`) yield the first path segment; unprefixed routes
-/// (`/v0/...`) fall back to the `X-NamiDB-Namespace` header / default. The
-/// segment is percent-decoded to match axum's `Path` extraction. This MUST
-/// agree with how the handlers resolve the namespace (axum `Path<String>` for
-/// prefixed, [`namespace_from_header`] for unprefixed) so scoping cannot be
-/// bypassed.
-fn resolve_request_namespace(shared: &SharedAppState, req: &axum::extract::Request) -> String {
-    let path = req.uri().path();
-    // Unprefixed: /v0 or /v0/... — namespace from the header / default.
-    if path == "/v0" || path.starts_with("/v0/") {
-        return namespace_from_header(shared, req.headers());
-    }
-    // Prefixed: /<namespace>/v0/... — the first segment is the namespace.
-    if let Some(rest) = path.strip_prefix('/') {
-        if let Some((seg, after)) = rest.split_once('/') {
-            if after == "v0" || after.starts_with("v0/") {
-                return percent_decode(seg);
-            }
+/// middleware's per-namespace scoping check.
+///
+/// **Correctness is load-bearing:** this MUST resolve the exact same namespace
+/// the handler will serve, or a scoped token could be authorized for namespace
+/// A while the request runs against namespace B (a cross-tenant bypass). To
+/// guarantee that, we read the `:namespace` path parameter axum/matchit already
+/// captured for the prefixed `/:namespace/v0/...` routes — the same value the
+/// handler's `Path<String>` extractor deserializes — instead of re-parsing the
+/// URI (which disagreed with matchit for paths like `/v0/v0/...`). Only when no
+/// `:namespace` param was captured (a true unprefixed `/v0/...` route) do we
+/// fall back to the `X-NamiDB-Namespace` header / default.
+fn resolve_request_namespace(
+    shared: &SharedAppState,
+    params: &axum::extract::RawPathParams,
+    headers: &axum::http::HeaderMap,
+) -> String {
+    for (key, value) in params.iter() {
+        if key == "namespace" {
+            return value.to_string();
         }
     }
-    namespace_from_header(shared, req.headers())
-}
-
-/// Minimal percent-decoding of a single path segment (matches axum's `Path`
-/// extraction for the namespace). Handles `%XX` escapes; leaves other bytes.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    namespace_from_header(shared, headers)
 }
 
 /// Boot the server: parse URI, open a `WriterSession`, optionally
@@ -802,6 +773,7 @@ async fn wait_for_shutdown_signal() {
 
 async fn require_auth_multi(
     State(shared): State<SharedAppState>,
+    params: axum::extract::RawPathParams,
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -817,7 +789,9 @@ async fn require_auth_multi(
         .and_then(strip_bearer);
     // Resolve the target namespace HERE (before auth) so a token scoped to
     // other namespaces is rejected even though it is a valid token overall.
-    let namespace = resolve_request_namespace(&shared, &req);
+    // Uses axum's captured :namespace param so it can't disagree with the
+    // handler (the /v0/v0/... bypass class).
+    let namespace = resolve_request_namespace(&shared, &params, req.headers());
     match presented.and_then(|token| shared.auth.principal_for_in(token, &namespace)) {
         Some(principal) => {
             req.extensions_mut().insert(principal);
@@ -1078,6 +1052,7 @@ async fn apply_create_vector_index(
 async fn run_create_vector_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    authz: &Arc<dyn authz::AuthzHook>,
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
     principal: &Principal,
     started: std::time::Instant,
@@ -1094,6 +1069,22 @@ async fn run_create_vector_index(
                     error: "this token is read-only; schema commands are forbidden".into(),
                 }),
             )
+                .into_response(),
+        };
+    }
+    // Authorization hook: DDL is the most-privileged op, so it must consult the
+    // policy too (it is intercepted pre-plan, so via check_schema). NoOp allows.
+    let op = authz::SchemaOp::CreateVectorIndex {
+        name: &cvi.name.name,
+        label: &cvi.label.name,
+        property: &cvi.property.name,
+    };
+    if let Err(denied) = authz.check_schema(principal, op).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (StatusCode::FORBIDDEN, Json(ErrorBody { error: denied.to_string() }))
                 .into_response(),
         };
     }
@@ -1186,8 +1177,15 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
     // `CREATE VECTOR INDEX` is schema DDL: intercept before planning.
     #[cfg(feature = "vector-index")]
     if let Some(cvi) = parsed.as_create_vector_index() {
-        return run_create_vector_index(&state.writer, &state.snapshot, cvi, principal, started)
-            .await;
+        return run_create_vector_index(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            cvi,
+            principal,
+            started,
+        )
+        .await;
     }
 
     // Plan against the latest published snapshot — no writer lock yet.
@@ -1343,7 +1341,12 @@ async fn admin_flush(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> Response {
-    // A flush mutates durable state, so a read-only token may not trigger it.
+    // Admin flush is an operator maintenance action (no Cypher, no plan), so it
+    // is intentionally gated by role only — not by the AuthzHook, which decides
+    // on a `LogicalPlan`. A flush touches no user data the way a query does;
+    // restricting who may operate the server is the deployment's concern (mTLS /
+    // network ACL on the admin route), consistent with how `/v0/admin/*` is
+    // treated. A read-only token may not trigger it.
     if !principal.allows_write() {
         return (
             StatusCode::FORBIDDEN,
@@ -1523,6 +1526,7 @@ async fn run_cypher_multi(
         return run_create_vector_index(
             &ns_state.writer,
             &ns_state.snapshot,
+            &shared.authz,
             cvi,
             principal,
             started,
@@ -2023,6 +2027,45 @@ mod tests {
         let app_ro = fixture_with_tokens("vecidx-ro", ROLE_TOKENS).await;
         let ro = post_cypher(&app_ro, Some("rkey"), q).await;
         assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    // A hook that allows queries but denies schema (DDL) operations.
+    struct DenySchemaAuthz;
+    #[async_trait::async_trait]
+    impl crate::authz::AuthzHook for DenySchemaAuthz {
+        async fn check(
+            &self,
+            _p: &Principal,
+            _plan: &namidb_query::LogicalPlan,
+        ) -> Result<(), crate::authz::Denied> {
+            Ok(())
+        }
+        async fn check_schema(
+            &self,
+            _p: &Principal,
+            _op: crate::authz::SchemaOp<'_>,
+        ) -> Result<(), crate::authz::Denied> {
+            Err(crate::authz::Denied::new("schema changes denied by policy"))
+        }
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn create_vector_index_consults_authz_check_schema() {
+        // Open mode (read-write principal) but a hook that denies schema ops:
+        // the DDL must be 403'd by the hook, proving DDL is not a policy bypass.
+        let (store, paths) = namidb_storage::parse_uri("memory://vecidx-authz").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into())
+            .with_authz(Arc::new(DenySchemaAuthz));
+        let app = build_router(state);
+
+        let q = "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16";
+        let resp = post_cypher(&app, None, q).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("schema changes denied"));
     }
 
     #[tokio::test]
@@ -2573,6 +2616,41 @@ mod tests {
         assert_eq!(
             mt_cypher_token(&app, "/v0/cypher", None, "acme-key", q).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Regression for the `/v0/v0/...` scoping bypass: a path whose namespace
+    /// segment is literally `v0` routes to the PREFIXED handler (Path = "v0"),
+    /// so the auth middleware must gate namespace `v0` — NOT fall back to the
+    /// header. An acme-scoped token sending `/v0/v0/cypher` with header
+    /// `acme` must be REJECTED (it is not scoped to `v0`). Before the fix the
+    /// middleware hand-parsed the path, saw the `/v0/` prefix, and authorized
+    /// against the header's `acme` while the handler served `v0` — a bypass.
+    #[tokio::test]
+    async fn v0_namespace_cannot_be_reached_by_path_shadowing() {
+        let json = r#"{ "tokens": [
+            { "name": "acme", "token": "acme-key", "role": "read-write", "namespaces": ["acme"] },
+            { "name": "v0", "token": "v0-key", "role": "read-write", "namespaces": ["v0"] }
+        ] }"#;
+        let path = std::env::temp_dir().join("namidb-test-v0-shadow.json");
+        std::fs::write(&path, json).unwrap();
+        let auth = Arc::new(AuthConfig::load_file(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        let app = multi_tenant_app_auth(auth, "default").await;
+        let q = "RETURN 1";
+
+        // acme-key targeting the `v0` tenant via /v0/v0/... + header=acme: the
+        // gate must check namespace `v0` (the routed param), not `acme`.
+        assert_eq!(
+            mt_cypher_token(&app, "/v0/v0/cypher", Some("acme"), "acme-key", q).await,
+            StatusCode::UNAUTHORIZED,
+            "acme-scoped token must not reach the v0 tenant via path shadowing"
+        );
+        // The correctly-scoped v0-key DOES reach it through the same path.
+        assert_eq!(
+            mt_cypher_token(&app, "/v0/v0/cypher", None, "v0-key", q).await,
+            StatusCode::OK,
+            "v0-scoped token reaches the v0 tenant"
         );
     }
 }

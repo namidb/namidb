@@ -757,15 +757,16 @@ impl ManifestStore {
             // The probe ran the full window WITHOUT finding a gap, which means
             // the true current pointer is >8192 versions ahead of the lower
             // bound (`start`) we began from. Handing back `n` would serve a
-            // stale pointer (and a stale manifest). Fail closed instead: the
-            // caller retries, and by then the LIST / advisory `current.json`
-            // (read-after-write consistent) has advanced the lower bound close
-            // enough to current that the probe terminates.
-            return Err(Error::precondition(format!(
-                "manifest pointer forward-probe exhausted its {MAX_PROBE}-version window \
-                 from v{start}: the namespace is too far ahead of the cached lower bound to \
-                 resolve safely — retry"
-            )));
+            // stale pointer (and a stale manifest). Fail closed with a
+            // RETRYABLE error: by the next attempt the LIST / advisory
+            // `current.json` (read-after-write consistent) has advanced the
+            // lower bound close enough to current that the probe terminates.
+            tracing::warn!(
+                from_version = start,
+                max_probe = MAX_PROBE,
+                "manifest pointer forward-probe exhausted its window; returning retryable stale error"
+            );
+            return Err(Error::PointerResolveStale);
         }
         Ok(n)
     }

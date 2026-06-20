@@ -33,6 +33,14 @@ pub enum Error {
     #[error("manifest commit lost CAS race; expected version {expected}, found {found}")]
     ManifestCommitCas { expected: u64, found: u64 },
 
+    /// The pointer family could not be resolved to a definitive current version
+    /// from the cached lower bound — typically the forward probe exhausted its
+    /// window because the namespace advanced far past the bound while a LIST was
+    /// stale. **Retryable:** the read-after-write advisory (`current.json`)
+    /// catches up, so the caller should retry rather than treat it as fatal.
+    #[error("manifest pointer resolution is temporarily stale; retry")]
+    PointerResolveStale,
+
     /// A precondition we believed held was violated by the world we observed.
     #[error("precondition failed: {0}")]
     Precondition(String),
