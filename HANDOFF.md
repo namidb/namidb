@@ -244,7 +244,27 @@ follow-up: thread `cancel::deadline_exceeded()` into the kernel loops).
   corpus text-statistics (per-term document frequency, avg doc length) exist
   yet. Real IDF needs an inverted index — a future Layer C, not a bug.
 
-### Fixed this turn (2026-06-20)
+### Adversarial-review fixes (2026-06-20, post-Wave-B)
+A 19-agent adversarial review of the session's auth/Principal/s3b/bm25/CALL
+work confirmed 4 real bugs (verified against pinned axum/matchit); all fixed:
+- ✅ **CRITICAL** cross-tenant bypass via `/v0/v0/...` — the multi-tenant auth
+  middleware hand-parsed the URI and disagreed with matchit (which routes
+  `/v0/v0/cypher` to the prefixed handler, namespace=`v0`), so a token scoped
+  to A could reach the `v0` tenant. Fixed: resolve from axum's captured
+  `:namespace` param (same value the handler sees); deleted the hand-rolled
+  decoder. `65a95a1` + regression test.
+- ✅ **CRITICAL** AuthzHook bypassed on the entire Bolt path — `run_query`/
+  `run_query_in_tx` never called `authz.check`. Now both do. `65a95a1`.
+- ✅ **HIGH** AuthzHook bypassed for `CREATE VECTOR INDEX` DDL — added
+  `AuthzHook::check_schema` (default-allow), called on HTTP + Bolt. `65a95a1`.
+- ✅ **HIGH** Bolt LOGOFF didn't clear the principal cell — added a `logoff`
+  override. `65a95a1`.
+- ✅ **HIGH** forward-probe exhaustion wasn't retryable e2e — added
+  `Error::PointerResolveStale` + `RegistryError::Unavailable` (503). `65a95a1`.
+- ✅ **HIGH** PageRank leaked mass when a node's out-edge weight sum ≤ 0 — now
+  counted as dangling (mass redistributed). `128df6c`.
+
+### Fixed earlier this turn (2026-06-20)
 - ✅ s3b forward-probe `MAX_PROBE` gap-safety — now fail-closed when the
   8192-version window is exhausted (no stale pointer served). `d796f6a`.
 - ✅ s3b bootstrap crash-atomicity — `bootstrap()` recovers a half-written
