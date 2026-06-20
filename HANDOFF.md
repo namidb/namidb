@@ -6,14 +6,19 @@
 
 ## Test status (all green)
 
-| Crate | Tests |
+Default `cargo test --workspace`: 55 suites, 0 failures. Same with every
+feature combo (`jwt`, `pdp`, `vector-index`). `cargo clippy --workspace
+--all-targets -- -D warnings` is clean in all combos. Per-crate lib counts
+(default; feature-gated tests add more):
+
+| Crate | Tests (default lib) |
 |-------|-------|
-| namidb-storage | 310 (304 + 5 vector build + 1 DDL register, behind `vector-index`) |
-| namidb-query | 462 default (+ 4 CALL parse, + 3 CALL e2e) → 471 with `vector-index` (adds 4 vector rewrite + 5 DDL parse + 1) |
-| namidb-ann | 21 (new) |
-| namidb-server | 32 default (+1 DDL HTTP behind `vector-index`) → 41 with `jwt` (+9 JWT unit tests) |
+| namidb-storage | 306 (+ vector build/DDL behind `vector-index`) |
+| namidb-query | 477 (+ vector rewrite/DDL behind `vector-index`) |
+| namidb-ann | 21 |
+| namidb-server | 41 (→ 48 with `pdp`, more with `jwt`/`vector-index`: JWT, authz, PDP, namespace-scoping, DDL) |
 | namidb-mcp | 20 |
-| namidb-graph | 10 |
+| namidb-graph | 12 (incl. cancellable kernels + pagerank mass-conservation) |
 
 ## Item 12 — DiskANN/Vamana ANN (shipped this session, 9/9)
 
