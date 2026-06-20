@@ -379,6 +379,60 @@ fn namespace_from_header(shared: &SharedAppState, headers: &axum::http::HeaderMa
         .unwrap_or_else(|| shared.default_namespace.clone())
 }
 
+/// Resolve the namespace a multi-tenant request targets, for the auth
+/// middleware's per-namespace scoping check. Prefixed routes
+/// (`/<namespace>/v0/...`) yield the first path segment; unprefixed routes
+/// (`/v0/...`) fall back to the `X-NamiDB-Namespace` header / default. The
+/// segment is percent-decoded to match axum's `Path` extraction. This MUST
+/// agree with how the handlers resolve the namespace (axum `Path<String>` for
+/// prefixed, [`namespace_from_header`] for unprefixed) so scoping cannot be
+/// bypassed.
+fn resolve_request_namespace(shared: &SharedAppState, req: &axum::extract::Request) -> String {
+    let path = req.uri().path();
+    // Unprefixed: /v0 or /v0/... — namespace from the header / default.
+    if path == "/v0" || path.starts_with("/v0/") {
+        return namespace_from_header(shared, req.headers());
+    }
+    // Prefixed: /<namespace>/v0/... — the first segment is the namespace.
+    if let Some(rest) = path.strip_prefix('/') {
+        if let Some((seg, after)) = rest.split_once('/') {
+            if after == "v0" || after.starts_with("v0/") {
+                return percent_decode(seg);
+            }
+        }
+    }
+    namespace_from_header(shared, req.headers())
+}
+
+/// Minimal percent-decoding of a single path segment (matches axum's `Path`
+/// extraction for the namespace). Handles `%XX` escapes; leaves other bytes.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Boot the server: parse URI, open a `WriterSession`, optionally
 /// spawn a periodic flush task, and serve until the process receives
 /// SIGINT.
@@ -748,7 +802,10 @@ async fn require_auth_multi(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(strip_bearer);
-    match presented.and_then(|token| shared.auth.role_for(token)) {
+    // Resolve the target namespace HERE (before auth) so a token scoped to
+    // other namespaces is rejected even though it is a valid token overall.
+    let namespace = resolve_request_namespace(&shared, &req);
+    match presented.and_then(|token| shared.auth.role_for_in(token, &namespace)) {
         Some(role) => {
             req.extensions_mut().insert(role);
             next.run(req).await
@@ -760,7 +817,8 @@ async fn require_auth_multi(
                 HeaderValue::from_static("Bearer realm=\"namidb\""),
             )],
             Json(ErrorBody {
-                error: "missing or invalid bearer token".into(),
+                error: "missing or invalid bearer token, or token not scoped to this namespace"
+                    .into(),
             }),
         )
             .into_response(),
@@ -2327,5 +2385,105 @@ mod tests {
         let _ = mt_cypher(&app, "/acme/v0/cypher", None, "CREATE (:Person {name: 'only-acme'})").await;
         let read = mt_cypher(&app, "/v0/cypher", None, "MATCH (p:Person) RETURN count(p)").await;
         assert_eq!(read, StatusCode::OK, "default namespace is isolated from acme");
+    }
+
+    async fn multi_tenant_app_auth(auth: Arc<AuthConfig>, default_ns: &str) -> Router {
+        let (store, _) = namidb_storage::parse_uri("memory://multi-tenant-scoped").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new(
+            registry,
+            auth,
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            default_ns.to_string(),
+        );
+        build_multi_tenant_router(shared)
+    }
+
+    async fn mt_cypher_token(
+        app: &Router,
+        uri: &str,
+        header_ns: Option<&str>,
+        token: &str,
+        query: &str,
+    ) -> StatusCode {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"));
+        if let Some(ns) = header_ns {
+            b = b.header("x-namidb-namespace", ns);
+        }
+        app.clone()
+            .oneshot(
+                b.body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Per-namespace token scoping (RFC-015 Wave B): a token scoped to one
+    /// namespace is rejected (401) on every other namespace, on BOTH the
+    /// prefixed path and the header-routed unprefixed path. Closes the
+    /// cross-namespace reach gap.
+    #[tokio::test]
+    async fn scoped_token_cannot_reach_other_namespaces() {
+        let json = r#"{ "tokens": [
+            { "name": "acme", "token": "acme-key", "role": "read-write", "namespaces": ["acme"] },
+            { "name": "beta", "token": "beta-key", "role": "read-write", "namespaces": ["beta"] }
+        ] }"#;
+        let path = std::env::temp_dir().join("namidb-test-scoped-tokens.json");
+        std::fs::write(&path, json).unwrap();
+        let auth = Arc::new(AuthConfig::load_file(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        let app = multi_tenant_app_auth(auth, "default").await;
+        let q = "RETURN 1";
+
+        // acme-key reaches acme (prefixed path) ...
+        assert_eq!(
+            mt_cypher_token(&app, "/acme/v0/cypher", None, "acme-key", q).await,
+            StatusCode::OK
+        );
+        // ... but is rejected on beta (prefixed).
+        assert_eq!(
+            mt_cypher_token(&app, "/beta/v0/cypher", None, "acme-key", q).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // ... and rejected via the unprefixed path + header routing to beta.
+        assert_eq!(
+            mt_cypher_token(&app, "/v0/cypher", Some("beta"), "acme-key", q).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // beta-key reaches beta but not acme.
+        assert_eq!(
+            mt_cypher_token(&app, "/beta/v0/cypher", None, "beta-key", q).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            mt_cypher_token(&app, "/acme/v0/cypher", None, "beta-key", q).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Either token is rejected on the default namespace (neither is scoped to it).
+        assert_eq!(
+            mt_cypher_token(&app, "/v0/cypher", None, "acme-key", q).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

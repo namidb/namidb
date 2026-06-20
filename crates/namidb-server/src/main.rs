@@ -68,6 +68,11 @@ struct Cli {
     #[cfg(feature = "jwt")]
     #[arg(long, env = "NAMIDB_JWT_READ_GROUP")]
     jwt_read_group: Option<String>,
+    /// JWT claim listing the namespaces a token may reach (multi-tenant
+    /// scoping). Unset = tokens reach every namespace.
+    #[cfg(feature = "jwt")]
+    #[arg(long, env = "NAMIDB_JWT_NAMESPACES_CLAIM")]
+    jwt_namespaces_claim: Option<String>,
 
     /// Interval at which the memtable is flushed to L0 SSTs in the
     /// background. Set to `0s` to disable periodic flush (callers
@@ -265,6 +270,7 @@ fn main() -> anyhow::Result<()> {
             groups_claim: cli.jwt_groups_claim,
             write_group: cli.jwt_write_group,
             read_group: cli.jwt_read_group,
+            namespaces_claim: cli.jwt_namespaces_claim,
         }),
         flush_interval: cli.flush_interval,
         compaction_interval: cli.compaction_interval,

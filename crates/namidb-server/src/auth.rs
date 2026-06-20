@@ -39,6 +39,11 @@ struct AuthToken {
     name: String,
     secret: Arc<str>,
     role: Role,
+    /// Namespaces this token may reach. `None` = unscoped (any namespace — the
+    /// back-compat default); `Some(set)` = scoped to exactly those. An empty
+    /// set denies every namespace. Only consulted by `role_for_in` (the
+    /// multi-tenant path); the single-tenant/Bolt `role_for` ignores it.
+    namespaces: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for AuthToken {
@@ -46,6 +51,7 @@ impl std::fmt::Debug for AuthToken {
         f.debug_struct("AuthToken")
             .field("name", &self.name)
             .field("role", &self.role)
+            .field("namespaces", &self.namespaces)
             .field("secret", &"***")
             .finish()
     }
@@ -76,6 +82,7 @@ impl AuthConfig {
                 name: "auth-token".into(),
                 secret: Arc::from(secret.into()),
                 role: Role::ReadWrite,
+                namespaces: None,
             }],
             ..Default::default()
         }
@@ -120,6 +127,7 @@ impl AuthConfig {
                     name: e.name.unwrap_or_else(|| format!("token-{i}")),
                     secret: Arc::from(e.token),
                     role: e.role.into(),
+                    namespaces: e.namespaces,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -154,22 +162,47 @@ impl AuthConfig {
     }
 
     /// The role granted to `presented`, or `None` when nothing matches.
-    ///
-    /// A JWT validator (if configured) is tried first; static tokens are the
-    /// fallback. The static-token walk uses a constant-time byte compare (no
-    /// early return), so neither the token count nor the matching position
-    /// leaks through timing; a length mismatch still short-circuits. If two
-    /// tokens share a secret (a config mistake), the last one's role wins.
+    /// Namespace-agnostic: used by the single-tenant path and Bolt (one
+    /// namespace each), so a token's namespace scope is intentionally ignored.
     pub fn role_for(&self, presented: &str) -> Option<Role> {
+        self.role_for_in(presented, "")
+    }
+
+    /// The role granted to `presented` for `namespace`, or `None` when nothing
+    /// matches OR the matched token is scoped to other namespaces. This is the
+    /// multi-tenant auth predicate that closes the cross-namespace reach gap.
+    ///
+    /// A `namespace` of `""` (the single-tenant sentinel) matches any token —
+    /// scoped tokens carry no meaning for a single-namespace server, so they
+    /// grant their role there. For a real namespace, a scoped token grants its
+    /// role only if `namespace` is in its set; an unscoped token grants always.
+    ///
+    /// The static-token walk uses a constant-time byte compare with no early
+    /// return (the namespace check happens only on a secret match), so neither
+    /// the token count nor the matching position leaks through timing.
+    pub fn role_for_in(&self, presented: &str, namespace: &str) -> Option<Role> {
+        // The empty-string namespace is the single-tenant sentinel: skip the
+        // scope check entirely (scoped tokens are meaningless for one ns).
+        let single_tenant = namespace.is_empty();
         #[cfg(feature = "jwt")]
         if let Some(jwt) = &self.jwt {
-            if let Some(role) = jwt.validate(presented) {
+            let ok = if single_tenant {
+                jwt.validate(presented)
+            } else {
+                jwt.validate_in(presented, namespace)
+            };
+            if let Some(role) = ok {
                 return Some(role);
             }
         }
         let mut granted = None;
         for t in &self.tokens {
-            if constant_time_eq(presented.as_bytes(), t.secret.as_bytes()) {
+            if constant_time_eq(presented.as_bytes(), t.secret.as_bytes())
+                && (single_tenant
+                    || t.namespaces
+                        .as_ref()
+                        .map_or(true, |ns| ns.iter().any(|n| n == namespace)))
+            {
                 granted = Some(t.role);
             }
         }
@@ -194,6 +227,11 @@ struct TokenFileEntry {
     name: Option<String>,
     #[serde(default)]
     role: RoleSpec,
+    /// Optional namespace scope. Omit (or null) for an unscoped token that
+    /// reaches every namespace; list namespaces to restrict it. An empty
+    /// array denies all namespaces.
+    #[serde(default)]
+    namespaces: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -249,6 +287,51 @@ mod tests {
 
     #[test]
     #[allow(clippy::needless_update)]
+    fn role_for_in_enforces_namespace_scope() {
+        // acme-key is scoped to ["acme"]; beta-key to ["beta"]; any-key unscoped.
+        let c = AuthConfig {
+            tokens: vec![
+                AuthToken {
+                    name: "acme".into(),
+                    secret: Arc::from("acme-key"),
+                    role: Role::ReadWrite,
+                    namespaces: Some(vec!["acme".into()]),
+                },
+                AuthToken {
+                    name: "beta".into(),
+                    secret: Arc::from("beta-key"),
+                    role: Role::ReadOnly,
+                    namespaces: Some(vec!["beta".into()]),
+                },
+                AuthToken {
+                    name: "any".into(),
+                    secret: Arc::from("any-key"),
+                    role: Role::ReadWrite,
+                    namespaces: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // acme-key reaches acme but not beta.
+        assert_eq!(c.role_for_in("acme-key", "acme"), Some(Role::ReadWrite));
+        assert_eq!(c.role_for_in("acme-key", "beta"), None);
+        // beta-key reaches beta (read-only) but not acme.
+        assert_eq!(c.role_for_in("beta-key", "beta"), Some(Role::ReadOnly));
+        assert_eq!(c.role_for_in("beta-key", "acme"), None);
+        // Unscoped any-key reaches every namespace.
+        assert_eq!(c.role_for_in("any-key", "acme"), Some(Role::ReadWrite));
+        assert_eq!(c.role_for_in("any-key", "beta"), Some(Role::ReadWrite));
+        assert_eq!(c.role_for_in("any-key", "zzz"), Some(Role::ReadWrite));
+        // role_for (single-tenant sentinel) ignores scope: every token authenticates.
+        assert_eq!(c.role_for("acme-key"), Some(Role::ReadWrite));
+        assert_eq!(c.role_for("beta-key"), Some(Role::ReadOnly));
+        // Wrong token is denied everywhere.
+        assert_eq!(c.role_for_in("nope", "acme"), None);
+    }
+
+    #[test]
+    #[allow(clippy::needless_update)]
     fn role_for_distinguishes_read_only_and_read_write() {
         let c = AuthConfig {
             tokens: vec![
@@ -256,11 +339,13 @@ mod tests {
                     name: "rw".into(),
                     secret: Arc::from("write-key"),
                     role: Role::ReadWrite,
+                    namespaces: None,
                 },
                 AuthToken {
                     name: "ro".into(),
                     secret: Arc::from("read-key"),
                     role: Role::ReadOnly,
+                    namespaces: None,
                 },
             ],
             ..Default::default()

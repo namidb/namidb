@@ -46,6 +46,10 @@ pub struct JwtConfig {
     pub write_group: Option<String>,
     /// Group that grants read-only access.
     pub read_group: Option<String>,
+    /// Optional JWT claim listing the namespaces the token may reach. `None`
+    /// (default) = unscoped (any namespace). When set, a token grants its role
+    /// only to namespaces named in the claim.
+    pub namespaces_claim: Option<String>,
 }
 
 /// A live JWT validator: a JWKS key set (refreshed in the background) plus the
@@ -127,42 +131,69 @@ impl JwtValidator {
     }
 
     /// Validate `token` and resolve the [`Role`] from its group claim, or
-    /// `None` (fail-closed) on any failure.
+    /// `None` (fail-closed) on any failure. Namespace-agnostic (the single-
+    /// tenant / Bolt path).
     pub fn validate(&self, token: &str) -> Option<Role> {
+        self.validate_inner(token, None)
+    }
+
+    /// Like [`validate`](Self::validate) but additionally requires the token's
+    /// namespaces claim (when `namespaces_claim` is configured) to name
+    /// `namespace`. Unconfigured → unscoped (back-compat). Used by the
+    /// multi-tenant path.
+    pub fn validate_in(&self, token: &str, namespace: &str) -> Option<Role> {
+        self.validate_inner(token, Some(namespace))
+    }
+
+    fn validate_inner(&self, token: &str, namespace: Option<&str>) -> Option<Role> {
         let header = decode_header(token).ok()?;
         if !ACCEPTED_ALGS.contains(&header.alg) {
             return None; // refuse symmetric / "none" / unknown algs
         }
         let validation = self.validation_for(header.alg);
 
-        let role = {
-            let keys = self.keys.read().expect("jwt key lock poisoned");
-            match &header.kid {
-                // A `kid` pins one key; still fall back to trying all on failure.
-                Some(kid) => keys
-                    .get(kid)
-                    .and_then(|dk| self.try_decode(token, dk, &validation))
-                    .or_else(|| {
-                        keys.values()
-                            .find_map(|dk| self.try_decode(token, dk, &validation))
-                    }),
-                None => keys
-                    .values()
-                    .find_map(|dk| self.try_decode(token, dk, &validation)),
-            }
-        };
-        role
+        let keys = self.keys.read().expect("jwt key lock poisoned");
+        match &header.kid {
+            // A `kid` pins one key; still fall back to trying all on failure.
+            Some(kid) => keys
+                .get(kid)
+                .and_then(|dk| self.try_decode(token, dk, &validation, namespace))
+                .or_else(|| {
+                    keys.values()
+                        .find_map(|dk| self.try_decode(token, dk, &validation, namespace))
+                }),
+            None => keys
+                .values()
+                .find_map(|dk| self.try_decode(token, dk, &validation, namespace)),
+        }
     }
 
-    /// Decode against one key; on success, extract the group claim and map it.
+    /// Decode against one key; on success, extract the group claim (and the
+    /// namespaces claim when a namespace is being checked), and map to a Role.
     fn try_decode(
         &self,
         token: &str,
         key: &DecodingKey,
         validation: &Validation,
+        namespace: Option<&str>,
     ) -> Option<Role> {
-        // Decode to a generic JSON value so the group claim can live anywhere.
+        // Decode to a generic JSON value so the claims can live anywhere.
         let data = decode::<serde_json::Value>(token, key, validation).ok()?;
+
+        // Namespace scoping: if a namespace is being checked AND a namespaces
+        // claim is configured, the token must name that namespace. Unconfigured
+        // claim → unscoped (back-compat).
+        if let (Some(ns), Some(claim)) = (namespace, &self.config.namespaces_claim) {
+            let allowed = data
+                .claims
+                .get(claim)
+                .and_then(extract_group_strings)
+                .unwrap_or_default();
+            if !allowed.iter().any(|n| n == ns) {
+                return None;
+            }
+        }
+
         let groups = data
             .claims
             .get(&self.config.groups_claim)
@@ -278,6 +309,7 @@ mod tests {
                 groups_claim: "groups".into(),
                 write_group: write_group.map(String::from),
                 read_group: read_group.map(String::from),
+                namespaces_claim: None,
             },
             keys: Arc::new(std::sync::RwLock::new(map)),
         }
