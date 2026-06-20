@@ -25,4 +25,4 @@ the [RFCs](../../docs/rfc/) for the design rationale.
 
 ## License
 
-[Business Source License 1.1](../../LICENSE), © LESAI, Corp.
+[Business Source License 1.1](../../LICENSE), © NamiDB, Inc.

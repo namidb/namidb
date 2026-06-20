@@ -22,4 +22,4 @@ See the [NamiDB README](../../README.md) for the project overview.
 
 ## License
 
-[Business Source License 1.1](../../LICENSE), © LESAI, Corp.
+[Business Source License 1.1](../../LICENSE), © NamiDB, Inc.

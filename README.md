@@ -376,7 +376,7 @@ NamiDB is licensed under the [**Business Source License 1.1**](LICENSE).
 
 ### The bucket is the database.
 
-<sub>NamiDB is a product of <a href="https://namidb.com"><b>LESAI, Corp.</b></a>, Delaware, USA.</sub><br />
-<sub>© 2026 LESAI, Corp. All rights reserved.</sub>
+<sub>NamiDB is built by <a href="https://namidb.com"><b>NamiDB, Inc.</b></a>, Delaware, USA.</sub><br />
+<sub>© 2026 NamiDB, Inc. All rights reserved.</sub>
 
 </div>

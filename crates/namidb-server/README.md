@@ -226,4 +226,4 @@ for engine internals.
 
 ## License
 
-[Business Source License 1.1](../../LICENSE), © LESAI, Corp.
+[Business Source License 1.1](../../LICENSE), © NamiDB, Inc.

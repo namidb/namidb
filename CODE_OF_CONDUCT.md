@@ -1,6 +1,6 @@
 # Code of Conduct
 
-NamiDB is a project by [LESAI, Corp.](https://namidb.com). We
+NamiDB is a project by [NamiDB, Inc.](https://namidb.com). We
 want it to be a place where engineers from anywhere on the planet feel
 welcome to learn, contribute and disagree productively.
 
@@ -21,8 +21,7 @@ welcome to learn, contribute and disagree productively.
 
 This Code of Conduct applies in every project space — GitHub issues,
 pull requests, discussions, Discord (when launched), the commit log,
-and any public event where you are representing NamiDB or LESAI
-Studios, Corp.
+and any public event where you are representing NamiDB or NamiDB, Inc.
 
 ## Enforcement
 
