@@ -159,9 +159,12 @@ pub fn weakly_connected_components_cancellable(
         }
     }
 
-    // Assign dense component ids by canonical root.
+    // Assign dense component ids by canonical root. This is a second O(N) pass,
+    // so it also polls the deadline (a high-node-count sparse graph spends real
+    // time here, not just in the union phase above).
     let mut root_to_comp: HashMap<usize, usize> = HashMap::new();
     let mut assignment = HashMap::with_capacity(n);
+    since_check = 0;
     for (&node, &i) in &index {
         let root = uf.find(i);
         let comp = match root_to_comp.get(&root) {
@@ -173,6 +176,13 @@ pub fn weakly_connected_components_cancellable(
             }
         };
         assignment.insert(node, comp);
+        since_check += 1;
+        if since_check >= CANCEL_CHECK_STRIDE {
+            since_check = 0;
+            if cancel() {
+                return Err(Cancelled);
+            }
+        }
     }
     Ok(Components {
         assignment,

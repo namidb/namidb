@@ -24,14 +24,21 @@
 //!     "namespace": "acme"
 //! } }
 //! ```
-//! Expected response: `{ "result": { "allow": true } }` (OPA's data API), or a
-//! bare `{ "allow": true }` (a custom endpoint) — both accepted by [`decide`].
+//! Accepted responses (see [`decide`]) — point `--pdp-url` at whichever your
+//! deployment uses:
+//! - OPA `/v1/data/<path>` with an object rule: `{ "result": { "allow": true } }`
+//! - OPA `/v1/data/<path>` with a boolean rule: `{ "result": true }`
+//! - OPA `/v0/data/<path>` (raw value): a bare `true`
+//! - a custom endpoint: `{ "allow": true }`
+//!
+//! Prefer the `/v1/data/<path>` API: it returns 200 with no `result` field for
+//! an *undefined* decision (which [`decide`] treats as deny), whereas `/v0`
+//! returns a 404 for an undefined document (also a deny, but noisier).
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use namidb_query::LogicalPlan;
-use serde::Deserialize;
 
 use crate::auth::Principal;
 use crate::authz::{AuthzHook, Denied, SchemaOp};
@@ -46,7 +53,7 @@ pub struct OpaAuthz {
 
 impl OpaAuthz {
     /// Build a PDP client for `endpoint` (the full policy decision URL, e.g.
-    /// `http://opa:8181/v0/data/namidb/allow`). A short timeout bounds the
+    /// `http://opa:8181/v1/data/namidb/allow`). A short timeout bounds the
     /// added latency; a timeout is a fail-closed deny.
     pub fn new(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -83,31 +90,47 @@ impl OpaAuthz {
 }
 
 /// The policy decision over an already-fetched response body. `Ok(())` only
-/// when the body definitively says `allow: true`; every other case (parse
-/// failure, missing field, `false`) is a fail-closed [`Denied`].
+/// when the body definitively evaluates to `allow == true`; every other case
+/// (parse failure, missing field, `false`, OPA "undefined" empty object) is a
+/// fail-closed [`Denied`].
+///
+/// Accepts the shapes real OPA endpoints actually return, so an operator can
+/// point `--pdp-url` at either API without the decision silently becoming
+/// deny-all:
+/// - `/v1/data/<path>` with an object rule: `{"result":{"allow":true}}`
+/// - `/v1/data/<path>` with a boolean rule: `{"result":true}`
+/// - `/v0/data/<path>` (raw value): a bare `true` / `false`
+/// - a custom endpoint: `{"allow":true}`
 pub fn decide(body: &str) -> Result<(), Denied> {
-    #[derive(Deserialize)]
-    struct OpaResult {
-        result: Option<AllowBody>,
-        #[serde(flatten)]
-        bare: AllowBody,
-    }
-    #[derive(Deserialize, Default)]
-    struct AllowBody {
-        #[serde(default)]
-        allow: bool,
-    }
-    let parsed: OpaResult = match serde_json::from_str(body) {
-        Ok(p) => p,
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
         Err(e) => return Err(Denied::new(format!("policy response not understood: {e}"))),
     };
-    // OPA's data API nests under `result`; a bare endpoint returns `allow` at
-    // top level. Accept either, but require an explicit true.
-    let allow = parsed.result.map(|r| r.allow).unwrap_or(parsed.bare.allow);
+    let allow = extract_allow(&v).unwrap_or(false);
     if allow {
         Ok(())
     } else {
         Err(Denied::new("denied by policy"))
+    }
+}
+
+/// Pull a boolean allow-decision out of any accepted response shape, or `None`
+/// when the body does not definitively decide (→ caller fail-closes).
+fn extract_allow(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        // Bare boolean (OPA /v0/data raw value, or a custom boolean endpoint).
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Object(map) => {
+            // `{"result": ...}` — recurse into the OPA /v1 envelope (the inner
+            // value may itself be a bool or an {"allow":...} object).
+            if let Some(inner) = map.get("result") {
+                return extract_allow(inner);
+            }
+            // `{"allow": <bool>}` — require an actual boolean (a string/number
+            // "true" must NOT allow).
+            map.get("allow").and_then(serde_json::Value::as_bool)
+        }
+        _ => None,
     }
 }
 
@@ -180,11 +203,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_only_on_explicit_true() {
-        // OPA data-API shape.
+    fn allows_on_every_accepted_true_shape() {
+        // OPA /v1 object-rule envelope.
         assert!(decide(r#"{"result":{"allow":true}}"#).is_ok());
         assert!(decide(r#"{"result":{"allow":false}}"#).is_err());
-        // Bare shape.
+        // OPA /v1 boolean-rule envelope.
+        assert!(decide(r#"{"result":true}"#).is_ok());
+        assert!(decide(r#"{"result":false}"#).is_err());
+        // OPA /v0/data raw value (bare boolean).
+        assert!(decide("true").is_ok());
+        assert!(decide("false").is_err());
+        // Custom bare-allow object.
         assert!(decide(r#"{"allow":true}"#).is_ok());
         assert!(decide(r#"{"allow":false}"#).is_err());
     }
@@ -199,6 +228,8 @@ mod tests {
         // A truthy-looking non-bool must NOT allow.
         assert!(decide(r#"{"result":{"allow":"true"}}"#).is_err());
         assert!(decide(r#"{"allow":1}"#).is_err());
+        assert!(decide(r#""true""#).is_err()); // bare string, not bool
+        assert!(decide("1").is_err()); // bare number, not bool
     }
 
     fn principal() -> Principal {

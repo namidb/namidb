@@ -75,7 +75,7 @@ struct Cli {
     jwt_namespaces_claim: Option<String>,
 
     /// External policy-decision-point URL (OPA-style data API), e.g.
-    /// `http://opa:8181/v0/data/namidb/allow`. When set, every query and DDL
+    /// `http://opa:8181/v1/data/namidb/allow`. When set, every query and DDL
     /// is checked against the policy (fail-closed). Requires the `pdp` build
     /// feature; unset = no external policy.
     #[cfg(feature = "pdp")]

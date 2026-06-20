@@ -744,16 +744,26 @@ impl ManifestStore {
         const MAX_PROBE: u32 = 8192;
         let start = n;
         let mut probed = 0u32;
+        // Track whether we found the end of the family (a NotFound gap) vs.
+        // ran out of probe budget. Distinguishing these is load-bearing: a
+        // namespace whose true current sits *exactly* MAX_PROBE steps ahead
+        // exits the loop on the budget guard on the same iteration it would
+        // have found the gap, so `probed >= MAX_PROBE` alone would wrongly
+        // fail it. We only fail when the gap was genuinely not reached.
+        let mut gap_found = false;
         while probed < MAX_PROBE {
             let next = n.saturating_add(1);
             match self.store.head(&self.paths.pointer_version(next)).await {
                 Ok(_) => n = next,
-                Err(object_store::Error::NotFound { .. }) => break,
+                Err(object_store::Error::NotFound { .. }) => {
+                    gap_found = true;
+                    break;
+                }
                 Err(e) => return Err(Error::ObjectStore(e)),
             }
             probed += 1;
         }
-        if probed >= MAX_PROBE {
+        if !gap_found {
             // The probe ran the full window WITHOUT finding a gap, which means
             // the true current pointer is >8192 versions ahead of the lower
             // bound (`start`) we began from. Handing back `n` would serve a
