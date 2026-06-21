@@ -2,8 +2,8 @@
 
 | File | Where it appears | Notes |
 |---|---|---|
-| `namidb_2.png` | Top of `README.md`, hero block | Wide "Oracle of Graphs" key art — wordmark, tagline, and the feature list. 1536×1024. |
-| `namidb_3.png` | `README.md` "Architecture" section | "The bucket is the database" key art — the graph pouring into object storage. 1774×887. |
+| `namidb_3.png` | Top of `README.md`, hero block | Wide "The bucket is the database" key art — the graph pouring into object storage. 1774×887 (2:1). |
+| `namidb_2.png` | `README.md` "Architecture" section | "Oracle of Graphs" key art — wordmark, tagline, and the feature list. 1536×1024 (3:2). |
 | `logo_namidb.png` | `README.md` footer; canonical brand mark | Square NamiDB logo (isotype + wordmark), for the footer, favicons, and packaging. 1254×1254. |
 | `namidb-logo.jpeg` | *(superseded)* | Old wordmark strip, kept for history. Replaced as the hero by `namidb_2.png`. |
 | `namidb-architecture.svg` (+ `-dark`) | *(not currently embedded)* | Layered engine diagram (parser → optimizer → executor; LSM/SST/manifest; object stores). Available for docs; light + dark variants. |

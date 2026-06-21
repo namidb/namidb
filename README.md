@@ -1,7 +1,7 @@
 <div align="center">
 
 <p>
-  <img src=".assets/namidb_2.png" alt="NamiDB — the oracle of graphs" width="820" />
+  <img src=".assets/namidb_3.png" alt="NamiDB — the bucket is the database" width="820" />
 </p>
 
 # NamiDB
@@ -373,7 +373,7 @@ See [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md) for every sub
 ## Architecture
 
 <p align="center">
-  <img src=".assets/namidb_3.png" alt="The bucket is the database — NamiDB stores your graph directly in object storage" width="820" />
+  <img src=".assets/namidb_2.png" alt="NamiDB — the oracle of graphs" width="820" />
 </p>
 
 ```
