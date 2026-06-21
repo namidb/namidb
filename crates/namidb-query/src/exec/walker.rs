@@ -768,6 +768,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
             } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let length = resolve_length(length, params)?;
                 execute_expand(
                     rows,
                     source,
@@ -776,7 +777,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     rel_alias.as_deref(),
                     target_alias,
                     target_labels,
-                    *length,
+                    length.clone(),
                     *optional,
                     *back_reference,
                     *shortest,
@@ -790,7 +791,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                         edge_type.as_deref(),
                         *direction,
                         target_labels,
-                        *length,
+                        length,
                         *back_reference,
                     ),
                     None,
@@ -894,6 +895,7 @@ fn execute_capped<'a>(
             } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let length = resolve_length(length, params)?;
                 execute_expand(
                     rows,
                     source,
@@ -902,7 +904,7 @@ fn execute_capped<'a>(
                     rel_alias.as_deref(),
                     target_alias,
                     target_labels,
-                    *length,
+                    length.clone(),
                     *optional,
                     *back_reference,
                     *shortest,
@@ -916,7 +918,7 @@ fn execute_capped<'a>(
                         edge_type.as_deref(),
                         *direction,
                         target_labels,
-                        *length,
+                        length,
                         *back_reference,
                     ),
                     Some(cap),
@@ -971,6 +973,47 @@ fn clamp_hop_max(max: u32) -> u32 {
     }
 }
 
+/// Read a variable-length bound supplied as a query parameter (`*1..$n`) as a
+/// non-negative hop count.
+fn resolve_hop_param(name: &str, params: &Params) -> Result<u32, ExecError> {
+    match params.get(name) {
+        Some(RuntimeValue::Integer(n)) if *n >= 0 => Ok(*n as u32),
+        Some(RuntimeValue::Integer(_)) => Err(ExecError::Runtime(format!(
+            "variable-length bound `${name}` must be non-negative"
+        ))),
+        Some(other) => Err(ExecError::Runtime(format!(
+            "variable-length bound `${name}` must be an integer, got {}",
+            other.type_name()
+        ))),
+        None => Err(ExecError::Runtime(format!(
+            "variable-length bound parameter `${name}` not provided"
+        ))),
+    }
+}
+
+/// Substitute any parameter bounds in `length` with their runtime values,
+/// yielding a fixed range the expand executors can consume directly.
+pub(crate) fn resolve_length(
+    length: &Option<crate::parser::RelationshipLength>,
+    params: &Params,
+) -> Result<Option<crate::parser::RelationshipLength>, ExecError> {
+    let Some(l) = length else { return Ok(None) };
+    let min = match &l.min_param {
+        Some(p) => resolve_hop_param(p, params)?,
+        None => l.min,
+    };
+    let max = match &l.max_param {
+        Some(p) => resolve_hop_param(p, params)?,
+        None => l.max,
+    };
+    if max < min {
+        return Err(ExecError::Runtime(format!(
+            "variable-length range resolves to *{min}..{max} (max < min)"
+        )));
+    }
+    Ok(Some(crate::parser::RelationshipLength::fixed(min, max)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_expand(
     rows: Vec<Row>,
@@ -992,8 +1035,8 @@ pub(crate) async fn execute_expand(
 ) -> Result<Vec<Row>, ExecError> {
     namidb_core::profile_scope!("walker::execute_expand");
     let edge_types = resolve_edge_types(snapshot, edge_type);
-    let min = length.map(|l| l.min).unwrap_or(1);
-    let max = clamp_hop_max(length.map(|l| l.max).unwrap_or(1));
+    let min = length.as_ref().map(|l| l.min).unwrap_or(1);
+    let max = clamp_hop_max(length.as_ref().map(|l| l.max).unwrap_or(1));
 
     let mut out = Vec::new();
     for row in rows {
@@ -3087,6 +3130,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
+                let length = resolve_length(length, params)?;
                 // The factor expand executor does not materialise a path binding
                 // (`p`) or a shortestPath trail. Route those to the flat executor
                 // (which does) and re-wrap — otherwise `p` / `nodes(p)` downstream
@@ -3101,7 +3145,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         rel_alias.as_deref(),
                         target_alias,
                         target_labels,
-                        *length,
+                        length,
                         *optional,
                         *back_reference,
                         *shortest,
@@ -3122,7 +3166,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     rel_alias.as_deref(),
                     target_alias,
                     target_labels,
-                    *length,
+                    length.clone(),
                     *optional,
                     *back_reference,
                     snapshot,
@@ -3134,7 +3178,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         edge_type.as_deref(),
                         *direction,
                         target_labels,
-                        *length,
+                        length,
                         *back_reference,
                     ),
                 )
@@ -3580,8 +3624,8 @@ async fn execute_expand_factor(
 ) -> Result<FactorRowSet, ExecError> {
     namidb_core::profile_scope!("walker::execute_expand_factor");
     let edge_types = resolve_edge_types(snapshot, edge_type);
-    let min = length.map(|l| l.min).unwrap_or(1);
-    let max = clamp_hop_max(length.map(|l| l.max).unwrap_or(1));
+    let min = length.as_ref().map(|l| l.min).unwrap_or(1);
+    let max = clamp_hop_max(length.as_ref().map(|l| l.max).unwrap_or(1));
 
     let FactorRowSet {
         mut arena,

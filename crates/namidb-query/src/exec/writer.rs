@@ -485,6 +485,7 @@ fn execute_write_inner<'a>(
             } if input.contains_write() => {
                 let input_rows = execute_write_inner(input, writer, params, outcome).await?;
                 let snap = writer.overlay_snapshot();
+                let length = crate::exec::walker::resolve_length(length, params)?;
                 crate::exec::walker::execute_expand(
                     input_rows,
                     source,
@@ -493,7 +494,7 @@ fn execute_write_inner<'a>(
                     rel_alias.as_deref(),
                     target_alias,
                     target_labels,
-                    *length,
+                    length,
                     *optional,
                     *back_reference,
                     *shortest,

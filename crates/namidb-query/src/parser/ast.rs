@@ -600,10 +600,33 @@ pub enum RelationshipDirection {
 /// `*1..3` — variable-length range. Bounds are inclusive. An open upper bound
 /// (`*`, `*N..`, `*..` with no max) is encoded as `max == u32::MAX`; the
 /// executor clamps it to [`UNBOUNDED_VAR_LENGTH_CAP`] hops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A bound may instead come from a query parameter (`*1..$n`, `*$n`): then
+/// `min_param` / `max_param` hold the parameter name and the matching `min` /
+/// `max` field is a placeholder until the executor resolves it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationshipLength {
     pub min: u32,
     pub max: u32,
+    pub min_param: Option<String>,
+    pub max_param: Option<String>,
+}
+
+impl RelationshipLength {
+    /// A fixed (parameter-free) range. Convenience for tests and rewrites.
+    pub fn fixed(min: u32, max: u32) -> Self {
+        Self {
+            min,
+            max,
+            min_param: None,
+            max_param: None,
+        }
+    }
+
+    /// Whether either bound is supplied by a parameter (resolved at execution).
+    pub fn has_param(&self) -> bool {
+        self.min_param.is_some() || self.max_param.is_some()
+    }
 }
 
 /// Hop cap applied to an open-ended variable-length traversal (`*`, `*N..`).

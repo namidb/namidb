@@ -669,7 +669,7 @@ mod tests {
     fn variable_length_chain_rejected() {
         let mut plan = expand(scan("a", "Person"), "a", "b", "Person", false);
         if let LogicalPlan::Expand { length, .. } = &mut plan {
-            *length = Some(crate::parser::RelationshipLength { min: 1, max: 3 });
+            *length = Some(crate::parser::RelationshipLength::fixed(1, 3));
         }
         let closed = expand(plan, "b", "a", "Person", true);
         assert!(try_rewrite_chain(&closed).is_none());

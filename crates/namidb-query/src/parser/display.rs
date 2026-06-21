@@ -416,11 +416,31 @@ impl fmt::Display for RelationshipPattern {
                 }
                 write!(f, "{}", t)?;
             }
-            if let Some(len) = self.length {
-                if len.min == len.max {
-                    write!(f, "*{}", len.min)?;
-                } else {
-                    write!(f, "*{}..{}", len.min, len.max)?;
+            if let Some(len) = &self.length {
+                f.write_str("*")?;
+                // Lower bound: parameter, or the literal unless it is the
+                // default 1 of an open form.
+                match &len.min_param {
+                    Some(p) => write!(f, "${p}")?,
+                    None => {
+                        let open_upper = len.max_param.is_none() && len.max == u32::MAX;
+                        if !(open_upper && len.min == 1) {
+                            write!(f, "{}", len.min)?;
+                        }
+                    }
+                }
+                let same_fixed =
+                    len.min_param.is_none() && len.max_param.is_none() && len.min == len.max;
+                if !same_fixed {
+                    f.write_str("..")?;
+                    match &len.max_param {
+                        Some(p) => write!(f, "${p}")?,
+                        None => {
+                            if len.max != u32::MAX {
+                                write!(f, "{}", len.max)?;
+                            }
+                        }
+                    }
                 }
             }
             if let Some(p) = &self.properties {

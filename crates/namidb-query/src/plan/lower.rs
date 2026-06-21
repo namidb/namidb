@@ -877,9 +877,10 @@ fn validate_shortest_path_pattern_v0(
         ));
     }
     let (rel, target) = &elem.chain[0];
-    // 3. Finite upper bound — `*..N` or `*min..N` or fixed `*N`.
-    match rel.length {
-        Some(crate::parser::RelationshipLength { max, .. }) if max < u32::MAX => {}
+    // 3. Finite upper bound — `*..N` or `*min..N` or fixed `*N`. A parameterised
+    //    or open (`*`, `*N..`) upper bound is not statically finite.
+    match &rel.length {
+        Some(l) if l.max_param.is_none() && l.max < u32::MAX => {}
         _ => {
             return Err(LowerError::new(
                 LowerErrorKind::UnsupportedFeature,
@@ -1189,7 +1190,7 @@ fn lower_rel_node(
         rel_alias,
         target_alias: target_alias.clone(),
         target_labels,
-        length: rel.length,
+        length: rel.length.clone(),
         optional,
         back_reference: target_already_bound,
         shortest,

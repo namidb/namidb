@@ -1133,7 +1133,7 @@ mod tests {
             rel_alias: None,
             target_alias: "q".into(),
             target_labels: vec![],
-            length: Some(crate::parser::ast::RelationshipLength { min: 1, max: 10 }),
+            length: Some(crate::parser::ast::RelationshipLength::fixed(1, 10)),
             optional: false,
             back_reference: false,
             shortest: ShortestMode::None,

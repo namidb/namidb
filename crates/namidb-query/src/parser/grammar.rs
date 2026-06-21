@@ -1537,50 +1537,53 @@ impl<'src> Parser<'src> {
         star_span: SourceSpan,
     ) -> Result<RelationshipLength, ParseError> {
         // Forms (`u32::MAX` for max encodes an open upper bound; the executor
-        // caps it at `UNBOUNDED_VAR_LENGTH_CAP`):
-        //   *        → 1..∞
-        //   *N       → N..N
-        //   *N..M    → N..M
-        //   *..M     → 1..M
-        //   *N..     → N..∞
-        let min_lit = self.eat_integer();
-        let min = min_lit.map(|(n, _)| n).unwrap_or(1);
-        let max = if self.eat(&Token::Range).is_some() {
-            // `..` present: an integer after it bounds the upper end; otherwise
-            // it is open (`*N..`).
-            self.eat_integer()
-                .map(|(n, _)| n)
-                .unwrap_or(i64::from(u32::MAX))
-        } else if min_lit.is_some() {
-            // `*N` exact.
-            min
+        // caps it at `UNBOUNDED_VAR_LENGTH_CAP`). A bound may be an integer or a
+        // `$param` resolved at execution:
+        //   *  *N  *N..M  *..M  *N..  *$n  *1..$n  *$a..$b
+        let min_bound = self.eat_hop_bound();
+        let (min, min_param) = min_bound.clone().unwrap_or((1, None));
+        let (max, max_param) = if self.eat(&Token::Range).is_some() {
+            // `..` present: a bound after it caps the upper end; else open.
+            self.eat_hop_bound().unwrap_or((u32::MAX, None))
+        } else if min_bound.is_some() {
+            // `*N` / `*$n` exact: max equals min.
+            (min, min_param.clone())
         } else {
             // Bare `*` — open upper bound.
-            i64::from(u32::MAX)
+            (u32::MAX, None)
         };
-        if min < 0 || max < 0 || max < min {
+        // Validate only when both ends are literal (params checked at execution).
+        if min_param.is_none() && max_param.is_none() && max < min {
             return Err(ParseError::new(
                 ErrorCode::InvalidNumber,
                 format!("invalid variable-length range *{}..{}", min, max),
                 star_span,
             ));
         }
-        // `min == 0` (zero-length patterns) is syntactically accepted; the
-        // semantic check is deferred to lowering.
         Ok(RelationshipLength {
-            min: min as u32,
-            max: max as u32,
+            min,
+            max,
+            min_param,
+            max_param,
         })
     }
 
-    fn eat_integer(&mut self) -> Option<(i64, SourceSpan)> {
+    /// One bound of a variable-length range: an integer or a `$param`. Returns
+    /// `(value, param)` — for a parameter the value is a placeholder.
+    fn eat_hop_bound(&mut self) -> Option<(u32, Option<String>)> {
         match self.peek() {
             Some(Token::Integer(_)) => {
                 let t = self.bump().unwrap();
-                if let Token::Integer(n) = t.value {
-                    Some((n, t.span))
-                } else {
-                    None
+                match t.value {
+                    Token::Integer(n) if n >= 0 => Some((n as u32, None)),
+                    _ => Some((0, None)),
+                }
+            }
+            Some(Token::Parameter(_)) => {
+                let t = self.bump().unwrap();
+                match t.value {
+                    Token::Parameter(name) => Some((u32::MAX, Some(name))),
+                    _ => None,
                 }
             }
             _ => None,
@@ -2380,8 +2383,8 @@ mod tests {
         match &q.head.clauses[0] {
             Clause::Match(m) => {
                 let rel = &m.patterns[0].element.chain[0].0;
-                assert_eq!(rel.length.unwrap().min, 1);
-                assert_eq!(rel.length.unwrap().max, 3);
+                assert_eq!(rel.length.as_ref().unwrap().min, 1);
+                assert_eq!(rel.length.as_ref().unwrap().max, 3);
             }
             _ => panic!(),
         }
@@ -2394,7 +2397,7 @@ mod tests {
         let q = ok("MATCH (a)-[:KNOWS*]->(b) RETURN b");
         match &q.head.clauses[0] {
             Clause::Match(m) => {
-                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                let len = m.patterns[0].element.chain[0].0.length.as_ref().unwrap();
                 assert_eq!(len.min, 1);
                 assert_eq!(len.max, u32::MAX);
             }
@@ -2403,7 +2406,7 @@ mod tests {
         let q2 = ok("MATCH (a)-[:KNOWS*2..]->(b) RETURN b");
         match &q2.head.clauses[0] {
             Clause::Match(m) => {
-                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                let len = m.patterns[0].element.chain[0].0.length.as_ref().unwrap();
                 assert_eq!(len.min, 2);
                 assert_eq!(len.max, u32::MAX);
             }
@@ -2576,7 +2579,7 @@ mod tests {
         match &q.head.clauses[0] {
             Clause::Match(m) => {
                 assert!(m.optional);
-                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                let len = m.patterns[0].element.chain[0].0.length.as_ref().unwrap();
                 assert_eq!(len.max, u32::MAX);
             }
             _ => panic!(),

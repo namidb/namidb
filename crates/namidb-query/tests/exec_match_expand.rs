@@ -1970,3 +1970,66 @@ async fn unbounded_var_length_traverses_the_whole_chain() {
         .collect();
     assert_eq!(ns2, vec![2, 3], "*2.. starts at the 2-hop node");
 }
+
+#[tokio::test]
+async fn parameterized_var_length_bound() {
+    let mut writer = WriterSession::open(store(), paths("exec-param-varlen"))
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..5).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("n".to_string(), CoreValue::I64(i as i64));
+        writer
+            .upsert_node(
+                "N",
+                *id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    for w in ids.windows(2) {
+        writer.upsert_edge("R", w[0], w[1], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // `*1..$depth` — the upper bound comes from a parameter.
+    let q = parse("MATCH (a:N {n: 0})-[:R*1..$depth]->(x:N) RETURN x.n AS n ORDER BY n").unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let mut params = Params::new();
+    params.insert("depth".to_string(), RuntimeValue::Integer(2));
+    let rows = execute(&plan, &snapshot, &params).await.unwrap();
+    let ns: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ns, vec![1, 2], "depth=2 reaches the 1- and 2-hop nodes");
+
+    // Same plan, larger depth → more reachable nodes (depth from a param at exec).
+    let mut params3 = Params::new();
+    params3.insert("depth".to_string(), RuntimeValue::Integer(4));
+    let rows3 = execute(&plan, &snapshot, &params3).await.unwrap();
+    let ns3: Vec<i64> = rows3
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ns3,
+        vec![1, 2, 3, 4],
+        "depth=4 reaches all downstream nodes"
+    );
+}
