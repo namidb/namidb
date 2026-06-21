@@ -61,6 +61,7 @@ impl fmt::Display for Clause {
             Clause::CreateFulltextIndex(c) => fmt::Display::fmt(c, f),
             Clause::CreateConstraint(c) => fmt::Display::fmt(c, f),
             Clause::CreateIndex(c) => fmt::Display::fmt(c, f),
+            Clause::ShowSchema(c) => fmt::Display::fmt(c, f),
             Clause::Foreach(c) => fmt::Display::fmt(c, f),
             Clause::CallSubquery(c) => fmt::Display::fmt(c, f),
             Clause::Call(c) => fmt::Display::fmt(c, f),
@@ -178,11 +179,21 @@ impl fmt::Display for CreateConstraintClause {
         if let Some(n) = &self.name {
             write!(f, "{n} ")?;
         }
-        write!(
-            f,
-            "FOR (n:{}) REQUIRE n.{} IS UNIQUE",
-            self.label, self.property
-        )
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        let props = self
+            .properties
+            .iter()
+            .map(|p| format!("n.{p}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A single property renders bare; a composite one in parentheses.
+        if self.properties.len() == 1 {
+            write!(f, "FOR (n:{}) REQUIRE {props} IS UNIQUE", self.label)
+        } else {
+            write!(f, "FOR (n:{}) REQUIRE ({props}) IS UNIQUE", self.label)
+        }
     }
 }
 
@@ -192,7 +203,19 @@ impl fmt::Display for CreateIndexClause {
         if let Some(n) = &self.name {
             write!(f, "{n} ")?;
         }
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
         write!(f, "FOR (n:{}) ON (n.{})", self.label, self.property)
+    }
+}
+
+impl fmt::Display for ShowSchemaClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ShowKind::Constraints => f.write_str("SHOW CONSTRAINTS"),
+            ShowKind::Indexes => f.write_str("SHOW INDEXES"),
+        }
     }
 }
 

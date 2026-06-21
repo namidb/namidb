@@ -388,6 +388,9 @@ impl<'src> Parser<'src> {
                     self.parse_call_clause().map(Clause::Call)
                 }
             }
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SHOW") => {
+                self.parse_show_schema().map(Clause::ShowSchema)
+            }
             Some(other) => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 format!("expected a clause keyword, found `{}`", other.label()),
@@ -652,15 +655,44 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Optional constraint/index name: an identifier that is not the `FOR`
-    /// soft keyword (which would start the target clause instead).
+    /// Optional constraint/index name: an identifier that is not a soft keyword
+    /// starting the rest of the statement (`FOR` → target, `IF` → `IF NOT
+    /// EXISTS`). `ON` is a hard keyword token, so it never reads as a name.
     fn parse_optional_ddl_name(&mut self) -> Option<Identifier> {
         if let Some(Token::Ident(n)) = self.peek() {
-            if !n.eq_ignore_ascii_case("FOR") {
+            if !n.eq_ignore_ascii_case("FOR") && !n.eq_ignore_ascii_case("IF") {
                 return self.expect_identifier().ok();
             }
         }
         None
+    }
+
+    /// Optional `IF NOT EXISTS` (after a DDL object's name). Consumes the three
+    /// tokens only when all are present; returns whether the clause was seen.
+    fn parse_if_not_exists(&mut self) -> Result<bool, ParseError> {
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("IF")) {
+            self.bump(); // IF
+            self.expect_in(&Token::Not, "`IF NOT EXISTS`")?;
+            self.expect_soft_keyword("EXISTS")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parse a constraint's property reference(s): either a single `n.prop` or a
+    /// parenthesized list `(n.a, n.b, …)` for a composite constraint.
+    fn parse_ddl_property_refs(&mut self) -> Result<Vec<Identifier>, ParseError> {
+        if self.eat(&Token::LParen).is_some() {
+            let mut props = vec![self.parse_ddl_property_ref()?];
+            while self.eat(&Token::Comma).is_some() {
+                props.push(self.parse_ddl_property_ref()?);
+            }
+            self.expect_in(&Token::RParen, "constraint property list")?;
+            Ok(props)
+        } else {
+            Ok(vec![self.parse_ddl_property_ref()?])
+        }
     }
 
     /// Parse `(<var>:<Label>)` returning the label identifier (the variable is
@@ -681,13 +713,16 @@ impl<'src> Parser<'src> {
         self.expect_identifier()
     }
 
-    /// `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE`
-    /// (Neo4j 5), or the legacy `ON (n:Label) ASSERT n.prop IS UNIQUE` (Neo4j 4).
+    /// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE (n.p, …)
+    /// IS UNIQUE` (Neo4j 5), or the legacy `ON (n:Label) ASSERT … IS UNIQUE`
+    /// (Neo4j 4). The `REQUIRE`/`ASSERT` target is a single `n.prop` or a
+    /// parenthesized list for a composite constraint.
     fn parse_create_constraint(&mut self) -> Result<CreateConstraintClause, ParseError> {
         let start = self.peek_span().start;
         self.expect(&Token::Create)?;
         self.expect_soft_keyword("CONSTRAINT")?;
         let name = self.parse_optional_ddl_name();
+        let if_not_exists = self.parse_if_not_exists()?;
         // FOR … REQUIRE … (5.x) or ON … ASSERT … (4.x).
         let assert_kw = if self.eat(&Token::On).is_some() {
             "ASSERT"
@@ -697,24 +732,63 @@ impl<'src> Parser<'src> {
         };
         let label = self.parse_ddl_node_target()?;
         self.expect_soft_keyword(assert_kw)?;
-        let property = self.parse_ddl_property_ref()?;
+        let properties = self.parse_ddl_property_refs()?;
         self.expect_in(&Token::Is, "constraint requires `IS UNIQUE`")?;
         let end = self.expect_soft_keyword("UNIQUE")?.end;
         Ok(CreateConstraintClause {
             name,
             label,
-            property,
+            properties,
+            if_not_exists,
             span: SourceSpan::new(start, end),
         })
     }
 
-    /// `CREATE INDEX [name] FOR (n:Label) ON (n.prop)` (Neo4j 5), or the legacy
-    /// `ON :Label(prop)` (Neo4j 4).
+    /// `SHOW CONSTRAINT[S]` / `SHOW INDEX[ES]` — schema introspection. Only the
+    /// bare form; trailing Neo4j modifiers (`BRIEF`/`VERBOSE`/`YIELD …`) are not
+    /// accepted.
+    fn parse_show_schema(&mut self) -> Result<ShowSchemaClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("SHOW")?;
+        let span = self.peek_span();
+        let kind = match self.peek() {
+            Some(Token::Ident(kw))
+                if kw.eq_ignore_ascii_case("CONSTRAINTS")
+                    || kw.eq_ignore_ascii_case("CONSTRAINT") =>
+            {
+                ShowKind::Constraints
+            }
+            Some(Token::Ident(kw))
+                if kw.eq_ignore_ascii_case("INDEXES") || kw.eq_ignore_ascii_case("INDEX") =>
+            {
+                ShowKind::Indexes
+            }
+            other => {
+                return Err(ParseError::new(
+                    ErrorCode::UnexpectedToken,
+                    format!(
+                        "expected `CONSTRAINTS` or `INDEXES` after `SHOW`, found `{}`",
+                        other.map(|t| t.label()).unwrap_or("end of input")
+                    ),
+                    span,
+                ));
+            }
+        };
+        self.bump(); // consume the object keyword
+        Ok(ShowSchemaClause {
+            kind,
+            span: SourceSpan::new(start, span.end),
+        })
+    }
+
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.prop)` (Neo4j 5),
+    /// or the legacy `ON :Label(prop)` (Neo4j 4).
     fn parse_create_index(&mut self) -> Result<CreateIndexClause, ParseError> {
         let start = self.peek_span().start;
         self.expect(&Token::Create)?;
         self.expect_soft_keyword("INDEX")?;
         let name = self.parse_optional_ddl_name();
+        let if_not_exists = self.parse_if_not_exists()?;
         let (label, property, end);
         if self.eat(&Token::On).is_some() {
             // Legacy: ON :Label(prop)
@@ -736,6 +810,7 @@ impl<'src> Parser<'src> {
             name,
             label,
             property,
+            if_not_exists,
             span: SourceSpan::new(start, end),
         })
     }
@@ -3125,5 +3200,116 @@ mod tests {
             "lower error should name the feature, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn create_constraint_single_property() {
+        let q = ok("CREATE CONSTRAINT FOR (n:User) REQUIRE n.email IS UNIQUE");
+        assert_eq!(q.head.clauses.len(), 1);
+        let c = match &q.head.clauses[0] {
+            Clause::CreateConstraint(c) => c,
+            other => panic!("expected CreateConstraint, got {other:?}"),
+        };
+        assert_eq!(c.label.name, "User");
+        assert_eq!(c.properties.len(), 1);
+        assert_eq!(c.properties[0].name, "email");
+        assert!(!c.if_not_exists);
+        assert!(c.name.is_none());
+        assert!(q.as_create_constraint().is_some());
+    }
+
+    #[test]
+    fn create_constraint_composite_properties() {
+        let q = ok("CREATE CONSTRAINT uq FOR (n:Cfg) \
+             REQUIRE (n.tenant_id, n.name, n.parameterSet) IS UNIQUE");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateConstraint(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.name.as_ref().unwrap().name, "uq");
+        assert_eq!(c.label.name, "Cfg");
+        let props: Vec<_> = c.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(props, ["tenant_id", "name", "parameterSet"]);
+    }
+
+    #[test]
+    fn create_constraint_if_not_exists_named_and_anonymous() {
+        let q = ok("CREATE CONSTRAINT IF NOT EXISTS FOR (n:User) REQUIRE n.email IS UNIQUE");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateConstraint(c) => c,
+            _ => panic!(),
+        };
+        assert!(c.if_not_exists);
+        // `IF` must not be swallowed as the constraint name.
+        assert!(c.name.is_none());
+
+        let q2 = ok("CREATE CONSTRAINT my_c IF NOT EXISTS FOR (n:User) REQUIRE n.email IS UNIQUE");
+        let c2 = match &q2.head.clauses[0] {
+            Clause::CreateConstraint(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c2.name.as_ref().unwrap().name, "my_c");
+        assert!(c2.if_not_exists);
+    }
+
+    #[test]
+    fn create_constraint_legacy_assert_still_parses() {
+        let q = ok("CREATE CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateConstraint(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.properties[0].name, "email");
+    }
+
+    #[test]
+    fn create_index_if_not_exists() {
+        let q = ok("CREATE INDEX IF NOT EXISTS FOR (n:User) ON (n.email)");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateIndex(c) => c,
+            _ => panic!(),
+        };
+        assert!(c.if_not_exists);
+        assert_eq!(c.property.name, "email");
+    }
+
+    #[test]
+    fn show_constraints_and_indexes_parse() {
+        for (src, want) in [
+            ("SHOW CONSTRAINTS", ShowKind::Constraints),
+            ("SHOW CONSTRAINT", ShowKind::Constraints),
+            ("SHOW INDEXES", ShowKind::Indexes),
+            ("SHOW INDEX", ShowKind::Indexes),
+        ] {
+            let q = ok(src);
+            let c = match &q.head.clauses[0] {
+                Clause::ShowSchema(c) => c,
+                other => panic!("expected ShowSchema for {src}, got {other:?}"),
+            };
+            assert_eq!(c.kind, want, "for {src}");
+            assert!(q.as_show_schema().is_some());
+        }
+        assert_eq!(err_code("SHOW TABLES"), ErrorCode::UnexpectedToken);
+    }
+
+    #[test]
+    fn ddl_constraint_index_show_roundtrip() {
+        let cases = [
+            "CREATE CONSTRAINT FOR (n:User) REQUIRE n.email IS UNIQUE",
+            "CREATE CONSTRAINT uq IF NOT EXISTS FOR (n:Cfg) REQUIRE (n.a, n.b, n.c) IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (n:User) ON (n.email)",
+            "SHOW CONSTRAINTS",
+            "SHOW INDEXES",
+        ];
+        for src in cases {
+            let q1 = ok(src);
+            let rendered = format!("{q1}");
+            let q2 = ok(&rendered);
+            assert_eq!(
+                format!("{q1}"),
+                format!("{q2}"),
+                "round-trip diverged for {src:?}"
+            );
+        }
     }
 }

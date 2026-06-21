@@ -77,8 +77,12 @@ pub enum SchemaOp<'a> {
         label: &'a str,
         properties: &'a [String],
     },
-    /// `CREATE CONSTRAINT … IS UNIQUE` over `(label, property)`.
-    CreateConstraint { label: &'a str, property: &'a str },
+    /// `CREATE CONSTRAINT … IS UNIQUE` over `(label, properties)` — one entry
+    /// for a single-property constraint, several for a composite one.
+    CreateConstraint {
+        label: &'a str,
+        properties: &'a [String],
+    },
     /// `CREATE INDEX … ON …` over `(label, property)`.
     CreateIndex { label: &'a str, property: &'a str },
 }

@@ -11,6 +11,7 @@ pub mod factor;
 pub mod leapfrog;
 pub mod limits;
 pub mod row;
+pub mod show;
 pub mod text_scoring;
 pub mod value;
 pub mod walker;
@@ -22,6 +23,7 @@ pub use factor::{
 };
 pub use leapfrog::{LeapfrogIntersect, MergeSortedUnion, OrdIterator, SortedSliceIter};
 pub use row::Row;
+pub use show::{show_constraints_rows, show_indexes_rows, show_schema_columns};
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{execute, execute_factor_path, execute_flat_path, execute_with_limits, ExecError};
 pub use writer::{

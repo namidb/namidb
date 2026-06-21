@@ -37,8 +37,8 @@ pub use cost::{
 pub use exec::{
     enforce_node_unique_constraints, evaluate, execute, execute_factor_path, execute_flat_path,
     execute_with_limits, execute_write, execute_write_staged, execute_write_staged_with_deadline,
-    execute_write_with_deadline, factorize_enabled, EvalError, ExecError, Params, Row,
-    RuntimeValue, WriteOutcome,
+    execute_write_with_deadline, factorize_enabled, show_constraints_rows, show_indexes_rows,
+    show_schema_columns, EvalError, ExecError, Params, Row, RuntimeValue, WriteOutcome,
 };
 pub use optimize::{convert_cross_to_hash, normalize_filters, optimize, predicate_pushdown};
 pub use parser::{parse, ParseError, ParseResult, Query};

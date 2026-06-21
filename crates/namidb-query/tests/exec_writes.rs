@@ -1598,3 +1598,96 @@ async fn correlated_call_subquery_writes_per_outer_row() {
         .collect();
     assert_eq!(owners, vec!["a", "b"], "one City per Person, correlated");
 }
+
+#[tokio::test]
+async fn composite_unique_create_rejects_duplicate_tuple() {
+    let mut writer = WriterSession::open(store(), paths("w-composite-create"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {name: 'Ann', age: 30})").await;
+    // Register a composite uniqueness constraint over (name, age).
+    let props = vec!["name".to_string(), "age".to_string()];
+    writer
+        .create_unique_constraint_named(None, "Person", &props, false)
+        .await
+        .unwrap();
+
+    // Same name, different age → distinct tuple → allowed.
+    write_q(&mut writer, "CREATE (:Person {name: 'Ann', age: 31})").await;
+    // Same age, different name → allowed.
+    write_q(&mut writer, "CREATE (:Person {name: 'Bob', age: 30})").await;
+
+    // Exact (name, age) duplicate → rejected.
+    let plan = lower(&parse("CREATE (:Person {name: 'Ann', age: 30})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate (name, age) tuple must be rejected");
+    assert!(
+        format!("{err:?}").contains("composite unique"),
+        "expected a composite-unique error, got: {err:?}"
+    );
+
+    // A node missing one of the constraint's properties is exempt.
+    write_q(&mut writer, "CREATE (:Person {name: 'Cara'})").await;
+    write_q(&mut writer, "CREATE (:Person {name: 'Cara'})").await;
+
+    let snap = writer.snapshot();
+    assert_eq!(snap.scan_label("Person").await.unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn composite_unique_set_rejects_collision_allows_self_update() {
+    let mut writer = WriterSession::open(store(), paths("w-composite-set"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {name: 'Ann', age: 30})").await;
+    write_q(&mut writer, "CREATE (:Person {name: 'Bob', age: 30})").await;
+    let props = vec!["name".to_string(), "age".to_string()];
+    writer
+        .create_unique_constraint_named(None, "Person", &props, false)
+        .await
+        .unwrap();
+
+    // Moving Bob onto Ann's (name, age) tuple is rejected.
+    let plan = lower(&parse("MATCH (p:Person {name: 'Bob'}) SET p.name = 'Ann'").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("SET onto another node's composite tuple must be rejected");
+    assert!(
+        format!("{err:?}").contains("composite unique"),
+        "expected a composite-unique error, got: {err:?}"
+    );
+
+    // A self-update (writing the same value) is allowed.
+    write_q(&mut writer, "MATCH (p:Person {name: 'Ann'}) SET p.age = 30").await;
+}
+
+#[tokio::test]
+async fn composite_unique_add_label_rejects_collision() {
+    let mut writer = WriterSession::open(store(), paths("w-composite-addlabel"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {a: 1, b: 2})").await;
+    let props = vec!["a".to_string(), "b".to_string()];
+    writer
+        .create_unique_constraint_named(None, "Person", &props, false)
+        .await
+        .unwrap();
+
+    // A :Tmp node with the same (a, b) is fine — the constraint is on :Person.
+    write_q(&mut writer, "CREATE (:Tmp {a: 1, b: 2})").await;
+
+    // Promoting it to :Person would create a duplicate tuple → rejected.
+    let plan = lower(&parse("MATCH (x:Tmp) SET x:Person").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("gaining :Person must run the composite uniqueness check");
+    assert!(
+        format!("{err:?}").contains("composite unique"),
+        "got: {err:?}"
+    );
+
+    // A :Tmp node with a distinct tuple promotes cleanly.
+    write_q(&mut writer, "CREATE (:Tmp {a: 9, b: 9})").await;
+    write_q(&mut writer, "MATCH (x:Tmp {a: 9}) SET x:Person").await;
+}

@@ -1284,21 +1284,36 @@ async fn run_create_fulltext_index(
     }
 }
 
-/// Apply a `CREATE CONSTRAINT … IS UNIQUE` (`unique = true`) or `CREATE INDEX`
-/// (`unique = false`) and republish the snapshot. Both are metadata-only schema
-/// commits in the writer.
-async fn apply_create_property_ddl(
+/// Apply a `CREATE CONSTRAINT … IS UNIQUE` (single- or multi-property) and
+/// republish the snapshot. A metadata-only schema commit in the writer.
+async fn apply_create_constraint(
     writer: &mut WriterSession,
     snapshot: &SnapshotCell,
+    name: Option<&str>,
+    label: &str,
+    properties: &[String],
+    if_not_exists: bool,
+) -> Result<u64, namidb_storage::Error> {
+    let version = writer
+        .create_unique_constraint_named(name, label, properties, if_not_exists)
+        .await?;
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// Apply a `CREATE INDEX … ON …` (single-property equality index) and republish
+/// the snapshot. A metadata-only schema commit in the writer.
+async fn apply_create_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    name: Option<&str>,
     label: &str,
     property: &str,
-    unique: bool,
+    if_not_exists: bool,
 ) -> Result<u64, namidb_storage::Error> {
-    let version = if unique {
-        writer.create_unique_constraint(label, property).await?
-    } else {
-        writer.create_property_index(label, property).await?
-    };
+    let version = writer
+        .create_property_index_named(name, label, property, if_not_exists)
+        .await?;
     snapshot.store(writer.owned_snapshot());
     Ok(version)
 }
@@ -1311,9 +1326,11 @@ async fn run_create_property_ddl(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
     authz: &Arc<dyn authz::AuthzHook>,
+    name: Option<&str>,
     label: &str,
-    property: &str,
+    properties: &[String],
     unique: bool,
+    if_not_exists: bool,
     principal: &Principal,
     started: std::time::Instant,
 ) -> ObservedQuery {
@@ -1332,9 +1349,12 @@ async fn run_create_property_ddl(
         };
     }
     let op = if unique {
-        authz::SchemaOp::CreateConstraint { label, property }
+        authz::SchemaOp::CreateConstraint { label, properties }
     } else {
-        authz::SchemaOp::CreateIndex { label, property }
+        authz::SchemaOp::CreateIndex {
+            label,
+            property: &properties[0],
+        }
     };
     if let Err(denied) = authz.check_schema(principal, op).await {
         return ObservedQuery {
@@ -1351,7 +1371,11 @@ async fn run_create_property_ddl(
         };
     }
     let mut w = writer.lock().await;
-    let result = apply_create_property_ddl(&mut w, snapshot, label, property, unique).await;
+    let result = if unique {
+        apply_create_constraint(&mut w, snapshot, name, label, properties, if_not_exists).await
+    } else {
+        apply_create_index(&mut w, snapshot, name, label, &properties[0], if_not_exists).await
+    };
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1473,30 +1497,64 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
 
     // `CREATE CONSTRAINT` / `CREATE INDEX` are schema DDL: intercept pre-plan.
     if let Some(c) = parsed.as_create_constraint() {
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
         return run_create_property_ddl(
             &state.writer,
             &state.snapshot,
             &state.authz,
+            c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
-            &c.property.name,
+            &properties,
             true,
+            c.if_not_exists,
             principal,
             started,
         )
         .await;
     }
     if let Some(c) = parsed.as_create_index() {
+        let properties = [c.property.name.clone()];
         return run_create_property_ddl(
             &state.writer,
             &state.snapshot,
             &state.authz,
+            c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
-            &c.property.name,
+            &properties,
             false,
+            c.if_not_exists,
             principal,
             started,
         )
         .await;
+    }
+
+    // `SHOW CONSTRAINTS` / `SHOW INDEXES` are schema introspection: answer them
+    // from the published manifest without planning or a writer lock.
+    if let Some(c) = parsed.as_show_schema() {
+        let owned = state.snapshot.load();
+        let manifest = &owned.manifest().manifest;
+        let rows = match c.kind {
+            namidb_query::parser::ast::ShowKind::Constraints => {
+                namidb_query::show_constraints_rows(&manifest.schema)
+            }
+            namidb_query::parser::ast::ShowKind::Indexes => {
+                namidb_query::show_indexes_rows(manifest)
+            }
+        };
+        let (_columns, json_rows) = rows_to_json(&rows);
+        let columns = namidb_query::show_schema_columns();
+        return ObservedQuery {
+            kind: Some(QueryKind::Read),
+            ok: true,
+            elapsed: started.elapsed(),
+            response: Json(CypherResponse {
+                columns,
+                rows: json_rows,
+                write_outcome: None,
+            })
+            .into_response(),
+        };
     }
 
     // Plan against the latest published snapshot — no writer lock yet.
@@ -1863,30 +1921,63 @@ async fn run_cypher_multi(
 
     // `CREATE CONSTRAINT` / `CREATE INDEX` are schema DDL: intercept pre-plan.
     if let Some(c) = parsed.as_create_constraint() {
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
         return run_create_property_ddl(
             &ns_state.writer,
             &ns_state.snapshot,
             &shared.authz,
+            c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
-            &c.property.name,
+            &properties,
             true,
+            c.if_not_exists,
             principal,
             started,
         )
         .await;
     }
     if let Some(c) = parsed.as_create_index() {
+        let properties = [c.property.name.clone()];
         return run_create_property_ddl(
             &ns_state.writer,
             &ns_state.snapshot,
             &shared.authz,
+            c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
-            &c.property.name,
+            &properties,
             false,
+            c.if_not_exists,
             principal,
             started,
         )
         .await;
+    }
+
+    // `SHOW CONSTRAINTS` / `SHOW INDEXES`: schema introspection from the
+    // published manifest (a read; no writer lock).
+    if let Some(c) = parsed.as_show_schema() {
+        let owned = ns_state.snapshot.load();
+        let manifest = &owned.manifest().manifest;
+        let rows = match c.kind {
+            namidb_query::parser::ast::ShowKind::Constraints => {
+                namidb_query::show_constraints_rows(&manifest.schema)
+            }
+            namidb_query::parser::ast::ShowKind::Indexes => {
+                namidb_query::show_indexes_rows(manifest)
+            }
+        };
+        let (_columns, json_rows) = rows_to_json(&rows);
+        return ObservedQuery {
+            kind: Some(QueryKind::Read),
+            ok: true,
+            elapsed: started.elapsed(),
+            response: Json(CypherResponse {
+                columns: namidb_query::show_schema_columns(),
+                rows: json_rows,
+                write_outcome: None,
+            })
+            .into_response(),
+        };
     }
 
     // Plan against the latest published snapshot. The optimizer catalog is
@@ -2490,6 +2581,126 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let r2 = post_cypher(&app, None, "CREATE INDEX ON :Doc(author)").await;
         assert_eq!(r2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn composite_constraint_enforces_uniqueness_end_to_end() {
+        let app = fixture(None).await;
+        let r = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT FOR (n:Cfg) REQUIRE (n.tenant, n.name) IS UNIQUE",
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "composite constraint created");
+
+        let r1 = post_cypher(&app, None, "CREATE (:Cfg {tenant: 't1', name: 'a'})").await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        // Same tenant, different name → distinct tuple → allowed.
+        let r2 = post_cypher(&app, None, "CREATE (:Cfg {tenant: 't1', name: 'b'})").await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        // Exact duplicate tuple → 409 Conflict.
+        let r3 = post_cypher(&app, None, "CREATE (:Cfg {tenant: 't1', name: 'a'})").await;
+        assert_eq!(
+            r3.status(),
+            StatusCode::CONFLICT,
+            "duplicate composite tuple must conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn constraint_if_not_exists_is_idempotent() {
+        let app = fixture(None).await;
+        let a = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT c1 IF NOT EXISTS FOR (n:User) REQUIRE n.email IS UNIQUE",
+        )
+        .await;
+        assert_eq!(a.status(), StatusCode::OK);
+        // Re-running the exact same DDL with IF NOT EXISTS is a no-op success.
+        let b = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT c1 IF NOT EXISTS FOR (n:User) REQUIRE n.email IS UNIQUE",
+        )
+        .await;
+        assert_eq!(b.status(), StatusCode::OK, "IF NOT EXISTS re-run succeeds");
+        // Without IF NOT EXISTS, re-declaring the same constraint is a 400.
+        let c = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT FOR (n:User) REQUIRE n.email IS UNIQUE",
+        )
+        .await;
+        assert_eq!(c.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn show_constraints_lists_declared_constraints() {
+        let app = fixture(None).await;
+        post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT FOR (n:User) REQUIRE n.email IS UNIQUE",
+        )
+        .await;
+        post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT cfg_uq FOR (n:Cfg) REQUIRE (n.tenant, n.name) IS UNIQUE",
+        )
+        .await;
+
+        let r = post_cypher(&app, None, "SHOW CONSTRAINTS").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 65536).await.unwrap()).unwrap();
+        let cols: Vec<&str> = body["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(cols.contains(&"name") && cols.contains(&"properties"));
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "both constraints listed");
+        let cfg = rows
+            .iter()
+            .find(|row| row["name"] == "cfg_uq")
+            .expect("cfg_uq present");
+        let props: Vec<&str> = cfg["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(props, ["tenant", "name"]);
+        assert_eq!(cfg["type"], "UNIQUENESS");
+        assert_eq!(cfg["entityType"], "NODE");
+        assert_eq!(cfg["labelsOrTypes"][0], "Cfg");
+    }
+
+    #[tokio::test]
+    async fn show_indexes_lists_declared_indexes() {
+        let app = fixture(None).await;
+        post_cypher(&app, None, "CREATE INDEX FOR (n:Doc) ON (n.slug)").await;
+        let r = post_cypher(&app, None, "SHOW INDEXES").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 65536).await.unwrap()).unwrap();
+        let rows = body["rows"].as_array().unwrap();
+        let doc = rows
+            .iter()
+            .find(|row| row["labelsOrTypes"][0] == "Doc")
+            .expect("Doc index present");
+        let props: Vec<&str> = doc["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(props, ["slug"]);
     }
 
     #[cfg(feature = "text-index")]

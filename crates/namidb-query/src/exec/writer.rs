@@ -822,12 +822,16 @@ pub async fn enforce_node_unique_constraints(
     labels: &[String],
     core_props: &BTreeMap<String, CoreValue>,
 ) -> Result<(), String> {
+    let to_msg = |e: ExecError| match e {
+        ExecError::Constraint(msg) => msg,
+        other => other.to_string(),
+    };
     enforce_unique_on_create(writer, labels, core_props)
         .await
-        .map_err(|e| match e {
-            ExecError::Constraint(msg) => msg,
-            other => other.to_string(),
-        })
+        .map_err(to_msg)?;
+    enforce_composite_unique(writer, labels, core_props, None)
+        .await
+        .map_err(to_msg)
 }
 
 /// Enforce a unique constraint when SET assigns `value` to `key` on a node.
@@ -867,6 +871,92 @@ async fn enforce_unique_on_set(
         {
             return Err(ExecError::Constraint(format!(
                 "{label}.{key} = {value:?} already held by another node (unique constraint)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Find a node, other than `exclude`, that already holds the same value for
+/// EVERY property in `props` — a composite-uniqueness conflict. Scans the
+/// label against the read-your-own-writes overlay (RFC-026); the scan IS the
+/// source of truth, so it cannot drift from a sidecar index. `props` is assumed
+/// complete (every value present and non-null), which the caller guarantees.
+async fn find_composite_conflict(
+    writer: &WriterSession,
+    label: &str,
+    props: &[(String, CoreValue)],
+    exclude: Option<NodeId>,
+) -> Result<Option<NodeId>, ExecError> {
+    let snap = writer.overlay_snapshot();
+    let mut found = None;
+    for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
+        if Some(node.id) == exclude {
+            continue;
+        }
+        if props.iter().all(|(k, v)| node.properties.get(k) == Some(v)) {
+            found = Some(node.id);
+            break;
+        }
+    }
+    drop(snap);
+    Ok(found)
+}
+
+/// Enforce declared COMPOSITE uniqueness constraints (two or more properties)
+/// for a node being created (`exclude = None`) or updated (`exclude =
+/// Some(self_id)`, so a self-update is allowed). A node is exempt from a
+/// constraint unless EVERY one of its properties is present and non-null in
+/// `core_props`, matching Cypher composite-uniqueness semantics. Single-property
+/// uniqueness is handled separately by [`enforce_unique_on_create`] /
+/// [`enforce_unique_on_set`] via the `PropertyDef::unique` flag.
+async fn enforce_composite_unique(
+    writer: &WriterSession,
+    labels: &[String],
+    core_props: &BTreeMap<String, CoreValue>,
+    exclude: Option<NodeId>,
+) -> Result<(), ExecError> {
+    // Collect the tuples to check first so the schema borrow is released before
+    // we take a snapshot.
+    let checks: Vec<(String, Vec<(String, CoreValue)>)> = {
+        let schema = writer.schema();
+        let mut checks = Vec::new();
+        for c in schema.constraints() {
+            if c.kind != namidb_core::ConstraintKind::Unique || c.properties.len() < 2 {
+                continue;
+            }
+            if !labels.iter().any(|l| l == &c.label) {
+                continue;
+            }
+            let mut tuple = Vec::with_capacity(c.properties.len());
+            let mut complete = true;
+            for p in &c.properties {
+                match core_props.get(p) {
+                    Some(v) if !matches!(v, CoreValue::Null) => tuple.push((p.clone(), v.clone())),
+                    _ => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                checks.push((c.label.clone(), tuple));
+            }
+        }
+        checks
+    };
+    for (label, tuple) in checks {
+        if find_composite_conflict(writer, &label, &tuple, exclude)
+            .await?
+            .is_some()
+        {
+            let desc = tuple
+                .iter()
+                .map(|(k, v)| format!("{k} = {v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ExecError::Constraint(format!(
+                "({desc}) already exists (composite unique constraint on {label})"
             )));
         }
     }
@@ -990,6 +1080,7 @@ async fn apply_create(
                 // node, so a duplicate staged earlier in the same uncommitted
                 // batch is caught as well as one already committed.
                 enforce_unique_on_create(writer, labels, &core_props).await?;
+                enforce_composite_unique(writer, labels, &core_props, None).await?;
                 enforce_notnull_on_create(writer, labels, &core_props)?;
                 let record = NodeWriteRecord {
                     properties: core_props,
@@ -1123,6 +1214,9 @@ async fn apply_set(
                     }
                     let mut core_props = node_runtime_props_to_core(&n.properties)?;
                     core_props.insert(key.clone(), core);
+                    // Composite uniqueness is checked against the node's full
+                    // post-SET property set, excluding the node itself.
+                    enforce_composite_unique(writer, &label_vec, &core_props, Some(n.id)).await?;
                     let record = NodeWriteRecord {
                         properties: core_props,
                         schema_version: 1,
@@ -1196,6 +1290,15 @@ async fn apply_set(
                 // node must already carry a non-null value for every property
                 // that label declares non-null.
                 enforce_notnull_on_create(writer, &added_labels, &core_props)?;
+                // It also subjects the node to that label's uniqueness contracts
+                // (single-property and composite): the node's existing values
+                // must not collide with another node under the labels it gains.
+                // Both checks scope to `added_labels` and exclude the node
+                // itself, so they no-op when no new label is actually added.
+                for (k, cv) in &core_props {
+                    enforce_unique_on_set(writer, &added_labels, k, cv, n.id).await?;
+                }
+                enforce_composite_unique(writer, &added_labels, &core_props, Some(n.id)).await?;
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
@@ -1287,6 +1390,7 @@ async fn apply_set_map(
             for (k, cv) in &final_core {
                 enforce_unique_on_set(writer, &labels, k, cv, n.id).await?;
             }
+            enforce_composite_unique(writer, &labels, &final_core, Some(n.id)).await?;
             enforce_notnull_on_create(writer, &labels, &final_core)?;
             let record = NodeWriteRecord {
                 properties: final_core,

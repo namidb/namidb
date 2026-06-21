@@ -25,8 +25,9 @@ use uuid::Uuid;
 use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
-    execute, execute_write, parse as cypher_parse, plan as build_plan, ExecError, LogicalPlan,
-    LowerError, Params, ParseError, Row, RuntimeValue, StatsCatalog,
+    execute, execute_write, parse as cypher_parse, plan as build_plan, show_constraints_rows,
+    show_indexes_rows, show_schema_columns, ExecError, LogicalPlan, LowerError, Params, ParseError,
+    Row, RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
     CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, NodeView, NodeWriteRecord, SstCache,
@@ -639,6 +640,55 @@ async fn run_cypher_inner(
     cache: SstCache,
 ) -> PyResult<QueryResult> {
     let parsed = cypher_parse(query).map_err(parse_errs_to_pyerr)?;
+
+    // Schema DDL / introspection is intercepted before planning — these clauses
+    // never lower to a `LogicalPlan`. Running them as the sole statement here
+    // lets the embedded client issue them directly (no Bolt/HTTP round-trip).
+    if let Some(c) = parsed.as_create_constraint() {
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
+        guard
+            .create_unique_constraint_named(
+                c.name.as_ref().map(|n| n.name.as_str()),
+                &c.label.name,
+                &properties,
+                c.if_not_exists,
+            )
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+    if let Some(c) = parsed.as_create_index() {
+        guard
+            .create_property_index_named(
+                c.name.as_ref().map(|n| n.name.as_str()),
+                &c.label.name,
+                &c.property.name,
+                c.if_not_exists,
+            )
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+    if let Some(c) = parsed.as_show_schema() {
+        use namidb_query::parser::ast::ShowKind;
+        let snap = guard.snapshot();
+        let manifest = &snap.manifest().manifest;
+        let rows = match c.kind {
+            ShowKind::Constraints => show_constraints_rows(&manifest.schema),
+            ShowKind::Indexes => show_indexes_rows(manifest),
+        };
+        return Ok(QueryResult {
+            columns: show_schema_columns(),
+            rows,
+        });
+    }
+
     let catalog = StatsCatalog::from_manifest(&guard.snapshot().manifest().manifest);
     let plan = build_plan(&parsed, &catalog).map_err(lower_err_to_pyerr)?;
     let plan_columns = extract_column_order(&plan);

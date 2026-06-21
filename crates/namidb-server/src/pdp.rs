@@ -211,14 +211,14 @@ impl AuthzHook for OpaAuthz {
                 "label": label,
                 "properties": properties,
             }),
-            SchemaOp::CreateConstraint { label, property } => serde_json::json!({
+            SchemaOp::CreateConstraint { label, properties } => serde_json::json!({
                 "subject": principal.subject,
                 "role": role_str(principal),
                 "groups": principal.groups,
                 "action": "schema",
                 "schema_op": "create_constraint",
                 "label": label,
-                "property": property,
+                "properties": properties,
             }),
             SchemaOp::CreateIndex { label, property } => serde_json::json!({
                 "subject": principal.subject,

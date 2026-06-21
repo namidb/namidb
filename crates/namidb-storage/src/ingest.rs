@@ -52,7 +52,10 @@ use object_store::ObjectStore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{DataType, LabelDef, LabelDictionary, NodeId, PropertyDef, Schema, Value};
+use namidb_core::{
+    Constraint, ConstraintKind, DataType, LabelDef, LabelDictionary, NodeId, PropertyDef, Schema,
+    Value,
+};
 
 use crate::adjacency::{adjacency_budget_bytes, adjacency_enabled, AdjacencyCache};
 use crate::cache::{sst_cache_budget_bytes, sst_cache_enabled, SstCache};
@@ -1122,8 +1125,161 @@ impl WriterSession {
     /// violated constraint. A metadata-only schema commit; the next flush emits
     /// the unique sidecar.
     pub async fn create_unique_constraint(&mut self, label: &str, property: &str) -> Result<u64> {
-        self.alter_property_for_ddl(label, property, true, false)
+        let props = [property.to_string()];
+        self.create_unique_constraint_named(None, label, &props, false)
             .await
+    }
+
+    /// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE (n.p, …)
+    /// IS UNIQUE`. Single-property uniqueness sets [`PropertyDef::unique`] (so
+    /// the planner point-lookup + equality sidecar keep working) AND records a
+    /// named [`Constraint`]; composite uniqueness records only the
+    /// [`Constraint`] and is enforced by a tuple scan on write. Validates the
+    /// existing data first — a pre-existing duplicate is rejected with
+    /// [`Error::Precondition`]. With `if_not_exists`, an already-present
+    /// constraint (by name, by the same label+property-set, or a legacy
+    /// single-property `unique` flag) is a no-op returning the current version;
+    /// without it, that case is an error.
+    pub async fn create_unique_constraint_named(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        properties: &[String],
+        if_not_exists: bool,
+    ) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+
+        if properties.is_empty() {
+            return Err(Error::precondition(
+                "a uniqueness constraint requires at least one property",
+            ));
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for p in properties {
+                if !seen.insert(p.as_str()) {
+                    return Err(Error::precondition(format!(
+                        "property '{p}' is listed twice in the same constraint"
+                    )));
+                }
+            }
+        }
+
+        let kind = ConstraintKind::Unique;
+
+        // ── Existence / name-collision checks (borrow the schema, then drop) ──
+        let (exists, declared_type) = {
+            let schema = &self.current.manifest.schema;
+            if let Some(n) = name {
+                if let Some(existing) = schema.constraint_named(n) {
+                    if !existing.matches(label, properties, kind) {
+                        return Err(Error::precondition(format!(
+                            "a constraint named '{n}' already exists with a different definition"
+                        )));
+                    }
+                }
+            }
+            let def_exists = schema
+                .constraint_matching(label, properties, kind)
+                .is_some();
+            // Legacy single-property unique: the flag is set on a manifest that
+            // predates named constraints, so there is no list entry yet.
+            let legacy_single_exists = properties.len() == 1
+                && !def_exists
+                && schema
+                    .label(label)
+                    .and_then(|l| l.properties.iter().find(|p| p.name == properties[0]))
+                    .is_some_and(|p| p.unique);
+            let declared_type = if properties.len() == 1 {
+                schema
+                    .label(label)
+                    .and_then(|l| l.properties.iter().find(|p| p.name == properties[0]))
+                    .map(|p| p.data_type.clone())
+            } else {
+                None
+            };
+            (def_exists || legacy_single_exists, declared_type)
+        };
+        if exists {
+            if if_not_exists {
+                return Ok(self.current.manifest.version);
+            }
+            return Err(Error::precondition(format!(
+                "a uniqueness constraint on {label}({}) already exists",
+                properties.join(", ")
+            )));
+        }
+
+        // ── Validate existing data; infer the single-property type ───────────
+        let single = properties.len() == 1;
+        let mut inferred: Option<DataType> = None;
+        {
+            let snap = self.snapshot();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for node in snap.scan_label(label).await? {
+                // A row is exempt unless every property is present and non-null.
+                let mut key_parts: Vec<String> = Vec::with_capacity(properties.len());
+                let mut complete = true;
+                for p in properties {
+                    match node.properties.get(p) {
+                        Some(v) if !matches!(v, Value::Null) => key_parts.push(format!("{v:?}")),
+                        _ => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+                if single && declared_type.is_none() && inferred.is_none() {
+                    inferred = value_datatype(node.properties.get(&properties[0]).unwrap());
+                }
+                // Separate the parts with a control byte so distinct tuples
+                // cannot alias (each `{v:?}` part already quotes strings).
+                let key = key_parts.join("\u{1}");
+                if !seen.insert(key) {
+                    let desc = properties
+                        .iter()
+                        .map(|p| format!("{p}={:?}", node.properties.get(p).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::precondition(format!(
+                        "cannot create unique constraint on {label}({}): \
+                         duplicate ({desc}) already exists",
+                        properties.join(", ")
+                    )));
+                }
+            }
+        }
+
+        // ── Commit the schema change ─────────────────────────────────────────
+        let mut schema = self.current.manifest.schema.clone();
+        if single {
+            let dtype = declared_type.unwrap_or_else(|| inferred.unwrap_or(DataType::Utf8));
+            upsert_property_flags(&mut schema, label, &properties[0], dtype, true, false)?;
+        }
+        let cname = name
+            .map(str::to_string)
+            .unwrap_or_else(|| Constraint::default_name(label, properties, kind));
+        schema.constraints.push(Constraint {
+            name: cname,
+            label: label.to_string(),
+            properties: properties.to_vec(),
+            kind,
+        });
+
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.schema = schema;
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
     }
 
     /// `CREATE INDEX … ON :Label(prop)`: declare `(label, property)` indexed so
@@ -1131,14 +1287,47 @@ impl WriterSession {
     /// `MATCH (n:Label {prop: …})`). Non-unique; no data validation. A
     /// metadata-only schema commit.
     pub async fn create_property_index(&mut self, label: &str, property: &str) -> Result<u64> {
+        self.create_property_index_named(None, label, property, false)
+            .await
+    }
+
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.prop)`. The
+    /// `name` is accepted for Cypher parity but equality-index names are not
+    /// persisted (the index is keyed by `(label, property)`); `SHOW INDEXES`
+    /// synthesizes a deterministic name. With `if_not_exists`, an already-indexed
+    /// property is a no-op; without it, re-declaring one is an error.
+    pub async fn create_property_index_named(
+        &mut self,
+        _name: Option<&str>,
+        label: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        let already = self
+            .current
+            .manifest
+            .schema
+            .label(label)
+            .and_then(|l| l.properties.iter().find(|p| p.name == property))
+            .is_some_and(|p| p.indexed);
+        if already {
+            if if_not_exists {
+                return Ok(self.current.manifest.version);
+            }
+            return Err(Error::precondition(format!(
+                "an index on {label}({property}) already exists"
+            )));
+        }
         self.alter_property_for_ddl(label, property, false, true)
             .await
     }
 
-    /// Shared body of the constraint/index DDL: scan the label to (for a unique
-    /// constraint) reject pre-existing duplicates and to infer the property type
+    /// Shared body of the index DDL: scan the label to infer the property type
     /// when it is not already declared, then commit a schema that marks the
-    /// property unique and/or indexed.
+    /// property indexed. (Uniqueness DDL has its own path in
+    /// [`create_unique_constraint_named`], which also records the named
+    /// [`Constraint`].)
     async fn alter_property_for_ddl(
         &mut self,
         label: &str,
@@ -1158,8 +1347,7 @@ impl WriterSession {
             .map(|p| p.data_type.clone());
 
         let mut inferred: Option<DataType> = None;
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        {
+        if declared_type.is_none() {
             let snap = self.snapshot();
             for node in snap.scan_label(label).await? {
                 let Some(v) = node.properties.get(property) else {
@@ -1168,19 +1356,8 @@ impl WriterSession {
                 if matches!(v, Value::Null) {
                     continue;
                 }
-                if declared_type.is_none() && inferred.is_none() {
-                    inferred = value_datatype(v);
-                }
-                if unique {
-                    // A stable key per distinct value; equal values collide.
-                    let key = format!("{v:?}");
-                    if !seen.insert(key) {
-                        return Err(Error::precondition(format!(
-                            "cannot create unique constraint on ({label}.{property}): \
-                             duplicate value {v:?} already exists"
-                        )));
-                    }
-                }
+                inferred = value_datatype(v);
+                break;
             }
         }
 
@@ -2566,5 +2743,91 @@ mod tests {
             .and_then(|l| l.properties.iter().find(|p| p.name == "name"))
             .map(|p| !p.unique)
             .unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn composite_unique_constraint_rejects_existing_duplicate_tuple() {
+        let store = make_store();
+        let paths = make_paths("ingest-composite-dup");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        // Two nodes share the same (name, age) tuple.
+        s.upsert_node("Person", NodeId::new(), &node_record("Dup", Some(7)))
+            .unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Dup", Some(7)))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+
+        let props = vec!["name".to_string(), "age".to_string()];
+        let err = s
+            .create_unique_constraint_named(None, "Person", &props, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "got {err:?}");
+        // Nothing recorded: rejected before any commit.
+        assert!(s
+            .snapshot()
+            .manifest()
+            .manifest
+            .schema
+            .constraints
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn composite_unique_constraint_allows_distinct_tuples_and_records_it() {
+        let store = make_store();
+        let paths = make_paths("ingest-composite-ok");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Ann", Some(7)))
+            .unwrap();
+        // Same name, different age → the tuple is distinct, so it is allowed.
+        s.upsert_node("Person", NodeId::new(), &node_record("Ann", Some(8)))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+
+        let props = vec!["name".to_string(), "age".to_string()];
+        s.create_unique_constraint_named(Some("uq_pa"), "Person", &props, false)
+            .await
+            .unwrap();
+        let snap = s.snapshot();
+        let schema = &snap.manifest().manifest.schema;
+        assert_eq!(schema.constraints.len(), 1);
+        assert_eq!(schema.constraints[0].name, "uq_pa");
+        assert_eq!(schema.constraints[0].properties, props);
+        // A composite constraint must NOT flip the single-property unique flag.
+        let name_unique = schema
+            .label("Person")
+            .and_then(|l| l.properties.iter().find(|p| p.name == "name"))
+            .map(|p| p.unique)
+            .unwrap_or(false);
+        assert!(!name_unique, "composite must not mark `name` itself unique");
+    }
+
+    #[tokio::test]
+    async fn unique_constraint_if_not_exists_is_idempotent_else_errors() {
+        let store = make_store();
+        let paths = make_paths("ingest-ine");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Ann", Some(1)))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+
+        let props = vec!["name".to_string()];
+        let v1 = s
+            .create_unique_constraint_named(None, "Person", &props, false)
+            .await
+            .unwrap();
+        // Re-declaring WITHOUT `IF NOT EXISTS` is an error.
+        let err = s
+            .create_unique_constraint_named(None, "Person", &props, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "got {err:?}");
+        // Re-declaring WITH `IF NOT EXISTS` is a no-op (no new manifest version).
+        let v2 = s
+            .create_unique_constraint_named(None, "Person", &props, true)
+            .await
+            .unwrap();
+        assert_eq!(v2, v1, "IF NOT EXISTS must not commit a new version");
     }
 }

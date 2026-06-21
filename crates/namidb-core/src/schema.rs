@@ -336,6 +336,66 @@ pub struct EdgeTypeDef {
     pub properties: Vec<PropertyDef>,
 }
 
+/// The kind of a declared schema constraint.
+///
+/// Only uniqueness today; the enum leaves room for `NODE KEY` / property
+/// existence without another wire migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstraintKind {
+    /// `REQUIRE (…) IS UNIQUE` — the tuple of properties is unique per label.
+    Unique,
+}
+
+impl ConstraintKind {
+    /// Neo4j-style type label surfaced by `SHOW CONSTRAINTS`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConstraintKind::Unique => "UNIQUENESS",
+        }
+    }
+}
+
+/// A named schema constraint over one or more properties of a node label.
+///
+/// A single-property uniqueness constraint ALSO sets [`PropertyDef::unique`]
+/// (so the planner point-lookup and the equality sidecar keep working);
+/// composite uniqueness lives only here and is enforced by a tuple scan on
+/// write. This list is the source of truth for naming, `SHOW CONSTRAINTS`, and
+/// `IF NOT EXISTS`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Constraint {
+    pub name: String,
+    pub label: String,
+    /// Properties forming the constraint, in declaration order. Length ≥ 1.
+    pub properties: Vec<String>,
+    pub kind: ConstraintKind,
+}
+
+impl Constraint {
+    /// Default name when the user did not supply one: `uniq_<label>_<prop…>`.
+    /// Deterministic, so re-running the same DDL yields the same name (and a
+    /// name collision then means a real duplicate, not a fresh random clash).
+    pub fn default_name(label: &str, properties: &[String], kind: ConstraintKind) -> String {
+        let prefix = match kind {
+            ConstraintKind::Unique => "uniq",
+        };
+        format!("{prefix}_{label}_{}", properties.join("_"))
+    }
+
+    /// True iff this constraint is the same `kind` over `label` and the same
+    /// *set* of properties (order-independent, matching Cypher's composite
+    /// uniqueness semantics).
+    pub fn matches(&self, label: &str, properties: &[String], kind: ConstraintKind) -> bool {
+        self.kind == kind && self.label == label && {
+            let mut a = self.properties.clone();
+            let mut b = properties.to_vec();
+            a.sort();
+            b.sort();
+            a == b
+        }
+    }
+}
+
 /// Logical schema for a graph.
 ///
 /// `version` is monotonic per-namespace. Each schema-altering manifest commit
@@ -345,6 +405,10 @@ pub struct Schema {
     pub version: u64,
     pub labels: BTreeMap<String, LabelDef>,
     pub edge_types: BTreeMap<String, EdgeTypeDef>,
+    /// Declared schema constraints (uniqueness, single- or multi-property).
+    /// `serde(default)` keeps pre-constraint manifests loading unchanged.
+    #[serde(default)]
+    pub constraints: Vec<Constraint>,
 }
 
 impl Schema {
@@ -357,6 +421,29 @@ impl Schema {
     }
     pub fn edge_type(&self, name: &str) -> Option<&EdgeTypeDef> {
         self.edge_types.get(name)
+    }
+
+    /// All declared constraints (uniqueness, single- or multi-property).
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
+    /// Find a constraint by its (case-sensitive) name.
+    pub fn constraint_named(&self, name: &str) -> Option<&Constraint> {
+        self.constraints.iter().find(|c| c.name == name)
+    }
+
+    /// Find a constraint covering `label` over the same property set and kind
+    /// (order-independent), ignoring its name.
+    pub fn constraint_matching(
+        &self,
+        label: &str,
+        properties: &[String],
+        kind: ConstraintKind,
+    ) -> Option<&Constraint> {
+        self.constraints
+            .iter()
+            .find(|c| c.matches(label, properties, kind))
     }
 
     pub fn builder() -> SchemaBuilder {

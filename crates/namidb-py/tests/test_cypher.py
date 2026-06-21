@@ -208,3 +208,28 @@ def test_create_with_relationship(client: tg.Client) -> None:
     )
     assert len(result) == 1
     assert result.first() == {"src": "Ada", "dst": "Lin", "w": 5}
+
+
+# ── schema DDL / introspection on the embedded client ──────────────────
+
+
+def test_embedded_ddl_constraint_index_and_show(client: tg.Client) -> None:
+    # Schema DDL runs directly on the embedded client — no Bolt/HTTP round-trip.
+    client.cypher(
+        "CREATE CONSTRAINT cfg_uq FOR (n:Cfg) REQUIRE (n.tenant, n.name) IS UNIQUE"
+    )
+    client.cypher("CREATE INDEX FOR (n:Doc) ON (n.slug)")
+    # Re-running with IF NOT EXISTS is a no-op (must not raise).
+    client.cypher(
+        "CREATE CONSTRAINT cfg_uq IF NOT EXISTS "
+        "FOR (n:Cfg) REQUIRE (n.tenant, n.name) IS UNIQUE"
+    )
+
+    cons = {row["name"]: row for row in client.cypher("SHOW CONSTRAINTS").rows()}
+    assert "cfg_uq" in cons
+    assert cons["cfg_uq"]["properties"] == ["tenant", "name"]
+    assert cons["cfg_uq"]["type"] == "UNIQUENESS"
+    assert cons["cfg_uq"]["labelsOrTypes"] == ["Cfg"]
+
+    idx_labels = [row["labelsOrTypes"][0] for row in client.cypher("SHOW INDEXES").rows()]
+    assert "Doc" in idx_labels

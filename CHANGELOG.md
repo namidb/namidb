@@ -11,6 +11,30 @@ the release notes.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-21: Composite constraints, IF NOT EXISTS, and SHOW
+
+### Added
+
+- Composite (multi-property) uniqueness constraints:
+  `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE (n.a, n.b, …) IS UNIQUE`.
+  The tuple is unique per label; a node is exempt unless every listed property is
+  present and non-null (matching Cypher semantics). Enforced on `CREATE`,
+  `MERGE`-create and `SET` against the read-your-own-writes overlay, and the
+  existing data is validated when the constraint is declared (a pre-existing
+  duplicate tuple is rejected). Single-property uniqueness is unchanged — it
+  still sets the planner point-lookup hint and emits the equality sidecar.
+- `IF NOT EXISTS` on `CREATE CONSTRAINT` and `CREATE INDEX`: re-declaring an
+  existing object is a no-op success instead of an error. Without it, declaring a
+  constraint that already exists (by name or by the same label + property set) is
+  now rejected, matching Neo4j.
+- Optional names on constraints are recorded; `SHOW CONSTRAINTS` and
+  `SHOW INDEXES` list the declared schema objects (columns `name`, `type`,
+  `entityType`, `labelsOrTypes`, `properties`). Available over HTTP, Bolt, and
+  the embedded Python client.
+- The embedded Python client now executes `CREATE CONSTRAINT` / `CREATE INDEX` /
+  `SHOW …` directly (intercepted before planning), so schema DDL no longer
+  requires a Bolt/HTTP round-trip.
+
 ## [1.1.0] - 2026-06-21: Cypher DDL, subqueries, FOREACH, and pattern extensions
 
 ### Fixed

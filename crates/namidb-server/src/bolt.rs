@@ -235,9 +235,11 @@ impl ServerBackend {
     /// Bolt shape for `CREATE CONSTRAINT`/`CREATE INDEX` (always-on schema DDL).
     async fn run_create_property_ddl(
         &self,
+        name: Option<&str>,
         label: &str,
-        property: &str,
+        properties: &[String],
         unique: bool,
+        if_not_exists: bool,
         started: std::time::Instant,
     ) -> RunObservation {
         if let Some(err) = self.write_forbidden() {
@@ -248,9 +250,12 @@ impl ServerBackend {
             };
         }
         let op = if unique {
-            crate::authz::SchemaOp::CreateConstraint { label, property }
+            crate::authz::SchemaOp::CreateConstraint { label, properties }
         } else {
-            crate::authz::SchemaOp::CreateIndex { label, property }
+            crate::authz::SchemaOp::CreateIndex {
+                label,
+                property: &properties[0],
+            }
         };
         if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
             return RunObservation {
@@ -260,14 +265,27 @@ impl ServerBackend {
             };
         }
         let mut writer = self.state.writer.lock().await;
-        let result = crate::apply_create_property_ddl(
-            &mut writer,
-            &self.state.snapshot,
-            label,
-            property,
-            unique,
-        )
-        .await;
+        let result = if unique {
+            crate::apply_create_constraint(
+                &mut writer,
+                &self.state.snapshot,
+                name,
+                label,
+                properties,
+                if_not_exists,
+            )
+            .await
+        } else {
+            crate::apply_create_index(
+                &mut writer,
+                &self.state.snapshot,
+                name,
+                label,
+                &properties[0],
+                if_not_exists,
+            )
+            .await
+        };
         drop(writer);
         let elapsed = started.elapsed();
         match result {
@@ -336,14 +354,47 @@ impl ServerBackend {
 
         // `CREATE CONSTRAINT` / `CREATE INDEX`: schema DDL, intercept pre-plan.
         if let Some(c) = parsed.as_create_constraint() {
+            let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
             return self
-                .run_create_property_ddl(&c.label.name, &c.property.name, true, started)
+                .run_create_property_ddl(
+                    c.name.as_ref().map(|n| n.name.as_str()),
+                    &c.label.name,
+                    &properties,
+                    true,
+                    c.if_not_exists,
+                    started,
+                )
                 .await;
         }
         if let Some(c) = parsed.as_create_index() {
+            let properties = [c.property.name.clone()];
             return self
-                .run_create_property_ddl(&c.label.name, &c.property.name, false, started)
+                .run_create_property_ddl(
+                    c.name.as_ref().map(|n| n.name.as_str()),
+                    &c.label.name,
+                    &properties,
+                    false,
+                    c.if_not_exists,
+                    started,
+                )
                 .await;
+        }
+
+        // `SHOW CONSTRAINTS` / `SHOW INDEXES`: schema introspection, answer from
+        // the published manifest (a read; no writer lock).
+        if let Some(c) = parsed.as_show_schema() {
+            use namidb_query::parser::ast::ShowKind;
+            let owned = self.state.snapshot.load();
+            let manifest = &owned.manifest().manifest;
+            let rows = match c.kind {
+                ShowKind::Constraints => namidb_query::show_constraints_rows(&manifest.schema),
+                ShowKind::Indexes => namidb_query::show_indexes_rows(manifest),
+            };
+            return RunObservation {
+                kind: Some(QueryKind::Read),
+                elapsed: started.elapsed(),
+                result: Ok(show_run_outcome(rows)),
+            };
         }
 
         // Plan against the latest published snapshot — no writer lock.
@@ -763,6 +814,19 @@ fn read_run_outcome(rows: Vec<Row>) -> RunOutcome {
     let fields = field_list(&rows);
     RunOutcome {
         fields,
+        rows,
+        statement_type: StatementType::Read,
+        counters: Default::default(),
+    }
+}
+
+/// Build the Bolt `RunOutcome` for a `SHOW CONSTRAINTS`/`SHOW INDEXES` result.
+/// The session emits each row's values by looking them up by field name, so the
+/// canonical SHOW column order is used as the field list (and is surfaced even
+/// when there are no rows).
+fn show_run_outcome(rows: Vec<Row>) -> RunOutcome {
+    RunOutcome {
+        fields: namidb_query::show_schema_columns(),
         rows,
         statement_type: StatementType::Read,
         counters: Default::default(),

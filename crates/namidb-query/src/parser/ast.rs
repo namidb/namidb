@@ -88,6 +88,9 @@ pub enum Clause {
     /// `CREATE INDEX … ON …` — schema DDL declaring a secondary (equality)
     /// index. Intercepted via [`Query::as_create_index`].
     CreateIndex(CreateIndexClause),
+    /// `SHOW CONSTRAINTS` / `SHOW INDEXES` — schema introspection. Intercepted
+    /// out-of-band via [`Query::as_show_schema`] (never lowered).
+    ShowSchema(ShowSchemaClause),
     /// `FOREACH (x IN list | <update clauses>)` — run the side-effecting inner
     /// clauses once per list element.
     Foreach(ForeachClause),
@@ -120,6 +123,7 @@ impl Clause {
             Clause::CreateFulltextIndex(c) => c.span,
             Clause::CreateConstraint(c) => c.span,
             Clause::CreateIndex(c) => c.span,
+            Clause::ShowSchema(c) => c.span,
             Clause::Foreach(c) => c.span,
             Clause::CallSubquery(c) => c.span,
             Clause::Call(c) => c.span,
@@ -174,6 +178,17 @@ impl Query {
     pub fn as_create_index(&self) -> Option<&CreateIndexClause> {
         if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
             if let Clause::CreateIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `SHOW CONSTRAINTS` / `SHOW INDEXES` interception hook: `Some` only when
+    /// the command is the sole statement.
+    pub fn as_show_schema(&self) -> Option<&ShowSchemaClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::ShowSchema(c) = &self.head.clauses[0] {
                 return Some(c);
             }
         }
@@ -309,25 +324,47 @@ pub struct CreateFulltextIndexClause {
     pub span: SourceSpan,
 }
 
-/// `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE` (and the
-/// legacy `ON (n:Label) ASSERT …` form). A standalone schema command executed
-/// out-of-band by the server (see [`Query::as_create_constraint`]).
+/// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE (n.p, …) IS
+/// UNIQUE` (and the legacy `ON (n:Label) ASSERT …` form). A standalone schema
+/// command executed out-of-band by the server (see
+/// [`Query::as_create_constraint`]). `properties` holds one entry for a
+/// single-property constraint and several for a composite one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateConstraintClause {
     pub name: Option<Identifier>,
     pub label: Identifier,
-    pub property: Identifier,
+    pub properties: Vec<Identifier>,
+    pub if_not_exists: bool,
     pub span: SourceSpan,
 }
 
-/// `CREATE INDEX [name] FOR (n:Label) ON (n.prop)` (and the legacy
-/// `ON :Label(prop)` form). A standalone schema command executed out-of-band by
-/// the server (see [`Query::as_create_index`]).
+/// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.prop)` (and the
+/// legacy `ON :Label(prop)` form). A standalone schema command executed
+/// out-of-band by the server (see [`Query::as_create_index`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateIndexClause {
     pub name: Option<Identifier>,
     pub label: Identifier,
     pub property: Identifier,
+    pub if_not_exists: bool,
+    pub span: SourceSpan,
+}
+
+/// Which schema objects a `SHOW` statement lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShowKind {
+    /// `SHOW CONSTRAINTS` (and the singular `SHOW CONSTRAINT`).
+    Constraints,
+    /// `SHOW INDEXES` (and the singular `SHOW INDEX`).
+    Indexes,
+}
+
+/// `SHOW CONSTRAINTS` / `SHOW INDEXES` — schema introspection. A standalone
+/// read-only command answered out-of-band by the server from the manifest
+/// schema (see [`Query::as_show_schema`]); it never lowers to a `LogicalPlan`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShowSchemaClause {
+    pub kind: ShowKind,
     pub span: SourceSpan,
 }
 
