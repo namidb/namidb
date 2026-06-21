@@ -1682,3 +1682,126 @@ async fn semi_apply_over_correlated_apply_is_correct() {
         ]
     );
 }
+
+#[tokio::test]
+async fn inline_label_disjunction_matches_any_label() {
+    let mut writer = WriterSession::open(store(), paths("exec-label-or"))
+        .await
+        .unwrap();
+    for (lbl, nm) in [("Cat", "Felix"), ("Dog", "Rex"), ("Fish", "Nemo")] {
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("name".to_string(), CoreValue::Str(nm.into()));
+        writer
+            .upsert_node(
+                lbl,
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // (n:Cat|Dog) matches Cat OR Dog, but not Fish.
+    let q = parse("MATCH (n:Cat|Dog) RETURN n.name AS name ORDER BY name").unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Felix", "Rex"]);
+}
+
+#[tokio::test]
+async fn with_where_exists_is_hoisted_to_semiapply() {
+    let mut writer = WriterSession::open(store(), paths("exec-with-exists"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // EXISTS in a WITH ... WHERE must hoist to SemiApply (not reach evaluate()).
+    // Everyone has an out-KNOWS, so all 5 survive.
+    let q = parse(
+        "MATCH (a:Person) WITH a WHERE EXISTS((a)-[:KNOWS]->(:Person)) \
+         RETURN a.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        5,
+        "EXISTS in WITH WHERE must filter via SemiApply"
+    );
+}
+
+#[tokio::test]
+async fn inline_label_disjunction_on_expand_target() {
+    let mut writer = WriterSession::open(store(), paths("exec-label-or-expand"))
+        .await
+        .unwrap();
+    let owner = NodeId::new();
+    let mut oprops = std::collections::BTreeMap::new();
+    oprops.insert("name".to_string(), CoreValue::Str("Sam".into()));
+    writer
+        .upsert_node(
+            "Owner",
+            owner,
+            &NodeWriteRecord {
+                properties: oprops,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for (lbl, nm) in [("Cat", "Felix"), ("Dog", "Rex"), ("Fish", "Nemo")] {
+        let pid = NodeId::new();
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("name".to_string(), CoreValue::Str(nm.into()));
+        writer
+            .upsert_node(
+                lbl,
+                pid,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        writer.upsert_edge("HAS", owner, pid, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q =
+        parse("MATCH (o:Owner)-[:HAS]->(p:Cat|Dog) RETURN p.name AS name ORDER BY name").unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Felix", "Rex"]);
+}

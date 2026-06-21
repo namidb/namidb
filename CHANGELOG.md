@@ -13,6 +13,14 @@ the release notes.
 
 ### Added
 
+- Inline label disjunction in node patterns: `(n:A|B)` matches a node carrying
+  ANY of the listed labels (vs `(n:A:B)`, which still requires ALL). Works on a
+  scanned node, on an expand target `(a)-[:R]->(b:A|B)`, and as a WHERE-position
+  predicate; the two separators may not be mixed. (An OPTIONAL-MATCH target with
+  `|` is not supported yet.)
+- `EXISTS(…)` / `EXISTS { … }` in a `WITH … WHERE` or `RETURN`-position `WHERE`
+  now hoists to a SemiApply like a `MATCH … WHERE` does, instead of failing at
+  evaluation.
 - `CALL { <subquery> }` — subquery blocks, both uncorrelated and correlated.
   Uncorrelated: a self-contained `RETURN`-terminated query whose result rows
   combine (cartesian) with the enclosing scope and whose `RETURN` columns become

@@ -1086,12 +1086,7 @@ fn lower_node_pattern_head(
                 predicate: pred,
             };
         }
-        return Ok(wrap_extra_label_filters(
-            plan,
-            &alias,
-            &extra_labels,
-            head.span,
-        ));
+        return Ok(wrap_label_filters(plan, &alias, head, head.span));
     }
 
     let scan = LogicalPlan::NodeScan {
@@ -1100,10 +1095,10 @@ fn lower_node_pattern_head(
         predicates: vec![],
         projection: None,
     };
-    Ok(wrap_extra_label_filters(
+    Ok(wrap_label_filters(
         combine(input, scan),
         &alias,
-        &extra_labels,
+        head,
         head.span,
     ))
 }
@@ -1158,11 +1153,25 @@ fn lower_rel_node(
     // listed label). Putting the check inside the Expand is what lets OPTIONAL
     // MATCH preserve a NULL row when a neighbour carries only some of the
     // labels — a post-expand filter would instead drop the row.
-    let target_labels = target
-        .labels
-        .iter()
-        .map(|l| l.name.clone())
-        .collect::<Vec<_>>();
+    if target.label_disjunction && optional {
+        return Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "a `|` label disjunction on the target of an OPTIONAL MATCH is not supported yet",
+            target.span,
+        ));
+    }
+    // A `|`-disjunction target carries OR semantics, which the Expand's
+    // (conjunctive) target_labels cannot express — match any neighbour here and
+    // apply the disjunction as a post-expand filter below.
+    let target_labels = if target.label_disjunction {
+        Vec::new()
+    } else {
+        target
+            .labels
+            .iter()
+            .map(|l| l.name.clone())
+            .collect::<Vec<_>>()
+    };
     let mut plan = LogicalPlan::Expand {
         input: Box::new(input),
         source,
@@ -1199,6 +1208,13 @@ fn lower_rel_node(
                 ));
             }
         }
+        // `(a)-[:R]->(b:A|B)`: keep only neighbours carrying any listed label.
+        if target.label_disjunction && target.labels.len() > 1 {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: build_label_disjunction(&target_alias, &target.labels, target.span),
+            };
+        }
     }
     Ok(plan)
 }
@@ -1231,7 +1247,55 @@ fn previous_source(plan: &LogicalPlan) -> Result<String, LowerError> {
 /// `__label_eq` filters (see [`wrap_extra_label_filters`]). `None` for an
 /// unlabelled pattern.
 fn optional_primary_label(node: &NodePattern) -> Option<&str> {
+    // For `|`-disjunction the labels are an OR predicate, NOT a scan label —
+    // using the first as the scan label would wrongly restrict to it.
+    if node.label_disjunction {
+        return None;
+    }
     node.labels.first().map(|l| l.name.as_str())
+}
+
+/// Build `__label_eq(alias, A) OR __label_eq(alias, B) OR …` for a `(x:A|B)`
+/// disjunction node.
+fn build_label_disjunction(
+    alias: &str,
+    labels: &[ast::Identifier],
+    span: SourceSpan,
+) -> Expression {
+    let mut acc: Option<Expression> = None;
+    for l in labels {
+        let call = build_label_eq(alias, &l.name, span);
+        acc = Some(match acc {
+            None => call,
+            Some(prev) => Expression {
+                kind: ExpressionKind::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(prev),
+                    right: Box::new(call),
+                },
+                span,
+            },
+        });
+    }
+    acc.expect("a label disjunction has at least one label")
+}
+
+/// Apply the node's label constraints on top of its scan: an OR filter for a
+/// `|`-disjunction node, otherwise the conjunctive extra-label filters.
+fn wrap_label_filters(
+    plan: LogicalPlan,
+    alias: &str,
+    node: &NodePattern,
+    span: SourceSpan,
+) -> LogicalPlan {
+    if node.label_disjunction && node.labels.len() > 1 {
+        LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: build_label_disjunction(alias, &node.labels, span),
+        }
+    } else {
+        wrap_extra_label_filters(plan, alias, &pattern_extra_labels(node), span)
+    }
 }
 
 /// Labels beyond the primary one. `MATCH (n:A:B)` yields `["B"]`; these are
@@ -1470,10 +1534,10 @@ fn lower_projection(
         // Validate after the projection aliases are visible — IC03 et
         // al. reference WITH-introduced names from the trailing WHERE.
         check_expression_bindings(pred, ctx)?;
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: pred.clone(),
-        };
+        // Route through attach_where so `EXISTS { … }` / `EXISTS(pattern)` terms
+        // in a WITH/RETURN WHERE hoist to SemiApply (like a MATCH WHERE) instead
+        // of reaching evaluate() as an un-hoisted Filter predicate.
+        plan = attach_where(plan, pred, ctx)?;
     }
 
     Ok(plan)

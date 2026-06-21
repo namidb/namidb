@@ -1337,13 +1337,14 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
-        let labels = self.parse_label_list()?;
+        let (labels, label_disjunction) = self.parse_label_list(true)?;
         let properties = self.parse_pattern_properties()?;
         let rparen = self.expect_in(&Token::RParen, "node pattern")?;
         let end = rparen.span.end;
         Ok(NodePattern {
             binding,
             labels,
+            label_disjunction,
             properties,
             span: SourceSpan::new(start, end),
         })
@@ -1371,12 +1372,52 @@ impl<'src> Parser<'src> {
         Ok(None)
     }
 
-    fn parse_label_list(&mut self) -> Result<Vec<Identifier>, ParseError> {
+    /// Parse a `:A`, `:A:B` (conjunction) or `:A|B` (disjunction) label list.
+    /// Returns the labels and whether they were `|`-separated. The two
+    /// separators may not be mixed (`:A:B|C` is rejected).
+    ///
+    /// `allow_pipe` gates the `|` disjunction form: it is on inside a node
+    /// pattern `(n:A|B)`, but off in expression position (`WHERE n:A …`) where a
+    /// following `|` belongs to an enclosing list comprehension, not the labels.
+    fn parse_label_list(
+        &mut self,
+        allow_pipe: bool,
+    ) -> Result<(Vec<Identifier>, bool), ParseError> {
         let mut labels = Vec::new();
-        while self.eat(&Token::Colon).is_some() {
-            labels.push(self.expect_identifier()?);
+        if self.eat(&Token::Colon).is_none() {
+            return Ok((labels, false));
         }
-        Ok(labels)
+        labels.push(self.expect_identifier()?);
+        let mut disjunction = false;
+        let mut conjunction = false;
+        loop {
+            if allow_pipe && self.check(&Token::Pipe) {
+                if conjunction {
+                    return Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        "cannot mix ':' (all-of) and '|' (any-of) label separators",
+                        self.peek_span(),
+                    ));
+                }
+                self.bump();
+                disjunction = true;
+                labels.push(self.expect_identifier()?);
+            } else if self.check(&Token::Colon) {
+                if disjunction {
+                    return Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        "cannot mix '|' (any-of) and ':' (all-of) label separators",
+                        self.peek_span(),
+                    ));
+                }
+                self.bump();
+                conjunction = true;
+                labels.push(self.expect_identifier()?);
+            } else {
+                break;
+            }
+        }
+        Ok((labels, disjunction))
     }
 
     fn parse_relationship_pattern(&mut self) -> Result<RelationshipPattern, ParseError> {
@@ -1788,7 +1829,12 @@ impl<'src> Parser<'src> {
                     // multiple labels, so the executor's membership builtin and
                     // the optimizer's `is_synthetic_label_eq` both recognise it.
                     // `NOT n:Person` comes for free: parse_unary wraps this.
-                    let labels = self.parse_label_list()?;
+                    let (labels, disjunction) = self.parse_label_list(false)?;
+                    let join_op = if disjunction {
+                        BinaryOp::Or
+                    } else {
+                        BinaryOp::And
+                    };
                     let mut acc: Option<Expression> = None;
                     for label in labels {
                         let span = SourceSpan::new(expr.span.start, label.span.end);
@@ -1817,7 +1863,7 @@ impl<'src> Parser<'src> {
                                 let span = SourceSpan::new(prev.span.start, call.span.end);
                                 Expression {
                                     kind: ExpressionKind::Binary {
-                                        op: BinaryOp::And,
+                                        op: join_op,
                                         left: Box::new(prev),
                                         right: Box::new(call),
                                     },

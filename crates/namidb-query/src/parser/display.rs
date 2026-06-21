@@ -374,8 +374,10 @@ impl fmt::Display for NodePattern {
         if let Some(b) = &self.binding {
             write!(f, "{}", b)?;
         }
-        for l in &self.labels {
-            write!(f, ":{}", l)?;
+        let sep = if self.label_disjunction { "|" } else { ":" };
+        for (i, l) in self.labels.iter().enumerate() {
+            let lead = if i == 0 { ":" } else { sep };
+            write!(f, "{lead}{l}")?;
         }
         if let Some(p) = &self.properties {
             write!(f, " {}", p)?;

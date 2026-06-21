@@ -545,6 +545,10 @@ pub struct PatternElement {
 pub struct NodePattern {
     pub binding: Option<Identifier>,
     pub labels: Vec<Identifier>,
+    /// `true` when the labels were written with `|` (disjunction, `(n:A|B)` —
+    /// matches a node carrying ANY of them) rather than `:` (conjunction,
+    /// `(n:A:B)` — ALL of them). Always `false` for zero or one label.
+    pub label_disjunction: bool,
     pub properties: Option<PatternProperties>,
     pub span: SourceSpan,
 }
