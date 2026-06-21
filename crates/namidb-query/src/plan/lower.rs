@@ -87,12 +87,25 @@ pub fn lower(query: &Query) -> Result<LogicalPlan, LowerError> {
 
 fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
     let mut ctx = LowerCtx::new();
-    let mut plan: Option<LogicalPlan> = None;
+    lower_clause_seq(&query.clauses, &mut ctx, None, query.span)
+}
 
-    for clause in &query.clauses {
+/// Lower a sequence of clauses onto an optional `initial` plan, threading
+/// `ctx`. Used both for a top-level single query (fresh ctx, no initial plan)
+/// and for a correlated subquery body (ctx pre-seeded with the imported
+/// bindings, `initial` an `Argument` carrying them).
+fn lower_clause_seq(
+    clauses: &[Clause],
+    ctx: &mut LowerCtx,
+    initial: Option<LogicalPlan>,
+    span: SourceSpan,
+) -> Result<LogicalPlan, LowerError> {
+    let mut plan: Option<LogicalPlan> = initial;
+
+    for clause in clauses {
         match clause {
             Clause::Match(m) => {
-                let p = lower_match(m, plan, &mut ctx)?;
+                let p = lower_match(m, plan, ctx)?;
                 plan = Some(p);
             }
             Clause::Where(_) => {
@@ -104,41 +117,41 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
             }
             Clause::Return(r) => {
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_return(r, base, &mut ctx)?);
+                plan = Some(lower_return(r, base, ctx)?);
             }
             Clause::With(w) => {
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_with(w, base, &mut ctx)?);
+                plan = Some(lower_with(w, base, ctx)?);
             }
             Clause::Unwind(u) => {
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_unwind(u, base, &mut ctx)?);
+                plan = Some(lower_unwind(u, base, ctx)?);
             }
             Clause::Create(c) => {
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_create(c, base, &mut ctx)?);
+                plan = Some(lower_create(c, base, ctx)?);
             }
             Clause::Merge(m) => {
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_merge(m, base, &mut ctx)?);
+                plan = Some(lower_merge(m, base, ctx)?);
             }
             Clause::Set(s) => {
                 let base = require_input(plan.take(), clause.span())?;
-                plan = Some(lower_set(s, base, &mut ctx)?);
+                plan = Some(lower_set(s, base, ctx)?);
             }
             Clause::Remove(r) => {
                 let base = require_input(plan.take(), clause.span())?;
-                plan = Some(lower_remove(r, base, &mut ctx)?);
+                plan = Some(lower_remove(r, base, ctx)?);
             }
             Clause::Delete(d) => {
                 let base = require_input(plan.take(), clause.span())?;
-                plan = Some(lower_delete(d, base, &mut ctx)?);
+                plan = Some(lower_delete(d, base, ctx)?);
             }
             Clause::Foreach(fe) => {
                 // Standalone FOREACH (no preceding clause) drives off one empty
                 // row, like a bare CREATE.
                 let base = plan.take().unwrap_or(LogicalPlan::Empty);
-                plan = Some(lower_foreach(fe, base, &mut ctx)?);
+                plan = Some(lower_foreach(fe, base, ctx)?);
             }
             // `CREATE VECTOR INDEX` is schema DDL, not a query operator: the
             // server intercepts a standalone one before lowering (see
@@ -187,18 +200,24 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
                         clause.span(),
                     ));
                 }
-                plan = Some(lower_call(c, &mut ctx)?);
+                plan = Some(lower_call(c, ctx)?);
             }
             Clause::CallSubquery(cs) => {
                 let base = plan.take();
-                let (subplan, produced) = lower_call_subquery(cs, &ctx)?;
+                let (subplan, produced, correlated) = lower_call_subquery(cs, ctx)?;
                 // The subquery's RETURN columns become outer bindings; its
                 // internal bindings stay local.
                 for a in produced {
                     ctx.bindings.insert(a);
                 }
                 plan = Some(match base {
+                    // A correlated subquery needs an outer row; without a
+                    // preceding clause it degenerates to its (uncorrelated) self.
                     None => subplan,
+                    Some(b) if correlated => LogicalPlan::Apply {
+                        input: Box::new(b),
+                        subplan: Box::new(subplan),
+                    },
                     Some(b) => LogicalPlan::CrossProduct {
                         left: Box::new(b),
                         right: Box::new(subplan),
@@ -212,7 +231,7 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
         LowerError::new(
             LowerErrorKind::InvalidPattern,
             "query produced no operators",
-            query.span,
+            span,
         )
     })
 }
@@ -227,35 +246,77 @@ fn require_input(p: Option<LogicalPlan>, span: SourceSpan) -> Result<LogicalPlan
     })
 }
 
-/// Lower a `CALL { … }` subquery block. Returns the subplan and the names its
-/// RETURN exposes to the outer scope. Lowered in a fresh scope (uncorrelated):
-/// the body is self-contained and its result is combined with the outer rows by
-/// the caller via `CrossProduct`. The correlated form (a leading `WITH` that
-/// imports an outer binding) is rejected — it needs an Apply operator we do not
-/// have yet.
+/// Lower a `CALL { … }` subquery block to `(subplan, produced_bindings,
+/// correlated)`. The body's RETURN columns are `produced_bindings`.
+///
+/// Uncorrelated: the body is self-contained, lowered in a fresh scope; the
+/// caller combines it with the outer rows via `CrossProduct`. Correlated (a
+/// leading `WITH` importing outer bindings): the body is rooted at an `Argument`
+/// carrying the imports and the caller wraps it in an `Apply` (per-outer-row
+/// lateral join).
 fn lower_call_subquery(
     cs: &ast::CallSubqueryClause,
     outer_ctx: &LowerCtx,
-) -> Result<(LogicalPlan, Vec<String>), LowerError> {
+) -> Result<(LogicalPlan, Vec<String>, bool), LowerError> {
     if let Some(Clause::With(w)) = cs.query.clauses.first() {
         let imports_outer = w.items.iter().any(|it| {
             matches!(&it.expression.kind, ExpressionKind::Variable(v)
                 if outer_ctx.bindings.contains(&v.name))
         });
         if imports_outer {
-            return Err(LowerError::new(
-                LowerErrorKind::UnsupportedFeature,
-                "correlated CALL { WITH … } subqueries are not yet supported; \
-                 use an uncorrelated CALL subquery or restructure the query",
-                cs.span,
-            ));
+            // The importing WITH must be a pure pass-through of bound variables.
+            let pure = w.where_.is_none()
+                && w.order_by.is_empty()
+                && w.skip.is_none()
+                && w.limit.is_none()
+                && !w.distinct
+                && w.items.iter().all(|it| {
+                    it.alias.is_none() && matches!(&it.expression.kind, ExpressionKind::Variable(_))
+                });
+            if !pure {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "the importing WITH of a correlated CALL subquery may only list \
+                     already-bound variables (no aliases, WHERE, ORDER BY, SKIP, LIMIT or DISTINCT)",
+                    w.span,
+                ));
+            }
+            let imports: Vec<String> = w
+                .items
+                .iter()
+                .map(|it| match &it.expression.kind {
+                    ExpressionKind::Variable(v) => v.name.clone(),
+                    _ => unreachable!("verified pure above"),
+                })
+                .collect();
+            for name in &imports {
+                if !outer_ctx.bindings.contains(name) {
+                    return Err(LowerError::new(
+                        LowerErrorKind::InvalidPattern,
+                        "CALL subquery imports a variable that is not bound in the outer query",
+                        w.span,
+                    ));
+                }
+            }
+            let mut sub = LowerCtx::new();
+            for name in &imports {
+                sub.bindings.insert(name.clone());
+            }
+            let base = LogicalPlan::Argument {
+                bindings: imports.clone(),
+            };
+            let subplan = lower_clause_seq(&cs.query.clauses[1..], &mut sub, Some(base), cs.span)?;
+            let produced: Vec<String> = crate::optimize::produced_aliases(&subplan)
+                .into_iter()
+                .collect();
+            return Ok((subplan, produced, true));
         }
     }
     let subplan = lower_single_query(&cs.query)?;
     let produced: Vec<String> = crate::optimize::produced_aliases(&subplan)
         .into_iter()
         .collect();
-    Ok((subplan, produced))
+    Ok((subplan, produced, false))
 }
 
 /// Lower a `CALL` source clause to a `CallProcedure` leaf. Normalises the

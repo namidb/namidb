@@ -152,6 +152,10 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan,
             negated,
         },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(convert_cross_to_hash(*input, catalog)),
+            subplan,
+        },
         LogicalPlan::PatternList {
             input,
             subplan,

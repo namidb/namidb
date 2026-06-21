@@ -474,6 +474,23 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
+        LogicalPlan::Apply { input, subplan } => {
+            // Correlated lateral join: per outer row, emit each subplan row.
+            // Estimate like a cross product (output bindings are the union).
+            let l = estimate_inner(input, catalog);
+            let r = estimate_inner(subplan, catalog);
+            let rows = l.rows * r.rows.max(1.0);
+            let mut bindings = l.bindings.clone();
+            for (k, v) in &r.bindings {
+                bindings.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            Cardinality {
+                rows,
+                bindings,
+                children: vec![l, r],
+                operator: plan.operator_name(),
+            }
+        }
         LogicalPlan::HashSemiJoin {
             outer,
             inner,

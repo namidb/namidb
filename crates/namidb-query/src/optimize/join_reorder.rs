@@ -200,6 +200,10 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan: Box::new(recurse(*subplan, catalog)),
             negated,
         },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(recurse(*input, catalog)),
+            subplan: Box::new(recurse(*subplan, catalog)),
+        },
         LogicalPlan::PatternList {
             input,
             subplan,

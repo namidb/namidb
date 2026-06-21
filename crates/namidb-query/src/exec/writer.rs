@@ -514,6 +514,7 @@ fn execute_write_inner<'a>(
             | LogicalPlan::Argument { .. }
             | LogicalPlan::Expand { .. }
             | LogicalPlan::SemiApply { .. }
+            | LogicalPlan::Apply { .. }
             | LogicalPlan::PatternList { .. }
             | LogicalPlan::MultiwayJoin { .. }
             | LogicalPlan::VectorSearch { .. }

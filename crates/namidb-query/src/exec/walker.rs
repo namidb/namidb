@@ -263,6 +263,28 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 Ok(out)
             }
 
+            LogicalPlan::Apply { input, subplan } => {
+                // Correlated lateral join: for each outer row, run the subplan
+                // with that row as the correlation and emit the row combined
+                // with each subplan row.
+                let rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let sub_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    for s in sub_rows {
+                        let mut merged = row.clone();
+                        for (k, v) in &s.bindings {
+                            merged.set(k.clone(), v.clone());
+                        }
+                        out.push(merged);
+                    }
+                }
+                Ok(out)
+            }
+
             LogicalPlan::Create { .. }
             | LogicalPlan::Merge { .. }
             | LogicalPlan::Set { .. }
@@ -3418,6 +3440,27 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 Ok(FactorRowSet::from_flat(out))
             }
 
+            LogicalPlan::Apply { input, subplan } => {
+                let input_set =
+                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                        .await?;
+                let rows = input_set.materialize_all(None);
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let sub_rows =
+                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
+                            .await?;
+                    for s in sub_rows {
+                        let mut merged = row.clone();
+                        for (k, v) in &s.bindings {
+                            merged.set(k.clone(), v.clone());
+                        }
+                        out.push(merged);
+                    }
+                }
+                Ok(FactorRowSet::from_flat(out))
+            }
+
             LogicalPlan::PatternList {
                 input,
                 subplan,
@@ -4625,6 +4668,7 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         | LogicalPlan::Union { .. }
         | LogicalPlan::CrossProduct { .. }
         | LogicalPlan::SemiApply { .. }
+        | LogicalPlan::Apply { .. }
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::Empty
         | LogicalPlan::Argument { .. }

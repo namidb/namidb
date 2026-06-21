@@ -516,6 +516,10 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             subplan,
             negated,
         },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(rewrite(*input)),
+            subplan,
+        },
         LogicalPlan::PatternList {
             input,
             subplan,

@@ -166,6 +166,10 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             subplan,
             negated,
         },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(normalize_filters(*input)),
+            subplan,
+        },
         LogicalPlan::PatternList {
             input,
             subplan,

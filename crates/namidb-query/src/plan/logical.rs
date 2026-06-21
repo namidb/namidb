@@ -276,6 +276,17 @@ pub enum LogicalPlan {
         negated: bool,
     },
 
+    /// Correlated lateral join — the row-producing sibling of [`Self::SemiApply`].
+    /// For each row from `input`, execute `subplan` with that row as the outer
+    /// correlation (its `Argument` leaf injects the imported bindings), then emit
+    /// the input row combined with each subplan row. An input row whose subplan
+    /// yields nothing contributes no output (inner join). Emitted for a
+    /// correlated `CALL { WITH … }` subquery.
+    Apply {
+        input: Box<LogicalPlan>,
+        subplan: Box<LogicalPlan>,
+    },
+
     /// Materialise a pattern comprehension `[(a)-[]->(b) WHERE p | proj]`
     /// into a list-valued binding. For each row from `input`, execute
     /// `subplan` parametrised by the row, evaluate `projection` on each
@@ -502,6 +513,9 @@ impl LogicalPlan {
             LogicalPlan::SemiApply { input, subplan, .. } => {
                 vec![input.as_ref(), subplan.as_ref()]
             }
+            LogicalPlan::Apply { input, subplan } => {
+                vec![input.as_ref(), subplan.as_ref()]
+            }
             LogicalPlan::PatternList { input, subplan, .. } => {
                 vec![input.as_ref(), subplan.as_ref()]
             }
@@ -581,6 +595,7 @@ impl LogicalPlan {
                     "SemiApply"
                 }
             }
+            LogicalPlan::Apply { .. } => "Apply",
             LogicalPlan::PatternList { .. } => "PatternList",
             LogicalPlan::Create { .. } => "Create",
             LogicalPlan::Merge { .. } => "Merge",

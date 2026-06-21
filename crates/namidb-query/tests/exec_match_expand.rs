@@ -1536,13 +1536,59 @@ async fn call_subquery_cross_joins_with_outer() {
 }
 
 #[tokio::test]
-async fn call_subquery_correlated_is_rejected() {
-    // Correlated form (leading WITH imports `a`) is not yet supported.
+async fn call_subquery_correlated_runs_per_outer_row() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-correlated"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Correlated: the leading `WITH a` imports the outer Person; the subquery
+    // expands a's out-KNOWS per row. Equivalent to a plain MATCH expand.
     let q = parse(
         "MATCH (a:Person) \
          CALL { WITH a MATCH (a)-[:KNOWS]->(b:Person) RETURN b.name AS fname } \
-         RETURN fname",
+         RETURN a.name AS name, fname ORDER BY name, fname",
     )
     .unwrap();
-    assert!(lower(&q).is_err(), "correlated CALL{{}} must be rejected");
+    // Run through the full optimizer so the Apply operator is exercised by every
+    // rewrite pass (this is what the server does).
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(lower(&q).unwrap(), &catalog);
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| match (r.get("name"), r.get("fname")) {
+            (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(b))) => {
+                (a.clone(), b.clone())
+            }
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".into(), "Bob".into()),
+            ("Alice".into(), "Carol".into()),
+            ("Bob".into(), "Carol".into()),
+            ("Carol".into(), "Dave".into()),
+            ("Dave".into(), "Eve".into()),
+            ("Eve".into(), "Alice".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn call_subquery_impure_import_is_rejected() {
+    // The importing WITH must be a bare pass-through; an alias makes it impure.
+    let q = parse(
+        "MATCH (a:Person) \
+         CALL { WITH a.name AS n MATCH (b:Person {name: n}) RETURN b } \
+         RETURN b",
+    )
+    .unwrap();
+    assert!(
+        lower(&q).is_err(),
+        "an aliased/projected import WITH must be rejected"
+    );
 }

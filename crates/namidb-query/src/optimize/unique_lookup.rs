@@ -242,6 +242,10 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan: Box::new(rewrite(*subplan, catalog)),
             negated,
         },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(rewrite(*input, catalog)),
+            subplan: Box::new(rewrite(*subplan, catalog)),
+        },
         LogicalPlan::PatternList {
             input,
             subplan,
