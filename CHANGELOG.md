@@ -11,6 +11,8 @@ the release notes.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-21: Cypher DDL, subqueries, FOREACH, and pattern extensions
+
 ### Fixed
 
 - `nodes(path)` over a variable-length path now carries the **start** node's full
