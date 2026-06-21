@@ -1099,6 +1099,14 @@ pub(crate) async fn execute_expand(
                     // (the binding's NodeView is already on the row).
                     // For non-back-reference, fetch the view so we
                     // can populate / label-filter.
+                    // The far-end label(s) constrain which reached nodes are
+                    // RESULTS — not which may be traversed THROUGH. For a
+                    // multi-hop (`*`) expansion we therefore traverse every
+                    // existing neighbour and let `target_is_result` gate the hit.
+                    // Pruning the frontier on a label mismatch (the pre-fix bug)
+                    // made `(s)-[:R*1..n]->(a:Label)` return empty whenever the
+                    // intermediate nodes were not themselves `Label`.
+                    let mut target_is_result = true;
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
@@ -1109,15 +1117,27 @@ pub(crate) async fn execute_expand(
                         // `continue`-on-None branch below.
                         None
                     } else if let Some(label) = target_labels.first() {
-                        match snapshot.lookup_node(label, target_id).await? {
-                            // Conjunctive multi-label: the neighbour must carry
-                            // EVERY listed label. Dropping a partial match here
-                            // feeds the OPTIONAL NULL path (no neighbour matched)
-                            // and, for non-OPTIONAL, simply excludes the edge.
-                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
-                                Some(v)
+                        if max > 1 {
+                            // Multi-hop: traverse through any existing node; the
+                            // far-end label gates only whether it is a result.
+                            match scan_node_for_id(snapshot, target_id).await? {
+                                Some(v) => {
+                                    target_is_result =
+                                        target_labels.iter().all(|l| v.labels.contains(l));
+                                    Some(v)
+                                }
+                                None => continue,
                             }
-                            _ => continue,
+                        } else {
+                            // Single hop: the target IS the result, so a label
+                            // mismatch excludes the edge (no traversal beyond it).
+                            // Conjunctive multi-label: must carry EVERY label.
+                            match snapshot.lookup_node(label, target_id).await? {
+                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                    Some(v)
+                                }
+                                _ => continue,
+                            }
                         }
                     } else {
                         match scan_node_for_id(snapshot, target_id).await? {
@@ -1188,10 +1208,11 @@ pub(crate) async fn execute_expand(
                         trail: new_trail.clone(),
                     });
                     if hop >= min.max(1) {
-                        let keeps = match existing_target_id {
-                            Some(existing) => target_id == existing,
-                            None => true,
-                        };
+                        let keeps = target_is_result
+                            && match existing_target_id {
+                                Some(existing) => target_id == existing,
+                                None => true,
+                            };
                         if keeps {
                             let mut hit_row = new_row;
                             if let Some(name) = path_binding {
@@ -3601,21 +3622,34 @@ async fn execute_expand_factor(
             for ((cur_parent, tail), neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, tail);
+                    // Far-end label(s) gate RESULTS, not traversal: for a
+                    // multi-hop expansion, traverse through any node and let
+                    // `target_is_result` decide the hit (see the flat-path fix).
+                    let mut target_is_result = true;
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
                         // Fix #3: transit-only binding, see flat-path comment.
                         None
                     } else if let Some(label) = target_labels.first() {
-                        match snapshot.lookup_node(label, target_id).await? {
-                            // Conjunctive multi-label: the neighbour must carry
-                            // EVERY listed label. Dropping a partial match here
-                            // feeds the OPTIONAL NULL path (no neighbour matched)
-                            // and, for non-OPTIONAL, simply excludes the edge.
-                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
-                                Some(v)
+                        if max > 1 {
+                            match scan_node_for_id(snapshot, target_id).await? {
+                                Some(v) => {
+                                    target_is_result =
+                                        target_labels.iter().all(|l| v.labels.contains(l));
+                                    Some(v)
+                                }
+                                None => continue,
                             }
-                            _ => continue,
+                        } else {
+                            // Single hop: label mismatch excludes the edge.
+                            // Conjunctive multi-label: must carry EVERY label.
+                            match snapshot.lookup_node(label, target_id).await? {
+                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                    Some(v)
+                                }
+                                _ => continue,
+                            }
                         }
                     } else {
                         match scan_node_for_id(snapshot, target_id).await? {
@@ -3650,10 +3684,11 @@ async fn execute_expand_factor(
                     let new_idx = arena.push(cur_parent, slots);
                     next_frontier.push((new_idx, target_id));
                     if hop >= min.max(1) {
-                        let keeps = match existing_target_id {
-                            Some(existing) => target_id == existing,
-                            None => true,
-                        };
+                        let keeps = target_is_result
+                            && match existing_target_id {
+                                Some(existing) => target_id == existing,
+                                None => true,
+                            };
                         if keeps {
                             hop_outputs_for_this_input.push(new_idx);
                             matched_any = true;

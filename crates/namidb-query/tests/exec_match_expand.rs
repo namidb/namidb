@@ -843,6 +843,45 @@ async fn unwind_alias_drives_following_match_property_filter() {
 }
 
 #[tokio::test]
+async fn var_length_forward_reaches_far_label_through_other_labels() {
+    // Regression: a forward variable-length path to a far-end label must
+    // traverse THROUGH intermediate nodes of other labels. The far-end label
+    // constrains which nodes are RESULTS, not which may be traversed.
+    // Chain: a:A -R-> b:Mid -R-> c:Goal. `(a:A)-[:R*1..3]->(g:Goal)` must
+    // return c (2 hops), even though the hop-1 node b is not a Goal.
+    let mut writer = WriterSession::open(store(), paths("exec-vlen-farlabel"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    writer.upsert_node("A", a, &person("a", 1)).unwrap();
+    writer.upsert_node("Mid", b, &person("b", 2)).unwrap();
+    writer.upsert_node("Goal", c, &person("c", 3)).unwrap();
+    writer.upsert_edge("R", a, b, &edge()).unwrap();
+    writer.upsert_edge("R", b, c, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse("MATCH (a:A)-[:R*1..3]->(g:Goal) RETURN g.name AS name").unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["c".to_string()],
+        "forward var-length must reach the far-end label through intermediates of other labels"
+    );
+}
+
+#[tokio::test]
 async fn optional_match_variable_length_matches_within_bound() {
     // Issue 05: variable-length under OPTIONAL MATCH now parses and runs.
     // Alice reaches Bob (1 hop) and Carol (1 and 2 hops) within `*1..2`.
