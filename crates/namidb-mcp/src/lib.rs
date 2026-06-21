@@ -615,37 +615,56 @@ impl Server {
         k: u64,
         filter: Option<&str>,
     ) -> Result<Vec<FusedResult>, String> {
-        let candidate_limit = 3 * k;
-        let mut p = Params::new();
-        p.insert("text".to_string(), RuntimeValue::String(text.to_string()));
+        let candidate_limit = (3 * k) as usize;
 
+        // 1. Allowed set: non-placeholder nodes, plus the optional caller filter.
+        // Resolving the filter here (against the `n` binding) keeps the caller's
+        // `where` predicate working — `CALL ... YIELD` has no WHERE clause, so the
+        // filter cannot ride along with the ranking query below.
         let where_extra = match filter {
             Some(f) => format!(" AND ({f})"),
             None => String::new(),
         };
-
-        // Rank candidates by BM25 lexical relevance (Item 13 Layer B): the
-        // `bm25(document, query)` builtin scores term-frequency saturation +
-        // field-length normalization, so a note with more/denser matches of the
-        // query terms ranks higher. The tie-break on title keeps ranks
-        // DETERMINISTIC (reproducible RRF ranks) when two notes score equally.
-        let cypher = format!(
-            "MATCH (n:{label}) \
-             WHERE (n.body CONTAINS $text OR n.title CONTAINS $text) \
-               AND n.placeholder IS NULL{where_extra} \
-             RETURN n.title AS title, n.path AS path, \
-                    bm25(coalesce(n.body, '') + ' ' + coalesce(n.title, ''), $text) AS lex_score \
-             ORDER BY lex_score DESC, n.title \
-             LIMIT {candidate_limit}"
+        let allowed_cypher = format!(
+            "MATCH (n:{label}) WHERE n.placeholder IS NULL{where_extra} RETURN id(n) AS id"
         );
+        let allowed_rows = self
+            .run_read_query(&allowed_cypher, &Params::new())
+            .await
+            .map_err(|e| e.to_string())?;
+        let allowed: std::collections::HashSet<String> = allowed_rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
 
+        // 2. Rank the whole corpus by full BM25 with real IDF (Layer C):
+        // `CALL search.bm25` builds corpus statistics (document frequency, average
+        // length) and weights rare query terms above common ones — the corpus
+        // signal the per-row `bm25()` scalar cannot see. `label` is a validated
+        // identifier; the query text rides as a parameter.
+        let mut p = Params::new();
+        p.insert("text".to_string(), RuntimeValue::String(text.to_string()));
+        let rank_cypher = format!(
+            "CALL search.bm25({{label: '{label}', text_properties: ['body', 'title'], query: $text}}) \
+             YIELD node, score \
+             RETURN id(node) AS id, node.title AS title, node.path AS path, score \
+             ORDER BY score DESC"
+        );
         let rows = self
-            .run_read_query(&cypher, &p)
+            .run_read_query(&rank_cypher, &p)
             .await
             .map_err(|e| e.to_string())?;
 
+        // 3. Keep allowed ids in rank order (already score-descending), then cap.
         Ok(rows
             .into_iter()
+            .filter(|r| {
+                r.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| allowed.contains(id))
+                    .unwrap_or(false)
+            })
+            .take(candidate_limit)
             .enumerate()
             .map(|(rank, row)| FusedResult {
                 title: row.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -1744,6 +1763,31 @@ mod tests {
         assert_eq!(res["isError"], json!(true));
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("source"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_lexical_channel_runs_real_bm25() {
+        // The lexical channel routes through `CALL search.bm25` (real IDF). This
+        // exercises that wiring end to end: the fused result for "fox" must
+        // surface the note that actually contains the rare term.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Fox.md", "the quick brown fox jumps over the lazy dog\n");
+        write(dir.path(), "Cat.md", "the common cat sleeps all day long\n");
+        write(dir.path(), "Dog.md", "the common dog barks at the moon\n");
+        let server = Server::open("memory://mcp-hybrid").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(&server, "hybrid_search", json!({ "query": "fox", "k": 3 })).await;
+        let titles: Vec<&str> = res
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert!(
+            titles.contains(&"Fox"),
+            "the note containing the rare term must surface; got {titles:?}"
+        );
     }
 
     #[tokio::test]

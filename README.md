@@ -185,7 +185,15 @@ For large collections, promote it to a real ANN index (DiskANN/Vamana) so the op
 CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 3;
 ```
 
-And `bm25(...)` gives you real lexical relevance — the MCP `hybrid_search` tool below fuses it with vector scores automatically.
+For lexical relevance, `CALL search.bm25(...)` ranks documents with full BM25 — real IDF (rare query terms outweigh common ones), term-frequency saturation, and corpus-derived length normalization:
+
+```cypher
+CALL search.bm25({label: 'Doc', text_properties: ['title', 'body'], query: 'graph storage', k: 10})
+YIELD node, score
+RETURN node.title AS title, score ORDER BY score DESC;
+```
+
+The MCP `hybrid_search` tool fuses this lexical channel with vector scores (reciprocal rank fusion) automatically. There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF.
 
 <br />
 

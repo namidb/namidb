@@ -11,6 +11,17 @@ the release notes.
 
 ## [Unreleased]
 
+### Added
+
+- `CALL search.bm25({label, text_property | text_properties, query, k?})` —
+  full BM25 lexical search with **real IDF**. It scans the label's text
+  property, builds corpus statistics (document count, average length, per-term
+  document frequency) in one pass, then weights rare query terms above common
+  ones — the signal the per-row `bm25(text, query)` scalar (IDF = 1.0) cannot
+  see. Yields `node` + `score`, ordered by relevance. The MCP `hybrid_search`
+  lexical channel now ranks through it, so hybrid results reflect true term
+  rarity. The corpus-free scalar remains for inline use.
+
 ## [1.0.0] - 2026-06-20: first stable release
 
 First stable release. The on-disk format, the Cypher surface, the HTTP/Bolt

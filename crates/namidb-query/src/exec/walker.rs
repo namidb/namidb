@@ -1282,9 +1282,15 @@ async fn flat_call_procedure(
     snapshot: &Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
+    // The `search` namespace holds text-retrieval procedures, which scan a
+    // label's text property rather than the edge graph. Dispatch them before
+    // the (potentially expensive) algo-graph build below.
+    if namespace == Some("search") {
+        return flat_search_procedure(name, args, yield_items, snapshot, params).await;
+    }
     if !matches!(namespace, Some("algo") | None) {
         return Err(proc_unsupported(format!(
-            "unknown procedure namespace `{}` (supported: `algo`)",
+            "unknown procedure namespace `{}` (supported: `algo`, `search`)",
             namespace.unwrap_or("")
         )));
     }
@@ -1463,7 +1469,19 @@ async fn flat_call_procedure(
         }
     };
 
-    // Project canonical columns → binding names (YIELD, or canonical names).
+    project_proc_rows(&format!("algo.{name}"), &cols, raw, yield_items)
+}
+
+/// Project a procedure's canonical columns (`cols`) and per-row values (`raw`)
+/// onto the caller's YIELD bindings — or the canonical names when YIELD is
+/// omitted. Shared by every `CALL` procedure. `qualified` is the full procedure
+/// name (e.g. `algo.wcc`, `search.bm25`) for error messages.
+fn project_proc_rows(
+    qualified: &str,
+    cols: &[&str],
+    raw: Vec<Vec<RuntimeValue>>,
+    yield_items: &[(String, String)],
+) -> Result<Vec<Row>, ExecError> {
     let projection: Vec<(usize, String)> = if yield_items.is_empty() {
         cols.iter()
             .enumerate()
@@ -1476,7 +1494,7 @@ async fn flat_call_procedure(
                 Some(i) => out.push((i, bind.clone())),
                 None => {
                     return Err(proc_unsupported(format!(
-                        "procedure `algo.{name}` has no output column `{src}` \
+                        "procedure `{qualified}` has no output column `{src}` \
                          (available: {})",
                         cols.join(", ")
                     )));
@@ -1499,6 +1517,232 @@ async fn flat_call_procedure(
 
 fn proc_unsupported(msg: impl Into<String>) -> ExecError {
     ExecError::Eval(EvalError::unsupported(msg, SourceSpan::point(0)))
+}
+
+/// `CALL search.<name>(...)` — text-retrieval procedures over a label's text
+/// property. Currently `search.bm25`.
+async fn flat_search_procedure(
+    name: &str,
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    match name {
+        "bm25" => bm25_search(args, yield_items, snapshot, params).await,
+        other => Err(proc_unsupported(format!(
+            "unknown procedure `search.{other}` (supported: search.bm25)"
+        ))),
+    }
+}
+
+/// Full BM25 with real IDF (hybrid search Layer C). Scans `label`'s text
+/// property/properties, builds corpus statistics (document count, average
+/// length, per-query-term document frequency) in one pass, then scores every
+/// candidate document with [`text_scoring::bm25_term_score`] and an IDF derived
+/// from the corpus. Yields `node` (the matched node) + `score`, ordered by
+/// score descending. Unlike the per-row `bm25()` scalar, this weights rare
+/// terms above common ones.
+///
+/// `CALL search.bm25({label: 'Note', text_properties: ['body','title'],
+/// query: $q, k: 10})`
+async fn bm25_search(
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::exec::text_scoring::{bm25_idf, bm25_term_score, tokenize_counts};
+
+    let (label, props, query, k) = bm25_search_args(args, params)?;
+
+    // Distinct query terms (a repeated query term is scored once).
+    let mut qterms: Vec<String> = Vec::new();
+    for t in tokenize_counts(&query).0.into_keys() {
+        qterms.push(t);
+    }
+    qterms.sort(); // deterministic df/idf index order
+    if qterms.is_empty() {
+        return project_proc_rows("search.bm25", &["node", "score"], Vec::new(), yield_items);
+    }
+
+    let views = snapshot.scan_label(&label).await?;
+
+    // One pass: corpus stats over every document (a node with the text field)
+    // and the per-query-term frequencies of the candidate documents.
+    let mut n_docs = 0usize;
+    let mut total_len = 0usize;
+    let mut df = vec![0usize; qterms.len()];
+    let mut candidates: Vec<(usize, Vec<u32>, usize)> = Vec::new(); // (view idx, tf per qterm, len)
+    let mut since_check = 0usize;
+    for (vi, view) in views.iter().enumerate() {
+        let Some(text) = doc_text(view, &props) else {
+            continue; // not part of the searchable corpus
+        };
+        let (counts, len) = tokenize_counts(&text);
+        n_docs += 1;
+        total_len += len;
+        let mut tfs = vec![0u32; qterms.len()];
+        let mut any = false;
+        for (i, qt) in qterms.iter().enumerate() {
+            let tf = counts.get(qt).copied().unwrap_or(0);
+            tfs[i] = tf;
+            if tf > 0 {
+                df[i] += 1;
+                any = true;
+            }
+        }
+        if any {
+            candidates.push((vi, tfs, len));
+        }
+        since_check += 1;
+        if since_check >= 4096 {
+            since_check = 0;
+            if namidb_storage::cancel::deadline_exceeded() {
+                return Err(ExecError::Timeout);
+            }
+        }
+    }
+
+    let avg_len = if n_docs > 0 {
+        total_len as f64 / n_docs as f64
+    } else {
+        1.0
+    };
+    let idf: Vec<f64> = df.iter().map(|&d| bm25_idf(n_docs, d)).collect();
+
+    let mut scored: Vec<(usize, f64)> = candidates
+        .into_iter()
+        .map(|(vi, tfs, len)| {
+            let s: f64 = tfs
+                .iter()
+                .enumerate()
+                .map(|(i, &tf)| bm25_term_score(idf[i], tf, len, avg_len))
+                .sum();
+            (vi, s)
+        })
+        .collect();
+    // Score descending, node id ascending for a deterministic tie-break.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| views[a.0].id.cmp(&views[b.0].id))
+    });
+    if let Some(k) = k {
+        scored.truncate(k);
+    }
+
+    let raw: Vec<Vec<RuntimeValue>> = scored
+        .into_iter()
+        .map(|(vi, s)| {
+            let node = RuntimeValue::Node(Box::new(NodeValue::from(views[vi].clone())));
+            vec![node, RuntimeValue::Float(s)]
+        })
+        .collect();
+    project_proc_rows("search.bm25", &["node", "score"], raw, yield_items)
+}
+
+/// The text of a document for BM25: the configured properties' string values
+/// joined by a space. `None` when the node carries none of them as a string —
+/// such a node is not a member of the searchable corpus.
+fn doc_text(view: &namidb_storage::NodeView, props: &[String]) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for p in props {
+        if let Some(namidb_core::Value::Str(s)) = view.properties.get(p) {
+            parts.push(s.as_str());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Resolve `search.bm25` options from its single required map argument:
+/// `{label, query, text_property | text_properties, k?}`. Returns
+/// `(label, text_properties, query, k)`.
+fn bm25_search_args(
+    args: &[Expression],
+    params: &Params,
+) -> Result<(String, Vec<String>, String, Option<usize>), ExecError> {
+    let map = match args {
+        [arg] => match evaluate(arg, &Row::new(), params)? {
+            RuntimeValue::Map(m) => m,
+            _ => {
+                return Err(proc_unsupported(
+                    "search.bm25 expects a single map argument, e.g. \
+                     {label: 'Note', text_property: 'body', query: $q}",
+                ));
+            }
+        },
+        _ => {
+            return Err(proc_unsupported(
+                "search.bm25 requires one map argument, e.g. \
+                 {label: 'Note', text_property: 'body', query: $q}",
+            ));
+        }
+    };
+
+    let want_str = |v: &RuntimeValue| match v {
+        RuntimeValue::String(s) => Some(s.clone()),
+        _ => None,
+    };
+
+    let label = map
+        .get("label")
+        .and_then(want_str)
+        .ok_or_else(|| proc_unsupported("search.bm25 requires a `label` string"))?;
+    let query = map
+        .get("query")
+        .and_then(want_str)
+        .ok_or_else(|| proc_unsupported("search.bm25 requires a `query` string"))?;
+
+    // Either a single `text_property` or a list `text_properties`.
+    let props: Vec<String> = match (map.get("text_properties"), map.get("text_property")) {
+        (Some(RuntimeValue::List(items)), _) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match want_str(it) {
+                    Some(s) => out.push(s),
+                    None => {
+                        return Err(proc_unsupported(
+                            "search.bm25 `text_properties` must be a list of strings",
+                        ));
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Err(proc_unsupported("search.bm25 `text_properties` must be non-empty"));
+            }
+            out
+        }
+        (Some(_), _) => {
+            return Err(proc_unsupported(
+                "search.bm25 `text_properties` must be a list of strings",
+            ));
+        }
+        (None, Some(v)) => match want_str(v) {
+            Some(s) => vec![s],
+            None => {
+                return Err(proc_unsupported("search.bm25 `text_property` must be a string"));
+            }
+        },
+        (None, None) => {
+            return Err(proc_unsupported(
+                "search.bm25 requires `text_property` (string) or `text_properties` (list)",
+            ));
+        }
+    };
+
+    let k = match map.get("k") {
+        None => None,
+        Some(v) => Some(as_usize(v).ok_or_else(|| {
+            proc_unsupported("search.bm25 `k` must be a non-negative integer")
+        })?),
+    };
+
+    Ok((label, props, query, k))
 }
 
 /// A `node_id` YIELD value: a node carrying just its id (labels/properties

@@ -364,6 +364,142 @@ async fn call_shortest_path_from_source() {
     );
 }
 
+fn node_with_body(text: &str) -> NodeWriteRecord {
+    let mut props = BTreeMap::new();
+    props.insert("body".to_string(), namidb_core::Value::Str(text.to_string()));
+    NodeWriteRecord {
+        properties: props,
+        schema_version: 1,
+        ..Default::default()
+    }
+}
+
+/// Five `:Note` docs. "fox" appears in exactly one (rare → high IDF); "common"
+/// appears in four (low IDF). Returns the ids in body order.
+async fn build_text_corpus(writer: &mut WriterSession) -> [NodeId; 5] {
+    let ids: [NodeId; 5] = std::array::from_fn(|_| NodeId::new());
+    let bodies = [
+        "fox the cat",
+        "common the cat",
+        "common the dog",
+        "common the bird",
+        "common the lizard",
+    ];
+    for (id, body) in ids.iter().zip(bodies) {
+        writer.upsert_node("Note", *id, &node_with_body(body)).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    ids
+}
+
+#[tokio::test]
+async fn call_search_bm25_ranks_rare_terms_higher() {
+    let mut writer = WriterSession::open(store(), paths("call-bm25"))
+        .await
+        .unwrap();
+    let ids = build_text_corpus(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let rows = run(
+        &snapshot,
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox common'}) \
+         YIELD node, score RETURN node, score",
+    )
+    .await;
+
+    // All five docs match at least one query term.
+    assert_eq!(rows.len(), 5);
+
+    let score = |r: &namidb_query::Row| match r.get("score") {
+        Some(RuntimeValue::Float(s)) => *s,
+        other => panic!("score not a float: {other:?}"),
+    };
+    let id_of = |r: &namidb_query::Row| match r.get("node") {
+        Some(RuntimeValue::Node(n)) => n.id,
+        other => panic!("node not a node: {other:?}"),
+    };
+
+    // The doc with the rare term "fox" (df=1, high IDF) must outscore the four
+    // that only share the common term (df=4, low IDF). With IDF=1.0 they would
+    // tie; real IDF is what separates them.
+    let top = rows
+        .iter()
+        .max_by(|a, b| score(a).partial_cmp(&score(b)).unwrap())
+        .unwrap();
+    assert_eq!(id_of(top), ids[0], "the rare-term doc should rank first");
+    assert!(score(top) > 0.0);
+}
+
+#[tokio::test]
+async fn call_search_bm25_mcp_query_shape_executes() {
+    // Exactly the query shape the MCP lexical channel generates: a map arg with
+    // a list value + a `$param`, then `id(node)` / property access in RETURN and
+    // an ORDER BY on the yielded score. Guards the MCP wiring from query-shape
+    // regressions without needing an embedder.
+    let mut writer = WriterSession::open(store(), paths("call-bm25-shape"))
+        .await
+        .unwrap();
+    let ids = build_text_corpus(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let cypher = "CALL search.bm25({label: 'Note', text_properties: ['body', 'title'], query: $text}) \
+                  YIELD node, score \
+                  RETURN id(node) AS id, node.path AS path, score \
+                  ORDER BY score DESC";
+    let parsed = parse(cypher).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    let plan = lower(&parsed).unwrap_or_else(|e| panic!("lower: {e:?}"));
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let mut params = Params::new();
+    params.insert(
+        "text".into(),
+        RuntimeValue::String("fox common".into()),
+    );
+    let rows = execute(&plan, &snapshot, &params)
+        .await
+        .unwrap_or_else(|e| panic!("execute: {e}"));
+
+    assert_eq!(rows.len(), 5);
+    // ORDER BY score DESC puts the rare-term doc first; id() yields its uuid.
+    let top_id = rows[0].get("id").and_then(|v| match v {
+        RuntimeValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(top_id, Some(ids[0].to_string()), "rare-term doc id should be first");
+}
+
+#[tokio::test]
+async fn call_search_bm25_requires_text_property() {
+    let mut writer = WriterSession::open(store(), paths("call-bm25-noprop"))
+        .await
+        .unwrap();
+    build_text_corpus(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse("CALL search.bm25({label: 'Note', query: 'fox'}) YIELD node").unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+    assert!(
+        err.is_unsupported(),
+        "search.bm25 without a text property should be unsupported, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn call_unknown_search_procedure_is_unsupported() {
+    let mut writer = WriterSession::open(store(), paths("call-search-unknown"))
+        .await
+        .unwrap();
+    build_text_corpus(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse("CALL search.bogus({label: 'Note'}) YIELD x").unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+    assert!(err.is_unsupported(), "unknown search proc should be unsupported, got {err}");
+}
+
 #[tokio::test]
 async fn call_shortest_path_requires_source() {
     let mut writer = WriterSession::open(store(), paths("call-sp-nosrc"))
