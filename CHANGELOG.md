@@ -30,8 +30,10 @@ the release notes.
   lateral join via the new `Apply` operator), e.g. per-row neighbour expansion or
   top-N. The importing `WITH` must be a bare pass-through of bound variables.
   Subquery bodies expose only their RETURN columns to the outer scope; a body
-  without a RETURN leaks nothing. (A top-level UNION inside the block, and writes
-  inside a *correlated* subquery, are not supported yet.)
+  without a RETURN leaks nothing. A `UNION` / `UNION ALL` inside the block is
+  supported for the uncorrelated form (`CALL { MATCH … RETURN x UNION MATCH …
+  RETURN x }`). (Writes inside a *correlated* subquery, and UNION in a correlated
+  subquery, are not supported yet.)
 - `EXISTS { MATCH … [WHERE …] }` — the Neo4j 5 existential subquery form, in
   addition to the existing `EXISTS(pattern)` function. Correlated on outer
   bindings, supports an inner `WHERE` (and nested `EXISTS`), and `NOT EXISTS {…}`.

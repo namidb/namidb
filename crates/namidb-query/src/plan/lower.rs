@@ -258,12 +258,19 @@ fn lower_call_subquery(
     cs: &ast::CallSubqueryClause,
     outer_ctx: &LowerCtx,
 ) -> Result<(LogicalPlan, Vec<String>, bool), LowerError> {
-    if let Some(Clause::With(w)) = cs.query.clauses.first() {
+    if let Some(Clause::With(w)) = cs.query.head.clauses.first() {
         let imports_outer = w.items.iter().any(|it| {
             matches!(&it.expression.kind, ExpressionKind::Variable(v)
                 if outer_ctx.bindings.contains(&v.name))
         });
         if imports_outer {
+            if !cs.query.tail.is_empty() {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "a correlated CALL subquery (importing WITH) cannot use UNION yet",
+                    cs.span,
+                ));
+            }
             // The importing WITH must be a pure pass-through of bound variables.
             let pure = w.where_.is_none()
                 && w.order_by.is_empty()
@@ -305,7 +312,8 @@ fn lower_call_subquery(
             let base = LogicalPlan::Argument {
                 bindings: imports.clone(),
             };
-            let subplan = lower_clause_seq(&cs.query.clauses[1..], &mut sub, Some(base), cs.span)?;
+            let subplan =
+                lower_clause_seq(&cs.query.head.clauses[1..], &mut sub, Some(base), cs.span)?;
             if subplan.contains_write() {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,
@@ -314,12 +322,13 @@ fn lower_call_subquery(
                     cs.span,
                 ));
             }
-            let produced = subquery_produced(&cs.query, &subplan);
+            let produced = subquery_produced(&cs.query.head, &subplan);
             return Ok((subplan, produced, true));
         }
     }
-    let subplan = lower_single_query(&cs.query)?;
-    let produced = subquery_produced(&cs.query, &subplan);
+    // Uncorrelated: lower the (possibly UNION) body as a self-contained query.
+    let subplan = lower(&cs.query)?;
+    let produced = subquery_produced(&cs.query.head, &subplan);
     Ok((subplan, produced, false))
 }
 

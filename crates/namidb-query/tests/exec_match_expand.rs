@@ -1805,3 +1805,60 @@ async fn inline_label_disjunction_on_expand_target() {
         .collect();
     assert_eq!(names, vec!["Felix", "Rex"]);
 }
+
+#[tokio::test]
+async fn call_subquery_union_composes() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-union"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // UNION inside CALL{}: two label scans combined, returned by the outer query.
+    let q = parse(
+        "CALL { MATCH (p:Person) RETURN p.name AS who \
+                UNION MATCH (p:Person) WHERE p.age > 100 RETURN p.name AS who } \
+         RETURN who ORDER BY who",
+    )
+    .unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("who") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    // Second branch adds nothing (no Person over 100); UNION dedups → 5 distinct.
+    assert_eq!(names, vec!["Alice", "Bob", "Carol", "Dave", "Eve"]);
+}
+
+#[tokio::test]
+async fn call_subquery_union_all_keeps_duplicates() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-union-all"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "CALL { MATCH (p:Person) RETURN count(p) AS c \
+                UNION ALL MATCH (p:Person) RETURN count(p) AS c } \
+         RETURN c ORDER BY c",
+    )
+    .unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    // UNION ALL keeps both branches' single aggregate rows.
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| matches!(r.get("c"), Some(RuntimeValue::Integer(5)))));
+}

@@ -344,12 +344,12 @@ pub struct ForeachClause {
 }
 
 /// `CALL { <subquery> }` — a subquery block. `query` is a self-contained
-/// `RETURN`-terminated query; its result rows are combined (cartesian) with the
-/// enclosing scope, and its `RETURN` columns become outer bindings. The
-/// correlated form (`CALL { WITH <outer vars> … }`) is not yet supported.
+/// `RETURN`-terminated query (which may itself be a `UNION`); its result rows
+/// are combined with the enclosing scope, and its `RETURN` columns become outer
+/// bindings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallSubqueryClause {
-    pub query: SingleQuery,
+    pub query: Query,
     pub span: SourceSpan,
 }
 

@@ -211,14 +211,7 @@ impl fmt::Display for ForeachClause {
 
 impl fmt::Display for CallSubqueryClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CALL { ")?;
-        for (i, c) in self.query.clauses.iter().enumerate() {
-            if i > 0 {
-                f.write_str(" ")?;
-            }
-            write!(f, "{c}")?;
-        }
-        f.write_str(" }")
+        write!(f, "CALL {{ {} }}", self.query)
     }
 }
 

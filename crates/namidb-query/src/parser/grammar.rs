@@ -915,16 +915,50 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// `CALL { <clauses> }` — a subquery block. The inner clauses parse via the
-    /// normal `parse_clause` recursion (MATCH / WITH / RETURN / updates). A
-    /// top-level UNION inside the block is not supported yet.
+    /// `CALL { <query> }` — a subquery block. The body is a full query: one or
+    /// more `parse_clause` sequences joined by `UNION` / `UNION ALL`, terminated
+    /// by the closing `}`.
     fn parse_call_subquery(&mut self) -> Result<CallSubqueryClause, ParseError> {
         let start = self.peek_span().start;
         self.expect_soft_keyword("CALL")?;
         self.expect(&Token::LBrace)?;
         let qstart = self.peek_span().start;
+        let head = self.parse_brace_terminated_single_query()?;
+        let mut tail = Vec::new();
+        while matches!(self.peek(), Some(Token::Union)) {
+            let union_start = self.peek_span().start;
+            self.bump();
+            let all = self.eat(&Token::All).is_some();
+            let part = self.parse_brace_terminated_single_query()?;
+            let end = part.span.end;
+            tail.push(UnionPart {
+                all,
+                query: part,
+                span: SourceSpan::new(union_start, end),
+            });
+        }
+        let rbrace = self.expect(&Token::RBrace)?;
+        let qspan = SourceSpan::new(qstart, rbrace.span.start);
+        Ok(CallSubqueryClause {
+            query: Query {
+                head,
+                tail,
+                explain: false,
+                explain_verbose: false,
+                explain_raw: false,
+                span: qspan,
+            },
+            span: SourceSpan::new(start, rbrace.span.end),
+        })
+    }
+
+    /// Parse one inner query of a CALL block: clauses up to a `UNION` or the
+    /// closing `}`. (`parse_single_query` only stops at top-level UNION/`;`.)
+    fn parse_brace_terminated_single_query(&mut self) -> Result<SingleQuery, ParseError> {
+        let start = self.peek_span().start;
+        let mut end = start;
         let mut clauses = Vec::new();
-        while !self.check(&Token::RBrace) {
+        while !self.check(&Token::RBrace) && !matches!(self.peek(), Some(Token::Union)) {
             if self.peek().is_none() {
                 return Err(ParseError::new(
                     ErrorCode::UnexpectedEof,
@@ -932,22 +966,20 @@ impl<'src> Parser<'src> {
                     self.peek_span(),
                 ));
             }
-            clauses.push(self.parse_clause()?);
+            let clause = self.parse_clause()?;
+            end = clause.span().end;
+            clauses.push(clause);
         }
-        let rbrace = self.expect(&Token::RBrace)?;
         if clauses.is_empty() {
             return Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 "CALL subquery body must contain at least one clause",
-                SourceSpan::new(start, rbrace.span.end),
+                SourceSpan::new(start, end.max(start)),
             ));
         }
-        Ok(CallSubqueryClause {
-            query: SingleQuery {
-                clauses,
-                span: SourceSpan::new(qstart, rbrace.span.start),
-            },
-            span: SourceSpan::new(start, rbrace.span.end),
+        Ok(SingleQuery {
+            clauses,
+            span: SourceSpan::new(start, end),
         })
     }
 
