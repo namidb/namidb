@@ -81,6 +81,13 @@ pub enum Clause {
     /// `CreateVectorIndex` it never lowers to a `LogicalPlan` — the server
     /// intercepts it via [`Query::as_create_fulltext_index`].
     CreateFulltextIndex(CreateFulltextIndexClause),
+    /// `CREATE CONSTRAINT … IS UNIQUE` — schema DDL declaring a uniqueness
+    /// constraint. Always a variant; intercepted out-of-band by the server via
+    /// [`Query::as_create_constraint`] (never lowered).
+    CreateConstraint(CreateConstraintClause),
+    /// `CREATE INDEX … ON …` — schema DDL declaring a secondary (equality)
+    /// index. Intercepted via [`Query::as_create_index`].
+    CreateIndex(CreateIndexClause),
     /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in procedure
     /// (RFC-008 PR1). A leading source clause: it introduces bindings (the
     /// YIELD columns) like `MATCH` does. Always-on (graph algorithms are
@@ -104,6 +111,8 @@ impl Clause {
             Clause::Delete(c) => c.span,
             Clause::CreateVectorIndex(c) => c.span,
             Clause::CreateFulltextIndex(c) => c.span,
+            Clause::CreateConstraint(c) => c.span,
+            Clause::CreateIndex(c) => c.span,
             Clause::Call(c) => c.span,
         }
     }
@@ -134,6 +143,28 @@ impl Query {
     pub fn as_create_fulltext_index(&self) -> Option<&CreateFulltextIndexClause> {
         if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
             if let Clause::CreateFulltextIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `CREATE CONSTRAINT … IS UNIQUE` interception hook: `Some` only when the
+    /// DDL is the sole statement.
+    pub fn as_create_constraint(&self) -> Option<&CreateConstraintClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::CreateConstraint(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `CREATE INDEX … ON …` interception hook: `Some` only when the DDL is the
+    /// sole statement.
+    pub fn as_create_index(&self) -> Option<&CreateIndexClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::CreateIndex(c) = &self.head.clauses[0] {
                 return Some(c);
             }
         }
@@ -266,6 +297,28 @@ pub struct CreateFulltextIndexClause {
     pub name: Identifier,
     pub label: Identifier,
     pub properties: Vec<Identifier>,
+    pub span: SourceSpan,
+}
+
+/// `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE` (and the
+/// legacy `ON (n:Label) ASSERT …` form). A standalone schema command executed
+/// out-of-band by the server (see [`Query::as_create_constraint`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateConstraintClause {
+    pub name: Option<Identifier>,
+    pub label: Identifier,
+    pub property: Identifier,
+    pub span: SourceSpan,
+}
+
+/// `CREATE INDEX [name] FOR (n:Label) ON (n.prop)` (and the legacy
+/// `ON :Label(prop)` form). A standalone schema command executed out-of-band by
+/// the server (see [`Query::as_create_index`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateIndexClause {
+    pub name: Option<Identifier>,
+    pub label: Identifier,
+    pub property: Identifier,
     pub span: SourceSpan,
 }
 

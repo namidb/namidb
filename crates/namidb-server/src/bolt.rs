@@ -232,6 +232,74 @@ impl ServerBackend {
         }
     }
 
+    /// Bolt shape for `CREATE CONSTRAINT`/`CREATE INDEX` (always-on schema DDL).
+    async fn run_create_property_ddl(
+        &self,
+        label: &str,
+        property: &str,
+        unique: bool,
+        started: std::time::Instant,
+    ) -> RunObservation {
+        if let Some(err) = self.write_forbidden() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
+        let op = if unique {
+            crate::authz::SchemaOp::CreateConstraint { label, property }
+        } else {
+            crate::authz::SchemaOp::CreateIndex { label, property }
+        };
+        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        let mut writer = self.state.writer.lock().await;
+        let result = crate::apply_create_property_ddl(
+            &mut writer,
+            &self.state.snapshot,
+            label,
+            property,
+            unique,
+        )
+        .await;
+        drop(writer);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed,
+                result: Ok(RunOutcome {
+                    fields: vec![],
+                    rows: vec![],
+                    statement_type: StatementType::Schema,
+                    counters: BTreeMap::new(),
+                }),
+            },
+            Err(e) => {
+                let is_user = matches!(
+                    &e,
+                    namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_)
+                );
+                let err = if is_user {
+                    BackendError::Semantic(e.to_string())
+                } else {
+                    map_storage_err(e)
+                };
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Err(err),
+                }
+            }
+        }
+    }
+
     /// Auto-commit query: parse, plan, and execute against the published
     /// snapshot (reads) or the writer lock (writes), timing the work for the
     /// metrics. Mirrors the HTTP `run_cypher`. The stopwatch stops at the end
@@ -264,6 +332,18 @@ impl ServerBackend {
         #[cfg(feature = "text-index")]
         if let Some(cfi) = parsed.as_create_fulltext_index() {
             return self.run_create_fulltext_index(cfi, started).await;
+        }
+
+        // `CREATE CONSTRAINT` / `CREATE INDEX`: schema DDL, intercept pre-plan.
+        if let Some(c) = parsed.as_create_constraint() {
+            return self
+                .run_create_property_ddl(&c.label.name, &c.property.name, true, started)
+                .await;
+        }
+        if let Some(c) = parsed.as_create_index() {
+            return self
+                .run_create_property_ddl(&c.label.name, &c.property.name, false, started)
+                .await;
         }
 
         // Plan against the latest published snapshot — no writer lock.
@@ -398,6 +478,15 @@ impl ServerBackend {
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Unsupported(
                     "CREATE FULLTEXT INDEX cannot run inside a transaction".into(),
+                )),
+            };
+        }
+        if parsed.as_create_constraint().is_some() || parsed.as_create_index().is_some() {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Unsupported(
+                    "CREATE CONSTRAINT / CREATE INDEX cannot run inside a transaction".into(),
                 )),
             };
         }

@@ -52,7 +52,7 @@ use object_store::ObjectStore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{LabelDictionary, NodeId, Schema};
+use namidb_core::{DataType, LabelDef, LabelDictionary, NodeId, PropertyDef, Schema, Value};
 
 use crate::adjacency::{adjacency_budget_bytes, adjacency_enabled, AdjacencyCache};
 use crate::cache::{sst_cache_budget_bytes, sst_cache_enabled, SstCache};
@@ -1114,6 +1114,93 @@ impl WriterSession {
         Ok(version)
     }
 
+    /// `CREATE CONSTRAINT … IS UNIQUE`: declare `(label, property)` unique so the
+    /// write path rejects duplicate values (`CREATE`/`MERGE`/`SET` and the bulk
+    /// API all consult `PropertyDef::unique`). Validates the existing data first
+    /// — if a duplicate is already present, the constraint is rejected with
+    /// [`Error::Precondition`] (mirroring Neo4j) rather than silently leaving a
+    /// violated constraint. A metadata-only schema commit; the next flush emits
+    /// the unique sidecar.
+    pub async fn create_unique_constraint(&mut self, label: &str, property: &str) -> Result<u64> {
+        self.alter_property_for_ddl(label, property, true, false)
+            .await
+    }
+
+    /// `CREATE INDEX … ON :Label(prop)`: declare `(label, property)` indexed so
+    /// the flush layer emits a secondary equality-index sidecar (faster
+    /// `MATCH (n:Label {prop: …})`). Non-unique; no data validation. A
+    /// metadata-only schema commit.
+    pub async fn create_property_index(&mut self, label: &str, property: &str) -> Result<u64> {
+        self.alter_property_for_ddl(label, property, false, true)
+            .await
+    }
+
+    /// Shared body of the constraint/index DDL: scan the label to (for a unique
+    /// constraint) reject pre-existing duplicates and to infer the property type
+    /// when it is not already declared, then commit a schema that marks the
+    /// property unique and/or indexed.
+    async fn alter_property_for_ddl(
+        &mut self,
+        label: &str,
+        property: &str,
+        unique: bool,
+        indexed: bool,
+    ) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+
+        // The declared type wins; otherwise infer it from the first live value.
+        let declared_type = self
+            .current
+            .manifest
+            .schema
+            .label(label)
+            .and_then(|l| l.properties.iter().find(|p| p.name == property))
+            .map(|p| p.data_type.clone());
+
+        let mut inferred: Option<DataType> = None;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let snap = self.snapshot();
+            for node in snap.scan_label(label).await? {
+                let Some(v) = node.properties.get(property) else {
+                    continue;
+                };
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                if declared_type.is_none() && inferred.is_none() {
+                    inferred = value_datatype(v);
+                }
+                if unique {
+                    // A stable key per distinct value; equal values collide.
+                    let key = format!("{v:?}");
+                    if !seen.insert(key) {
+                        return Err(Error::precondition(format!(
+                            "cannot create unique constraint on ({label}.{property}): \
+                             duplicate value {v:?} already exists"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let dtype = declared_type.unwrap_or_else(|| inferred.unwrap_or(DataType::Utf8));
+        let mut schema = self.current.manifest.schema.clone();
+        upsert_property_flags(&mut schema, label, property, dtype, unique, indexed)?;
+
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.schema = schema;
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
+    }
+
     fn alloc_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
         self.next_lsn = self.next_lsn.saturating_add(1);
@@ -1133,6 +1220,55 @@ impl WriterSession {
 /// emits these inside `commit_batch`.
 pub fn encode_wal_entry(entry: &WalEntry) -> Result<Bytes> {
     entry.encode()
+}
+
+/// Best-effort [`DataType`] for a runtime [`Value`], used to type a property
+/// that a constraint/index DDL declares but the schema did not. `None` for
+/// values that cannot back a typed column (vectors, lists, maps), where the
+/// caller falls back to `Utf8` — write-time uniqueness enforcement is
+/// type-agnostic regardless.
+fn value_datatype(v: &Value) -> Option<DataType> {
+    match v {
+        Value::Bool(_) => Some(DataType::Bool),
+        Value::I64(_) => Some(DataType::Int64),
+        Value::F64(_) => Some(DataType::Float64),
+        Value::Str(_) => Some(DataType::Utf8),
+        Value::Bytes(_) => Some(DataType::Binary),
+        Value::Date(_) => Some(DataType::Date32),
+        Value::DateTime(_) => Some(DataType::TimestampMicrosUtc),
+        Value::Null | Value::Vec(_) | Value::VecI8 { .. } | Value::List(_) | Value::Map(_) => None,
+    }
+}
+
+/// Mark `(label, property)` unique and/or indexed in `schema`, creating the
+/// `LabelDef`/`PropertyDef` when absent (the engine is schemaless, so a
+/// constraint may target a property no manifest has declared yet). Existing
+/// flags are preserved — a second DDL only ORs its flag in.
+fn upsert_property_flags(
+    schema: &mut Schema,
+    label: &str,
+    property: &str,
+    dtype: DataType,
+    unique: bool,
+    indexed: bool,
+) -> Result<()> {
+    let label_def = schema
+        .labels
+        .entry(label.to_string())
+        .or_insert_with(|| LabelDef {
+            name: label.to_string(),
+            properties: Vec::new(),
+        });
+    if let Some(p) = label_def.properties.iter_mut().find(|p| p.name == property) {
+        p.unique = p.unique || unique;
+        p.indexed = p.indexed || indexed;
+    } else {
+        let mut p = PropertyDef::new(property, dtype, true).map_err(Error::Core)?;
+        p.unique = unique;
+        p.indexed = indexed;
+        label_def.properties.push(p);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2357,5 +2493,78 @@ mod tests {
         let out = snap.out_edges("KNOWS", aid).await.unwrap();
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].dst, zid);
+    }
+
+    #[tokio::test]
+    async fn create_unique_constraint_sets_flag_and_create_index_marks_indexed() {
+        let store = make_store();
+        let paths = make_paths("ingest-constraint");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Alice", Some(30)))
+            .unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Bob", Some(40)))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+
+        // No duplicates → the unique constraint commits and flips the schema flag.
+        let v = s.create_unique_constraint("Person", "name").await.unwrap();
+        assert!(v >= 1);
+        assert_eq!(s.pending_len(), 0, "DDL stages no memtable rows");
+        let snap = s.snapshot();
+        let name = snap
+            .manifest()
+            .manifest
+            .schema
+            .label("Person")
+            .unwrap()
+            .properties
+            .iter()
+            .find(|p| p.name == "name")
+            .unwrap();
+        assert!(name.unique);
+        drop(snap);
+
+        // CREATE INDEX marks the property indexed (non-unique).
+        s.create_property_index("Person", "age").await.unwrap();
+        let snap = s.snapshot();
+        let age = snap
+            .manifest()
+            .manifest
+            .schema
+            .label("Person")
+            .unwrap()
+            .properties
+            .iter()
+            .find(|p| p.name == "age")
+            .unwrap();
+        assert!(age.indexed);
+    }
+
+    #[tokio::test]
+    async fn create_unique_constraint_rejects_when_data_already_violates() {
+        let store = make_store();
+        let paths = make_paths("ingest-constraint-dup");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Dup", Some(1)))
+            .unwrap();
+        s.upsert_node("Person", NodeId::new(), &node_record("Dup", Some(2)))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+
+        let err = s
+            .create_unique_constraint("Person", "name")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "got {err:?}");
+        // Rejected before any commit: schema unchanged.
+        assert!(s
+            .snapshot()
+            .manifest()
+            .manifest
+            .schema
+            .label("Person")
+            .and_then(|l| l.properties.iter().find(|p| p.name == "name"))
+            .map(|p| !p.unique)
+            .unwrap_or(true));
     }
 }

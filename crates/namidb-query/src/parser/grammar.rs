@@ -356,6 +356,16 @@ impl<'src> Parser<'src> {
                 ) {
                     self.parse_create_fulltext_index()
                         .map(Clause::CreateFulltextIndex)
+                } else if matches!(
+                    self.peek_at(1),
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CONSTRAINT")
+                ) {
+                    self.parse_create_constraint().map(Clause::CreateConstraint)
+                } else if matches!(
+                    self.peek_at(1),
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX")
+                ) {
+                    self.parse_create_index().map(Clause::CreateIndex)
                 } else {
                     self.parse_create_clause().map(Clause::Create)
                 }
@@ -631,6 +641,94 @@ impl<'src> Parser<'src> {
             name,
             label,
             properties,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// Optional constraint/index name: an identifier that is not the `FOR`
+    /// soft keyword (which would start the target clause instead).
+    fn parse_optional_ddl_name(&mut self) -> Option<Identifier> {
+        if let Some(Token::Ident(n)) = self.peek() {
+            if !n.eq_ignore_ascii_case("FOR") {
+                return self.expect_identifier().ok();
+            }
+        }
+        None
+    }
+
+    /// Parse `(<var>:<Label>)` returning the label identifier (the variable is
+    /// only a binding for the `REQUIRE`/`ON` property reference).
+    fn parse_ddl_node_target(&mut self) -> Result<Identifier, ParseError> {
+        self.expect(&Token::LParen)?;
+        let _var = self.expect_identifier()?;
+        self.expect(&Token::Colon)?;
+        let label = self.expect_identifier()?;
+        self.expect(&Token::RParen)?;
+        Ok(label)
+    }
+
+    /// Parse a `<var>.<property>` reference, returning the property identifier.
+    fn parse_ddl_property_ref(&mut self) -> Result<Identifier, ParseError> {
+        let _var = self.expect_identifier()?;
+        self.expect(&Token::Dot)?;
+        self.expect_identifier()
+    }
+
+    /// `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE`
+    /// (Neo4j 5), or the legacy `ON (n:Label) ASSERT n.prop IS UNIQUE` (Neo4j 4).
+    fn parse_create_constraint(&mut self) -> Result<CreateConstraintClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect(&Token::Create)?;
+        self.expect_soft_keyword("CONSTRAINT")?;
+        let name = self.parse_optional_ddl_name();
+        // FOR … REQUIRE … (5.x) or ON … ASSERT … (4.x).
+        let assert_kw = if self.eat(&Token::On).is_some() {
+            "ASSERT"
+        } else {
+            self.expect_soft_keyword("FOR")?;
+            "REQUIRE"
+        };
+        let label = self.parse_ddl_node_target()?;
+        self.expect_soft_keyword(assert_kw)?;
+        let property = self.parse_ddl_property_ref()?;
+        self.expect_in(&Token::Is, "constraint requires `IS UNIQUE`")?;
+        let end = self.expect_soft_keyword("UNIQUE")?.end;
+        Ok(CreateConstraintClause {
+            name,
+            label,
+            property,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// `CREATE INDEX [name] FOR (n:Label) ON (n.prop)` (Neo4j 5), or the legacy
+    /// `ON :Label(prop)` (Neo4j 4).
+    fn parse_create_index(&mut self) -> Result<CreateIndexClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect(&Token::Create)?;
+        self.expect_soft_keyword("INDEX")?;
+        let name = self.parse_optional_ddl_name();
+        let (label, property, end);
+        if self.eat(&Token::On).is_some() {
+            // Legacy: ON :Label(prop)
+            self.expect(&Token::Colon)?;
+            label = self.expect_identifier()?;
+            self.expect(&Token::LParen)?;
+            property = self.expect_identifier()?;
+            end = self.expect_in(&Token::RParen, "index target")?.span.end;
+        } else {
+            // Modern: FOR (n:Label) ON (n.prop)
+            self.expect_soft_keyword("FOR")?;
+            label = self.parse_ddl_node_target()?;
+            self.expect_in(&Token::On, "index requires `ON (n.prop)`")?;
+            self.expect(&Token::LParen)?;
+            property = self.parse_ddl_property_ref()?;
+            end = self.expect_in(&Token::RParen, "index target")?.span.end;
+        }
+        Ok(CreateIndexClause {
+            name,
+            label,
+            property,
             span: SourceSpan::new(start, end),
         })
     }

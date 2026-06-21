@@ -907,6 +907,9 @@ fn exec_error_classification(
     match e {
         ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
         ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
+        // A unique-constraint violation is a client error (duplicate value), not
+        // a server fault — surface it as 409 Conflict.
+        ExecError::Constraint(_) => (StatusCode::CONFLICT, Some("constraint")),
         other if other.is_unsupported() => (StatusCode::BAD_REQUEST, Some("unsupported")),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
     }
@@ -1281,6 +1284,113 @@ async fn run_create_fulltext_index(
     }
 }
 
+/// Apply a `CREATE CONSTRAINT … IS UNIQUE` (`unique = true`) or `CREATE INDEX`
+/// (`unique = false`) and republish the snapshot. Both are metadata-only schema
+/// commits in the writer.
+async fn apply_create_property_ddl(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    label: &str,
+    property: &str,
+    unique: bool,
+) -> Result<u64, namidb_storage::Error> {
+    let version = if unique {
+        writer.create_unique_constraint(label, property).await?
+    } else {
+        writer.create_property_index(label, property).await?
+    };
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// HTTP shape for `CREATE CONSTRAINT`/`CREATE INDEX`: gate on role + authz, run
+/// the schema DDL, return an empty `CypherResponse`. Mirrors the vector/fulltext
+/// DDL handlers. These are always-on (no Cargo feature).
+#[allow(clippy::too_many_arguments)]
+async fn run_create_property_ddl(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    authz: &Arc<dyn authz::AuthzHook>,
+    label: &str,
+    property: &str,
+    unique: bool,
+    principal: &Principal,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    if !principal.allows_write() {
+        return ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: "this token is read-only; schema commands are forbidden".into(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let op = if unique {
+        authz::SchemaOp::CreateConstraint { label, property }
+    } else {
+        authz::SchemaOp::CreateIndex { label, property }
+    };
+    if let Err(denied) = authz.check_schema(principal, op).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let mut w = writer.lock().await;
+    let result = apply_create_property_ddl(&mut w, snapshot, label, property, unique).await;
+    drop(w);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
+        Err(e) => {
+            // A pre-existing duplicate (constraint) is a user error (400); a
+            // fence/lost CAS is a server condition (503).
+            let status = match &e {
+                namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    status,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
 async fn cypher(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1355,6 +1465,34 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.authz,
             cfi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `CREATE CONSTRAINT` / `CREATE INDEX` are schema DDL: intercept pre-plan.
+    if let Some(c) = parsed.as_create_constraint() {
+        return run_create_property_ddl(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            &c.label.name,
+            &c.property.name,
+            true,
+            principal,
+            started,
+        )
+        .await;
+    }
+    if let Some(c) = parsed.as_create_index() {
+        return run_create_property_ddl(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            &c.label.name,
+            &c.property.name,
+            false,
             principal,
             started,
         )
@@ -1717,6 +1855,34 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &shared.authz,
             cfi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `CREATE CONSTRAINT` / `CREATE INDEX` are schema DDL: intercept pre-plan.
+    if let Some(c) = parsed.as_create_constraint() {
+        return run_create_property_ddl(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            &shared.authz,
+            &c.label.name,
+            &c.property.name,
+            true,
+            principal,
+            started,
+        )
+        .await;
+    }
+    if let Some(c) = parsed.as_create_index() {
+        return run_create_property_ddl(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            &shared.authz,
+            &c.label.name,
+            &c.property.name,
+            false,
             principal,
             started,
         )
@@ -2245,6 +2411,85 @@ mod tests {
         let app_ro = fixture_with_tokens("ftidx-ro", ROLE_TOKENS).await;
         let ro = post_cypher(&app_ro, Some("rkey"), q).await;
         assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_constraint_enforces_uniqueness_end_to_end() {
+        let app = fixture(None).await;
+
+        // Declare a uniqueness constraint (Neo4j 5 syntax).
+        let r = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT FOR (n:User) REQUIRE n.email IS UNIQUE",
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "constraint should be created");
+
+        // First insert is fine.
+        let r1 = post_cypher(&app, None, "CREATE (:User {email: 'a@x.com'})").await;
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // A duplicate value is now rejected by the engine (the whole point):
+        // 409 Conflict from the unique-constraint violation.
+        let r2 = post_cypher(&app, None, "CREATE (:User {email: 'a@x.com'})").await;
+        assert_eq!(
+            r2.status(),
+            StatusCode::CONFLICT,
+            "duplicate must violate the unique constraint"
+        );
+
+        // A different value still inserts.
+        let r3 = post_cypher(&app, None, "CREATE (:User {email: 'b@x.com'})").await;
+        assert_eq!(r3.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_constraint_rejects_existing_duplicates_and_read_only_token() {
+        let app = fixture(None).await;
+        // Seed a duplicate, then the constraint must be refused (400).
+        post_cypher(&app, None, "CREATE (:Tag {slug: 'x'})").await;
+        post_cypher(&app, None, "CREATE (:Tag {slug: 'x'})").await;
+        let dup = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT FOR (n:Tag) REQUIRE n.slug IS UNIQUE",
+        )
+        .await;
+        assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+
+        // A read-only token may not run schema DDL.
+        let app_ro = fixture_with_tokens("constraint-ro", ROLE_TOKENS).await;
+        let ro = post_cypher(
+            &app_ro,
+            Some("rkey"),
+            "CREATE INDEX FOR (n:Doc) ON (n.title)",
+        )
+        .await;
+        assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_constraint_legacy_assert_syntax_with_name() {
+        let app = fixture(None).await;
+        // Neo4j 4 form + a constraint name.
+        let r = post_cypher(
+            &app,
+            None,
+            "CREATE CONSTRAINT acct_num ON (n:Acct) ASSERT n.num IS UNIQUE",
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_index_legacy_syntax_parses_and_applies() {
+        let app = fixture(None).await;
+        // Neo4j 4 form: `ON :Label(prop)`.
+        let r = post_cypher(&app, None, "CREATE INDEX FOR (n:Doc) ON (n.slug)").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r2 = post_cypher(&app, None, "CREATE INDEX ON :Doc(author)").await;
+        assert_eq!(r2.status(), StatusCode::OK);
     }
 
     #[cfg(feature = "text-index")]

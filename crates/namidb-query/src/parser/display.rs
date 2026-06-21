@@ -59,6 +59,8 @@ impl fmt::Display for Clause {
             Clause::Delete(d) => fmt::Display::fmt(d, f),
             Clause::CreateVectorIndex(c) => fmt::Display::fmt(c, f),
             Clause::CreateFulltextIndex(c) => fmt::Display::fmt(c, f),
+            Clause::CreateConstraint(c) => fmt::Display::fmt(c, f),
+            Clause::CreateIndex(c) => fmt::Display::fmt(c, f),
             Clause::Call(c) => fmt::Display::fmt(c, f),
         }
     }
@@ -165,6 +167,30 @@ impl fmt::Display for CreateFulltextIndexClause {
             "CREATE FULLTEXT INDEX {} ON :{}({})",
             self.name, self.label, props
         )
+    }
+}
+
+impl fmt::Display for CreateConstraintClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE CONSTRAINT ")?;
+        if let Some(n) = &self.name {
+            write!(f, "{n} ")?;
+        }
+        write!(
+            f,
+            "FOR (n:{}) REQUIRE n.{} IS UNIQUE",
+            self.label, self.property
+        )
+    }
+}
+
+impl fmt::Display for CreateIndexClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE INDEX ")?;
+        if let Some(n) = &self.name {
+            write!(f, "{n} ")?;
+        }
+        write!(f, "FOR (n:{}) ON (n.{})", self.label, self.property)
     }
 }
 

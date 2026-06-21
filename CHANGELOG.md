@@ -13,6 +13,15 @@ the release notes.
 
 ### Added
 
+- `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE` (and the
+  legacy `ON (n:Label) ASSERT …`) and `CREATE INDEX [name] FOR (n:Label) ON
+  (n.prop)` (and legacy `ON :Label(prop)`) — schema DDL in Cypher for uniqueness
+  constraints and secondary indexes, instead of only the programmatic schema
+  API. A unique constraint validates existing data first (rejects creation with
+  409-style "duplicate" if already violated) and then the write path enforces it
+  on `CREATE`/`MERGE`/`SET`; a duplicate now returns **409 Conflict**. Both are
+  always-on (no Cargo feature), intercepted on HTTP and Bolt, gated by the
+  read-only/`AuthzHook` policy, and rejected inside a transaction.
 - Cypher path functions `nodes(path)` and `relationships(path)`, and the list
   quantifier predicates `all`/`any`/`none`/`single(x IN list WHERE pred)`.
   Together they express intermediate-node filtering, e.g. a per-tenant guard

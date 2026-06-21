@@ -77,6 +77,10 @@ pub enum SchemaOp<'a> {
         label: &'a str,
         properties: &'a [String],
     },
+    /// `CREATE CONSTRAINT … IS UNIQUE` over `(label, property)`.
+    CreateConstraint { label: &'a str, property: &'a str },
+    /// `CREATE INDEX … ON …` over `(label, property)`.
+    CreateIndex { label: &'a str, property: &'a str },
 }
 
 /// The default hook: allows every request. Wiring it is behavior-preserving —

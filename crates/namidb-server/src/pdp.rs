@@ -211,6 +211,24 @@ impl AuthzHook for OpaAuthz {
                 "label": label,
                 "properties": properties,
             }),
+            SchemaOp::CreateConstraint { label, property } => serde_json::json!({
+                "subject": principal.subject,
+                "role": role_str(principal),
+                "groups": principal.groups,
+                "action": "schema",
+                "schema_op": "create_constraint",
+                "label": label,
+                "property": property,
+            }),
+            SchemaOp::CreateIndex { label, property } => serde_json::json!({
+                "subject": principal.subject,
+                "role": role_str(principal),
+                "groups": principal.groups,
+                "action": "schema",
+                "schema_op": "create_index",
+                "label": label,
+                "property": property,
+            }),
         };
         self.evaluate(input).await
     }
