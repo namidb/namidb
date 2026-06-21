@@ -13,6 +13,10 @@ the release notes.
 
 ### Added
 
+- Cypher path functions `nodes(path)` and `relationships(path)`, and the list
+  quantifier predicates `all`/`any`/`none`/`single(x IN list WHERE pred)`.
+  Together they express intermediate-node filtering, e.g. a per-tenant guard
+  `WHERE all(t IN [a.tenant, b.tenant] WHERE t = $t)`.
 - `CALL search.bm25({label, text_property | text_properties, query, k?})` —
   full BM25 lexical search with **real IDF**. It scans the label's text
   property, builds corpus statistics (document count, average length, per-term
@@ -29,6 +33,19 @@ the release notes.
   match — touching only documents that contain the query terms instead of
   re-scanning the corpus — falling back to the flat scan otherwise. The index
   reflects the compacted corpus and is rebuilt on each compaction.
+
+### Fixed
+
+- Variable-length paths to a labelled far end now traverse through intermediate
+  nodes of other labels: `(s:Service)-[:R*1..n]->(a:Algorithm)` previously
+  returned empty whenever the intermediate hops were not themselves `Algorithm`
+  (the far-end label filter pruned the frontier instead of just the result), and
+  `shortestPath` to a labelled target shared the bug. The label now constrains
+  results, not traversal.
+- Path-binding plan analysis: a `WHERE`/`RETURN` over `p` from a variable-length
+  `MATCH p = …` no longer mis-binds. The Expand's `path_binding` is now counted
+  as a produced alias (so predicate pushdown keeps a `p`-referencing filter above
+  it) and the factorised executor materialises the trail instead of dropping it.
 
 ## [1.0.0] - 2026-06-20: first stable release
 
