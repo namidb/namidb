@@ -150,7 +150,10 @@ mod tests {
     fn more_query_terms_matched_scores_higher() {
         let one = bm25_score("the quick brown fox jumps", "fox");
         let two = bm25_score("the quick brown fox jumps", "quick fox");
-        assert!(two > one, "two matched terms ({two}) should beat one ({one})");
+        assert!(
+            two > one,
+            "two matched terms ({two}) should beat one ({one})"
+        );
     }
 
     #[test]
@@ -194,7 +197,10 @@ mod tests {
         // In a 100-doc corpus, a term in 1 doc must outweigh one in 50.
         let rare = bm25_idf(100, 1);
         let common = bm25_idf(100, 50);
-        assert!(rare > common, "rare ({rare}) should outweigh common ({common})");
+        assert!(
+            rare > common,
+            "rare ({rare}) should outweigh common ({common})"
+        );
         // Even a term present in every document is non-negative (Lucene form).
         assert!(bm25_idf(100, 100) >= 0.0);
         assert!(common > 0.0);

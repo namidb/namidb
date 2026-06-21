@@ -1063,11 +1063,7 @@ pub(crate) fn vector_score(
     };
     if av.len() != bv.len() {
         return Err(EvalError::new(
-            format!(
-                "vector dimension mismatch ({} vs {})",
-                av.len(),
-                bv.len()
-            ),
+            format!("vector dimension mismatch ({} vs {})", av.len(), bv.len()),
             span,
         ));
     }

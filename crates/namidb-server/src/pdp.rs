@@ -136,7 +136,11 @@ fn extract_allow(v: &serde_json::Value) -> Option<bool> {
 
 /// Build the `input` document for a query plan.
 fn plan_input(principal: &Principal, plan: &LogicalPlan) -> serde_json::Value {
-    let action = if plan.contains_write() { "write" } else { "read" };
+    let action = if plan.contains_write() {
+        "write"
+    } else {
+        "read"
+    };
     serde_json::json!({
         "subject": principal.subject,
         "role": role_str(principal),

@@ -161,7 +161,10 @@ impl Int8Space {
 
     /// `sqrt(Σ code²)` (no scale) — the scale-invariant denominator piece.
     fn l2_i8(a: &[i8]) -> f32 {
-        a.iter().map(|&x| (x as f32) * (x as f32)).sum::<f32>().sqrt()
+        a.iter()
+            .map(|&x| (x as f32) * (x as f32))
+            .sum::<f32>()
+            .sqrt()
     }
 
     fn cosine(a: &[i8], b: &[i8]) -> f32 {
@@ -254,7 +257,10 @@ mod tests {
             })
             .collect();
         let f32s = F32CosineSpace::new(v.clone());
-        let members: Vec<(Vec<i8>, f32)> = v.iter().map(|x| namidb_core::quantize::quantize_i8(x)).collect();
+        let members: Vec<(Vec<i8>, f32)> = v
+            .iter()
+            .map(|x| namidb_core::quantize::quantize_i8(x))
+            .collect();
         let i8s = Int8Space::new(members);
 
         for a in 0..6 {

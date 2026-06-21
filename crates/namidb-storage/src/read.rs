@@ -2251,9 +2251,7 @@ impl<'mt> Snapshot<'mt> {
             );
         }
         // Best-first: higher similarity first.
-        all.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        all.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         all.truncate(k);
         Ok(all)
     }

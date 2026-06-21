@@ -271,15 +271,17 @@ fn main() -> anyhow::Result<()> {
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
         #[cfg(feature = "jwt")]
-        jwt: cli.jwt_jwks_url.map(|jwks_url| namidb_server::jwt::JwtConfig {
-            jwks_url,
-            issuer: cli.jwt_issuer,
-            audience: cli.jwt_audience,
-            groups_claim: cli.jwt_groups_claim,
-            write_group: cli.jwt_write_group,
-            read_group: cli.jwt_read_group,
-            namespaces_claim: cli.jwt_namespaces_claim,
-        }),
+        jwt: cli
+            .jwt_jwks_url
+            .map(|jwks_url| namidb_server::jwt::JwtConfig {
+                jwks_url,
+                issuer: cli.jwt_issuer,
+                audience: cli.jwt_audience,
+                groups_claim: cli.jwt_groups_claim,
+                write_group: cli.jwt_write_group,
+                read_group: cli.jwt_read_group,
+                namespaces_claim: cli.jwt_namespaces_claim,
+            }),
         #[cfg(feature = "pdp")]
         pdp_url: cli.pdp_url,
         flush_interval: cli.flush_interval,

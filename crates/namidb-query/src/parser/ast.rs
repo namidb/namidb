@@ -269,7 +269,10 @@ impl YieldItem {
     /// The binding name this item produces in downstream scope: the alias if
     /// given, else the column name itself.
     pub fn binding_name(&self) -> &str {
-        self.alias.as_ref().map(|a| a.name.as_str()).unwrap_or(&self.name.name)
+        self.alias
+            .as_ref()
+            .map(|a| a.name.as_str())
+            .unwrap_or(&self.name.name)
     }
 }
 

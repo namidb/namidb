@@ -698,7 +698,12 @@ impl ManifestStore {
         }
         if max.is_none() {
             // Fresh namespace: LIST lagged behind a just-created p0.
-            if self.store.head(&self.paths.pointer_version(0)).await.is_ok() {
+            if self
+                .store
+                .head(&self.paths.pointer_version(0))
+                .await
+                .is_ok()
+            {
                 max = Some(0);
             } else if let Ok(res) = self.store.get(&self.paths.current_pointer()).await {
                 // Aged namespace: p0 was reclaimed below the horizon, but the
@@ -1502,7 +1507,10 @@ mod tests {
         // the forward probe should discover p6-p10 via HEAD and land on p10.
         let max_from_stale_list = 5u64;
         let probed = ms.probe_pointer_forward(max_from_stale_list).await?;
-        assert_eq!(probed, 5, "forward probe from stale max should stay at 5 until more commits");
+        assert_eq!(
+            probed, 5,
+            "forward probe from stale max should stay at 5 until more commits"
+        );
 
         // Now create p6-p10; forward probe from 5 should discover them.
         for _ in 0..5 {
@@ -1513,7 +1521,10 @@ mod tests {
 
         // Forward probe from stale max=5 should now discover up to p10.
         let probed = ms.probe_pointer_forward(5).await?;
-        assert_eq!(probed, 10, "forward probe should advance from stale max to actual current");
+        assert_eq!(
+            probed, 10,
+            "forward probe should advance from stale max to actual current"
+        );
 
         Ok(())
     }

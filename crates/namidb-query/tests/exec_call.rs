@@ -54,10 +54,7 @@ async fn build(writer: &mut WriterSession) -> [NodeId; 5] {
     ids
 }
 
-async fn run(
-    snapshot: &namidb_storage::Snapshot<'_>,
-    cypher: &str,
-) -> Vec<namidb_query::Row> {
+async fn run(snapshot: &namidb_storage::Snapshot<'_>, cypher: &str) -> Vec<namidb_query::Row> {
     let q = parse(cypher).unwrap_or_else(|e| panic!("parse {cypher}: {e:?}"));
     let plan = lower(&q).unwrap_or_else(|e| panic!("lower: {e:?}"));
     let plan = optimize(plan, &StatsCatalog::empty());
@@ -178,7 +175,10 @@ async fn call_pagerank_accepts_options_map() {
             _ => 0.0,
         })
         .sum();
-    assert!((sum - 1.0).abs() < 1e-6, "scores still sum to ~1.0, got {sum}");
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "scores still sum to ~1.0, got {sum}"
+    );
 }
 
 #[tokio::test]
@@ -366,7 +366,10 @@ async fn call_shortest_path_from_source() {
 
 fn node_with_body(text: &str) -> NodeWriteRecord {
     let mut props = BTreeMap::new();
-    props.insert("body".to_string(), namidb_core::Value::Str(text.to_string()));
+    props.insert(
+        "body".to_string(),
+        namidb_core::Value::Str(text.to_string()),
+    );
     NodeWriteRecord {
         properties: props,
         schema_version: 1,
@@ -386,7 +389,9 @@ async fn build_text_corpus(writer: &mut WriterSession) -> [NodeId; 5] {
         "common the lizard",
     ];
     for (id, body) in ids.iter().zip(bodies) {
-        writer.upsert_node("Note", *id, &node_with_body(body)).unwrap();
+        writer
+            .upsert_node("Note", *id, &node_with_body(body))
+            .unwrap();
     }
     writer.commit_batch().await.unwrap();
     ids
@@ -442,7 +447,8 @@ async fn call_search_bm25_mcp_query_shape_executes() {
     let ids = build_text_corpus(&mut writer).await;
     let snapshot = writer.snapshot();
 
-    let cypher = "CALL search.bm25({label: 'Note', text_properties: ['body', 'title'], query: $text}) \
+    let cypher =
+        "CALL search.bm25({label: 'Note', text_properties: ['body', 'title'], query: $text}) \
                   YIELD node, score \
                   RETURN id(node) AS id, node.path AS path, score \
                   ORDER BY score DESC";
@@ -450,10 +456,7 @@ async fn call_search_bm25_mcp_query_shape_executes() {
     let plan = lower(&parsed).unwrap_or_else(|e| panic!("lower: {e:?}"));
     let plan = optimize(plan, &StatsCatalog::empty());
     let mut params = Params::new();
-    params.insert(
-        "text".into(),
-        RuntimeValue::String("fox common".into()),
-    );
+    params.insert("text".into(), RuntimeValue::String("fox common".into()));
     let rows = execute(&plan, &snapshot, &params)
         .await
         .unwrap_or_else(|e| panic!("execute: {e}"));
@@ -464,7 +467,11 @@ async fn call_search_bm25_mcp_query_shape_executes() {
         RuntimeValue::String(s) => Some(s.clone()),
         _ => None,
     });
-    assert_eq!(top_id, Some(ids[0].to_string()), "rare-term doc id should be first");
+    assert_eq!(
+        top_id,
+        Some(ids[0].to_string()),
+        "rare-term doc id should be first"
+    );
 }
 
 #[tokio::test]
@@ -497,7 +504,10 @@ async fn call_unknown_search_procedure_is_unsupported() {
     let plan = lower(&q).unwrap();
     let plan = optimize(plan, &StatsCatalog::empty());
     let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
-    assert!(err.is_unsupported(), "unknown search proc should be unsupported, got {err}");
+    assert!(
+        err.is_unsupported(),
+        "unknown search proc should be unsupported, got {err}"
+    );
 }
 
 #[tokio::test]

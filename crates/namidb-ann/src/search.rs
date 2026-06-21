@@ -74,8 +74,14 @@ pub(crate) fn beam_search(
 
     visited[entry as usize] = true;
     let d0 = dist(entry);
-    candidates.push(std::cmp::Reverse(DistNode { dist: d0, id: entry }));
-    results.push(DistNode { dist: d0, id: entry });
+    candidates.push(std::cmp::Reverse(DistNode {
+        dist: d0,
+        id: entry,
+    }));
+    results.push(DistNode {
+        dist: d0,
+        id: entry,
+    });
 
     while let Some(std::cmp::Reverse(DistNode { dist: d_c, id: c })) = candidates.pop() {
         // Converged: the closest unexplored candidate is already farther than
@@ -104,7 +110,10 @@ pub(crate) fn beam_search(
 
     let mut out: Vec<Neighbor> = results
         .into_iter()
-        .map(|d| Neighbor { id: d.id, dist: d.dist })
+        .map(|d| Neighbor {
+            id: d.id,
+            dist: d.dist,
+        })
         .collect();
     out.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist).then_with(|| a.id.cmp(&b.id)));
     out.truncate(k);
@@ -142,10 +151,10 @@ mod tests {
     /// A tiny ring + centre graph to exercise expansion + convergence.
     fn ring_space() -> F32CosineSpace {
         F32CosineSpace::new(vec![
-            vec![1.0, 0.0],   // 0
-            vec![0.0, 1.0],   // 1
-            vec![-1.0, 0.0],  // 2
-            vec![0.0, -1.0],  // 3
+            vec![1.0, 0.0],  // 0
+            vec![0.0, 1.0],  // 1
+            vec![-1.0, 0.0], // 2
+            vec![0.0, -1.0], // 3
         ])
     }
 

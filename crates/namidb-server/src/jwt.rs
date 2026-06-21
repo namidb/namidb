@@ -91,7 +91,12 @@ impl JwtValidator {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        let jwks: JwkSet = client.get(&self.config.jwks_url).send().await?.json().await?;
+        let jwks: JwkSet = client
+            .get(&self.config.jwks_url)
+            .send()
+            .await?
+            .json()
+            .await?;
         let mut map = HashMap::new();
         for key in &jwks.keys {
             if let Ok(dk) = DecodingKey::from_jwk(key) {
@@ -142,8 +147,7 @@ impl JwtValidator {
     /// `namespace`. Unconfigured → unscoped (back-compat). Used by the
     /// multi-tenant path.
     pub fn validate_in(&self, token: &str, namespace: &str) -> Option<Role> {
-        self.validate_principal_in(token, namespace)
-            .map(|p| p.role)
+        self.validate_principal_in(token, namespace).map(|p| p.role)
     }
 
     /// Full principal (subject + role + groups) for `token`, namespace-agnostic.
@@ -364,7 +368,10 @@ mod tests {
     #[test]
     fn write_group_wins_over_read_group() {
         let v = validator(Some("admins"), Some("readers"), None, None);
-        assert_eq!(v.validate(&mint(&["readers", "admins"])), Some(Role::ReadWrite));
+        assert_eq!(
+            v.validate(&mint(&["readers", "admins"])),
+            Some(Role::ReadWrite)
+        );
     }
 
     #[test]
@@ -416,4 +423,3 @@ mod tests {
         assert_eq!(extract_group_strings(&serde_json::json!(42)), None);
     }
 }
-

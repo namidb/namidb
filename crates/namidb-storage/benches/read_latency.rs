@@ -162,11 +162,7 @@ async fn build_fixture(node_count: u64) -> Fixture {
         for i in lo..hi {
             let id = synth_node_id(i);
             ids.push(id);
-            mt.apply(
-                MemKey::Node { id },
-                i + 1,
-                MemOp::Upsert(synth_payload(i)),
-            );
+            mt.apply(MemKey::Node { id }, i + 1, MemOp::Upsert(synth_payload(i)));
         }
         let frozen = mt.freeze();
         let outcome = flush(&ms, &fence, &current, &frozen, schema.clone())

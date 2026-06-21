@@ -83,7 +83,11 @@ impl NamespacePaths {
     /// RFC-029). Created write-once with `PutMode::Create`; `version` matches
     /// the manifest body the pointer names.
     pub fn pointer_version(&self, version: u64) -> Path {
-        self.join(&["manifest", "pointer", &format!("p{}.json", pad_hex(version, 16))])
+        self.join(&[
+            "manifest",
+            "pointer",
+            &format!("p{}.json", pad_hex(version, 16)),
+        ])
     }
     pub fn wal_dir(&self) -> Path {
         self.join(&["wal"])

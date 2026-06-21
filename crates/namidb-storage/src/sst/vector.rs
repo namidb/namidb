@@ -13,9 +13,7 @@
 //! returns `Ok(None)` for it so the caller keeps the flat-scan fallback.
 
 use bytes::Bytes;
-use namidb_ann::{
-    build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, VamanaGraph,
-};
+use namidb_ann::{build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, VamanaGraph};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3;
 
@@ -244,10 +242,7 @@ mod tests {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let base = &centroids[i % 4];
-            let mut v: Vec<f32> = base
-                .iter()
-                .map(|b| b + 0.02 * rng.gen::<f32>())
-                .collect();
+            let mut v: Vec<f32> = base.iter().map(|b| b + 0.02 * rng.gen::<f32>()).collect();
             normalize(&mut v);
             let mut id = [0u8; 16];
             id[0..8].copy_from_slice(&(i as u64).to_be_bytes());
@@ -263,7 +258,9 @@ mod tests {
         assert!(build_body(&d, m).unwrap().is_none());
 
         let d = desc("c", VectorMetric::Cosine, 4);
-        assert!(build_body(&d, clustered_members(1, 4, 2)).unwrap().is_none());
+        assert!(build_body(&d, clustered_members(1, 4, 2))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -328,13 +325,19 @@ mod tests {
             scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             let truth: std::collections::HashSet<[u8; 16]> =
                 scored.iter().take(k).map(|(_, id)| *id).collect();
-            let approx: std::collections::HashSet<[u8; 16]> =
-                idx.search(&query, k, 64).into_iter().map(|(id, _)| id).collect();
+            let approx: std::collections::HashSet<[u8; 16]> = idx
+                .search(&query, k, 64)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             let hits = approx.intersection(&truth).count();
             total += hits as f64 / k as f64;
         }
         let avg = total / 30.0;
-        assert!(avg >= 0.85, "indexed recall@{k} = {avg:.3}, expected >= 0.85");
+        assert!(
+            avg >= 0.85,
+            "indexed recall@{k} = {avg:.3}, expected >= 0.85"
+        );
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {

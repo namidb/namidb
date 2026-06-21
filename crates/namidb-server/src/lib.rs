@@ -381,7 +381,10 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
         .route("/v0/health", get(health_multi_unprefixed))
         .route("/v0/cypher", post(cypher_multi_unprefixed))
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
-        .layer(middleware::from_fn_with_state(shared.clone(), require_auth_multi));
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_auth_multi,
+        ));
 
     Router::new()
         .merge(public)
@@ -537,11 +540,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         });
 
         // TLS on the serving path.
-        let tls_config: Option<Arc<rustls::ServerConfig>> = match (&config.tls_cert, &config.tls_key) {
-            (Some(cert), Some(key)) => Some(tls::load_server_config(cert, key)?),
-            (None, None) => None,
-            _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
-        };
+        let tls_config: Option<Arc<rustls::ServerConfig>> =
+            match (&config.tls_cert, &config.tls_key) {
+                (Some(cert), Some(key)) => Some(tls::load_server_config(cert, key)?),
+                (None, None) => None,
+                _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
+            };
 
         info!(multi_tenant = true, "starting multi-tenant server");
         return serve_http(app, config, tls_config, shutdown_rx).await;
@@ -896,7 +900,9 @@ struct ErrorBody {
 /// machine-readable `code`. A deliberately-unsupported feature is a 400 with
 /// `code: "unsupported"` (not a 500), so clients can tell "not implemented"
 /// from a genuine server bug.
-fn exec_error_classification(e: &namidb_query::exec::ExecError) -> (StatusCode, Option<&'static str>) {
+fn exec_error_classification(
+    e: &namidb_query::exec::ExecError,
+) -> (StatusCode, Option<&'static str>) {
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
@@ -1115,7 +1121,12 @@ async fn run_create_vector_index(
             kind: None,
             ok: false,
             elapsed: started.elapsed(),
-            response: (StatusCode::FORBIDDEN, Json(ErrorBody { error: denied.to_string() }))
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
                 .into_response(),
         };
     }
@@ -1139,15 +1150,22 @@ async fn run_create_vector_index(
             // A duplicate name/target is a user error (400); a fence or lost
             // CAS is a server-side condition (503).
             let status = match &e {
-                namidb_storage::Error::Precondition(_)
-                | namidb_storage::Error::Invariant(_) => StatusCode::BAD_REQUEST,
+                namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_) => {
+                    StatusCode::BAD_REQUEST
+                }
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
             ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
                 elapsed,
-                response: (status, Json(ErrorBody { error: e.to_string() })).into_response(),
+                response: (
+                    status,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response(),
             }
         }
     }
@@ -1448,13 +1466,13 @@ async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Re
             })
             .into_response()
         }
-        Err(e) => {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody { error: e.to_string() }),
-            )
-                .into_response()
-        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -1498,7 +1516,9 @@ async fn dispatch_cypher_multi(
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody { error: e.to_string() }),
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
             )
                 .into_response();
         }
@@ -1623,7 +1643,8 @@ async fn run_cypher_multi(
             };
         }
         let mut writer = ns_state.writer.lock().await;
-        let result = execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
+        let result =
+            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
         let stall = if result.is_ok() {
             ns_state.snapshot.store(writer.owned_snapshot());
             shared.write_stall_for(writer.max_l0_bucket_len())
@@ -1733,7 +1754,9 @@ async fn dispatch_admin_flush_multi(
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody { error: e.to_string() }),
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
             )
                 .into_response();
         }
@@ -1986,15 +2009,17 @@ mod tests {
         // proving the hook runs and can deny what the role gate would allow.
         let (store, paths) = namidb_storage::parse_uri("memory://authz-deny").unwrap();
         let writer = WriterSession::open(store, paths).await.unwrap();
-        let state = AppState::new(writer, None, "test".into())
-            .with_authz(Arc::new(DenyAllAuthz));
+        let state = AppState::new(writer, None, "test".into()).with_authz(Arc::new(DenyAllAuthz));
         let app = build_router(state);
 
         let resp = post_cypher(&app, None, "MATCH (n) RETURN n").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("denied by test policy"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("denied by test policy"));
     }
 
     #[tokio::test]
@@ -2060,8 +2085,12 @@ mod tests {
         assert_eq!(ro.status(), StatusCode::FORBIDDEN);
     }
 
-    // A hook that allows queries but denies schema (DDL) operations.
+    // A hook that allows queries but denies schema (DDL) operations. Only the
+    // `vector-index` DDL test below constructs it, so gate it the same way or
+    // the default build flags it as dead code.
+    #[cfg(feature = "vector-index")]
     struct DenySchemaAuthz;
+    #[cfg(feature = "vector-index")]
     #[async_trait::async_trait]
     impl crate::authz::AuthzHook for DenySchemaAuthz {
         async fn check(
@@ -2087,8 +2116,8 @@ mod tests {
         // the DDL must be 403'd by the hook, proving DDL is not a policy bypass.
         let (store, paths) = namidb_storage::parse_uri("memory://vecidx-authz").unwrap();
         let writer = WriterSession::open(store, paths).await.unwrap();
-        let state = AppState::new(writer, None, "test".into())
-            .with_authz(Arc::new(DenySchemaAuthz));
+        let state =
+            AppState::new(writer, None, "test".into()).with_authz(Arc::new(DenySchemaAuthz));
         let app = build_router(state);
 
         let q = "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16";
@@ -2096,7 +2125,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("schema changes denied"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("schema changes denied"));
     }
 
     #[tokio::test]
@@ -2512,7 +2544,12 @@ mod tests {
         build_multi_tenant_router(shared)
     }
 
-    async fn mt_cypher(app: &Router, uri: &str, header_ns: Option<&str>, query: &str) -> StatusCode {
+    async fn mt_cypher(
+        app: &Router,
+        uri: &str,
+        header_ns: Option<&str>,
+        query: &str,
+    ) -> StatusCode {
         let mut b = Request::builder()
             .method("POST")
             .uri(uri)
@@ -2537,17 +2574,33 @@ mod tests {
         let app = multi_tenant_app("default").await;
         // 1. Explicit path prefix.
         let q = "CREATE (:Person {name: 'x'}) RETURN 1";
-        assert_eq!(mt_cypher(&app, "/acme/v0/cypher", None, q).await, StatusCode::OK);
+        assert_eq!(
+            mt_cypher(&app, "/acme/v0/cypher", None, q).await,
+            StatusCode::OK
+        );
         // 2. X-NamiDB-Namespace header on an unprefixed path.
-        assert_eq!(mt_cypher(&app, "/v0/cypher", Some("beta"), q).await, StatusCode::OK);
+        assert_eq!(
+            mt_cypher(&app, "/v0/cypher", Some("beta"), q).await,
+            StatusCode::OK
+        );
         // 3. No prefix, no header → default namespace.
         assert_eq!(mt_cypher(&app, "/v0/cypher", None, q).await, StatusCode::OK);
         // The default namespace is genuinely distinct: a note written to
         // `acme` is NOT visible via the default namespace.
         let app = multi_tenant_app("default").await;
-        let _ = mt_cypher(&app, "/acme/v0/cypher", None, "CREATE (:Person {name: 'only-acme'})").await;
+        let _ = mt_cypher(
+            &app,
+            "/acme/v0/cypher",
+            None,
+            "CREATE (:Person {name: 'only-acme'})",
+        )
+        .await;
         let read = mt_cypher(&app, "/v0/cypher", None, "MATCH (p:Person) RETURN count(p)").await;
-        assert_eq!(read, StatusCode::OK, "default namespace is isolated from acme");
+        assert_eq!(
+            read,
+            StatusCode::OK,
+            "default namespace is isolated from acme"
+        );
     }
 
     async fn multi_tenant_app_auth(auth: Arc<AuthConfig>, default_ns: &str) -> Router {

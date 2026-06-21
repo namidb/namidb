@@ -61,11 +61,11 @@ use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{build_edge_sst, build_node_sst, NodeRow, NodeWriteRecord};
+#[cfg(feature = "vector-index")]
+use crate::manifest::VectorIndexDescriptor;
 use crate::manifest::{
     KindSpecificStats, LoadedManifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
 };
-#[cfg(feature = "vector-index")]
-use crate::manifest::VectorIndexDescriptor;
 use crate::memtable::MemOp;
 use crate::paths::NamespacePaths;
 use crate::read::arrow_value_to_value;
@@ -877,9 +877,7 @@ async fn build_vector_indexes_for_nodes(
             };
             let v: Vec<f32> = match val {
                 Value::Vec(v) => v.clone(),
-                Value::VecI8 { codes, scale } => {
-                    codes.iter().map(|&c| c as f32 * *scale).collect()
-                }
+                Value::VecI8 { codes, scale } => codes.iter().map(|&c| c as f32 * *scale).collect(),
                 _ => continue,
             };
             members.push((row.id, v));
@@ -2034,7 +2032,9 @@ mod tests {
                 i += 1;
             }
             let frozen = mt.freeze();
-            let after = flush(&ms, &fence, &cur, &frozen, schema.clone()).await.unwrap();
+            let after = flush(&ms, &fence, &cur, &frozen, schema.clone())
+                .await
+                .unwrap();
             cur = after.committed;
         }
         assert!(cur.manifest.ssts.iter().all(|d| d.level == SstLevel::L0));
@@ -2070,9 +2070,7 @@ mod tests {
         // Count how many returned hits belong to cluster 0 (recall proxy).
         let cluster0_hits = hits
             .iter()
-            .filter(|(id, _)| {
-                cluster_of.get(&NodeId::from_uuid(Uuid::from_bytes(*id))) == Some(&0)
-            })
+            .filter(|(id, _)| cluster_of.get(&NodeId::from_uuid(Uuid::from_bytes(*id))) == Some(&0))
             .count();
         assert!(
             cluster0_hits >= 8,

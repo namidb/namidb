@@ -332,7 +332,8 @@ impl<'src> Parser<'src> {
                     self.peek_at(1),
                     Some(Token::Ident(name)) if name.eq_ignore_ascii_case("VECTOR")
                 ) {
-                    self.parse_create_vector_index().map(Clause::CreateVectorIndex)
+                    self.parse_create_vector_index()
+                        .map(Clause::CreateVectorIndex)
                 } else {
                     self.parse_create_clause().map(Clause::Create)
                 }

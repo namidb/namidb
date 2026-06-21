@@ -135,9 +135,7 @@ fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> 
 /// From `keys`, if it's a single DESC key whose expression is
 /// `dist_fn(Property(Variable(alias), prop), query)`, return
 /// `(metric, prop, alias, query)`.
-fn single_distance_key(
-    keys: &[OrderKey],
-) -> Option<(VectorDistance, String, String, Expression)> {
+fn single_distance_key(keys: &[OrderKey]) -> Option<(VectorDistance, String, String, Expression)> {
     if keys.len() != 1 {
         return None;
     }
@@ -281,10 +279,7 @@ mod tests {
     }
 
     fn catalog_with_index(metric: VectorMetric) -> StatsCatalog {
-        let mut m = namidb_storage::Manifest::empty(
-            namidb_storage::Epoch::ZERO,
-            uuid::Uuid::nil(),
-        );
+        let mut m = namidb_storage::Manifest::empty(namidb_storage::Epoch::ZERO, uuid::Uuid::nil());
         m.vector_indexes.push(VectorIndexDescriptor {
             name: "doc_emb".into(),
             label: "Doc".into(),
@@ -329,7 +324,10 @@ mod tests {
         let plan = knn_plan("cosine_similarity");
         let cat = StatsCatalog::empty();
         let out = apply_vector_search(plan.clone(), &cat);
-        assert!(matches!(out, LogicalPlan::TopN { .. }), "no index → unchanged");
+        assert!(
+            matches!(out, LogicalPlan::TopN { .. }),
+            "no index → unchanged"
+        );
     }
 
     #[test]

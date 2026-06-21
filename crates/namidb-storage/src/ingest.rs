@@ -1039,10 +1039,7 @@ impl WriterSession {
     /// Returns the new manifest version. Error contract mirrors
     /// [`attach_ssts`](Self::attach_ssts): [`Error::Fenced`] ⇒ abort and drop
     /// the session; a lost manifest CAS ⇒ retryable.
-    pub async fn register_vector_index(
-        &mut self,
-        desc: VectorIndexDescriptor,
-    ) -> Result<u64> {
+    pub async fn register_vector_index(&mut self, desc: VectorIndexDescriptor) -> Result<u64> {
         self.fence.assert_alive(self.current.manifest.epoch)?;
         for existing in &self.current.manifest.vector_indexes {
             if existing.name == desc.name {
@@ -1193,7 +1190,12 @@ mod tests {
         let paths = make_paths("ingest-vecidx");
         let mut session = WriterSession::open(store, paths).await.unwrap();
         assert!(
-            session.snapshot().manifest().manifest.vector_indexes.is_empty(),
+            session
+                .snapshot()
+                .manifest()
+                .manifest
+                .vector_indexes
+                .is_empty(),
             "fresh namespace has no vector indexes"
         );
 

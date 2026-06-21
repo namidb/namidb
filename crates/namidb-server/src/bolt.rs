@@ -89,10 +89,7 @@ impl ServerBackend {
     /// `Some(Forbidden)` to deny (mapped to a Bolt `Forbidden` error), `None`
     /// to allow. Mirrors the HTTP `authz.check` call so the Bolt path is NOT a
     /// policy bypass (NoOp default ⇒ always allows).
-    async fn authz_denied(
-        &self,
-        plan: &namidb_query::LogicalPlan,
-    ) -> Option<BackendError> {
+    async fn authz_denied(&self, plan: &namidb_query::LogicalPlan) -> Option<BackendError> {
         match self.state.authz.check(&self.principal(), plan).await {
             Ok(()) => None,
             Err(denied) => Some(BackendError::Forbidden(denied.to_string())),

@@ -306,7 +306,17 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 name,
                 args,
                 yield_items,
-            } => flat_call_procedure(namespace.as_deref(), name, args, yield_items, snapshot, params).await,
+            } => {
+                flat_call_procedure(
+                    namespace.as_deref(),
+                    name,
+                    args,
+                    yield_items,
+                    snapshot,
+                    params,
+                )
+                .await
+            }
 
             LogicalPlan::PatternList {
                 input,
@@ -1357,12 +1367,8 @@ async fn flat_call_procedure(
                 .map(|id| {
                     vec![
                         node_runtime(id),
-                        RuntimeValue::Integer(
-                            deg.in_degree.get(&id).copied().unwrap_or(0) as i64,
-                        ),
-                        RuntimeValue::Integer(
-                            deg.out_degree.get(&id).copied().unwrap_or(0) as i64,
-                        ),
+                        RuntimeValue::Integer(deg.in_degree.get(&id).copied().unwrap_or(0) as i64),
+                        RuntimeValue::Integer(deg.out_degree.get(&id).copied().unwrap_or(0) as i64),
                         RuntimeValue::Integer(deg.total(&id) as i64),
                     ]
                 })
@@ -1407,9 +1413,7 @@ async fn flat_call_procedure(
                 .map(|id| {
                     vec![
                         node_runtime(id),
-                        RuntimeValue::Integer(
-                            tri.per_node.get(&id).copied().unwrap_or(0) as i64,
-                        ),
+                        RuntimeValue::Integer(tri.per_node.get(&id).copied().unwrap_or(0) as i64),
                         RuntimeValue::Float(tri.coefficient.get(&id).copied().unwrap_or(0.0)),
                     ]
                 })
@@ -1713,7 +1717,9 @@ fn bm25_search_args(
                 }
             }
             if out.is_empty() {
-                return Err(proc_unsupported("search.bm25 `text_properties` must be non-empty"));
+                return Err(proc_unsupported(
+                    "search.bm25 `text_properties` must be non-empty",
+                ));
             }
             out
         }
@@ -1725,7 +1731,9 @@ fn bm25_search_args(
         (None, Some(v)) => match want_str(v) {
             Some(s) => vec![s],
             None => {
-                return Err(proc_unsupported("search.bm25 `text_property` must be a string"));
+                return Err(proc_unsupported(
+                    "search.bm25 `text_property` must be a string",
+                ));
             }
         },
         (None, None) => {
@@ -1735,12 +1743,13 @@ fn bm25_search_args(
         }
     };
 
-    let k = match map.get("k") {
-        None => None,
-        Some(v) => Some(as_usize(v).ok_or_else(|| {
-            proc_unsupported("search.bm25 `k` must be a non-negative integer")
-        })?),
-    };
+    let k =
+        match map.get("k") {
+            None => None,
+            Some(v) => Some(as_usize(v).ok_or_else(|| {
+                proc_unsupported("search.bm25 `k` must be a non-negative integer")
+            })?),
+        };
 
     Ok((label, props, query, k))
 }
@@ -1804,13 +1813,14 @@ fn pagerank_options(
                 }
             };
             if let Some(d) = map.get("damping") {
-                opts.damping = as_f64(d).ok_or_else(|| {
-                    proc_unsupported("algo.pagerank `damping` must be a number")
-                })?;
+                opts.damping = as_f64(d)
+                    .ok_or_else(|| proc_unsupported("algo.pagerank `damping` must be a number"))?;
             }
             if let Some(m) = map.get("max_iterations") {
                 opts.max_iterations = as_usize(m).ok_or_else(|| {
-                    proc_unsupported("algo.pagerank `max_iterations` must be a non-negative integer")
+                    proc_unsupported(
+                        "algo.pagerank `max_iterations` must be a non-negative integer",
+                    )
                 })?;
             }
             if let Some(t) = map.get("tolerance") {
@@ -1955,7 +1965,14 @@ async fn flat_vector_search(
     #[cfg(feature = "vector-index")]
     {
         if let Some(rows) = try_index_search(
-            snapshot, label, alias, property, &q, limit, distance, score_alias,
+            snapshot,
+            label,
+            alias,
+            property,
+            &q,
+            limit,
+            distance,
+            score_alias,
         )
         .await?
         {
@@ -1979,8 +1996,7 @@ async fn flat_vector_search(
             let Some(emb) = node.properties.get(property) else {
                 continue;
             };
-            let Some((score, higher_is_better)) =
-                vector_score(distance, emb, &q, query.span)?
+            let Some((score, higher_is_better)) = vector_score(distance, emb, &q, query.span)?
             else {
                 continue;
             };

@@ -279,7 +279,14 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(copy_namespace_cmd("backed up", &from, &to, version, force, verify))?;
+            rt.block_on(copy_namespace_cmd(
+                "backed up",
+                &from,
+                &to,
+                version,
+                force,
+                verify,
+            ))?;
         }
         Cmd::Restore {
             from,
@@ -291,7 +298,9 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(copy_namespace_cmd("restored", &from, &to, version, force, verify))?;
+            rt.block_on(copy_namespace_cmd(
+                "restored", &from, &to, version, force, verify,
+            ))?;
         }
     }
     Ok(())

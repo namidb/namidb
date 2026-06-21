@@ -250,7 +250,9 @@ pub async fn sweep_orphans(
             .map(|rest| (false, rest))
             .or_else(|| filename.strip_prefix('p').map(|rest| (true, rest)))
             .and_then(|(is_pointer, rest)| rest.strip_suffix(".json").map(|h| (is_pointer, h)))
-            .and_then(|(is_pointer, hex)| u64::from_str_radix(hex, 16).ok().map(|v| (is_pointer, v)))
+            .and_then(|(is_pointer, hex)| {
+                u64::from_str_radix(hex, 16).ok().map(|v| (is_pointer, v))
+            })
         else {
             continue;
         };

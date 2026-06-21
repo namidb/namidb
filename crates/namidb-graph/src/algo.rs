@@ -389,10 +389,7 @@ pub fn degrees(graph: &Graph) -> Degrees {
 }
 
 /// [`degrees`] that polls `cancel` periodically.
-pub fn degrees_cancellable(
-    graph: &Graph,
-    cancel: &dyn Fn() -> bool,
-) -> Result<Degrees, Cancelled> {
+pub fn degrees_cancellable(graph: &Graph, cancel: &dyn Fn() -> bool) -> Result<Degrees, Cancelled> {
     let mut in_degree: HashMap<NodeId, usize> = HashMap::with_capacity(graph.node_count());
     let mut out_degree: HashMap<NodeId, usize> = HashMap::with_capacity(graph.node_count());
     // Seed every known node at 0 so isolates report degree 0 rather than absent.

@@ -29,12 +29,12 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use namidb_markdown::Embedder;
 use namidb_graph::algo::{
     degrees, label_propagation, pagerank, shortest_paths, strongly_connected_components,
     triangle_count, weakly_connected_components, Graph, PageRankOptions,
     LABEL_PROPAGATION_DEFAULT_ITERS,
 };
+use namidb_markdown::Embedder;
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute, parse as cypher_parse, plan as build_plan, Params, ParseError, Row, RuntimeValue,
@@ -667,8 +667,16 @@ impl Server {
             .take(candidate_limit)
             .enumerate()
             .map(|(rank, row)| FusedResult {
-                title: row.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-                path: row.get("path").and_then(Value::as_str).unwrap_or("").to_string(),
+                title: row
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                path: row
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 lexical_rank: Some(rank + 1), // 1-indexed
                 semantic_rank: None,
                 score: 0.0,
@@ -714,8 +722,16 @@ impl Server {
             .map(|(rank, row)| {
                 let score = row.get("score").and_then(Value::as_f64).unwrap_or(0.0);
                 FusedResult {
-                    title: row.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-                    path: row.get("path").and_then(Value::as_str).unwrap_or("").to_string(),
+                    title: row
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    path: row
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     lexical_rank: None,
                     semantic_rank: Some(rank + 1), // 1-indexed
                     score,
@@ -779,9 +795,21 @@ impl Server {
         // id string -> (NodeId, title, path) for result joining.
         let mut id_meta: HashMap<String, (String, String)> = HashMap::new();
         for row in &node_rows {
-            let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let title = row.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            let path = row.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = row
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let title = row
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = row
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             id_meta.insert(id, (title, path));
         }
 
@@ -998,9 +1026,9 @@ impl Server {
                     .keys()
                     .filter_map(|id| {
                         namidb_core::NodeId::from_str(id).ok().and_then(|nid| {
-                            sp.distance.get(&nid).map(|&d| {
-                                (id.clone(), d, sp.hops.get(&nid).copied().unwrap_or(0))
-                            })
+                            sp.distance
+                                .get(&nid)
+                                .map(|&d| (id.clone(), d, sp.hops.get(&nid).copied().unwrap_or(0)))
                         })
                     })
                     .collect();
@@ -1291,7 +1319,11 @@ fn rrf_fuse(
 
     // Sort by fused score descending
     let mut results: Vec<_> = fused.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
@@ -1663,7 +1695,12 @@ mod tests {
         let server = Server::open("memory://mcp-wcc").await.unwrap();
         server.load_vault(dir.path(), false).await.unwrap();
 
-        let res = call(&server, "graph_algorithm", json!({ "algorithm": "wcc", "label": "Note" })).await;
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "wcc", "label": "Note" }),
+        )
+        .await;
         // Two components: {A,B,C} and {D}.
         assert_eq!(res["algorithm"], "wcc");
         assert_eq!(res["component_count"], 2);
@@ -1771,7 +1808,11 @@ mod tests {
         // exercises that wiring end to end: the fused result for "fox" must
         // surface the note that actually contains the rare term.
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "Fox.md", "the quick brown fox jumps over the lazy dog\n");
+        write(
+            dir.path(),
+            "Fox.md",
+            "the quick brown fox jumps over the lazy dog\n",
+        );
         write(dir.path(), "Cat.md", "the common cat sleeps all day long\n");
         write(dir.path(), "Dog.md", "the common dog barks at the moon\n");
         let server = Server::open("memory://mcp-hybrid").await.unwrap();

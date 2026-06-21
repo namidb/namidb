@@ -62,7 +62,11 @@ async fn serves_https_and_bolt_over_tls() {
         store_uri: "memory://tls-it".into(),
         listen: http,
         auth_token: None,
-        auth_tokens_file: None, #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,

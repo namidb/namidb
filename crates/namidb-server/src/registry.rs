@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::{Json, response::IntoResponse};
-use axum::response::Response;
 use axum::http::StatusCode;
+use axum::response::Response;
+use axum::{response::IntoResponse, Json};
 use namidb_core::NamespaceId;
 use namidb_query::StatsCatalog;
 use namidb_storage::{
@@ -165,7 +165,8 @@ impl NamespaceRegistry {
         }
 
         // Create new session
-        let ns_id = NamespaceId::new(namespace).map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
+        let ns_id = NamespaceId::new(namespace)
+            .map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
         let paths = NamespacePaths::new(&self.root, ns_id);
 
         let writer = WriterSession::open(self.store.clone(), paths.clone())
@@ -199,7 +200,11 @@ impl NamespaceRegistry {
         self.spawn_maintenance(Arc::clone(&state), paths);
 
         sessions.insert(namespace.to_string(), Arc::clone(&state));
-        tracing::info!("opened namespace: {} (total: {})", namespace, sessions.len());
+        tracing::info!(
+            "opened namespace: {} (total: {})",
+            namespace,
+            sessions.len()
+        );
         Ok(state)
     }
 
@@ -268,14 +273,18 @@ impl NamespaceRegistry {
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => error!(namespace = %ns, error = %e, "periodic compaction failed"),
+                            Err(e) => {
+                                error!(namespace = %ns, error = %e, "periodic compaction failed")
+                            }
                         }
                     }
                     // Orphan sweep — no writer lock; the retention horizon
                     // (RFC-027) keeps it from deleting a body a live reader
                     // still references.
                     let horizon = s.snapshot.retention_horizon();
-                    if let Err(e) = sweep_orphans(&ms, horizon, sweep_min_age, 1, sweep_delete).await {
+                    if let Err(e) =
+                        sweep_orphans(&ms, horizon, sweep_min_age, 1, sweep_delete).await
+                    {
                         error!(namespace = %ns, error = %e, "orphan sweep failed");
                     }
                 }
@@ -381,7 +390,10 @@ impl IntoResponse for RegistryError {
         let (status, message) = match self {
             Self::InvalidNamespace(msg) => (StatusCode::BAD_REQUEST, msg),
             Self::OpenFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            Self::AtCapacity => (StatusCode::SERVICE_UNAVAILABLE, "namespace registry at capacity".to_string()),
+            Self::AtCapacity => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "namespace registry at capacity".to_string(),
+            ),
             Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()

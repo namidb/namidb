@@ -80,8 +80,7 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // unique_lookup (also a NodeScan-shape rewrite) and before pushdown so
         // the new leaf operator is visible to the column analysis.
         #[cfg(feature = "vector-index")]
-        let unique_lookup =
-            vector_search::apply_vector_search(unique_lookup, catalog);
+        let unique_lookup = vector_search::apply_vector_search(unique_lookup, catalog);
         let pushed = normalize_filters(predicate_pushdown(unique_lookup));
         let hashed = convert_cross_to_hash(pushed, catalog);
         let decorrelated = convert_semi_apply_to_hash_semi_join(hashed, catalog);

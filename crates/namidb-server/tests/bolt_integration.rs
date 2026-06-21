@@ -290,7 +290,11 @@ async fn boot_bolt_full(
         store_uri: format!("memory://{ns}"),
         listen: http_addr,
         auth_token: Some("test-token".into()),
-        auth_tokens_file: None, #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -345,7 +349,11 @@ async fn boot_bolt_tokens(
         store_uri: format!("memory://{ns}"),
         listen: http_addr,
         auth_token: None,
-        auth_tokens_file: Some(tokens_path), #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: Some(tokens_path),
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -435,7 +443,11 @@ async fn bolt_create_then_match_roundtrip() {
         store_uri: "memory://bolt-test".into(),
         listen: http_addr,
         auth_token: Some("test-token".into()),
-        auth_tokens_file: None, #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -517,7 +529,11 @@ async fn bolt_bad_token_yields_failure() {
         store_uri: "memory://bolt-bad-auth".into(),
         listen: http_addr,
         auth_token: Some("correct-token".into()),
-        auth_tokens_file: None, #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
@@ -663,7 +679,11 @@ async fn bolt_memgraph_introspection_populates_schema() {
         store_uri: "memory://bolt-introspect".into(),
         listen: http_addr,
         auth_token: Some("test-token".into()),
-        auth_tokens_file: None, #[cfg(feature = "jwt")] jwt: None, #[cfg(feature = "pdp")] pdp_url: None,
+        auth_tokens_file: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,

@@ -25,7 +25,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
         | LogicalPlan::Argument { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
-        | LogicalPlan::VectorSearch { .. } | LogicalPlan::CallProcedure { .. } => plan,
+        | LogicalPlan::VectorSearch { .. }
+        | LogicalPlan::CallProcedure { .. } => plan,
         LogicalPlan::NodeById {
             input,
             label,

@@ -243,7 +243,10 @@ pub async fn copy_namespace_snapshot(
     // Also publish the advisory `current.json` (see manifest.rs) so the
     // restored namespace is findable via a non-LIST read on EC stores.
     dst_store
-        .put(&dst_paths.current_pointer(), PutPayload::from(pointer_bytes))
+        .put(
+            &dst_paths.current_pointer(),
+            PutPayload::from(pointer_bytes),
+        )
         .await
         .map_err(Error::ObjectStore)?;
     objects_copied += 1;
@@ -276,7 +279,11 @@ async fn verify_snapshot(
         let rels: Vec<&str> = std::iter::once(sst.path.as_str())
             .chain(sst.bloom.as_ref().map(|b| b.path.as_str()))
             .chain(sst.unique_property_indices.iter().map(|u| u.path.as_str()))
-            .chain(sst.equality_property_indices.iter().map(|e| e.path.as_str()))
+            .chain(
+                sst.equality_property_indices
+                    .iter()
+                    .map(|e| e.path.as_str()),
+            )
             .chain(sst.label_index.as_ref().map(|l| l.path.as_str()))
             .collect();
         for rel in rels {
@@ -512,9 +519,11 @@ mod tests {
         assert!(matches!(err, Error::Precondition(_)), "got {err:?}");
 
         // With overwrite, it proceeds.
-        copy_namespace_snapshot(src_store, src_paths, dst_store, dst_paths, None, true, false)
-            .await
-            .unwrap();
+        copy_namespace_snapshot(
+            src_store, src_paths, dst_store, dst_paths, None, true, false,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -655,7 +664,8 @@ mod tests {
             let mut w = WriterSession::open(src_store.clone(), src_paths.clone())
                 .await
                 .unwrap();
-            w.upsert_node("Person", NodeId::new(), &person("Ada")).unwrap();
+            w.upsert_node("Person", NodeId::new(), &person("Ada"))
+                .unwrap();
             w.commit_batch().await.unwrap();
             w.flush(schema()).await.unwrap();
         }

@@ -548,7 +548,9 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 "VectorSearch label={:?} prop={} k={} metric={} => {} (score={})",
                 label,
                 property,
-                k.as_const().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                k.as_const()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 distance.builtin_name(),
                 alias,
                 score_alias

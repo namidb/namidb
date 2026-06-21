@@ -13,8 +13,8 @@
 
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::Rng;
-use rand_chacha::ChaCha8Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 use crate::graph::VamanaGraph;
 use crate::search::beam_search;
@@ -123,11 +123,7 @@ pub fn robust_prune<S: VectorSpace>(
 /// the random-permutation order, and (for `Random` init) the seed neighbours;
 /// pass a fixed seed (`rand_chacha::ChaCha8Rng::seed_from_u64`) for a
 /// deterministic build. Returns a graph indexing all `space.len()` members.
-pub fn build<S: VectorSpace, R: Rng>(
-    space: &S,
-    params: BuildParams,
-    rng: &mut R,
-) -> VamanaGraph {
+pub fn build<S: VectorSpace, R: Rng>(space: &S, params: BuildParams, rng: &mut R) -> VamanaGraph {
     let n = space.len();
     if n == 0 {
         return VamanaGraph::new(Vec::new(), 0);
@@ -160,16 +156,15 @@ pub fn build<S: VectorSpace, R: Rng>(
 
     for &i in &order {
         // Find l_build nearest members to i over the graph-so-far.
-        let found = beam_search(
-            &adj,
-            n,
-            entry,
-            l_build,
-            l_build,
-            |id| space.pair_distance(i, id),
-        );
+        let found = beam_search(&adj, n, entry, l_build, l_build, |id| {
+            space.pair_distance(i, id)
+        });
         // Candidate set = found neighbours (dist to i), excluding i.
-        let cands: Vec<Cand> = found.into_iter().filter(|nb| nb.id != i).map(|nb| (nb.dist, nb.id)).collect();
+        let cands: Vec<Cand> = found
+            .into_iter()
+            .filter(|nb| nb.id != i)
+            .map(|nb| (nb.dist, nb.id))
+            .collect();
         let new_n = robust_prune(space, i, cands, alpha, r);
         // Write i's pruned out-list.
         adj[i as usize] = new_n.clone();
@@ -198,11 +193,7 @@ pub fn build<S: VectorSpace, R: Rng>(
 /// callers (storage compaction, the recall harness) that want reproducible
 /// builds without constructing an RNG themselves — same `(data, params, seed)`
 /// always yields the same graph.
-pub fn build_with_seed<S: VectorSpace>(
-    space: &S,
-    params: BuildParams,
-    seed: u64,
-) -> VamanaGraph {
+pub fn build_with_seed<S: VectorSpace>(space: &S, params: BuildParams, seed: u64) -> VamanaGraph {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     build(space, params, &mut rng)
 }
@@ -259,18 +250,16 @@ fn random_init<R: Rng>(n: usize, r: usize, rng: &mut R) -> Vec<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::space::{F32CosineSpace, Int8Space};
     use crate::search::search;
-    use rand_chacha::ChaCha8Rng;
+    use crate::space::{F32CosineSpace, Int8Space};
     use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     /// Clustered unit vectors: `clusters` centroids, members perturbed around
     /// them — the regime where ANN recall is meaningful (true NN well-separated).
     fn clustered(cosine: bool, n: usize, clusters: usize, dim: usize, seed: u64) -> F32CosineSpace {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let centroids: Vec<Vec<f32>> = (0..clusters)
-            .map(|_| random_unit(&mut rng, dim))
-            .collect();
+        let centroids: Vec<Vec<f32>> = (0..clusters).map(|_| random_unit(&mut rng, dim)).collect();
         let vecs: Vec<Vec<f32>> = (0..n)
             .map(|i| perturbed(&mut rng, &centroids[i % clusters], 0.15))
             .collect();
@@ -286,13 +275,19 @@ mod tests {
             let r = (-2.0 * u1.ln()).sqrt();
             let (s, c) = (std::f32::consts::TAU * u2).sin_cos();
             v.push(r * c);
-            if v.len() < dim { v.push(r * s); }
+            if v.len() < dim {
+                v.push(r * s);
+            }
         }
         v
     }
     fn normalize(v: &mut [f32]) {
         let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if nrm > 0.0 { for x in v { *x /= nrm; } }
+        if nrm > 0.0 {
+            for x in v {
+                *x /= nrm;
+            }
+        }
     }
     fn random_unit(rng: &mut ChaCha8Rng, dim: usize) -> Vec<f32> {
         let mut v = gaussian(rng, dim);
@@ -301,7 +296,11 @@ mod tests {
     }
     fn perturbed(rng: &mut ChaCha8Rng, base: &[f32], spread: f32) -> Vec<f32> {
         let noise = gaussian(rng, base.len());
-        let mut v: Vec<f32> = base.iter().zip(&noise).map(|(b, n)| b + spread * n).collect();
+        let mut v: Vec<f32> = base
+            .iter()
+            .zip(&noise)
+            .map(|(b, n)| b + spread * n)
+            .collect();
         normalize(&mut v);
         v
     }
@@ -339,7 +338,12 @@ mod tests {
         // After build, no node exceeds R out-neighbours (back-edge prune caps it).
         let space = clustered(true, 200, 10, 32, 7);
         let mut rng = ChaCha8Rng::seed_from_u64(3);
-        let params = BuildParams { r: 16, l_build: 32, alpha: 1.2, init: InitStrategy::BruteForce };
+        let params = BuildParams {
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            init: InitStrategy::BruteForce,
+        };
         let g = build(&space, params, &mut rng);
         assert!(
             g.max_degree() <= 16,
@@ -356,7 +360,12 @@ mod tests {
         let dim = 48;
         let space = clustered(true, n, clusters, dim, 42);
         let mut rng = ChaCha8Rng::seed_from_u64(99);
-        let params = BuildParams { r: 32, l_build: 64, alpha: 1.2, init: InitStrategy::Auto };
+        let params = BuildParams {
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+            init: InitStrategy::Auto,
+        };
         let g = build(&space, params, &mut rng);
 
         let k = 10;
@@ -366,7 +375,10 @@ mod tests {
         for i in 0..50 {
             let q = perturbed(&mut rng, space.vector((i as u32) % (clusters as u32)), 0.1);
             let truth = exact_topk(&space, &q, k);
-            let approx: Vec<u32> = search(&space, &g, &q, k, ef).into_iter().map(|n| n.id).collect();
+            let approx: Vec<u32> = search(&space, &g, &q, k, ef)
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
             total_recall += recall(&approx, &truth);
         }
         let avg = total_recall / 50.0;
@@ -390,7 +402,12 @@ mod tests {
         let i8space = Int8Space::new(members);
 
         let mut rng = ChaCha8Rng::seed_from_u64(8);
-        let params = BuildParams { r: 32, l_build: 64, alpha: 1.2, init: InitStrategy::Auto };
+        let params = BuildParams {
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+            init: InitStrategy::Auto,
+        };
         let g = build(&i8space, params, &mut rng);
 
         let k = 10;
@@ -401,7 +418,10 @@ mod tests {
             // Use the f32 ground truth, search over the int8 graph/space.
             let q = perturbed(&mut rng, space.vector((i as u32) % (clusters as u32)), 0.1);
             let truth = exact_topk(&space, &q, k);
-            let approx: Vec<u32> = search(&i8space, &g, &q, k, ef).into_iter().map(|n| n.id).collect();
+            let approx: Vec<u32> = search(&i8space, &g, &q, k, ef)
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
             total_recall += recall(&approx, &truth);
         }
         let avg = total_recall / 50.0;
@@ -415,11 +435,11 @@ mod tests {
     fn robust_prune_caps_and_excludes_anchor() {
         // 5 candidates all equidistant-ish; prune to r=2, anchor excluded.
         let space = F32CosineSpace::new(vec![
-            vec![1.0, 0.0],   // 0 = anchor
-            vec![0.9, 0.1],   // 1 near anchor
-            vec![0.8, 0.2],   // 2
-            vec![0.1, 0.9],   // 3 far / different dir
-            vec![-1.0, 0.0],  // 4 opposite
+            vec![1.0, 0.0],  // 0 = anchor
+            vec![0.9, 0.1],  // 1 near anchor
+            vec![0.8, 0.2],  // 2
+            vec![0.1, 0.9],  // 3 far / different dir
+            vec![-1.0, 0.0], // 4 opposite
         ]);
         let cands = vec![
             (space.pair_distance(0, 1), 1),
