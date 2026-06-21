@@ -843,6 +843,83 @@ async fn unwind_alias_drives_following_match_property_filter() {
 }
 
 #[tokio::test]
+async fn where_label_disjunction_filters_multiple_labels() {
+    // `WHERE x:A OR x:Goal` — multi-label filtering via the label predicate +
+    // boolean OR (the downstream `labels(x)[0] IN [...]` workaround is unneeded).
+    let mut writer = WriterSession::open(store(), paths("exec-label-or"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    writer.upsert_node("A", a, &person("a", 1)).unwrap();
+    writer.upsert_node("Mid", b, &person("b", 2)).unwrap();
+    writer.upsert_node("Goal", c, &person("c", 3)).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse("MATCH (x) WHERE x:A OR x:Goal RETURN x.name AS name ORDER BY name").unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["a".to_string(), "c".to_string()]);
+}
+
+#[tokio::test]
+async fn nodes_and_relationships_extract_path_elements() {
+    // a:A -R-> b:Mid -R-> c:Goal. With the path bound, nodes(p) yields all three
+    // nodes and relationships(p) the two edges — enabling intermediate-node
+    // filtering like `[x IN nodes(p) WHERE x:Mid | x.name]`.
+    let mut writer = WriterSession::open(store(), paths("exec-path-fns"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    writer.upsert_node("A", a, &person("a", 1)).unwrap();
+    writer.upsert_node("Mid", b, &person("b", 2)).unwrap();
+    writer.upsert_node("Goal", c, &person("c", 3)).unwrap();
+    writer.upsert_edge("R", a, b, &edge()).unwrap();
+    writer.upsert_edge("R", b, c, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH p = (a:A)-[:R*2..2]->(g:Goal) \
+         RETURN size(nodes(p)) AS n, size(relationships(p)) AS r, \
+                [x IN nodes(p) WHERE x:Mid | x.name] AS mids",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].get("n"), Some(RuntimeValue::Integer(3))));
+    assert!(matches!(rows[0].get("r"), Some(RuntimeValue::Integer(2))));
+    // The intermediate-node filter isolates b:Mid.
+    match rows[0].get("mids") {
+        Some(RuntimeValue::List(items)) => {
+            let names: Vec<&str> = items
+                .iter()
+                .filter_map(|v| match v {
+                    RuntimeValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, vec!["b"], "only the Mid intermediate node");
+        }
+        other => panic!("mids not a list: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn var_length_forward_reaches_far_label_through_other_labels() {
     // Regression: a forward variable-length path to a far-end label must
     // traverse THROUGH intermediate nodes of other labels. The far-end label

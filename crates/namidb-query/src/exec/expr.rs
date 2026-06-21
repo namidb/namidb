@@ -647,6 +647,33 @@ fn call_scalar_function(
             _ => RuntimeValue::Null,
         }),
 
+        // --- Path element functions (RFC-004). A path is the alternating
+        // sequence `[Node, Rel, Node, Rel, ..., Node]`; `nodes` returns the node
+        // elements (even positions), `relationships` the rel elements (odd
+        // positions). NULL padding from shortestPath is dropped so the lists
+        // stay well-typed for downstream `[x IN nodes(p) WHERE ...]` filtering.
+        "nodes" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Path(items) => RuntimeValue::List(
+                items
+                    .into_iter()
+                    .step_by(2)
+                    .filter(|x| matches!(x, RuntimeValue::Node(_)))
+                    .collect(),
+            ),
+            _ => RuntimeValue::Null,
+        }),
+        "relationships" => single_arg(name, args, span).map(|v| match v {
+            RuntimeValue::Path(items) => RuntimeValue::List(
+                items
+                    .into_iter()
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|x| matches!(x, RuntimeValue::Rel(_)))
+                    .collect(),
+            ),
+            _ => RuntimeValue::Null,
+        }),
+
         // --- Collection ops
         "size" | "length" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::String(s) => RuntimeValue::Integer(s.chars().count() as i64),

@@ -37,6 +37,28 @@ If you don't set `--auth-token`, the server boots in **unauthenticated**
 mode and prints a loud warning. Don't expose that port to the public
 internet.
 
+## Security & auth
+
+Auth is **off by default** — set one of the schemes below for any non-local
+deployment. All of them resolve a bearer token to a role (read-only vs
+read-write) and, optionally, a namespace scope, through one path, so HTTP and
+Bolt behave identically.
+
+| Scheme | Flags | Notes |
+|---|---|---|
+| **Static token** | `--auth-token` (or `NAMIDB_AUTH_TOKEN`) | Single read-write token. |
+| **Static token file** | `--auth-tokens-file` | Per-token roles **and** per-namespace scoping; hand out read-only tokens or tokens scoped to a namespace set. Takes precedence over `--auth-token`. |
+| **OIDC / JWT** | `--jwt-jwks-url` (enables), `--jwt-issuer`, `--jwt-audience`, `--jwt-groups-claim` (default `groups`), `--jwt-write-group`, `--jwt-read-group`, `--jwt-namespaces-claim` | Verifies bearer tokens against a JWKS URL (RS/ES* sig, `exp`, optional `iss`/`aud`), maps a group claim → role and a claim → namespace scope. Requires building with `--features jwt`. Fail-closed: a validation failure is a 401; an unreachable JWKS at boot aborts startup. |
+| **External policy (PDP)** | `--pdp-url` | POSTs `{subject, role, groups, action, …}` (or a schema op) to an OPA-style endpoint and denies unless it allows. **Fail-closed** on any error. Requires `--features pdp`. Can deny even reads, and gates DDL via `check_schema`. |
+
+TLS: pass `--tls-cert` and `--tls-key` (PEM) to serve HTTPS (and Bolt over TLS);
+omit them for plaintext (terminate TLS at a proxy/mesh instead). The Bolt
+listener shares the same token and TLS config as HTTP.
+
+`jwt` and `pdp` are optional Cargo features (default off → the build is
+byte-identical to static-token-only). Build the server with, e.g.,
+`cargo build -p namidb-server --features jwt,pdp` to enable them.
+
 ## Endpoints (v0)
 
 | Method | Path | Auth | Description |
