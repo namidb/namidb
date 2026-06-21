@@ -77,6 +77,13 @@ pub struct Manifest {
     /// loading unchanged.
     #[serde(default)]
     pub vector_indexes: Vec<VectorIndexDescriptor>,
+
+    /// Registered full-text (BM25) indexes (`text-index` feature). The
+    /// compaction build hook materializes a `TextIndex` SST per descriptor and
+    /// `CALL search.bm25` discovers one by matching `(label, properties)`.
+    /// `serde(default)` keeps pre-feature manifests loading unchanged.
+    #[serde(default)]
+    pub text_indexes: Vec<TextIndexDescriptor>,
 }
 
 impl Manifest {
@@ -92,6 +99,7 @@ impl Manifest {
             wal_segments: Vec::new(),
             label_dict: LabelDictionary::new(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         }
     }
 
@@ -109,6 +117,7 @@ impl Manifest {
             wal_segments: self.wal_segments.clone(),
             label_dict: self.label_dict.clone(),
             vector_indexes: self.vector_indexes.clone(),
+            text_indexes: self.text_indexes.clone(),
         }
     }
 }
@@ -140,6 +149,11 @@ pub enum SstKind {
     /// meaningful lexicographic key range, so its descriptors carry full-range
     /// `min_key/max_key` and are looked up by `(kind, scope=index_name)`.
     VectorGraph,
+    /// Full-text (BM25) inverted-index body for one text index (`text-index`
+    /// feature). Self-contained (postings + corpus stats serialized inline),
+    /// built during compaction. Like `VectorGraph` it has no lexicographic key
+    /// range and is looked up by `(kind, scope=index_name)`.
+    TextIndex,
 }
 
 impl SstKind {
@@ -150,6 +164,7 @@ impl SstKind {
             SstKind::EdgesFwd => "edges-fwd",
             SstKind::EdgesInv => "edges-inv",
             SstKind::VectorGraph => "vector-graph",
+            SstKind::TextIndex => "text-index",
         }
     }
 }
@@ -200,6 +215,16 @@ pub enum KindSpecificStats {
         alpha: f32,
         /// Entry-point medoid id.
         entry_medoid: u32,
+    },
+    /// Stats for a `TextIndex` (BM25 inverted-index) SST. Records the corpus
+    /// shape so observability can reason about it without decoding the body.
+    TextIndex {
+        /// Number of documents indexed in this SST.
+        doc_count: u64,
+        /// Distinct terms in the inverted index.
+        term_count: u64,
+        /// Sum of all document lengths in tokens (→ average document length).
+        total_len: u64,
     },
 }
 
@@ -434,6 +459,51 @@ impl VectorIndexDescriptor {
     /// `true` iff this index covers `(label, property)` with `metric`.
     pub fn matches(&self, label: &str, property: &str, metric: VectorMetric) -> bool {
         self.label == label && self.property == property && self.metric == metric
+    }
+}
+
+/// A registered full-text (BM25) index over a `(label, properties)` set.
+///
+/// `CREATE FULLTEXT INDEX` appends one of these to [`Manifest::text_indexes`];
+/// the compaction build hook materializes a `SstKind::TextIndex` body for it
+/// (concatenating the listed properties per document), and `CALL search.bm25`
+/// answers from the index when its `(label, properties)` match the request,
+/// falling back to a flat scan otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextIndexDescriptor {
+    /// Index name (unique within the namespace).
+    pub name: String,
+    /// Node label whose text is indexed.
+    pub label: String,
+    /// Text properties concatenated (in this order) to form each document.
+    /// Stored sorted so lookups are order-independent.
+    pub properties: Vec<String>,
+}
+
+impl TextIndexDescriptor {
+    /// Build a descriptor, normalizing `properties` to sorted order so two
+    /// descriptors (or a descriptor and a query request) over the same property
+    /// set compare equal regardless of the order they were given.
+    pub fn new(name: String, label: String, mut properties: Vec<String>) -> Self {
+        properties.sort();
+        properties.dedup();
+        Self {
+            name,
+            label,
+            properties,
+        }
+    }
+
+    /// `true` iff this index covers `label` over exactly the `properties` set
+    /// (order-independent).
+    pub fn matches(&self, label: &str, properties: &[String]) -> bool {
+        if self.label != label {
+            return false;
+        }
+        let mut req = properties.to_vec();
+        req.sort();
+        req.dedup();
+        self.properties == req
     }
 }
 

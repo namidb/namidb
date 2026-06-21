@@ -22,6 +22,10 @@ default = []
 # `Snapshot::vector_search` reader exists. The variant + its flat fallback are
 # always compiled. Default off.
 vector-index = ["namidb-storage/vector-index"]
+# Persistent full-text (BM25) index. Lets `CALL search.bm25` answer from the
+# `Snapshot::text_search` index reader instead of re-scanning; the flat scan is
+# always compiled as the fallback. Default off.
+text-index = ["namidb-storage/text-index"]
 
 [dependencies]
 namidb-core = { workspace = true }

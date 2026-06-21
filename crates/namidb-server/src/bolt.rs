@@ -170,6 +170,68 @@ impl ServerBackend {
         }
     }
 
+    /// Bolt shape for `CREATE FULLTEXT INDEX` (mirrors `run_create_vector_index`).
+    #[cfg(feature = "text-index")]
+    async fn run_create_fulltext_index(
+        &self,
+        cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
+        started: std::time::Instant,
+    ) -> RunObservation {
+        if let Some(err) = self.write_forbidden() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
+        let props: Vec<String> = cfi.properties.iter().map(|p| p.name.clone()).collect();
+        let op = crate::authz::SchemaOp::CreateFulltextIndex {
+            name: &cfi.name.name,
+            label: &cfi.label.name,
+            properties: &props,
+        };
+        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        let mut writer = self.state.writer.lock().await;
+        let result =
+            crate::apply_create_fulltext_index(&mut writer, &self.state.snapshot, cfi).await;
+        drop(writer);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed,
+                result: Ok(RunOutcome {
+                    fields: vec![],
+                    rows: vec![],
+                    statement_type: StatementType::Schema,
+                    counters: BTreeMap::new(),
+                }),
+            },
+            Err(e) => {
+                let is_user = matches!(
+                    &e,
+                    namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_)
+                );
+                let err = if is_user {
+                    BackendError::Semantic(e.to_string())
+                } else {
+                    map_storage_err(e)
+                };
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Err(err),
+                }
+            }
+        }
+    }
+
     /// Auto-commit query: parse, plan, and execute against the published
     /// snapshot (reads) or the writer lock (writes), timing the work for the
     /// metrics. Mirrors the HTTP `run_cypher`. The stopwatch stops at the end
@@ -196,6 +258,12 @@ impl ServerBackend {
         #[cfg(feature = "vector-index")]
         if let Some(cvi) = parsed.as_create_vector_index() {
             return self.run_create_vector_index(cvi, started).await;
+        }
+
+        // `CREATE FULLTEXT INDEX` is schema DDL: intercept before planning.
+        #[cfg(feature = "text-index")]
+        if let Some(cfi) = parsed.as_create_fulltext_index() {
+            return self.run_create_fulltext_index(cfi, started).await;
         }
 
         // Plan against the latest published snapshot — no writer lock.
@@ -320,6 +388,16 @@ impl ServerBackend {
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Unsupported(
                     "CREATE VECTOR INDEX cannot run inside a transaction".into(),
+                )),
+            };
+        }
+        #[cfg(feature = "text-index")]
+        if parsed.as_create_fulltext_index().is_some() {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Unsupported(
+                    "CREATE FULLTEXT INDEX cannot run inside a transaction".into(),
                 )),
             };
         }

@@ -58,6 +58,7 @@ impl fmt::Display for Clause {
             Clause::Remove(r) => fmt::Display::fmt(r, f),
             Clause::Delete(d) => fmt::Display::fmt(d, f),
             Clause::CreateVectorIndex(c) => fmt::Display::fmt(c, f),
+            Clause::CreateFulltextIndex(c) => fmt::Display::fmt(c, f),
             Clause::Call(c) => fmt::Display::fmt(c, f),
         }
     }
@@ -148,6 +149,22 @@ impl fmt::Display for CreateVectorIndexClause {
             f.write_str("}")?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for CreateFulltextIndexClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let props = self
+            .properties
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "CREATE FULLTEXT INDEX {} ON :{}({})",
+            self.name, self.label, props
+        )
     }
 }
 

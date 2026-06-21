@@ -75,6 +75,12 @@ pub enum Clause {
     /// `LogicalPlan` — the server intercepts it via
     /// [`Query::as_create_vector_index`].
     CreateVectorIndex(CreateVectorIndexClause),
+    /// `CREATE FULLTEXT INDEX` — schema DDL for the persistent BM25 index.
+    /// Always present as a variant; the parse arm and the out-of-band server
+    /// execution are gated behind the `text-index` Cargo feature. Like
+    /// `CreateVectorIndex` it never lowers to a `LogicalPlan` — the server
+    /// intercepts it via [`Query::as_create_fulltext_index`].
+    CreateFulltextIndex(CreateFulltextIndexClause),
     /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in procedure
     /// (RFC-008 PR1). A leading source clause: it introduces bindings (the
     /// YIELD columns) like `MATCH` does. Always-on (graph algorithms are
@@ -97,6 +103,7 @@ impl Clause {
             Clause::Remove(c) => c.span,
             Clause::Delete(c) => c.span,
             Clause::CreateVectorIndex(c) => c.span,
+            Clause::CreateFulltextIndex(c) => c.span,
             Clause::Call(c) => c.span,
         }
     }
@@ -115,6 +122,18 @@ impl Query {
     pub fn as_create_vector_index(&self) -> Option<&CreateVectorIndexClause> {
         if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
             if let Clause::CreateVectorIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `CREATE FULLTEXT INDEX` interception hook (mirrors
+    /// [`as_create_vector_index`](Self::as_create_vector_index)): `Some` only
+    /// when the DDL is the sole statement (no `RETURN`/`UNION`/`EXPLAIN`).
+    pub fn as_create_fulltext_index(&self) -> Option<&CreateFulltextIndexClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::CreateFulltextIndex(c) = &self.head.clauses[0] {
                 return Some(c);
             }
         }
@@ -232,6 +251,21 @@ pub struct CreateVectorIndexClause {
     pub l_build: Option<usize>,
     /// Optional `WITH {alpha: …}` override of the Vamana diversification.
     pub alpha: Option<f32>,
+    pub span: SourceSpan,
+}
+
+/// `CREATE FULLTEXT INDEX <name> ON :<Label>(<prop1>[, <prop2>, …])`.
+///
+/// A standalone schema command for the persistent BM25 index: the parser only
+/// emits it as the sole clause of a query, and the server executes it
+/// out-of-band (see [`Query::as_create_fulltext_index`]) — it never becomes a
+/// `LogicalPlan`. The listed properties are concatenated per document at build
+/// time; order does not affect BM25 scores.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateFulltextIndexClause {
+    pub name: Identifier,
+    pub label: Identifier,
+    pub properties: Vec<Identifier>,
     pub span: SourceSpan,
 }
 

@@ -71,6 +71,12 @@ pub enum SchemaOp<'a> {
         label: &'a str,
         property: &'a str,
     },
+    /// `CREATE FULLTEXT INDEX <name>` over `(label, properties)`.
+    CreateFulltextIndex {
+        name: &'a str,
+        label: &'a str,
+        properties: &'a [String],
+    },
 }
 
 /// The default hook: allows every request. Wiring it is behavior-preserving —

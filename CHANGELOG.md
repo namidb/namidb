@@ -21,6 +21,14 @@ the release notes.
   see. Yields `node` + `score`, ordered by relevance. The MCP `hybrid_search`
   lexical channel now ranks through it, so hybrid results reflect true term
   rarity. The corpus-free scalar remains for inline use.
+- `CREATE FULLTEXT INDEX <name> ON :Label(prop[, prop…])` — a **persistent
+  inverted index** for BM25, behind the new `text-index` Cargo feature (default
+  off; byte-identical when disabled). It is built during compaction (an inverted
+  index of postings + corpus statistics, mirroring the vector index), and
+  `CALL search.bm25` answers from it automatically when its `(label, properties)`
+  match — touching only documents that contain the query terms instead of
+  re-scanning the corpus — falling back to the flat scan otherwise. The index
+  reflects the compacted corpus and is rebuilt on each compaction.
 
 ## [1.0.0] - 2026-06-20: first stable release
 

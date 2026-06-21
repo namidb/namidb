@@ -205,6 +205,9 @@ impl StatsCatalog {
                 // node/edge rows — it contributes nothing to the label/edge/
                 // property stats the cost model uses for selectivity.
                 SstKind::VectorGraph => {}
+                // A TextIndex SST holds an inverted index, not rows — likewise
+                // irrelevant to the cost model's row/selectivity stats.
+                SstKind::TextIndex => {}
             }
         }
 
@@ -760,6 +763,7 @@ mod tests {
             wal_segments: vec![],
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").expect("Person seeded");
@@ -803,6 +807,7 @@ mod tests {
             wal_segments: vec![],
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").unwrap();
@@ -857,6 +862,7 @@ mod tests {
             wal_segments: vec![],
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let k = cat.edge_type("KNOWS").unwrap();
@@ -889,6 +895,7 @@ mod tests {
             wal_segments: vec![],
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let u = cat.label("Unknown").unwrap();
@@ -916,6 +923,7 @@ mod tests {
             wal_segments: vec![],
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let names: Vec<_> = cat.label_names().collect();

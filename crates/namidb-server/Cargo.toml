@@ -17,6 +17,12 @@ default = []
 # so a registered index is actually built and used. With the feature off the
 # DDL is rejected at the lowerer (HTTP 400 / Bolt NotSupported).
 vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+# Persistent full-text (BM25) index end-to-end: routes `CREATE FULLTEXT INDEX`
+# DDL to `WriterSession::register_text_index` (pre-plan intercept) AND turns on
+# the storage build hook + the `CALL search.bm25` index-backed path. With the
+# feature off the DDL is rejected at the lowerer; `search.bm25` still works via
+# the flat scan.
+text-index = ["namidb-query/text-index", "namidb-storage/text-index"]
 # OIDC/JWT bearer-token auth (RFC-015 Wave A). Adds a JWT validator that
 # verifies bearer tokens against a JWKS URL and maps a group claim to a Role.
 # It plugs into AuthConfig::role_for, so both HTTP and Bolt become JWT-aware

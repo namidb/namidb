@@ -14,6 +14,8 @@ pub mod hll;
 pub mod nodes;
 pub mod predicates;
 pub mod stats;
+#[cfg(feature = "text-index")]
+pub mod text;
 #[cfg(feature = "vector-index")]
 pub mod vector;
 

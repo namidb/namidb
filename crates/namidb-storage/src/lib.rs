@@ -33,6 +33,7 @@ pub mod property_index;
 pub mod read;
 pub mod recovery;
 pub mod sst;
+pub mod text;
 pub mod uri;
 pub mod wal;
 

@@ -193,7 +193,13 @@ YIELD node, score
 RETURN node.title AS title, score ORDER BY score DESC;
 ```
 
-The MCP `hybrid_search` tool fuses this lexical channel with vector scores (reciprocal rank fusion) automatically. There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF.
+By default this scans the label and computes corpus statistics on the fly. For large collections, register a persistent inverted index so the same query answers from precomputed postings instead of re-scanning — build the server or CLI with `--features text-index`, then:
+
+```cypher
+CREATE FULLTEXT INDEX doc_ft ON :Doc(title, body);
+```
+
+The index is built during compaction and `CALL search.bm25` uses it automatically when its `(label, properties)` match (falling back to the scan otherwise). The MCP `hybrid_search` tool fuses this lexical channel with vector scores (reciprocal rank fusion) automatically. There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF.
 
 <br />
 

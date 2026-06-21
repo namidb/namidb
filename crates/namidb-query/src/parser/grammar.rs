@@ -325,15 +325,21 @@ impl<'src> Parser<'src> {
             Some(Token::With) => self.parse_with_clause().map(Clause::With),
             Some(Token::Unwind) => self.parse_unwind_clause().map(Clause::Unwind),
             Some(Token::Create) => {
-                // `CREATE VECTOR INDEX …` is schema DDL and parses very
-                // differently from a graph `CREATE (pattern)`. VECTOR is a
-                // soft keyword (an `Ident`), so peek one ahead to route.
+                // `CREATE VECTOR INDEX …` / `CREATE FULLTEXT INDEX …` are schema
+                // DDL and parse very differently from a graph `CREATE (pattern)`.
+                // VECTOR/FULLTEXT are soft keywords (`Ident`s), so peek one ahead.
                 if matches!(
                     self.peek_at(1),
                     Some(Token::Ident(name)) if name.eq_ignore_ascii_case("VECTOR")
                 ) {
                     self.parse_create_vector_index()
                         .map(Clause::CreateVectorIndex)
+                } else if matches!(
+                    self.peek_at(1),
+                    Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FULLTEXT")
+                ) {
+                    self.parse_create_fulltext_index()
+                        .map(Clause::CreateFulltextIndex)
                 } else {
                     self.parse_create_clause().map(Clause::Create)
                 }
@@ -574,6 +580,41 @@ impl<'src> Parser<'src> {
             r,
             l_build,
             alpha,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// `CREATE FULLTEXT INDEX <name> ON :Label(prop1[, prop2, …])`. Routed here
+    /// off the `CREATE FULLTEXT` two-token prefix. Never reaches the lowerer; the
+    /// server intercepts it via `Query::as_create_fulltext_index`.
+    fn parse_create_fulltext_index(&mut self) -> Result<CreateFulltextIndexClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect(&Token::Create)?;
+        self.expect_soft_keyword("FULLTEXT")?;
+        self.expect_soft_keyword("INDEX")?;
+        let name = self.expect_identifier()?;
+        self.expect_in(&Token::On, "fulltext-index target")?;
+        self.expect(&Token::Colon)?;
+        let label = self.expect_identifier()?;
+        self.expect(&Token::LParen)?;
+        // One or more comma-separated text properties.
+        let mut properties = vec![self
+            .expect_identifier()
+            .map_err(|e| e.with_help("fulltext-index properties go in parentheses"))?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.bump();
+            properties.push(self.expect_identifier()?);
+        }
+        self.expect(&Token::RParen)?;
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(CreateFulltextIndexClause {
+            name,
+            label,
+            properties,
             span: SourceSpan::new(start, end),
         })
     }

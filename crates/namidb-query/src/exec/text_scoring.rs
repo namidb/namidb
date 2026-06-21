@@ -8,9 +8,11 @@
 //!    ones. See [`bm25_score`].
 //! 2. **`CALL search.bm25(...)` procedure** — full BM25 with **real IDF** and a
 //!    corpus-derived average document length. The procedure scans a label's
-//!    text property, builds corpus statistics ([`Bm25Stats`] + per-term
-//!    document frequency) in one pass, then scores every candidate document
-//!    with [`bm25_term_score`]. This is "Layer C": the IDF the scalar omits.
+//!    text property, builds corpus statistics (document count, average length,
+//!    per-term document frequency) in one pass, then scores every candidate
+//!    document with [`bm25_term_score`]. A registered full-text index
+//!    (`text-index`) serves the same scores without the scan. This is the IDF
+//!    the scalar omits.
 //!
 //! **The BM25 model.** For query term `t` in document `d`:
 //!
@@ -27,70 +29,19 @@
 //!
 //! Tokenization is ASCII-lowercase, split on non-alphanumeric runs (no
 //! stemming, no stopwords in v0).
+//!
+//! The shared, corpus-aware primitives ([`tokenize_counts`], [`bm25_idf`],
+//! [`bm25_term_score`]) live in [`namidb_storage::text`] so the persistent
+//! full-text index and this query-time path score identically; they are
+//! re-exported here for the procedure and the scalar below.
 
-/// BM25 `k1` — term-frequency saturation point.
-const K1: f64 = 1.5;
-/// BM25 `b` — field-length normalization strength.
-const B: f64 = 0.75;
+pub use namidb_storage::text::{bm25_idf, bm25_term_score, tokenize, tokenize_counts, B, K1};
+
 /// Reference average document length (in tokens) for the corpus-free scalar
 /// builtin, where the true corpus average is unavailable. A document of this
 /// length gets a neutral length factor. The `CALL search.bm25` procedure uses
 /// the real corpus average instead.
 const AVG_LEN: f64 = 120.0;
-
-/// Tokenize text into lowercased alphanumeric terms.
-pub(crate) fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
-        .collect()
-}
-
-/// Tokenize `text` into a term→count map plus the total token count (document
-/// length). The basis for corpus-aware BM25 over a scanned document.
-pub fn tokenize_counts(text: &str) -> (std::collections::HashMap<String, u32>, usize) {
-    let terms = tokenize(text);
-    let len = terms.len();
-    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for t in terms {
-        *counts.entry(t).or_insert(0) += 1;
-    }
-    (counts, len)
-}
-
-/// Corpus-level statistics needed for true BM25.
-#[derive(Debug, Clone, Copy)]
-pub struct Bm25Stats {
-    /// Number of documents in the corpus (the label's docs with the text field).
-    pub n_docs: usize,
-    /// Average document length in tokens. Falls back to a neutral 1.0 when the
-    /// corpus is empty so the length factor never divides by zero.
-    pub avg_len: f64,
-}
-
-/// BM25 inverse document frequency, Lucene form:
-/// `ln(1 + (N - df + 0.5) / (df + 0.5))`.
-///
-/// The `+1` keeps it non-negative even for a term present in most documents
-/// (classic Robertson–Spärck Jones IDF goes negative past N/2). A rarer term
-/// (smaller `df`) gets a larger weight. `df = 0` yields the maximum weight but
-/// callers only score terms that occur, so it is harmless.
-pub fn bm25_idf(n_docs: usize, doc_freq: usize) -> f64 {
-    let n = n_docs as f64;
-    let df = doc_freq as f64;
-    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
-}
-
-/// One query term's BM25 contribution to a document: the saturated,
-/// length-normalized term score scaled by its IDF weight. `tf == 0` → 0.
-pub fn bm25_term_score(idf: f64, tf: u32, doc_len: usize, avg_len: f64) -> f64 {
-    if tf == 0 {
-        return 0.0;
-    }
-    let tf = tf as f64;
-    let norm = 1.0 - B + B * (doc_len as f64 / avg_len.max(1.0));
-    idf * (tf * (K1 + 1.0)) / (tf + K1 * norm)
-}
 
 /// BM25 relevance of `document` for `query` (see the module docs). Returns
 /// `0.0` when the query has no terms or none of them occur in the document.
@@ -190,54 +141,6 @@ mod tests {
         assert!(bm25_score("e-mail server", "mail") > 0.0);
     }
 
-    // --- corpus-aware BM25 (real IDF) ---------------------------------------
-
-    #[test]
-    fn idf_rewards_rarer_terms_and_stays_non_negative() {
-        // In a 100-doc corpus, a term in 1 doc must outweigh one in 50.
-        let rare = bm25_idf(100, 1);
-        let common = bm25_idf(100, 50);
-        assert!(
-            rare > common,
-            "rare ({rare}) should outweigh common ({common})"
-        );
-        // Even a term present in every document is non-negative (Lucene form).
-        assert!(bm25_idf(100, 100) >= 0.0);
-        assert!(common > 0.0);
-    }
-
-    #[test]
-    fn term_score_zero_when_absent() {
-        assert_eq!(bm25_term_score(2.0, 0, 50, 120.0), 0.0);
-    }
-
-    #[test]
-    fn term_score_scales_with_idf() {
-        // Same tf/length, higher idf → higher contribution.
-        let low = bm25_term_score(0.5, 3, 100, 120.0);
-        let high = bm25_term_score(2.0, 3, 100, 120.0);
-        assert!(high > low);
-        // Proportional to idf for fixed tf/len.
-        assert!((high / low - 4.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn term_score_saturates_and_normalizes_length() {
-        // Saturation: 1→2 helps more than 9→10.
-        let g_low = bm25_term_score(1.0, 2, 50, 50.0) - bm25_term_score(1.0, 1, 50, 50.0);
-        let g_high = bm25_term_score(1.0, 10, 50, 50.0) - bm25_term_score(1.0, 9, 50, 50.0);
-        assert!(g_low > g_high);
-        // Length norm: same tf, shorter doc scores higher.
-        let short = bm25_term_score(1.0, 1, 10, 100.0);
-        let long = bm25_term_score(1.0, 1, 200, 100.0);
-        assert!(short > long);
-    }
-
-    #[test]
-    fn tokenize_counts_groups_and_measures_length() {
-        let (counts, len) = tokenize_counts("Fox fox, FOX! bird");
-        assert_eq!(len, 4);
-        assert_eq!(counts.get("fox").copied(), Some(3));
-        assert_eq!(counts.get("bird").copied(), Some(1));
-    }
+    // Corpus-aware primitives (bm25_idf / bm25_term_score / tokenize_counts) are
+    // tested in `namidb_storage::text`, their home module.
 }

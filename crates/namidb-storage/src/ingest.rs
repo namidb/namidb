@@ -61,8 +61,8 @@ use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
 use crate::manifest::{
-    LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, VectorIndexDescriptor,
-    WalSegmentDescriptor,
+    LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, TextIndexDescriptor,
+    VectorIndexDescriptor, WalSegmentDescriptor,
 };
 use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
@@ -1065,6 +1065,44 @@ impl WriterSession {
         // catalog.
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.vector_indexes.push(desc);
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
+    }
+
+    /// Register a full-text (BM25) index. A **metadata-only** manifest commit
+    /// (mirrors [`register_vector_index`](Self::register_vector_index)): appends
+    /// `desc` to [`Manifest::text_indexes`], stages no rows and no WAL. The
+    /// compaction build hook materializes the `SstKind::TextIndex` body lazily on
+    /// the next sweep. Rejects a duplicate by name or by `(label, properties)`
+    /// target. Returns the new manifest version.
+    pub async fn register_text_index(&mut self, desc: TextIndexDescriptor) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        for existing in &self.current.manifest.text_indexes {
+            if existing.name == desc.name {
+                return Err(Error::precondition(format!(
+                    "a text index named `{}` already exists",
+                    desc.name
+                )));
+            }
+            if existing.matches(&desc.label, &desc.properties) {
+                return Err(Error::precondition(format!(
+                    "a text index on ({}:{}) already exists: `{}`",
+                    desc.label,
+                    desc.properties.join(","),
+                    existing.name
+                )));
+            }
+        }
+
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.text_indexes.push(desc);
         let committed = self
             .manifest_store
             .commit(&self.fence, &self.current, next)

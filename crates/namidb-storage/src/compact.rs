@@ -255,6 +255,7 @@ async fn compact_leveled(
     let mut fwd_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut inv_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     let mut vector_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
+    let mut text_buckets: BTreeMap<String, Vec<&SstDescriptor>> = BTreeMap::new();
     for desc in &base.manifest.ssts {
         match desc.kind {
             SstKind::Nodes => node_buckets
@@ -273,6 +274,12 @@ async fn compact_leveled(
             // name (the descriptor scope). With the feature off none are ever
             // written, so this stays empty.
             SstKind::VectorGraph => vector_buckets
+                .entry(desc.scope.clone())
+                .or_default()
+                .push(desc),
+            // TextIndex SSTs (`text-index`). Bucketed per index name; empty when
+            // the feature is off (none are ever written).
+            SstKind::TextIndex => text_buckets
                 .entry(desc.scope.clone())
                 .or_default()
                 .push(desc),
@@ -370,6 +377,25 @@ async fn compact_leveled(
             .await?;
             new_descs.extend(new_vg);
             removed_ids.extend(old_vg_ids);
+        }
+
+        // (`text-index`): rebuild full-text indexes whose label has nodes in this
+        // bucket, from the same GC'd merged node rows (rebuild-not-merge).
+        #[cfg(feature = "text-index")]
+        {
+            let (new_ft, old_ft_ids) = build_text_indexes_for_nodes(
+                store.as_ref(),
+                paths,
+                plan.target_level,
+                &base.manifest.label_dict,
+                &base.manifest.text_indexes,
+                &merged_rows,
+                &label,
+                &text_buckets,
+            )
+            .await?;
+            new_descs.extend(new_ft);
+            removed_ids.extend(old_ft_ids);
         }
     }
 
@@ -935,6 +961,119 @@ async fn build_vector_indexes_for_nodes(
 
         // Rebuild-not-merge: drop prior VectorGraph SSTs for this index.
         if let Some(old) = old_vector_by_scope.get(&desc.name) {
+            removed.extend(old.iter().map(|d| d.id));
+        }
+    }
+
+    Ok((new_descs, removed))
+}
+
+/// (`text-index`): for every registered full-text index whose label has nodes in
+/// `merged_rows`, build a fresh `TextIndex` SST from those nodes' text and return
+/// the new descriptors **plus** the ids of any prior TextIndex SSTs for the same
+/// index (rebuild-not-merge, like the vector hook). A document is the
+/// space-joined string value of the index's properties; nodes carrying none of
+/// them are not part of the corpus.
+#[cfg(feature = "text-index")]
+#[allow(clippy::too_many_arguments)]
+async fn build_text_indexes_for_nodes(
+    store: &dyn ObjectStore,
+    paths: &NamespacePaths,
+    out_level: u32,
+    label_dict: &LabelDictionary,
+    descriptors: &[crate::manifest::TextIndexDescriptor],
+    merged_rows: &[NodeRow],
+    bucket_scope: &str,
+    old_text_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
+) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
+    use crate::sst::text::build_body;
+
+    let mut new_descs = Vec::new();
+    let mut removed = Vec::new();
+
+    for desc in descriptors {
+        let label_id = label_dict.id(&desc.label);
+        let mut members: Vec<([u8; 16], String)> = Vec::new();
+        for row in merged_rows {
+            let MemOp::Upsert(payload) = &row.op else {
+                continue;
+            };
+            let Ok(rec) = NodeWriteRecord::decode(payload) else {
+                continue;
+            };
+            // id-primary rows carry an authoritative label set; legacy rows
+            // (empty set) fall back to the bucket scope as their label.
+            let carries_label = match label_id {
+                Some(lid) => {
+                    rec.labels.contains(&lid.0)
+                        || (rec.labels.is_empty() && bucket_scope == desc.label)
+                }
+                None => rec.labels.is_empty() && bucket_scope == desc.label,
+            };
+            if !carries_label {
+                continue;
+            }
+            // Concatenate the indexed properties' string values into one document.
+            let mut parts: Vec<&str> = Vec::new();
+            for prop in &desc.properties {
+                if let Some(Value::Str(s)) = rec.properties.get(prop) {
+                    parts.push(s.as_str());
+                }
+            }
+            if parts.is_empty() {
+                continue; // not a member of this index's corpus
+            }
+            members.push((row.id, parts.join(" ")));
+        }
+
+        let Some((body, stats)) = build_body(members)? else {
+            continue;
+        };
+
+        let id = Uuid::now_v7();
+        let level = SstLevel(out_level);
+        let file_name = format!(
+            "{}-{}-{}.ft",
+            uuid_path_id(&id),
+            SstKind::TextIndex.path_tag(),
+            desc.name
+        );
+        let object_path = paths.sst_object(level.as_u32(), &file_name);
+        let relative_path = relative_sst_path(level.as_u32(), &file_name);
+        let body_len = body.len() as u64;
+        put_create(store, &object_path, body).await?;
+
+        let descriptor = SstDescriptor {
+            id,
+            kind: SstKind::TextIndex,
+            scope: desc.name.clone(),
+            level,
+            path: relative_path,
+            size_bytes: body_len,
+            row_count: stats.doc_count,
+            created_at: Utc::now(),
+            min_key: [0u8; 16],
+            max_key: [0xFFu8; 16],
+            min_lsn: 0,
+            max_lsn: 0,
+            schema_version_min: 0,
+            schema_version_max: 0,
+            property_stats: vec![],
+            kind_specific: KindSpecificStats::TextIndex {
+                doc_count: stats.doc_count,
+                term_count: stats.term_count,
+                total_len: stats.total_len,
+            },
+            bloom: None,
+            unique_property_indices: vec![],
+            equality_property_indices: vec![],
+            label_index: None,
+            per_label_property_stats: vec![],
+        };
+        new_descs.push(descriptor);
+
+        // Rebuild-not-merge: drop prior TextIndex SSTs for this index.
+        if let Some(old) = old_text_by_scope.get(&desc.name) {
             removed.extend(old.iter().map(|d| d.id));
         }
     }
@@ -1940,6 +2079,107 @@ mod tests {
     /// clustered `Doc` embeddings across two L0 SSTs, compact to L1, and the
     /// build hook materialises a searchable `VectorGraph` SST whose recall
     /// tracks brute force.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn compaction_builds_a_searchable_text_index() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::sst::text::TextIndex;
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(body: &str, label_id: u32) -> Bytes {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("body".into(), Value::Str(body.into()));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-text");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        // "fox" appears in exactly one document (rare → high IDF); "common" in
+        // the rest. Six docs across two L0 SSTs.
+        let bodies = [
+            "fox the cat",
+            "common the cat",
+            "common the dog",
+            "common the bird",
+            "common the lizard",
+            "common the fish",
+        ];
+        let mut cur = base;
+        let mut i: u64 = 0;
+        for chunk in bodies.chunks(3) {
+            let mut mt = Memtable::new();
+            for b in chunk {
+                let id = idx_id(i + 1);
+                mt.apply(
+                    MemKey::Node { id },
+                    i + 1,
+                    MemOp::Upsert(doc_payload(b, note_id.0)),
+                );
+                i += 1;
+            }
+            let frozen = mt.freeze();
+            let after = flush(&ms, &fence, &cur, &frozen, schema.clone())
+                .await
+                .unwrap();
+            cur = after.committed;
+        }
+
+        // Compact L0 → L1. The build hook emits one TextIndex SST.
+        let out = compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+        let fts: Vec<&SstDescriptor> = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == SstKind::TextIndex)
+            .collect();
+        assert_eq!(fts.len(), 1, "exactly one TextIndex SST after compaction");
+        assert_eq!(fts[0].scope, "note_ft");
+        let doc_count = match &fts[0].kind_specific {
+            KindSpecificStats::TextIndex { doc_count, .. } => *doc_count,
+            _ => 0,
+        };
+        assert_eq!(doc_count, bodies.len() as u64, "all docs indexed");
+
+        // Decode + search: the rare-term doc must rank first via real IDF.
+        let body = get_sst_body(s.as_ref(), &p, fts[0]).await.unwrap();
+        let idx = TextIndex::decode(&body).unwrap();
+        let hits = idx.search(&crate::text::tokenize("fox common"), None);
+        assert_eq!(hits.len(), bodies.len(), "every doc matches a query term");
+        assert_eq!(
+            hits[0].0,
+            *idx_id(1).as_bytes(),
+            "the rare-term doc ranks first"
+        );
+    }
+
     #[cfg(feature = "vector-index")]
     #[tokio::test]
     async fn compaction_builds_a_searchable_vector_graph() {

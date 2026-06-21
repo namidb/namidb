@@ -1171,6 +1171,116 @@ async fn run_create_vector_index(
     }
 }
 
+#[cfg(feature = "text-index")]
+fn text_index_descriptor_from(
+    cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
+) -> namidb_storage::manifest::TextIndexDescriptor {
+    namidb_storage::manifest::TextIndexDescriptor::new(
+        cfi.name.name.clone(),
+        cfi.label.name.clone(),
+        cfi.properties.iter().map(|p| p.name.clone()).collect(),
+    )
+}
+
+/// Register a full-text index (metadata-only) and republish the snapshot.
+/// Shared by the HTTP and Bolt DDL paths. The compaction build hook materializes
+/// the `.ft` body lazily.
+#[cfg(feature = "text-index")]
+async fn apply_create_fulltext_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
+) -> Result<u64, namidb_storage::Error> {
+    let desc = text_index_descriptor_from(cfi);
+    let version = writer.register_text_index(desc).await?;
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// HTTP shape for a `CREATE FULLTEXT INDEX`: gate on role + authz, run the DDL,
+/// return an empty `CypherResponse` on success. Mirrors `run_create_vector_index`.
+#[cfg(feature = "text-index")]
+async fn run_create_fulltext_index(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    authz: &Arc<dyn authz::AuthzHook>,
+    cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
+    principal: &Principal,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    if !principal.allows_write() {
+        return ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: "this token is read-only; schema commands are forbidden".into(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let props: Vec<String> = cfi.properties.iter().map(|p| p.name.clone()).collect();
+    let op = authz::SchemaOp::CreateFulltextIndex {
+        name: &cfi.name.name,
+        label: &cfi.label.name,
+        properties: &props,
+    };
+    if let Err(denied) = authz.check_schema(principal, op).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let mut w = writer.lock().await;
+    let result = apply_create_fulltext_index(&mut w, snapshot, cfi).await;
+    drop(w);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
+        Err(e) => {
+            let status = match &e {
+                namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    status,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
 async fn cypher(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1231,6 +1341,20 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.authz,
             cvi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `CREATE FULLTEXT INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "text-index")]
+    if let Some(cfi) = parsed.as_create_fulltext_index() {
+        return run_create_fulltext_index(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            cfi,
             principal,
             started,
         )
@@ -1579,6 +1703,20 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &shared.authz,
             cvi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `CREATE FULLTEXT INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "text-index")]
+    if let Some(cfi) = parsed.as_create_fulltext_index() {
+        return run_create_fulltext_index(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            &shared.authz,
+            cfi,
             principal,
             started,
         )
@@ -2085,12 +2223,50 @@ mod tests {
         assert_eq!(ro.status(), StatusCode::FORBIDDEN);
     }
 
+    /// `CREATE FULLTEXT INDEX` end-to-end over HTTP: registers, rejects a
+    /// duplicate with 400, and is forbidden for a read-only token.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn create_fulltext_index_registers_and_reports_duplicate() {
+        let app = fixture(None).await;
+
+        let q = "CREATE FULLTEXT INDEX note_ft ON :Note(body, title)";
+        let r = post_cypher(&app, None, q).await;
+        assert_eq!(r.status(), StatusCode::OK, "first create should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["rows"].as_array().unwrap().is_empty());
+
+        // Same name (or same target) again is a duplicate → 400.
+        let dup = post_cypher(&app, None, q).await;
+        assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+
+        // A read-only token may not run schema DDL.
+        let app_ro = fixture_with_tokens("ftidx-ro", ROLE_TOKENS).await;
+        let ro = post_cypher(&app_ro, Some("rkey"), q).await;
+        assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn create_fulltext_index_consults_authz_check_schema() {
+        let (store, paths) = namidb_storage::parse_uri("memory://ftidx-authz").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state =
+            AppState::new(writer, None, "test".into()).with_authz(Arc::new(DenySchemaAuthz));
+        let app = build_router(state);
+
+        let q = "CREATE FULLTEXT INDEX note_ft ON :Note(body)";
+        let resp = post_cypher(&app, None, q).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     // A hook that allows queries but denies schema (DDL) operations. Only the
-    // `vector-index` DDL test below constructs it, so gate it the same way or
-    // the default build flags it as dead code.
-    #[cfg(feature = "vector-index")]
+    // DDL authz tests construct it, so gate it the same way or the default build
+    // flags it as dead code.
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
     struct DenySchemaAuthz;
-    #[cfg(feature = "vector-index")]
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
     #[async_trait::async_trait]
     impl crate::authz::AuthzHook for DenySchemaAuthz {
         async fn check(

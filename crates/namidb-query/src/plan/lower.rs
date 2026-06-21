@@ -147,6 +147,14 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
                     clause.span(),
                 ));
             }
+            Clause::CreateFulltextIndex(_) => {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "CREATE FULLTEXT INDEX is a schema command and must be the \
+                     sole statement; it cannot be lowered to a query plan",
+                    clause.span(),
+                ));
+            }
             Clause::Call(c) => {
                 // CALL is a leading source clause (like MATCH). For v0 it must
                 // be the first clause — a CALL after a WITH/MATCH is rejected.

@@ -474,6 +474,124 @@ async fn call_search_bm25_mcp_query_shape_executes() {
     );
 }
 
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn call_search_bm25_uses_the_index() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::{ManifestStore, TextIndexDescriptor};
+    use namidb_storage::memtable::{MemKey, MemOp, Memtable};
+    use namidb_storage::{compact_l0_to_l1, flush, WriterFence};
+
+    let store = store();
+    let p = paths("bm25-index");
+    let ms = ManifestStore::new(store.clone(), p.clone());
+    let mut base = ms.bootstrap(uuid::Uuid::now_v7()).await.unwrap();
+    let note_id = base.manifest.label_dict.intern("Note");
+    base.manifest.text_indexes.push(TextIndexDescriptor::new(
+        "note_ft".into(),
+        "Note".into(),
+        vec!["body".into()],
+    ));
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+        })
+        .unwrap()
+        .build();
+    let fence = WriterFence::new(base.manifest.epoch);
+
+    // "fox" is rare (one doc); "common" is in the rest. Two L0 SSTs.
+    let bodies = [
+        "fox the cat",
+        "common the cat",
+        "common the dog",
+        "common the bird",
+    ];
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut cur = base;
+    let mut i: u64 = 0;
+    for chunk in bodies.chunks(2) {
+        let mut mt = Memtable::new();
+        for b in chunk {
+            let id = NodeId::new();
+            ids.push(id);
+            let mut props = BTreeMap::new();
+            props.insert("body".to_string(), namidb_core::Value::Str(b.to_string()));
+            let rec = NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![note_id.0],
+            };
+            mt.apply(
+                MemKey::Node { id },
+                i + 1,
+                MemOp::Upsert(rec.encode().unwrap()),
+            );
+            i += 1;
+        }
+        cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+            .await
+            .unwrap()
+            .committed;
+    }
+    compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+
+    // Reopen so the snapshot reflects the compacted TextIndex SST, then the
+    // procedure answers from the index (feature on).
+    let writer = WriterSession::open(store.clone(), p.clone()).await.unwrap();
+    let snapshot = writer.snapshot();
+    let rows = run(
+        &snapshot,
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox common'}) \
+         YIELD node, score RETURN node, score",
+    )
+    .await;
+
+    assert_eq!(rows.len(), bodies.len(), "every doc matches a query term");
+    let score = |r: &namidb_query::Row| match r.get("score") {
+        Some(RuntimeValue::Float(s)) => *s,
+        other => panic!("score not a float: {other:?}"),
+    };
+    let id_of = |r: &namidb_query::Row| match r.get("node") {
+        Some(RuntimeValue::Node(n)) => n.id,
+        other => panic!("node not a node: {other:?}"),
+    };
+    let top = rows
+        .iter()
+        .max_by(|a, b| score(a).partial_cmp(&score(b)).unwrap())
+        .unwrap();
+    assert_eq!(
+        id_of(top),
+        ids[0],
+        "the rare-term doc ranks first via the index"
+    );
+
+    // Freshness: write a NEW doc (now in the memtable, un-compacted) and search
+    // for its unique term. The index does not contain it, but the procedure must
+    // still find it — `text_search` detects the delta and falls back to the flat
+    // scan, so a fresh write is never silently hidden by the index.
+    let mut writer = writer;
+    let fresh = NodeId::new();
+    writer
+        .upsert_node("Note", fresh, &node_with_body("zebra"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snap2 = writer.snapshot();
+    let fresh_rows = run(
+        &snap2,
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'zebra'}) \
+         YIELD node, score RETURN node, score",
+    )
+    .await;
+    assert_eq!(fresh_rows.len(), 1, "the just-written doc must be visible");
+    assert_eq!(
+        id_of(&fresh_rows[0]),
+        fresh,
+        "fresh write found via flat fallback"
+    );
+}
+
 #[tokio::test]
 async fn call_search_bm25_requires_text_property() {
     let mut writer = WriterSession::open(store(), paths("call-bm25-noprop"))

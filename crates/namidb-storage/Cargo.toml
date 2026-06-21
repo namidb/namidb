@@ -54,6 +54,10 @@ default = []
 # build hook and the VectorGraph SST reader. Default off — existing namespaces
 # stay byte-for-byte identical with it disabled.
 vector-index = ["dep:namidb-ann"]
+# Persistent full-text (BM25) inverted index. Enables the compaction-time index
+# build hook and the TextIndex SST reader so `CALL search.bm25` answers from the
+# index instead of re-scanning. Default off — byte-identical when disabled.
+text-index = []
 
 [dev-dependencies]
 tokio-test = { workspace = true }

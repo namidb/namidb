@@ -197,6 +197,20 @@ impl AuthzHook for OpaAuthz {
                 "label": label,
                 "property": property,
             }),
+            SchemaOp::CreateFulltextIndex {
+                name,
+                label,
+                properties,
+            } => serde_json::json!({
+                "subject": principal.subject,
+                "role": role_str(principal),
+                "groups": principal.groups,
+                "action": "schema",
+                "schema_op": "create_fulltext_index",
+                "index_name": name,
+                "label": label,
+                "properties": properties,
+            }),
         };
         self.evaluate(input).await
     }

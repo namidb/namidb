@@ -1570,6 +1570,19 @@ async fn bm25_search(
         return project_proc_rows("search.bm25", &["node", "score"], Vec::new(), yield_items);
     }
 
+    // (`text-index`): serve from a registered full-text index when one covers
+    // (label, properties), so we score only documents containing a query term
+    // instead of re-scanning the whole label. Falls through to the flat scan
+    // when no index applies (feature off, no descriptor, or a property mismatch).
+    #[cfg(feature = "text-index")]
+    {
+        if let Some(rows) =
+            bm25_index_search(snapshot, &label, &props, &qterms, k, yield_items).await?
+        {
+            return Ok(rows);
+        }
+    }
+
     let views = snapshot.scan_label(&label).await?;
 
     // One pass: corpus stats over every document (a node with the text field)
@@ -1644,6 +1657,53 @@ async fn bm25_search(
         })
         .collect();
     project_proc_rows("search.bm25", &["node", "score"], raw, yield_items)
+}
+
+/// (`text-index`): answer `search.bm25` from a registered full-text index when
+/// one covers `(label, props)`. Returns `Ok(None)` when no descriptor matches so
+/// the caller falls through to the flat scan. The index yields `(NodeId, score)`;
+/// each hit is hydrated to a full node via `lookup_node` so `YIELD node` carries
+/// the document's properties, exactly as the flat path does.
+#[cfg(feature = "text-index")]
+async fn bm25_index_search(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    qterms: &[String],
+    k: Option<usize>,
+    yield_items: &[(String, String)],
+) -> Result<Option<Vec<Row>>, ExecError> {
+    let index_name = snapshot
+        .manifest()
+        .manifest
+        .text_indexes
+        .iter()
+        .find(|d| d.matches(label, props))
+        .map(|d| d.name.clone());
+    let Some(index_name) = index_name else {
+        return Ok(None);
+    };
+
+    // `text_search` returns None when the index is not authoritative for the
+    // current corpus (no built SST yet, or un-compacted writes the index has not
+    // absorbed); fall through to the flat scan so fresh writes stay visible.
+    let Some(hits) = snapshot.text_search(&index_name, label, qterms, k).await? else {
+        return Ok(None);
+    };
+    let mut raw = Vec::with_capacity(hits.len());
+    for (node_id, score) in hits {
+        // A document indexed but since deleted resolves to None; skip it.
+        if let Some(view) = snapshot.lookup_node(label, node_id).await? {
+            let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
+            raw.push(vec![node, RuntimeValue::Float(score)]);
+        }
+    }
+    Ok(Some(project_proc_rows(
+        "search.bm25",
+        &["node", "score"],
+        raw,
+        yield_items,
+    )?))
 }
 
 /// The text of a document for BM25: the configured properties' string values

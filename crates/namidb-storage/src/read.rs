@@ -2256,6 +2256,76 @@ impl<'mt> Snapshot<'mt> {
         Ok(all)
     }
 
+    /// (`text-index`): full BM25 top-k over the `TextIndex` SST(s) registered for
+    /// `index_name`, **only when the index is authoritative for `label`**.
+    ///
+    /// Returns `Ok(None)` — meaning "fall back to the flat scan" — when the index
+    /// would not see the full corpus: no built `TextIndex` SST yet, or there is
+    /// un-compacted node data for `label` (committed/staged memtable entries, or
+    /// an L0 `Nodes` SST not yet folded into the index by compaction). This keeps
+    /// the index path freshness-equivalent to the flat scan: a write is visible
+    /// to `search.bm25` immediately, regardless of whether an index exists. The
+    /// index only serves once compaction has caught the corpus up.
+    ///
+    /// `Ok(Some(hits))` is the BM25 result: `(NodeId, score)` best-first with a
+    /// node-id tie-break, unioned across every in-scope TextIndex SST (normally
+    /// one per index; a partial rebuild can briefly leave two). `k = None`
+    /// returns every match.
+    #[cfg(feature = "text-index")]
+    pub async fn text_search(
+        &self,
+        index_name: &str,
+        label: &str,
+        query_terms: &[String],
+        k: Option<usize>,
+    ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        use crate::sst::text::TextIndex;
+
+        // Authoritative only if a TextIndex SST exists for this index...
+        let has_index_sst = self
+            .manifest
+            .manifest
+            .ssts
+            .iter()
+            .any(|d| d.kind == SstKind::TextIndex && d.scope == index_name);
+        if !has_index_sst {
+            return Ok(None);
+        }
+        // ...and there is no un-compacted node delta the index has not absorbed:
+        // any node memtable entry (committed or staged), or an L0 `Nodes` SST for
+        // this label (flushed but not yet compacted into the index).
+        let memtable_delta = self.node_entries().next().is_some();
+        let l0_delta = self.manifest.manifest.ssts.iter().any(|d| {
+            d.kind == SstKind::Nodes && d.scope == label && d.level == crate::manifest::SstLevel::L0
+        });
+        if memtable_delta || l0_delta {
+            return Ok(None);
+        }
+
+        let mut all: Vec<(NodeId, f64)> = Vec::new();
+        for desc in &self.manifest.manifest.ssts {
+            if desc.kind != SstKind::TextIndex || desc.scope != index_name {
+                continue;
+            }
+            let body = self.get_sst_body(desc).await?;
+            let idx = TextIndex::decode(&body)?;
+            all.extend(
+                idx.search(query_terms, k)
+                    .into_iter()
+                    .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
+            );
+        }
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some(k) = k {
+            all.truncate(k);
+        }
+        Ok(Some(all))
+    }
+
     /// Return the decoded edge property streams for the SST identified by
     /// `absolute`, hitting [`SstCache::get_edge_streams`] first and
     /// decoding via the freshly-opened `reader` on miss.
