@@ -1579,6 +1579,29 @@ async fn call_subquery_correlated_runs_per_outer_row() {
 }
 
 #[tokio::test]
+async fn call_subquery_correlated_drops_rows_with_no_subquery_match() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-innerjoin"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Inner-join semantics: only Eve -> Alice exists, so the per-row subquery
+    // yields rows for Eve alone; the other four outer rows are dropped.
+    let q = parse(
+        "MATCH (a:Person) \
+         CALL { WITH a MATCH (a)-[:KNOWS]->(b:Person) WHERE b.name = 'Alice' RETURN b.name AS fn } \
+         RETURN a.name AS name, fn ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1, "only Eve has a KNOWS edge to Alice");
+    assert!(matches!(rows[0].get("name"), Some(RuntimeValue::String(s)) if s == "Eve"));
+    assert!(matches!(rows[0].get("fn"), Some(RuntimeValue::String(s)) if s == "Alice"));
+}
+
+#[tokio::test]
 async fn call_subquery_impure_import_is_rejected() {
     // The importing WITH must be a bare pass-through; an alias makes it impure.
     let q = parse(
