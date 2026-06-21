@@ -579,8 +579,35 @@ pub enum ExpressionKind {
     Map(MapLiteral),
     ListComprehension(Box<ListComprehension>),
     PatternComprehension(Box<PatternComprehension>),
+    /// List quantifier predicate: `all(x IN list WHERE pred)` and its
+    /// `any`/`none`/`single` siblings. Returns a boolean.
+    Quantifier(Box<Quantifier>),
     /// `*` projection placeholder. Reserved — RFC-004 §Open question Q1.
     Star,
+}
+
+/// Which list quantifier a [`Quantifier`] expresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantifierKind {
+    /// `all(x IN list WHERE pred)` — true iff every element satisfies `pred`.
+    All,
+    /// `any(x IN list WHERE pred)` — true iff at least one does.
+    Any,
+    /// `none(x IN list WHERE pred)` — true iff no element does.
+    None,
+    /// `single(x IN list WHERE pred)` — true iff exactly one does.
+    Single,
+}
+
+/// `<kind>(<variable> IN <list> WHERE <predicate>)`. Binds `variable` over each
+/// element of `list` and evaluates `predicate`, aggregating per [`QuantifierKind`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Quantifier {
+    pub kind: QuantifierKind,
+    pub variable: Identifier,
+    pub list: Expression,
+    pub predicate: Expression,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

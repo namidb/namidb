@@ -140,6 +140,12 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
             if let Some(r) = &rel_alias {
                 introduced.insert(r.clone());
             }
+            // The path binding (`p` in `MATCH p = (a)-[*]->(b)`) is materialised
+            // here too, so a `WHERE` term over `nodes(p)` must stay ABOVE the
+            // Expand, not sink below the operator that produces `p`.
+            if let Some(p) = &path_binding {
+                introduced.insert(p.clone());
+            }
             let (pushable, stay) = partition_by_alias_disjoint(pending, &introduced);
             let new_input = pushdown_at(*input, pushable);
             apply_filters(

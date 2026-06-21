@@ -12,6 +12,22 @@ pub fn parse_query(src: &str, tokens: Vec<Spanned<Token>>) -> ParseResult<Query>
     Ok(q)
 }
 
+/// Map an identifier to a list-quantifier kind (case-insensitive), or `None`
+/// when it is an ordinary function name.
+fn quantifier_kind(name: &str) -> Option<QuantifierKind> {
+    if name.eq_ignore_ascii_case("all") {
+        Some(QuantifierKind::All)
+    } else if name.eq_ignore_ascii_case("any") {
+        Some(QuantifierKind::Any)
+    } else if name.eq_ignore_ascii_case("none") {
+        Some(QuantifierKind::None)
+    } else if name.eq_ignore_ascii_case("single") {
+        Some(QuantifierKind::Single)
+    } else {
+        None
+    }
+}
+
 /// Cap on expression-nesting recursion. Deeply nested input (thousands of
 /// nested parens / lists / maps) would otherwise overflow the stack and
 /// abort the whole process. Every nested expression construct funnels
@@ -1644,6 +1660,22 @@ impl<'src> Parser<'src> {
         let start_span = self.peek_span();
         let next = self.peek().cloned();
         match next {
+            // `ALL` is a keyword token (UNION ALL), so the quantifier form
+            // `all(x IN list WHERE pred)` is recognised here rather than in
+            // parse_after_identifier (which only sees `Ident`s).
+            Some(Token::All) if matches!(self.peek_at(1), Some(Token::LParen)) => {
+                let t = self.bump().unwrap();
+                if self.looks_like_quantifier() {
+                    self.parse_quantifier_body(QuantifierKind::All, t.span.start)
+                } else {
+                    Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        "ALL is only valid here as a list quantifier, e.g. \
+                         `all(x IN list WHERE ...)`",
+                        t.span,
+                    ))
+                }
+            }
             Some(Token::Integer(n)) => {
                 let t = self.bump().unwrap();
                 Ok(Expression {
@@ -1745,6 +1777,45 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// `(` immediately followed by `<ident> IN` — the opening of a list
+    /// quantifier `(x IN list WHERE pred)`. Lets a quantifier word be told apart
+    /// from an ordinary function call without committing.
+    fn looks_like_quantifier(&self) -> bool {
+        self.check(&Token::LParen)
+            && matches!(
+                self.peek_at(1),
+                Some(Token::Ident(_)) | Some(Token::QuotedIdent(_))
+            )
+            && matches!(self.peek_at(2), Some(Token::In))
+    }
+
+    /// Parse the body of a list quantifier starting at the `(`: `(x IN list
+    /// WHERE pred)`. `start` is the byte offset of the quantifier keyword.
+    fn parse_quantifier_body(
+        &mut self,
+        kind: QuantifierKind,
+        start: usize,
+    ) -> Result<Expression, ParseError> {
+        self.expect(&Token::LParen)?;
+        let var = self.expect_identifier()?;
+        self.expect(&Token::In)?;
+        let list = self.parse_expression()?;
+        self.expect_in(&Token::Where, "list quantifier requires a WHERE predicate")?;
+        let predicate = self.parse_expression()?;
+        let rparen = self.expect_in(&Token::RParen, "list quantifier")?;
+        let span = SourceSpan::new(start, rparen.span.end);
+        Ok(Expression {
+            kind: ExpressionKind::Quantifier(Box::new(Quantifier {
+                kind,
+                variable: var,
+                list,
+                predicate,
+                span,
+            })),
+            span,
+        })
+    }
+
     fn parse_after_identifier(&mut self, head: Identifier) -> Result<Expression, ParseError> {
         // Function call: head ( ... )
         // Qualified function: head.head2 ( ... )
@@ -1760,6 +1831,18 @@ impl<'src> Parser<'src> {
             segments.push(next_id);
             if !self.check(&Token::LParen) && !self.check(&Token::Dot) {
                 break;
+            }
+        }
+
+        // List quantifier: `any|none|single (x IN list WHERE pred)`. (`all` is a
+        // keyword token handled in parse_primary.) A single segment whose name is
+        // a quantifier word, opening an `(x IN ...` form, is a quantifier, not a
+        // function call.
+        if segments.len() == 1 {
+            if let Some(kind) = quantifier_kind(&segments[0].name) {
+                if self.looks_like_quantifier() {
+                    return self.parse_quantifier_body(kind, segments[0].span.start);
+                }
             }
         }
 

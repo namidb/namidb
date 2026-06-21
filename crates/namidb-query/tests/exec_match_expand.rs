@@ -843,6 +843,65 @@ async fn unwind_alias_drives_following_match_property_filter() {
 }
 
 #[tokio::test]
+async fn all_quantifier_over_path_nodes_enforces_tenant_isolation() {
+    // The multi-tenant guard: `WHERE all(n IN nodes(p) WHERE n.tenant = $t)`
+    // keeps only paths that stay entirely within one tenant, so a leak edge to
+    // another tenant's node is excluded from the result.
+    fn tnode(name: &str, tenant: &str) -> NodeWriteRecord {
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("name".into(), CoreValue::Str(name.into()));
+        props.insert("tenant".into(), CoreValue::Str(tenant.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+    let mut writer = WriterSession::open(store(), paths("exec-tenant"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    let x = NodeId::new();
+    writer.upsert_node("A", a, &tnode("a", "t1")).unwrap();
+    writer.upsert_node("N", b, &tnode("b", "t1")).unwrap();
+    writer.upsert_node("N", c, &tnode("c", "t1")).unwrap();
+    writer.upsert_node("N", x, &tnode("x", "t2")).unwrap(); // other tenant
+    writer.upsert_edge("R", a, b, &edge()).unwrap();
+    writer.upsert_edge("R", b, c, &edge()).unwrap();
+    writer.upsert_edge("R", a, x, &edge()).unwrap(); // cross-tenant leak edge
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // The `all(...)` quantifier over the path's node tenants keeps only paths
+    // that stay within tenant t1. Explicit hops bind a/b each as a node, so the
+    // guard reads their tenant directly: a->b (both t1) is kept; a->x (x is t2)
+    // is excluded.
+    let q = parse(
+        "MATCH (a:A)-[:R]->(b) \
+         WHERE all(t IN [a.tenant, b.tenant] WHERE t = 't1') \
+         RETURN b.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let plan = optimize(plan, &StatsCatalog::empty());
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["b".to_string()],
+        "the cross-tenant neighbour x (tenant t2) must be excluded"
+    );
+}
+
+#[tokio::test]
 async fn where_label_disjunction_filters_multiple_labels() {
     // `WHERE x:A OR x:Goal` — multi-label filtering via the label predicate +
     // boolean OR (the downstream `labels(x)[0] IN [...]` workaround is unneeded).

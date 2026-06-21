@@ -197,6 +197,11 @@ fn visit_expression(expr: &Expression, out: &mut BTreeSet<String>) {
             }
             out.insert(lc.variable.name.clone());
         }
+        ExpressionKind::Quantifier(q) => {
+            visit_expression(&q.list, out);
+            visit_expression(&q.predicate, out);
+            out.insert(q.variable.name.clone());
+        }
         ExpressionKind::PatternComprehension(pc) => {
             if let Some(b) = &pc.binding {
                 out.insert(b.name.clone());
@@ -296,12 +301,19 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
             input,
             target_alias,
             rel_alias,
+            path_binding,
             ..
         } => {
             collect_produced(input, out);
             out.insert(target_alias.clone());
             if let Some(r) = rel_alias {
                 out.insert(r.clone());
+            }
+            // The path binding (`p` in `MATCH p = (a)-[*]->(b)`) is materialised
+            // by the Expand too; omitting it let predicate pushdown sink a
+            // `WHERE`/`nodes(p)` filter below the operator that produces `p`.
+            if let Some(p) = path_binding {
+                out.insert(p.clone());
             }
         }
         LogicalPlan::Filter { input, .. }

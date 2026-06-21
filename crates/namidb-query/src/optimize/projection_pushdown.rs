@@ -432,6 +432,10 @@ fn collect_from_expr(expr: &Expression, req: &mut RequiredSet) {
                 collect_from_expr(p, req);
             }
         }
+        ExpressionKind::Quantifier(q) => {
+            collect_from_expr(&q.list, req);
+            collect_from_expr(&q.predicate, req);
+        }
         ExpressionKind::PatternComprehension(pc) => {
             collect_from_pattern_element(&pc.pattern, req);
             if let Some(p) = &pc.predicate {

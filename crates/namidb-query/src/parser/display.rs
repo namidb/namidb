@@ -483,6 +483,19 @@ impl fmt::Display for Expression {
                 }
                 write!(f, " | {}]", pc.projection)
             }
+            ExpressionKind::Quantifier(q) => {
+                let kw = match q.kind {
+                    QuantifierKind::All => "all",
+                    QuantifierKind::Any => "any",
+                    QuantifierKind::None => "none",
+                    QuantifierKind::Single => "single",
+                };
+                write!(
+                    f,
+                    "{}({} IN {} WHERE {})",
+                    kw, q.variable, q.list, q.predicate
+                )
+            }
             ExpressionKind::Star => f.write_str("*"),
         }
     }

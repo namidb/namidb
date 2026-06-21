@@ -562,6 +562,10 @@ fn reject_nested_pattern_comprehension(expr: &Expression) -> Result<(), LowerErr
             }
             Ok(())
         }
+        ExpressionKind::Quantifier(q) => {
+            reject_nested_pattern_comprehension(&q.list)?;
+            reject_nested_pattern_comprehension(&q.predicate)
+        }
         ExpressionKind::Exists(_)
         | ExpressionKind::Star
         | ExpressionKind::Variable(_)
@@ -2098,6 +2102,11 @@ fn check_expression_bindings(expr: &Expression, ctx: &LowerCtx) -> Result<(), Lo
             // The bound variable is local — we don't add it to ctx because
             // the caller's scope shouldn't see it.
             Ok(())
+        }
+        ExpressionKind::Quantifier(q) => {
+            // Only the list is checked against the outer scope; the predicate
+            // references the quantifier's local variable, not yet in ctx.
+            check_expression_bindings(&q.list, ctx)
         }
         ExpressionKind::PatternComprehension(_) => Ok(()),
     }

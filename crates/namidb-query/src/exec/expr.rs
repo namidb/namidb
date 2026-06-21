@@ -188,6 +188,7 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
             Ok(RuntimeValue::Map(out))
         }
         ExpressionKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params),
+        ExpressionKind::Quantifier(q) => eval_quantifier(q, row, params),
         ExpressionKind::PatternComprehension(_) => Err(EvalError::new(
             "pattern comprehension evaluation requires storage access — \
  must be hoisted to a PatternList operator before evaluate()",
@@ -1415,6 +1416,74 @@ fn eval_list_comprehension(
     Ok(RuntimeValue::List(out))
 }
 
+/// Evaluate a list quantifier `all|any|none|single(x IN list WHERE pred)`.
+/// Binds `x` over each element and aggregates the boolean predicate with
+/// three-valued logic: a NULL predicate result is neither true nor false, so an
+/// otherwise-decided quantifier returns NULL rather than a wrong boolean.
+fn eval_quantifier(
+    q: &crate::parser::Quantifier,
+    row: &Row,
+    params: &Params,
+) -> Result<RuntimeValue, EvalError> {
+    use crate::parser::QuantifierKind;
+    let items = match evaluate(&q.list, row, params)? {
+        RuntimeValue::List(items) => items,
+        RuntimeValue::Null => return Ok(RuntimeValue::Null),
+        other => {
+            return Err(EvalError::new(
+                format!("list quantifier requires a list, got {}", other.type_name()),
+                q.list.span,
+            ));
+        }
+    };
+
+    let mut true_count = 0usize;
+    let mut any_null = false;
+    for item in items {
+        let mut local = row.clone();
+        local.set(q.variable.name.clone(), item);
+        match evaluate(&q.predicate, &local, params)?.as_bool() {
+            Some(true) => {
+                true_count += 1;
+                match q.kind {
+                    // Decisive early exits (independent of the remaining
+                    // elements, so NULLs after this point cannot change them).
+                    QuantifierKind::Any => return Ok(RuntimeValue::Bool(true)),
+                    QuantifierKind::None => return Ok(RuntimeValue::Bool(false)),
+                    QuantifierKind::Single if true_count > 1 => {
+                        return Ok(RuntimeValue::Bool(false));
+                    }
+                    _ => {}
+                }
+            }
+            Some(false) => {
+                if q.kind == QuantifierKind::All {
+                    return Ok(RuntimeValue::Bool(false));
+                }
+            }
+            None => any_null = true,
+        }
+    }
+
+    let result = match q.kind {
+        // No decisive element seen; a NULL leaves the answer unknown.
+        QuantifierKind::All | QuantifierKind::None => {
+            if any_null {
+                return Ok(RuntimeValue::Null);
+            }
+            true
+        }
+        QuantifierKind::Any => {
+            if any_null {
+                return Ok(RuntimeValue::Null);
+            }
+            false
+        }
+        QuantifierKind::Single => true_count == 1,
+    };
+    Ok(RuntimeValue::Bool(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::value::NodeValue;
@@ -1803,6 +1872,48 @@ mod tests {
             r,
             RuntimeValue::List(vec![RuntimeValue::Integer(20), RuntimeValue::Integer(40)])
         );
+    }
+
+    #[test]
+    fn list_quantifiers_aggregate_predicates() {
+        let t = |src: &str| eval_str(src, &Row::new(), &Params::new());
+        // all
+        assert_eq!(t("all(x IN [1,2,3] WHERE x > 0)"), RuntimeValue::Bool(true));
+        assert_eq!(
+            t("all(x IN [1,2,3] WHERE x > 1)"),
+            RuntimeValue::Bool(false)
+        );
+        // any
+        assert_eq!(t("any(x IN [1,2,3] WHERE x = 2)"), RuntimeValue::Bool(true));
+        assert_eq!(
+            t("any(x IN [1,2,3] WHERE x > 9)"),
+            RuntimeValue::Bool(false)
+        );
+        // none
+        assert_eq!(
+            t("none(x IN [1,2,3] WHERE x > 9)"),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            t("none(x IN [1,2,3] WHERE x = 2)"),
+            RuntimeValue::Bool(false)
+        );
+        // single
+        assert_eq!(
+            t("single(x IN [1,2,3] WHERE x = 2)"),
+            RuntimeValue::Bool(true)
+        );
+        assert_eq!(
+            t("single(x IN [1,2,3] WHERE x > 1)"),
+            RuntimeValue::Bool(false)
+        );
+        // empty list: all/none vacuously true, any/single false
+        assert_eq!(t("all(x IN [] WHERE x > 0)"), RuntimeValue::Bool(true));
+        assert_eq!(t("any(x IN [] WHERE x > 0)"), RuntimeValue::Bool(false));
+        assert_eq!(t("none(x IN [] WHERE x > 0)"), RuntimeValue::Bool(true));
+        assert_eq!(t("single(x IN [] WHERE x > 0)"), RuntimeValue::Bool(false));
+        // null list → null
+        assert!(t("all(x IN null WHERE x > 0)").is_null());
     }
 
     #[test]

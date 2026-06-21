@@ -3047,12 +3047,39 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 length,
                 optional,
                 back_reference,
-                shortest: _, // factor path: shortestPath routes via the flat path; see Plan-aware routing.
-                path_binding: _,
+                shortest,
+                path_binding,
             } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
+                // The factor expand executor does not materialise a path binding
+                // (`p`) or a shortestPath trail. Route those to the flat executor
+                // (which does) and re-wrap — otherwise `p` / `nodes(p)` downstream
+                // of a factorised variable-length expand sees an unbound `p`.
+                if path_binding.is_some() || !matches!(shortest, crate::plan::ShortestMode::None) {
+                    let rows = input_set.materialize_all(None);
+                    let out = execute_expand(
+                        rows,
+                        source,
+                        edge_type.as_deref(),
+                        *direction,
+                        rel_alias.as_deref(),
+                        target_alias,
+                        target_labels,
+                        *length,
+                        *optional,
+                        *back_reference,
+                        *shortest,
+                        path_binding.as_deref(),
+                        snapshot,
+                        routing.needs_properties(rel_alias.as_deref()),
+                        false,
+                        None,
+                    )
+                    .await?;
+                    return Ok(FactorRowSet::from_flat(out));
+                }
                 execute_expand_factor(
                     input_set,
                     source,
@@ -4388,6 +4415,7 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
         ExpressionKind::Exists(_)
         | ExpressionKind::ListComprehension(_)
         | ExpressionKind::PatternComprehension(_)
+        | ExpressionKind::Quantifier(_)
         | ExpressionKind::Literal(_)
         | ExpressionKind::Parameter(_)
         | ExpressionKind::Star => {}
