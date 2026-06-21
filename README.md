@@ -1,7 +1,7 @@
 <div align="center">
 
 <p>
-  <img src=".assets/namidb-logo.jpeg" alt="NamiDB" width="640" />
+  <img src=".assets/namidb_2.png" alt="NamiDB — the oracle of graphs" width="820" />
 </p>
 
 # NamiDB
@@ -27,7 +27,8 @@ NamiDB is a graph engine built on object storage. You write Cypher; it lays your
 
 What you get out of the box:
 
-- **A property graph** you query with Cypher / GQL.
+- **A property graph** you query with Cypher / GQL — `CALL { … }` subqueries (correlated and uncorrelated), `EXISTS { … }`, `FOREACH`, label disjunction `(n:A|B)`, and open-ended / parameterised variable-length paths (`*`, `*1..$n`).
+- **Schema when you want it** — `CREATE CONSTRAINT` for uniqueness (single- *and* multi-property), `NOT NULL`, and `CREATE INDEX` for equality lookups, with `IF NOT EXISTS` and `SHOW CONSTRAINTS` / `SHOW INDEXES`. Schema-optional: the engine enforces only what you declare.
 - **Vector search** — store embeddings as node properties, rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN.
 - **Hybrid search** — BM25 lexical + semantic, fused with reciprocal rank fusion, in one call.
 - **Graph algorithms** — connected components (weak & strong), PageRank, degree centrality, triangle count, community detection, and shortest paths over `CALL algo.*`.
@@ -153,6 +154,47 @@ CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops R
 ```
 
 The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `shortest_path`. They run exact (no sampling) and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
+
+<br />
+
+## Quick win: constraints, schema & richer Cypher
+
+Declare just the invariants you care about — the engine enforces them on write and leaves everything else schema-less. Uniqueness can span several properties, equality indexes speed up point lookups, and `IF NOT EXISTS` makes a migration script idempotent.
+
+```cypher
+-- Uniqueness on a single property…
+CREATE CONSTRAINT user_email IF NOT EXISTS
+  FOR (u:User) REQUIRE u.email IS UNIQUE;
+
+-- …or on a tuple (composite): no two configs share (tenant, name, parameterSet).
+CREATE CONSTRAINT cfg_uq IF NOT EXISTS
+  FOR (c:Config) REQUIRE (c.tenant, c.name, c.parameterSet) IS UNIQUE;
+
+-- An equality index for fast point lookups.
+CREATE INDEX FOR (d:Doc) ON (d.slug);
+
+-- Introspect what's declared.
+SHOW CONSTRAINTS;
+SHOW INDEXES;
+```
+
+A write that violates a uniqueness constraint is rejected (HTTP `409 Conflict`); a composite constraint applies only when every listed property is present. The same `SHOW` / `CREATE CONSTRAINT` commands work over HTTP, Bolt, and the embedded Python client.
+
+The query language goes well beyond basic `MATCH` — subqueries, existential checks, per-row updates, and flexible patterns all compose like any other clause:
+
+```cypher
+-- Correlated subquery: the 3 most-liked posts per author, in one query.
+MATCH (a:Author)
+CALL { WITH a MATCH (a)-[:WROTE]->(p:Post) RETURN p.title AS title ORDER BY p.likes DESC LIMIT 3 }
+RETURN a.name AS author, title;
+
+-- Existential filter + conditional per-row write (the FOREACH idiom).
+MATCH (u:User) WHERE NOT EXISTS { MATCH (u)-[:HAS]->(:Profile) }
+FOREACH (x IN [1] | CREATE (u)-[:HAS]->(:Profile {created: true}));
+
+-- Any-of labels, plus a parameterised variable-length path.
+MATCH (n:Person|Org)-[:KNOWS*1..$hops]->(m) RETURN DISTINCT m;
+```
 
 <br />
 
@@ -319,9 +361,9 @@ namidb load-vault --store "s3://bucket?ns=vault" --embed --prune ./vault
 # Inspect a plan without touching storage.
 namidb explain --verbose "MATCH (a:Person)-[:KNOWS]->(b) RETURN b LIMIT 20"
 
-# Consistent backup / restore of a namespace.
-namidb backup  --store "s3://bucket?ns=prod" ./snapshot
-namidb restore --store "s3://bucket?ns=restored" ./snapshot
+# Consistent backup / restore of a namespace (copy between URIs).
+namidb backup  --from "s3://bucket?ns=prod"      --to "file:///snapshots/prod"
+namidb restore --from "file:///snapshots/prod"   --to "s3://bucket?ns=restored"
 ```
 
 See [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md) for every subcommand.
@@ -329,6 +371,10 @@ See [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md) for every sub
 <br />
 
 ## Architecture
+
+<p align="center">
+  <img src=".assets/namidb_3.png" alt="The bucket is the database — NamiDB stores your graph directly in object storage" width="820" />
+</p>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -372,6 +418,7 @@ crates/
 ├── namidb-graph/       # Property columns, CSR adjacency, graph algorithm kernels
 ├── namidb-ann/         # DiskANN / Vamana vector index
 ├── namidb-query/       # Cypher / GQL parser, optimizer, executor, BM25
+├── namidb-bolt/        # Bolt wire protocol (PackStream, handshake, state machine)
 ├── namidb-markdown/    # Obsidian / Markdown vault → graph (+ embedders)
 ├── namidb-cli/         # `namidb` command-line tool
 ├── namidb-py/          # Python bindings (PyO3 + maturin)
@@ -416,6 +463,8 @@ NamiDB is licensed under the [**Business Source License 1.1**](LICENSE).
 ---
 
 <div align="center">
+
+<img src=".assets/logo_namidb.png" alt="NamiDB" width="120" />
 
 ### The bucket is the database.
 
