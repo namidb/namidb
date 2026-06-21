@@ -21,6 +21,11 @@ the release notes.
 
 ### Added
 
+- Open-ended variable-length relationships: `*` (any length), `*N..` (N or more)
+  and `*..M` now parse, lifting the previous requirement of an explicit upper
+  bound. An open upper bound is clamped to a hop cap
+  (`UNBOUNDED_VAR_LENGTH_CAP`, 64) at execution; an explicit `*1..M` is always
+  honoured. (`shortestPath` still requires a finite bound.)
 - Inline label disjunction in node patterns: `(n:A|B)` matches a node carrying
   ANY of the listed labels (vs `(n:A:B)`, which still requires ALL). Works on a
   scanned node, on an expand target `(a)-[:R]->(b:A|B)`, and as a WHERE-position

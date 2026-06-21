@@ -1905,3 +1905,68 @@ async fn nodes_of_varlen_path_carry_full_properties() {
         other => panic!("ages not a list: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn unbounded_var_length_traverses_the_whole_chain() {
+    let mut writer = WriterSession::open(store(), paths("exec-unbounded-star"))
+        .await
+        .unwrap();
+    // Chain a -> b -> c -> d (all label N).
+    let ids: Vec<NodeId> = (0..4).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("n".to_string(), CoreValue::I64(i as i64));
+        writer
+            .upsert_node(
+                "N",
+                *id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    for w in ids.windows(2) {
+        writer.upsert_edge("R", w[0], w[1], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // `*` (unbounded, capped) from the head reaches b, c, d.
+    let q = parse("MATCH (a:N {n: 0})-[:R*]->(x:N) RETURN x.n AS n ORDER BY n").unwrap();
+    let plan = optimize(
+        lower(&q).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let ns: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ns,
+        vec![1, 2, 3],
+        "unbounded * reaches every downstream node"
+    );
+
+    // Open-upper `*2..` skips the 1-hop neighbour.
+    let q2 = parse("MATCH (a:N {n: 0})-[:R*2..]->(x:N) RETURN x.n AS n ORDER BY n").unwrap();
+    let plan2 = optimize(
+        lower(&q2).unwrap(),
+        &StatsCatalog::from_manifest(&snapshot.manifest().manifest),
+    );
+    let rows2 = execute(&plan2, &snapshot, &Params::new()).await.unwrap();
+    let ns2: Vec<i64> = rows2
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ns2, vec![2, 3], "*2.. starts at the 2-hop node");
+}

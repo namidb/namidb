@@ -960,6 +960,17 @@ fn execute_capped<'a>(
 
 // ───────────────────────── Expand ────────────────────────────────────
 
+/// Clamp an open-ended variable-length upper bound (`max == u32::MAX`, from a
+/// `*` / `*N..` pattern) to the configured hop cap. A finite bound passes
+/// through unchanged.
+fn clamp_hop_max(max: u32) -> u32 {
+    if max == u32::MAX {
+        crate::parser::ast::UNBOUNDED_VAR_LENGTH_CAP
+    } else {
+        max
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_expand(
     rows: Vec<Row>,
@@ -982,7 +993,7 @@ pub(crate) async fn execute_expand(
     namidb_core::profile_scope!("walker::execute_expand");
     let edge_types = resolve_edge_types(snapshot, edge_type);
     let min = length.map(|l| l.min).unwrap_or(1);
-    let max = length.map(|l| l.max).unwrap_or(1);
+    let max = clamp_hop_max(length.map(|l| l.max).unwrap_or(1));
 
     let mut out = Vec::new();
     for row in rows {
@@ -3570,7 +3581,7 @@ async fn execute_expand_factor(
     namidb_core::profile_scope!("walker::execute_expand_factor");
     let edge_types = resolve_edge_types(snapshot, edge_type);
     let min = length.map(|l| l.min).unwrap_or(1);
-    let max = length.map(|l| l.max).unwrap_or(1);
+    let max = clamp_hop_max(length.map(|l| l.max).unwrap_or(1));
 
     let FactorRowSet {
         mut arena,

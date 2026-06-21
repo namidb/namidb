@@ -1536,45 +1536,27 @@ impl<'src> Parser<'src> {
         &mut self,
         star_span: SourceSpan,
     ) -> Result<RelationshipLength, ParseError> {
-        // Forms:
-        // * (forbidden — RFC-004)
-        // *N (exact)
-        // *N..M (range)
-        // *..M (forbidden)
-        // *N.. (forbidden — no upper bound)
+        // Forms (`u32::MAX` for max encodes an open upper bound; the executor
+        // caps it at `UNBOUNDED_VAR_LENGTH_CAP`):
+        //   *        → 1..∞
+        //   *N       → N..N
+        //   *N..M    → N..M
+        //   *..M     → 1..M
+        //   *N..     → N..∞
         let min_lit = self.eat_integer();
-        let min = match min_lit {
-            Some((n, _)) => n,
-            None => {
-                // `*..M` form: no min, just an upper bound. The next
-                // token must be `..`; otherwise it's a bare `*` and
-                // we still reject.
-                if matches!(self.peek(), Some(Token::Range)) {
-                    1
-                } else {
-                    return Err(ParseError::new(
-                        ErrorCode::UnboundedVariableLength,
-                        "variable-length pattern requires explicit min..max bounds in v0",
-                        star_span,
-                    )
-                    .with_help("see RFC-004 §Out-of-scope: variable-length without upper bound"));
-                }
-            }
-        };
+        let min = min_lit.map(|(n, _)| n).unwrap_or(1);
         let max = if self.eat(&Token::Range).is_some() {
-            match self.eat_integer() {
-                Some((n, _)) => n,
-                None => {
-                    return Err(ParseError::new(
-                        ErrorCode::UnboundedVariableLength,
-                        "variable-length upper bound is required in v0",
-                        self.peek_span(),
-                    )
-                    .with_help("write `*N..M` with finite M"));
-                }
-            }
-        } else {
+            // `..` present: an integer after it bounds the upper end; otherwise
+            // it is open (`*N..`).
+            self.eat_integer()
+                .map(|(n, _)| n)
+                .unwrap_or(i64::from(u32::MAX))
+        } else if min_lit.is_some() {
+            // `*N` exact.
             min
+        } else {
+            // Bare `*` — open upper bound.
+            i64::from(u32::MAX)
         };
         if min < 0 || max < 0 || max < min {
             return Err(ParseError::new(
@@ -1584,7 +1566,7 @@ impl<'src> Parser<'src> {
             ));
         }
         // `min == 0` (zero-length patterns) is syntactically accepted; the
-        // semantic check is deferred to lowering (RFC-004 §Out-of-scope).
+        // semantic check is deferred to lowering.
         Ok(RelationshipLength {
             min: min as u32,
             max: max as u32,
@@ -2406,9 +2388,27 @@ mod tests {
     }
 
     #[test]
-    fn variable_length_unbounded_is_error() {
-        let code = err_code("MATCH (a)-[:KNOWS*]->(b) RETURN b");
-        assert_eq!(code, ErrorCode::UnboundedVariableLength);
+    fn variable_length_unbounded_parses_with_open_upper_bound() {
+        // `*` now parses as 1..∞ (encoded as max == u32::MAX; the executor caps
+        // it). Same for the open-upper `*2..` form.
+        let q = ok("MATCH (a)-[:KNOWS*]->(b) RETURN b");
+        match &q.head.clauses[0] {
+            Clause::Match(m) => {
+                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                assert_eq!(len.min, 1);
+                assert_eq!(len.max, u32::MAX);
+            }
+            _ => panic!(),
+        }
+        let q2 = ok("MATCH (a)-[:KNOWS*2..]->(b) RETURN b");
+        match &q2.head.clauses[0] {
+            Clause::Match(m) => {
+                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                assert_eq!(len.min, 2);
+                assert_eq!(len.max, u32::MAX);
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -2570,11 +2570,17 @@ mod tests {
     }
 
     #[test]
-    fn optional_match_unbounded_variable_length_still_rejected() {
-        // E002 is orthogonal to the optional flag: an unbounded `*` upper
-        // bound is still rejected under OPTIONAL MATCH.
-        let code = err_code("OPTIONAL MATCH (a)-[*]->(b) RETURN b");
-        assert_eq!(code, ErrorCode::UnboundedVariableLength);
+    fn optional_match_unbounded_variable_length_parses() {
+        // Unbounded `*` is accepted under OPTIONAL MATCH too (capped at exec).
+        let q = ok("OPTIONAL MATCH (a)-[*]->(b) RETURN b");
+        match &q.head.clauses[0] {
+            Clause::Match(m) => {
+                assert!(m.optional);
+                let len = m.patterns[0].element.chain[0].0.length.unwrap();
+                assert_eq!(len.max, u32::MAX);
+            }
+            _ => panic!(),
+        }
     }
 
     fn match_where(src: &str) -> Expression {

@@ -159,15 +159,21 @@ async fn all_shortest_paths_alice_to_dave_returns_minimum_length_only() {
 
 #[tokio::test]
 async fn shortest_path_rejects_unbounded_star() {
-    // `*..` without an upper bound is rejected at the lower; verify
-    // the error code is surfaced rather than a panic.
+    // Open-ended `*` now parses (capped for ordinary expands), but shortestPath
+    // still requires a finite upper bound, so the lower must reject it.
     let q = parse(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MATCH p = shortestPath((a)-[:KNOWS*]-(b)) \
          RETURN p",
+    )
+    .expect("open-ended `*` now parses");
+    let err = lower(&q).expect_err("shortestPath requires a finite upper bound");
+    assert!(
+        err.message.to_lowercase().contains("finite")
+            || err.message.to_lowercase().contains("bound"),
+        "error should mention the finite-bound requirement, got: {}",
+        err.message
     );
-    // `*` without bounds doesn't even parse.
-    assert!(q.is_err(), "open-ended `*` must be a parse error");
 }
 
 #[tokio::test]

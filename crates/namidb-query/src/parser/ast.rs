@@ -597,13 +597,19 @@ pub enum RelationshipDirection {
     Both,
 }
 
-/// `*1..3` — variable-length range. Bounds are inclusive; both required by
-/// RFC-004 (no unbounded `*` or `*1..`).
+/// `*1..3` — variable-length range. Bounds are inclusive. An open upper bound
+/// (`*`, `*N..`, `*..` with no max) is encoded as `max == u32::MAX`; the
+/// executor clamps it to [`UNBOUNDED_VAR_LENGTH_CAP`] hops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationshipLength {
     pub min: u32,
     pub max: u32,
 }
+
+/// Hop cap applied to an open-ended variable-length traversal (`*`, `*N..`).
+/// A finite traversal that would otherwise be unbounded stops here; an explicit
+/// bound (`*1..1000`) is always honoured as written.
+pub const UNBOUNDED_VAR_LENGTH_CAP: u32 = 64;
 
 // ────────────────────────────────────────────────────────────────────
 // Expressions
