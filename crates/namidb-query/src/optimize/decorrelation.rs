@@ -166,6 +166,13 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             collect_outer_labels(input, out);
             out.insert(target_alias.clone(), target_labels.first().cloned());
         }
+        // Apply's `subplan` is a separate correlated scope: its internal
+        // aliases are NOT outer bindings (only the subquery RETURN columns are,
+        // which surface above the Apply). Recurse the outer `input` only —
+        // descending into `subplan` would leak inner labels into the outer map.
+        LogicalPlan::Apply { input, .. } => {
+            collect_outer_labels(input, out);
+        }
         _ => {
             for c in plan.children() {
                 collect_outer_labels(c, out);

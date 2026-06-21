@@ -1615,3 +1615,70 @@ async fn call_subquery_impure_import_is_rejected() {
         "an aliased/projected import WITH must be rejected"
     );
 }
+
+#[tokio::test]
+async fn call_subquery_without_return_exposes_no_bindings() {
+    // A block with no terminating RETURN must not leak its internal bindings
+    // into the outer scope (regression: produced was the whole subplan).
+    let q = parse("MATCH (a:Person) CALL { WITH a MATCH (a)-->(b) } RETURN b").unwrap();
+    assert!(
+        lower(&q).is_err(),
+        "the subquery-internal `b` must not be referenceable outside the block"
+    );
+}
+
+#[tokio::test]
+async fn call_subquery_correlated_writes_are_rejected() {
+    // Writes inside a correlated CALL subquery are rejected at planning rather
+    // than failing with an opaque runtime error.
+    let q =
+        parse("MATCH (a:Person) CALL { WITH a CREATE (c:City {of: a.name}) } RETURN a").unwrap();
+    assert!(
+        lower(&q).is_err(),
+        "writes in a correlated CALL subquery must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn semi_apply_over_correlated_apply_is_correct() {
+    let mut writer = WriterSession::open(store(), paths("exec-semiapply-apply"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // A SemiApply (the MATCH ... WHERE EXISTS) sits above a correlated Apply
+    // (the CALL). Exercises decorrelation's collect_outer_labels over an Apply
+    // input through the full optimizer. Every b has an out-KNOWS, so all pairs
+    // survive.
+    let q = parse(
+        "MATCH (a:Person) \
+         CALL { WITH a MATCH (a)-[:KNOWS]->(b:Person) RETURN b } \
+         MATCH (b) WHERE EXISTS((b)-[:KNOWS]->(:Person)) \
+         RETURN a.name AS name, b.name AS bn ORDER BY name, bn",
+    )
+    .unwrap();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(lower(&q).unwrap(), &catalog);
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| match (r.get("name"), r.get("bn")) {
+            (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(b))) => {
+                (a.clone(), b.clone())
+            }
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".into(), "Bob".into()),
+            ("Alice".into(), "Carol".into()),
+            ("Bob".into(), "Carol".into()),
+            ("Carol".into(), "Dave".into()),
+            ("Dave".into(), "Eve".into()),
+            ("Eve".into(), "Alice".into()),
+        ]
+    );
+}

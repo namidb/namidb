@@ -306,17 +306,35 @@ fn lower_call_subquery(
                 bindings: imports.clone(),
             };
             let subplan = lower_clause_seq(&cs.query.clauses[1..], &mut sub, Some(base), cs.span)?;
-            let produced: Vec<String> = crate::optimize::produced_aliases(&subplan)
-                .into_iter()
-                .collect();
+            if subplan.contains_write() {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "writes inside a correlated CALL subquery are not yet supported; \
+                     use an uncorrelated CALL subquery for writes",
+                    cs.span,
+                ));
+            }
+            let produced = subquery_produced(&cs.query, &subplan);
             return Ok((subplan, produced, true));
         }
     }
     let subplan = lower_single_query(&cs.query)?;
-    let produced: Vec<String> = crate::optimize::produced_aliases(&subplan)
-        .into_iter()
-        .collect();
+    let produced = subquery_produced(&cs.query, &subplan);
     Ok((subplan, produced, false))
+}
+
+/// The bindings a CALL subquery exposes to the enclosing scope: its trailing
+/// RETURN columns only. A body that does not end in RETURN (a write-only unit
+/// subquery, say) exposes nothing — so the subquery's internal bindings never
+/// leak into the outer query.
+fn subquery_produced(query: &SingleQuery, subplan: &LogicalPlan) -> Vec<String> {
+    if matches!(query.clauses.last(), Some(Clause::Return(_))) {
+        crate::optimize::produced_aliases(subplan)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Lower a `CALL` source clause to a `CallProcedure` leaf. Normalises the

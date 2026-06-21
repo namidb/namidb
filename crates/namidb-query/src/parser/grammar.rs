@@ -916,7 +916,8 @@ impl<'src> Parser<'src> {
     }
 
     /// `CALL { <clauses> }` — a subquery block. The inner clauses parse via the
-    /// normal `parse_clause` recursion (so the body can MATCH/WITH/RETURN/UNION).
+    /// normal `parse_clause` recursion (MATCH / WITH / RETURN / updates). A
+    /// top-level UNION inside the block is not supported yet.
     fn parse_call_subquery(&mut self) -> Result<CallSubqueryClause, ParseError> {
         let start = self.peek_span().start;
         self.expect_soft_keyword("CALL")?;
