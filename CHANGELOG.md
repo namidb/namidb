@@ -13,6 +13,12 @@ the release notes.
 
 ### Added
 
+- `CALL { <subquery> } ` — uncorrelated subquery blocks. The subquery is a
+  self-contained `RETURN`-terminated query; its result rows combine (cartesian)
+  with the enclosing scope and its `RETURN` columns become outer bindings — so
+  `CALL { MATCH … RETURN count(*) AS c }` brings an aggregate into the outer
+  query, and `CALL { … UNION … }` composes. The correlated form
+  (`CALL { WITH <outer vars> … }`) is rejected with a clear error for now.
 - `EXISTS { MATCH … [WHERE …] }` — the Neo4j 5 existential subquery form, in
   addition to the existing `EXISTS(pattern)` function. Correlated on outer
   bindings, supports an inner `WHERE` (and nested `EXISTS`), and `NOT EXISTS {…}`.

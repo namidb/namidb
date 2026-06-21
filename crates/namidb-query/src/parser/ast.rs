@@ -91,6 +91,10 @@ pub enum Clause {
     /// `FOREACH (x IN list | <update clauses>)` — run the side-effecting inner
     /// clauses once per list element.
     Foreach(ForeachClause),
+    /// `CALL { <subquery> }` — run an (uncorrelated) subquery and combine its
+    /// result rows with the outer scope. The subquery is a self-contained
+    /// `RETURN`-terminated query.
+    CallSubquery(CallSubqueryClause),
     /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in procedure
     /// (RFC-008 PR1). A leading source clause: it introduces bindings (the
     /// YIELD columns) like `MATCH` does. Always-on (graph algorithms are
@@ -117,6 +121,7 @@ impl Clause {
             Clause::CreateConstraint(c) => c.span,
             Clause::CreateIndex(c) => c.span,
             Clause::Foreach(c) => c.span,
+            Clause::CallSubquery(c) => c.span,
             Clause::Call(c) => c.span,
         }
     }
@@ -335,6 +340,16 @@ pub struct ForeachClause {
     pub variable: Identifier,
     pub list: Expression,
     pub body: Vec<Clause>,
+    pub span: SourceSpan,
+}
+
+/// `CALL { <subquery> }` — a subquery block. `query` is a self-contained
+/// `RETURN`-terminated query; its result rows are combined (cartesian) with the
+/// enclosing scope, and its `RETURN` columns become outer bindings. The
+/// correlated form (`CALL { WITH <outer vars> … }`) is not yet supported.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallSubqueryClause {
+    pub query: SingleQuery,
     pub span: SourceSpan,
 }
 

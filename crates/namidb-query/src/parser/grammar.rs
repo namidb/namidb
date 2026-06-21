@@ -382,7 +382,11 @@ impl<'src> Parser<'src> {
                 self.parse_foreach_clause().map(Clause::Foreach)
             }
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CALL") => {
-                self.parse_call_clause().map(Clause::Call)
+                if matches!(self.peek_at(1), Some(Token::LBrace)) {
+                    self.parse_call_subquery().map(Clause::CallSubquery)
+                } else {
+                    self.parse_call_clause().map(Clause::Call)
+                }
             }
             Some(other) => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
@@ -908,6 +912,41 @@ impl<'src> Parser<'src> {
             list,
             body,
             span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// `CALL { <clauses> }` — a subquery block. The inner clauses parse via the
+    /// normal `parse_clause` recursion (so the body can MATCH/WITH/RETURN/UNION).
+    fn parse_call_subquery(&mut self) -> Result<CallSubqueryClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("CALL")?;
+        self.expect(&Token::LBrace)?;
+        let qstart = self.peek_span().start;
+        let mut clauses = Vec::new();
+        while !self.check(&Token::RBrace) {
+            if self.peek().is_none() {
+                return Err(ParseError::new(
+                    ErrorCode::UnexpectedEof,
+                    "unterminated CALL subquery: expected `}`",
+                    self.peek_span(),
+                ));
+            }
+            clauses.push(self.parse_clause()?);
+        }
+        let rbrace = self.expect(&Token::RBrace)?;
+        if clauses.is_empty() {
+            return Err(ParseError::new(
+                ErrorCode::UnexpectedToken,
+                "CALL subquery body must contain at least one clause",
+                SourceSpan::new(start, rbrace.span.end),
+            ));
+        }
+        Ok(CallSubqueryClause {
+            query: SingleQuery {
+                clauses,
+                span: SourceSpan::new(qstart, rbrace.span.start),
+            },
+            span: SourceSpan::new(start, rbrace.span.end),
         })
     }
 

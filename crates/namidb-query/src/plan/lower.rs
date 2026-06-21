@@ -189,6 +189,22 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
                 }
                 plan = Some(lower_call(c, &mut ctx)?);
             }
+            Clause::CallSubquery(cs) => {
+                let base = plan.take();
+                let (subplan, produced) = lower_call_subquery(cs, &ctx)?;
+                // The subquery's RETURN columns become outer bindings; its
+                // internal bindings stay local.
+                for a in produced {
+                    ctx.bindings.insert(a);
+                }
+                plan = Some(match base {
+                    None => subplan,
+                    Some(b) => LogicalPlan::CrossProduct {
+                        left: Box::new(b),
+                        right: Box::new(subplan),
+                    },
+                });
+            }
         }
     }
 
@@ -209,6 +225,37 @@ fn require_input(p: Option<LogicalPlan>, span: SourceSpan) -> Result<LogicalPlan
             span,
         )
     })
+}
+
+/// Lower a `CALL { … }` subquery block. Returns the subplan and the names its
+/// RETURN exposes to the outer scope. Lowered in a fresh scope (uncorrelated):
+/// the body is self-contained and its result is combined with the outer rows by
+/// the caller via `CrossProduct`. The correlated form (a leading `WITH` that
+/// imports an outer binding) is rejected — it needs an Apply operator we do not
+/// have yet.
+fn lower_call_subquery(
+    cs: &ast::CallSubqueryClause,
+    outer_ctx: &LowerCtx,
+) -> Result<(LogicalPlan, Vec<String>), LowerError> {
+    if let Some(Clause::With(w)) = cs.query.clauses.first() {
+        let imports_outer = w.items.iter().any(|it| {
+            matches!(&it.expression.kind, ExpressionKind::Variable(v)
+                if outer_ctx.bindings.contains(&v.name))
+        });
+        if imports_outer {
+            return Err(LowerError::new(
+                LowerErrorKind::UnsupportedFeature,
+                "correlated CALL { WITH … } subqueries are not yet supported; \
+                 use an uncorrelated CALL subquery or restructure the query",
+                cs.span,
+            ));
+        }
+    }
+    let subplan = lower_single_query(&cs.query)?;
+    let produced: Vec<String> = crate::optimize::produced_aliases(&subplan)
+        .into_iter()
+        .collect();
+    Ok((subplan, produced))
 }
 
 /// Lower a `CALL` source clause to a `CallProcedure` leaf. Normalises the

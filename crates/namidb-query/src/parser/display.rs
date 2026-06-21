@@ -62,6 +62,7 @@ impl fmt::Display for Clause {
             Clause::CreateConstraint(c) => fmt::Display::fmt(c, f),
             Clause::CreateIndex(c) => fmt::Display::fmt(c, f),
             Clause::Foreach(c) => fmt::Display::fmt(c, f),
+            Clause::CallSubquery(c) => fmt::Display::fmt(c, f),
             Clause::Call(c) => fmt::Display::fmt(c, f),
         }
     }
@@ -205,6 +206,19 @@ impl fmt::Display for ForeachClause {
             write!(f, "{c}")?;
         }
         f.write_str(")")
+    }
+}
+
+impl fmt::Display for CallSubqueryClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CALL { ")?;
+        for (i, c) in self.query.clauses.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{c}")?;
+        }
+        f.write_str(" }")
     }
 }
 

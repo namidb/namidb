@@ -1490,3 +1490,59 @@ async fn not_exists_left_of_and_hoists_to_semiapply() {
         assert_eq!(rows.len(), 0, "expected 0 rows for: {q}");
     }
 }
+
+#[tokio::test]
+async fn call_subquery_uncorrelated_aggregation() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-agg"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Uncorrelated CALL{}: a one-row aggregation that the outer RETURNs.
+    let q = parse("CALL { MATCH (p:Person) RETURN count(p) AS total } RETURN total").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(rows[0].get("total"), Some(RuntimeValue::Integer(5))),
+        "got {:?}",
+        rows[0].get("total")
+    );
+}
+
+#[tokio::test]
+async fn call_subquery_cross_joins_with_outer() {
+    let mut writer = WriterSession::open(store(), paths("exec-call-cross"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // The uncorrelated subquery result (total=5) is combined with each of the
+    // 5 outer Person rows.
+    let q = parse(
+        "MATCH (a:Person) \
+         CALL { MATCH (p:Person) RETURN count(p) AS total } \
+         RETURN a.name AS name, total ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 5);
+    for r in &rows {
+        assert!(matches!(r.get("total"), Some(RuntimeValue::Integer(5))));
+    }
+}
+
+#[tokio::test]
+async fn call_subquery_correlated_is_rejected() {
+    // Correlated form (leading WITH imports `a`) is not yet supported.
+    let q = parse(
+        "MATCH (a:Person) \
+         CALL { WITH a MATCH (a)-[:KNOWS]->(b:Person) RETURN b.name AS fname } \
+         RETURN fname",
+    )
+    .unwrap();
+    assert!(lower(&q).is_err(), "correlated CALL{{}} must be rejected");
+}
