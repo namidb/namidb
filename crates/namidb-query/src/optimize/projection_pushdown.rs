@@ -107,7 +107,12 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             req.record_property(alias, property);
             collect_from_expr(value, req);
         }
-        LogicalPlan::Expand { input, source, .. } => {
+        LogicalPlan::Expand {
+            input,
+            source,
+            path_binding,
+            ..
+        } => {
             // The source binding must expose its `id` for traversal —
             // the executor reads `row.get(source).id` to call
             // `out_edges` / `in_edges`. Record `id` defensively so the
@@ -115,6 +120,13 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             // column — always included by the engine-column carve-out;
             // belt-and-suspenders).
             req.record_property(source, "id");
+            // A path-binding Expand copies the source node into the materialised
+            // trail (`nodes(p)`), where any property may later be read — so keep
+            // ALL of the source node's properties, not just `id`. (Traversed
+            // nodes are re-fetched whole by id, so only the source needs this.)
+            if path_binding.is_some() {
+                req.record_all(source);
+            }
             collect_from_plan(input, req);
         }
         LogicalPlan::Filter { input, predicate } => {

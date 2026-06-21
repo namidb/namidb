@@ -1862,3 +1862,46 @@ async fn call_subquery_union_all_keeps_duplicates() {
         .iter()
         .all(|r| matches!(r.get("c"), Some(RuntimeValue::Integer(5)))));
 }
+
+#[tokio::test]
+async fn nodes_of_varlen_path_carry_full_properties() {
+    let mut writer = WriterSession::open(store(), paths("exec-varlen-props"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    writer.upsert_node("A", a, &person("a", 1)).unwrap();
+    writer.upsert_node("Mid", b, &person("b", 2)).unwrap();
+    writer.upsert_node("Goal", c, &person("c", 3)).unwrap();
+    writer.upsert_edge("R", a, b, &edge()).unwrap();
+    writer.upsert_edge("R", b, c, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // The start node's properties must be present in nodes(p), so a quantifier
+    // over path-node properties works (regression: the start node came back with
+    // pruned/NULL properties).
+    let q = parse(
+        "MATCH p = (a:A)-[:R*2..2]->(g:Goal) \
+         WHERE all(x IN nodes(p) WHERE x.age >= 1) \
+         RETURN [x IN nodes(p) | x.age] AS ages",
+    )
+    .unwrap();
+    let plan = optimize(lower(&q).unwrap(), &StatsCatalog::empty());
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1, "the path satisfies all(age >= 1)");
+    match rows[0].get("ages") {
+        Some(RuntimeValue::List(items)) => {
+            let ages: Vec<i64> = items
+                .iter()
+                .filter_map(|v| match v {
+                    RuntimeValue::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ages, vec![1, 2, 3], "every path node, start included");
+        }
+        other => panic!("ages not a list: {other:?}"),
+    }
+}

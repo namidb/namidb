@@ -11,6 +11,14 @@ the release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nodes(path)` over a variable-length path now carries the **start** node's full
+  properties, not just its id. Previously projection pushdown pruned the source
+  scan (since only `nodes(p)` referenced it), so the first path node came back
+  with NULL properties and a predicate like `all(x IN nodes(p) WHERE x.age >= 1)`
+  wrongly filtered the path out.
+
 ### Added
 
 - Inline label disjunction in node patterns: `(n:A|B)` matches a node carrying
