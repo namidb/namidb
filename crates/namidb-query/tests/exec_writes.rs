@@ -1528,25 +1528,24 @@ async fn foreach_runs_per_matched_row_and_preserves_cardinality() {
 }
 
 #[tokio::test]
-async fn foreach_with_set_runs_per_element() {
-    // FOREACH can SET a property on a node bound by the outer MATCH, once per
-    // element. Each iteration reads the pre-loop row snapshot (a read-modify-
-    // write is not accumulated across iterations), so the last assignment wins:
-    // `SET c.n = i` over [1,2,3] leaves n = 3.
+async fn foreach_read_modify_write_accumulates_across_iterations() {
+    // A read-modify-write on a node bound by the outer MATCH accumulates across
+    // FOREACH iterations: `SET c.n = c.n + i` over [1,2,3] leaves n = 0+1+2+3 = 6
+    // (each iteration sees the previous iteration's write, not the pre-loop row).
     let mut writer = WriterSession::open(store(), paths("w-foreach-set"))
         .await
         .unwrap();
     write_q(&mut writer, "CREATE (:Counter {name: 'c', n: 0})").await;
     write_q(
         &mut writer,
-        "MATCH (c:Counter {name: 'c'}) FOREACH (i IN [1, 2, 3] | SET c.n = i)",
+        "MATCH (c:Counter {name: 'c'}) FOREACH (i IN [1, 2, 3] | SET c.n = c.n + i)",
     )
     .await;
 
     let snap = writer.snapshot();
     let plan = lower(&parse("MATCH (c:Counter) RETURN c.n AS n").unwrap()).unwrap();
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
-    assert!(matches!(rows[0].get("n"), Some(RuntimeValue::Integer(3))));
+    assert!(matches!(rows[0].get("n"), Some(RuntimeValue::Integer(6))));
 }
 
 #[tokio::test]
@@ -1557,4 +1556,45 @@ async fn foreach_body_rejects_non_update_clause() {
         lower(&parsed).is_err(),
         "FOREACH body may only contain update clauses"
     );
+}
+
+#[tokio::test]
+async fn correlated_call_subquery_writes_per_outer_row() {
+    // `MATCH (a) CALL { WITH a CREATE (:City {owner: a.name}) }` runs the write
+    // once per matched Person, creating one City each.
+    let mut writer = WriterSession::open(store(), paths("w-corr-call-write"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {name: 'a'})").await;
+    write_q(&mut writer, "CREATE (:Person {name: 'b'})").await;
+
+    let plan = optimize(
+        lower(
+            &parse(
+                "MATCH (p:Person) \
+                 CALL { WITH p CREATE (:City {owner: p.name}) } \
+                 RETURN p.name AS name ORDER BY name",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        &StatsCatalog::empty(),
+    );
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    // One output row per Person (pass-through), two Cities created.
+    assert_eq!(outcome.rows.len(), 2);
+
+    let snap = writer.snapshot();
+    let cities = lower(&parse("MATCH (c:City) RETURN c.owner AS o ORDER BY o").unwrap()).unwrap();
+    let rows = execute(&cities, &snap, &Params::new()).await.unwrap();
+    let owners: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| match r.get("o") {
+            Some(RuntimeValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(owners, vec!["a", "b"], "one City per Person, correlated");
 }

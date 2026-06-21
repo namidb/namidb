@@ -47,8 +47,9 @@ the release notes.
   Subquery bodies expose only their RETURN columns to the outer scope; a body
   without a RETURN leaks nothing. A `UNION` / `UNION ALL` inside the block is
   supported for the uncorrelated form (`CALL { MATCH … RETURN x UNION MATCH …
-  RETURN x }`). (Writes inside a *correlated* subquery, and UNION in a correlated
-  subquery, are not supported yet.)
+  RETURN x }`). A correlated subquery body may also write — `MATCH (a) CALL { WITH
+  a CREATE (a)-[:R]->(:X) }` runs the write once per outer row. (UNION in a
+  correlated subquery is still unsupported.)
 - `EXISTS { MATCH … [WHERE …] }` — the Neo4j 5 existential subquery form, in
   addition to the existing `EXISTS(pattern)` function. Correlated on outer
   bindings, supports an inner `WHERE` (and nested `EXISTS`), and `NOT EXISTS {…}`.
@@ -57,9 +58,10 @@ the release notes.
   (CREATE / SET / MERGE / REMOVE / DELETE, and nested FOREACH) once per list
   element. It is a pass-through over its input rows (a clause after FOREACH keeps
   the same cardinality), so it covers both the bulk-write idiom
-  `FOREACH (x IN $rows | CREATE …)` and per-matched-row updates. Each iteration
-  reads the pre-loop row snapshot. The body is restricted to updating clauses
-  (a read clause inside FOREACH is rejected at planning).
+  `FOREACH (x IN $rows | CREATE …)` and per-matched-row updates. A read-modify-
+  write on a node bound by the outer clause accumulates across iterations
+  (`SET c.n = c.n + i`). The body is restricted to updating clauses (a read
+  clause inside FOREACH is rejected at planning).
 - `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE` (and the
   legacy `ON (n:Label) ASSERT …`) and `CREATE INDEX [name] FOR (n:Label) ON
   (n.prop)` (and legacy `ON :Label(prop)`) — schema DDL in Cypher for uniqueness

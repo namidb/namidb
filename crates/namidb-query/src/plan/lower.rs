@@ -314,14 +314,6 @@ fn lower_call_subquery(
             };
             let subplan =
                 lower_clause_seq(&cs.query.head.clauses[1..], &mut sub, Some(base), cs.span)?;
-            if subplan.contains_write() {
-                return Err(LowerError::new(
-                    LowerErrorKind::UnsupportedFeature,
-                    "writes inside a correlated CALL subquery are not yet supported; \
-                     use an uncorrelated CALL subquery for writes",
-                    cs.span,
-                ));
-            }
             let produced = subquery_produced(&cs.query.head, &subplan);
             return Ok((subplan, produced, true));
         }

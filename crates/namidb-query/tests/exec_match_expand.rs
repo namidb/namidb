@@ -1628,14 +1628,13 @@ async fn call_subquery_without_return_exposes_no_bindings() {
 }
 
 #[tokio::test]
-async fn call_subquery_correlated_writes_are_rejected() {
-    // Writes inside a correlated CALL subquery are rejected at planning rather
-    // than failing with an opaque runtime error.
+async fn call_subquery_correlated_writes_lower_ok() {
+    // Writes inside a correlated CALL subquery now lower (executed in exec_writes).
     let q =
         parse("MATCH (a:Person) CALL { WITH a CREATE (c:City {of: a.name}) } RETURN a").unwrap();
     assert!(
-        lower(&q).is_err(),
-        "writes in a correlated CALL subquery must be rejected"
+        lower(&q).is_ok(),
+        "writes in a correlated CALL subquery should lower"
     );
 }
 

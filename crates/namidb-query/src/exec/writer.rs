@@ -231,15 +231,33 @@ fn execute_write_inner<'a>(
                             )));
                         }
                     };
-                    for item in items {
-                        let mut seed = row.clone();
-                        seed.set(variable.clone(), item);
-                        exec_foreach_body(body, writer, params, outcome, &seed).await?;
-                    }
+                    foreach_iterations(variable, items, body, row, writer, params, outcome).await?;
                 }
                 // FOREACH is side-effect only: the input rows pass through
                 // unchanged so any following clause keeps the same cardinality.
                 Ok(rows)
+            }
+
+            // Correlated CALL subquery whose body writes: for each outer row,
+            // run the subplan's write chain seeded with that row (its Argument
+            // leaf carries the imports), then emit the outer row combined with
+            // each subplan row. A read-only Apply falls through to the read
+            // delegation below.
+            LogicalPlan::Apply { input, subplan } if subplan.contains_write() => {
+                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    crate::exec::limits::check_deadline()?;
+                    let sub_rows = exec_foreach_body(subplan, writer, params, outcome, row).await?;
+                    for s in sub_rows {
+                        let mut merged = row.clone();
+                        for (k, v) in &s.bindings {
+                            merged.set(k.clone(), v.clone());
+                        }
+                        out.push(merged);
+                    }
+                }
+                Ok(out)
             }
 
             // ─── Read operators that may wrap a write child: handle
@@ -622,11 +640,7 @@ fn exec_foreach_body<'a>(
                             )));
                         }
                     };
-                    for item in items {
-                        let mut inner = row.clone();
-                        inner.set(variable.clone(), item);
-                        exec_foreach_body(body, writer, params, outcome, &inner).await?;
-                    }
+                    foreach_iterations(variable, items, body, row, writer, params, outcome).await?;
                 }
                 Ok(rows)
             }
@@ -637,6 +651,38 @@ fn exec_foreach_body<'a>(
         }
     }
     .boxed()
+}
+
+/// Run a FOREACH's body once per list element. Read-modify-write mutations to
+/// bindings that existed on the incoming `row` are carried across iterations
+/// (so `SET c.n = c.n + i` accumulates), but bindings introduced by the body
+/// (e.g. a CREATE alias) and the loop variable are not, so they cannot corrupt
+/// the next iteration's seed.
+async fn foreach_iterations(
+    variable: &str,
+    items: Vec<RuntimeValue>,
+    body: &LogicalPlan,
+    row: &Row,
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<(), ExecError> {
+    let original_keys: Vec<String> = row.bindings.keys().cloned().collect();
+    let mut carry = row.clone();
+    for item in items {
+        crate::exec::limits::check_deadline()?;
+        let mut seed = carry.clone();
+        seed.set(variable.to_string(), item);
+        let out = exec_foreach_body(body, writer, params, outcome, &seed).await?;
+        if let Some(last) = out.into_iter().next_back() {
+            for k in &original_keys {
+                if let Some(v) = last.get(k) {
+                    carry.set(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ──────────────────────────── CREATE ─────────────────────────────────
