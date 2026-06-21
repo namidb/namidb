@@ -13,6 +13,10 @@ the release notes.
 
 ### Added
 
+- `EXISTS { MATCH … [WHERE …] }` — the Neo4j 5 existential subquery form, in
+  addition to the existing `EXISTS(pattern)` function. Correlated on outer
+  bindings, supports an inner `WHERE` (and nested `EXISTS`), and `NOT EXISTS {…}`.
+  Lowers to the same SemiApply operator, so it runs on both executor paths.
 - `FOREACH (x IN list | <update clauses>)` — run side-effecting updates
   (CREATE / SET / MERGE / REMOVE / DELETE, and nested FOREACH) once per list
   element. It is a pass-through over its input rows (a clause after FOREACH keeps

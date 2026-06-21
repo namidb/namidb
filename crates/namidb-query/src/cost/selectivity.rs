@@ -134,7 +134,7 @@ fn sel_inner(expr: &Expression, bindings: &BindingStats<'_>) -> f64 {
         ExpressionKind::Literal(Literal::Boolean(true)) => 1.0,
         ExpressionKind::Literal(Literal::Boolean(false)) => 0.0,
         ExpressionKind::Literal(Literal::Null) => 0.0,
-        ExpressionKind::Exists(_) => FALLBACK_UNKNOWN,
+        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => FALLBACK_UNKNOWN,
 
         // ─── synthetic engine functions ────────────────────────────────
         ExpressionKind::FunctionCall { name, args, .. }

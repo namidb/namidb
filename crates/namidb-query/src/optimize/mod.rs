@@ -181,6 +181,14 @@ fn visit_expression(expr: &Expression, out: &mut BTreeSet<String>) {
             }
         }
         ExpressionKind::Exists(pe) => visit_pattern_element(pe, out),
+        ExpressionKind::ExistsSubquery(mc) => {
+            for part in &mc.patterns {
+                visit_pattern_element(&part.element, out);
+            }
+            if let Some(w) = &mc.where_ {
+                visit_expression(w, out);
+            }
+        }
         ExpressionKind::List(xs) => {
             for x in xs {
                 visit_expression(x, out);

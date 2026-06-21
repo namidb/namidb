@@ -4415,6 +4415,7 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
         // Closed pattern forms — the binding reads they perform live
         // inside their own sub-plan, not in the host expression.
         ExpressionKind::Exists(_)
+        | ExpressionKind::ExistsSubquery(_)
         | ExpressionKind::ListComprehension(_)
         | ExpressionKind::PatternComprehension(_)
         | ExpressionKind::Quantifier(_)

@@ -644,6 +644,11 @@ pub enum ExpressionKind {
         otherwise: Option<Box<Expression>>,
     },
     Exists(Box<PatternElement>),
+    /// `EXISTS { MATCH <patterns> [WHERE <pred>] }` (Neo4j 5 subquery form).
+    /// A boolean: true when the (optionally outer-correlated) inner MATCH
+    /// produces at least one row. The single [`MatchClause`] covers multiple
+    /// comma-separated patterns and an inner `WHERE`.
+    ExistsSubquery(Box<MatchClause>),
     List(Vec<Expression>),
     Map(MapLiteral),
     ListComprehension(Box<ListComprehension>),

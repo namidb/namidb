@@ -499,6 +499,7 @@ impl fmt::Display for Expression {
                 f.write_str(" END")
             }
             ExpressionKind::Exists(p) => write!(f, "exists({})", p),
+            ExpressionKind::ExistsSubquery(mc) => write!(f, "EXISTS {{ {mc} }}"),
             ExpressionKind::List(items) => {
                 f.write_str("[")?;
                 write_list(f, items, ", ")?;

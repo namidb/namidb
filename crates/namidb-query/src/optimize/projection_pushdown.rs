@@ -424,6 +424,14 @@ fn collect_from_expr(expr: &Expression, req: &mut RequiredSet) {
             }
         }
         ExpressionKind::Exists(pe) => collect_from_pattern_element(pe, req),
+        ExpressionKind::ExistsSubquery(mc) => {
+            for part in &mc.patterns {
+                collect_from_pattern_element(&part.element, req);
+            }
+            if let Some(w) = &mc.where_ {
+                collect_from_expr(w, req);
+            }
+        }
         ExpressionKind::List(xs) => {
             for x in xs {
                 collect_from_expr(x, req);

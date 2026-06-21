@@ -194,7 +194,7 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
  must be hoisted to a PatternList operator before evaluate()",
             span,
         )),
-        ExpressionKind::Exists(_) => Err(EvalError::new(
+        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => Err(EvalError::new(
             "EXISTS pattern predicates require storage access — \
  must be hoisted to a SemiApply operator before evaluate()",
             span,

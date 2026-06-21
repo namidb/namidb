@@ -1901,6 +1901,9 @@ impl<'src> Parser<'src> {
                 if id.name.eq_ignore_ascii_case("exists") && self.check(&Token::LParen) {
                     return self.parse_exists_call(id);
                 }
+                if id.name.eq_ignore_ascii_case("exists") && self.check(&Token::LBrace) {
+                    return self.parse_exists_subquery(id);
+                }
                 self.parse_after_identifier(id)
             }
             Some(other) => Err(ParseError::new(
@@ -2168,6 +2171,42 @@ impl<'src> Parser<'src> {
         Ok(Expression {
             kind: ExpressionKind::Exists(Box::new(element)),
             span,
+        })
+    }
+
+    /// `EXISTS { MATCH <patterns> [WHERE <pred>] }` or the bare-pattern form
+    /// `EXISTS { (a)-[:R]->(b) [WHERE <pred>] }`. Captured as a single
+    /// [`MatchClause`] (multiple comma-separated patterns + an inner WHERE).
+    fn parse_exists_subquery(&mut self, exists_id: Identifier) -> Result<Expression, ParseError> {
+        self.expect(&Token::LBrace)?;
+        let mc = if self.check(&Token::Match) {
+            self.parse_match_clause(false)?
+        } else {
+            let mstart = self.peek_span().start;
+            let mut patterns = vec![self.parse_pattern_part()?];
+            while self.eat(&Token::Comma).is_some() {
+                patterns.push(self.parse_pattern_part()?);
+            }
+            let where_ = if self.eat(&Token::Where).is_some() {
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            let mend = where_
+                .as_ref()
+                .map(|e| e.span.end)
+                .unwrap_or_else(|| patterns.last().map(|p| p.span.end).unwrap_or(mstart));
+            MatchClause {
+                optional: false,
+                patterns,
+                where_,
+                span: SourceSpan::new(mstart, mend),
+            }
+        };
+        let rbrace = self.expect(&Token::RBrace)?;
+        Ok(Expression {
+            kind: ExpressionKind::ExistsSubquery(Box::new(mc)),
+            span: SourceSpan::new(exists_id.span.start, rbrace.span.end),
         })
     }
 }

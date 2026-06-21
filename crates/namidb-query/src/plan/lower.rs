@@ -359,8 +359,11 @@ fn attach_where(
     let mut residuals: Vec<Expression> = Vec::new();
     for term in collect_and_terms(pred) {
         match classify_exists_term(&term) {
-            Some((pattern, negated)) => {
-                let subplan = lower_exists_subplan(&pattern, ctx)?;
+            Some((source, negated)) => {
+                let subplan = match source {
+                    ExistsSource::Pattern(pattern) => lower_exists_subplan(&pattern, ctx)?,
+                    ExistsSource::Subquery(mc) => lower_exists_subquery_block(&mc, ctx)?,
+                };
                 plan = LogicalPlan::SemiApply {
                     input: Box::new(plan),
                     subplan: Box::new(subplan),
@@ -394,14 +397,23 @@ fn collect_and_terms(expr: &Expression) -> Vec<Expression> {
     }
 }
 
-fn classify_exists_term(term: &Expression) -> Option<(PatternElement, bool)> {
+/// The body of an EXISTS-family WHERE term: either a single inline pattern
+/// (`EXISTS(p)`) or a subquery block (`EXISTS { MATCH … }`).
+enum ExistsSource {
+    Pattern(PatternElement),
+    Subquery(Box<MatchClause>),
+}
+
+fn classify_exists_term(term: &Expression) -> Option<(ExistsSource, bool)> {
     match &term.kind {
-        ExpressionKind::Exists(p) => Some((p.as_ref().clone(), false)),
+        ExpressionKind::Exists(p) => Some((ExistsSource::Pattern(p.as_ref().clone()), false)),
+        ExpressionKind::ExistsSubquery(mc) => Some((ExistsSource::Subquery(mc.clone()), false)),
         ExpressionKind::Unary {
             op: UnaryOp::Not,
             expr,
         } => match &expr.kind {
-            ExpressionKind::Exists(p) => Some((p.as_ref().clone(), true)),
+            ExpressionKind::Exists(p) => Some((ExistsSource::Pattern(p.as_ref().clone()), true)),
+            ExpressionKind::ExistsSubquery(mc) => Some((ExistsSource::Subquery(mc.clone()), true)),
             _ => None,
         },
         _ => None,
@@ -434,6 +446,19 @@ fn lower_exists_subplan(
     let mut sub = LowerCtx::new();
     sub.bindings = outer_ctx.bindings.clone();
     lower_pattern_element(elem, None, false, ShortestMode::None, &mut sub)
+}
+
+/// Lower an `EXISTS { MATCH … }` subquery block. Outer bindings are seeded so
+/// back-references resolve (correlated via the SemiApply outer row); bindings
+/// introduced inside the block stay local. The block's own `WHERE` is lowered
+/// by `lower_match`, so a nested EXISTS inside it hoists recursively.
+fn lower_exists_subquery_block(
+    mc: &MatchClause,
+    outer_ctx: &LowerCtx,
+) -> Result<LogicalPlan, LowerError> {
+    let mut sub = LowerCtx::new();
+    sub.bindings = outer_ctx.bindings.clone();
+    lower_match(mc, None, &mut sub)
 }
 
 /// Lower the subplan of a pattern comprehension. Like `lower_exists_subplan`
@@ -589,6 +614,7 @@ fn reject_nested_pattern_comprehension(expr: &Expression) -> Result<(), LowerErr
             reject_nested_pattern_comprehension(&q.predicate)
         }
         ExpressionKind::Exists(_)
+        | ExpressionKind::ExistsSubquery(_)
         | ExpressionKind::Star
         | ExpressionKind::Variable(_)
         | ExpressionKind::Parameter(_)
@@ -2160,7 +2186,7 @@ fn check_expression_bindings(expr: &Expression, ctx: &LowerCtx) -> Result<(), Lo
             }
             Ok(())
         }
-        ExpressionKind::Exists(_) => {
+        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => {
             // Pattern predicates are validated semantically (they
             // need their own scope visit). For now we accept them blind.
             Ok(())

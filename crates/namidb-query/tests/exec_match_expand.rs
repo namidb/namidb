@@ -393,6 +393,87 @@ async fn not_exists_predicate_excludes_matching_rows() {
 }
 
 #[tokio::test]
+async fn exists_subquery_block_filters_via_semiapply() {
+    let mut writer = WriterSession::open(store(), paths("exec-exists-sq"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Block form, correlated on `a`: everyone has an out-KNOWS → all 5.
+    let q = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH (a)-[:KNOWS]->(b:Person) } \
+         RETURN a.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob", "Carol", "Dave", "Eve"]);
+}
+
+#[tokio::test]
+async fn exists_subquery_block_with_inner_where_is_correlated() {
+    let mut writer = WriterSession::open(store(), paths("exec-exists-sq-where"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Only Eve -> Alice in the fixture, so the inner WHERE narrows to Eve.
+    let q = parse(
+        "MATCH (a:Person) \
+         WHERE EXISTS { MATCH (a)-[:KNOWS]->(b:Person) WHERE b.name = 'Alice' } \
+         RETURN a.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Eve"]);
+}
+
+#[tokio::test]
+async fn not_exists_subquery_block_excludes_matches() {
+    let mut writer = WriterSession::open(store(), paths("exec-not-exists-sq"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Complement of the previous test: everyone except Eve.
+    let q = parse(
+        "MATCH (a:Person) \
+         WHERE NOT EXISTS { MATCH (a)-[:KNOWS]->(b:Person) WHERE b.name = 'Alice' } \
+         RETURN a.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {:?}", other),
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob", "Carol", "Dave"]);
+}
+
+#[tokio::test]
 async fn exists_combined_with_scalar_predicate() {
     let mut writer = WriterSession::open(store(), paths("exec-exists-and"))
         .await
