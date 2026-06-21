@@ -5,11 +5,50 @@ All notable changes to NamiDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project loosely follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-While the engine is pre-1.0, breaking changes can land in minor
-versions. They will always be called out in the **Breaking** section
-below and in the release notes.
+As of 1.0.0 the public API is stable: breaking changes bump the major
+version and are always called out in the **Breaking** section below and in
+the release notes.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-06-20: first stable release
+
+First stable release. The on-disk format, the Cypher surface, the HTTP/Bolt
+servers, and the embedded Python/Rust APIs are now covered by semantic
+versioning.
+
+### Added
+
+- Graph algorithms expanded from 2 to 7 procedures, exposed identically
+  through Cypher `CALL algo.*` and the MCP `graph_algorithm` tool:
+  - `algo.degree` — in/out/total degree centrality.
+  - `algo.scc` — strongly connected components (iterative Tarjan, no
+    recursion limit on deep graphs).
+  - `algo.triangle_count` — triangles per node plus the local clustering
+    coefficient.
+  - `algo.label_propagation` — community detection (asynchronous,
+    deterministic label propagation).
+  - `algo.shortest_path` — single-source shortest paths, BFS (hop count) by
+    default or Dijkstra over non-negative `weight`s with `{weighted: true}`.
+  Every kernel has a cancellable variant that honours the query deadline, so
+  a heavy `CALL` on a large graph stays interruptible. Output rows and the
+  MCP ranking/grouping use deterministic tie-breaks.
+
+### Changed
+
+- The project is now developed and released by NamiDB, Inc.
+
+## [0.18.1] - 2026-06-20: ownership and durability
+
+### Fixed
+
+- s3b versioned-pointer forward probe is now fail-closed when its scan window
+  is exhausted (a stale pointer is never served), and `bootstrap()` recovers a
+  half-written namespace instead of wedging.
+
+### Changed
+
+- Ownership and licensing updated to NamiDB, Inc.
 
 ## [0.18.0] - 2026-06-15: Cypher write ergonomics and bulk-load
 
