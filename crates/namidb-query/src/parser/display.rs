@@ -61,6 +61,7 @@ impl fmt::Display for Clause {
             Clause::CreateFulltextIndex(c) => fmt::Display::fmt(c, f),
             Clause::CreateConstraint(c) => fmt::Display::fmt(c, f),
             Clause::CreateIndex(c) => fmt::Display::fmt(c, f),
+            Clause::Foreach(c) => fmt::Display::fmt(c, f),
             Clause::Call(c) => fmt::Display::fmt(c, f),
         }
     }
@@ -191,6 +192,19 @@ impl fmt::Display for CreateIndexClause {
             write!(f, "{n} ")?;
         }
         write!(f, "FOR (n:{}) ON (n.{})", self.label, self.property)
+    }
+}
+
+impl fmt::Display for ForeachClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FOREACH ({} IN {} | ", self.variable, self.list)?;
+        for (i, c) in self.body.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{c}")?;
+        }
+        f.write_str(")")
     }
 }
 

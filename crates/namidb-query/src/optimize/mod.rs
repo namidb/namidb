@@ -391,7 +391,10 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         }
         LogicalPlan::Set { input, .. }
         | LogicalPlan::Remove { input, .. }
-        | LogicalPlan::Delete { input, .. } => collect_produced(input, out),
+        | LogicalPlan::Delete { input, .. }
+        // FOREACH is a pass-through: it produces exactly its input's bindings
+        // (the loop variable is scoped to the body, not the outer row).
+        | LogicalPlan::Foreach { input, .. } => collect_produced(input, out),
         LogicalPlan::MultiwayJoin { vars, .. } => {
             for v in vars {
                 out.insert(v.alias.clone());

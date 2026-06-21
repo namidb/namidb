@@ -259,6 +259,17 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             input: Box::new(rewrite(*input, catalog)),
             elements,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(rewrite(*input, catalog)),
+            variable,
+            list,
+            body,
+        },
         LogicalPlan::Merge {
             input,
             pattern,

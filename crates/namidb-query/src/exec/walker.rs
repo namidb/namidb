@@ -267,7 +267,8 @@ pub(crate) fn execute_inner_with_routing<'a>(
             | LogicalPlan::Merge { .. }
             | LogicalPlan::Set { .. }
             | LogicalPlan::Remove { .. }
-            | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::Foreach { .. } => Err(ExecError::Runtime(
                 "write operators require execute_write(plan, &mut WriterSession, params)"
                     .to_string(),
             )),
@@ -3465,7 +3466,8 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
             | LogicalPlan::Merge { .. }
             | LogicalPlan::Set { .. }
             | LogicalPlan::Remove { .. }
-            | LogicalPlan::Delete { .. } => Err(ExecError::Runtime(
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::Foreach { .. } => Err(ExecError::Runtime(
                 "write operators require execute_write(plan, &mut WriterSession, params)"
                     .to_string(),
             )),
@@ -4537,6 +4539,11 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
             }
         }
         LogicalPlan::Unwind { list, .. } => {
+            collect_referenced_variables(list, out);
+        }
+        LogicalPlan::Foreach { list, .. } => {
+            // The body (a child) is walked by the generic children() recursion
+            // below; here we only add the list's outer references.
             collect_referenced_variables(list, out);
         }
         LogicalPlan::HashJoin { on, residual, .. } => {

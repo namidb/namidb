@@ -610,6 +610,19 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
+        // FOREACH is a side-effecting pass-through: it emits exactly its input
+        // rows, so its cardinality and bindings are the input's.
+        LogicalPlan::Foreach { input, .. } => {
+            let child = estimate_inner(input, catalog);
+            let rows = child.rows;
+            let bindings = child.bindings.clone();
+            Cardinality {
+                rows,
+                bindings,
+                children: vec![child],
+                operator: plan.operator_name(),
+            }
+        }
         LogicalPlan::MultiwayJoin { vars, edges, .. } => {
             let rows = agm_bound_rows(vars, edges, catalog);
             let mut bindings = BTreeMap::new();

@@ -440,6 +440,25 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
                 pending,
             )
         }
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => {
+            // Push pending filters down through the input; keep the write body
+            // untouched. Filters stay above FOREACH (it is a pass-through).
+            let new_input = pushdown_at(*input, Vec::new());
+            apply_filters(
+                LogicalPlan::Foreach {
+                    input: Box::new(new_input),
+                    variable,
+                    list,
+                    body,
+                },
+                pending,
+            )
+        }
         LogicalPlan::Merge {
             input,
             pattern,

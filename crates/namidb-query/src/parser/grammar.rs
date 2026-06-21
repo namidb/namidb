@@ -378,6 +378,9 @@ impl<'src> Parser<'src> {
             }
             // `CALL` is a soft keyword (a non-reserved `Ident`), so it must be
             // matched before the fall-through "expected a clause keyword" arm.
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FOREACH") => {
+                self.parse_foreach_clause().map(Clause::Foreach)
+            }
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CALL") => {
                 self.parse_call_clause().map(Clause::Call)
             }
@@ -870,6 +873,44 @@ impl<'src> Parser<'src> {
     /// `CALL <namespace>.<name>([args]) [YIELD <item>, …]` (RFC-008 PR1).
     /// `CALL`/`YIELD` are soft keywords (non-reserved `Ident`s). A leading
     /// source clause; the lowerer turns it into a `LogicalPlan::CallProcedure`.
+    /// `FOREACH (<var> IN <list> | <clause>…)`. The inner clauses are parsed
+    /// with the same `parse_clause` recursion (so nested FOREACH works); the
+    /// lowerer rejects any inner clause that is not an updating clause.
+    fn parse_foreach_clause(&mut self) -> Result<ForeachClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("FOREACH")?;
+        self.expect(&Token::LParen)?;
+        let variable = self.expect_identifier()?;
+        self.expect(&Token::In)?;
+        let list = self.parse_expression()?;
+        self.expect(&Token::Pipe)?;
+        let mut body = Vec::new();
+        while !self.check(&Token::RParen) {
+            if self.peek().is_none() {
+                return Err(ParseError::new(
+                    ErrorCode::UnexpectedEof,
+                    "unterminated FOREACH: expected `)`",
+                    self.peek_span(),
+                ));
+            }
+            body.push(self.parse_clause()?);
+        }
+        let end = self.expect(&Token::RParen)?.span.end;
+        if body.is_empty() {
+            return Err(ParseError::new(
+                ErrorCode::UnexpectedToken,
+                "FOREACH body must contain at least one update clause",
+                SourceSpan::new(start, end),
+            ));
+        }
+        Ok(ForeachClause {
+            variable,
+            list,
+            body,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
     fn parse_call_clause(&mut self) -> Result<CallClause, ParseError> {
         let start = self.peek_span().start;
         self.expect_soft_keyword("CALL")?;

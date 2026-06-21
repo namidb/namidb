@@ -333,6 +333,19 @@ pub enum LogicalPlan {
         detach: bool,
     },
 
+    /// `FOREACH (x IN list | <update clauses>)` — for each element of `list`
+    /// (re-evaluated per input row), bind `x` and run the side-effecting `body`
+    /// (CREATE / SET / MERGE / REMOVE / DELETE / nested FOREACH). Pass-through:
+    /// the `input` rows flow out unchanged, so a clause after FOREACH sees the
+    /// same cardinality; `body` produces no rows of its own. `body` bottoms out
+    /// in an `Empty`/`Argument` leaf the executor seeds with the per-element row.
+    Foreach {
+        input: Box<LogicalPlan>,
+        variable: String,
+        list: Expression,
+        body: Box<LogicalPlan>,
+    },
+
     /// Worst-case optimal multiway join (RFC-024). Emitted by the
     /// `multiway_join` optimiser pass when it detects a cyclic
     /// constraint graph in a subtree of `Expand` / `HashJoin`
@@ -497,6 +510,7 @@ impl LogicalPlan {
             | LogicalPlan::Set { input, .. }
             | LogicalPlan::Remove { input, .. }
             | LogicalPlan::Delete { input, .. } => vec![input.as_ref()],
+            LogicalPlan::Foreach { input, body, .. } => vec![input.as_ref(), body.as_ref()],
         }
     }
 
@@ -512,6 +526,7 @@ impl LogicalPlan {
                 | LogicalPlan::Set { .. }
                 | LogicalPlan::Remove { .. }
                 | LogicalPlan::Delete { .. }
+                | LogicalPlan::Foreach { .. }
         ) || self.children().iter().any(|c| c.contains_write())
     }
 
@@ -547,6 +562,7 @@ impl LogicalPlan {
                 }
             }
             LogicalPlan::Unwind { .. } => "Unwind",
+            LogicalPlan::Foreach { .. } => "Foreach",
             LogicalPlan::Empty => "Empty",
             LogicalPlan::CrossProduct { .. } => "CrossProduct",
             LogicalPlan::HashJoin { .. } => "HashJoin",

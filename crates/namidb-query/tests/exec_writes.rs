@@ -1466,3 +1466,95 @@ async fn expand_above_write_sees_staged_edge_in_one_statement() {
     .unwrap();
     assert_eq!(rows.len(), 1, "the edge must persist after commit");
 }
+
+#[tokio::test]
+async fn foreach_creates_a_node_per_list_element() {
+    // FOREACH over a list literal: one CREATE per element.
+    let mut writer = WriterSession::open(store(), paths("w-foreach"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "FOREACH (x IN [10, 20, 30] | CREATE (:Item {v: x}))",
+    )
+    .await;
+
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n:Item) RETURN n.v AS v ORDER BY v").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    let vs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("v") {
+            Some(RuntimeValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vs, vec![10, 20, 30], "one Item per list element");
+}
+
+#[tokio::test]
+async fn foreach_runs_per_matched_row_and_preserves_cardinality() {
+    // For each matched Person, FOREACH creates one Tag per list element; the
+    // RETURN after FOREACH still sees one row per Person (pass-through).
+    let mut writer = WriterSession::open(store(), paths("w-foreach-card"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {name: 'a'})").await;
+    write_q(&mut writer, "CREATE (:Person {name: 'b'})").await;
+
+    let plan = optimize(
+        lower(
+            &parse(
+                "MATCH (p:Person) \
+                 FOREACH (t IN [1, 2] | CREATE (:Tag {owner: p.name, t: t})) \
+                 RETURN p.name AS name ORDER BY name",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        &StatsCatalog::empty(),
+    );
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    // FOREACH passes the 2 Person rows through unchanged.
+    assert_eq!(outcome.rows.len(), 2, "one row per matched Person");
+
+    // 2 Persons × 2 list elements = 4 Tag nodes.
+    let snap = writer.snapshot();
+    let count = lower(&parse("MATCH (n:Tag) RETURN n").unwrap()).unwrap();
+    let tags = execute(&count, &snap, &Params::new()).await.unwrap();
+    assert_eq!(tags.len(), 4, "one Tag per (Person × element)");
+}
+
+#[tokio::test]
+async fn foreach_with_set_runs_per_element() {
+    // FOREACH can SET a property on a node bound by the outer MATCH, once per
+    // element. Each iteration reads the pre-loop row snapshot (a read-modify-
+    // write is not accumulated across iterations), so the last assignment wins:
+    // `SET c.n = i` over [1,2,3] leaves n = 3.
+    let mut writer = WriterSession::open(store(), paths("w-foreach-set"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Counter {name: 'c', n: 0})").await;
+    write_q(
+        &mut writer,
+        "MATCH (c:Counter {name: 'c'}) FOREACH (i IN [1, 2, 3] | SET c.n = i)",
+    )
+    .await;
+
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (c:Counter) RETURN c.n AS n").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert!(matches!(rows[0].get("n"), Some(RuntimeValue::Integer(3))));
+}
+
+#[tokio::test]
+async fn foreach_body_rejects_non_update_clause() {
+    // A read clause (RETURN) inside a FOREACH body is rejected at lowering.
+    let parsed = parse("FOREACH (x IN [1] | RETURN x)").unwrap();
+    assert!(
+        lower(&parsed).is_err(),
+        "FOREACH body may only contain update clauses"
+    );
+}

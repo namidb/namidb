@@ -215,6 +215,17 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             input: Box::new(recurse(*input, catalog)),
             elements,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(recurse(*input, catalog)),
+            variable,
+            list,
+            body,
+        },
         LogicalPlan::Merge {
             input,
             pattern,

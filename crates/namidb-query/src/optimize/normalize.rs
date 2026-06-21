@@ -181,6 +181,17 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(normalize_filters(*input)),
             elements,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(normalize_filters(*input)),
+            variable,
+            list,
+            body,
+        },
         LogicalPlan::Merge {
             input,
             pattern,

@@ -15,10 +15,10 @@ use super::logical::{
     ShortestMode,
 };
 use crate::parser::{
-    self as ast, BinaryOp, Clause, Expression, ExpressionKind, Literal, MatchClause, NodePattern,
-    PatternElement, PatternPart, PatternProperties, ProjectionItem as AstProjectionItem,
-    QualifiedName, Query, RelationshipPattern, ReturnClause, SingleQuery, SourceSpan, UnaryOp,
-    UnwindClause, WithClause,
+    self as ast, BinaryOp, Clause, Expression, ExpressionKind, ForeachClause, Literal, MatchClause,
+    NodePattern, PatternElement, PatternPart, PatternProperties,
+    ProjectionItem as AstProjectionItem, QualifiedName, Query, RelationshipPattern, ReturnClause,
+    SingleQuery, SourceSpan, UnaryOp, UnwindClause, WithClause,
 };
 
 /// Error returned by [`lower`].
@@ -133,6 +133,12 @@ fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
             Clause::Delete(d) => {
                 let base = require_input(plan.take(), clause.span())?;
                 plan = Some(lower_delete(d, base, &mut ctx)?);
+            }
+            Clause::Foreach(fe) => {
+                // Standalone FOREACH (no preceding clause) drives off one empty
+                // row, like a bare CREATE.
+                let base = plan.take().unwrap_or(LogicalPlan::Empty);
+                plan = Some(lower_foreach(fe, base, &mut ctx)?);
             }
             // `CREATE VECTOR INDEX` is schema DDL, not a query operator: the
             // server intercepts a standalone one before lowering (see
@@ -1728,6 +1734,64 @@ fn single_arg<'a>(
 }
 
 // ─────────────────────────── UNWIND ──────────────────────────────────
+
+/// Lower a `FOREACH (x IN list | body)`. The body's leaf is an `Argument`
+/// carrying the outer bindings plus the loop variable; the executor seeds it
+/// with each per-element row. The loop variable is scoped to the body only.
+fn lower_foreach(
+    fe: &ForeachClause,
+    input: LogicalPlan,
+    ctx: &mut LowerCtx,
+) -> Result<LogicalPlan, LowerError> {
+    // The list is evaluated in the outer scope.
+    check_expression_bindings(&fe.list, ctx)?;
+
+    let mut body_bindings: Vec<String> = ctx.bindings.iter().cloned().collect();
+    body_bindings.push(fe.variable.name.clone());
+
+    // Introduce the loop variable for the body's binding checks, remembering
+    // whether it was newly added so we can scope it back out afterwards.
+    let newly_introduced = ctx.bindings.insert(fe.variable.name.clone());
+
+    let mut body: LogicalPlan = LogicalPlan::Argument {
+        bindings: body_bindings,
+    };
+    for clause in &fe.body {
+        body = lower_update_clause(clause, body, ctx)?;
+    }
+
+    if newly_introduced {
+        ctx.bindings.remove(&fe.variable.name);
+    }
+
+    Ok(LogicalPlan::Foreach {
+        input: Box::new(input),
+        variable: fe.variable.name.clone(),
+        list: fe.list.clone(),
+        body: Box::new(body),
+    })
+}
+
+/// Lower one clause inside a FOREACH body. Only updating clauses are allowed.
+fn lower_update_clause(
+    clause: &Clause,
+    base: LogicalPlan,
+    ctx: &mut LowerCtx,
+) -> Result<LogicalPlan, LowerError> {
+    match clause {
+        Clause::Create(c) => lower_create(c, base, ctx),
+        Clause::Merge(m) => lower_merge(m, base, ctx),
+        Clause::Set(s) => lower_set(s, base, ctx),
+        Clause::Remove(r) => lower_remove(r, base, ctx),
+        Clause::Delete(d) => lower_delete(d, base, ctx),
+        Clause::Foreach(fe) => lower_foreach(fe, base, ctx),
+        other => Err(LowerError::new(
+            LowerErrorKind::UnsupportedFeature,
+            "FOREACH body may only contain CREATE, SET, MERGE, REMOVE, DELETE, or a nested FOREACH",
+            other.span(),
+        )),
+    }
+}
 
 fn lower_unwind(
     u: &UnwindClause,

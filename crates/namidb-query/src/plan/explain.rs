@@ -724,6 +724,9 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
             }
             out.push(']');
         }
+        LogicalPlan::Foreach { variable, list, .. } => {
+            let _ = write!(out, "Foreach {} IN {}", variable, list);
+        }
         LogicalPlan::MultiwayJoin {
             vars,
             edges,

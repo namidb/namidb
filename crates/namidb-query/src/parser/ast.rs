@@ -88,6 +88,9 @@ pub enum Clause {
     /// `CREATE INDEX … ON …` — schema DDL declaring a secondary (equality)
     /// index. Intercepted via [`Query::as_create_index`].
     CreateIndex(CreateIndexClause),
+    /// `FOREACH (x IN list | <update clauses>)` — run the side-effecting inner
+    /// clauses once per list element.
+    Foreach(ForeachClause),
     /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in procedure
     /// (RFC-008 PR1). A leading source clause: it introduces bindings (the
     /// YIELD columns) like `MATCH` does. Always-on (graph algorithms are
@@ -113,6 +116,7 @@ impl Clause {
             Clause::CreateFulltextIndex(c) => c.span,
             Clause::CreateConstraint(c) => c.span,
             Clause::CreateIndex(c) => c.span,
+            Clause::Foreach(c) => c.span,
             Clause::Call(c) => c.span,
         }
     }
@@ -319,6 +323,18 @@ pub struct CreateIndexClause {
     pub name: Option<Identifier>,
     pub label: Identifier,
     pub property: Identifier,
+    pub span: SourceSpan,
+}
+
+/// `FOREACH (<variable> IN <list> | <clause>…)`. The inner clauses are
+/// updating clauses (CREATE / SET / MERGE / REMOVE / DELETE / nested FOREACH);
+/// they run once per element of `list` with `variable` bound, for side effects
+/// only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ForeachClause {
+    pub variable: Identifier,
+    pub list: Expression,
+    pub body: Vec<Clause>,
     pub span: SourceSpan,
 }
 

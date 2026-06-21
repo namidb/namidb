@@ -532,6 +532,17 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(rewrite(*input)),
             elements,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(rewrite(*input)),
+            variable,
+            list,
+            body,
+        },
         LogicalPlan::Merge {
             input,
             pattern,

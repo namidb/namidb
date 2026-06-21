@@ -212,6 +212,36 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
 
+            LogicalPlan::Foreach {
+                input,
+                variable,
+                list,
+                body,
+            } => {
+                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                for row in &rows {
+                    crate::exec::limits::check_deadline()?;
+                    let items = match evaluate(list, row, params)? {
+                        RuntimeValue::List(items) => items,
+                        RuntimeValue::Null => continue,
+                        v => {
+                            return Err(ExecError::Runtime(format!(
+                                "FOREACH requires a list; got {}",
+                                v.type_name()
+                            )));
+                        }
+                    };
+                    for item in items {
+                        let mut seed = row.clone();
+                        seed.set(variable.clone(), item);
+                        exec_foreach_body(body, writer, params, outcome, &seed).await?;
+                    }
+                }
+                // FOREACH is side-effect only: the input rows pass through
+                // unchanged so any following clause keeps the same cardinality.
+                Ok(rows)
+            }
+
             // ─── Read operators that may wrap a write child: handle
             // row-wise here so the write semantics run on the child first.
             LogicalPlan::Project {
@@ -491,6 +521,117 @@ fn execute_write_inner<'a>(
                 let snap = writer.overlay_snapshot();
                 execute_inner(plan, &snap, params, None).await
             }
+        }
+    }
+    .boxed()
+}
+
+/// Execute a FOREACH body for one element, seeded with `seed` (the per-element
+/// row carrying the loop variable + outer bindings). The body is a chain of
+/// updating operators bottoming at an `Empty`/`Argument` leaf, which here yields
+/// `seed`. Returns the produced rows (used only to thread bindings through a
+/// multi-clause body); the caller discards them.
+fn exec_foreach_body<'a>(
+    plan: &'a LogicalPlan,
+    writer: &'a mut WriterSession,
+    params: &'a Params,
+    outcome: &'a mut WriteOutcome,
+    seed: &'a Row,
+) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
+    async move {
+        match plan {
+            // The leaf: the per-element seed row.
+            LogicalPlan::Empty | LogicalPlan::Argument { .. } => Ok(vec![seed.clone()]),
+            LogicalPlan::Create { input, elements } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    crate::exec::limits::check_deadline()?;
+                    out.push(apply_create(elements, row, writer, params, outcome).await?);
+                }
+                Ok(out)
+            }
+            LogicalPlan::Set { input, items } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(apply_sets(items, row, writer, params, outcome).await?);
+                }
+                Ok(out)
+            }
+            LogicalPlan::Remove { input, items } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(apply_removes(items, row, writer, outcome)?);
+                }
+                Ok(out)
+            }
+            LogicalPlan::Delete {
+                input,
+                targets,
+                detach,
+            } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                for row in &rows {
+                    apply_delete(targets, *detach, row, writer, params, outcome).await?;
+                }
+                Ok(rows)
+            }
+            LogicalPlan::Merge {
+                input,
+                pattern,
+                on_match_sets,
+                on_create_sets,
+            } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.extend(
+                        apply_merge(
+                            pattern,
+                            on_match_sets,
+                            on_create_sets,
+                            row,
+                            writer,
+                            params,
+                            outcome,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(out)
+            }
+            LogicalPlan::Foreach {
+                input,
+                variable,
+                list,
+                body,
+            } => {
+                let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
+                for row in &rows {
+                    let items = match evaluate(list, row, params)? {
+                        RuntimeValue::List(items) => items,
+                        RuntimeValue::Null => continue,
+                        v => {
+                            return Err(ExecError::Runtime(format!(
+                                "FOREACH requires a list; got {}",
+                                v.type_name()
+                            )));
+                        }
+                    };
+                    for item in items {
+                        let mut inner = row.clone();
+                        inner.set(variable.clone(), item);
+                        exec_foreach_body(body, writer, params, outcome, &inner).await?;
+                    }
+                }
+                Ok(rows)
+            }
+            other => Err(ExecError::Runtime(format!(
+                "operator `{}` is not allowed in a FOREACH body",
+                other.operator_name()
+            ))),
         }
     }
     .boxed()

@@ -495,6 +495,17 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             targets,
             detach,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
+            variable,
+            list,
+            body,
+        },
     }
 }
 

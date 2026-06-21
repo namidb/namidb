@@ -191,6 +191,17 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             input: Box::new(convert_cross_to_hash(*input, catalog)),
             elements,
         },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(convert_cross_to_hash(*input, catalog)),
+            variable,
+            list,
+            body,
+        },
         LogicalPlan::Merge {
             input,
             pattern,

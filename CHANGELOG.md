@@ -13,6 +13,13 @@ the release notes.
 
 ### Added
 
+- `FOREACH (x IN list | <update clauses>)` — run side-effecting updates
+  (CREATE / SET / MERGE / REMOVE / DELETE, and nested FOREACH) once per list
+  element. It is a pass-through over its input rows (a clause after FOREACH keeps
+  the same cardinality), so it covers both the bulk-write idiom
+  `FOREACH (x IN $rows | CREATE …)` and per-matched-row updates. Each iteration
+  reads the pre-loop row snapshot. The body is restricted to updating clauses
+  (a read clause inside FOREACH is rejected at planning).
 - `CREATE CONSTRAINT [name] FOR (n:Label) REQUIRE n.prop IS UNIQUE` (and the
   legacy `ON (n:Label) ASSERT …`) and `CREATE INDEX [name] FOR (n:Label) ON
   (n.prop)` (and legacy `ON :Label(prop)`) — schema DDL in Cypher for uniqueness

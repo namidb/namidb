@@ -269,6 +269,13 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
                 collect_from_expr(t, req);
             }
         }
+        LogicalPlan::Foreach {
+            input, list, body, ..
+        } => {
+            collect_from_plan(input, req);
+            collect_from_expr(list, req);
+            collect_from_plan(body, req);
+        }
     }
 }
 
@@ -714,6 +721,17 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             input: Box::new(rewrite(*input, req)),
             targets,
             detach,
+        },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(rewrite(*input, req)),
+            variable,
+            list,
+            body,
         },
     }
 }
