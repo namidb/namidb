@@ -2256,6 +2256,71 @@ impl<'mt> Snapshot<'mt> {
         Ok(all)
     }
 
+    /// (`vector-index`) `true` if an L0 `Nodes` SST that could carry rows for
+    /// `label` exists — flushed but not yet folded into a `.vg` index by
+    /// compaction. While such a delta exists the vector index cannot be trusted
+    /// to see the full corpus (the rows are neither in the `.vg` nor in the
+    /// memtable, which was cleared on flush), so the executor falls back to the
+    /// (exact) flat scan for that window.
+    ///
+    /// Node SSTs are **id-primary**: one SST spans every label, flushed with an
+    /// empty `scope` (`flush.rs`), so the test must NOT require `scope == label`
+    /// (that check is dead — it never matches an id-primary SST). An empty scope
+    /// covers `label`; a legacy per-label SST is matched by name.
+    #[cfg(feature = "vector-index")]
+    pub fn has_l0_node_delta(&self, label: &str) -> bool {
+        self.manifest.manifest.ssts.iter().any(|d| {
+            d.kind == SstKind::Nodes
+                && d.level == crate::manifest::SstLevel::L0
+                && (d.scope.is_empty() || d.scope == label)
+        })
+    }
+
+    /// (`vector-index`) Fresh node deltas (committed memtable + staged overlay)
+    /// for a `(label, property)` vector index: every node id touched since the
+    /// last compaction the `.vg` has not absorbed. `Some(vec)` is a live
+    /// embedding to merge into the KNN; `None` suppresses the id — it is
+    /// tombstoned, no longer carries `label`, or dropped its embedding — so a
+    /// stale index hit for it is excluded. Highest-LSN entry per id wins (staged
+    /// overlay LSNs outrank committed). The executor unions this with the index
+    /// result so the ANN answer stays freshness-equivalent to the flat scan
+    /// (RFC-030); a node written but not yet compacted is found immediately.
+    #[cfg(feature = "vector-index")]
+    pub fn vector_fresh_delta(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Vec<(NodeId, Option<Vec<f32>>)>> {
+        let dict = &self.manifest.manifest.label_dict;
+        // (node_id) → (winning lsn, Some(embedding) | None=suppress).
+        let mut latest: BTreeMap<NodeId, (u64, Option<Vec<f32>>)> = BTreeMap::new();
+        for (mk, entry) in self.node_entries() {
+            let MemKey::Node { id } = mk else {
+                continue;
+            };
+            let val: Option<Vec<f32>> = match &entry.op {
+                MemOp::Tombstone => None,
+                MemOp::Upsert(payload) => {
+                    let rec = NodeWriteRecord::decode(payload)?;
+                    if record_carries_label(&rec, label, dict) {
+                        embedding_as_f32(rec.properties.get(property))
+                    } else {
+                        // A memtable version that no longer carries `label`
+                        // supersedes any indexed row for this id → suppress.
+                        None
+                    }
+                }
+            };
+            match latest.get(id) {
+                Some((existing_lsn, _)) if *existing_lsn >= entry.lsn => {}
+                _ => {
+                    latest.insert(*id, (entry.lsn, val));
+                }
+            }
+        }
+        Ok(latest.into_iter().map(|(id, (_, v))| (id, v)).collect())
+    }
+
     /// (`text-index`): full BM25 top-k over the `TextIndex` SST(s) registered for
     /// `index_name`, **only when the index is authoritative for `label`**.
     ///
@@ -2292,11 +2357,16 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         // ...and there is no un-compacted node delta the index has not absorbed:
-        // any node memtable entry (committed or staged), or an L0 `Nodes` SST for
-        // this label (flushed but not yet compacted into the index).
+        // any node memtable entry (committed or staged), or an L0 `Nodes` SST
+        // (flushed but not yet compacted into the index). Node SSTs are
+        // id-primary — one SST spans every label with an empty `scope` — so the
+        // L0 test must accept an empty scope; requiring `scope == label` was dead
+        // (it never matched a real id-primary SST).
         let memtable_delta = self.node_entries().next().is_some();
         let l0_delta = self.manifest.manifest.ssts.iter().any(|d| {
-            d.kind == SstKind::Nodes && d.scope == label && d.level == crate::manifest::SstLevel::L0
+            d.kind == SstKind::Nodes
+                && d.level == crate::manifest::SstLevel::L0
+                && (d.scope.is_empty() || d.scope == label)
         });
         if memtable_delta || l0_delta {
             return Ok(None);
@@ -2580,6 +2650,21 @@ fn record_carries_label(rec: &NodeWriteRecord, label: &str, dict: &LabelDictiona
     dict.id(label)
         .map(|lid| rec.labels.contains(&lid.get()))
         .unwrap_or(false)
+}
+
+/// Decode an embedding property value to `Vec<f32>` for a vector delta scan:
+/// a stored `Vec` directly, an int8-quantized `VecI8` dequantized via
+/// `code * scale` (matching the build hook and `coerce_vector`). Any other
+/// value (or absence) yields `None` — the node has no usable embedding.
+#[cfg(feature = "vector-index")]
+fn embedding_as_f32(v: Option<&Value>) -> Option<Vec<f32>> {
+    match v {
+        Some(Value::Vec(v)) => Some(v.clone()),
+        Some(Value::VecI8 { codes, scale }) => {
+            Some(codes.iter().map(|&c| c as f32 * *scale).collect())
+        }
+        _ => None,
+    }
 }
 
 /// Resolve interned `LabelId`s to label names via `dict`. Falls back to a

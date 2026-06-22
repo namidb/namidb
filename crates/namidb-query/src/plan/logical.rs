@@ -432,6 +432,13 @@ pub enum LogicalPlan {
         distance: VectorDistance,
         /// Output column for the (lower-is-closer) distance score.
         score_alias: String,
+        /// Residual predicate captured from a `WHERE` the rewrite folded in
+        /// (a similarity threshold like `>= 0.86`, or a label/property filter):
+        /// evaluated per candidate row against `alias`/`score_alias`, so the
+        /// rewrite survives a filter instead of falling back to the flat scan.
+        /// Always references only the searched binding; `None` when there is no
+        /// filter. (RFC-030 filtered ANN.)
+        post_filter: Option<Expression>,
     },
     /// `CALL <ns>.<name>([args]) [YIELD …]` — invoke a built-in graph
     /// procedure (RFC-008 PR1). A source leaf: no input, yields one row per

@@ -20,6 +20,11 @@ so you can diff the two backends directly.
   - `generate`: write the dataset out as CSV files.
   - `run`: load (or reuse) the dataset into an in-memory NamiDB
     namespace, time each query, and print JSON.
+  - `vector-recall`: in-memory int8-quantization recall@k vs exact f32 (the gate
+    for the on-disk int8 vector format). No engine, pure arithmetic.
+  - `ann-bench` (needs `--features vector-index`): the Vamana ANN **index**
+    recall@k vs the exact flat KNN, plus index-vs-scan latency, over the real
+    engine — see [Vector / ANN benchmarks](#vector--ann-benchmarks).
 - `bench/kuzu_runner.py`: a Python harness that runs the same CSVs
   against Kuzu (via the `kuzu` PyPI package).
 
@@ -76,6 +81,35 @@ identical files (and Kuzu sees the same edges as NamiDB).
 Node ids are 32-hex-char strings (16 bytes) with a prefix byte tagging
 the label (`P=Person, O=Post, C=Comment`), so the same numeric index
 maps to distinct ids across labels.
+
+## Vector / ANN benchmarks
+
+The vector tracks are separate from the LDBC graph bench above. `ann-bench`
+needs the `vector-index` feature (it links the Vamana engine):
+
+```bash
+# Realistic clustered embeddings (true neighbours well separated):
+cargo run --release -p namidb-bench --features vector-index -- ann-bench \
+    --dim 256 --num 50000 --queries 200 --k 10 --clusters 256 --ef 64
+
+# Pessimistic floor (uniform on the sphere, no meaningful neighbours):
+cargo run --release -p namidb-bench --features vector-index -- ann-bench \
+    --dim 256 --num 50000 --queries 200 --k 10 --clusters 0
+```
+
+It builds a real namespace, registers a cosine index, writes the corpus across
+two L0 SSTs, `compact_l0`s to materialise the `.vg`, then reports JSON with
+`recall_at_k` (indexed top-k vs the exact flat top-k), `index_p50_us` /
+`flat_p50_us` / `speedup_p50`, and `cypher_index_path_reachable` (whether a plain
+KNN Cypher query is rewritten onto the index). Run under `--release`: a debug
+build inflates both the graph build and the per-query latency several-fold.
+
+`vector-recall` is the lower-level companion — int8 quantization recall vs exact
+f32, no engine — used to justify the on-disk vector format:
+
+```bash
+cargo run --release -p namidb-bench -- vector-recall --dim 1536 --num 10000 --k 10
+```
 
 ## What this bench does **not** cover yet
 

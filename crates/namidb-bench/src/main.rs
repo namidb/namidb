@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "vector-index")]
+mod ann_bench;
 mod dataset;
 mod loader;
 mod queries;
@@ -135,6 +137,42 @@ enum Cmd {
         /// renormalizing). Smaller = tighter clusters.
         #[arg(long, default_value_t = 0.35)]
         spread: f32,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// Measure the Vamana ANN **index** recall@k vs the exact flat KNN, and
+    /// index latency vs full-scan latency, over the real engine: build the `.vg`
+    /// by compaction, then run the same KNN query optimized (index) and
+    /// un-optimized (flat scan) on one snapshot. The gate for RFC-030 ANN: run
+    /// with `--clusters 64` (realistic) and `--clusters 0` (pessimistic floor)
+    /// and confirm recall@10 stays high while the index out-runs the scan.
+    #[cfg(feature = "vector-index")]
+    AnnBench {
+        /// Vector dimension (e.g. 256 local, 1536 OpenAI).
+        #[arg(long, default_value_t = 256)]
+        dim: usize,
+        /// Number of stored vectors (corpus size) to index and search.
+        #[arg(long, default_value_t = 10_000)]
+        num: usize,
+        /// Number of query vectors to average recall/latency over.
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+        /// Top-k.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        /// Number of cluster centroids. `0` = uniform random (pessimistic
+        /// floor); `>0` draws vectors/queries around centroids, like real
+        /// embeddings with meaningful neighbours.
+        #[arg(long, default_value_t = 64)]
+        clusters: usize,
+        /// Cluster tightness (Gaussian noise stddev added to a centroid before
+        /// renormalizing). Smaller = tighter clusters.
+        #[arg(long, default_value_t = 0.35)]
+        spread: f32,
+        /// Index search beam width (clamped up to at least `k`). Higher trades
+        /// latency for recall.
+        #[arg(long, default_value_t = 64)]
+        ef: usize,
         #[arg(short = 'S', long, default_value_t = 42)]
         seed: u64,
     },
@@ -386,6 +424,37 @@ async fn main() -> Result<()> {
                 report.compression_ratio,
                 report.exact_p50_us,
                 report.int8_p50_us,
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "vector-index")]
+        Cmd::AnnBench {
+            dim,
+            num,
+            queries,
+            k,
+            clusters,
+            spread,
+            ef,
+            seed,
+        } => {
+            let report = ann_bench::run(dim, num, queries, k, clusters, spread, ef, seed).await?;
+            if !report.cypher_index_path_reachable {
+                eprintln!(
+                    "NOTE: cypher_index_path_reachable=false — the optimizer did not rewrite \
+                     a plain KNN query to VectorSearch for this catalog; the figures below come \
+                     from the low-level index reader."
+                );
+            }
+            eprintln!(
+                "ann-bench dim={dim} num={num} queries={queries} k={k} clusters={clusters} ef={}: \
+                 recall@{k}={:.4}  index p50={}µs  flat p50={}µs  speedup={:.1}x  build={:.2}s",
+                report.ef,
+                report.recall_at_k,
+                report.index_p50_us,
+                report.flat_p50_us,
+                report.speedup_p50,
+                report.build_secs,
             );
             println!("{}", serde_json::to_string_pretty(&report)?);
         }

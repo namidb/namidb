@@ -309,6 +309,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 k,
                 distance,
                 score_alias,
+                post_filter,
             } => {
                 flat_vector_search(
                     snapshot,
@@ -319,6 +320,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     k,
                     *distance,
                     score_alias,
+                    post_filter.as_ref(),
                     params,
                 )
                 .await
@@ -2109,6 +2111,7 @@ async fn flat_vector_search(
     k: &RowCount,
     distance: crate::plan::logical::VectorDistance,
     score_alias: &str,
+    post_filter: Option<&Expression>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::exec::expr::vector_score;
@@ -2119,7 +2122,8 @@ async fn flat_vector_search(
     let limit = k.as_const().unwrap_or(10) as usize;
 
     // RFC-030 (`vector-index`): serve from the Vamana index when one exists for
-    // (label, property, metric). Falls through to the flat scan otherwise.
+    // (label, property, metric). Falls through to the flat scan otherwise (and
+    // also when a residual filter is too selective for the index to satisfy).
     #[cfg(feature = "vector-index")]
     {
         if let Some(rows) = try_index_search(
@@ -2131,6 +2135,9 @@ async fn flat_vector_search(
             limit,
             distance,
             score_alias,
+            post_filter,
+            query.span,
+            params,
         )
         .await?
         {
@@ -2139,14 +2146,21 @@ async fn flat_vector_search(
     }
 
     let labels = resolve_node_labels(snapshot, label);
-    let projection = vec![property.to_string()];
+    // A residual `post_filter` may reference properties beyond `property`, so
+    // materialise the whole node when one is present; otherwise project only the
+    // embedding column.
+    let projection: Option<Vec<String>> = if post_filter.is_some() {
+        None
+    } else {
+        Some(vec![property.to_string()])
+    };
 
     // (sort_key, score_value, node) — sort_key is "lower is better" (higher-is-
     // better metrics are negated), so an ascending sort yields the top-k.
     let mut scored: Vec<(f64, f64, NodeValue)> = Vec::new();
     for label_name in &labels {
         let nodes = snapshot
-            .scan_label_with_predicates_and_projection(label_name, &[], Some(&projection))
+            .scan_label_with_predicates_and_projection(label_name, &[], projection.as_deref())
             .await?;
         for n in nodes {
             crate::exec::limits::check_deadline()?;
@@ -2164,13 +2178,22 @@ async fn flat_vector_search(
     }
 
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    scored.truncate(limit);
 
-    let mut out = Vec::with_capacity(scored.len());
+    // Build rows in rank order; apply the residual filter (if any) BEFORE
+    // truncating, so the top-k is taken among the rows that pass it.
+    let mut out = Vec::with_capacity(limit);
     for (_sort_key, score, node) in scored {
+        if out.len() >= limit {
+            break;
+        }
         let mut row = Row::new();
         row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
         row.set(score_alias.to_string(), RuntimeValue::Float(score));
+        if let Some(pf) = post_filter {
+            if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                continue;
+            }
+        }
         out.push(row);
     }
     Ok(out)
@@ -2191,7 +2214,11 @@ async fn try_index_search(
     k: usize,
     distance: crate::plan::logical::VectorDistance,
     score_alias: &str,
+    post_filter: Option<&Expression>,
+    span: SourceSpan,
+    params: &Params,
 ) -> Result<Option<Vec<Row>>, ExecError> {
+    use crate::exec::expr::vector_score;
     use crate::plan::logical::VectorDistance;
     use namidb_storage::manifest::VectorMetric;
 
@@ -2203,19 +2230,34 @@ async fn try_index_search(
         VectorDistance::Dot => VectorMetric::Dot,
         VectorDistance::Euclidean => VectorMetric::Euclidean,
     };
-    // Euclidean is not yet indexable (no L2 space in namidb-ann); flat scan.
-    if metric == VectorMetric::Euclidean {
+    // Only cosine is served from the index today. Euclidean has no L2 space in
+    // namidb-ann. Dot would return an index score on a *different* scale than the
+    // flat path: the index normalises stored vectors at build, so it yields
+    // cosine, whereas the flat path scores the raw dot product — the ranking is
+    // monotone-equivalent but the value (and any threshold on it) would differ.
+    // Until that is reconciled, both fall back to the exact flat scan.
+    if metric != VectorMetric::Cosine {
         return Ok(None);
     }
-    let desc = snapshot
-        .manifest()
-        .manifest
-        .vector_indexes
-        .iter()
-        .find(|d| d.matches(label, property, metric));
-    let Some(desc) = desc else {
-        return Ok(None);
+    let index_name = {
+        let desc = snapshot
+            .manifest()
+            .manifest
+            .vector_indexes
+            .iter()
+            .find(|d| d.matches(label, property, metric));
+        match desc {
+            Some(d) => d.name.clone(),
+            None => return Ok(None),
+        }
     };
+
+    // Freshness: an L0 `Nodes` delta the `.vg` has not absorbed (flushed, not
+    // yet compacted) means the index cannot see the full corpus — fall back to
+    // the exact flat scan for that window (mirrors `text_search`).
+    if snapshot.has_l0_node_delta(label) {
+        return Ok(None);
+    }
 
     // Coerce the query to f32 for the index search.
     let qv: Vec<f32> = match q {
@@ -2226,22 +2268,82 @@ async fn try_index_search(
         _ => return Ok(None),
     };
 
-    // Beam wider than k for recall (the index reranks in full f32 precision,
-    // so a generous ef costs little and lifts recall@k).
-    let ef = k.max(64);
-    let hits = snapshot.vector_search(&desc.name, &qv, k, ef).await?;
+    // Fresh memtable/overlay delta the index has not absorbed: `Some(vec)` is a
+    // live embedding to merge in, `None` suppresses a now-stale id (tombstoned,
+    // label removed, or embedding dropped) so the merge stays equal to the flat
+    // scan (RFC-030 freshness).
+    let delta = snapshot
+        .vector_fresh_delta(label, property)
+        .map_err(ExecError::Storage)?;
+    let delta_ids: BTreeSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
 
-    let mut out = Vec::with_capacity(hits.len());
-    for (node_id, score) in hits {
-        if let Some(view) = snapshot.lookup_node(label, node_id).await? {
-            let mut row = Row::new();
-            row.set(
-                alias.to_string(),
-                RuntimeValue::Node(Box::new(NodeValue::from(view))),
-            );
-            row.set(score_alias.to_string(), RuntimeValue::Float(score as f64));
-            out.push(row);
+    // Over-fetch so superseded ids — and, when a residual filter is present, its
+    // selectivity — cannot starve the top-k. The index reranks in full f32, so a
+    // wider fetch is cheap.
+    const OVERFETCH: usize = 8;
+    let mult = if post_filter.is_some() { OVERFETCH } else { 1 };
+    let kprime = k.saturating_mul(mult).saturating_add(delta.len()).max(k);
+    let ef = kprime.max(64);
+    let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
+
+    // Merge: index hits not superseded by the delta, plus the freshly-scored
+    // delta embeddings. The metric is cosine (gated above), so the index score
+    // and the delta's `vector_score(Cosine, …)` are on the same scale. `seen`
+    // starts from the delta ids — so a superseded hit is dropped — and also
+    // dedups the index hits themselves: storage `vector_search` unions across
+    // every `.vg` SST without deduping, so a partial rebuild can return one id
+    // twice, and the wider `kprime` fetch widens that window.
+    let q_rv = RuntimeValue::Vector(qv);
+    let mut seen: BTreeSet<NodeId> = delta_ids;
+    let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta.len());
+    for (id, score) in hits {
+        if seen.insert(id) {
+            scored.push((score as f64, id));
         }
+    }
+    for (id, emb) in delta {
+        if let Some(v) = emb {
+            let emb_rv = RuntimeValue::Vector(v);
+            if let Some((s, _higher)) = vector_score(VectorDistance::Cosine, &emb_rv, &q_rv, span)?
+            {
+                scored.push((s, id));
+            }
+        }
+    }
+    // Best-first by similarity.
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+
+    // Materialise rows in rank order, applying the residual filter; take up to k
+    // survivors.
+    let mut out = Vec::with_capacity(k);
+    for (score, id) in scored {
+        if out.len() >= k {
+            break;
+        }
+        let Some(view) = snapshot.lookup_node(label, id).await? else {
+            continue;
+        };
+        let mut row = Row::new();
+        row.set(
+            alias.to_string(),
+            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+        );
+        row.set(score_alias.to_string(), RuntimeValue::Float(score));
+        if let Some(pf) = post_filter {
+            if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                continue;
+            }
+        }
+        out.push(row);
+    }
+
+    // Fewer than k survivors in the over-fetched candidate set — a selective
+    // `post_filter`, or index hits whose nodes are gone (`lookup_node` → None) —
+    // so fall back to the exact flat scan: it applies the same filter to every
+    // node and is the ground truth, never short. (A corpus genuinely smaller
+    // than k just makes the flat scan agree, at a small extra cost.)
+    if out.len() < k {
+        return Ok(None);
     }
     Ok(Some(out))
 }
@@ -2931,6 +3033,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 k,
                 distance,
                 score_alias,
+                post_filter,
             } => {
                 let rows = flat_vector_search(
                     snapshot,
@@ -2941,6 +3044,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     k,
                     *distance,
                     score_alias,
+                    post_filter.as_ref(),
                     params,
                 )
                 .await?;

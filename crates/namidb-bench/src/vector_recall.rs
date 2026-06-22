@@ -71,14 +71,14 @@ fn normalize(v: &mut [f32]) {
     }
 }
 
-fn random_unit_vector(rng: &mut ChaCha8Rng, dim: usize) -> Vec<f32> {
+pub(crate) fn random_unit_vector(rng: &mut ChaCha8Rng, dim: usize) -> Vec<f32> {
     let mut v = gaussian(rng, dim);
     normalize(&mut v);
     v
 }
 
 /// `base + spread * gaussian`, normalized — a vector near `base`'s direction.
-fn perturbed_unit_vector(rng: &mut ChaCha8Rng, base: &[f32], spread: f32) -> Vec<f32> {
+pub(crate) fn perturbed_unit_vector(rng: &mut ChaCha8Rng, base: &[f32], spread: f32) -> Vec<f32> {
     let noise = gaussian(rng, base.len());
     let mut v: Vec<f32> = base
         .iter()
@@ -117,7 +117,7 @@ fn top_k(scores: &[f32], k: usize) -> Vec<usize> {
     idx
 }
 
-fn percentile(sorted_us: &[u128], p: f64) -> u128 {
+pub(crate) fn percentile(sorted_us: &[u128], p: f64) -> u128 {
     if sorted_us.is_empty() {
         return 0;
     }

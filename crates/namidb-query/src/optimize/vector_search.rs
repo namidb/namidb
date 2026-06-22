@@ -1,33 +1,100 @@
 //! `vector_search` rewrite (RFC-030, `vector-index`): turn a flat KNN shape
 //! into a [`LogicalPlan::VectorSearch`] when a matching Vamana index exists.
 //!
-//! The flat KNN shape lowered from
-//! `MATCH (n:L) WITH n ORDER BY cosine_similarity(n.emb, $q) DESC LIMIT 10` is
-//! `TopN{ keys:[dist(prop,$q) DESC], limit:k, Project{ [.., dist AS score],
-//! Filter{ NodeScan{L, n} } } }`. When the catalog has a `VectorIndexDescriptor`
-//! for `(L, prop, metric)`, the whole chain collapses to a `VectorSearch` leaf
-//! that the executor serves from the index (falling back to flat scan when no
-//! index matches). Conservative: any `SKIP`, a non-DESC key, multiple keys, a
-//! non-vector key function, a `DISTINCT` projection, or a missing index leaves
-//! the plan unchanged.
+//! A KNN lowers to one of two shapes depending on how the query ends:
+//!
+//! - **terminal `RETURN`** — `MATCH (d:L) [WHERE …] RETURN d.x AS t,
+//!   cosine_similarity(d.emb, $q) AS score ORDER BY score DESC LIMIT k` lowers to
+//!   `Project[t, score]{ TopN{ [Filter] { NodeScan{L, d} } } }` — the projection
+//!   is the **outer** node. This is the common, natural way to write a KNN.
+//! - **non-terminal `WITH`** — `MATCH (d:L) WITH d ORDER BY cosine_similarity(
+//!   d.emb,$q) DESC LIMIT k …` lowers to `TopN{ Project[.., dist AS score]{
+//!   [Filter]{ NodeScan{L, d} } } }` — the projection is **inside** the TopN.
+//!
+//! When the catalog has a `VectorIndexDescriptor` for `(L, prop, metric)`, the
+//! `TopN[ [Filter] NodeScan ]` ranking sub-tree collapses to a `VectorSearch`
+//! leaf the executor serves from the index (falling back to the flat scan when
+//! no index matches); any outer `Project` is preserved on top. A `WHERE` the
+//! rewrite folds in is captured as the `VectorSearch`'s `post_filter` so the
+//! index path survives a filter (RFC-030 filtered ANN). Conservative: any `SKIP`,
+//! a non-DESC key, multiple keys, a non-vector key function, a `DISTINCT`
+//! projection, a cross-binding filter, or a missing index leaves the plan
+//! unchanged.
 //!
 //! Registered in `optimize::mod` right after `unique_lookup`, so the downstream
 //! pushdowns (which treat `VectorSearch` as an opaque leaf) see the new
 //! operator and don't re-introduce a Filter above it.
 
 use crate::cost::StatsCatalog;
-use crate::parser::ast::OrderDirection;
+use crate::parser::ast::{BinaryOp, OrderDirection};
 use crate::parser::{Expression, ExpressionKind};
-use crate::plan::logical::{LogicalPlan, OrderKey, RowCount, VectorDistance};
+use crate::plan::logical::{LogicalPlan, OrderKey, ProjectionItem, RowCount, VectorDistance};
 
 /// Run the rewrite over `plan`. No-op when no index matches.
 pub fn apply_vector_search(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     let plan = recurse(plan);
-    if let Some(vs) = try_match(&plan, catalog) {
+
+    // Terminal-`RETURN` KNN: `Project[ … ]{ TopN{ [Filter] NodeScan } }`. Rewrite
+    // the TopN ranking sub-tree to a `VectorSearch` and keep the outer Project
+    // (it re-projects `d.x`/`score` from the node the index returns). The score
+    // column's alias is read from the outer Project so the operator names it the
+    // same way the projection expects.
+    if let LogicalPlan::Project {
+        items,
+        input,
+        distinct,
+        discard_input_bindings,
+    } = plan
+    {
+        if let LogicalPlan::TopN { keys, .. } = input.as_ref() {
+            let sa = outer_score_alias_of(&items, keys);
+            if let Some(vs) = try_match(&input, catalog, None, sa.as_deref()) {
+                return LogicalPlan::Project {
+                    items,
+                    input: Box::new(vs),
+                    distinct,
+                    discard_input_bindings,
+                };
+            }
+        }
+        // Not a KNN under this Project — reassemble unchanged.
+        return LogicalPlan::Project {
+            items,
+            input,
+            distinct,
+            discard_input_bindings,
+        };
+    }
+
+    // A threshold / filter on the *ranked* output (e.g. `WHERE score >= 0.86`)
+    // lowers to a Filter wrapping the TopN. Fold it into the VectorSearch's
+    // `post_filter` when it references only the searched binding; otherwise leave
+    // the plan alone so the filter still runs (flat path).
+    if let LogicalPlan::Filter { predicate, input } = &plan {
+        if matches!(input.as_ref(), LogicalPlan::TopN { .. }) {
+            if let Some(vs) = try_match(input, catalog, Some(predicate), None) {
+                return vs;
+            }
+        }
+    }
+
+    // Bare TopN at the root (non-terminal `WITH`, or a hand-built plan).
+    if let Some(vs) = try_match(&plan, catalog, None, None) {
         vs
     } else {
         plan
     }
+}
+
+/// The alias the outer Project gives the distance column, matched structurally
+/// (span-insensitively) against the TopN's ranking key, so the rewritten
+/// `VectorSearch` names its score column the way the projection refers to it.
+fn outer_score_alias_of(items: &[ProjectionItem], keys: &[OrderKey]) -> Option<String> {
+    let (km, kp, ka, _) = single_distance_key(keys)?;
+    items.iter().find_map(|it| {
+        let (m, p, a, _) = distance_call_parts(&it.expression)?;
+        (m == km && p == kp && a == ka).then(|| it.alias.clone())
+    })
 }
 
 /// Bottom-up recursion through the single-input operators that wrap a KNN
@@ -67,8 +134,15 @@ fn recurse(plan: LogicalPlan) -> LogicalPlan {
 }
 
 /// Borrow-based matcher: if `plan` is the KNN chain AND a backing index exists,
-/// return the replacement `VectorSearch`.
-fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> {
+/// return the replacement `VectorSearch`. `above` is an optional predicate from
+/// a Filter wrapping the TopN (a threshold on the ranked output) to fold into
+/// `post_filter`.
+fn try_match(
+    plan: &LogicalPlan,
+    catalog: &StatsCatalog,
+    above: Option<&Expression>,
+    outer_score_alias: Option<&str>,
+) -> Option<LogicalPlan> {
     let LogicalPlan::TopN {
         keys,
         skip,
@@ -84,28 +158,38 @@ fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> 
     }
     let (distance, prop, alias, query) = single_distance_key(keys)?;
 
-    let LogicalPlan::Project {
-        items,
-        distinct: false,
-        discard_input_bindings: _,
-        input: proj_input,
-    } = input.as_ref()
-    else {
-        return None;
+    // The TopN's input is either an inner Project that computes the score and
+    // carries the binding through (non-terminal `WITH` form), or — for a terminal
+    // `RETURN`, whose projection sits *outside* the TopN — a `[Filter →] NodeScan`
+    // directly. Resolve the score alias and peel an optional `WHERE` Filter in
+    // both cases.
+    let (score_alias, between, scan) = match input.as_ref() {
+        LogicalPlan::Project {
+            items,
+            distinct: false,
+            input: proj_input,
+            ..
+        } => {
+            let sa = items
+                .iter()
+                .find_map(|it| {
+                    let (m, p, a, _) = distance_call_parts(&it.expression)?;
+                    (m == distance && p == prop && a == alias).then(|| it.alias.clone())
+                })
+                .or_else(|| outer_score_alias.map(str::to_string))
+                .unwrap_or_else(|| "score".to_string());
+            let (scan, between) = peel_filter(proj_input.as_ref());
+            (sa, between, scan)
+        }
+        other => {
+            let sa = outer_score_alias
+                .map(str::to_string)
+                .unwrap_or_else(|| "score".to_string());
+            let (scan, between) = peel_filter(other);
+            (sa, between, scan)
+        }
     };
 
-    // Score column alias = the projection item equal to the distance call.
-    let score_alias = items
-        .iter()
-        .find(|it| distance_key_matches(&it.expression, keys))
-        .map(|it| it.alias.clone())
-        .unwrap_or_else(|| "score".to_string());
-
-    // Peel an optional Filter (e.g. `WHERE n.emb IS NOT NULL`).
-    let scan = match proj_input.as_ref() {
-        LogicalPlan::Filter { input, .. } => input.as_ref(),
-        other => other,
-    };
     let LogicalPlan::NodeScan {
         label: Some(label),
         alias: scan_alias,
@@ -121,6 +205,27 @@ fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> 
     // Index must exist for (label, prop, metric).
     catalog.vector_index_for(label, &prop, metric_to_storage(distance))?;
 
+    // Fold the captured predicate(s) into `post_filter`, but ONLY when they
+    // reference solely the searched binding (`alias`) / the score column
+    // (`score_alias`). A predicate that touches another binding must NOT be
+    // swallowed — bail so the plan keeps its Filter and runs via the flat path.
+    let mut post_filter: Option<Expression> = None;
+    if let Some(b) = between {
+        if !aliases_within(&b, &[&alias]) {
+            return None;
+        }
+        post_filter = Some(b);
+    }
+    if let Some(a) = above {
+        if !aliases_within(a, &[&alias, &score_alias]) {
+            return None;
+        }
+        post_filter = Some(match post_filter {
+            Some(p) => and_expr(p, a.clone()),
+            None => a.clone(),
+        });
+    }
+
     Some(LogicalPlan::VectorSearch {
         label: Some(label.clone()),
         alias,
@@ -129,7 +234,29 @@ fn try_match(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> 
         k: limit.clone(),
         distance,
         score_alias,
+        post_filter,
     })
+}
+
+/// `true` if every binding `expr` references is in `allowed`. Used to keep a
+/// captured `WHERE` from swallowing a cross-binding predicate.
+fn aliases_within(expr: &Expression, allowed: &[&str]) -> bool {
+    super::expression_aliases(expr)
+        .iter()
+        .all(|a| allowed.contains(&a.as_str()))
+}
+
+/// `a AND b` as one predicate Expression.
+fn and_expr(a: Expression, b: Expression) -> Expression {
+    let span = a.span;
+    Expression {
+        kind: ExpressionKind::Binary {
+            op: BinaryOp::And,
+            left: Box::new(a),
+            right: Box::new(b),
+        },
+        span,
+    }
 }
 
 /// From `keys`, if it's a single DESC key whose expression is
@@ -143,8 +270,16 @@ fn single_distance_key(keys: &[OrderKey]) -> Option<(VectorDistance, String, Str
     if !matches!(key.direction, OrderDirection::Desc) {
         return None;
     }
-    let metric = distance_metric(&key.expression)?;
-    let ExpressionKind::FunctionCall { args, .. } = &key.expression.kind else {
+    distance_call_parts(&key.expression)
+}
+
+/// `dist_fn(Property(Variable(alias), prop), query)` →
+/// `(metric, prop, alias, query)`. The same shape whether it drives an
+/// `ORDER BY` key or a projection item, so the score column's alias can be
+/// matched structurally (span-insensitively) across the two.
+fn distance_call_parts(expr: &Expression) -> Option<(VectorDistance, String, String, Expression)> {
+    let metric = distance_metric(expr)?;
+    let ExpressionKind::FunctionCall { args, .. } = &expr.kind else {
         return None;
     };
     if args.len() != 2 {
@@ -157,6 +292,16 @@ fn single_distance_key(keys: &[OrderKey]) -> Option<(VectorDistance, String, Str
         _ => return None,
     };
     Some((metric, prop, alias, query))
+}
+
+/// Peel an optional `WHERE` Filter directly above the NodeScan, returning the
+/// inner plan and the captured predicate (e.g. `d.emb IS NOT NULL`,
+/// `cosine_similarity(d.emb,$q) >= 0.86`, or a label/property predicate).
+fn peel_filter(plan: &LogicalPlan) -> (&LogicalPlan, Option<Expression>) {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => (input.as_ref(), Some(predicate.clone())),
+        other => (other, None),
+    }
 }
 
 /// `dist_fn(...)` → its [`VectorDistance`], or `None` for a non-vector function.
@@ -182,14 +327,6 @@ fn extract_property(expr: &Expression) -> Option<(String, String)> {
         return None;
     };
     Some((ident.name.clone(), pa.key.name.clone()))
-}
-
-/// `true` if `expr` is the same distance-function call that drives `keys[0]`.
-fn distance_key_matches(expr: &Expression, keys: &[OrderKey]) -> bool {
-    if keys.len() != 1 {
-        return false;
-    }
-    expr == &keys[0].expression
 }
 
 fn metric_to_storage(d: VectorDistance) -> namidb_storage::manifest::VectorMetric {
@@ -349,6 +486,210 @@ mod tests {
                 assert_eq!(distance, VectorDistance::Dot);
             }
             other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+        }
+    }
+
+    /// `knn_plan` with a `Filter(predicate)` between the Project and the
+    /// NodeScan (a `WHERE` on the match).
+    fn knn_plan_with_filter(metric_fn: &str, predicate: Expression) -> LogicalPlan {
+        let call = dist_call(metric_fn);
+        let scan = LogicalPlan::NodeScan {
+            label: Some("Doc".into()),
+            alias: "d".into(),
+            predicates: vec![],
+            projection: None,
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+        };
+        let project = LogicalPlan::Project {
+            input: Box::new(filter),
+            items: vec![
+                ProjectionItem {
+                    expression: call.clone(),
+                    alias: "score".into(),
+                },
+                ProjectionItem {
+                    expression: Expression {
+                        kind: ExpressionKind::Variable(Identifier::new("d", sp())),
+                        span: sp(),
+                    },
+                    alias: "d".into(),
+                },
+            ],
+            distinct: false,
+            discard_input_bindings: true,
+        };
+        LogicalPlan::TopN {
+            input: Box::new(project),
+            keys: vec![OrderKey {
+                expression: call,
+                direction: OrderDirection::Desc,
+            }],
+            skip: RowCount::Const(0),
+            limit: RowCount::Const(10),
+        }
+    }
+
+    #[test]
+    fn captures_scan_filter_into_post_filter() {
+        // A WHERE that references only the searched binding is folded into
+        // `post_filter` instead of being dropped.
+        let pred = dist_call("cosine_similarity"); // references only `d`
+        let plan = knn_plan_with_filter("cosine_similarity", pred);
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::VectorSearch { post_filter, .. } => {
+                assert!(post_filter.is_some(), "scan WHERE must be captured");
+            }
+            other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+        }
+    }
+
+    #[test]
+    fn cross_binding_filter_blocks_rewrite() {
+        // A predicate touching another binding must NOT be swallowed: bail so
+        // the Filter survives and runs via the flat path.
+        let pred = Expression {
+            kind: ExpressionKind::Variable(Identifier::new("other", sp())),
+            span: sp(),
+        };
+        let plan = knn_plan_with_filter("cosine_similarity", pred);
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        let out = apply_vector_search(plan, &cat);
+        assert!(
+            matches!(out, LogicalPlan::TopN { .. }),
+            "cross-binding filter → no rewrite"
+        );
+    }
+
+    #[test]
+    fn plain_knn_has_no_post_filter() {
+        let plan = knn_plan("cosine_similarity");
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::VectorSearch { post_filter, .. } => assert!(post_filter.is_none()),
+            other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+        }
+    }
+
+    /// Terminal-`RETURN` shape (the common KNN): the Project sits *outside* the
+    /// TopN — `Project[title, dist AS score]{ TopN{ [Filter] NodeScan{Doc, d} } }`.
+    fn knn_plan_terminal_return(metric_fn: &str, filter: Option<Expression>) -> LogicalPlan {
+        let call = dist_call(metric_fn);
+        let scan = LogicalPlan::NodeScan {
+            label: Some("Doc".into()),
+            alias: "d".into(),
+            predicates: vec![],
+            projection: None,
+        };
+        let topn_input = match filter {
+            Some(predicate) => LogicalPlan::Filter {
+                input: Box::new(scan),
+                predicate,
+            },
+            None => scan,
+        };
+        let topn = LogicalPlan::TopN {
+            input: Box::new(topn_input),
+            keys: vec![OrderKey {
+                expression: call.clone(),
+                direction: OrderDirection::Desc,
+            }],
+            skip: RowCount::Const(0),
+            limit: RowCount::Const(10),
+        };
+        LogicalPlan::Project {
+            input: Box::new(topn),
+            items: vec![
+                // A non-distance projected column (`RETURN d.title AS title`),
+                // here a bare binding ref — the matcher must ignore it.
+                ProjectionItem {
+                    expression: Expression {
+                        kind: ExpressionKind::Variable(Identifier::new("d", sp())),
+                        span: sp(),
+                    },
+                    alias: "title".into(),
+                },
+                ProjectionItem {
+                    expression: call,
+                    alias: "score".into(),
+                },
+            ],
+            distinct: false,
+            discard_input_bindings: true,
+        }
+    }
+
+    #[test]
+    fn rewrites_terminal_return_knn() {
+        // The TopN ranking sub-tree collapses to VectorSearch; the outer Project
+        // (the RETURN) is preserved on top, and the score column keeps its alias.
+        let plan = knn_plan_terminal_return("cosine_similarity", None);
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::VectorSearch {
+                    alias,
+                    property,
+                    score_alias,
+                    post_filter,
+                    ..
+                } => {
+                    assert_eq!(alias, "d");
+                    assert_eq!(property, "emb");
+                    assert_eq!(score_alias, "score");
+                    assert!(post_filter.is_none());
+                }
+                other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+            },
+            other => panic!(
+                "expected Project(VectorSearch), got {:?}",
+                other.operator_name()
+            ),
+        }
+    }
+
+    #[test]
+    fn terminal_return_folds_where_into_post_filter() {
+        // A `WHERE` on the match (e.g. `d.emb IS NOT NULL`, or a `>= 0.86`
+        // threshold) sits under the TopN; it must be captured, not dropped.
+        let pred = dist_call("cosine_similarity"); // references only `d`
+        let plan = knn_plan_terminal_return("cosine_similarity", Some(pred));
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::Project { input, .. } => match *input {
+                LogicalPlan::VectorSearch { post_filter, .. } => {
+                    assert!(post_filter.is_some(), "match WHERE must be captured");
+                }
+                other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+            },
+            other => panic!(
+                "expected Project(VectorSearch), got {:?}",
+                other.operator_name()
+            ),
+        }
+    }
+
+    #[test]
+    fn terminal_return_cross_binding_filter_blocks_rewrite() {
+        // A predicate touching another binding must bail: the plan stays
+        // Project(TopN(...)), running via the flat path.
+        let pred = Expression {
+            kind: ExpressionKind::Variable(Identifier::new("other", sp())),
+            span: sp(),
+        };
+        let plan = knn_plan_terminal_return("cosine_similarity", Some(pred));
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::Project { input, .. } => {
+                assert!(
+                    matches!(*input, LogicalPlan::TopN { .. }),
+                    "cross-binding filter → TopN preserved (flat path)"
+                );
+            }
+            other => panic!("expected Project(TopN), got {:?}", other.operator_name()),
         }
     }
 }

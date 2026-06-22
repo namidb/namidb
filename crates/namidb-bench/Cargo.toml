@@ -12,6 +12,12 @@ description = "LDBC-shaped synthetic benchmark harness for NamiDB"
 name = "namidb-bench"
 path = "src/main.rs"
 
+[features]
+default = []
+# RFC-030 ANN index bench (`ann-bench`): builds the real Vamana `.vg` and queries
+# it through the engine. Off by default so the standard bench build stays light.
+vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }

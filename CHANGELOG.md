@@ -11,6 +11,58 @@ the release notes.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-22: Vector search reaches the index — filtered and fresh
+
+### Fixed
+
+- **The Vamana vector index (`vector-index`) was never used by Cypher queries.**
+  The optimizer's KNN → `VectorSearch` rewrite only matched the non-terminal
+  `WITH d ORDER BY cosine_similarity(d.emb, $q) DESC LIMIT k` shape (projection
+  *inside* the `TopN`). The natural, common form — a terminal
+  `RETURN d.x AS t, cosine_similarity(d.emb, $q) AS score ORDER BY score DESC
+  LIMIT k` — lowers with the projection *outside* the `TopN`, which the matcher
+  did not recognize, so every vector query silently fell back to the O(n) flat
+  scan. The result-equivalence tests passed regardless, because the flat
+  fallback is exact. The matcher now handles both shapes (preserving the outer
+  projection on top of the new `VectorSearch`), so an indexed KNN actually serves
+  from the `.vg`. A new test asserts the optimized plan contains `VectorSearch`,
+  and the `ann-bench` harness reports it end-to-end. The index serves **cosine**
+  KNN; dot-product and Euclidean still use the exact flat scan (the index would
+  return a score on a different scale than the flat path).
+- The freshness gate for both the vector and BM25 (`text-index`) indexes tested
+  `scope == label` for an L0 `Nodes` delta, but node SSTs are id-primary (one SST
+  spans every label, flushed with an empty scope), so the check never matched —
+  a node flushed to L0 but not yet compacted into the index was invisible to the
+  indexed read (neither in the index nor the cleared memtable), silently
+  returning a stale top-k. The gate now detects any L0 node delta and falls back
+  to the exact flat scan for that window.
+
+### Added
+
+- **Filtered ANN.** A `WHERE` on the KNN candidate set — a label/property
+  predicate or a `cosine_similarity(...) >= t` threshold — that references only
+  the searched binding is now folded into the `VectorSearch` as a residual
+  `post_filter` and evaluated per candidate, instead of disabling the index
+  rewrite. The index over-fetches so the filter can't starve the top-k, and
+  falls back to the exact flat scan when a selective filter leaves fewer than `k`
+  survivors. This is the entity-resolution pattern (vector + label filter +
+  similarity threshold) served from the index. A predicate touching another
+  binding still bails to the flat path, unchanged.
+- **Index freshness.** The indexed KNN path unions the committed-memtable and
+  staged-overlay delta that the `.vg` has not yet absorbed: freshly written /
+  updated embeddings are merged into the candidate set and re-scored, while ids
+  that were tombstoned, lost the indexed label, or dropped their embedding are
+  suppressed. While an un-compacted L0 node delta exists the path falls back to
+  the exact flat scan (mirroring the BM25 text index). A node written after the
+  last compaction is visible to the index search immediately, so the ANN answer
+  stays equivalent to the flat scan instead of going stale until the next compaction.
+- **`namidb-bench ann-bench`** (gated behind the crate's new `vector-index`
+  feature): builds a real `.vg` by compaction and measures the Vamana index's
+  recall@k against the exact flat KNN plus index-vs-scan latency, over clustered
+  or uniform synthetic embeddings. It also reports `cypher_index_path_reachable`
+  — whether a plain KNN Cypher query is rewritten to the indexed path — so the
+  reachability fix above stays regression-tested from the outside.
+
 ## [1.2.0] - 2026-06-21: Composite constraints, IF NOT EXISTS, and SHOW
 
 ### Added
