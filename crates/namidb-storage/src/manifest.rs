@@ -425,6 +425,26 @@ impl VectorMetric {
     }
 }
 
+/// On-disk representation of the indexed vectors inside a `.vg` body.
+///
+/// `None` stores full f32 vectors (recall-golden, ~`4·dim` bytes/vector).
+/// `Int8` stores per-vector int8 codes + an f32 scale (~`dim+4` bytes/vector,
+/// ~4× smaller) — the DiskANN-style memory/storage win for object-storage-first
+/// indexes, where the whole `.vg` is fetched per search. int8 navigation and
+/// scoring are cosine-only (scale-invariant, exact-in-f32 arithmetic but lossy
+/// vs the original embedding), so `Int8` requires `metric: cosine`; recall is
+/// slightly lower (the `namidb-ann` floor is ~0.80 vs ~0.85 at f32) and a
+/// `WHERE score >= t` threshold compares against the quantized score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorQuantization {
+    /// Full-precision f32 vectors (default).
+    #[default]
+    None,
+    /// Per-vector int8 codes + scale (~4× smaller, cosine-only, lossy).
+    Int8,
+}
+
 /// A registered DiskANN/Vamana vector index over one `(label, property)`.
 ///
 /// `CREATE VECTOR INDEX` appends one of these to [`Manifest::vector_indexes`];
@@ -453,6 +473,10 @@ pub struct VectorIndexDescriptor {
     pub l_build: usize,
     /// Vamana α diversification.
     pub alpha: f32,
+    /// On-disk vector quantization (`#[serde(default)]` → existing manifests
+    /// without the field decode as `None`).
+    #[serde(default)]
+    pub quantization: VectorQuantization,
 }
 
 impl VectorIndexDescriptor {

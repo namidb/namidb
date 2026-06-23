@@ -53,7 +53,11 @@ pub fn linear(legs: &[&[(NodeId, f64)]], weights: &[f64]) -> Vec<(NodeId, f64)> 
     let mut acc: BTreeMap<NodeId, f64> = BTreeMap::new();
     for (li, leg) in legs.iter().enumerate() {
         let w = weights.get(li).copied().unwrap_or(0.0);
-        if leg.is_empty() || w == 0.0 {
+        // Skip only an EMPTY leg. A present but zero-weighted leg still seeds its
+        // nodes into the accumulator (contributing 0.0), so they survive into the
+        // result — otherwise a single-leg hybrid with that leg's weight 0 would
+        // return nothing.
+        if leg.is_empty() {
             continue;
         }
         // Best-first: first element is the closest, last the farthest. Mapping
@@ -138,6 +142,19 @@ mod tests {
         let blended = linear(&[&dense, &sparse], &[0.5, 0.5]);
         assert!((blended[0].1 - 0.5).abs() < 1e-9);
         assert_eq!(blended[0].0, nid(1));
+    }
+
+    #[test]
+    fn linear_zero_weighted_present_leg_keeps_its_nodes() {
+        // A single present leg weighted 0 (the other leg empty) must still return
+        // that leg's nodes — not an empty result.
+        let dense = [(nid(1), 0.9), (nid(2), 0.1)];
+        let out = linear(&[&dense, &[]], &[0.0, 1.0]);
+        assert_eq!(
+            out.len(),
+            2,
+            "zero-weighted present leg keeps nodes: {out:?}"
+        );
     }
 
     #[test]

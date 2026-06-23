@@ -2249,24 +2249,49 @@ async fn hybrid_search_procedure(
         .get("fusion")
         .and_then(proc_str)
         .unwrap_or_else(|| "rrf".to_string());
-    let rrf_k = map
-        .get("rrf_k")
-        .and_then(as_f64)
-        .unwrap_or(fusion::DEFAULT_RRF_K);
-    let alpha = map.get("alpha").and_then(as_f64).unwrap_or(0.5);
+    // A present-but-wrong-type tuning value is an error, not a silent default.
+    let opt_f64 = |key: &str| -> Result<Option<f64>, ExecError> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(v) => Ok(Some(as_f64(v).ok_or_else(|| {
+                proc_unsupported(format!("search.hybrid `{key}` must be a number"))
+            })?)),
+        }
+    };
+    let opt_usize = |key: &str| -> Result<Option<usize>, ExecError> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(v) => Ok(Some(as_usize(v).ok_or_else(|| {
+                proc_unsupported(format!(
+                    "search.hybrid `{key}` must be a non-negative integer"
+                ))
+            })?)),
+        }
+    };
+    let rrf_k = opt_f64("rrf_k")?.unwrap_or(fusion::DEFAULT_RRF_K);
+    if rrf_k <= 0.0 {
+        return Err(proc_unsupported("search.hybrid `rrf_k` must be > 0"));
+    }
+    let alpha = opt_f64("alpha")?.unwrap_or(0.5);
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(proc_unsupported("search.hybrid `alpha` must be in [0, 1]"));
+    }
     // Per-leg candidate depth before fusion: over-fetch so a node ranked well in
     // one leg but just outside the other's window still contributes.
     const OVERFETCH: usize = 8;
-    let k_dense = map
-        .get("k_dense")
-        .and_then(as_usize)
-        .unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
-    let k_sparse = map
-        .get("k_sparse")
-        .and_then(as_usize)
-        .unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
+    let k_dense = opt_usize("k_dense")?.unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
+    let k_sparse = opt_usize("k_sparse")?.unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
 
-    let dense_configured = map.contains_key("query_vector") && map.contains_key("vector_property");
+    // A dense leg needs BOTH keys; supplying exactly one is a mistake, not a
+    // silently-disabled leg.
+    let has_qvec = map.contains_key("query_vector");
+    let has_vprop = map.contains_key("vector_property");
+    if has_qvec != has_vprop {
+        return Err(proc_unsupported(
+            "search.hybrid dense leg needs both `query_vector` and `vector_property`",
+        ));
+    }
+    let dense_configured = has_qvec && has_vprop;
     let sparse_configured = map.contains_key("query_text");
     if !dense_configured && !sparse_configured {
         return Err(proc_unsupported(
@@ -2784,7 +2809,7 @@ async fn try_index_search(
     // vectors and reranks with the true metric, so the returned score equals the
     // flat path's (cosine similarity / raw dot / L2 distance), and the freshness
     // merge below scores deltas with the same `vector_score(distance, …)`.
-    let (index_name, index_dim) = {
+    let (index_name, index_dim, index_int8) = {
         let desc = snapshot
             .manifest()
             .manifest
@@ -2792,7 +2817,11 @@ async fn try_index_search(
             .iter()
             .find(|d| d.matches(label, property, metric));
         match desc {
-            Some(d) => (d.name.clone(), d.dim as usize),
+            Some(d) => (
+                d.name.clone(),
+                d.dim as usize,
+                d.quantization == namidb_storage::manifest::VectorQuantization::Int8,
+            ),
             None => return Ok(None),
         }
     };
@@ -2846,19 +2875,23 @@ async fn try_index_search(
     let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
 
     // Merge: index hits not superseded by the delta, plus the freshly-scored
-    // delta embeddings. The metric is cosine (gated above), so the index score
-    // and the delta's `vector_score(Cosine, …)` are on the same scale. `seen`
-    // starts from the delta ids — so a superseded hit is dropped — and also
-    // dedups the index hits themselves: storage `vector_search` unions across
-    // every `.vg` SST without deduping, so a partial rebuild can return one id
-    // twice, and the wider `kprime` fetch widens that window.
+    // delta embeddings. All three metrics serve from the index; an f32 index
+    // reranks with the true metric so its score equals the flat path's, and the
+    // delta's `vector_score(metric, …)` is on the same scale and orientation. An
+    // int8 index returns the QUANTIZED cosine, so a fresh delta is round-tripped
+    // through the same quantizer below (`index_int8`) to keep both halves of the
+    // merge commensurable — otherwise a node would score differently before vs
+    // after compaction folds it into the index. `seen` starts from the delta ids
+    // — so a superseded hit is dropped — and also dedups the index hits
+    // themselves: storage `vector_search` unions across every `.vg` SST without
+    // deduping, so a partial rebuild can return one id twice, and the wider
+    // `kprime` fetch widens that window.
     let q_rv = RuntimeValue::Vector(qv);
     let mut seen: BTreeSet<NodeId> = delta_ids;
     let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta.len());
     // Orientation of the metric: cosine/dot are higher-is-closer, euclidean is
     // lower-is-closer. Derived from the metric (not from the delta loop, which is
-    // empty in the common case), since the index hits and freshly-scored deltas
-    // share this scale (both the true metric).
+    // empty in the common case).
     let higher_is_better = !matches!(distance, VectorDistance::Euclidean);
     for (id, score) in hits {
         if seen.insert(id) {
@@ -2867,6 +2900,15 @@ async fn try_index_search(
     }
     for (id, emb) in delta {
         if let Some(v) = emb {
+            // For an int8 index, quantize → dequantize the fresh embedding so the
+            // delta is scored on the SAME (quantized) cosine scale as the index
+            // hits; for f32 the vector is scored as-is (exact, == the index).
+            let v = if index_int8 {
+                let (codes, scale) = namidb_core::quantize::quantize_i8(&v);
+                namidb_core::quantize::dequantize_i8(&codes, scale)
+            } else {
+                v
+            };
             let emb_rv = RuntimeValue::Vector(v);
             if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
                 scored.push((s, id));

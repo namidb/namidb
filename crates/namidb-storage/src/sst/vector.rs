@@ -19,21 +19,24 @@
 
 use bytes::Bytes;
 use namidb_ann::{
-    build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, L2Space, VamanaGraph,
+    build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, Int8Space, L2Space,
+    VamanaGraph,
 };
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3;
 
-use crate::error::Error;
-use crate::manifest::{VectorIndexDescriptor, VectorMetric};
+use namidb_core::quantize::quantize_i8;
 
-/// On-disk magic + format major version (`NAMI` `VG` `\0` major=2). Major bumped
-/// to 2: `dot` vectors are no longer normalised at build (the body now keeps the
-/// original vectors and reranks with the true metric), and `euclidean` is now
-/// indexable. A v1 reader would mis-score a v2 dot index and vice-versa, so the
-/// magic forces a rebuild; the read path skips an undecodable `.vg` and falls
-/// back to the flat scan rather than erroring.
-const MAGIC: &[u8; 8] = b"NAMIVG02";
+use crate::error::Error;
+use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+/// On-disk magic + format major version (`NAMI` `VG` `\0` major=3). v2 stored the
+/// original f32 vectors and reranked with the true metric (all three metrics
+/// indexable); v3 generalises the vector store to f32 OR per-vector int8 codes
+/// (`quantization: int8`, ~4× smaller, cosine-only). A reader of an older body
+/// mismatches the magic; the read path skips an undecodable `.vg` and falls back
+/// to the flat scan rather than erroring.
+const MAGIC: &[u8; 8] = b"NAMIVG03";
 
 /// Canonical short metric name stored in the body / stats.
 fn metric_name(m: VectorMetric) -> &'static str {
@@ -41,6 +44,36 @@ fn metric_name(m: VectorMetric) -> &'static str {
         VectorMetric::Cosine => "cosine",
         VectorMetric::Dot => "dot",
         VectorMetric::Euclidean => "euclidean",
+    }
+}
+
+/// The stored vectors inside a `.vg` body — full f32, or per-vector int8 codes
+/// plus a scale (`x_i ≈ codes_i · scale`), one entry per graph node `i`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VectorStorage {
+    F32(Vec<Vec<f32>>),
+    Int8 {
+        codes: Vec<Vec<i8>>,
+        scales: Vec<f32>,
+    },
+}
+
+impl VectorStorage {
+    /// Number of stored vectors.
+    fn len(&self) -> usize {
+        match self {
+            VectorStorage::F32(v) => v.len(),
+            VectorStorage::Int8 { codes, .. } => codes.len(),
+        }
+    }
+    /// The vector for node `i` materialised as f32 (dequantising int8).
+    fn f32_at(&self, i: usize) -> Vec<f32> {
+        match self {
+            VectorStorage::F32(v) => v[i].clone(),
+            VectorStorage::Int8 { codes, scales } => {
+                codes[i].iter().map(|&c| c as f32 * scales[i]).collect()
+            }
+        }
     }
 }
 
@@ -52,11 +85,11 @@ pub struct VectorGraphBody {
     pub dim: u32,
     /// Canonical metric name (`"cosine"` / `"dot"` / `"euclidean"`).
     pub metric: String,
-    /// `NodeId` per graph node `i`, parallel to `vectors` and the graph
+    /// `NodeId` per graph node `i`, parallel to `storage` and the graph
     /// adjacency (`graph.adjacency[i]`).
     pub ids: Vec<[u8; 16]>,
-    /// f32 embedding per graph node `i`.
-    pub vectors: Vec<Vec<f32>>,
+    /// f32 or int8-quantised embedding per graph node `i`.
+    pub storage: VectorStorage,
     /// The Vamana search graph.
     pub graph: VamanaGraph,
 }
@@ -157,8 +190,29 @@ pub fn build_body(
                 dim
             )));
         }
+        // A zero-norm (all-zero) vector is not cosine-rankable — the flat scan's
+        // `vector_score(Cosine, …)` returns None and drops it — so exclude it from
+        // a cosine index too, keeping the indexed corpus equal to the flat scan's.
+        // (Dot and L2 are well-defined on the zero vector, so keep it there.)
+        if desc.metric == VectorMetric::Cosine && v.iter().all(|x| *x == 0.0) {
+            continue;
+        }
         ids.push(id);
         vectors.push(v);
+    }
+    // Fewer than 2 indexable members after filtering → no graph (flat scan).
+    if vectors.len() < 2 {
+        return Ok(None);
+    }
+
+    // int8 quantization is cosine-only (the scale-invariant Int8Space). Reject a
+    // misconfigured index loudly rather than silently building a wrong one.
+    if desc.quantization == VectorQuantization::Int8 && desc.metric != VectorMetric::Cosine {
+        return Err(Error::invariant(format!(
+            "vector index `{}`: int8 quantization requires metric cosine (got {})",
+            desc.name,
+            metric_name(desc.metric)
+        )));
     }
 
     let params = BuildParams {
@@ -170,12 +224,27 @@ pub fn build_body(
     // Deterministic build: seed from the index name so two builds of the same
     // (data, descriptor) yield the same graph, while different indexes diverge.
     let seed = xxh3::xxh3_64(desc.name.as_bytes());
-    // Navigate with a metric-appropriate space over the original vectors. Cosine
-    // is scale-invariant, so it correctly navigates both cosine and dot; L2 is
-    // required for euclidean (cosine ignores magnitude and would mis-rank).
-    let graph = match desc.metric {
-        VectorMetric::Euclidean => build_with_seed(&L2Space::new(vectors.clone()), params, seed),
-        _ => build_with_seed(&F32CosineSpace::new(vectors.clone()), params, seed),
+
+    // Navigate, and choose the on-disk store, per quantization + metric. int8
+    // quantizes per-vector and navigates/scores with the scale-invariant cosine
+    // Int8Space (~4× smaller body). f32 keeps the original vectors and navigates
+    // with cosine (cosine/dot) or L2 (euclidean), reranking with the true metric.
+    let (graph, storage) = match desc.quantization {
+        VectorQuantization::Int8 => {
+            let members8: Vec<(Vec<i8>, f32)> = vectors.iter().map(|v| quantize_i8(v)).collect();
+            let graph = build_with_seed(&Int8Space::new(members8.clone()), params, seed);
+            let (codes, scales) = members8.into_iter().unzip();
+            (graph, VectorStorage::Int8 { codes, scales })
+        }
+        VectorQuantization::None => {
+            let graph = match desc.metric {
+                VectorMetric::Euclidean => {
+                    build_with_seed(&L2Space::new(vectors.clone()), params, seed)
+                }
+                _ => build_with_seed(&F32CosineSpace::new(vectors.clone()), params, seed),
+            };
+            (graph, VectorStorage::F32(vectors))
+        }
     };
 
     let stats = VectorGraphBuildStats {
@@ -192,7 +261,7 @@ pub fn build_body(
         dim: desc.dim,
         metric: metric_name(desc.metric).to_string(),
         ids,
-        vectors,
+        storage,
         graph,
     };
     let payload = bincode::serialize(&body)
@@ -203,11 +272,13 @@ pub fn build_body(
 }
 
 /// The navigation space a decoded index uses to walk its Vamana graph. Cosine
-/// for cosine/dot indexes, L2 for euclidean — matching the build.
+/// for f32 cosine/dot indexes, L2 for f32 euclidean, Int8 for a quantized
+/// (cosine-only) index — matching the build.
 #[derive(Debug)]
 enum NavSpace {
     Cosine(F32CosineSpace),
     L2(L2Space),
+    Int8(Int8Space),
 }
 
 /// A decoded, searchable VectorGraph index.
@@ -242,17 +313,27 @@ impl VectorGraphIndex {
         })?;
         // Validate the graph's internal consistency before trusting it: the entry
         // point and every id must be in range, since the body carries no checksum
-        // and search indexes adjacency/vectors by id directly.
-        let n = body.vectors.len();
+        // and search indexes adjacency/storage by id directly.
+        let n = body.storage.len();
         if n != body.ids.len() || n != body.graph.adjacency.len() {
             return Err(Error::invariant("vector graph body length mismatch"));
         }
         if n > 0 && body.graph.entry as usize >= n {
             return Err(Error::invariant("vector graph entry out of range"));
         }
-        let nav = match metric {
-            VectorMetric::Euclidean => NavSpace::L2(L2Space::new(body.vectors.clone())),
-            _ => NavSpace::Cosine(F32CosineSpace::new(body.vectors.clone())),
+        let nav = match &body.storage {
+            VectorStorage::Int8 { codes, scales } => {
+                if codes.len() != scales.len() {
+                    return Err(Error::invariant("vector graph int8 codes/scales mismatch"));
+                }
+                let members: Vec<(Vec<i8>, f32)> =
+                    codes.iter().cloned().zip(scales.iter().copied()).collect();
+                NavSpace::Int8(Int8Space::new(members))
+            }
+            VectorStorage::F32(v) if metric == VectorMetric::Euclidean => {
+                NavSpace::L2(L2Space::new(v.clone()))
+            }
+            VectorStorage::F32(v) => NavSpace::Cosine(F32CosineSpace::new(v.clone())),
         };
         Ok(Self { body, metric, nav })
     }
@@ -296,20 +377,28 @@ impl VectorGraphIndex {
             return Vec::new();
         }
         let ef = ef.max(k);
-        // Navigate for up to `ef` candidates (k = ef), then rerank by the true
-        // metric. For dot the navigation metric (cosine) differs from the score
-        // metric, so the wider candidate pool is what lets the rerank surface the
-        // true dot-nearest; for cosine/euclidean navigation already is the metric.
+        // Navigate for up to `ef` candidates (k = ef), then score them. For f32
+        // we rerank by the TRUE metric from the original vectors (for dot the
+        // navigation metric — cosine — differs, so the wider pool surfaces the
+        // true dot-nearest); for int8 the navigation distance already IS the
+        // (cosine-only) score, so we just flip distance → similarity.
         let cands = match &self.nav {
             NavSpace::Cosine(s) => search(s, &self.body.graph, query, ef, ef),
             NavSpace::L2(s) => search(s, &self.body.graph, query, ef, ef),
+            NavSpace::Int8(s) => search(s, &self.body.graph, query, ef, ef),
         };
+        let is_int8 = matches!(self.nav, NavSpace::Int8(_));
         let mut scored: Vec<([u8; 16], f32)> = cands
             .into_iter()
             .map(|nb| {
-                let v = &self.body.vectors[nb.id as usize];
-                let (score, _hib) = metric_score(self.metric, v, query);
-                (self.body.ids[nb.id as usize], score as f32)
+                let score = if is_int8 {
+                    // int8 cosine similarity (the stored, quantized score).
+                    1.0 - nb.dist
+                } else {
+                    let v = self.body.storage.f32_at(nb.id as usize);
+                    metric_score(self.metric, &v, query).0 as f32
+                };
+                (self.body.ids[nb.id as usize], score)
             })
             .collect();
         if self.higher_is_better() {
@@ -338,6 +427,15 @@ mod tests {
     }
 
     fn desc(name: &str, metric: VectorMetric, dim: u32) -> VectorIndexDescriptor {
+        desc_q(name, metric, dim, VectorQuantization::None)
+    }
+
+    fn desc_q(
+        name: &str,
+        metric: VectorMetric,
+        dim: u32,
+        quantization: VectorQuantization,
+    ) -> VectorIndexDescriptor {
         VectorIndexDescriptor {
             name: name.into(),
             label: "Doc".into(),
@@ -347,6 +445,7 @@ mod tests {
             r: 16,
             l_build: 32,
             alpha: 1.2,
+            quantization,
         }
     }
 
@@ -516,6 +615,96 @@ mod tests {
             avg >= 0.85,
             "indexed recall@{k} = {avg:.3}, expected >= 0.85"
         );
+    }
+
+    /// Clustered unit vectors with enough spread that the top-k is well-defined
+    /// (the tight `clustered_members` fixture makes near-duplicates whose top-k
+    /// is noise — useless for a recall measurement). Mirrors the `namidb-ann`
+    /// int8 recall fixture (spread 0.15).
+    fn spread_members(
+        n: usize,
+        dim: usize,
+        clusters: usize,
+        spread: f32,
+        seed: u64,
+    ) -> Vec<([u8; 16], Vec<f32>)> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let cents: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| {
+                let mut c: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+                normalize(&mut c);
+                c
+            })
+            .collect();
+        (0..n)
+            .map(|i| {
+                let base = &cents[i % clusters];
+                let mut v: Vec<f32> = base
+                    .iter()
+                    .map(|b| b + spread * (rng.gen::<f32>() * 2.0 - 1.0))
+                    .collect();
+                normalize(&mut v);
+                let mut id = [0u8; 16];
+                id[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+                (id, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn int8_index_is_smaller_and_recalls_well() {
+        // int8 quantization makes the body materially smaller while keeping
+        // recall above the documented floor on well-separated data.
+        let n = 400;
+        let dim = 64;
+        let members = spread_members(n, dim, 16, 0.15, 17);
+        let f32_d = desc("f32", VectorMetric::Cosine, dim as u32);
+        let int8_d = desc_q(
+            "int8",
+            VectorMetric::Cosine,
+            dim as u32,
+            VectorQuantization::Int8,
+        );
+        let (f32_body, _) = build_body(&f32_d, members.clone()).unwrap().unwrap();
+        let (int8_body, stats) = build_body(&int8_d, members.clone()).unwrap().unwrap();
+        assert_eq!(stats.point_count, n as u64);
+        assert!(
+            int8_body.len() < f32_body.len(),
+            "int8 body {} should be smaller than f32 body {}",
+            int8_body.len(),
+            f32_body.len()
+        );
+
+        let idx = VectorGraphIndex::decode(&int8_body).unwrap();
+        assert_eq!(idx.point_count(), n as u64);
+        let k = 10;
+        let mut total = 0.0;
+        for q in 0..30 {
+            let query = members[q % 50].1.clone();
+            let mut scored: Vec<(f64, [u8; 16])> = members
+                .iter()
+                .map(|(id, v)| (cosine(&query, v), *id))
+                .collect();
+            scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let truth: std::collections::HashSet<[u8; 16]> =
+                scored.iter().take(k).map(|(_, id)| *id).collect();
+            let approx: std::collections::HashSet<[u8; 16]> = idx
+                .search(&query, k, 64)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            total += approx.intersection(&truth).count() as f64 / k as f64;
+        }
+        let avg = total / 30.0;
+        assert!(avg >= 0.80, "int8 recall@{k} = {avg:.3}, expected >= 0.80");
+    }
+
+    #[test]
+    fn int8_requires_cosine_metric() {
+        // int8 + a non-cosine metric is rejected at build (not silently wrong).
+        let d = desc_q("bad", VectorMetric::Dot, 8, VectorQuantization::Int8);
+        assert!(build_body(&d, clustered_members(10, 8, 1)).is_err());
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {

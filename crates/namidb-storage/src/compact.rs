@@ -892,7 +892,7 @@ async fn build_vector_indexes_for_nodes(
     // strict subset; rebuilding from it and deleting the deep `.vg` would
     // silently truncate the index to the shallow rows (permanent recall loss vs
     // the flat scan). Leave the existing `.vg` untouched instead — the freshness
-    // gate (`vector_index_stale`) detects the now-newer Nodes SST and falls back
+    // gate (`index_outrun_by_nodes`) detects the now-newer Nodes SST and falls back
     // to the exact flat scan until an authoritative merge rebuilds the index.
     if !authoritative {
         return Ok((Vec::new(), Vec::new()));
@@ -934,7 +934,17 @@ async fn build_vector_indexes_for_nodes(
             members.push((row.id, v));
         }
 
-        let Some((body, stats)) = build_body(desc, members)? else {
+        // Skip-and-warn on a per-index build error (e.g. a malformed descriptor)
+        // rather than `?`-aborting the whole compaction — one bad index must
+        // never wedge the namespace's compaction permanently.
+        let built = match build_body(desc, members) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(index = %desc.name, error = %e, "skipping vector index build");
+                continue;
+            }
+        };
+        let Some((body, stats)) = built else {
             continue;
         };
 
@@ -2222,7 +2232,7 @@ mod tests {
     #[cfg(feature = "vector-index")]
     #[tokio::test]
     async fn compaction_builds_a_searchable_vector_graph() {
-        use crate::manifest::{VectorIndexDescriptor, VectorMetric};
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
         use crate::sst::vector::VectorGraphIndex;
         use rand::Rng;
         use rand::SeedableRng;
@@ -2266,6 +2276,7 @@ mod tests {
             r: 32,
             l_build: 64,
             alpha: 1.2,
+            quantization: VectorQuantization::None,
         });
         let schema = SchemaBuilder::new()
             .label(LabelDef {

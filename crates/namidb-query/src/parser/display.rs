@@ -138,7 +138,8 @@ impl fmt::Display for CreateVectorIndexClause {
         )?;
         // Render WITH only when at least one build override is present, so a
         // defaults-only index round-trips without a trailing `WITH {}`.
-        if self.r.is_some() || self.l_build.is_some() || self.alpha.is_some() {
+        let has_quant = self.quantization != crate::parser::ast::VectorQuantization::None;
+        if self.r.is_some() || self.l_build.is_some() || self.alpha.is_some() || has_quant {
             f.write_str(" WITH {")?;
             let mut parts: Vec<String> = Vec::new();
             if let Some(v) = self.r {
@@ -149,6 +150,9 @@ impl fmt::Display for CreateVectorIndexClause {
             }
             if let Some(v) = self.alpha {
                 parts.push(format!("alpha: {v}"));
+            }
+            if has_quant {
+                parts.push(format!("quantization: {}", self.quantization.as_keyword()));
             }
             write!(f, "{}", parts.join(", "))?;
             f.write_str("}")?;

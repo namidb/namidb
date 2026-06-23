@@ -1044,6 +1044,18 @@ impl WriterSession {
     /// the session; a lost manifest CAS ⇒ retryable.
     pub async fn register_vector_index(&mut self, desc: VectorIndexDescriptor) -> Result<u64> {
         self.fence.assert_alive(self.current.manifest.epoch)?;
+        // int8 quantization is cosine-only (the scale-invariant Int8Space).
+        // Reject the misconfiguration here — fail-fast — rather than committing a
+        // descriptor whose `build_body` would later error and wedge EVERY
+        // compaction for the namespace (the descriptor lives in the manifest).
+        if desc.quantization == crate::manifest::VectorQuantization::Int8
+            && desc.metric != crate::manifest::VectorMetric::Cosine
+        {
+            return Err(Error::precondition(format!(
+                "vector index `{}`: int8 quantization requires metric cosine",
+                desc.name
+            )));
+        }
         for existing in &self.current.manifest.vector_indexes {
             if existing.name == desc.name {
                 return Err(Error::precondition(format!(
@@ -1535,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_vector_index_commits_descriptor_and_rejects_duplicates() {
-        use crate::manifest::VectorMetric;
+        use crate::manifest::{VectorMetric, VectorQuantization};
 
         let store = make_store();
         let paths = make_paths("ingest-vecidx");
@@ -1559,6 +1571,7 @@ mod tests {
             r: 32,
             l_build: 64,
             alpha: 1.2,
+            quantization: VectorQuantization::None,
         };
         // Metadata-only commit: no rows staged, manifest version bumps to 1.
         assert_eq!(session.pending_len(), 0);
@@ -1592,12 +1605,24 @@ mod tests {
         let other = VectorIndexDescriptor {
             name: "doc_dot".into(),
             metric: VectorMetric::Dot,
-            ..desc
+            ..desc.clone()
         };
         let v2 = session.register_vector_index(other).await.unwrap();
         assert_eq!(v2, 2);
         let snap = session.snapshot();
         assert_eq!(snap.manifest().manifest.vector_indexes.len(), 2);
+
+        // int8 quantization requires cosine — a dot/int8 descriptor is rejected at
+        // registration (else it would wedge every later compaction).
+        let bad = VectorIndexDescriptor {
+            name: "doc_i8_dot".into(),
+            property: "emb2".into(),
+            metric: VectorMetric::Dot,
+            quantization: VectorQuantization::Int8,
+            ..desc
+        };
+        let err = session.register_vector_index(bad).await.unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -227,7 +227,7 @@ For large collections, promote it to a real ANN index (DiskANN/Vamana) so the op
 CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 3;
 ```
 
-All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
+All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. For large corpora, add `WITH { quantization: 'int8' }` to store the vectors as int8 (~4× smaller index, cosine-only). Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
 
 ```cypher
 CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 5, ef: 200}) YIELD node, score;

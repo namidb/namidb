@@ -1049,11 +1049,15 @@ struct ObservedQuery {
 fn vector_index_descriptor_from(
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
 ) -> namidb_storage::manifest::VectorIndexDescriptor {
-    use namidb_query::parser::ast::VectorMetric as M;
+    use namidb_query::parser::ast::{VectorMetric as M, VectorQuantization as Q};
     let metric = match cvi.metric {
         M::Cosine => namidb_storage::manifest::VectorMetric::Cosine,
         M::Dot => namidb_storage::manifest::VectorMetric::Dot,
         M::Euclidean => namidb_storage::manifest::VectorMetric::Euclidean,
+    };
+    let quantization = match cvi.quantization {
+        Q::None => namidb_storage::manifest::VectorQuantization::None,
+        Q::Int8 => namidb_storage::manifest::VectorQuantization::Int8,
     };
     // Vamana build defaults mirror `namidb_ann::BuildParams::default()`
     // (R=64, L_build=128, α=1.2); the user's `WITH {…}` overrides win.
@@ -1066,6 +1070,7 @@ fn vector_index_descriptor_from(
         r: cvi.r.unwrap_or(64),
         l_build: cvi.l_build.unwrap_or(128),
         alpha: cvi.alpha.unwrap_or(1.2),
+        quantization,
     }
 }
 

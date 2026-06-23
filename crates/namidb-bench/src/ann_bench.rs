@@ -36,7 +36,7 @@ use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
 use namidb_core::value::Value as CoreValue;
 use namidb_query::{lower, optimize, parse, StatsCatalog};
-use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric};
+use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
 use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -185,6 +185,7 @@ pub async fn run(
         r: 32,
         l_build: 64,
         alpha: 1.2,
+        quantization: VectorQuantization::None,
     })
     .await
     .map_err(|e| anyhow!("register index: {e}"))?;

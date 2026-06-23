@@ -41,7 +41,12 @@ const MAX_EXPRESSION_DEPTH: usize = 128;
 
 /// Optional Vamana build overrides from `CREATE VECTOR INDEX … WITH {…}`:
 /// `(r, l_build, alpha)`, each `None` when the key was omitted.
-type VectorBuildOverrides = (Option<usize>, Option<usize>, Option<f32>);
+type VectorBuildOverrides = (
+    Option<usize>,
+    Option<usize>,
+    Option<f32>,
+    crate::parser::ast::VectorQuantization,
+);
 
 struct Parser<'src> {
     src: &'src str,
@@ -600,13 +605,23 @@ impl<'src> Parser<'src> {
         let metric = self.parse_vector_metric()?;
         self.expect_soft_keyword("DIMENSION")?;
         let dim = self.parse_dimension()?;
-        let (r, l_build, alpha) = self.parse_optional_vector_with()?;
+        let (r, l_build, alpha, quantization) = self.parse_optional_vector_with()?;
         // `self.pos` now points just past the last consumed token.
         let end = self
             .tokens
             .get(self.pos.wrapping_sub(1))
             .map(|s| s.span.end)
             .unwrap_or(start);
+        // int8 quantization is cosine-only (the scale-invariant Int8Space).
+        if quantization == crate::parser::ast::VectorQuantization::Int8
+            && metric != VectorMetric::Cosine
+        {
+            return Err(ParseError::new(
+                ErrorCode::UnexpectedToken,
+                "int8 quantization requires METRIC cosine".to_string(),
+                SourceSpan::new(start, end),
+            ));
+        }
         Ok(CreateVectorIndexClause {
             name,
             label,
@@ -616,6 +631,7 @@ impl<'src> Parser<'src> {
             r,
             l_build,
             alpha,
+            quantization,
             span: SourceSpan::new(start, end),
         })
     }
@@ -866,14 +882,16 @@ impl<'src> Parser<'src> {
     /// Returns all-`None` when the clause is absent. `WITH` is a reserved
     /// keyword (`Token::With`), unlike the other DDL words which are soft.
     fn parse_optional_vector_with(&mut self) -> Result<VectorBuildOverrides, ParseError> {
+        use crate::parser::ast::VectorQuantization;
         if !self.check(&Token::With) {
-            return Ok((None, None, None));
+            return Ok((None, None, None, VectorQuantization::None));
         }
         self.bump(); // WITH
         self.expect(&Token::LBrace)?;
         let mut r = None;
         let mut l_build = None;
         let mut alpha = None;
+        let mut quantization = VectorQuantization::None;
         loop {
             let key = self.expect_identifier()?;
             self.expect(&Token::Colon)?;
@@ -887,11 +905,26 @@ impl<'src> Parser<'src> {
                 "alpha" => {
                     alpha = Some(self.parse_vector_option_float("alpha")?);
                 }
+                "quantization" => {
+                    let word = self.expect_identifier()?;
+                    quantization =
+                        VectorQuantization::from_keyword(&word.name).ok_or_else(|| {
+                            ParseError::new(
+                                ErrorCode::UnexpectedToken,
+                                format!(
+                                    "unknown quantization `{}` (expected none or int8)",
+                                    word.name
+                                ),
+                                word.span,
+                            )
+                        })?;
+                }
                 other => {
                     return Err(ParseError::new(
                         ErrorCode::UnexpectedToken,
                         format!(
-                            "unknown vector-index option `{other}` (expected r, l_build, or alpha)"
+                            "unknown vector-index option `{other}` \
+                             (expected r, l_build, alpha, or quantization)"
                         ),
                         key.span,
                     ));
@@ -903,7 +936,7 @@ impl<'src> Parser<'src> {
             break;
         }
         self.expect(&Token::RBrace)?;
-        Ok((r, l_build, alpha))
+        Ok((r, l_build, alpha, quantization))
     }
 
     fn parse_vector_option_int(&mut self, ctx: &str) -> Result<usize, ParseError> {
@@ -2749,12 +2782,39 @@ mod tests {
     }
 
     #[test]
+    fn create_vector_index_parses_int8_quantization() {
+        let q = ok(
+            "CREATE VECTOR INDEX ix ON :Doc(emb) METRIC cosine DIMENSION 8 \
+             WITH { quantization: int8 }",
+        );
+        let c = match &q.head.clauses[0] {
+            Clause::CreateVectorIndex(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.quantization, crate::parser::ast::VectorQuantization::Int8);
+    }
+
+    #[test]
+    fn create_vector_index_int8_requires_cosine() {
+        // int8 + a non-cosine metric is rejected at parse time.
+        assert_eq!(
+            err_code(
+                "CREATE VECTOR INDEX ix ON :Doc(emb) METRIC dot DIMENSION 8 \
+                 WITH { quantization: int8 }"
+            ),
+            ErrorCode::UnexpectedToken
+        );
+    }
+
+    #[test]
     fn create_vector_index_roundtrips() {
         // parse → format → parse must yield the same AST modulo spans.
         let cases = [
             "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16",
             "CREATE VECTOR INDEX ix ON :Doc(emb) METRIC dot DIMENSION 8 \
              WITH { r: 32, l_build: 64, alpha: 1.2 }",
+            "CREATE VECTOR INDEX iq ON :Doc(emb) METRIC cosine DIMENSION 8 \
+             WITH { quantization: int8 }",
         ];
         for src in cases {
             let q1 = ok(src);

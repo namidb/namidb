@@ -925,14 +925,20 @@ pub fn fast_rp_cancellable(
     }
     let pos: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
-    // Undirected adjacency (each stored out-edge links both directions).
+    // Undirected adjacency (each stored out-edge links both directions). Built
+    // in node-INSERTION order (`nodes`), not `graph.out` HashMap order, so each
+    // `adj[i]` neighbour list is deterministic — f32 propagation sums are
+    // non-associative, so a different neighbour order would yield different
+    // embeddings run-to-run / across platforms, breaking the seed determinism.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (&src, nbrs) in &graph.out {
-        let Some(&si) = pos.get(&src) else { continue };
-        for &(dst, _) in nbrs {
-            if let Some(&di) = pos.get(&dst) {
-                adj[si].push(di);
-                adj[di].push(si);
+    for &src in nodes {
+        let si = pos[&src];
+        if let Some(nbrs) = graph.out_edges(src) {
+            for &(dst, _) in nbrs {
+                if let Some(&di) = pos.get(&dst) {
+                    adj[si].push(di);
+                    adj[di].push(si);
+                }
             }
         }
     }

@@ -454,7 +454,7 @@ mod tests {
     use crate::parser::{Identifier, PropertyAccess, SourceSpan};
     use crate::plan::logical::{RowCount, VectorDistance};
     use crate::plan::{LogicalPlan, OrderKey, ProjectionItem};
-    use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric};
+    use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
 
     fn sp() -> SourceSpan {
         SourceSpan::point(0)
@@ -535,6 +535,7 @@ mod tests {
             r: 32,
             l_build: 64,
             alpha: 1.2,
+            quantization: VectorQuantization::None,
         });
         StatsCatalog::from_manifest(&m)
     }

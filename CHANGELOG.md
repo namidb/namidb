@@ -40,8 +40,14 @@ the release notes.
   and reranks candidates with the **true metric**, so the index score equals the
   flat scan's exactly (cosine similarity / raw dot, higher = closer; L2 distance,
   lower = closer). `euclidean` navigates with a new L2 space; `cosine`/`dot`
-  navigate with cosine. (`.vg` format bumped to v2; old `.vg` files are skipped
-  and rebuilt by compaction.)
+  navigate with cosine. (`.vg` format bumped; old `.vg` files are skipped and
+  rebuilt by compaction.)
+- **int8 quantization for vector indexes** — `CREATE VECTOR INDEX … WITH
+  {quantization: 'int8'}`. Stores per-vector int8 codes + a scale instead of full
+  f32 (~4× smaller `.vg`, the DiskANN memory/storage win for object-storage-first
+  indexes where the whole index is fetched per search). Cosine-only (the
+  scale-invariant int8 space); recall stays above ~0.80 and the score is the
+  quantized cosine. Opt-in per index; the default stays full-precision f32.
 
 ### Fixed
 

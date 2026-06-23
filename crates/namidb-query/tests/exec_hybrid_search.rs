@@ -159,6 +159,40 @@ async fn hybrid_requires_at_least_one_leg() {
 }
 
 #[tokio::test]
+async fn hybrid_rejects_alpha_out_of_range() {
+    let w = seed("hybrid-alpha").await;
+    let snap = w.snapshot();
+    let plan = lower(
+        &parse(
+            "CALL search.hybrid({ label: 'Doc', query_text: 'quantum', text_property: 'body', \
+             fusion: 'linear', alpha: 1.5, k: 3 }) YIELD node, score RETURN node",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        execute(&plan, &snap, &Params::new()).await.is_err(),
+        "alpha outside [0,1] must error"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_rejects_partial_dense_leg() {
+    let w = seed("hybrid-partial").await;
+    let snap = w.snapshot();
+    // query_vector without vector_property → error, not a silently-disabled leg.
+    let plan = lower(
+        &parse(
+            "CALL search.hybrid({ label: 'Doc', query_vector: [1.0, 0.0, 0.0], k: 3 }) \
+             YIELD node, score RETURN node",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(execute(&plan, &snap, &Params::new()).await.is_err());
+}
+
+#[tokio::test]
 async fn search_vector_procedure_ranks_by_closeness() {
     let w = seed("vec-proc").await;
     let cypher = "CALL search.vector({ label: 'Doc', property: 'embedding', \

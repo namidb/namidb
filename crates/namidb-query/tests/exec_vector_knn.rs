@@ -124,7 +124,7 @@ mod indexed {
     use super::*;
     use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
     use namidb_query::{optimize, StatsCatalog};
-    use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric};
+    use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
 
     const DIM: u32 = 4;
     const KNN3: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL \
@@ -174,6 +174,7 @@ mod indexed {
             r: 32,
             l_build: 64,
             alpha: 1.2,
+            quantization: VectorQuantization::None,
         })
         .await
         .unwrap();
@@ -424,6 +425,15 @@ mod indexed {
         metric: VectorMetric,
         docs: &[(&str, &str, Vec<f32>)],
     ) -> WriterSession {
+        build_index_q(name, metric, VectorQuantization::None, docs).await
+    }
+
+    async fn build_index_q(
+        name: &str,
+        metric: VectorMetric,
+        quantization: VectorQuantization,
+        docs: &[(&str, &str, Vec<f32>)],
+    ) -> WriterSession {
         let mut w = WriterSession::open(store(), paths(name)).await.unwrap();
         w.register_vector_index(VectorIndexDescriptor {
             name: "doc_emb".into(),
@@ -434,6 +444,7 @@ mod indexed {
             r: 32,
             l_build: 64,
             alpha: 1.2,
+            quantization,
         })
         .await
         .unwrap();
@@ -561,5 +572,38 @@ mod indexed {
         let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
         // query ∥ x → a (cos 1.0) then e (cos ~0.707).
         assert_eq!(got, vec!["a".to_string(), "e".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn int8_quantized_index_reaches_index_and_ranks_correctly() {
+        // An int8-quantized cosine index serves the same KNN (lossy but the
+        // well-separated fixtures rank identically to f32/brute force).
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+            ("e", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let w = build_index_q(
+            "idx-i8",
+            VectorMetric::Cosine,
+            VectorQuantization::Int8,
+            &docs,
+        )
+        .await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 2";
+        let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "int8 cosine KNN must reach the index"
+        );
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        // query ∥ x → a closest, then c (≈x).
+        assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
     }
 }

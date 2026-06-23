@@ -285,8 +285,40 @@ impl VectorMetric {
     }
 }
 
+/// On-disk vector quantization named in `CREATE VECTOR INDEX … WITH
+/// {quantization: …}`. Parser vocabulary, converted to
+/// `namidb_storage::manifest::VectorQuantization` by the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorQuantization {
+    /// Full-precision f32 vectors (default).
+    #[default]
+    None,
+    /// Per-vector int8 codes + scale (~4× smaller, cosine-only).
+    Int8,
+}
+
+impl VectorQuantization {
+    /// `none` / `int8` (case-insensitive) → the variant, else `None`.
+    pub fn from_keyword(word: &str) -> Option<Self> {
+        match word.to_ascii_lowercase().as_str() {
+            "none" => Some(VectorQuantization::None),
+            "int8" => Some(VectorQuantization::Int8),
+            _ => None,
+        }
+    }
+
+    /// Canonical source spelling (for [`fmt::Display`](std::fmt::Display)).
+    pub fn as_keyword(self) -> &'static str {
+        match self {
+            VectorQuantization::None => "none",
+            VectorQuantization::Int8 => "int8",
+        }
+    }
+}
+
 /// `CREATE VECTOR INDEX <name> FOR (<alias>:<Label>) ON <alias>.<property>
-/// METRIC <m> DIMENSION <n> [WITH {r, l_build, alpha}]` (RFC-030).
+/// METRIC <m> DIMENSION <n> [WITH {r, l_build, alpha, quantization}]` (RFC-030).
 ///
 /// A standalone schema command: the parser only emits it as the sole clause
 /// of a query, and the server executes it out-of-band (see
@@ -306,6 +338,8 @@ pub struct CreateVectorIndexClause {
     pub l_build: Option<usize>,
     /// Optional `WITH {alpha: …}` override of the Vamana diversification.
     pub alpha: Option<f32>,
+    /// `WITH {quantization: int8}` → store int8 codes (cosine-only); default `None`.
+    pub quantization: VectorQuantization,
     pub span: SourceSpan,
 }
 
