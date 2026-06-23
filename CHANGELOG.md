@@ -27,6 +27,13 @@ the release notes.
   tunable `ef` beam width (recall vs latency), mirroring `search.bm25`.
 - **Neo4j-compatible `CALL db.index.vector.queryNodes(indexName, k, queryVector
   [, {ef}])`** — resolves the index by name and serves it through the same path.
+- **FastRP structural embeddings — `CALL algo.fastRP({dimension, iterations,
+  iteration_weights, normalization_strength, seed})`.** Turns pure graph structure
+  into dense f32 embeddings (Fast Random Projection) with no model or external
+  service. The output is exactly the `(node, embedding)` shape the vector index
+  ingests, so "find structurally similar nodes" becomes a vector KNN over a `.vg`
+  built from the graph itself. Deterministic for a fixed seed, near-linear,
+  cancellable.
 - **All three vector metrics now serve from the Vamana index.** Previously only
   `cosine` used the `.vg`; `dot_product` and `euclidean_distance` fell back to the
   O(n) flat scan. The `.vg` now stores the **original (un-normalised) vectors**

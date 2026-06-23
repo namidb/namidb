@@ -830,6 +830,190 @@ pub fn shortest_paths_cancellable(
 }
 
 // ===========================================================================
+// FastRP — Fast Random Projection node embeddings
+// ===========================================================================
+
+/// Knobs for [`fast_rp`]. Defaults follow Neo4j GDS: dimension 256, four
+/// propagation hops with `[0, 1, 1, 1]` weights (hop 0 — the raw random
+/// projection — is dropped), undirected mean propagation.
+#[derive(Clone, Debug)]
+pub struct FastRpOptions {
+    /// Embedding dimensionality `d`.
+    pub dimension: usize,
+    /// One weight per hop, length `iterations + 1`. `iteration_weights[0]`
+    /// weights the initial random projection (hop 0); `[k]` weights the k-th
+    /// propagation. The embedding is `Σ_k w[k] · R_k`.
+    pub iteration_weights: Vec<f32>,
+    /// Degree-normalization exponent `β` on the *source* neighbour: a message
+    /// from `j` to `i` is scaled by `deg(j)^β / deg(i)`. `0.0` (default) is plain
+    /// mean propagation (`D⁻¹A`).
+    pub normalization_strength: f32,
+    /// Seed for the deterministic sparse random projection — same
+    /// `(graph, options, seed)` always yields the same embeddings.
+    pub seed: u64,
+}
+
+impl Default for FastRpOptions {
+    fn default() -> Self {
+        Self {
+            dimension: 256,
+            iteration_weights: vec![0.0, 1.0, 1.0, 1.0],
+            normalization_strength: 0.0,
+            seed: 42,
+        }
+    }
+}
+
+/// FastRP result: a `d`-dimensional f32 embedding per node — exactly the
+/// `(NodeId, Vec<f32>)` shape the vector index ingests, so structural embeddings
+/// can be written straight into a `.vg`.
+#[derive(Debug, Clone)]
+pub struct FastRp {
+    pub embeddings: HashMap<NodeId, Vec<f32>>,
+    pub dimension: usize,
+}
+
+/// SplitMix64 — a tiny deterministic PRNG for the sparse random projection (no
+/// external RNG dependency, fully reproducible across platforms).
+fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// L2-normalise a vector in place (no-op for a zero vector).
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v {
+            *x /= norm;
+        }
+    }
+}
+
+/// FastRP node embeddings over the undirected graph. See [`fast_rp_cancellable`].
+pub fn fast_rp(graph: &Graph, opts: &FastRpOptions) -> FastRp {
+    fast_rp_cancellable(graph, opts, &|| false).expect("non-cancelling closure cannot fail")
+}
+
+/// FastRP (Chen et al., "Fast and Accurate Network Embeddings via Very Sparse
+/// Random Projection", CIKM 2019). Each node starts from a very-sparse random
+/// projection (`±√s` with probability `1/(2s)` each, else 0, with `s = 3`),
+/// L2-normalised; that signal is propagated over the degree-normalised
+/// undirected adjacency for `iterations` hops, and the hops are combined with
+/// `iteration_weights`. Near-linear (`O(iterations · (E·d))`), deterministic for
+/// a fixed seed, and cancellable per hop.
+///
+/// The node iteration order is the graph's insertion order (`graph.nodes()`),
+/// never HashMap order, so embeddings are reproducible. Parallel/both-direction
+/// edges raise a node's effective degree (a multigraph view), matching how the
+/// other kernels here treat the edge multiset.
+pub fn fast_rp_cancellable(
+    graph: &Graph,
+    opts: &FastRpOptions,
+    cancel: &dyn Fn() -> bool,
+) -> Result<FastRp, Cancelled> {
+    let nodes = graph.nodes();
+    let n = nodes.len();
+    let d = opts.dimension;
+    if n == 0 || d == 0 {
+        return Ok(FastRp {
+            embeddings: HashMap::new(),
+            dimension: d,
+        });
+    }
+    let pos: HashMap<NodeId, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+    // Undirected adjacency (each stored out-edge links both directions).
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (&src, nbrs) in &graph.out {
+        let Some(&si) = pos.get(&src) else { continue };
+        for &(dst, _) in nbrs {
+            if let Some(&di) = pos.get(&dst) {
+                adj[si].push(di);
+                adj[di].push(si);
+            }
+        }
+    }
+    let deg: Vec<f64> = adj.iter().map(|a| a.len() as f64).collect();
+
+    // Hop 0: very-sparse random projection (s = 3), L2-normalised per node.
+    let scale = (3.0f32).sqrt();
+    let mut r_prev: Vec<Vec<f32>> = (0..n)
+        .map(|p| {
+            let node_seed = splitmix64(opts.seed ^ (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut v = vec![0.0f32; d];
+            for (dim, slot) in v.iter_mut().enumerate() {
+                let h = splitmix64(node_seed.wrapping_add(dim as u64));
+                // Uniform in [0, 1) from the top 53 bits.
+                let u = (h >> 11) as f64 / (1u64 << 53) as f64;
+                *slot = if u < 1.0 / 6.0 {
+                    scale
+                } else if u < 1.0 / 3.0 {
+                    -scale
+                } else {
+                    0.0
+                };
+            }
+            l2_normalize(&mut v);
+            v
+        })
+        .collect();
+
+    let iterations = opts.iteration_weights.len().saturating_sub(1);
+    let mut emb: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
+    let w0 = opts.iteration_weights.first().copied().unwrap_or(0.0);
+    if w0 != 0.0 {
+        for i in 0..n {
+            for x in 0..d {
+                emb[i][x] += w0 * r_prev[i][x];
+            }
+        }
+    }
+
+    let beta = opts.normalization_strength as f64;
+    for k in 1..=iterations {
+        if cancel() {
+            return Err(Cancelled);
+        }
+        let mut r_next: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
+        for i in 0..n {
+            let di = deg[i].max(1.0);
+            let row = &mut r_next[i];
+            for &j in &adj[i] {
+                // Propagate from the previous hop (`r_prev`), so writing `row`
+                // (= r_next[i]) never aliases the source.
+                let cij = (deg[j].max(1.0).powf(beta) / di) as f32;
+                for x in 0..d {
+                    row[x] += cij * r_prev[j][x];
+                }
+            }
+            l2_normalize(row);
+        }
+        let wk = opts.iteration_weights[k];
+        if wk != 0.0 {
+            for i in 0..n {
+                for x in 0..d {
+                    emb[i][x] += wk * r_next[i][x];
+                }
+            }
+        }
+        r_prev = r_next;
+    }
+
+    let embeddings = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, std::mem::take(&mut emb[i])))
+        .collect();
+    Ok(FastRp {
+        embeddings,
+        dimension: d,
+    })
+}
+
+// ===========================================================================
 // Shared helpers
 // ===========================================================================
 
@@ -952,6 +1136,49 @@ mod tests {
             pr.scores.values().all(|s| s.is_finite() && *s >= 0.0),
             "negative/NaN score leaked: {:?}",
             pr.scores
+        );
+    }
+
+    #[test]
+    fn fastrp_is_deterministic_and_separates_communities() {
+        // Two triangles joined by a single bridge edge. Nodes inside a triangle
+        // should embed more similarly to each other than to the far triangle.
+        let t1 = [nid([1; 16]), nid([2; 16]), nid([3; 16])];
+        let t2 = [nid([4; 16]), nid([5; 16]), nid([6; 16])];
+        let mut g = Graph::new();
+        for tri in [&t1, &t2] {
+            g.add_edge(tri[0], tri[1], None);
+            g.add_edge(tri[1], tri[2], None);
+            g.add_edge(tri[2], tri[0], None);
+        }
+        g.add_edge(t1[0], t2[0], None); // bridge
+
+        let opts = FastRpOptions {
+            dimension: 64,
+            ..Default::default()
+        };
+        let a = fast_rp(&g, &opts);
+        let b = fast_rp(&g, &opts);
+        assert_eq!(a.embeddings, b.embeddings, "same seed → same embeddings");
+        assert!(a.embeddings.values().all(|v| v.len() == 64));
+
+        let cos = |x: &[f32], y: &[f32]| -> f32 {
+            let dot: f32 = x.iter().zip(y).map(|(p, q)| p * q).sum();
+            let nx = x.iter().map(|p| p * p).sum::<f32>().sqrt();
+            let ny = y.iter().map(|p| p * p).sum::<f32>().sqrt();
+            if nx == 0.0 || ny == 0.0 {
+                0.0
+            } else {
+                dot / (nx * ny)
+            }
+        };
+        // Within-triangle similarity exceeds the cross-triangle similarity for
+        // the two non-bridge nodes.
+        let within = cos(&a.embeddings[&t1[1]], &a.embeddings[&t1[2]]);
+        let across = cos(&a.embeddings[&t1[1]], &a.embeddings[&t2[1]]);
+        assert!(
+            within > across,
+            "within {within} should exceed across {across}"
         );
     }
 

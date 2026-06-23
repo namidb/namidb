@@ -108,6 +108,60 @@ async fn call_wcc_yields_three_components_including_isolate() {
 }
 
 #[tokio::test]
+async fn call_fastrp_yields_structural_embeddings() {
+    let mut writer = WriterSession::open(store(), paths("call-fastrp"))
+        .await
+        .unwrap();
+    let ids = build(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let rows = run(
+        &snapshot,
+        "CALL algo.fastRP({dimension: 16, seed: 7}) YIELD node_id, embedding",
+    )
+    .await;
+    assert_eq!(rows.len(), 5, "one embedding per node");
+
+    let mut emb: BTreeMap<[u8; 16], Vec<f32>> = BTreeMap::new();
+    for r in &rows {
+        let nid = match r.get("node_id") {
+            Some(RuntimeValue::Node(n)) => *n.id.as_bytes(),
+            other => panic!("node_id not a node: {other:?}"),
+        };
+        let v = match r.get("embedding") {
+            Some(RuntimeValue::Vector(v)) => v.clone(),
+            other => panic!("embedding not a vector: {other:?}"),
+        };
+        assert_eq!(v.len(), 16, "embedding has the requested dimension");
+        emb.insert(nid, v);
+    }
+
+    let cos = |x: &[f32], y: &[f32]| -> f32 {
+        let dot: f32 = x.iter().zip(y).map(|(p, q)| p * q).sum();
+        let nx = x.iter().map(|p| p * p).sum::<f32>().sqrt();
+        let ny = y.iter().map(|p| p * p).sum::<f32>().sqrt();
+        if nx == 0.0 || ny == 0.0 {
+            0.0
+        } else {
+            dot / (nx * ny)
+        }
+    };
+    // The connected pair a-b is more similar than a vs the isolate e.
+    let connected = cos(
+        emb[ids[0].as_bytes()].as_slice(),
+        emb[ids[1].as_bytes()].as_slice(),
+    );
+    let isolate = cos(
+        emb[ids[0].as_bytes()].as_slice(),
+        emb[ids[4].as_bytes()].as_slice(),
+    );
+    assert!(
+        connected > isolate,
+        "connected pair ({connected}) should embed closer than the isolate ({isolate})"
+    );
+}
+
+#[tokio::test]
 async fn call_pagerank_scores_sum_to_one_and_cover_all_nodes() {
     let mut writer = WriterSession::open(store(), paths("call-pr"))
         .await

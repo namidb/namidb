@@ -1569,11 +1569,29 @@ async fn flat_call_procedure(
                 .collect();
             (vec!["node_id", "distance", "hops"], raw)
         }
+        "fastRP" | "fast_rp" | "fastrp" => {
+            let opts = fastrp_options(args, params)?;
+            let result = namidb_graph::algo::fast_rp_cancellable(
+                &graph,
+                &opts,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            // Deterministic order by node id; the embedding is a FloatVector
+            // ready to ingest straight into a vector index.
+            let mut entries: Vec<(NodeId, Vec<f32>)> = result.embeddings.into_iter().collect();
+            entries.sort_by_key(|e| e.0);
+            let raw = entries
+                .into_iter()
+                .map(|(id, emb)| vec![node_runtime(id), RuntimeValue::Vector(emb)])
+                .collect();
+            (vec!["node_id", "embedding"], raw)
+        }
         other => {
             return Err(proc_unsupported(format!(
                 "unknown procedure `algo.{other}` (supported: algo.wcc, algo.scc, \
                  algo.pagerank, algo.degree, algo.triangle_count, \
-                 algo.label_propagation, algo.shortest_path)"
+                 algo.label_propagation, algo.shortest_path, algo.fastRP)"
             )));
         }
     };
@@ -2404,6 +2422,87 @@ fn pagerank_options(
         _ => {
             return Err(proc_unsupported(
                 "algo.pagerank takes at most one (map) argument",
+            ));
+        }
+    }
+    Ok(opts)
+}
+
+/// Resolve `algo.fastRP` options from an optional map:
+/// `{dimension?, iterations?, iteration_weights?, normalization_strength?, seed?}`.
+/// `iterations: k` sets the default `[0, 1, …, 1]` weights of length `k+1`; an
+/// explicit `iteration_weights` list overrides that.
+fn fastrp_options(
+    args: &[Expression],
+    params: &Params,
+) -> Result<namidb_graph::algo::FastRpOptions, ExecError> {
+    let mut opts = namidb_graph::algo::FastRpOptions::default();
+    match args {
+        [] => {}
+        [arg] => {
+            let map = match evaluate(arg, &Row::new(), params)? {
+                RuntimeValue::Map(m) => m,
+                _ => {
+                    return Err(proc_unsupported(
+                        "algo.fastRP expects a single map argument, e.g. {dimension: 256}",
+                    ))
+                }
+            };
+            if let Some(v) = map.get("dimension") {
+                opts.dimension = as_usize(v).ok_or_else(|| {
+                    proc_unsupported("algo.fastRP `dimension` must be a non-negative integer")
+                })?;
+            }
+            if let Some(v) = map.get("normalization_strength") {
+                opts.normalization_strength = as_f64(v).ok_or_else(|| {
+                    proc_unsupported("algo.fastRP `normalization_strength` must be a number")
+                })? as f32;
+            }
+            if let Some(v) = map.get("seed") {
+                opts.seed = as_usize(v).ok_or_else(|| {
+                    proc_unsupported("algo.fastRP `seed` must be a non-negative integer")
+                })? as u64;
+            }
+            if let Some(v) = map.get("iterations") {
+                let iters = as_usize(v).ok_or_else(|| {
+                    proc_unsupported("algo.fastRP `iterations` must be a non-negative integer")
+                })?;
+                opts.iteration_weights = std::iter::once(0.0)
+                    .chain(std::iter::repeat_n(1.0, iters))
+                    .collect();
+            }
+            if let Some(v) = map.get("iteration_weights") {
+                match v {
+                    RuntimeValue::List(items) => {
+                        let mut w = Vec::with_capacity(items.len());
+                        for it in items {
+                            w.push(as_f64(it).ok_or_else(|| {
+                                proc_unsupported(
+                                    "algo.fastRP `iteration_weights` must be a list of numbers",
+                                )
+                            })? as f32);
+                        }
+                        if w.is_empty() {
+                            return Err(proc_unsupported(
+                                "algo.fastRP `iteration_weights` must be non-empty",
+                            ));
+                        }
+                        opts.iteration_weights = w;
+                    }
+                    _ => {
+                        return Err(proc_unsupported(
+                            "algo.fastRP `iteration_weights` must be a list of numbers",
+                        ))
+                    }
+                }
+            }
+            if opts.dimension == 0 {
+                return Err(proc_unsupported("algo.fastRP `dimension` must be >= 1"));
+            }
+        }
+        _ => {
+            return Err(proc_unsupported(
+                "algo.fastRP takes at most one (map) argument",
             ));
         }
     }
