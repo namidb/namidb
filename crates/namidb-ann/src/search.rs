@@ -62,6 +62,14 @@ pub(crate) fn beam_search(
     if n == 0 || k == 0 {
         return Vec::new();
     }
+    // The entry point comes from a stored graph that may have been decoded from
+    // object storage (the `.vg` body has no checksum), so an out-of-range entry
+    // is possible on a corrupt/foreign file. Neighbour ids are already bounds-
+    // checked in the expansion loop; guard the entry the same way rather than
+    // indexing `visited[entry]` / `adjacency[entry]` and panicking.
+    if entry as usize >= n {
+        return Vec::new();
+    }
     let k = k.min(n);
     let ef = ef.max(k).min(n);
 
@@ -193,6 +201,19 @@ mod tests {
         let out = search(&s, &g, &[0.0, -1.0], 1, 4);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, 3, "must walk the chain to reach node 3");
+    }
+
+    #[test]
+    fn out_of_range_entry_returns_empty_not_panic() {
+        // A graph decoded from a corrupt/foreign body could carry an entry that
+        // is out of range for its adjacency. Search must return empty, not panic
+        // on `visited[entry]`.
+        let s = ring_space();
+        let g = VamanaGraph {
+            adjacency: vec![vec![1], vec![0], vec![3], vec![2]],
+            entry: 99,
+        };
+        assert!(search(&s, &g, &[1.0, 0.0], 2, 4).is_empty());
     }
 
     #[test]

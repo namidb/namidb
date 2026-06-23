@@ -1398,9 +1398,14 @@ async fn flat_call_procedure(
     if namespace == Some("search") {
         return flat_search_procedure(name, args, yield_items, snapshot, params).await;
     }
+    // Neo4j-compatible `CALL db.index.vector.queryNodes(indexName, k, queryVector)`.
+    if namespace == Some("db.index.vector") {
+        return db_index_vector_procedure(name, args, yield_items, snapshot, params).await;
+    }
     if !matches!(namespace, Some("algo") | None) {
         return Err(proc_unsupported(format!(
-            "unknown procedure namespace `{}` (supported: `algo`, `search`)",
+            "unknown procedure namespace `{}` \
+             (supported: `algo`, `search`, `db.index.vector`)",
             namespace.unwrap_or("")
         )));
     }
@@ -1634,8 +1639,11 @@ async fn flat_search_procedure(
 ) -> Result<Vec<Row>, ExecError> {
     match name {
         "bm25" => bm25_search(args, yield_items, snapshot, params).await,
+        "vector" => vector_search_procedure(args, yield_items, snapshot, params).await,
+        "hybrid" => hybrid_search_procedure(args, yield_items, snapshot, params).await,
         other => Err(proc_unsupported(format!(
-            "unknown procedure `search.{other}` (supported: search.bm25)"
+            "unknown procedure `search.{other}` \
+             (supported: search.bm25, search.vector, search.hybrid)"
         ))),
     }
 }
@@ -1656,34 +1664,64 @@ async fn bm25_search(
     snapshot: &Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
+    let (label, props, query, k) = bm25_search_args(args, params)?;
+    let ranked = bm25_ranked(snapshot, &label, &props, &query, k).await?;
+
+    // Hydrate each ranked id to its full node so `YIELD node` carries the
+    // document's properties. A doc ranked but since deleted resolves to None.
+    let mut raw = Vec::with_capacity(ranked.len());
+    for (id, score) in ranked {
+        if let Some(view) = snapshot.lookup_node(&label, id).await? {
+            let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
+            raw.push(vec![node, RuntimeValue::Float(score)]);
+        }
+    }
+    project_proc_rows("search.bm25", &["node", "score"], raw, yield_items)
+}
+
+/// Full BM25 ranking as `(NodeId, score)` best-first (score desc, `NodeId` asc on
+/// ties) — the retrieval core shared by `search.bm25` and the sparse leg of
+/// `search.hybrid`. Serves from a registered full-text index when one covers
+/// `(label, props)` and is authoritative for the corpus, else the exact flat
+/// scan; either way the result is freshness-equivalent to the flat scan. `k`
+/// caps the result (`None` = all). The empty-query case returns an empty vec.
+async fn bm25_ranked(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    query: &str,
+    k: Option<usize>,
+) -> Result<Vec<(NodeId, f64)>, ExecError> {
     use crate::exec::text_scoring::{bm25_idf, bm25_term_score, tokenize_counts};
 
-    let (label, props, query, k) = bm25_search_args(args, params)?;
-
-    // Distinct query terms (a repeated query term is scored once).
-    let mut qterms: Vec<String> = Vec::new();
-    for t in tokenize_counts(&query).0.into_keys() {
-        qterms.push(t);
-    }
-    qterms.sort(); // deterministic df/idf index order
+    // Distinct query terms (a repeated query term is scored once), sorted for a
+    // deterministic df/idf index order.
+    let mut qterms: Vec<String> = tokenize_counts(query).0.into_keys().collect();
+    qterms.sort();
     if qterms.is_empty() {
-        return project_proc_rows("search.bm25", &["node", "score"], Vec::new(), yield_items);
+        return Ok(Vec::new());
     }
 
-    // (`text-index`): serve from a registered full-text index when one covers
-    // (label, properties), so we score only documents containing a query term
-    // instead of re-scanning the whole label. Falls through to the flat scan
-    // when no index applies (feature off, no descriptor, or a property mismatch).
+    // (`text-index`): serve from a registered full-text index that covers
+    // (label, props) and is authoritative for the corpus; `text_search` returns
+    // None (→ flat scan) when it is not, keeping fresh writes visible.
     #[cfg(feature = "text-index")]
     {
-        if let Some(rows) =
-            bm25_index_search(snapshot, &label, &props, &qterms, k, yield_items).await?
-        {
-            return Ok(rows);
+        let index_name = snapshot
+            .manifest()
+            .manifest
+            .text_indexes
+            .iter()
+            .find(|d| d.matches(label, props))
+            .map(|d| d.name.clone());
+        if let Some(index_name) = index_name {
+            if let Some(hits) = snapshot.text_search(&index_name, label, &qterms, k).await? {
+                return Ok(hits);
+            }
         }
     }
 
-    let views = snapshot.scan_label(&label).await?;
+    let views = snapshot.scan_label(label).await?;
 
     // One pass: corpus stats over every document (a node with the text field)
     // and the per-query-term frequencies of the candidate documents.
@@ -1693,7 +1731,7 @@ async fn bm25_search(
     let mut candidates: Vec<(usize, Vec<u32>, usize)> = Vec::new(); // (view idx, tf per qterm, len)
     let mut since_check = 0usize;
     for (vi, view) in views.iter().enumerate() {
-        let Some(text) = doc_text(view, &props) else {
+        let Some(text) = doc_text(view, props) else {
             continue; // not part of the searchable corpus
         };
         let (counts, len) = tokenize_counts(&text);
@@ -1749,61 +1787,10 @@ async fn bm25_search(
         scored.truncate(k);
     }
 
-    let raw: Vec<Vec<RuntimeValue>> = scored
+    Ok(scored
         .into_iter()
-        .map(|(vi, s)| {
-            let node = RuntimeValue::Node(Box::new(NodeValue::from(views[vi].clone())));
-            vec![node, RuntimeValue::Float(s)]
-        })
-        .collect();
-    project_proc_rows("search.bm25", &["node", "score"], raw, yield_items)
-}
-
-/// (`text-index`): answer `search.bm25` from a registered full-text index when
-/// one covers `(label, props)`. Returns `Ok(None)` when no descriptor matches so
-/// the caller falls through to the flat scan. The index yields `(NodeId, score)`;
-/// each hit is hydrated to a full node via `lookup_node` so `YIELD node` carries
-/// the document's properties, exactly as the flat path does.
-#[cfg(feature = "text-index")]
-async fn bm25_index_search(
-    snapshot: &Snapshot<'_>,
-    label: &str,
-    props: &[String],
-    qterms: &[String],
-    k: Option<usize>,
-    yield_items: &[(String, String)],
-) -> Result<Option<Vec<Row>>, ExecError> {
-    let index_name = snapshot
-        .manifest()
-        .manifest
-        .text_indexes
-        .iter()
-        .find(|d| d.matches(label, props))
-        .map(|d| d.name.clone());
-    let Some(index_name) = index_name else {
-        return Ok(None);
-    };
-
-    // `text_search` returns None when the index is not authoritative for the
-    // current corpus (no built SST yet, or un-compacted writes the index has not
-    // absorbed); fall through to the flat scan so fresh writes stay visible.
-    let Some(hits) = snapshot.text_search(&index_name, label, qterms, k).await? else {
-        return Ok(None);
-    };
-    let mut raw = Vec::with_capacity(hits.len());
-    for (node_id, score) in hits {
-        // A document indexed but since deleted resolves to None; skip it.
-        if let Some(view) = snapshot.lookup_node(label, node_id).await? {
-            let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
-            raw.push(vec![node, RuntimeValue::Float(score)]);
-        }
-    }
-    Ok(Some(project_proc_rows(
-        "search.bm25",
-        &["node", "score"],
-        raw,
-        yield_items,
-    )?))
+        .map(|(vi, s)| (views[vi].id, s))
+        .collect())
 }
 
 /// The text of a document for BM25: the configured properties' string values
@@ -1912,6 +1899,431 @@ fn bm25_search_args(
         };
 
     Ok((label, props, query, k))
+}
+
+/// Single required map argument for a procedure: `CALL proc({...})`.
+fn proc_single_map(
+    args: &[Expression],
+    params: &Params,
+    proc: &str,
+) -> Result<std::collections::BTreeMap<String, RuntimeValue>, ExecError> {
+    match args {
+        [arg] => match evaluate(arg, &Row::new(), params)? {
+            RuntimeValue::Map(m) => Ok(m),
+            _ => Err(proc_unsupported(format!(
+                "{proc} expects a single map argument"
+            ))),
+        },
+        _ => Err(proc_unsupported(format!(
+            "{proc} requires one map argument"
+        ))),
+    }
+}
+
+/// A map value as an owned `String`, or `None` if it is not a string.
+fn proc_str(v: &RuntimeValue) -> Option<String> {
+    match v {
+        RuntimeValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Coerce a map value into an f32 query vector: a `vector()`/int8 vector, or a
+/// Cypher list of numbers.
+fn runtime_to_f32_vec(v: &RuntimeValue) -> Option<Vec<f32>> {
+    match v {
+        RuntimeValue::Vector(x) => Some(x.clone()),
+        RuntimeValue::Vector8 { codes, scale } => {
+            Some(codes.iter().map(|&c| c as f32 * *scale).collect())
+        }
+        RuntimeValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    RuntimeValue::Float(f) => out.push(*f as f32),
+                    RuntimeValue::Integer(n) => out.push(*n as f32),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Parse an optional `metric` map value into a [`VectorDistance`] (default cosine).
+fn proc_metric(
+    v: Option<&RuntimeValue>,
+) -> Result<crate::plan::logical::VectorDistance, ExecError> {
+    use crate::plan::logical::VectorDistance;
+    match v {
+        None => Ok(VectorDistance::Cosine),
+        Some(RuntimeValue::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "cosine" => Ok(VectorDistance::Cosine),
+            "dot" | "dot_product" => Ok(VectorDistance::Dot),
+            "euclidean" | "l2" => Ok(VectorDistance::Euclidean),
+            other => Err(proc_unsupported(format!(
+                "unknown metric `{other}` (cosine|dot|euclidean)"
+            ))),
+        },
+        Some(_) => Err(proc_unsupported("`metric` must be a string")),
+    }
+}
+
+/// Map storage `VectorMetric` (from a registered index descriptor) to the
+/// engine's `VectorDistance`.
+fn storage_metric_to_distance(
+    m: namidb_storage::manifest::VectorMetric,
+) -> crate::plan::logical::VectorDistance {
+    use crate::plan::logical::VectorDistance;
+    use namidb_storage::manifest::VectorMetric;
+    match m {
+        VectorMetric::Cosine => VectorDistance::Cosine,
+        VectorMetric::Dot => VectorDistance::Dot,
+        VectorMetric::Euclidean => VectorDistance::Euclidean,
+    }
+}
+
+/// Extract `(NodeId, score)` from `vector_search_rows` / procedure rows (bound to
+/// `node` + `score`), for fusion.
+fn rows_to_id_score(rows: &[Row]) -> Vec<(NodeId, f64)> {
+    rows.iter()
+        .filter_map(|r| {
+            let id = match r.get("node") {
+                Some(RuntimeValue::Node(n)) => n.id,
+                _ => return None,
+            };
+            let score = match r.get("score") {
+                Some(RuntimeValue::Float(f)) => *f,
+                Some(RuntimeValue::Integer(i)) => *i as f64,
+                _ => return None,
+            };
+            Some((id, score))
+        })
+        .collect()
+}
+
+/// `CALL search.vector({label, property, query, k?, ef?, metric?}) YIELD node,
+/// score` — vector KNN served from the Vamana index (or the exact flat scan),
+/// with a tunable `ef` beam width (recall vs latency). The ergonomic,
+/// EXPLAIN-free counterpart to the optimizer's KNN rewrite.
+async fn vector_search_procedure(
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    let map = proc_single_map(args, params, "search.vector")?;
+    let label = map
+        .get("label")
+        .and_then(proc_str)
+        .ok_or_else(|| proc_unsupported("search.vector requires a `label` string"))?;
+    let property = map
+        .get("property")
+        .and_then(proc_str)
+        .ok_or_else(|| proc_unsupported("search.vector requires a `property` string"))?;
+    let qv = map
+        .get("query")
+        .and_then(runtime_to_f32_vec)
+        .ok_or_else(|| {
+            proc_unsupported("search.vector requires a `query` vector (list or vector())")
+        })?;
+    let k = match map.get("k") {
+        None => 10,
+        Some(v) => as_usize(v)
+            .ok_or_else(|| proc_unsupported("search.vector `k` must be a non-negative integer"))?,
+    };
+    let ef = match map.get("ef") {
+        None => None,
+        Some(v) => Some(as_usize(v).ok_or_else(|| {
+            proc_unsupported("search.vector `ef` must be a non-negative integer")
+        })?),
+    };
+    let distance = proc_metric(map.get("metric"))?;
+
+    let q = RuntimeValue::Vector(qv);
+    let rows = vector_search_rows(
+        snapshot,
+        Some(&label),
+        "node",
+        &property,
+        &q,
+        SourceSpan::point(0),
+        k,
+        distance,
+        "score",
+        None,
+        ef,
+        params,
+    )
+    .await?;
+    let raw: Vec<Vec<RuntimeValue>> = rows
+        .into_iter()
+        .map(|r| {
+            vec![
+                r.get("node").cloned().unwrap_or(RuntimeValue::Null),
+                r.get("score").cloned().unwrap_or(RuntimeValue::Null),
+            ]
+        })
+        .collect();
+    project_proc_rows("search.vector", &["node", "score"], raw, yield_items)
+}
+
+/// `CALL db.index.vector.queryNodes(indexName, k, queryVector [, {ef}])
+/// YIELD node, score` — Neo4j-compatible vector KNN. Resolves the index by NAME
+/// (its descriptor supplies the label, property, and metric), then serves it
+/// through the same path as `search.vector`.
+async fn db_index_vector_procedure(
+    name: &str,
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    if name != "queryNodes" {
+        return Err(proc_unsupported(format!(
+            "unknown procedure `db.index.vector.{name}` (supported: queryNodes)"
+        )));
+    }
+    if args.len() < 3 {
+        return Err(proc_unsupported(
+            "db.index.vector.queryNodes(indexName, k, queryVector [, {ef: …}])",
+        ));
+    }
+    let index_name = match evaluate(&args[0], &Row::new(), params)? {
+        RuntimeValue::String(s) => s,
+        _ => return Err(proc_unsupported("queryNodes `indexName` must be a string")),
+    };
+    let k = as_usize(&evaluate(&args[1], &Row::new(), params)?)
+        .ok_or_else(|| proc_unsupported("queryNodes `k` must be a non-negative integer"))?;
+    let qv = runtime_to_f32_vec(&evaluate(&args[2], &Row::new(), params)?)
+        .ok_or_else(|| proc_unsupported("queryNodes `queryVector` must be a list or vector()"))?;
+    let ef = match args.get(3) {
+        None => None,
+        Some(a) => match evaluate(a, &Row::new(), params)? {
+            RuntimeValue::Map(m) => m.get("ef").and_then(as_usize),
+            _ => None,
+        },
+    };
+
+    // Resolve the index by name → (label, property, metric).
+    let resolved = snapshot
+        .manifest()
+        .manifest
+        .vector_indexes
+        .iter()
+        .find(|d| d.name == index_name)
+        .map(|d| {
+            (
+                d.label.clone(),
+                d.property.clone(),
+                storage_metric_to_distance(d.metric),
+            )
+        });
+    let (label, property, distance) = resolved
+        .ok_or_else(|| proc_unsupported(format!("no vector index named `{index_name}`")))?;
+
+    let q = RuntimeValue::Vector(qv);
+    let rows = vector_search_rows(
+        snapshot,
+        Some(&label),
+        "node",
+        &property,
+        &q,
+        SourceSpan::point(0),
+        k,
+        distance,
+        "score",
+        None,
+        ef,
+        params,
+    )
+    .await?;
+    let raw: Vec<Vec<RuntimeValue>> = rows
+        .into_iter()
+        .map(|r| {
+            vec![
+                r.get("node").cloned().unwrap_or(RuntimeValue::Null),
+                r.get("score").cloned().unwrap_or(RuntimeValue::Null),
+            ]
+        })
+        .collect();
+    project_proc_rows(
+        "db.index.vector.queryNodes",
+        &["node", "score"],
+        raw,
+        yield_items,
+    )
+}
+
+/// Resolve the sparse leg's text properties from a `search.hybrid` map:
+/// `text_properties` (non-empty list) or `text_property` (string).
+fn hybrid_text_props(
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+) -> Result<Vec<String>, ExecError> {
+    match (map.get("text_properties"), map.get("text_property")) {
+        (Some(RuntimeValue::List(items)), _) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match proc_str(it) {
+                    Some(s) => out.push(s),
+                    None => {
+                        return Err(proc_unsupported(
+                            "search.hybrid `text_properties` must be a list of strings",
+                        ))
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Err(proc_unsupported(
+                    "search.hybrid `text_properties` must be non-empty",
+                ));
+            }
+            Ok(out)
+        }
+        (Some(_), _) => Err(proc_unsupported(
+            "search.hybrid `text_properties` must be a list of strings",
+        )),
+        (None, Some(v)) => proc_str(v)
+            .map(|s| vec![s])
+            .ok_or_else(|| proc_unsupported("search.hybrid `text_property` must be a string")),
+        (None, None) => Err(proc_unsupported(
+            "search.hybrid sparse leg requires `text_property` or `text_properties`",
+        )),
+    }
+}
+
+/// `CALL search.hybrid({label, query_text?, text_property(ies)?, query_vector?,
+/// vector_property?, k?, ef?, fusion?, rrf_k?, alpha?, metric?}) YIELD node,
+/// score` — fuse a dense (vector KNN) and a sparse (BM25) retrieval into one
+/// ranking. Default fusion is Reciprocal Rank Fusion (rank-based, needs no score
+/// calibration across the two scales); `fusion: 'linear'` does a weighted
+/// min-max blend (`alpha` on the dense leg). Each leg independently serves from
+/// its index or falls back to its exact flat scan, so hybrid is
+/// freshness-equivalent to running the two separately and fusing. At least one
+/// leg must be configured.
+async fn hybrid_search_procedure(
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::exec::fusion;
+
+    let map = proc_single_map(args, params, "search.hybrid")?;
+    let label = map
+        .get("label")
+        .and_then(proc_str)
+        .ok_or_else(|| proc_unsupported("search.hybrid requires a `label` string"))?;
+    let k = match map.get("k") {
+        None => 10,
+        Some(v) => as_usize(v)
+            .ok_or_else(|| proc_unsupported("search.hybrid `k` must be a non-negative integer"))?,
+    };
+    let ef = match map.get("ef") {
+        None => None,
+        Some(v) => Some(as_usize(v).ok_or_else(|| {
+            proc_unsupported("search.hybrid `ef` must be a non-negative integer")
+        })?),
+    };
+    let distance = proc_metric(map.get("metric"))?;
+    let fusion_mode = map
+        .get("fusion")
+        .and_then(proc_str)
+        .unwrap_or_else(|| "rrf".to_string());
+    let rrf_k = map
+        .get("rrf_k")
+        .and_then(as_f64)
+        .unwrap_or(fusion::DEFAULT_RRF_K);
+    let alpha = map.get("alpha").and_then(as_f64).unwrap_or(0.5);
+    // Per-leg candidate depth before fusion: over-fetch so a node ranked well in
+    // one leg but just outside the other's window still contributes.
+    const OVERFETCH: usize = 8;
+    let k_dense = map
+        .get("k_dense")
+        .and_then(as_usize)
+        .unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
+    let k_sparse = map
+        .get("k_sparse")
+        .and_then(as_usize)
+        .unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
+
+    let dense_configured = map.contains_key("query_vector") && map.contains_key("vector_property");
+    let sparse_configured = map.contains_key("query_text");
+    if !dense_configured && !sparse_configured {
+        return Err(proc_unsupported(
+            "search.hybrid needs a dense leg (query_vector + vector_property) \
+             and/or a sparse leg (query_text + text_property/properties)",
+        ));
+    }
+
+    // Dense leg (vector KNN), best-first.
+    let dense: Vec<(NodeId, f64)> = if dense_configured {
+        let qv = map
+            .get("query_vector")
+            .and_then(runtime_to_f32_vec)
+            .ok_or_else(|| {
+                proc_unsupported("search.hybrid `query_vector` must be a list or vector()")
+            })?;
+        let vprop = map
+            .get("vector_property")
+            .and_then(proc_str)
+            .ok_or_else(|| proc_unsupported("search.hybrid `vector_property` must be a string"))?;
+        let q = RuntimeValue::Vector(qv);
+        let rows = vector_search_rows(
+            snapshot,
+            Some(&label),
+            "node",
+            &vprop,
+            &q,
+            SourceSpan::point(0),
+            k_dense,
+            distance,
+            "score",
+            None,
+            ef,
+            params,
+        )
+        .await?;
+        rows_to_id_score(&rows)
+    } else {
+        Vec::new()
+    };
+
+    // Sparse leg (BM25), best-first.
+    let sparse: Vec<(NodeId, f64)> = if sparse_configured {
+        let qtext = map
+            .get("query_text")
+            .and_then(proc_str)
+            .ok_or_else(|| proc_unsupported("search.hybrid `query_text` must be a string"))?;
+        let props = hybrid_text_props(&map)?;
+        bm25_ranked(snapshot, &label, &props, &qtext, Some(k_sparse)).await?
+    } else {
+        Vec::new()
+    };
+
+    let fused = match fusion_mode.to_ascii_lowercase().as_str() {
+        "rrf" => fusion::rrf(&[&dense, &sparse], rrf_k),
+        "linear" => fusion::linear(&[&dense, &sparse], &[alpha, 1.0 - alpha]),
+        other => {
+            return Err(proc_unsupported(format!(
+                "unknown fusion `{other}` (rrf|linear)"
+            )))
+        }
+    };
+
+    // Materialise the fused top-k nodes.
+    let mut raw = Vec::with_capacity(k.min(fused.len()));
+    for (id, score) in fused.into_iter().take(k) {
+        crate::exec::limits::check_deadline()?;
+        if let Some(view) = snapshot.lookup_node(&label, id).await? {
+            raw.push(vec![
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                RuntimeValue::Float(score),
+            ]);
+        }
+    }
+    project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
 }
 
 /// A `node_id` YIELD value: a node carrying just its id (labels/properties
@@ -2114,12 +2526,50 @@ async fn flat_vector_search(
     post_filter: Option<&Expression>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    use crate::exec::expr::vector_score;
-
     // The query expression carries no row bindings (literal vector or $param);
-    // evaluate it once against an empty row.
+    // evaluate it once against an empty row. The operator path uses the index's
+    // default beam width.
     let q = evaluate(query, &Row::new(), params)?;
     let limit = k.as_const().unwrap_or(10) as usize;
+    vector_search_rows(
+        snapshot,
+        label,
+        alias,
+        property,
+        &q,
+        query.span,
+        limit,
+        distance,
+        score_alias,
+        post_filter,
+        None,
+        params,
+    )
+    .await
+}
+
+/// Core of the vector KNN: serve a pre-evaluated query vector `q` from the
+/// Vamana index when one applies (freshness-equivalent to the flat scan), else
+/// the exact flat scan. `ef_search` overrides the index beam width (`None` =
+/// default). Shared by the `VectorSearch` operator and the `search.vector` /
+/// `search.hybrid` procedures. Emits rows binding the node to `alias` and the
+/// metric score to `score_alias`.
+#[allow(clippy::too_many_arguments)]
+async fn vector_search_rows(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    alias: &str,
+    property: &str,
+    q: &RuntimeValue,
+    span: SourceSpan,
+    limit: usize,
+    distance: crate::plan::logical::VectorDistance,
+    score_alias: &str,
+    post_filter: Option<&Expression>,
+    ef_search: Option<usize>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::exec::expr::vector_score;
 
     // RFC-030 (`vector-index`): serve from the Vamana index when one exists for
     // (label, property, metric). Falls through to the flat scan otherwise (and
@@ -2131,12 +2581,13 @@ async fn flat_vector_search(
             label,
             alias,
             property,
-            &q,
+            q,
             limit,
             distance,
             score_alias,
             post_filter,
-            query.span,
+            span,
+            ef_search,
             params,
         )
         .await?
@@ -2144,16 +2595,16 @@ async fn flat_vector_search(
             return Ok(rows);
         }
     }
+    #[cfg(not(feature = "vector-index"))]
+    let _ = ef_search;
 
     let labels = resolve_node_labels(snapshot, label);
-    // A residual `post_filter` may reference properties beyond `property`, so
-    // materialise the whole node when one is present; otherwise project only the
-    // embedding column.
-    let projection: Option<Vec<String>> = if post_filter.is_some() {
-        None
-    } else {
-        Some(vec![property.to_string()])
-    };
+    // Materialise the WHOLE node: the result binds it to `alias`, and a
+    // downstream projection (`RETURN d.title`) or a procedure's `YIELD node` may
+    // read any property — not just the embedding — and a `post_filter` may too.
+    // (The index path likewise returns full nodes via `lookup_node`.) Projecting
+    // only the embedding column here would leave those properties null.
+    let projection: Option<Vec<String>> = None;
 
     // (sort_key, score_value, node) — sort_key is "lower is better" (higher-is-
     // better metrics are negated), so an ascending sort yields the top-k.
@@ -2168,8 +2619,7 @@ async fn flat_vector_search(
             let Some(emb) = node.properties.get(property) else {
                 continue;
             };
-            let Some((score, higher_is_better)) = vector_score(distance, emb, &q, query.span)?
-            else {
+            let Some((score, higher_is_better)) = vector_score(distance, emb, q, span)? else {
                 continue;
             };
             let sort_key = if higher_is_better { -score } else { score };
@@ -2216,6 +2666,7 @@ async fn try_index_search(
     score_alias: &str,
     post_filter: Option<&Expression>,
     span: SourceSpan,
+    ef_search: Option<usize>,
     params: &Params,
 ) -> Result<Option<Vec<Row>>, ExecError> {
     use crate::exec::expr::vector_score;
@@ -2230,16 +2681,11 @@ async fn try_index_search(
         VectorDistance::Dot => VectorMetric::Dot,
         VectorDistance::Euclidean => VectorMetric::Euclidean,
     };
-    // Only cosine is served from the index today. Euclidean has no L2 space in
-    // namidb-ann. Dot would return an index score on a *different* scale than the
-    // flat path: the index normalises stored vectors at build, so it yields
-    // cosine, whereas the flat path scores the raw dot product — the ranking is
-    // monotone-equivalent but the value (and any threshold on it) would differ.
-    // Until that is reconciled, both fall back to the exact flat scan.
-    if metric != VectorMetric::Cosine {
-        return Ok(None);
-    }
-    let index_name = {
+    // All three metrics now serve from the index: the `.vg` stores the original
+    // vectors and reranks with the true metric, so the returned score equals the
+    // flat path's (cosine similarity / raw dot / L2 distance), and the freshness
+    // merge below scores deltas with the same `vector_score(distance, …)`.
+    let (index_name, index_dim) = {
         let desc = snapshot
             .manifest()
             .manifest
@@ -2247,15 +2693,16 @@ async fn try_index_search(
             .iter()
             .find(|d| d.matches(label, property, metric));
         match desc {
-            Some(d) => d.name.clone(),
+            Some(d) => (d.name.clone(), d.dim as usize),
             None => return Ok(None),
         }
     };
 
-    // Freshness: an L0 `Nodes` delta the `.vg` has not absorbed (flushed, not
-    // yet compacted) means the index cannot see the full corpus — fall back to
-    // the exact flat scan for that window (mirrors `text_search`).
-    if snapshot.has_l0_node_delta(label) {
+    // Freshness: a persisted `Nodes` SST newer than the index (flushed or
+    // partially-merged but not yet folded in by an authoritative compaction)
+    // means the `.vg` cannot see the full corpus — fall back to the exact flat
+    // scan for that window (LSN-based; mirrors `text_search`).
+    if snapshot.index_outrun_by_nodes(&index_name, namidb_storage::manifest::SstKind::VectorGraph) {
         return Ok(None);
     }
 
@@ -2267,6 +2714,13 @@ async fn try_index_search(
         }
         _ => return Ok(None),
     };
+    // Dimension parity with the index: a wrong-length query would otherwise be
+    // silently prefix-scored by the index. Fall back to the flat scan, which
+    // raises the canonical `vector dimension mismatch` error — same behaviour as
+    // when no index exists.
+    if qv.len() != index_dim {
+        return Ok(None);
+    }
 
     // Fresh memtable/overlay delta the index has not absorbed: `Some(vec)` is a
     // live embedding to merge in, `None` suppresses a now-stale id (tombstoned,
@@ -2283,7 +2737,13 @@ async fn try_index_search(
     const OVERFETCH: usize = 8;
     let mult = if post_filter.is_some() { OVERFETCH } else { 1 };
     let kprime = k.saturating_mul(mult).saturating_add(delta.len()).max(k);
-    let ef = kprime.max(64);
+    // Beam width: the user-supplied `ef` when given (clamped to ≥ the fetch
+    // count so the beam can actually surface `kprime` candidates), else the
+    // default `max(kprime, 64)`. A larger `ef` trades latency for recall.
+    let ef = match ef_search {
+        Some(e) => e.max(kprime),
+        None => kprime.max(64),
+    };
     let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
 
     // Merge: index hits not superseded by the delta, plus the freshly-scored
@@ -2296,6 +2756,11 @@ async fn try_index_search(
     let q_rv = RuntimeValue::Vector(qv);
     let mut seen: BTreeSet<NodeId> = delta_ids;
     let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta.len());
+    // Orientation of the metric: cosine/dot are higher-is-closer, euclidean is
+    // lower-is-closer. Derived from the metric (not from the delta loop, which is
+    // empty in the common case), since the index hits and freshly-scored deltas
+    // share this scale (both the true metric).
+    let higher_is_better = !matches!(distance, VectorDistance::Euclidean);
     for (id, score) in hits {
         if seen.insert(id) {
             scored.push((score as f64, id));
@@ -2304,14 +2769,17 @@ async fn try_index_search(
     for (id, emb) in delta {
         if let Some(v) = emb {
             let emb_rv = RuntimeValue::Vector(v);
-            if let Some((s, _higher)) = vector_score(VectorDistance::Cosine, &emb_rv, &q_rv, span)?
-            {
+            if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
                 scored.push((s, id));
             }
         }
     }
-    // Best-first by similarity.
-    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    // Best-first by the metric's orientation.
+    if higher_is_better {
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    } else {
+        scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    }
 
     // Materialise rows in rank order, applying the residual filter; take up to k
     // survivors.
@@ -2320,6 +2788,10 @@ async fn try_index_search(
         if out.len() >= k {
             break;
         }
+        // Probe the deadline per candidate: an over-fetched filtered ANN can do
+        // up to k*OVERFETCH cold node lookups, and we must stay interruptible the
+        // way the flat scan is.
+        crate::exec::limits::check_deadline()?;
         let Some(view) = snapshot.lookup_node(label, id).await? else {
             continue;
         };

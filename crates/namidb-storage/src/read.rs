@@ -2238,42 +2238,72 @@ impl<'mt> Snapshot<'mt> {
         use crate::sst::vector::VectorGraphIndex;
 
         let mut all: Vec<(NodeId, f32)> = Vec::new();
+        // Score orientation is metric-dependent: cosine/dot are higher-is-closer,
+        // euclidean is lower-is-closer. All `.vg` SSTs for one index share a
+        // metric, so the last decoded one's orientation is authoritative.
+        let mut higher_is_better = true;
         for desc in &self.manifest.manifest.ssts {
             if desc.kind != SstKind::VectorGraph || desc.scope != index_name {
                 continue;
             }
             let body = self.get_sst_body(desc).await?;
-            let idx = VectorGraphIndex::decode(&body)?;
+            // A legacy (v1) or corrupt body fails to decode; skip it so the read
+            // falls back to the flat scan rather than erroring the whole query.
+            let Ok(idx) = VectorGraphIndex::decode(&body) else {
+                continue;
+            };
+            higher_is_better = idx.higher_is_better();
             all.extend(
                 idx.search(query, k, ef)
                     .into_iter()
                     .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
             );
         }
-        // Best-first: higher similarity first.
-        all.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Best-first by the metric's orientation.
+        if higher_is_better {
+            all.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        } else {
+            all.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        }
         all.truncate(k);
         Ok(all)
     }
 
-    /// (`vector-index`) `true` if an L0 `Nodes` SST that could carry rows for
-    /// `label` exists — flushed but not yet folded into a `.vg` index by
-    /// compaction. While such a delta exists the vector index cannot be trusted
-    /// to see the full corpus (the rows are neither in the `.vg` nor in the
-    /// memtable, which was cleared on flush), so the executor falls back to the
-    /// (exact) flat scan for that window.
+    /// `true` if any persisted `Nodes` SST carries writes **newer** than the
+    /// `index_name` index's SST(s) — the index has been outrun by node data it
+    /// has not absorbed, so the caller must fall back to the exact flat scan.
     ///
-    /// Node SSTs are **id-primary**: one SST spans every label, flushed with an
-    /// empty `scope` (`flush.rs`), so the test must NOT require `scope == label`
-    /// (that check is dead — it never matches an id-primary SST). An empty scope
-    /// covers `label`; a legacy per-label SST is matched by name.
-    #[cfg(feature = "vector-index")]
-    pub fn has_l0_node_delta(&self, label: &str) -> bool {
-        self.manifest.manifest.ssts.iter().any(|d| {
-            d.kind == SstKind::Nodes
-                && d.level == crate::manifest::SstLevel::L0
-                && (d.scope.is_empty() || d.scope == label)
-        })
+    /// An SST-backed index (`.vg` / `.ft`) is rebuilt only on an **authoritative**
+    /// (deepest-level) compaction whose merged rows span the full label corpus;
+    /// the rebuild stamps the index descriptor's `max_lsn` with that corpus's
+    /// high-water LSN. A later flush (→ L0) or partial merge (→ L1+) produces a
+    /// `Nodes` SST with a higher `max_lsn`. Comparing LSNs — not levels — is what
+    /// makes this correct regardless of which level the newer data landed at,
+    /// closing the partial-compaction truncation window: a shallow merge that
+    /// rewrites a subset to L1 no longer hides those rows from the freshness
+    /// check just because L0 is now empty. The lockstep `Nodes` SST written by
+    /// the same authoritative merge shares the index's `max_lsn` exactly, so it is
+    /// never (`>`) flagged. `kind` is the index SST kind
+    /// (`VectorGraph` / `TextIndex`).
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    pub fn index_outrun_by_nodes(&self, index_name: &str, kind: SstKind) -> bool {
+        let idx_lsn = self
+            .manifest
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.kind == kind && d.scope == index_name)
+            .map(|d| d.max_lsn)
+            .max();
+        let Some(idx_lsn) = idx_lsn else {
+            // No index SST yet → the index path is not taken; nothing to gate.
+            return false;
+        };
+        self.manifest
+            .manifest
+            .ssts
+            .iter()
+            .any(|d| d.kind == SstKind::Nodes && d.max_lsn > idx_lsn)
     }
 
     /// (`vector-index`) Fresh node deltas (committed memtable + staged overlay)
@@ -2357,18 +2387,14 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         // ...and there is no un-compacted node delta the index has not absorbed:
-        // any node memtable entry (committed or staged), or an L0 `Nodes` SST
-        // (flushed but not yet compacted into the index). Node SSTs are
-        // id-primary — one SST spans every label with an empty `scope` — so the
-        // L0 test must accept an empty scope; requiring `scope == label` was dead
-        // (it never matched a real id-primary SST).
+        // any node memtable entry (committed or staged), or a persisted `Nodes`
+        // SST newer than the index (flushed/partially-merged but not yet folded
+        // into the index by an authoritative compaction). The LSN comparison
+        // catches data that a partial merge moved to L1+ as well as fresh L0
+        // flushes — see `index_outrun_by_nodes`.
+        let _ = label;
         let memtable_delta = self.node_entries().next().is_some();
-        let l0_delta = self.manifest.manifest.ssts.iter().any(|d| {
-            d.kind == SstKind::Nodes
-                && d.level == crate::manifest::SstLevel::L0
-                && (d.scope.is_empty() || d.scope == label)
-        });
-        if memtable_delta || l0_delta {
+        if memtable_delta || self.index_outrun_by_nodes(index_name, SstKind::TextIndex) {
             return Ok(None);
         }
 

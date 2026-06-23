@@ -108,6 +108,13 @@ impl VectorSpace for F32CosineSpace {
 
     fn query_distance(&self, query: &[f32], b: u32) -> f32 {
         let vb = &self.vecs[b as usize];
+        debug_assert_eq!(
+            query.len(),
+            vb.len(),
+            "cosine query dim {} != stored dim {}",
+            query.len(),
+            vb.len()
+        );
         let denom = Self::norm(query) * Self::norm(vb);
         if denom == 0.0 {
             return if query.iter().all(|x| *x == 0.0) && vb.iter().all(|x| *x == 0.0) {
@@ -200,15 +207,94 @@ impl VectorSpace for Int8Space {
         // norm_i8 (×scale), so the result is identical to dividing the unscaled
         // sum by the unscaled norm. Computed with the primitives for one truth.
         let (codes, scale) = &self.members[b as usize];
+        debug_assert_eq!(
+            query.len(),
+            codes.len(),
+            "int8 query dim {} != stored dim {}",
+            query.len(),
+            codes.len()
+        );
         let dot = dot_i8_asymmetric(query, codes, *scale);
         let norm = norm_i8(codes, *scale);
         let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
         let denom = q_norm * norm;
         if denom == 0.0 {
-            return if dot == 0.0 { 0.0 } else { 1.0 };
+            // Mirror the F32 / pair_distance convention: distance 0 only when
+            // BOTH sides are zero-norm; a zero-vs-nonzero pair is maximally
+            // distant (1.0). Keying on `dot` is wrong — `dot` is forced to 0 in
+            // every zero-norm case, so it can't tell the two apart.
+            return if q_norm == 0.0 && norm == 0.0 {
+                0.0
+            } else {
+                1.0
+            };
         }
         let cos = (dot / denom).clamp(-1.0, 1.0);
         1.0 - cos
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f32 Euclidean (L2) space — the metric-faithful path for `euclidean` indexes.
+// ---------------------------------------------------------------------------
+
+/// Full-precision f32 vectors scored by **Euclidean (L2) distance**
+/// (`sqrt(Σ (a−b)²)`). Unlike cosine, L2 is magnitude-sensitive, so it induces a
+/// genuinely different neighbour graph: the Vamana build must navigate with L2
+/// for a euclidean index to recall correctly (a cosine graph would mis-rank
+/// whenever vector magnitudes vary). Lower is closer; always finite.
+#[derive(Clone, Debug)]
+pub struct L2Space {
+    vecs: Vec<Vec<f32>>,
+}
+
+impl L2Space {
+    /// Build a space from owned f32 vectors. All must share the same length; an
+    /// empty space is allowed.
+    pub fn new(vecs: Vec<Vec<f32>>) -> Self {
+        Self { vecs }
+    }
+
+    /// Reference to the f32 vector for `id` (build-time introspection).
+    pub fn vector(&self, id: u32) -> &[f32] {
+        &self.vecs[id as usize]
+    }
+
+    fn l2(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let d = x - y;
+                d * d
+            })
+            .sum::<f32>()
+            .sqrt()
+    }
+}
+
+impl VectorSpace for L2Space {
+    fn len(&self) -> usize {
+        self.vecs.len()
+    }
+
+    fn dim(&self) -> usize {
+        self.vecs.first().map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn pair_distance(&self, a: u32, b: u32) -> f32 {
+        Self::l2(&self.vecs[a as usize], &self.vecs[b as usize])
+    }
+
+    fn query_distance(&self, query: &[f32], b: u32) -> f32 {
+        let vb = &self.vecs[b as usize];
+        debug_assert_eq!(
+            query.len(),
+            vb.len(),
+            "L2 query dim {} != stored dim {}",
+            query.len(),
+            vb.len()
+        );
+        Self::l2(query, vb)
     }
 }
 
@@ -277,11 +363,46 @@ mod tests {
     }
 
     #[test]
+    fn probe_zero_query_consistency() {
+        let f = F32CosineSpace::new(vec![vec![1.0, 0.0, 0.0]]);
+        let i = Int8Space::new(vec![namidb_core::quantize::quantize_i8(&[1.0, 0.0, 0.0])]);
+        let zq = [0.0f32, 0.0, 0.0];
+        eprintln!("F32 zero-query dist = {}", f.query_distance(&zq, 0));
+        eprintln!("Int8 zero-query dist = {}", i.query_distance(&zq, 0));
+    }
+
+    #[test]
     fn int8_zero_vector_is_finite() {
         let s = Int8Space::new(vec![(vec![0, 0, 0], 0.0), (vec![1, -1, 2], 0.5)]);
         assert!(s.pair_distance(0, 1).is_finite());
         assert!(s.query_distance(&[0.1, 0.2, 0.3], 0).is_finite());
         // zero vs zero → distance 0.
         assert_eq!(s.pair_distance(0, 0), 0.0);
+    }
+
+    #[test]
+    fn int8_query_zero_vs_nonzero_is_maximally_distant() {
+        // A nonzero query against an all-zero stored vector must be distance 1.0
+        // (orthogonal), NOT 0.0 (a false perfect match). Regression for the
+        // `dot == 0.0` zero-norm branch that always returned 0.0.
+        let s = Int8Space::new(vec![(vec![0, 0, 0], 0.0), (vec![1, -1, 2], 0.5)]);
+        assert_eq!(s.query_distance(&[0.1, 0.2, 0.3], 0), 1.0);
+        // A zero query against a nonzero stored vector is likewise distance 1.0.
+        assert_eq!(s.query_distance(&[0.0, 0.0, 0.0], 1), 1.0);
+        // Zero query vs zero stored → distance 0.0 (both degenerate, "identical").
+        assert_eq!(s.query_distance(&[0.0, 0.0, 0.0], 0), 0.0);
+    }
+
+    #[test]
+    fn l2_distances_are_euclidean() {
+        let s = L2Space::new(vec![vec![0.0, 0.0], vec![3.0, 4.0], vec![0.0, 0.0]]);
+        // 3-4-5 triangle.
+        assert!(approx(s.pair_distance(0, 1), 5.0));
+        assert!(approx(s.query_distance(&[3.0, 4.0], 0), 5.0));
+        // Identical vectors → 0.
+        assert!(approx(s.pair_distance(0, 2), 0.0));
+        // L2 is magnitude-sensitive: same direction, different magnitude ≠ 0.
+        let m = L2Space::new(vec![vec![1.0, 0.0], vec![2.0, 0.0]]);
+        assert!(approx(m.pair_distance(0, 1), 1.0));
     }
 }

@@ -181,10 +181,18 @@ pub fn weakly_connected_components_cancellable(
     // Assign dense component ids by canonical root. This is a second O(N) pass,
     // so it also polls the deadline (a high-node-count sparse graph spends real
     // time here, not just in the union phase above).
+    //
+    // Iterate in node-INSERTION order (`graph.nodes()`), not `&index` HashMap
+    // order: component ids are allocated first-come, so iterating the randomized
+    // HashMap would label the same partition differently every run. The partition
+    // is always correct either way, but stable ids are required for snapshot
+    // tests, cross-kernel joins, and reproducible output — matching the
+    // deterministic relabel that `label_propagation` already does.
     let mut root_to_comp: HashMap<usize, usize> = HashMap::new();
     let mut assignment = HashMap::with_capacity(n);
     since_check = 0;
-    for (&node, &i) in &index {
+    for &node in graph.nodes() {
+        let i = index[&node];
         let root = uf.find(i);
         let comp = match root_to_comp.get(&root) {
             Some(&c) => c,
@@ -298,13 +306,22 @@ pub fn pagerank_cancellable(
 
         // Collect dangling mass and redistribute uniformly so probability is
         // conserved. A node is "dangling" if it has NO usable out-mass path:
-        // no out-edges, OR a non-positive out-edge weight sum (a degenerate
-        // case the push loop below skips). Counting the latter as dangling is
-        // load-bearing — without it that node's rank would simply vanish each
+        // no out-edges, OR no positive out-edge weight (a degenerate case the
+        // push loop below skips). Counting the latter as dangling is load-
+        // bearing — without it that node's rank would simply vanish each
         // iteration and the scores would stop summing to 1.
+        //
+        // PageRank is only defined for non-negative weights, so a NEGATIVE edge
+        // is treated as absent: the weight sum and the per-edge push both use
+        // `max(w, 0)`. Keying the guards on the raw signed sum was a bug — a node
+        // mixing signs but summing positive (e.g. +3 and −2) passed both guards
+        // and the −2 edge injected negative mass, producing negative (and
+        // compensating >1) scores.
+        let positive_sum =
+            |e: &[(NodeId, f64)]| -> f64 { e.iter().map(|&(_, w)| w.max(0.0)).sum::<f64>() };
         let is_dangling = |n: &NodeId| match graph.out_edges(*n) {
             None | Some([]) => true,
-            Some(e) => e.iter().map(|&(_, w)| w).sum::<f64>() <= 0.0,
+            Some(e) => positive_sum(e) <= 0.0,
         };
         let dangling_mass: f64 = graph
             .nodes()
@@ -318,23 +335,25 @@ pub fn pagerank_cancellable(
         for &node in graph.nodes() {
             new_scores.insert(node, teleport + dangling_share);
         }
-        // Push each node's rank along its out-edges. Total out-mass must be
-        // exactly `d * PR(src)` to conserve probability, so the per-edge share
-        // is `d * PR(src) * (w / Σw)` — normalized by the WEIGHT SUM, not the
-        // edge count. (Dividing by count and multiplying by w leaks mass when
-        // weights are not all 1.0.) A non-positive weight sum is degenerate and
-        // was already counted as dangling above (its mass is redistributed), so
-        // skip it here rather than divide by zero / produce NaN.
+        // Push each node's rank along its (positive-weight) out-edges. Total
+        // out-mass must be exactly `d * PR(src)` to conserve probability, so the
+        // per-edge share is `d * PR(src) * (w / Σw⁺)` — normalized by the POSITIVE
+        // weight sum, not the edge count. A non-positive weight sum is degenerate
+        // and was already counted as dangling above (its mass is redistributed),
+        // so skip it here rather than divide by zero / produce NaN.
         for (&src, nbrs) in &graph.out {
             if nbrs.is_empty() {
                 continue;
             }
-            let weight_sum: f64 = nbrs.iter().map(|&(_, w)| w).sum();
+            let weight_sum = positive_sum(nbrs);
             if weight_sum <= 0.0 {
                 continue;
             }
             let base = d * scores[&src] / weight_sum;
             for &(dst, w) in nbrs {
+                if w <= 0.0 {
+                    continue;
+                }
                 *new_scores.get_mut(&dst).unwrap() += base * w;
             }
         }
@@ -911,6 +930,45 @@ mod tests {
 
     fn nid(b: [u8; 16]) -> NodeId {
         NodeId::from_uuid(uuid::Uuid::from_bytes(b))
+    }
+
+    #[test]
+    fn pagerank_mixed_sign_edges_leak_no_negative_mass() {
+        // `a` has two out-edges: +3 to b and −2 to c (raw sum +1, so the old
+        // signed-sum guards let the −2 edge inject negative mass). The negative
+        // edge must be ignored: no score is negative and mass is conserved.
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let c = nid([3; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, Some(3.0));
+        g.add_edge(a, c, Some(-2.0));
+        g.add_node(c);
+
+        let pr = pagerank(&g, &PageRankOptions::default());
+        let total: f64 = pr.scores.values().sum();
+        assert!((total - 1.0).abs() < 1e-3, "mass not conserved: {total}");
+        assert!(
+            pr.scores.values().all(|s| s.is_finite() && *s >= 0.0),
+            "negative/NaN score leaked: {:?}",
+            pr.scores
+        );
+    }
+
+    #[test]
+    fn wcc_component_ids_are_deterministic() {
+        // 40 disjoint two-node components; the integer ids must be identical
+        // across runs (no dependence on HashMap iteration order).
+        let build = || {
+            let mut g = Graph::new();
+            for i in 0..40u8 {
+                let x = nid([i; 16]);
+                let y = nid([100 + i; 16]);
+                g.add_edge(x, y, None);
+            }
+            weakly_connected_components(&g).assignment
+        };
+        assert_eq!(build(), build(), "WCC component ids must be deterministic");
     }
 
     #[test]

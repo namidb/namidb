@@ -7,23 +7,33 @@
 //! merged node rows ([`build_body`]); searched by decoding into a
 //! [`VectorGraphIndex`] and calling [`VectorGraphIndex::search`].
 //!
-//! `cosine` and `dot` are both served by an f32 cosine space (for `dot` the
-//! vectors are L2-normalised at build time, so dot ranking coincides with
-//! cosine ranking). `euclidean` is **not** indexable here — [`build_body`]
-//! returns `Ok(None)` for it so the caller keeps the flat-scan fallback.
+//! All three metrics are served from the index. The body stores the **original
+//! (un-normalised) f32 vectors** plus a navigation graph; [`VectorGraphIndex::
+//! search`] navigates with a metric-appropriate space and then **reranks the
+//! candidates with the real metric**, so the returned score equals the flat
+//! scan's `vector_score` exactly (to f32 tolerance): cosine similarity and raw
+//! dot product (higher = closer), L2 distance (lower = closer). `cosine`/`dot`
+//! navigate with cosine (scale-invariant — a fine, rank-correlated navigator for
+//! dot); `euclidean` navigates with an L2 space (cosine would mis-rank whenever
+//! magnitudes vary).
 
 use bytes::Bytes;
-use namidb_ann::{build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, VamanaGraph};
+use namidb_ann::{
+    build_with_seed, search, BuildParams, F32CosineSpace, InitStrategy, L2Space, VamanaGraph,
+};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3;
 
 use crate::error::Error;
 use crate::manifest::{VectorIndexDescriptor, VectorMetric};
 
-/// On-disk magic + format major version (`NAMI` `VG` `\0` major=1). Bumped on
-/// any incompatible layout change to the body below so a reader never silently
-/// misparses a future/legacy file.
-const MAGIC: &[u8; 8] = b"NAMIVG01";
+/// On-disk magic + format major version (`NAMI` `VG` `\0` major=2). Major bumped
+/// to 2: `dot` vectors are no longer normalised at build (the body now keeps the
+/// original vectors and reranks with the true metric), and `euclidean` is now
+/// indexable. A v1 reader would mis-score a v2 dot index and vice-versa, so the
+/// magic forces a rebuild; the read path skips an undecodable `.vg` and falls
+/// back to the flat scan rather than erroring.
+const MAGIC: &[u8; 8] = b"NAMIVG02";
 
 /// Canonical short metric name stored in the body / stats.
 fn metric_name(m: VectorMetric) -> &'static str {
@@ -64,37 +74,81 @@ pub struct VectorGraphBuildStats {
     pub entry_medoid: u32,
 }
 
-/// L2-normalise `v` in place (no-op for a zero vector). Dot-product ranking on
-/// unit vectors coincides with cosine ranking, so normalising lets one cosine
-/// space serve both metrics.
-fn normalize(v: &mut [f32]) {
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n > 0.0 {
-        for x in v {
-            *x /= n;
+/// Metric-faithful score of stored vector `a` against `query`, computed in f64
+/// to match the query engine's `vector_score`: returns `(value, higher_is_
+/// better)`. Cosine similarity and raw dot product are higher-is-closer; L2
+/// distance is lower-is-closer. This is the rerank applied to the navigation
+/// candidates so the index's returned score equals the flat scan's.
+fn metric_score(metric: VectorMetric, a: &[f32], query: &[f32]) -> (f64, bool) {
+    match metric {
+        VectorMetric::Cosine => {
+            let dot: f64 = a
+                .iter()
+                .zip(query)
+                .map(|(x, y)| *x as f64 * *y as f64)
+                .sum();
+            let na: f64 = a.iter().map(|x| *x as f64 * *x as f64).sum::<f64>().sqrt();
+            let nq: f64 = query
+                .iter()
+                .map(|x| *x as f64 * *x as f64)
+                .sum::<f64>()
+                .sqrt();
+            if na == 0.0 || nq == 0.0 {
+                (0.0, true)
+            } else {
+                (dot / (na * nq), true)
+            }
         }
+        VectorMetric::Dot => {
+            let dot: f64 = a
+                .iter()
+                .zip(query)
+                .map(|(x, y)| *x as f64 * *y as f64)
+                .sum();
+            (dot, true)
+        }
+        VectorMetric::Euclidean => {
+            let s: f64 = a
+                .iter()
+                .zip(query)
+                .map(|(x, y)| {
+                    let d = *x as f64 - *y as f64;
+                    d * d
+                })
+                .sum();
+            (s.sqrt(), false)
+        }
+    }
+}
+
+/// Parse the canonical metric name stored in a `.vg` body back into the enum.
+fn metric_from_name(name: &str) -> Option<VectorMetric> {
+    match name {
+        "cosine" => Some(VectorMetric::Cosine),
+        "dot" => Some(VectorMetric::Dot),
+        "euclidean" => Some(VectorMetric::Euclidean),
+        _ => None,
     }
 }
 
 /// Build a `.vg` body from `(node_id, embedding)` pairs for one index.
 ///
-/// Returns `Ok(None)` when the metric is not indexable here (`euclidean`) or
-/// the set has fewer than 2 members — the caller then skips emitting a
-/// VectorGraph SST and the query falls through to the flat scan.
+/// Returns `Ok(None)` only when the set has fewer than 2 members — the caller
+/// then skips emitting a VectorGraph SST and the query falls through to the flat
+/// scan. All three metrics are indexable: `cosine`/`dot` navigate with cosine,
+/// `euclidean` with an L2 space, and the original (un-normalised) vectors are
+/// stored so search can rerank with the true metric.
 pub fn build_body(
     desc: &VectorIndexDescriptor,
     mut members: Vec<([u8; 16], Vec<f32>)>,
 ) -> Result<Option<(Bytes, VectorGraphBuildStats)>, Error> {
-    if desc.metric == VectorMetric::Euclidean {
-        return Ok(None);
-    }
     if members.len() < 2 {
         return Ok(None);
     }
     let dim = desc.dim as usize;
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(members.len());
     let mut ids: Vec<[u8; 16]> = Vec::with_capacity(members.len());
-    for (id, mut v) in members.drain(..) {
+    for (id, v) in members.drain(..) {
         if v.len() != dim {
             return Err(Error::invariant(format!(
                 "vector index `{}`: embedding dim {} != declared {}",
@@ -103,14 +157,10 @@ pub fn build_body(
                 dim
             )));
         }
-        if desc.metric == VectorMetric::Dot {
-            normalize(&mut v);
-        }
         ids.push(id);
         vectors.push(v);
     }
 
-    let space = F32CosineSpace::new(vectors.clone());
     let params = BuildParams {
         r: desc.r,
         l_build: desc.l_build,
@@ -120,7 +170,13 @@ pub fn build_body(
     // Deterministic build: seed from the index name so two builds of the same
     // (data, descriptor) yield the same graph, while different indexes diverge.
     let seed = xxh3::xxh3_64(desc.name.as_bytes());
-    let graph = build_with_seed(&space, params, seed);
+    // Navigate with a metric-appropriate space over the original vectors. Cosine
+    // is scale-invariant, so it correctly navigates both cosine and dot; L2 is
+    // required for euclidean (cosine ignores magnitude and would mis-rank).
+    let graph = match desc.metric {
+        VectorMetric::Euclidean => build_with_seed(&L2Space::new(vectors.clone()), params, seed),
+        _ => build_with_seed(&F32CosineSpace::new(vectors.clone()), params, seed),
+    };
 
     let stats = VectorGraphBuildStats {
         dim: desc.dim,
@@ -146,16 +202,28 @@ pub fn build_body(
     Ok(Some((Bytes::from(bytes), stats)))
 }
 
+/// The navigation space a decoded index uses to walk its Vamana graph. Cosine
+/// for cosine/dot indexes, L2 for euclidean — matching the build.
+#[derive(Debug)]
+enum NavSpace {
+    Cosine(F32CosineSpace),
+    L2(L2Space),
+}
+
 /// A decoded, searchable VectorGraph index.
 #[derive(Debug)]
 pub struct VectorGraphIndex {
     body: VectorGraphBody,
-    space: F32CosineSpace,
+    metric: VectorMetric,
+    nav: NavSpace,
 }
 
 impl VectorGraphIndex {
     /// Decode a `.vg` body (magic + bincode). Errors on a truncated/foreign
-    /// file or a magic mismatch.
+    /// file, a magic mismatch (incl. a legacy v1 body), an unknown metric, or a
+    /// graph whose entry point is out of range (a corrupt body — the body has no
+    /// checksum). The read path treats any decode error as "index absent" and
+    /// falls back to the flat scan, so this never panics a query.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < MAGIC.len() {
             return Err(Error::invariant("vector graph body too short for magic"));
@@ -169,8 +237,24 @@ impl VectorGraphIndex {
         }
         let body: VectorGraphBody = bincode::deserialize(rest)
             .map_err(|e| Error::invariant(format!("vector graph decode failed: {e}")))?;
-        let space = F32CosineSpace::new(body.vectors.clone());
-        Ok(Self { body, space })
+        let metric = metric_from_name(&body.metric).ok_or_else(|| {
+            Error::invariant(format!("vector graph unknown metric: {}", body.metric))
+        })?;
+        // Validate the graph's internal consistency before trusting it: the entry
+        // point and every id must be in range, since the body carries no checksum
+        // and search indexes adjacency/vectors by id directly.
+        let n = body.vectors.len();
+        if n != body.ids.len() || n != body.graph.adjacency.len() {
+            return Err(Error::invariant("vector graph body length mismatch"));
+        }
+        if n > 0 && body.graph.entry as usize >= n {
+            return Err(Error::invariant("vector graph entry out of range"));
+        }
+        let nav = match metric {
+            VectorMetric::Euclidean => NavSpace::L2(L2Space::new(body.vectors.clone())),
+            _ => NavSpace::Cosine(F32CosineSpace::new(body.vectors.clone())),
+        };
+        Ok(Self { body, metric, nav })
     }
 
     /// Number of vectors indexed.
@@ -183,29 +267,58 @@ impl VectorGraphIndex {
         self.body.dim
     }
 
-    /// Metric name (`"cosine"` / `"dot"`).
+    /// Metric name (`"cosine"` / `"dot"` / `"euclidean"`).
     pub fn metric(&self) -> &str {
         &self.body.metric
     }
 
-    /// Approximate top-`k` nearest to `query`, returning `(NodeId, score)`
-    /// pairs sorted best-first. `score` is the similarity (higher = closer) for
-    /// cosine/dot; `ef` is the search beam width (≥ `k`; larger → better
-    /// recall, more work). Candidates are full-precision reranked from the
-    /// stored f32 vectors, so the returned scores are exact for the stored
-    /// representation (the approximation is only in *which* nodes the graph
-    /// visits, not in the score math).
+    /// `true` when a higher score means a closer match (cosine / dot); `false`
+    /// for euclidean, where lower (distance) is closer. The caller uses this to
+    /// orient a multi-SST union / delta merge.
+    pub fn higher_is_better(&self) -> bool {
+        !matches!(self.metric, VectorMetric::Euclidean)
+    }
+
+    /// Approximate top-`k` nearest to `query`, returning `(NodeId, score)` pairs
+    /// sorted best-first. `score` is **metric-faithful**: cosine similarity or
+    /// raw dot product (higher = closer), or L2 distance (lower = closer) — equal
+    /// to the flat scan's `vector_score` to f32 tolerance. `ef` is the beam width
+    /// (≥ `k`; larger → better recall, more work). The graph is navigated with
+    /// the metric's navigation space to gather up to `ef` candidates, which are
+    /// then reranked by the true metric from the original f32 vectors, so the
+    /// approximation is only in *which* nodes the graph visits, not the score.
+    ///
+    /// Returns an empty vec when `query`'s dimensionality does not match the
+    /// index's (the caller falls back to the flat scan, which raises the
+    /// canonical dimension-mismatch error) — never a prefix-scored wrong answer.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<([u8; 16], f32)> {
+        if k == 0 || query.len() != self.body.dim as usize {
+            return Vec::new();
+        }
         let ef = ef.max(k);
-        let hits = search(&self.space, &self.body.graph, query, k, ef);
-        hits.into_iter()
+        // Navigate for up to `ef` candidates (k = ef), then rerank by the true
+        // metric. For dot the navigation metric (cosine) differs from the score
+        // metric, so the wider candidate pool is what lets the rerank surface the
+        // true dot-nearest; for cosine/euclidean navigation already is the metric.
+        let cands = match &self.nav {
+            NavSpace::Cosine(s) => search(s, &self.body.graph, query, ef, ef),
+            NavSpace::L2(s) => search(s, &self.body.graph, query, ef, ef),
+        };
+        let mut scored: Vec<([u8; 16], f32)> = cands
+            .into_iter()
             .map(|nb| {
-                // The graph distance is cosine distance (1 - similarity); flip
-                // back to similarity so higher = closer (matches the builtins).
-                let sim = 1.0 - nb.dist;
-                (self.body.ids[nb.id as usize], sim)
+                let v = &self.body.vectors[nb.id as usize];
+                let (score, _hib) = metric_score(self.metric, v, query);
+                (self.body.ids[nb.id as usize], score as f32)
             })
-            .collect()
+            .collect();
+        if self.higher_is_better() {
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        } else {
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        }
+        scored.truncate(k);
+        scored
     }
 }
 
@@ -213,6 +326,16 @@ impl VectorGraphIndex {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
+
+    /// L2-normalise in place (test fixtures build unit vectors).
+    fn normalize(v: &mut [f32]) {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v {
+                *x /= n;
+            }
+        }
+    }
 
     fn desc(name: &str, metric: VectorMetric, dim: u32) -> VectorIndexDescriptor {
         VectorIndexDescriptor {
@@ -252,15 +375,70 @@ mod tests {
     }
 
     #[test]
-    fn euclidean_and_tiny_sets_are_not_indexed() {
-        let d = desc("e", VectorMetric::Euclidean, 4);
-        let m = clustered_members(50, 4, 1);
-        assert!(build_body(&d, m).unwrap().is_none());
-
+    fn tiny_sets_are_not_indexed() {
+        // Fewer than 2 members → no graph (caller keeps the flat scan).
         let d = desc("c", VectorMetric::Cosine, 4);
         assert!(build_body(&d, clustered_members(1, 4, 2))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn all_three_metrics_are_indexable_and_score_faithfully() {
+        // Every metric now produces a `.vg`, and the returned score equals the
+        // engine's metric (cosine sim / raw dot / L2 distance) to f32 tolerance.
+        for metric in [
+            VectorMetric::Cosine,
+            VectorMetric::Dot,
+            VectorMetric::Euclidean,
+        ] {
+            let d = desc("m", metric, 8);
+            let members = clustered_members(60, 8, 11);
+            let (body, _) = build_body(&d, members.clone()).unwrap().unwrap();
+            let idx = VectorGraphIndex::decode(&body).unwrap();
+            assert_eq!(idx.higher_is_better(), metric != VectorMetric::Euclidean);
+
+            let query = members[3].1.clone();
+            let hits = idx.search(&query, 5, 32);
+            assert!(!hits.is_empty(), "{metric:?} produced no hits");
+            // Best-first ordering matches the metric orientation.
+            for w in hits.windows(2) {
+                if metric == VectorMetric::Euclidean {
+                    assert!(w[0].1 <= w[1].1 + 1e-5, "{metric:?} not asc: {hits:?}");
+                } else {
+                    assert!(w[0].1 >= w[1].1 - 1e-5, "{metric:?} not desc: {hits:?}");
+                }
+            }
+            // The top score equals a direct metric computation on the same id.
+            let (top_id, top_score) = hits[0];
+            let top_vec = members
+                .iter()
+                .find(|(id, _)| *id == top_id)
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let (want, _) = metric_score(metric, &top_vec, &query);
+            assert!(
+                (want as f32 - top_score).abs() < 1e-4,
+                "{metric:?}: index score {top_score} != metric {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_entry() {
+        // A corrupt body with an entry past the graph size is rejected, not
+        // trusted into a panic on search.
+        let d = desc("x", VectorMetric::Cosine, 4);
+        let (body, _) = build_body(&d, clustered_members(10, 4, 3))
+            .unwrap()
+            .unwrap();
+        // Decode, corrupt the entry, re-encode, and assert decode rejects it.
+        let (_, rest) = body.split_at(MAGIC.len());
+        let mut decoded: VectorGraphBody = bincode::deserialize(rest).unwrap();
+        decoded.graph.entry = 9999;
+        let mut bad = MAGIC.to_vec();
+        bad.extend_from_slice(&bincode::serialize(&decoded).unwrap());
+        assert!(VectorGraphIndex::decode(&bad).is_err());
     }
 
     #[test]

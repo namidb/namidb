@@ -330,6 +330,11 @@ async fn compact_leveled(
         // bucket's deepest level (no older un-merged level below it).
         let gc = node_gc_safe && plan.is_deepest;
         let (finish, merged_rows) = compact_node_ssts(&label_def, &readers, gc)?;
+        // The highest LSN in the merged corpus — stamped onto any SST-backed
+        // index (vector / text) rebuilt from these rows so a later freshness
+        // check can tell whether a newer Nodes SST has outrun the index.
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        let finish_max_lsn = finish.stats.max_lsn;
         if finish.stats.row_count == 0 {
             // Nothing to write; still mark the merged sources for removal so
             // the bucket truly shrinks.
@@ -368,6 +373,8 @@ async fn compact_leveled(
                 store.as_ref(),
                 paths,
                 plan.target_level,
+                plan.is_deepest,
+                finish_max_lsn,
                 &base.manifest.label_dict,
                 &base.manifest.vector_indexes,
                 &merged_rows,
@@ -387,6 +394,8 @@ async fn compact_leveled(
                 store.as_ref(),
                 paths,
                 plan.target_level,
+                plan.is_deepest,
+                finish_max_lsn,
                 &base.manifest.label_dict,
                 &base.manifest.text_indexes,
                 &merged_rows,
@@ -865,6 +874,8 @@ async fn build_vector_indexes_for_nodes(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
+    authoritative: bool,
+    corpus_max_lsn: u64,
     label_dict: &LabelDictionary,
     descriptors: &[VectorIndexDescriptor],
     merged_rows: &[NodeRow],
@@ -872,6 +883,20 @@ async fn build_vector_indexes_for_nodes(
     old_vector_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
     use crate::sst::vector::build_body;
+
+    // A Vamana graph is not row-mergeable, so this hook rebuilds it from scratch
+    // and drops the prior `.vg`. That is only sound when the merge is
+    // **authoritative** for the full label corpus — i.e. the output is the
+    // bucket's deepest level (`is_deepest`), so `merged_rows` spans every node
+    // SST for the label. On a partial (non-deepest) merge `merged_rows` is a
+    // strict subset; rebuilding from it and deleting the deep `.vg` would
+    // silently truncate the index to the shallow rows (permanent recall loss vs
+    // the flat scan). Leave the existing `.vg` untouched instead — the freshness
+    // gate (`vector_index_stale`) detects the now-newer Nodes SST and falls back
+    // to the exact flat scan until an authoritative merge rebuilds the index.
+    if !authoritative {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
@@ -938,7 +963,9 @@ async fn build_vector_indexes_for_nodes(
             min_key: [0u8; 16],
             max_key: [0xFFu8; 16],
             min_lsn: 0,
-            max_lsn: 0,
+            // Stamp the indexed corpus's high-water LSN so a later read can tell
+            // whether a newer Nodes SST has outrun this `.vg` (freshness gate).
+            max_lsn: corpus_max_lsn,
             schema_version_min: 0,
             schema_version_max: 0,
             property_stats: vec![],
@@ -980,6 +1007,8 @@ async fn build_text_indexes_for_nodes(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
+    authoritative: bool,
+    corpus_max_lsn: u64,
     label_dict: &LabelDictionary,
     descriptors: &[crate::manifest::TextIndexDescriptor],
     merged_rows: &[NodeRow],
@@ -987,6 +1016,14 @@ async fn build_text_indexes_for_nodes(
     old_text_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
     use crate::sst::text::build_body;
+
+    // Rebuild-not-merge, like the vector hook — only sound on an authoritative
+    // (deepest-level) merge whose `merged_rows` span the full label corpus. On a
+    // partial merge, keep the prior `.ft` and let the freshness gate fall back to
+    // the flat scan, rather than truncate the index to the shallow subset.
+    if !authoritative {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
@@ -1055,7 +1092,9 @@ async fn build_text_indexes_for_nodes(
             min_key: [0u8; 16],
             max_key: [0xFFu8; 16],
             min_lsn: 0,
-            max_lsn: 0,
+            // High-water LSN of the indexed corpus — lets a later read detect a
+            // newer Nodes SST and fall back to the flat scan (freshness gate).
+            max_lsn: corpus_max_lsn,
             schema_version_min: 0,
             schema_version_max: 0,
             property_stats: vec![],

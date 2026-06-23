@@ -416,4 +416,150 @@ mod indexed {
             "filtered KNN (label + threshold) must also reach the index"
         );
     }
+
+    /// Build a `.vg` for an arbitrary metric (mirrors `build_index`, which is
+    /// cosine-only).
+    async fn build_index_metric(
+        name: &str,
+        metric: VectorMetric,
+        docs: &[(&str, &str, Vec<f32>)],
+    ) -> WriterSession {
+        let mut w = WriterSession::open(store(), paths(name)).await.unwrap();
+        w.register_vector_index(VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: DIM,
+            metric,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+        })
+        .await
+        .unwrap();
+        let half = docs.len().div_ceil(2);
+        for (i, (title, kind, emb)) in docs.iter().enumerate() {
+            w.upsert_node("Doc", NodeId::new(), &rec(title, kind, emb.clone()))
+                .unwrap();
+            if i + 1 == half {
+                w.flush(schema()).await.unwrap();
+            }
+        }
+        w.flush(schema()).await.unwrap();
+        w.compact_l0(&schema()).await.unwrap();
+        w
+    }
+
+    fn exact_topk_dot(live: &[(String, Vec<f32>)], q: &[f32], k: usize) -> Vec<String> {
+        let mut s: Vec<(f64, String)> = live
+            .iter()
+            .map(|(t, e)| {
+                let dot: f64 = e.iter().zip(q).map(|(x, y)| *x as f64 * *y as f64).sum();
+                (dot, t.clone())
+            })
+            .collect();
+        s.sort_by(|a, b| b.0.total_cmp(&a.0));
+        s.truncate(k);
+        s.into_iter().map(|(_, t)| t).collect()
+    }
+
+    fn exact_topk_l2(live: &[(String, Vec<f32>)], q: &[f32], k: usize) -> Vec<String> {
+        let mut s: Vec<(f64, String)> = live
+            .iter()
+            .map(|(t, e)| {
+                let d: f64 = e
+                    .iter()
+                    .zip(q)
+                    .map(|(x, y)| {
+                        let d = *x as f64 - *y as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                (d, t.clone())
+            })
+            .collect();
+        s.sort_by(|a, b| a.0.total_cmp(&b.0));
+        s.truncate(k);
+        s.into_iter().map(|(_, t)| t).collect()
+    }
+
+    #[tokio::test]
+    async fn dot_knn_reaches_index_and_matches_bruteforce() {
+        // Dot is magnitude-sensitive: `a` (largest magnitude along x) beats the
+        // unit `b`. The rewrite must fire (DESC) and the index score = raw dot.
+        let docs = vec![
+            ("a", "X", vec![2.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 1.0, 0.0, 0.0]),
+            ("e", "Y", vec![0.5, 0.5, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-dot", VectorMetric::Dot, &docs).await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             dot_product(d.embedding, $q) AS score ORDER BY score DESC LIMIT 3";
+        let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "dot KNN must reach the index"
+        );
+        let q = vec![1.0, 0.0, 0.0, 0.0];
+        let got = titles(&run(&w, cypher, q.clone()).await);
+        let live: Vec<(String, Vec<f32>)> = docs
+            .iter()
+            .map(|(t, _, e)| (t.to_string(), e.clone()))
+            .collect();
+        assert_eq!(got, exact_topk_dot(&live, &q, 3));
+    }
+
+    #[tokio::test]
+    async fn euclidean_knn_reaches_index_and_matches_bruteforce() {
+        // Euclidean is nearest-first ASC; the rewrite must fire on ASC and the
+        // index score = L2 distance, ranked ascending.
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+            ("e", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-l2", VectorMetric::Euclidean, &docs).await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             euclidean_distance(d.embedding, $q) AS score ORDER BY score ASC LIMIT 3";
+        let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "euclidean ASC KNN must reach the index"
+        );
+        let q = vec![1.0, 0.0, 0.0, 0.0];
+        let got = titles(&run(&w, cypher, q.clone()).await);
+        let live: Vec<(String, Vec<f32>)> = docs
+            .iter()
+            .map(|(t, _, e)| (t.to_string(), e.clone()))
+            .collect();
+        assert_eq!(got, exact_topk_l2(&live, &q, 3));
+    }
+
+    #[tokio::test]
+    async fn query_nodes_procedure_serves_from_the_index() {
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+            ("e", "Y", vec![0.5, 0.5, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-qn", VectorMetric::Cosine, &docs).await;
+        // Neo4j-style positional call; resolves `doc_emb` by name.
+        let cypher = "CALL db.index.vector.queryNodes('doc_emb', 2, $q) \
+             YIELD node, score RETURN node.title AS title";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        // query ∥ x → a (cos 1.0) then e (cos ~0.707).
+        assert_eq!(got, vec!["a".to_string(), "e".to_string()]);
+    }
 }

@@ -8,6 +8,7 @@
 
 pub mod expr;
 pub mod factor;
+pub mod fusion;
 pub mod leapfrog;
 pub mod limits;
 pub mod row;

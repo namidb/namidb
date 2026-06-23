@@ -16,10 +16,18 @@
 //! leaf the executor serves from the index (falling back to the flat scan when
 //! no index matches); any outer `Project` is preserved on top. A `WHERE` the
 //! rewrite folds in is captured as the `VectorSearch`'s `post_filter` so the
-//! index path survives a filter (RFC-030 filtered ANN). Conservative: any `SKIP`,
-//! a non-DESC key, multiple keys, a non-vector key function, a `DISTINCT`
-//! projection, a cross-binding filter, or a missing index leaves the plan
-//! unchanged.
+//! index path survives a filter (RFC-030 filtered ANN). The rewrite reaches a
+//! KNN nested in a UNION branch, a `CALL {}` subquery, a join, or an aggregate
+//! (bottom-up recursion).
+//!
+//! The order key must be in the metric's *nearest-first* direction — `DESC` for
+//! the higher-is-closer metrics (`cosine_similarity`, `dot_product`), `ASC` for
+//! `euclidean_distance` (lower distance is closer); the wrong direction asks for
+//! the *farthest* k, which the index does not compute. Conservative: any `SKIP`,
+//! an unbounded `ORDER BY` with no `LIMIT` (k = `u64::MAX`), multiple keys, a
+//! non-vector key function, a `DISTINCT` projection, a cross-binding filter, a
+//! predicate already pushed into `NodeScan.predicates`, or a missing index leaves
+//! the plan unchanged.
 //!
 //! Registered in `optimize::mod` right after `unique_lookup`, so the downstream
 //! pushdowns (which treat `VectorSearch` as an opaque leaf) see the new
@@ -32,8 +40,17 @@ use crate::plan::logical::{LogicalPlan, OrderKey, ProjectionItem, RowCount, Vect
 
 /// Run the rewrite over `plan`. No-op when no index matches.
 pub fn apply_vector_search(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
-    let plan = recurse(plan);
+    // Rewrite nested sub-plans first (so a KNN inside a UNION branch, a `CALL {}`
+    // subquery, a join, or an aggregate is collapsed too), then attempt the KNN
+    // shapes at this node.
+    let plan = recurse(plan, catalog);
+    try_rewrite_here(plan, catalog)
+}
 
+/// Attempt the KNN→`VectorSearch` rewrite at the *root* of `plan` (its children
+/// are already rewritten). Tries the three lowered shapes; returns `plan`
+/// unchanged when none match or no index backs it.
+fn try_rewrite_here(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     // Terminal-`RETURN` KNN: `Project[ … ]{ TopN{ [Filter] NodeScan } }`. Rewrite
     // the TopN ranking sub-tree to a `VectorSearch` and keep the outer Project
     // (it re-projects `d.x`/`score` from the node the index returns). The score
@@ -97,11 +114,17 @@ fn outer_score_alias_of(items: &[ProjectionItem], keys: &[OrderKey]) -> Option<S
     })
 }
 
-/// Bottom-up recursion through the single-input operators that wrap a KNN
-/// (TopN / Project / Filter). A KNN is a single-chain shape, so this is enough
-/// to catch one nested under an outer clause. (Pure structural rebuild; the
-/// index match is decided in `try_match` against the catalog.)
-fn recurse(plan: LogicalPlan) -> LogicalPlan {
+/// Descend into a plan's children so a KNN nested anywhere gets rewritten.
+///
+/// The KNN-chain wrappers (TopN / Project / Filter) are rebuilt **structurally**
+/// (`recurse` on the child) so the multi-level shapes — `Project{TopN}` (terminal
+/// RETURN) and `Filter{TopN}` (similarity threshold) — survive intact for
+/// `try_rewrite_here` to match as a unit at the parent. Every other operator that
+/// can *contain* a KNN sub-plan (UNION branches, `CALL {}` subqueries lowered to
+/// Apply/SemiApply, joins, cross products, aggregates, unwind/distinct) hands each
+/// child to the full `apply_vector_search`, which independently optimizes that
+/// sub-plan from its own root. Leaves and write operators fall through unchanged.
+fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     match plan {
         LogicalPlan::TopN {
             input,
@@ -109,7 +132,7 @@ fn recurse(plan: LogicalPlan) -> LogicalPlan {
             skip,
             limit,
         } => LogicalPlan::TopN {
-            input: Box::new(recurse(*input)),
+            input: Box::new(recurse(*input, catalog)),
             keys,
             skip,
             limit,
@@ -120,14 +143,66 @@ fn recurse(plan: LogicalPlan) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         } => LogicalPlan::Project {
-            input: Box::new(recurse(*input)),
+            input: Box::new(recurse(*input, catalog)),
             items,
             distinct,
             discard_input_bindings,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(recurse(*input)),
+            input: Box::new(recurse(*input, catalog)),
             predicate,
+        },
+        // Binary operators that can host a complete KNN sub-plan in a branch.
+        LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+            left: Box::new(apply_vector_search(*left, catalog)),
+            right: Box::new(apply_vector_search(*right, catalog)),
+            all,
+        },
+        LogicalPlan::CrossProduct { left, right } => LogicalPlan::CrossProduct {
+            left: Box::new(apply_vector_search(*left, catalog)),
+            right: Box::new(apply_vector_search(*right, catalog)),
+        },
+        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+            input: Box::new(apply_vector_search(*input, catalog)),
+            subplan: Box::new(apply_vector_search(*subplan, catalog)),
+        },
+        LogicalPlan::SemiApply {
+            input,
+            subplan,
+            negated,
+        } => LogicalPlan::SemiApply {
+            input: Box::new(apply_vector_search(*input, catalog)),
+            subplan: Box::new(apply_vector_search(*subplan, catalog)),
+            negated,
+        },
+        LogicalPlan::HashJoin {
+            build,
+            probe,
+            on,
+            residual,
+        } => LogicalPlan::HashJoin {
+            build: Box::new(apply_vector_search(*build, catalog)),
+            probe: Box::new(apply_vector_search(*probe, catalog)),
+            on,
+            residual,
+        },
+        // Single-input read wrappers a KNN sub-plan can sit beneath.
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregations,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(apply_vector_search(*input, catalog)),
+            group_by,
+            aggregations,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(apply_vector_search(*input, catalog)),
+        },
+        LogicalPlan::Unwind { input, list, alias } => LogicalPlan::Unwind {
+            input: Box::new(apply_vector_search(*input, catalog)),
+            list,
+            alias,
         },
         other => other,
     }
@@ -152,8 +227,15 @@ fn try_match(
     else {
         return None;
     };
-    // No SKIP; exactly one DESC key on a vector-distance function.
+    // No SKIP; exactly one correctly-oriented key on a vector-distance function.
     if !matches!(skip, RowCount::Const(0)) {
+        return None;
+    }
+    // An unbounded `ORDER BY` with no `LIMIT` lowers to `k = u64::MAX`; copying
+    // that into `VectorSearch.k` would overflow `Vec::with_capacity(k)` in the
+    // executor. Leave such a plan as the flat TopN (which streams without
+    // pre-allocating k).
+    if matches!(limit, RowCount::Const(u64::MAX)) {
         return None;
     }
     let (distance, prop, alias, query) = single_distance_key(keys)?;
@@ -193,12 +275,23 @@ fn try_match(
     let LogicalPlan::NodeScan {
         label: Some(label),
         alias: scan_alias,
+        predicates,
         ..
     } = scan
     else {
         return None;
     };
     if scan_alias != &alias {
+        return None;
+    }
+    // `predicate_pushdown` can fold a `WHERE` into `NodeScan.predicates` before
+    // this rewrite runs (the fixpoint interleaves the passes). Those storage-level
+    // predicates cannot be reconstructed into a `post_filter` Expression here, so
+    // swallowing the scan into a `VectorSearch` would silently drop them. Refuse
+    // the rewrite when any are present — the flat path keeps and honours them. The
+    // common filtered-ANN case is unaffected: a `Filter` directly above the scan
+    // is captured via `peel_filter` before pushdown moves it.
+    if !predicates.is_empty() {
         return None;
     }
 
@@ -259,18 +352,34 @@ fn and_expr(a: Expression, b: Expression) -> Expression {
     }
 }
 
-/// From `keys`, if it's a single DESC key whose expression is
-/// `dist_fn(Property(Variable(alias), prop), query)`, return
-/// `(metric, prop, alias, query)`.
+/// `true` when a larger metric value means a closer match — cosine similarity
+/// and raw dot product. Euclidean is a distance: smaller is closer.
+fn metric_higher_is_better(metric: VectorDistance) -> bool {
+    !matches!(metric, VectorDistance::Euclidean)
+}
+
+/// From `keys`, if it's a single key whose expression is
+/// `dist_fn(Property(Variable(alias), prop), query)` ordered in the metric's
+/// *nearest-first* direction, return `(metric, prop, alias, query)`. Nearest-first
+/// is `DESC` for the higher-is-closer metrics (cosine, dot) and `ASC` for
+/// euclidean (lower distance is closer). A query ordered the other way asks for
+/// the *farthest* k — which `VectorSearch` does not compute — so it is left as the
+/// flat TopN.
 fn single_distance_key(keys: &[OrderKey]) -> Option<(VectorDistance, String, String, Expression)> {
     if keys.len() != 1 {
         return None;
     }
     let key = &keys[0];
-    if !matches!(key.direction, OrderDirection::Desc) {
+    let parts = distance_call_parts(&key.expression)?;
+    let want = if metric_higher_is_better(parts.0) {
+        OrderDirection::Desc
+    } else {
+        OrderDirection::Asc
+    };
+    if key.direction != want {
         return None;
     }
-    distance_call_parts(&key.expression)
+    Some(parts)
 }
 
 /// `dist_fn(Property(Variable(alias), prop), query)` →
@@ -669,6 +778,106 @@ mod tests {
                 "expected Project(VectorSearch), got {:?}",
                 other.operator_name()
             ),
+        }
+    }
+
+    /// `knn_plan` in the non-terminal WITH shape with an explicit metric fn and
+    /// order direction, for the orientation tests.
+    fn knn_plan_dir(metric_fn: &str, dir: OrderDirection) -> LogicalPlan {
+        let mut plan = knn_plan(metric_fn);
+        if let LogicalPlan::TopN { ref mut keys, .. } = plan {
+            keys[0].direction = dir;
+        }
+        plan
+    }
+
+    #[test]
+    fn euclidean_rewrites_asc_not_desc() {
+        // Euclidean is nearest-first ASC; the ANN serves nearest-k, so only ASC
+        // (with a euclidean index) rewrites. DESC asks for the farthest k.
+        let cat = catalog_with_index(VectorMetric::Euclidean);
+        let asc = knn_plan_dir("euclidean_distance", OrderDirection::Asc);
+        assert!(
+            matches!(
+                apply_vector_search(asc, &cat),
+                LogicalPlan::VectorSearch { .. }
+            ),
+            "euclidean ASC + index → VectorSearch"
+        );
+        let desc = knn_plan_dir("euclidean_distance", OrderDirection::Desc);
+        assert!(
+            matches!(apply_vector_search(desc, &cat), LogicalPlan::TopN { .. }),
+            "euclidean DESC (farthest-k) → unchanged"
+        );
+    }
+
+    #[test]
+    fn cosine_asc_does_not_rewrite() {
+        // Cosine nearest-first is DESC; ASC asks for the least-similar k.
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        let asc = knn_plan_dir("cosine_similarity", OrderDirection::Asc);
+        assert!(matches!(
+            apply_vector_search(asc, &cat),
+            LogicalPlan::TopN { .. }
+        ));
+    }
+
+    #[test]
+    fn unbounded_limit_is_not_rewritten() {
+        // `ORDER BY … DESC` with no `LIMIT` lowers to k = u64::MAX; rewriting it
+        // would overflow `Vec::with_capacity(k)` in the executor. Stay flat.
+        let mut plan = knn_plan("cosine_similarity");
+        if let LogicalPlan::TopN { ref mut limit, .. } = plan {
+            *limit = RowCount::Const(u64::MAX);
+        }
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        assert!(matches!(
+            apply_vector_search(plan, &cat),
+            LogicalPlan::TopN { .. }
+        ));
+    }
+
+    #[test]
+    fn pushed_scan_predicate_blocks_rewrite() {
+        use namidb_storage::sst::predicates::ScanPredicate;
+        // A predicate already folded into NodeScan.predicates (by predicate
+        // pushdown) must not be silently dropped — refuse the rewrite so the flat
+        // path keeps honouring it.
+        let mut plan = knn_plan("cosine_similarity");
+        if let LogicalPlan::TopN { ref mut input, .. } = plan {
+            if let LogicalPlan::Project { ref mut input, .. } = **input {
+                if let LogicalPlan::NodeScan {
+                    ref mut predicates, ..
+                } = **input
+                {
+                    predicates.push(ScanPredicate::IsNotNull {
+                        column: "emb".into(),
+                    });
+                }
+            }
+        }
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        assert!(
+            matches!(apply_vector_search(plan, &cat), LogicalPlan::TopN { .. }),
+            "pushed scan predicate → no rewrite (flat path honours it)"
+        );
+    }
+
+    #[test]
+    fn rewrites_knn_nested_in_union_branch() {
+        // A KNN in a UNION branch is collapsed too (bottom-up recursion).
+        let cat = catalog_with_index(VectorMetric::Cosine);
+        let plan = LogicalPlan::Union {
+            left: Box::new(knn_plan("cosine_similarity")),
+            right: Box::new(knn_plan("cosine_similarity")),
+            all: true,
+        };
+        match apply_vector_search(plan, &cat) {
+            LogicalPlan::Union { left, right, .. } => {
+                assert!(matches!(*left, LogicalPlan::VectorSearch { .. }));
+                assert!(matches!(*right, LogicalPlan::VectorSearch { .. }));
+            }
+            other => panic!("expected Union, got {:?}", other.operator_name()),
         }
     }
 

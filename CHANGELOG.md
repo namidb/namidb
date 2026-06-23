@@ -11,6 +11,74 @@ the release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Hybrid search — `CALL search.hybrid({…})`.** Fuses a dense (vector KNN) and
+  a sparse (BM25) retrieval into one ranking. Default fusion is **Reciprocal
+  Rank Fusion** (RRF, k=60) — rank-based, so it needs no score calibration across
+  the cosine and BM25 scales (the same default Elasticsearch / Weaviate / Qdrant /
+  pgvector ship); `fusion: 'linear'` does a weighted min-max blend (`alpha` on the
+  dense leg). Each leg independently serves from its index or its exact flat scan,
+  so hybrid is freshness-equivalent to running the two separately and fusing.
+  Configure either or both legs: `query_vector`+`vector_property` (dense),
+  `query_text`+`text_property(ies)` (sparse), plus `k`, `ef`, `rrf_k`, `alpha`,
+  `metric`.
+- **`CALL search.vector({…})`** — vector KNN as an ergonomic procedure, with a
+  tunable `ef` beam width (recall vs latency), mirroring `search.bm25`.
+- **Neo4j-compatible `CALL db.index.vector.queryNodes(indexName, k, queryVector
+  [, {ef}])`** — resolves the index by name and serves it through the same path.
+- **All three vector metrics now serve from the Vamana index.** Previously only
+  `cosine` used the `.vg`; `dot_product` and `euclidean_distance` fell back to the
+  O(n) flat scan. The `.vg` now stores the **original (un-normalised) vectors**
+  and reranks candidates with the **true metric**, so the index score equals the
+  flat scan's exactly (cosine similarity / raw dot, higher = closer; L2 distance,
+  lower = closer). `euclidean` navigates with a new L2 space; `cosine`/`dot`
+  navigate with cosine. (`.vg` format bumped to v2; old `.vg` files are skipped
+  and rebuilt by compaction.)
+
+### Fixed
+
+- **CRITICAL — a partial compaction silently truncated the vector/text index.**
+  The `.vg`/`.ft` rebuild ran on every node merge from the *merged subset* and
+  unconditionally dropped the prior index, so a shallow L0+L1 sweep deleted the
+  deep index that covered L2/L3 — permanent recall loss vs the flat scan, with no
+  error. The rebuild now runs only on an **authoritative** (deepest-level) merge
+  that spans the full label corpus; the freshness gate is now LSN-based
+  (`index_outrun_by_nodes`), so a newer `Nodes` SST at *any* level (not just L0)
+  makes the read fall back to the exact flat scan until an authoritative rebuild.
+- **CRITICAL — a `WHERE` predicate could be silently dropped from an indexed KNN.**
+  When predicate pushdown folded a filter into `NodeScan.predicates` before the
+  vector rewrite ran, the rewrite discarded those predicates. The rewrite now
+  refuses to fire when the scan carries pushed predicates (the flat path keeps and
+  honours them); the common filtered-ANN case (a `Filter` above the scan) is
+  unaffected.
+- **HIGH — a dimension-mismatched query returned silently-wrong results from the
+  index** (a prefix-scored cosine) where the flat path errors. The index path now
+  validates the query dimension and falls back to the flat scan (which raises the
+  canonical mismatch error).
+- **HIGH — `ORDER BY` with no `LIMIT` (k = u64::MAX) panicked** the executor via a
+  `Vec::with_capacity` overflow; such plans are no longer rewritten to the index.
+- **`euclidean_distance` KNN was rewritten in the wrong direction.** The rewrite
+  required `DESC` (farthest-k) and never fired for the correct nearest-first `ASC`
+  euclidean query; it now matches the metric's natural direction.
+- The KNN→`VectorSearch` rewrite now reaches a KNN nested in a UNION branch, a
+  `CALL {}` subquery, a join, or an aggregate (previously only top-level shapes).
+- A `.vg` decoded from a corrupt/foreign body with an out-of-range entry point
+  **panicked** the search; `decode` now validates the graph and the read path
+  skips an undecodable `.vg` (→ flat scan) instead of erroring the query.
+- The indexed-KNN materialisation loop now polls the query deadline (a filtered
+  ANN can do up to `k×8` cold node lookups), and a plain-KNN flat fallback now
+  materialises the full node so a `RETURN d.<prop>` is no longer null.
+- **PageRank produced negative (and >1) scores** when a node's out-edges mixed
+  signs but summed positive — a negative edge injected negative mass. Negative
+  weights are now treated as absent (PageRank is defined for non-negative
+  weights).
+- **`algo.wcc` assigned non-deterministic component ids** (HashMap iteration
+  order); ids are now assigned in node-insertion order, like `label_propagation`.
+- `Int8Space::query_distance` returned distance 0 (a false perfect match) for a
+  zero-vs-nonzero pair; it now returns 1.0, matching the f32 / pair-distance
+  convention.
+
 ## [1.3.0] - 2026-06-22: Vector search reaches the index — filtered and fresh
 
 ### Fixed

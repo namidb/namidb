@@ -227,6 +227,13 @@ For large collections, promote it to a real ANN index (DiskANN/Vamana) so the op
 CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 3;
 ```
 
+All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
+
+```cypher
+CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 5, ef: 200}) YIELD node, score;
+CALL db.index.vector.queryNodes('doc_emb', 5, $q) YIELD node, score;
+```
+
 For lexical relevance, `CALL search.bm25(...)` ranks documents with full BM25 — real IDF (rare query terms outweigh common ones), term-frequency saturation, and corpus-derived length normalization:
 
 ```cypher
@@ -241,7 +248,21 @@ By default this scans the label and computes corpus statistics on the fly. For l
 CREATE FULLTEXT INDEX doc_ft ON :Doc(title, body);
 ```
 
-The index is built during compaction and `CALL search.bm25` uses it automatically when its `(label, properties)` match (falling back to the scan otherwise). The MCP `hybrid_search` tool fuses this lexical channel with vector scores (reciprocal rank fusion) automatically. There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF.
+The index is built during compaction and `CALL search.bm25` uses it automatically when its `(label, properties)` match (falling back to the scan otherwise).
+
+**Hybrid search** fuses both channels natively — `CALL search.hybrid(...)` runs the dense (vector KNN) and sparse (BM25) retrievals and combines them with **Reciprocal Rank Fusion** (the default; `fusion: 'linear'` for a weighted blend). Each leg serves from its index or its exact flat scan, so the result is always fresh:
+
+```cypher
+CALL search.hybrid({
+  label: 'Doc',
+  query_text: 'graph storage', text_properties: ['title', 'body'],
+  query_vector: $q,             vector_property: 'embedding',
+  k: 10
+}) YIELD node, score
+RETURN node.title AS title, score ORDER BY score DESC;
+```
+
+There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF, and the MCP `hybrid_search` tool exposes the same fusion to agents.
 
 <br />
 
