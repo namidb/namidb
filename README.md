@@ -29,9 +29,9 @@ What you get out of the box:
 
 - **A property graph** you query with Cypher / GQL — `CALL { … }` subqueries (correlated and uncorrelated), `EXISTS { … }`, `FOREACH`, label disjunction `(n:A|B)`, and open-ended / parameterised variable-length paths (`*`, `*1..$n`).
 - **Schema when you want it** — `CREATE CONSTRAINT` for uniqueness (single- *and* multi-property), `NOT NULL`, and `CREATE INDEX` for equality lookups, with `IF NOT EXISTS` and `SHOW CONSTRAINTS` / `SHOW INDEXES`. Schema-optional: the engine enforces only what you declare.
-- **Vector search** — store embeddings as node properties, rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN.
-- **Hybrid search** — BM25 lexical + semantic, fused with reciprocal rank fusion, in one call.
-- **Graph algorithms** — connected components (weak & strong), PageRank, degree centrality, triangle count, community detection, and shortest paths over `CALL algo.*`.
+- **Vector search** — store embeddings as node properties and rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN over cosine, dot, *and* Euclidean — with optional int8 quantization for a ~4× smaller index. Reachable from idiomatic Cypher KNN or `CALL search.vector` / Neo4j-style `db.index.vector.queryNodes`.
+- **Hybrid search** — BM25 lexical + dense vector, fused with Reciprocal Rank Fusion (or a weighted blend), in one `CALL search.hybrid`.
+- **Graph algorithms** — connected components (weak & strong), PageRank, degree centrality, triangle count, community detection, shortest paths, and FastRP structural embeddings over `CALL algo.*`.
 - **Obsidian / Markdown ingestion** — turn a folder of notes into a live graph (wikilinks, embeds, tags, frontmatter) in one command.
 - **Auth that's real** — static tokens, OIDC/JWT, per-namespace scoping, and an external policy hook (OPA).
 
@@ -151,9 +151,15 @@ CALL algo.triangle_count() YIELD node_id, triangles, coefficient RETURN *;
 
 -- Hop distance from a starting node (BFS; pass weighted: true for Dijkstra).
 CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops RETURN *;
+
+-- Structural embeddings from pure graph shape (FastRP) — no model, no service.
+-- The output is a FloatVector, ready to store and serve from a vector index:
+-- "find structurally similar nodes" becomes a KNN over the graph itself.
+CALL algo.fastRP({dimension: 256, iterations: 4, seed: 42}) YIELD node_id, embedding
+RETURN node_id, embedding;
 ```
 
-The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `shortest_path`. They run exact (no sampling) and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
+The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `shortest_path`, `fastRP`. They run exact (no sampling), are deterministic, and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
 
 <br />
 
@@ -227,7 +233,7 @@ For large collections, promote it to a real ANN index (DiskANN/Vamana) so the op
 CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 3;
 ```
 
-All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. For large corpora, add `WITH { quantization: 'int8' }` to store the vectors as int8 (~4× smaller index, cosine-only). Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
+All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. For large corpora, add `WITH { quantization: int8 }` to store the vectors as int8 (~4× smaller index, cosine-only). Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
 
 ```cypher
 CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 5, ef: 200}) YIELD node, score;

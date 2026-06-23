@@ -45,7 +45,7 @@ the release notes.
   navigate with cosine. (`.vg` format bumped; old `.vg` files are skipped and
   rebuilt by compaction.)
 - **int8 quantization for vector indexes** — `CREATE VECTOR INDEX … WITH
-  {quantization: 'int8'}`. Stores per-vector int8 codes + a scale instead of full
+  {quantization: int8}`. Stores per-vector int8 codes + a scale instead of full
   f32 (~4× smaller `.vg`, the DiskANN memory/storage win for object-storage-first
   indexes where the whole index is fetched per search). Cosine-only (the
   scale-invariant int8 space); recall stays above ~0.80 and the score is the
