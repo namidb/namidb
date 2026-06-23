@@ -11,6 +11,8 @@ the release notes.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-23: World-class vector & graph — hybrid search, full-metric ANN, int8, FastRP
+
 ### Added
 
 - **Hybrid search — `CALL search.hybrid({…})`.** Fuses a dense (vector KNN) and
