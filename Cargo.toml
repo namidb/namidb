@@ -103,7 +103,7 @@ criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
 # Markdown / vault ingest (isolated to namidb-markdown so the core
 # storage/query crates stay free of these parsers)
-pulldown-cmark = { version = "0.12", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
 yaml-rust2 = "0.10"
 regex = "1"
 
