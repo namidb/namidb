@@ -227,11 +227,13 @@ hits = db.cypher(
 ).rows()
 ```
 
-For large collections, promote it to a real ANN index (DiskANN/Vamana) so the optimizer serves the same query from the index instead of scanning. Build the server or CLI with `--features vector-index`, then:
+For large collections, promote it to a real ANN index (DiskANN/Vamana) so the optimizer serves the same query from the index instead of scanning. Build the server with `--features vector-index` (or grab the prebuilt server binary — see below), then:
 
 ```cypher
-CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 3;
+CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(embedding) METRIC cosine DIMENSION 3;
 ```
+
+`IF NOT EXISTS` goes between the name and `ON`, so re-running the statement is a no-op when the index already exists — the same idempotent-migration story as `CREATE CONSTRAINT` / `CREATE INDEX`.
 
 All three metrics are served from the index — `cosine` and `dot_product` (rank `… DESC`, higher is closer) and `euclidean_distance` (rank `… ASC`, lower is closer) — and the indexed score equals the flat scan's exactly. For large corpora, add `WITH { quantization: int8 }` to store the vectors as int8 (~4× smaller index, cosine-only). Or call it as a procedure with a tunable beam width, including the Neo4j-compatible form:
 
@@ -239,6 +241,24 @@ All three metrics are served from the index — `cosine` and `dot_product` (rank
 CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 5, ef: 200}) YIELD node, score;
 CALL db.index.vector.queryNodes('doc_emb', 5, $q) YIELD node, score;
 ```
+
+`search.vector`, `search.hybrid`, and `db.index.vector.queryNodes` all take an optional `filter` map for metadata-scoped KNN — the right tool when many tenants share one index:
+
+```cypher
+CALL search.vector({
+  label: 'Doc', property: 'embedding', query: $q, k: 5,
+  filter: { tenant_id: $t }
+}) YIELD node, score;
+
+-- queryNodes carries it (with `ef`) in the optional 4th map.
+CALL db.index.vector.queryNodes('doc_emb', 5, $q, { ef: 200, filter: { tenant_id: $t } }) YIELD node, score;
+```
+
+A scalar value means equality (`tenant_id = $t`), a list means `IN` (`{ tier: [1, 2, 3] }` → `tier IN [1, 2, 3]`), and a `{ gte, gt, lte, lt, eq, ne }` map is a range (`{ score: { gte: 0.5 } }`) — keys AND-combine. The filter runs *index-side*: the ANN over-fetches and adaptively widens its candidate set, then falls back to an exact flat scan, so a selective predicate returns the true top-k for that slice instead of post-truncating a shared top-k down to zero rows for a sparse tenant.
+
+Recall is tunable. The procedures take a first-class `ef` beam width (shown above); the natural `MATCH … ORDER BY cosine_similarity(…)` form has no syntax for it, so it reads a reserved `$__vector_ef` param. `$__vector_ef` only ever *raises* the beam (never corrupts the answer) and is a **non-stable** knob — expect it to be superseded by an `OPTIONS { ef }` clause.
+
+Two correctness details worth knowing. When a vector index covers a property, embeddings are dimension-checked on write: a wrong-dimension value is rejected, and a correct-dimension bare `list[float]` is coerced to a dense vector so it actually enters the index (otherwise a bare list reads back fine via flat scan yet is silently skipped at build time). And cosine is undefined for a zero-magnitude vector — `cosine_similarity` returns NULL and that row drops out of a KNN — a contract the index enforces too, so the indexed result equals the flat scan's row-for-row.
 
 For lexical relevance, `CALL search.bm25(...)` ranks documents with full BM25 — real IDF (rare query terms outweigh common ones), term-frequency saturation, and corpus-derived length normalization:
 
@@ -248,11 +268,13 @@ YIELD node, score
 RETURN node.title AS title, score ORDER BY score DESC;
 ```
 
-By default this scans the label and computes corpus statistics on the fly. For large collections, register a persistent inverted index so the same query answers from precomputed postings instead of re-scanning — build the server or CLI with `--features text-index`, then:
+By default this scans the label and computes corpus statistics on the fly. For large collections, register a persistent inverted index so the same query answers from precomputed postings instead of re-scanning — build the server with `--features text-index` (or use the prebuilt server, below), then:
 
 ```cypher
-CREATE FULLTEXT INDEX doc_ft ON :Doc(title, body);
+CREATE FULLTEXT INDEX doc_ft IF NOT EXISTS ON :Doc(title, body);
 ```
+
+`IF NOT EXISTS` sits between the name and `ON` here too, keeping migration scripts idempotent.
 
 The index is built during compaction and `CALL search.bm25` uses it automatically when its `(label, properties)` match (falling back to the scan otherwise).
 
@@ -269,6 +291,8 @@ RETURN node.title AS title, score ORDER BY score DESC;
 ```
 
 There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF, and the MCP `hybrid_search` tool exposes the same fusion to agents.
+
+The full vector-index design — freshness gating, all three metrics, int8 quantization, and the index-vs-flat equivalence — is [RFC-030](./docs/rfc/030-vector-index.md); the multi-tenant filtered-ANN pre-filtering path behind the `filter` argument is [RFC-032](./docs/rfc/032-filtered-ann-prefiltering.md).
 
 <br />
 
@@ -347,7 +371,9 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 | `--pdp-url` *(feature `pdp`)* | Send each query to an OPA-style policy endpoint; deny unless it allows (fail-closed). |
 | `--multi-tenant` / `--default-namespace` | Serve many namespaces, routed by path (`/<ns>/v0/cypher`) or the `X-NamiDB-Namespace` header. |
 
-> Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
+> Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`), `text-index` (`CREATE FULLTEXT INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
+>
+> **Prebuilt server binary.** Each GitHub Release ships a `namidb-server-<tag>-<target>` archive built with `--features vector-index,text-index`, so `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX` work out of the box. The `namidb` and `namidb-mcp` archives are feature-light — no optional features — so build the server from source with your own `--features` set when you also want `jwt`/`pdp` or a slimmer binary.
 
 <br />
 
