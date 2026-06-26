@@ -11,6 +11,81 @@ the release notes.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-26: Vector search hardening — filtering, idempotent DDL, dimension safety
+
+### Added
+
+- **Structured `filter` on the KNN procedures.** `search.vector`,
+  `search.hybrid`, and `db.index.vector.queryNodes` now take a `filter` map and
+  compile it into the index-side predicate path — the same over-fetch + exact
+  flat fallback the natural `MATCH … WHERE … ORDER BY score` form gets — instead
+  of post-filtering an already-truncated top-`k` (which could starve a sparse
+  tenant in a shared index to zero results). Qdrant-style shape: a scalar is
+  equality, a list is `IN`, and a `{ gte, gt, lte, lt, eq, ne }` map is a range,
+  AND-combined across keys (e.g. `filter: { tenant_id: $t, tier: [1, 2, 3] }`).
+- **`CREATE VECTOR INDEX … IF NOT EXISTS`** and **`CREATE FULLTEXT INDEX …
+  IF NOT EXISTS`** — re-declaring an index is now an idempotent no-op success
+  instead of an "already exists" error (matching `CREATE INDEX` / `CREATE
+  CONSTRAINT`), over both HTTP and Bolt. The int8-requires-cosine check is never
+  suppressed.
+- **Tunable beam width on the natural form.** A reserved, namespaced
+  `$__vector_ef` parameter widens (or narrows) the Vamana beam for the
+  operator-form filtered ANN, so a filtered query can finally trade recall for
+  latency — previously only the procedures exposed `ef`. Explicitly **non-stable**
+  (see RFC-036 for the first-class `OPTIONS { ef }` surface that supersedes it).
+- **Prebuilt HTTP server binary.** Each GitHub Release now ships a
+  `namidb-server-<tag>-<target>` archive built with `--features
+  vector-index,text-index`, so `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX`
+  and index-backed KNN/BM25 work out of the box without building from source. A
+  feature-on CI job now exercises the vector/text code paths that the default
+  build compiles out, and the Docker image is built with the features on.
+- **RFC-030** (the DiskANN/Vamana vector index, previously cited in code but
+  undocumented) plus design RFCs **031** (ANN benchmark methodology, with
+  reproducible recall/latency numbers), **032** (true pre-filtering /
+  filtered-DiskANN), **033** (rich properties + named/sparse/multi-vector),
+  **034** (writer concurrency), **035** (incremental index maintenance), and
+  **036** (first-class `ef` surface); a `docs/multi-tenancy.md` operator guide.
+
+### Changed
+
+- **Filtered ANN adaptively widens before falling back to a flat scan.** A
+  selective `WHERE` / `filter` no longer over-fetches a single fixed ×8 and then
+  drops to an `O(n)` flat scan: the index fetch grows geometrically
+  (×8 → ×32 → ×128 → ×512) until enough candidates survive the predicate, so a
+  moderately selective filter is served from the index. The exact flat scan
+  remains the ground-truth fallback. No-filter queries are unchanged.
+- **Hybrid sparse leg no longer starves a filter.** With a `filter` present, the
+  BM25 leg fetches a much deeper ranking (`k × 512`, matching the dense leg's
+  maximum widening depth) before applying the predicate at fusion, rather than
+  truncating to `k_sparse` first — so a filter-matching document ranked past
+  `k_sparse` is no longer dropped. The depth is bounded (not the whole corpus) to
+  avoid a resource cliff on a common query term. `linear` fusion's score
+  calibration is window-sensitive under filtering; the default RRF fusion is
+  rank-based and unaffected.
+
+### Fixed
+
+- **Zero-magnitude query vector divergence (cosine).** A zero-magnitude query
+  made `cosine_similarity` undefined; the flat path correctly returned no rows
+  (3-valued-logic `NULL`), but the index path returned `k` rows scored `0.0`,
+  breaking the invariant that the index returns exactly what the flat scan would.
+  The index path now agrees (empty) for a zero cosine query. Dot/L2 remain
+  well-defined on a zero query.
+
+### Changed — behaviour
+
+- **Write-time embedding dimension enforcement.** When a vector index covers a
+  `(label, property)`, writing an embedding of the wrong dimension to that
+  property is now **rejected** (`ExecError::Constraint`) instead of being silently
+  accepted — a single mismatched row previously poisoned the entire `.vg` build,
+  permanently dropping every query for that index to the flat scan. A
+  correct-dimension *bare list* (`embedding = [f, …]`, no `vector()`) is coerced
+  to a dense vector so it is actually indexed rather than silently skipped at
+  build time. Enforcement is scoped to the property a write touches (a `SET` of
+  an unrelated property on a node with a legacy wrong-dimension embedding still
+  succeeds), and a label-add validates the existing embedding against the gained
+  label's index. Pre-existing rows are not retro-validated.
+
 ## [1.4.0] - 2026-06-23: World-class vector & graph — hybrid search, full-metric ANN, int8, FastRP
 
 ### Added
