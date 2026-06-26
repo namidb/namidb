@@ -41,15 +41,15 @@ notify-debouncer-full = "0.3"
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 
 # Columnar in-memory
-arrow = { version = "55", features = ["prettyprint"] }
-arrow-array = "55"
-arrow-buffer = "55"
-arrow-schema = "55"
-arrow-select = "55"
+arrow = { version = "59", features = ["prettyprint"] }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-schema = "59"
+arrow-select = "59"
 arrow-ord = "55"
 
 # Parquet
-parquet = { version = "55", features = ["async", "object_store"] }
+parquet = { version = "59", features = ["async", "object_store"] }
 
 # Hybrid cache
 foyer = "0.22"
