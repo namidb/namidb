@@ -340,6 +340,10 @@ pub struct CreateVectorIndexClause {
     pub alpha: Option<f32>,
     /// `WITH {quantization: int8}` → store int8 codes (cosine-only); default `None`.
     pub quantization: VectorQuantization,
+    /// `CREATE VECTOR INDEX <name> IF NOT EXISTS …` — a duplicate is a no-op
+    /// success instead of an "already exists" error. Mirrors
+    /// [`CreateIndexClause::if_not_exists`].
+    pub if_not_exists: bool,
     pub span: SourceSpan,
 }
 
@@ -355,6 +359,9 @@ pub struct CreateFulltextIndexClause {
     pub name: Identifier,
     pub label: Identifier,
     pub properties: Vec<Identifier>,
+    /// `CREATE FULLTEXT INDEX <name> IF NOT EXISTS …` — a duplicate is a no-op
+    /// success instead of an "already exists" error.
+    pub if_not_exists: bool,
     pub span: SourceSpan,
 }
 

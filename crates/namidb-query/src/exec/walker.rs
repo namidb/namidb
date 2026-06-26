@@ -2021,10 +2021,237 @@ fn rows_to_id_score(rows: &[Row]) -> Vec<(NodeId, f64)> {
         .collect()
 }
 
-/// `CALL search.vector({label, property, query, k?, ef?, metric?}) YIELD node,
-/// score` — vector KNN served from the Vamana index (or the exact flat scan),
-/// with a tunable `ef` beam width (recall vs latency). The ergonomic,
-/// EXPLAIN-free counterpart to the optimizer's KNN rewrite.
+/// Wrap an [`ExpressionKind`](crate::parser::ast::ExpressionKind) into an
+/// [`Expression`] at a synthetic span (the predicate is engine-built, not parsed).
+fn mk_filter_expr(kind: crate::parser::ast::ExpressionKind, sp: SourceSpan) -> Expression {
+    Expression { kind, span: sp }
+}
+
+/// `alias.key` property-access expression over the bound node binding.
+fn proc_prop_access(alias: &str, key: &str, sp: SourceSpan) -> Expression {
+    use crate::parser::ast::{ExpressionKind, Identifier, PropertyAccess};
+    let target = mk_filter_expr(ExpressionKind::Variable(Identifier::new(alias, sp)), sp);
+    mk_filter_expr(
+        ExpressionKind::Property(Box::new(PropertyAccess {
+            target,
+            key: Identifier::new(key, sp),
+            span: sp,
+        })),
+        sp,
+    )
+}
+
+/// Convert a `filter` operand [`RuntimeValue`] into a literal/list [`Expression`].
+fn proc_value_expr(v: &RuntimeValue, sp: SourceSpan) -> Result<Expression, ExecError> {
+    use crate::parser::ast::{ExpressionKind, Literal};
+    let kind = match v {
+        // A null comparison is 3VL-undefined (never true), so `filter: {k: null}`
+        // would silently match zero rows. The filter DSL has no IS NULL operator,
+        // so reject null outright rather than produce a useless empty result.
+        RuntimeValue::Null => {
+            return Err(proc_unsupported(
+                "`filter` values cannot be null (a null comparison matches no rows); \
+                 omit the key instead",
+            ))
+        }
+        RuntimeValue::Bool(b) => ExpressionKind::Literal(Literal::Boolean(*b)),
+        RuntimeValue::Integer(n) => ExpressionKind::Literal(Literal::Integer(*n)),
+        RuntimeValue::Float(f) => ExpressionKind::Literal(Literal::Float(*f)),
+        RuntimeValue::String(s) => ExpressionKind::Literal(Literal::String(s.clone())),
+        RuntimeValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(proc_value_expr(it, sp)?);
+            }
+            ExpressionKind::List(out)
+        }
+        _ => {
+            return Err(proc_unsupported(
+                "`filter` values must be scalars (string/number/bool) or lists of them",
+            ))
+        }
+    };
+    Ok(mk_filter_expr(kind, sp))
+}
+
+/// One `filter` term: a `{ op: value }` map → the matching comparison, else a
+/// bare scalar → equality. Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`.
+fn proc_filter_term(
+    alias: &str,
+    key: &str,
+    val: &RuntimeValue,
+    sp: SourceSpan,
+) -> Result<Expression, ExecError> {
+    use crate::parser::ast::{BinaryOp, ExpressionKind};
+    match val {
+        // `{ op: value, … }` condition map → each operator AND-combined (so a
+        // range is `{ gte: 10, lt: 100 }`). `in` works here too when the filter
+        // arrives via a `$param` (runtime map keys are plain strings, not parsed).
+        RuntimeValue::Map(opmap) => {
+            if opmap.is_empty() {
+                return Err(proc_unsupported(format!(
+                    "`filter` `{key}`: a condition map needs at least one operator \
+                     (eq|ne|gt|gte|lt|lte|in)"
+                )));
+            }
+            let mut acc: Option<Expression> = None;
+            for (op, operand) in opmap {
+                let term = proc_filter_op(alias, key, op, operand, sp)?;
+                acc = Some(match acc {
+                    None => term,
+                    Some(prev) => mk_filter_expr(
+                        ExpressionKind::Binary {
+                            op: BinaryOp::And,
+                            left: Box::new(prev),
+                            right: Box::new(term),
+                        },
+                        sp,
+                    ),
+                });
+            }
+            Ok(acc.expect("non-empty condition map"))
+        }
+        // A bare list → membership (`tenant_id: ['a', 'b']` ⇒ `n.tenant_id IN […]`).
+        // The ergonomic inline spelling of `in`, which can't be a bare map key
+        // (it is a reserved Cypher keyword that must be backtick-quoted).
+        RuntimeValue::List(_) => {
+            let list = proc_value_expr(val, sp)?;
+            Ok(mk_filter_expr(
+                ExpressionKind::In {
+                    item: Box::new(proc_prop_access(alias, key, sp)),
+                    list: Box::new(list),
+                },
+                sp,
+            ))
+        }
+        // A bare scalar → equality.
+        _ => {
+            let rhs = proc_value_expr(val, sp)?;
+            Ok(mk_filter_expr(
+                ExpressionKind::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(proc_prop_access(alias, key, sp)),
+                    right: Box::new(rhs),
+                },
+                sp,
+            ))
+        }
+    }
+}
+
+/// One `prop op operand` predicate inside a condition map.
+fn proc_filter_op(
+    alias: &str,
+    key: &str,
+    op: &str,
+    operand: &RuntimeValue,
+    sp: SourceSpan,
+) -> Result<Expression, ExecError> {
+    use crate::parser::ast::{BinaryOp, ExpressionKind};
+    let prop = proc_prop_access(alias, key, sp);
+    if op.eq_ignore_ascii_case("in") {
+        if !matches!(operand, RuntimeValue::List(_)) {
+            return Err(proc_unsupported(format!(
+                "`filter` `{key}.in` must be a list"
+            )));
+        }
+        let list = proc_value_expr(operand, sp)?;
+        return Ok(mk_filter_expr(
+            ExpressionKind::In {
+                item: Box::new(prop),
+                list: Box::new(list),
+            },
+            sp,
+        ));
+    }
+    let binop = match op.to_ascii_lowercase().as_str() {
+        "eq" => BinaryOp::Eq,
+        "ne" => BinaryOp::Ne,
+        "gt" => BinaryOp::Gt,
+        "gte" => BinaryOp::Ge,
+        "lt" => BinaryOp::Lt,
+        "lte" => BinaryOp::Le,
+        other => {
+            return Err(proc_unsupported(format!(
+                "`filter` `{key}`: unknown operator `{other}` (eq|ne|gt|gte|lt|lte|in)"
+            )))
+        }
+    };
+    let rhs = proc_value_expr(operand, sp)?;
+    Ok(mk_filter_expr(
+        ExpressionKind::Binary {
+            op: binop,
+            left: Box::new(prop),
+            right: Box::new(rhs),
+        },
+        sp,
+    ))
+}
+
+/// Build a `post_filter` [`Expression`] from a procedure `filter` map argument so
+/// the KNN procedures get the SAME index over-fetch + flat-scan fallback the
+/// natural `MATCH … WHERE` form gets — instead of post-filtering an already
+/// truncated top-k (which can starve a sparse tenant in a shared index to zero
+/// results). Built against the bound node `alias` and handed to
+/// [`vector_search_rows`] as its `post_filter`.
+///
+/// Shape (Qdrant-like; keys AND-combine):
+/// - `{ tenant_id: "t1", status: "active" }` → `n.tenant_id = "t1" AND n.status = "active"`
+/// - `{ tier: [1, 2, 3] }`                    → `n.tier IN [1, 2, 3]` (a list value ⇒ membership)
+/// - `{ score: { gte: 0.5 }, region: { ne: "eu" } }` → `n.score >= 0.5 AND n.region <> "eu"`
+///
+/// A scalar value ⇒ equality, a list value ⇒ `IN`, a `{ op: value }` map ⇒ the
+/// AND of its operators (`eq|ne|gt|gte|lt|lte|in`). The explicit `in` operator is
+/// reachable only when the filter is supplied as a `$param` (a bare `in:` map key
+/// can't be parsed inline — it is a reserved keyword); inline queries use the
+/// list-value form.
+fn proc_filter_expr(filter: &RuntimeValue, alias: &str) -> Result<Expression, ExecError> {
+    use crate::parser::ast::{BinaryOp, ExpressionKind};
+    let map = match filter {
+        RuntimeValue::Map(m) => m,
+        _ => {
+            return Err(proc_unsupported(
+                "`filter` must be a map of property → value or { op: value }",
+            ))
+        }
+    };
+    if map.is_empty() {
+        return Err(proc_unsupported("`filter` must not be empty"));
+    }
+    let sp = SourceSpan::point(0);
+    let mut conj: Option<Expression> = None;
+    for (key, val) in map {
+        let term = proc_filter_term(alias, key, val, sp)?;
+        conj = Some(match conj {
+            None => term,
+            Some(acc) => mk_filter_expr(
+                ExpressionKind::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(acc),
+                    right: Box::new(term),
+                },
+                sp,
+            ),
+        });
+    }
+    Ok(conj.expect("a non-empty filter map yields at least one term"))
+}
+
+/// Parse an optional `filter` map value into a `post_filter` over the `node`
+/// binding (shared by the vector / hybrid / queryNodes procedures).
+fn proc_opt_filter(v: Option<&RuntimeValue>) -> Result<Option<Expression>, ExecError> {
+    match v {
+        None => Ok(None),
+        Some(f) => Ok(Some(proc_filter_expr(f, "node")?)),
+    }
+}
+
+/// `CALL search.vector({label, property, query, k?, ef?, metric?, filter?}) YIELD
+/// node, score` — vector KNN served from the Vamana index (or the exact flat
+/// scan), with a tunable `ef` beam width (recall vs latency) and an optional
+/// `filter` (index-side over-fetch + exact fallback, not a post-truncation
+/// filter). The ergonomic, EXPLAIN-free counterpart to the optimizer's KNN
+/// rewrite.
 async fn vector_search_procedure(
     args: &[Expression],
     yield_items: &[(String, String)],
@@ -2058,6 +2285,7 @@ async fn vector_search_procedure(
         })?),
     };
     let distance = proc_metric(map.get("metric"))?;
+    let pf = proc_opt_filter(map.get("filter"))?;
 
     let q = RuntimeValue::Vector(qv);
     let rows = vector_search_rows(
@@ -2070,7 +2298,7 @@ async fn vector_search_procedure(
         k,
         distance,
         "score",
-        None,
+        pf.as_ref(),
         ef,
         params,
     )
@@ -2087,10 +2315,11 @@ async fn vector_search_procedure(
     project_proc_rows("search.vector", &["node", "score"], raw, yield_items)
 }
 
-/// `CALL db.index.vector.queryNodes(indexName, k, queryVector [, {ef}])
+/// `CALL db.index.vector.queryNodes(indexName, k, queryVector [, {ef, filter}])
 /// YIELD node, score` — Neo4j-compatible vector KNN. Resolves the index by NAME
 /// (its descriptor supplies the label, property, and metric), then serves it
-/// through the same path as `search.vector`.
+/// through the same path as `search.vector`. The optional 4th map may carry an
+/// `ef` beam width and/or a `filter` (index over-fetch + exact fallback).
 async fn db_index_vector_procedure(
     name: &str,
     args: &[Expression],
@@ -2105,7 +2334,7 @@ async fn db_index_vector_procedure(
     }
     if args.len() < 3 {
         return Err(proc_unsupported(
-            "db.index.vector.queryNodes(indexName, k, queryVector [, {ef: …}])",
+            "db.index.vector.queryNodes(indexName, k, queryVector [, {ef: …, filter: {…}}])",
         ));
     }
     let index_name = match evaluate(&args[0], &Row::new(), params)? {
@@ -2116,11 +2345,18 @@ async fn db_index_vector_procedure(
         .ok_or_else(|| proc_unsupported("queryNodes `k` must be a non-negative integer"))?;
     let qv = runtime_to_f32_vec(&evaluate(&args[2], &Row::new(), params)?)
         .ok_or_else(|| proc_unsupported("queryNodes `queryVector` must be a list or vector()"))?;
-    let ef = match args.get(3) {
-        None => None,
+    // The optional 4th map carries `ef` (beam width) and/or `filter` (a
+    // post_filter compiled to the bound `node` binding → index over-fetch +
+    // exact fallback, the same as the natural form).
+    let (ef, pf) = match args.get(3) {
+        None => (None, None),
         Some(a) => match evaluate(a, &Row::new(), params)? {
-            RuntimeValue::Map(m) => m.get("ef").and_then(as_usize),
-            _ => None,
+            RuntimeValue::Map(m) => {
+                let ef = m.get("ef").and_then(as_usize);
+                let pf = proc_opt_filter(m.get("filter"))?;
+                (ef, pf)
+            }
+            _ => (None, None),
         },
     };
 
@@ -2152,7 +2388,7 @@ async fn db_index_vector_procedure(
         k,
         distance,
         "score",
-        None,
+        pf.as_ref(),
         ef,
         params,
     )
@@ -2212,7 +2448,7 @@ fn hybrid_text_props(
 }
 
 /// `CALL search.hybrid({label, query_text?, text_property(ies)?, query_vector?,
-/// vector_property?, k?, ef?, fusion?, rrf_k?, alpha?, metric?}) YIELD node,
+/// vector_property?, k?, ef?, fusion?, rrf_k?, alpha?, metric?, filter?}) YIELD node,
 /// score` — fuse a dense (vector KNN) and a sparse (BM25) retrieval into one
 /// ranking. Default fusion is Reciprocal Rank Fusion (rank-based, needs no score
 /// calibration across the two scales); `fusion: 'linear'` does a weighted
@@ -2245,6 +2481,10 @@ async fn hybrid_search_procedure(
         })?),
     };
     let distance = proc_metric(map.get("metric"))?;
+    // Optional `filter`: applied to the dense leg as an index-side post_filter
+    // (over-fetch + exact fallback) AND to the fused output (so a sparse-only
+    // BM25 hit that fails the predicate is dropped too).
+    let pf = proc_opt_filter(map.get("filter"))?;
     let fusion_mode = map
         .get("fusion")
         .and_then(proc_str)
@@ -2323,7 +2563,7 @@ async fn hybrid_search_procedure(
             k_dense,
             distance,
             "score",
-            None,
+            pf.as_ref(),
             ef,
             params,
         )
@@ -2340,11 +2580,33 @@ async fn hybrid_search_procedure(
             .and_then(proc_str)
             .ok_or_else(|| proc_unsupported("search.hybrid `query_text` must be a string"))?;
         let props = hybrid_text_props(&map)?;
-        bm25_ranked(snapshot, &label, &props, &qtext, Some(k_sparse)).await?
+        // BM25 has no filter pushdown, so a residual `filter` is applied only at
+        // the fused materialization below. Truncating the sparse leg to `k_sparse`
+        // BEFORE that filter would starve a selective filter (the matching docs
+        // can rank past `k_sparse` globally). When a filter is present, fetch a much
+        // DEEPER ranking so the post-filter sees enough candidates — `k * 512`,
+        // matching the dense leg's maximum widening depth (OVERFETCH_BASE ×
+        // WIDEN_GROWTH^(MAX_WIDEN_ROUNDS-1) = 8 × 4³). This bounds the sparse leg,
+        // the fusion structures, and the materialization probes to O(k·512) rather
+        // than O(corpus) (avoiding a resource cliff on a common query term), while
+        // still covering any filter that keeps ≳ 1/512 of the BM25-ranked docs.
+        const SPARSE_FILTER_DEPTH: usize = 512;
+        let sparse_k = if pf.is_some() {
+            Some(k.saturating_mul(SPARSE_FILTER_DEPTH).max(k_sparse))
+        } else {
+            Some(k_sparse)
+        };
+        bm25_ranked(snapshot, &label, &props, &qtext, sparse_k).await?
     } else {
         Vec::new()
     };
 
+    // RRF is rank-based, so the deeper filtered sparse leg does not change the
+    // fused order (only the ranks of the surviving docs matter). `linear`
+    // min-max-normalizes each leg over its own [worst, best] window, so a deeper
+    // (filtered) sparse leg shifts the normalization baseline and can reorder the
+    // blend — a known sensitivity of score-calibrated fusion. RRF (the default) is
+    // the robust choice when a `filter` is present.
     let fused = match fusion_mode.to_ascii_lowercase().as_str() {
         "rrf" => fusion::rrf(&[&dense, &sparse], rrf_k),
         "linear" => fusion::linear(&[&dense, &sparse], &[alpha, 1.0 - alpha]),
@@ -2355,15 +2617,27 @@ async fn hybrid_search_procedure(
         }
     };
 
-    // Materialise the fused top-k nodes.
+    // Materialise the fused candidates in rank order, applying the residual
+    // `filter` (if any) BEFORE truncating, so the top-k is taken among the rows
+    // that pass it (a node missing from the over-fetched window simply isn't
+    // returned — fusion already over-fetched ×8 per leg).
     let mut raw = Vec::with_capacity(k.min(fused.len()));
-    for (id, score) in fused.into_iter().take(k) {
+    for (id, score) in fused.into_iter() {
+        if raw.len() >= k {
+            break;
+        }
         crate::exec::limits::check_deadline()?;
         if let Some(view) = snapshot.lookup_node(&label, id).await? {
-            raw.push(vec![
-                RuntimeValue::Node(Box::new(NodeValue::from(view))),
-                RuntimeValue::Float(score),
-            ]);
+            let node_rv = RuntimeValue::Node(Box::new(NodeValue::from(view)));
+            if let Some(pf) = pf.as_ref() {
+                let mut row = Row::new();
+                row.set("node".to_string(), node_rv.clone());
+                row.set("score".to_string(), RuntimeValue::Float(score));
+                if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                    continue;
+                }
+            }
+            raw.push(vec![node_rv, RuntimeValue::Float(score)]);
         }
     }
     project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
@@ -2651,10 +2925,23 @@ async fn flat_vector_search(
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     // The query expression carries no row bindings (literal vector or $param);
-    // evaluate it once against an empty row. The operator path uses the index's
-    // default beam width.
+    // evaluate it once against an empty row.
     let q = evaluate(query, &Row::new(), params)?;
     let limit = k.as_const().unwrap_or(10) as usize;
+    // The natural/operator form has no syntax for the beam width, so it reads a
+    // reserved, namespaced param `$__vector_ef` to tune recall vs latency on the
+    // filtered-ANN path (the procedures take a first-class `ef`). It is the
+    // recall/latency dial: a larger value widens the beam (more recall, more
+    // latency), a smaller one narrows it — clamped downstream only to `≥ kprime`
+    // (`e.max(kprime)`), so for a small `k` a value below the default 64 yields a
+    // narrower-than-default beam (lower recall). It changes neither correctness of
+    // a *selective* filter (one that under-fills `k` and forces the exact flat
+    // fallback) nor a result the engine already calls exact; but for a
+    // non-selective filter or a plain KNN, a narrower beam can return a different,
+    // lower-recall approximate top-k — like any ANN beam knob. Absent, the index
+    // default applies. NON-STABLE knob — superseded by a future `OPTIONS { ef }`
+    // surface (RFC-036). Namespaced to avoid clashing with a user's own `$ef`.
+    let ef_search = params.get("__vector_ef").and_then(as_usize);
     vector_search_rows(
         snapshot,
         label,
@@ -2666,7 +2953,7 @@ async fn flat_vector_search(
         distance,
         score_alias,
         post_filter,
-        None,
+        ef_search,
         params,
     )
     .await
@@ -2849,6 +3136,16 @@ async fn try_index_search(
     if qv.len() != index_dim {
         return Ok(None);
     }
+    // A zero-magnitude query makes cosine undefined. The flat path's
+    // `vector_score(Cosine, …)` returns `None` for every candidate (drop), so the
+    // correct answer is empty — but the index rerank's `metric_score` returns a
+    // similarity of 0.0 instead of dropping, which would diverge. Fall through to
+    // the flat scan (the single source of truth) so the index path agrees with the
+    // `cosine_similarity` builtin. Dot/L2 are well-defined on a zero query, so the
+    // guard is cosine-only (mirrors `build_body`'s cosine-only zero-vector skip).
+    if metric == VectorMetric::Cosine && qv.iter().all(|x| *x == 0.0) {
+        return Ok(None);
+    }
 
     // Fresh memtable/overlay delta the index has not absorbed: `Some(vec)` is a
     // live embedding to merge in, `None` suppresses a now-stale id (tombstoned,
@@ -2859,106 +3156,128 @@ async fn try_index_search(
         .map_err(ExecError::Storage)?;
     let delta_ids: BTreeSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
 
-    // Over-fetch so superseded ids — and, when a residual filter is present, its
-    // selectivity — cannot starve the top-k. The index reranks in full f32, so a
-    // wider fetch is cheap.
-    const OVERFETCH: usize = 8;
-    let mult = if post_filter.is_some() { OVERFETCH } else { 1 };
-    let kprime = k.saturating_mul(mult).saturating_add(delta.len()).max(k);
-    // Beam width: the user-supplied `ef` when given (clamped to ≥ the fetch
-    // count so the beam can actually surface `kprime` candidates), else the
-    // default `max(kprime, 64)`. A larger `ef` trades latency for recall.
-    let ef = match ef_search {
-        Some(e) => e.max(kprime),
-        None => kprime.max(64),
-    };
-    let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
-
-    // Merge: index hits not superseded by the delta, plus the freshly-scored
-    // delta embeddings. All three metrics serve from the index; an f32 index
+    // Pre-score the freshness delta ONCE: a delta's score is independent of the
+    // fetch width, so the widening loop below only re-queries the index — it never
+    // re-scores the delta. All three metrics serve from the index; an f32 index
     // reranks with the true metric so its score equals the flat path's, and the
     // delta's `vector_score(metric, …)` is on the same scale and orientation. An
     // int8 index returns the QUANTIZED cosine, so a fresh delta is round-tripped
-    // through the same quantizer below (`index_int8`) to keep both halves of the
-    // merge commensurable — otherwise a node would score differently before vs
-    // after compaction folds it into the index. `seen` starts from the delta ids
-    // — so a superseded hit is dropped — and also dedups the index hits
-    // themselves: storage `vector_search` unions across every `.vg` SST without
-    // deduping, so a partial rebuild can return one id twice, and the wider
-    // `kprime` fetch widens that window.
-    let q_rv = RuntimeValue::Vector(qv);
-    let mut seen: BTreeSet<NodeId> = delta_ids;
-    let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta.len());
-    // Orientation of the metric: cosine/dot are higher-is-closer, euclidean is
-    // lower-is-closer. Derived from the metric (not from the delta loop, which is
-    // empty in the common case).
+    // through the same quantizer to keep both halves of the merge commensurable —
+    // otherwise a node would score differently before vs after compaction folds it
+    // into the index.
     let higher_is_better = !matches!(distance, VectorDistance::Euclidean);
-    for (id, score) in hits {
-        if seen.insert(id) {
-            scored.push((score as f64, id));
-        }
-    }
-    for (id, emb) in delta {
-        if let Some(v) = emb {
-            // For an int8 index, quantize → dequantize the fresh embedding so the
-            // delta is scored on the SAME (quantized) cosine scale as the index
-            // hits; for f32 the vector is scored as-is (exact, == the index).
-            let v = if index_int8 {
-                let (codes, scale) = namidb_core::quantize::quantize_i8(&v);
-                namidb_core::quantize::dequantize_i8(&codes, scale)
-            } else {
-                v
-            };
-            let emb_rv = RuntimeValue::Vector(v);
-            if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
-                scored.push((s, id));
+    let mut delta_scored: Vec<(f64, NodeId)> = Vec::with_capacity(delta.len());
+    if !delta.is_empty() {
+        let q_rv = RuntimeValue::Vector(qv.clone());
+        for (id, emb) in delta {
+            if let Some(v) = emb {
+                let v = if index_int8 {
+                    let (codes, scale) = namidb_core::quantize::quantize_i8(&v);
+                    namidb_core::quantize::dequantize_i8(&codes, scale)
+                } else {
+                    v
+                };
+                let emb_rv = RuntimeValue::Vector(v);
+                if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
+                    delta_scored.push((s, id));
+                }
             }
         }
     }
-    // Best-first by the metric's orientation.
-    if higher_is_better {
-        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    } else {
-        scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    }
 
-    // Materialise rows in rank order, applying the residual filter; take up to k
-    // survivors.
-    let mut out = Vec::with_capacity(k);
-    for (score, id) in scored {
+    // Adaptive iterative widening: start at the historical ×8 over-fetch, then grow
+    // `kprime`/`ef` geometrically (×4) whenever a residual `post_filter` leaves
+    // fewer than k survivors, BEFORE the O(n) flat fallback — so a moderately
+    // selective filter (the multi-tenant shared-index case) is served from the
+    // index, not a flat scan every query. With no filter it is exactly one round at
+    // mult=1: an exact top-k cannot under-fill from selectivity.
+    const OVERFETCH_BASE: usize = 8;
+    const WIDEN_GROWTH: usize = 4;
+    const MAX_WIDEN_ROUNDS: usize = 4; // mult = 8, 32, 128, 512
+    let widen = post_filter.is_some();
+    let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
+    let mut mult = if widen { OVERFETCH_BASE } else { 1 };
+
+    for _ in 0..max_rounds {
+        let kprime = k
+            .saturating_mul(mult)
+            .saturating_add(delta_ids.len())
+            .max(k);
+        // Beam width ≥ the fetch count so the beam can actually surface `kprime`
+        // candidates. A user `$__vector_ef` is clamped only to `≥ kprime`, so for a
+        // small `kprime` it can sit below the no-override default of 64 (a narrower
+        // beam, lower recall); it is the recall/latency dial, not a one-way raise.
+        // Correctness for a selective filter is still guaranteed by the flat
+        // fallback below, regardless of the beam.
+        let ef = match ef_search {
+            Some(e) => e.max(kprime),
+            None => kprime.max(64),
+        };
+        let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
+        // Fewer hits than asked ⇒ `kprime ≥` the corpus the index can see, so a
+        // wider fetch cannot surface more (checked after using this round's hits).
+        let index_exhausted = hits.len() < kprime;
+
+        // Merge: deduped index hits not superseded by the delta, plus the
+        // pre-scored delta. `seen` starts from the delta ids each round so a
+        // superseded hit is dropped, and also dedups index hits a partial rebuild
+        // returned twice (storage `vector_search` unions `.vg` SSTs without
+        // deduping, and the wider `kprime` fetch widens that window).
+        let mut seen: BTreeSet<NodeId> = delta_ids.clone();
+        let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta_scored.len());
+        for (id, score) in hits {
+            if seen.insert(id) {
+                scored.push((score as f64, id));
+            }
+        }
+        scored.extend(delta_scored.iter().copied());
+        if higher_is_better {
+            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        } else {
+            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        }
+
+        // Materialise in rank order, applying the residual filter; take up to k.
+        // Per-candidate deadline probe: a widened filtered ANN can do many cold
+        // node lookups and must stay interruptible the way the flat scan is.
+        let mut out = Vec::with_capacity(k);
+        for (score, id) in scored {
+            if out.len() >= k {
+                break;
+            }
+            crate::exec::limits::check_deadline()?;
+            let Some(view) = snapshot.lookup_node(label, id).await? else {
+                continue;
+            };
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            row.set(score_alias.to_string(), RuntimeValue::Float(score));
+            if let Some(pf) = post_filter {
+                if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                    continue;
+                }
+            }
+            out.push(row);
+        }
+
         if out.len() >= k {
+            return Ok(Some(out));
+        }
+        // Once the index is drained, only the flat scan can reach k (it also covers
+        // ids whose node is gone, `lookup_node` → None, and is the ground truth).
+        if index_exhausted {
             break;
         }
-        // Probe the deadline per candidate: an over-fetched filtered ANN can do
-        // up to k*OVERFETCH cold node lookups, and we must stay interruptible the
-        // way the flat scan is.
-        crate::exec::limits::check_deadline()?;
-        let Some(view) = snapshot.lookup_node(label, id).await? else {
-            continue;
-        };
-        let mut row = Row::new();
-        row.set(
-            alias.to_string(),
-            RuntimeValue::Node(Box::new(NodeValue::from(view))),
-        );
-        row.set(score_alias.to_string(), RuntimeValue::Float(score));
-        if let Some(pf) = post_filter {
-            if evaluate(pf, &row, params)?.as_bool() != Some(true) {
-                continue;
-            }
-        }
-        out.push(row);
+        mult = mult.saturating_mul(WIDEN_GROWTH);
     }
 
-    // Fewer than k survivors in the over-fetched candidate set — a selective
-    // `post_filter`, or index hits whose nodes are gone (`lookup_node` → None) —
-    // so fall back to the exact flat scan: it applies the same filter to every
-    // node and is the ground truth, never short. (A corpus genuinely smaller
-    // than k just makes the flat scan agree, at a small extra cost.)
-    if out.len() < k {
-        return Ok(None);
-    }
-    Ok(Some(out))
+    // Fewer than k survivors even after widening (a selective `post_filter`, or
+    // index hits whose nodes vanished) — fall back to the exact flat scan: it
+    // applies the same filter to every node and is the ground truth, never short.
+    Ok(None)
 }
 
 /// Resolve the set of edge types an `Expand` operator must traverse.

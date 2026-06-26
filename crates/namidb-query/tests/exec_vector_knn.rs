@@ -165,17 +165,20 @@ mod indexed {
         docs: &[(&str, &str, Vec<f32>)],
     ) -> (WriterSession, BTreeMap<String, NodeId>) {
         let mut w = WriterSession::open(store(), paths(name)).await.unwrap();
-        w.register_vector_index(VectorIndexDescriptor {
-            name: "doc_emb".into(),
-            label: "Doc".into(),
-            property: "embedding".into(),
-            dim: DIM,
-            metric: VectorMetric::Cosine,
-            r: 32,
-            l_build: 64,
-            alpha: 1.2,
-            quantization: VectorQuantization::None,
-        })
+        w.register_vector_index(
+            VectorIndexDescriptor {
+                name: "doc_emb".into(),
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: DIM,
+                metric: VectorMetric::Cosine,
+                r: 32,
+                l_build: 64,
+                alpha: 1.2,
+                quantization: VectorQuantization::None,
+            },
+            false,
+        )
         .await
         .unwrap();
         let mut ids = BTreeMap::new();
@@ -435,17 +438,20 @@ mod indexed {
         docs: &[(&str, &str, Vec<f32>)],
     ) -> WriterSession {
         let mut w = WriterSession::open(store(), paths(name)).await.unwrap();
-        w.register_vector_index(VectorIndexDescriptor {
-            name: "doc_emb".into(),
-            label: "Doc".into(),
-            property: "embedding".into(),
-            dim: DIM,
-            metric,
-            r: 32,
-            l_build: 64,
-            alpha: 1.2,
-            quantization,
-        })
+        w.register_vector_index(
+            VectorIndexDescriptor {
+                name: "doc_emb".into(),
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: DIM,
+                metric,
+                r: 32,
+                l_build: 64,
+                alpha: 1.2,
+                quantization,
+            },
+            false,
+        )
         .await
         .unwrap();
         let half = docs.len().div_ceil(2);
@@ -575,6 +581,27 @@ mod indexed {
     }
 
     #[tokio::test]
+    async fn query_nodes_procedure_filter_serves_from_the_index() {
+        // The same corpus, but a `filter: { kind: 'Y' }` in the optional 4th map.
+        // Unfiltered, the top-2 for q∥x is [a, e] (both not all Y). Constrained to
+        // kind Y, the index over-fetch must surface e (cos ~.707) then c (cos 0),
+        // dropping the higher-ranked a (kind X) — i.e. the filter is applied
+        // index-side, NOT as a post-truncation of an already-cut top-k.
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+            ("e", "Y", vec![0.5, 0.5, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-qn-filter", VectorMetric::Cosine, &docs).await;
+        let cypher =
+            "CALL db.index.vector.queryNodes('doc_emb', 2, $q, { filter: { kind: 'Y' } }) \
+             YIELD node, score RETURN node.title AS title";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        assert_eq!(got, vec!["e".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
     async fn int8_quantized_index_reaches_index_and_ranks_correctly() {
         // An int8-quantized cosine index serves the same KNN (lossy but the
         // well-separated fixtures rank identically to f32/brute force).
@@ -605,5 +632,163 @@ mod indexed {
         let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
         // query ∥ x → a closest, then c (≈x).
         assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    // ── Zero-magnitude cosine semantics (issue h): index ≡ flat ≡ builtin ──
+
+    #[tokio::test]
+    async fn index_stored_zero_vector_absent_matches_flat() {
+        // A stored all-zero vector makes cosine undefined → it must be ABSENT from
+        // a KNN result on the index path, exactly as the flat scan drops it.
+        let docs = vec![
+            ("zero", "X", vec![0.0, 0.0, 0.0, 0.0]),
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-zero-stored", VectorMetric::Cosine, &docs).await;
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 3";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        assert!(
+            !got.contains(&"zero".to_string()),
+            "all-zero stored vector must be dropped: {got:?}"
+        );
+        // The three nonzero docs in similarity order (b has cosine 0 but is a valid
+        // nonzero vector, so it stays).
+        assert_eq!(got, vec!["a".to_string(), "c".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn index_zero_query_returns_empty_matches_flat() {
+        // A zero-magnitude QUERY makes cosine undefined for every candidate. The
+        // flat scan returns []; the index rerank would otherwise return k rows
+        // scored 0.0 — the zero-query guard makes the index agree (empty).
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-zero-query", VectorMetric::Cosine, &docs).await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        // ORDER BY form …
+        let order = "MATCH (d:Doc) RETURN d.title AS title, \
+             cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 3";
+        let plan = optimize(lower(&parse(order).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "the empty result must come from the index path, not a flat scan"
+        );
+        assert!(
+            titles(&run(&w, order, vec![0.0, 0.0, 0.0, 0.0]).await).is_empty(),
+            "zero query → empty (ORDER BY form)"
+        );
+        // … and the explicit-threshold form the limitation calls out.
+        let threshold = "MATCH (d:Doc) WHERE cosine_similarity(d.embedding, $q) >= 0.0 \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 10";
+        assert!(
+            titles(&run(&w, threshold, vec![0.0, 0.0, 0.0, 0.0]).await).is_empty(),
+            "zero query → empty (>= threshold form)"
+        );
+    }
+
+    // ── Adaptive filtered-ANN widening (issue d) ─────────────────────────────
+
+    #[tokio::test]
+    async fn widening_serves_selective_filter_correctly() {
+        // 95 "common" docs cluster tightly around the query (cosine ≈ 1) and 5
+        // "rare" docs sit far away (cosine ≈ 0.3). For q∥x the index's first
+        // over-fetched window (8·k) is ALL common docs — zero `rare` survivors —
+        // so the widening loop must grow the fetch (round 2) to reach the rare
+        // docs before the flat fallback. Either way the result must be the exact
+        // top-k of the rare subset.
+        let mut owned: Vec<(String, &'static str, Vec<f32>)> = Vec::new();
+        for i in 0..95 {
+            // Tiny per-doc perturbation off the x-axis keeps them distinct but all
+            // near-parallel to q (high cosine).
+            let p = (i as f32) * 1e-4;
+            owned.push((format!("c{i}"), "common", vec![1.0, p, 0.0, 0.0]));
+        }
+        for i in 0..5 {
+            let p = (i as f32) * 1e-3;
+            owned.push((format!("r{i}"), "rare", vec![0.3, 0.95 + p, 0.0, 0.0]));
+        }
+        let docs: Vec<(&str, &str, Vec<f32>)> = owned
+            .iter()
+            .map(|(t, k, e)| (t.as_str(), *k, e.clone()))
+            .collect();
+        let w = build_index_metric("idx-widen", VectorMetric::Cosine, &docs).await;
+        let cypher = "MATCH (d:Doc) WHERE d.kind = 'rare' \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 3";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        let live: Vec<(String, Vec<f32>)> = owned
+            .iter()
+            .filter(|(_, k, _)| *k == "rare")
+            .map(|(t, _, e)| (t.clone(), e.clone()))
+            .collect();
+        assert_eq!(got, exact_topk(&live, &[1.0, 0.0, 0.0, 0.0], 3));
+        assert!(
+            got.iter().all(|t| t.starts_with('r')),
+            "only rare docs: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn widening_too_selective_falls_back_to_flat() {
+        // A filter that matches exactly ONE doc with LIMIT 5: the index is
+        // exhausted before k survivors accumulate, so the loop breaks and the flat
+        // fallback returns the single correct match (never a short, wrong result).
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 1.0, 0.0, 0.0]),
+            ("d", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-widen-fallback", VectorMetric::Cosine, &docs).await;
+        let cypher = "MATCH (n:Doc) WHERE n.kind = 'X' \
+             RETURN n.title AS title, cosine_similarity(n.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 5";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        assert_eq!(got, vec!["a".to_string()]);
+    }
+
+    // ── Natural-form beam width via `$__vector_ef` (issue e) ──────────────────
+
+    #[tokio::test]
+    async fn natural_form_filter_and_vector_ef_coexist() {
+        // The natural/operator form is the only one with real filtered ANN, and it
+        // now also honours a beam-width override via the reserved `$__vector_ef`
+        // param — so filtered-ANN + tunable ef finally compose in one query.
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.9, 0.1, 0.0, 0.0]),
+            ("e", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-ef", VectorMetric::Cosine, &docs).await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let cypher = "MATCH (d:Doc) WHERE d.kind = 'Y' \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 2";
+        let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "filtered KNN must reach the index"
+        );
+        let mut params = Params::new();
+        params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0, 0.0]));
+        params.insert("__vector_ef".into(), RuntimeValue::Integer(256));
+        let rows = execute(&plan, &snap, &params).await.unwrap();
+        // kind Y only → c (cos ≈ .994) then e (cos 0); the wide beam doesn't change
+        // the (correct) ranking, it only raises recall.
+        assert_eq!(titles(&rows), vec!["c".to_string(), "e".to_string()]);
     }
 }

@@ -884,8 +884,15 @@ fn call_scalar_function(
                             .sum();
                         RuntimeValue::Float(sum.sqrt())
                     }
-                    // cosine_similarity: undefined (NULL) when either vector has
-                    // zero magnitude, since the denominator would be zero.
+                    // cosine_similarity: undefined (NULL) when EITHER vector has
+                    // zero magnitude (the denominator |a|·|b| would be zero). NULL
+                    // is 3VL-correct: a `>= threshold` test on it is NULL (never
+                    // true), so a zero-magnitude row drops from a KNN result. This
+                    // is the single contract three places enforce together — the
+                    // flat fallback `vector_score` (also drops via `None`), the
+                    // index build `build_body` (skips all-zero cosine vectors), and
+                    // `try_index_search`'s zero-query guard (falls back to flat) —
+                    // so the indexed path returns the SAME rows as this builtin.
                     _ => {
                         let na = vec_dot_f64(&a, &a).sqrt();
                         let nb = vec_dot_f64(&b, &b).sqrt();
@@ -1111,6 +1118,10 @@ pub(crate) fn vector_score(
         VectorDistance::Cosine => {
             let na = vec_dot_f64(&av, &av).sqrt();
             let nb = vec_dot_f64(&bv, &bv).sqrt();
+            // Zero magnitude ⇒ cosine undefined ⇒ drop (mirrors the
+            // `cosine_similarity` builtin's NULL and the index build's all-zero
+            // skip; the `try_index_search` zero-query guard keeps the index path
+            // in agreement). Dot/L2 above stay defined on a zero operand.
             if na == 0.0 || nb == 0.0 {
                 return Ok(None);
             }

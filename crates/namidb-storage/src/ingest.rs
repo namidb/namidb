@@ -487,6 +487,14 @@ impl WriterSession {
         &self.current.manifest.schema
     }
 
+    /// The registered vector indexes (committed manifest). The write path consults
+    /// these to enforce embedding dimension at write time: a `register_vector_index`
+    /// commits immediately and is never part of a staged batch, so `self.current`
+    /// is authoritative when a mutation is applied.
+    pub fn vector_indexes(&self) -> &[crate::manifest::VectorIndexDescriptor] {
+        &self.current.manifest.vector_indexes
+    }
+
     /// Queue a single-label node upsert. Convenience wrapper over
     /// [`upsert_node_with_labels`](Self::upsert_node_with_labels); kept so the
     /// many single-label call sites stay unchanged.
@@ -1037,17 +1045,25 @@ impl WriterSession {
     /// Rejects a duplicate index (same `name`, or the same
     /// `(label, property, metric)` target already covered) so two
     /// `CREATE VECTOR INDEX` statements for one property cannot race to build
-    /// two graphs over it.
+    /// two graphs over it. With `if_not_exists`, a duplicate is instead a no-op
+    /// success returning the current manifest version (`IF NOT EXISTS`); the
+    /// int8/cosine misconfiguration check is never suppressed.
     ///
     /// Returns the new manifest version. Error contract mirrors
     /// [`attach_ssts`](Self::attach_ssts): [`Error::Fenced`] ⇒ abort and drop
     /// the session; a lost manifest CAS ⇒ retryable.
-    pub async fn register_vector_index(&mut self, desc: VectorIndexDescriptor) -> Result<u64> {
+    pub async fn register_vector_index(
+        &mut self,
+        desc: VectorIndexDescriptor,
+        if_not_exists: bool,
+    ) -> Result<u64> {
         self.fence.assert_alive(self.current.manifest.epoch)?;
         // int8 quantization is cosine-only (the scale-invariant Int8Space).
         // Reject the misconfiguration here — fail-fast — rather than committing a
         // descriptor whose `build_body` would later error and wedge EVERY
         // compaction for the namespace (the descriptor lives in the manifest).
+        // `IF NOT EXISTS` suppresses only *existence* conflicts, not this
+        // misconfiguration, so the check stays unconditional.
         if desc.quantization == crate::manifest::VectorQuantization::Int8
             && desc.metric != crate::manifest::VectorMetric::Cosine
         {
@@ -1058,12 +1074,21 @@ impl WriterSession {
         }
         for existing in &self.current.manifest.vector_indexes {
             if existing.name == desc.name {
+                // A same-name index already exists: idempotent no-op under
+                // `IF NOT EXISTS`, otherwise an error (mirrors
+                // `create_property_index_named`).
+                if if_not_exists {
+                    return Ok(self.current.manifest.version);
+                }
                 return Err(Error::precondition(format!(
                     "a vector index named `{}` already exists",
                     desc.name
                 )));
             }
             if existing.matches(&desc.label, &desc.property, desc.metric) {
+                if if_not_exists {
+                    return Ok(self.current.manifest.version);
+                }
                 return Err(Error::precondition(format!(
                     "a vector index on ({}:{}) with metric `{}` already exists: `{}`",
                     desc.label,
@@ -1096,17 +1121,29 @@ impl WriterSession {
     /// `desc` to [`Manifest::text_indexes`], stages no rows and no WAL. The
     /// compaction build hook materializes the `SstKind::TextIndex` body lazily on
     /// the next sweep. Rejects a duplicate by name or by `(label, properties)`
-    /// target. Returns the new manifest version.
-    pub async fn register_text_index(&mut self, desc: TextIndexDescriptor) -> Result<u64> {
+    /// target; with `if_not_exists`, a duplicate is a no-op success returning the
+    /// current manifest version. Returns the new manifest version.
+    pub async fn register_text_index(
+        &mut self,
+        desc: TextIndexDescriptor,
+        if_not_exists: bool,
+    ) -> Result<u64> {
         self.fence.assert_alive(self.current.manifest.epoch)?;
         for existing in &self.current.manifest.text_indexes {
             if existing.name == desc.name {
+                // Idempotent no-op under `IF NOT EXISTS`, else an error.
+                if if_not_exists {
+                    return Ok(self.current.manifest.version);
+                }
                 return Err(Error::precondition(format!(
                     "a text index named `{}` already exists",
                     desc.name
                 )));
             }
             if existing.matches(&desc.label, &desc.properties) {
+                if if_not_exists {
+                    return Ok(self.current.manifest.version);
+                }
                 return Err(Error::precondition(format!(
                     "a text index on ({}:{}) already exists: `{}`",
                     desc.label,
@@ -1575,7 +1612,10 @@ mod tests {
         };
         // Metadata-only commit: no rows staged, manifest version bumps to 1.
         assert_eq!(session.pending_len(), 0);
-        let v = session.register_vector_index(desc.clone()).await.unwrap();
+        let v = session
+            .register_vector_index(desc.clone(), false)
+            .await
+            .unwrap();
         assert_eq!(v, 1);
         assert_eq!(session.pending_len(), 0, "DDL stages no memtable rows");
         let snap = session.snapshot();
@@ -1587,19 +1627,41 @@ mod tests {
 
         // Same name → rejected, version unchanged.
         let err = session
-            .register_vector_index(desc.clone())
+            .register_vector_index(desc.clone(), false)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
         assert_eq!(session.manifest_version(), 1);
+
+        // Same name with `IF NOT EXISTS` → idempotent no-op: Ok(current version),
+        // no extra index registered.
+        let v_ine = session
+            .register_vector_index(desc.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(v_ine, 1, "IF NOT EXISTS returns the current version");
+        assert_eq!(session.manifest_version(), 1);
+        assert_eq!(
+            session.snapshot().manifest().manifest.vector_indexes.len(),
+            1
+        );
 
         // Same (label, property, metric) target under a new name → rejected.
         let dup_target = VectorIndexDescriptor {
             name: "doc_emb2".into(),
             ..desc.clone()
         };
-        let err = session.register_vector_index(dup_target).await.unwrap_err();
+        let err = session
+            .register_vector_index(dup_target.clone(), false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        // …but `IF NOT EXISTS` over the same target is a no-op success.
+        let v_dup = session
+            .register_vector_index(dup_target, true)
+            .await
+            .unwrap();
+        assert_eq!(v_dup, 1, "IF NOT EXISTS target collision is a no-op");
 
         // A different metric over the same property is a distinct index.
         let other = VectorIndexDescriptor {
@@ -1607,7 +1669,7 @@ mod tests {
             metric: VectorMetric::Dot,
             ..desc.clone()
         };
-        let v2 = session.register_vector_index(other).await.unwrap();
+        let v2 = session.register_vector_index(other, false).await.unwrap();
         assert_eq!(v2, 2);
         let snap = session.snapshot();
         assert_eq!(snap.manifest().manifest.vector_indexes.len(), 2);
@@ -1621,7 +1683,13 @@ mod tests {
             quantization: VectorQuantization::Int8,
             ..desc
         };
-        let err = session.register_vector_index(bad).await.unwrap_err();
+        let err = session
+            .register_vector_index(bad.clone(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        // int8/cosine misconfiguration is NOT suppressed by IF NOT EXISTS.
+        let err = session.register_vector_index(bad, true).await.unwrap_err();
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
     }
 

@@ -363,12 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn probe_zero_query_consistency() {
+    fn zero_query_distance_is_consistent_across_spaces() {
+        // A zero query against a nonzero stored member is maximally distant (1.0)
+        // in BOTH cosine spaces — the space layer agrees. (The query-result layer
+        // then drops it; see `try_index_search`'s zero-query guard, which keeps the
+        // index path equal to the `cosine_similarity` builtin's NULL.)
         let f = F32CosineSpace::new(vec![vec![1.0, 0.0, 0.0]]);
         let i = Int8Space::new(vec![namidb_core::quantize::quantize_i8(&[1.0, 0.0, 0.0])]);
         let zq = [0.0f32, 0.0, 0.0];
-        eprintln!("F32 zero-query dist = {}", f.query_distance(&zq, 0));
-        eprintln!("Int8 zero-query dist = {}", i.query_distance(&zq, 0));
+        assert_eq!(f.query_distance(&zq, 0), 1.0, "F32 zero-query distance");
+        assert_eq!(i.query_distance(&zq, 0), 1.0, "Int8 zero-query distance");
     }
 
     #[test]

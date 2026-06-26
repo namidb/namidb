@@ -131,10 +131,14 @@ impl fmt::Display for VectorMetric {
 
 impl fmt::Display for CreateVectorIndexClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE VECTOR INDEX {} ", self.name)?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
         write!(
             f,
-            "CREATE VECTOR INDEX {} ON :{}({}) METRIC {} DIMENSION {}",
-            self.name, self.label, self.property, self.metric, self.dim
+            "ON :{}({}) METRIC {} DIMENSION {}",
+            self.label, self.property, self.metric, self.dim
         )?;
         // Render WITH only when at least one build override is present, so a
         // defaults-only index round-trips without a trailing `WITH {}`.
@@ -169,11 +173,11 @@ impl fmt::Display for CreateFulltextIndexClause {
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(
-            f,
-            "CREATE FULLTEXT INDEX {} ON :{}({})",
-            self.name, self.label, props
-        )
+        write!(f, "CREATE FULLTEXT INDEX {} ", self.name)?;
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ")?;
+        }
+        write!(f, "ON :{}({})", self.label, props)
     }
 }
 

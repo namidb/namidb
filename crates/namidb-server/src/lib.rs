@@ -1084,7 +1084,9 @@ async fn apply_create_vector_index(
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
 ) -> Result<u64, namidb_storage::Error> {
     let desc = vector_index_descriptor_from(cvi);
-    let version = writer.register_vector_index(desc).await?;
+    let version = writer
+        .register_vector_index(desc, cvi.if_not_exists)
+        .await?;
     // Refresh the published snapshot (catalog_for rebuilds on version bump).
     snapshot.store(writer.owned_snapshot());
     Ok(version)
@@ -1200,7 +1202,7 @@ async fn apply_create_fulltext_index(
     cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
 ) -> Result<u64, namidb_storage::Error> {
     let desc = text_index_descriptor_from(cfi);
-    let version = writer.register_text_index(desc).await?;
+    let version = writer.register_text_index(desc, cfi.if_not_exists).await?;
     snapshot.store(writer.owned_snapshot());
     Ok(version)
 }
@@ -2479,6 +2481,19 @@ mod tests {
         let dup = post_cypher(&app, None, q).await;
         assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
 
+        // …but the same target with IF NOT EXISTS is an idempotent no-op → 200.
+        let ine = post_cypher(
+            &app,
+            None,
+            "CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(emb) METRIC cosine DIMENSION 16",
+        )
+        .await;
+        assert_eq!(
+            ine.status(),
+            StatusCode::OK,
+            "IF NOT EXISTS over a duplicate must succeed as a no-op"
+        );
+
         // A read-only token may not run schema DDL.
         let app_ro = fixture_with_tokens("vecidx-ro", ROLE_TOKENS).await;
         let ro = post_cypher(&app_ro, Some("rkey"), q).await;
@@ -2502,6 +2517,19 @@ mod tests {
         // Same name (or same target) again is a duplicate → 400.
         let dup = post_cypher(&app, None, q).await;
         assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+
+        // …but the same target with IF NOT EXISTS is an idempotent no-op → 200.
+        let ine = post_cypher(
+            &app,
+            None,
+            "CREATE FULLTEXT INDEX note_ft IF NOT EXISTS ON :Note(body, title)",
+        )
+        .await;
+        assert_eq!(
+            ine.status(),
+            StatusCode::OK,
+            "IF NOT EXISTS over a duplicate must succeed as a no-op"
+        );
 
         // A read-only token may not run schema DDL.
         let app_ro = fixture_with_tokens("ftidx-ro", ROLE_TOKENS).await;

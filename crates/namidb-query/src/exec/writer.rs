@@ -1007,6 +1007,105 @@ fn enforce_notnull_on_create(
     Ok(())
 }
 
+/// Length of a vector-valued property, or `None` if `v` is not a vector — a dense
+/// `Vec`, an int8 `VecI8`, or an all-numeric `List` (a coercion candidate). A
+/// heterogeneous/non-numeric list is NOT a vector.
+fn vector_value_len(v: &CoreValue) -> Option<usize> {
+    match v {
+        CoreValue::Vec(x) => Some(x.len()),
+        CoreValue::VecI8 { codes, .. } => Some(codes.len()),
+        CoreValue::List(items) if items.iter().all(is_numeric_core) => Some(items.len()),
+        _ => None,
+    }
+}
+
+fn is_numeric_core(v: &CoreValue) -> bool {
+    matches!(v, CoreValue::I64(_) | CoreValue::F64(_))
+}
+
+/// An all-numeric `List` as `Vec<f32>` (for coercion to a dense `CoreValue::Vec`).
+fn numeric_list_to_f32(items: &[CoreValue]) -> Option<Vec<f32>> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            CoreValue::F64(f) => out.push(*f as f32),
+            CoreValue::I64(n) => out.push(*n as f32),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Enforce embedding dimension at write time for every registered vector index
+/// covering one of `labels`. A wrong-dim value is rejected (instead of silently
+/// poisoning the next index build — a single mismatched row makes `build_body`
+/// error and skip the whole `.vg`), and a correct-dim numeric `List` is coerced to
+/// a dense `Vec` so it is actually indexed (a `List` is skipped at build time, so
+/// a bare-list embedding otherwise reads fine via flat scan yet never enters the
+/// `.vg`). No-ops when no vector index exists. Node-only — vector indexes are
+/// label-scoped — mirroring `enforce_notnull_on_create`. Length-only (a zero-norm
+/// but correct-dim vector is accepted, matching the build's dim-only check).
+///
+/// `changed` scopes the check to the properties this write actually introduces:
+/// `Some(keys)` validates/coerces only indexes whose property is in `keys` (so a
+/// `SET d.title = …` does NOT re-validate a node's untouched, possibly legacy,
+/// embedding); `None` validates every present property (used on `CREATE`, where
+/// all properties are new, and on a label-add, where the existing embedding must
+/// satisfy the newly-applicable label's index).
+fn enforce_vector_dims(
+    writer: &WriterSession,
+    labels: &[String],
+    core_props: &mut BTreeMap<String, CoreValue>,
+    changed: Option<&[&str]>,
+) -> Result<(), ExecError> {
+    let indexes = writer.vector_indexes();
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    for desc in indexes {
+        if !labels.iter().any(|l| l == &desc.label) {
+            continue;
+        }
+        // Only validate/coerce indexes whose property this write touches.
+        if let Some(keys) = changed {
+            if !keys.contains(&desc.property.as_str()) {
+                continue;
+            }
+        }
+        // A null clears the property (not-null is enforced separately); a present
+        // value must be a vector of the declared dimension.
+        let len = match core_props.get(&desc.property) {
+            None | Some(CoreValue::Null) => continue,
+            Some(v) => match vector_value_len(v) {
+                Some(l) => l,
+                None => {
+                    return Err(ExecError::Constraint(format!(
+                        "{}.{} must be a numeric vector for index `{}` (dimension constraint)",
+                        desc.label, desc.property, desc.name
+                    )))
+                }
+            },
+        };
+        if len != desc.dim as usize {
+            return Err(ExecError::Constraint(format!(
+                "{}.{} embedding has dim {len} but vector index `{}` declares {} \
+                 (dimension constraint)",
+                desc.label, desc.property, desc.name, desc.dim
+            )));
+        }
+        // Correct dim but stored as a numeric List → coerce to a dense Vec so the
+        // index build covers it.
+        let coerced = match core_props.get(&desc.property) {
+            Some(CoreValue::List(items)) => numeric_list_to_f32(items),
+            _ => None,
+        };
+        if let Some(floats) = coerced {
+            core_props.insert(desc.property.clone(), CoreValue::Vec(floats));
+        }
+    }
+    Ok(())
+}
+
 /// The first of the node's `labels` that declares `key` as `nullable =
 /// false`, if any. Shared by the SET-to-null and REMOVE not-null guards.
 fn not_null_label(writer: &WriterSession, labels: &[String], key: &str) -> Option<String> {
@@ -1082,6 +1181,8 @@ async fn apply_create(
                 enforce_unique_on_create(writer, labels, &core_props).await?;
                 enforce_composite_unique(writer, labels, &core_props, None).await?;
                 enforce_notnull_on_create(writer, labels, &core_props)?;
+                // CREATE introduces every property → validate them all.
+                enforce_vector_dims(writer, labels, &mut core_props, None)?;
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
@@ -1217,6 +1318,14 @@ async fn apply_set(
                     // Composite uniqueness is checked against the node's full
                     // post-SET property set, excluding the node itself.
                     enforce_composite_unique(writer, &label_vec, &core_props, Some(n.id)).await?;
+                    // Validate only the property being SET, not the node's other
+                    // (possibly pre-index, legacy) embeddings.
+                    enforce_vector_dims(
+                        writer,
+                        &label_vec,
+                        &mut core_props,
+                        Some(&[key.as_str()]),
+                    )?;
                     let record = NodeWriteRecord {
                         properties: core_props,
                         schema_version: 1,
@@ -1285,11 +1394,17 @@ async fn apply_set(
                     .filter(|l| n.labels.insert((*l).clone()))
                     .cloned()
                     .collect();
-                let core_props = node_runtime_props_to_core(&n.properties)?;
+                let mut core_props = node_runtime_props_to_core(&n.properties)?;
                 // A newly-added label brings its own NOT NULL contract: the
                 // node must already carry a non-null value for every property
                 // that label declares non-null.
                 enforce_notnull_on_create(writer, &added_labels, &core_props)?;
+                // …and its vector-index dimension contract: a gained label can
+                // bring a vector index the node's existing embedding must satisfy
+                // (scoped to the gained labels, so a pre-existing index on an
+                // unchanged label does not re-validate here — `None` over the
+                // added-label set checks every present property against them).
+                enforce_vector_dims(writer, &added_labels, &mut core_props, None)?;
                 // It also subjects the node to that label's uniqueness contracts
                 // (single-property and composite): the node's existing values
                 // must not collide with another node under the labels it gains.
@@ -1382,7 +1497,7 @@ async fn apply_set_map(
     match row.get(target_alias).cloned() {
         Some(RuntimeValue::Node(mut n)) => {
             let final_runtime = merged_props(replace, &n.properties, &incoming);
-            let final_core = node_runtime_props_to_core(&final_runtime)?;
+            let mut final_core = node_runtime_props_to_core(&final_runtime)?;
             let labels: Vec<String> = n.labels.iter().cloned().collect();
             // Uniqueness against the final set, excluding the node's own row so
             // a self-update is allowed; then NOT NULL so a `=` that drops a
@@ -1392,6 +1507,11 @@ async fn apply_set_map(
             }
             enforce_composite_unique(writer, &labels, &final_core, Some(n.id)).await?;
             enforce_notnull_on_create(writer, &labels, &final_core)?;
+            // Validate only the properties this SET introduces (a `+=` must not
+            // re-validate the node's untouched legacy embeddings; a `=` replaces
+            // the whole set, so `incoming` IS the final embedding set).
+            let changed: Vec<&str> = incoming.iter().map(|(k, _)| k.as_str()).collect();
+            enforce_vector_dims(writer, &labels, &mut final_core, Some(&changed))?;
             let record = NodeWriteRecord {
                 properties: final_core,
                 schema_version: 1,

@@ -176,17 +176,20 @@ pub async fn run(
         .await
         .map_err(|e| anyhow!("open writer: {e}"))?;
     let sch = schema(dim as u32);
-    w.register_vector_index(VectorIndexDescriptor {
-        name: INDEX_NAME.into(),
-        label: "Doc".into(),
-        property: "embedding".into(),
-        dim: dim as u32,
-        metric: VectorMetric::Cosine,
-        r: 32,
-        l_build: 64,
-        alpha: 1.2,
-        quantization: VectorQuantization::None,
-    })
+    w.register_vector_index(
+        VectorIndexDescriptor {
+            name: INDEX_NAME.into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: dim as u32,
+            metric: VectorMetric::Cosine,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        },
+        false,
+    )
     .await
     .map_err(|e| anyhow!("register index: {e}"))?;
 

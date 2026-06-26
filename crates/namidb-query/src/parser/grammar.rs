@@ -593,6 +593,9 @@ impl<'src> Parser<'src> {
         self.expect_soft_keyword("VECTOR")?;
         self.expect_soft_keyword("INDEX")?;
         let name = self.expect_identifier()?;
+        // Optional `IF NOT EXISTS` (after the name, before `ON`) — the next token
+        // is either `IF` (Ident) or the hard `Token::On`, so this is unambiguous.
+        let if_not_exists = self.parse_if_not_exists()?;
         self.expect_in(&Token::On, "vector-index target")?;
         self.expect(&Token::Colon)?;
         let label = self.expect_identifier()?;
@@ -632,6 +635,7 @@ impl<'src> Parser<'src> {
             l_build,
             alpha,
             quantization,
+            if_not_exists,
             span: SourceSpan::new(start, end),
         })
     }
@@ -645,6 +649,8 @@ impl<'src> Parser<'src> {
         self.expect_soft_keyword("FULLTEXT")?;
         self.expect_soft_keyword("INDEX")?;
         let name = self.expect_identifier()?;
+        // Optional `IF NOT EXISTS` (after the name, before `ON`).
+        let if_not_exists = self.parse_if_not_exists()?;
         self.expect_in(&Token::On, "fulltext-index target")?;
         self.expect(&Token::Colon)?;
         let label = self.expect_identifier()?;
@@ -667,6 +673,7 @@ impl<'src> Parser<'src> {
             name,
             label,
             properties,
+            if_not_exists,
             span: SourceSpan::new(start, end),
         })
     }
@@ -2760,8 +2767,51 @@ mod tests {
         assert_eq!(c.dim, 16);
         assert_eq!(c.metric, VectorMetric::Cosine);
         assert!(c.r.is_none() && c.l_build.is_none() && c.alpha.is_none());
+        assert!(!c.if_not_exists, "no IF NOT EXISTS by default");
         // The server-side DDL hook recognises a standalone statement.
         assert!(q.as_create_vector_index().is_some());
+    }
+
+    #[test]
+    fn create_vector_index_if_not_exists() {
+        let q = ok("CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(emb) \
+             METRIC cosine DIMENSION 16 WITH { quantization: int8 }");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateVectorIndex(c) => c,
+            other => panic!("expected CreateVectorIndex, got {other:?}"),
+        };
+        assert!(c.if_not_exists);
+        assert_eq!(c.name.name, "doc_emb");
+        assert_eq!(c.property.name, "emb");
+        assert_eq!(c.quantization, crate::parser::ast::VectorQuantization::Int8);
+        // Round-trips through Display, including the IF NOT EXISTS marker.
+        assert_eq!(
+            c.to_string(),
+            "CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(emb) \
+             METRIC cosine DIMENSION 16 WITH {quantization: int8}"
+        );
+    }
+
+    #[test]
+    fn create_fulltext_index_if_not_exists() {
+        let q = ok("CREATE FULLTEXT INDEX body_ix IF NOT EXISTS ON :Doc(title, body)");
+        let c = match &q.head.clauses[0] {
+            Clause::CreateFulltextIndex(c) => c,
+            other => panic!("expected CreateFulltextIndex, got {other:?}"),
+        };
+        assert!(c.if_not_exists);
+        assert_eq!(c.name.name, "body_ix");
+        assert_eq!(c.properties.len(), 2);
+        assert_eq!(
+            c.to_string(),
+            "CREATE FULLTEXT INDEX body_ix IF NOT EXISTS ON :Doc(title, body)"
+        );
+        // Without IF NOT EXISTS the flag is false.
+        let q2 = ok("CREATE FULLTEXT INDEX body_ix ON :Doc(title, body)");
+        match &q2.head.clauses[0] {
+            Clause::CreateFulltextIndex(c) => assert!(!c.if_not_exists),
+            _ => panic!(),
+        }
     }
 
     #[test]
