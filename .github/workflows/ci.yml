@@ -58,6 +58,22 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --exclude namidb-py --no-fail-fast
 
+  # The default `test` job builds with all optional features OFF, so the
+  # `#[cfg(feature = "vector-index")]` / `text-index` code — the server DDL
+  # interceptors, the index-backed KNN/BM25 path, and their tests — never runs
+  # there. Exercise that config explicitly (the shipped server is built with it).
+  test-features:
+    name: test (vector-index + text-index)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --features vector-index,text-index
+        run: |
+          cargo test -p namidb-storage -p namidb-query -p namidb-server \
+            --features vector-index,text-index --no-fail-fast
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest

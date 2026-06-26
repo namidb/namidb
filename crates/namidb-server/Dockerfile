@@ -15,7 +15,10 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 
-RUN cargo build --release -p namidb-server \
+# Build WITH vector + text search so `CREATE VECTOR INDEX` / `CREATE FULLTEXT
+# INDEX` and index-backed KNN/BM25 work in the image out of the box (matching the
+# prebuilt `namidb-server` release archive). Omit the features for a smaller image.
+RUN cargo build --release -p namidb-server --features vector-index,text-index \
     && strip target/release/namidb-server
 
 # ─── runtime ───────────────────────────────────────────────────────────

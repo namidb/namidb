@@ -37,6 +37,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --bin namidb --bin namidb-mcp
+      # The HTTP server is shipped with vector + text search ON (see the `upload`
+      # job), so gate that exact config on PRs — `ci.yml` builds/tests without
+      # features, leaving the feature-gated server code otherwise uncovered.
+      - run: cargo build -p namidb-server --features vector-index,text-index
 
   # On a `v*` tag: ensure the GitHub Release exists before the matrix tries to
   # upload to it. taiki-e/upload-rust-binary-action does NOT create the
@@ -81,6 +85,25 @@ jobs:
           bin: namidb,namidb-mcp
           target: ${{ matrix.target }}
           archive: namidb-$tag-$target
+          tar: unix
+          zip: windows
+          include: LICENSE,README.md
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # The HTTP server, built WITH vector + text search so `CREATE VECTOR INDEX`
+      # / `CREATE FULLTEXT INDEX` and index-backed KNN/BM25 work out of the box.
+      # A separate step: `features:` applies to every bin in a step's build, and
+      # namidb/namidb-mcp do not define these features. `manifest-path` pins the
+      # crate so `--features` resolves unambiguously; the distinct `archive` name
+      # avoids clobbering the CLI archive above.
+      - name: Build and upload namidb-server (vector + text index)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: namidb-server
+          features: vector-index,text-index
+          manifest-path: crates/namidb-server/Cargo.toml
+          target: ${{ matrix.target }}
+          archive: namidb-server-$tag-$target
           tar: unix
           zip: windows
           include: LICENSE,README.md
