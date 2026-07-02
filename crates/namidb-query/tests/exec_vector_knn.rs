@@ -692,6 +692,55 @@ mod indexed {
         assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
     }
 
+    #[tokio::test]
+    async fn int8_index_serves_exact_scores_not_quantized_ones() {
+        // `a`'s tiny second component quantizes with a ~60% relative error
+        // (0.005 → code 1 → 0.00787), so the quantized cosine against a
+        // y-axis query is ~0.00787 while the exact score is ~0.005. The index
+        // must rescore candidates with the true f32 metric: the served score
+        // equals the flat scan's to fp tolerance, and stays identical whether
+        // the node lives in the index or the fresh delta.
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.005, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 0.0, 1.0, 0.0]),
+            ("c", "Y", vec![0.5, 0.5, 0.0, 0.0]),
+        ];
+        let w = build_index_q(
+            "idx-i8-rescore",
+            VectorMetric::Cosine,
+            VectorQuantization::Int8,
+            &docs,
+        )
+        .await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 3";
+        let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("VectorSearch"),
+            "the scores must come from the index path, not a flat scan"
+        );
+        let rows = run(&w, cypher, vec![0.0, 1.0, 0.0, 0.0]).await;
+        let a_score = rows
+            .iter()
+            .find(|r| matches!(r.get("title"), Some(RuntimeValue::String(t)) if t == "a"))
+            .and_then(|r| match r.get("score") {
+                Some(RuntimeValue::Float(s)) => Some(*s),
+                _ => None,
+            })
+            .expect("`a` must be in the top-3");
+        // Exact cosine of a=[1, 0.005, 0, 0] against q=[0, 1, 0, 0].
+        let exact = 0.005f64 / (1.0f64 + 0.005 * 0.005).sqrt();
+        assert!(
+            (a_score - exact).abs() < 1e-6,
+            "served score {a_score} must be the exact cosine {exact}, \
+             not the quantized ~0.00787"
+        );
+    }
+
     // ── Zero-magnitude cosine semantics (issue h): index ≡ flat ≡ builtin ──
 
     #[tokio::test]

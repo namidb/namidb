@@ -3538,26 +3538,16 @@ async fn try_index_search(
     // re-scores the delta. All three metrics serve from the index; an f32 index
     // reranks with the true metric so its score equals the flat path's, and the
     // delta's `vector_score(metric, …)` is on the same scale and orientation. An
-    // int8 index returns the QUANTIZED cosine, so a fresh delta is round-tripped
-    // through the same quantizer to keep both halves of the merge commensurable —
-    // otherwise a node would score differently before vs after compaction folds it
-    // into the index.
+    // int8 index's hits are likewise rescored with the true f32 metric below, so
+    // both halves of the merge are exact — no quantize round-trip needed.
     let higher_is_better = !matches!(distance, VectorDistance::Euclidean);
+    let q_rv = RuntimeValue::Vector(qv.clone());
     let mut delta_scored: Vec<(f64, NodeId)> = Vec::with_capacity(delta.len());
-    if !delta.is_empty() {
-        let q_rv = RuntimeValue::Vector(qv.clone());
-        for (id, emb) in delta {
-            if let Some(v) = emb {
-                let v = if index_int8 {
-                    let (codes, scale) = namidb_core::quantize::quantize_i8(&v);
-                    namidb_core::quantize::dequantize_i8(&codes, scale)
-                } else {
-                    v
-                };
-                let emb_rv = RuntimeValue::Vector(v);
-                if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
-                    delta_scored.push((s, id));
-                }
+    for (id, emb) in delta {
+        if let Some(v) = emb {
+            let emb_rv = RuntimeValue::Vector(v);
+            if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
+                delta_scored.push((s, id));
             }
         }
     }
@@ -3571,9 +3561,19 @@ async fn try_index_search(
     const OVERFETCH_BASE: usize = 8;
     const WIDEN_GROWTH: usize = 4;
     const MAX_WIDEN_ROUNDS: usize = 4; // mult = 8, 32, 128, 512
+    // int8 hits are rescored with the exact f32 metric before truncation, so
+    // fetch a wider pool than k even without a filter: membership then depends
+    // on true scores, confining the quantization error to beam recall.
+    const INT8_RESCORE_POOL: usize = 4;
     let widen = post_filter.is_some();
     let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
-    let mut mult = if widen { OVERFETCH_BASE } else { 1 };
+    let mut mult = if widen {
+        OVERFETCH_BASE
+    } else if index_int8 {
+        INT8_RESCORE_POOL
+    } else {
+        1
+    };
 
     for _ in 0..max_rounds {
         let kprime = k
@@ -3590,10 +3590,45 @@ async fn try_index_search(
             Some(e) => e.max(kprime),
             None => kprime.max(64),
         };
-        let hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
+        let raw_hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
         // Fewer hits than asked ⇒ `kprime ≥` the corpus the index can see, so a
         // wider fetch cannot surface more (checked after using this round's hits).
-        let index_exhausted = hits.len() < kprime;
+        let index_exhausted = raw_hits.len() < kprime;
+
+        // int8 rescore (RFC-030): the index returned the QUANTIZED cosine, so
+        // rescore every candidate with the true f32 metric from its stored
+        // embedding BEFORE ranking/truncation — served scores and top-k
+        // membership then match the flat scan, and a node scores identically
+        // before vs after compaction folds it into the index. The materialise
+        // loop below reuses the fetched views, so the lookups are not wasted.
+        let mut rescored_views: std::collections::HashMap<NodeId, NodeValue> =
+            std::collections::HashMap::new();
+        let hits: Vec<(NodeId, f64)> = if index_int8 {
+            let ids: Vec<NodeId> = raw_hits.iter().map(|(id, _)| *id).collect();
+            // Batch prewarm so the per-id lookups below hit the cache.
+            let _ = snapshot.batch_lookup_nodes(label, &ids).await?;
+            let mut exact = Vec::with_capacity(raw_hits.len());
+            for (id, _quantized) in raw_hits {
+                crate::exec::limits::check_deadline()?;
+                let Some(view) = snapshot.lookup_node(label, id).await? else {
+                    continue;
+                };
+                let node = NodeValue::from(view);
+                let Some(emb) = node.properties.get(property) else {
+                    continue;
+                };
+                if let Some((s, _higher)) = vector_score(distance, emb, &q_rv, span)? {
+                    exact.push((id, s));
+                    rescored_views.insert(id, node);
+                }
+            }
+            exact
+        } else {
+            raw_hits
+                .into_iter()
+                .map(|(id, s)| (id, s as f64))
+                .collect()
+        };
 
         // Merge: deduped index hits not superseded by the delta, plus the
         // pre-scored delta. `seen` starts from the delta ids each round so a
@@ -3604,7 +3639,7 @@ async fn try_index_search(
         let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta_scored.len());
         for (id, score) in hits {
             if seen.insert(id) {
-                scored.push((score as f64, id));
+                scored.push((score, id));
             }
         }
         scored.extend(delta_scored.iter().copied());
@@ -3623,14 +3658,15 @@ async fn try_index_search(
                 break;
             }
             crate::exec::limits::check_deadline()?;
-            let Some(view) = snapshot.lookup_node(label, id).await? else {
-                continue;
+            let node_value = match rescored_views.remove(&id) {
+                Some(nv) => nv,
+                None => match snapshot.lookup_node(label, id).await? {
+                    Some(view) => NodeValue::from(view),
+                    None => continue,
+                },
             };
             let mut row = Row::new();
-            row.set(
-                alias.to_string(),
-                RuntimeValue::Node(Box::new(NodeValue::from(view))),
-            );
+            row.set(alias.to_string(), RuntimeValue::Node(Box::new(node_value)));
             row.set(score_alias.to_string(), RuntimeValue::Float(score));
             if let Some(pf) = post_filter {
                 if evaluate(pf, &row, params)?.as_bool() != Some(true) {
