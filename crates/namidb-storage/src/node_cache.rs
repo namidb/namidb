@@ -30,7 +30,7 @@
 //! On L2 hit we promote into L1 so the rest of the snapshot bypasses L2
 //! entirely. On L3 hit we insert into both L1 and L2.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -93,18 +93,32 @@ struct CacheStats {
     evictions: AtomicU64,
 }
 
+/// Inner cache state, guarded by one mutex so the map, its eviction order, and
+/// the byte accounting stay consistent.
+struct Inner {
+    /// key → (cached view, insertion sequence). The sequence disambiguates the
+    /// eviction-order entry so an overwrite can remove the stale one in O(log n).
+    map: HashMap<NodeCacheKey, (CachedNodeView, u64)>,
+    /// Eviction order: `(manifest_version, seq) → key`. `pop_first` yields the
+    /// victim (oldest manifest version, then oldest insertion) in O(log n) — no
+    /// full-map scan or per-key String clone.
+    order: BTreeMap<(u64, u64), NodeCacheKey>,
+    next_seq: u64,
+    used_bytes: usize,
+}
+
 /// Process-wide cross-snapshot NodeView cache.
 pub struct NodeViewCache {
-    inner: Mutex<HashMap<NodeCacheKey, CachedNodeView>>,
+    inner: Mutex<Inner>,
     capacity_bytes: usize,
-    used_bytes: Mutex<usize>,
     stats: Arc<CacheStats>,
 }
 
 impl std::fmt::Debug for NodeViewCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let entries = self.inner.lock().unwrap().len();
-        let used = *self.used_bytes.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let entries = inner.map.len();
+        let used = inner.used_bytes;
         f.debug_struct("NodeViewCache")
             .field("entries", &entries)
             .field("used_bytes", &used)
@@ -120,9 +134,13 @@ impl std::fmt::Debug for NodeViewCache {
 impl NodeViewCache {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                order: BTreeMap::new(),
+                next_seq: 0,
+                used_bytes: 0,
+            }),
             capacity_bytes: capacity_bytes.max(1),
-            used_bytes: Mutex::new(0),
             stats: Arc::new(CacheStats::default()),
         }
     }
@@ -132,11 +150,11 @@ impl NodeViewCache {
     }
 
     pub fn used_bytes(&self) -> usize {
-        *self.used_bytes.lock().unwrap()
+        self.inner.lock().unwrap().used_bytes
     }
 
     pub fn entries(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().unwrap().map.len()
     }
 
     pub fn hits(&self) -> u64 {
@@ -155,9 +173,9 @@ impl NodeViewCache {
     /// Probe the cache. Returns `Some(cached)` on hit (positive or
     /// negative), `None` on miss. Increments hit/miss counters.
     pub fn get(&self, key: &NodeCacheKey) -> Option<CachedNodeView> {
-        let map = self.inner.lock().unwrap();
-        match map.get(key) {
-            Some(view) => {
+        let inner = self.inner.lock().unwrap();
+        match inner.map.get(key) {
+            Some((view, _seq)) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 Some(view.clone())
             }
@@ -173,35 +191,37 @@ impl NodeViewCache {
     pub fn insert(&self, key: NodeCacheKey, view: CachedNodeView) {
         let weight = approx_size(&view) + key.label.capacity() + 32;
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
-        let mut map = self.inner.lock().unwrap();
-        let mut used = self.used_bytes.lock().unwrap();
+        let inner = &mut *self.inner.lock().unwrap();
 
-        // If we're overwriting an existing entry, reclaim its weight first.
-        if let Some(prev) = map.get(&key) {
+        // If we're overwriting an existing entry, reclaim its weight and drop
+        // its stale eviction-order entry (keyed by its old seq) first.
+        if let Some((prev, prev_seq)) = inner.map.get(&key) {
             let prev_weight = approx_size(prev) + key.label.capacity() + 32;
-            *used = used.saturating_sub(prev_weight);
+            let prev_order_key = (key.manifest_version, *prev_seq);
+            inner.used_bytes = inner.used_bytes.saturating_sub(prev_weight);
+            inner.order.remove(&prev_order_key);
         }
 
-        while *used + weight > self.capacity_bytes && !map.is_empty() {
-            let victim_key = map
-                .keys()
-                .min_by_key(|k| (k.manifest_version, k.label.clone()))
-                .cloned();
-            let Some(vk) = victim_key else { break };
-            if vk == key {
-                // We're trying to insert this exact key — no point
-                // evicting ourselves. Break and let the entry exceed the
-                // budget rather than rejecting it (caller cannot recover).
-                break;
-            }
-            if let Some(victim) = map.remove(&vk) {
-                let victim_weight = approx_size(&victim) + vk.label.capacity() + 32;
-                *used = used.saturating_sub(victim_weight);
+        // Evict oldest (manifest_version, seq) entries in O(log n) each until the
+        // new entry fits. The new key is not yet in `order`, so it is never a
+        // victim of its own insert.
+        while inner.used_bytes + weight > self.capacity_bytes {
+            let Some((&victim_ord, _)) = inner.order.iter().next() else {
+                break; // nothing left to evict
+            };
+            let victim_key = inner.order.remove(&victim_ord).unwrap();
+            if let Some((victim, _)) = inner.map.remove(&victim_key) {
+                let victim_weight = approx_size(&victim) + victim_key.label.capacity() + 32;
+                inner.used_bytes = inner.used_bytes.saturating_sub(victim_weight);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
-        map.insert(key, view);
-        *used = used.saturating_add(weight);
+
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.order.insert((key.manifest_version, seq), key.clone());
+        inner.map.insert(key, (view, seq));
+        inner.used_bytes = inner.used_bytes.saturating_add(weight);
     }
 }
 

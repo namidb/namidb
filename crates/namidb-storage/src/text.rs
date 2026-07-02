@@ -31,21 +31,77 @@ pub const K1: f64 = 1.5;
 /// BM25 `b` — field-length normalization strength.
 pub const B: f64 = 0.75;
 
-/// Tokenize text into lowercased alphanumeric terms (split on non-alphanumeric
-/// runs; no stemming, no stopwords).
+/// `true` for scripts written without spaces between words (CJK ideographs,
+/// kana, Hangul), where whitespace/punctuation splitting yields one giant token.
+/// Such runs are indexed as overlapping bigrams instead (the Lucene CJKAnalyzer
+/// approach: dictionary-free, and symmetric between index and query).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF   // Hiragana + Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7AF // Hangul syllables
+        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+    )
+}
+
+/// Tokenize text into lowercased terms (split on non-alphanumeric runs; no
+/// stemming, no stopwords).
 ///
 /// Case folding is Unicode-aware (`to_lowercase`), so `CAFÉ`, `ÜBER`, `ПРИВЕТ`
 /// fold to `café`, `über`, `привет` and match their lowercase forms. Using
-/// `to_ascii_lowercase` here left every non-ASCII capital un-folded, so
+/// `to_ascii_lowercase` left every non-ASCII capital un-folded, so
 /// case-insensitive full-text search silently failed for all non-English text.
+///
+/// CJK/Hangul runs (which carry no word separators) are emitted as overlapping
+/// bigrams — `東京大学` → `東京`, `京大`, `大学` — so a query like `東京` matches;
+/// otherwise the whole run became one token that no realistic query ever typed.
+/// A length-1 CJK run is emitted as a unigram.
+///
 /// The index and the flat `bm25` scalar both call this, so they stay in exact
 /// agreement (an index built by an older binary reindexes on the next
 /// authoritative compaction).
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
+    let mut out = Vec::new();
+    for segment in text.split(|c: char| !c.is_alphanumeric()) {
+        if segment.is_empty() {
+            continue;
+        }
+        emit_segment_tokens(segment, &mut out);
+    }
+    out
+}
+
+/// Emit tokens for one maximal alphanumeric segment: non-CJK subruns become one
+/// lowercased word each; CJK subruns become overlapping lowercased bigrams.
+fn emit_segment_tokens(segment: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_cjk(chars[i]) {
+            // Consume the maximal CJK run and emit overlapping bigrams.
+            let start = i;
+            while i < chars.len() && is_cjk(chars[i]) {
+                i += 1;
+            }
+            let run = &chars[start..i];
+            if run.len() == 1 {
+                out.push(run[0].to_lowercase().to_string());
+            } else {
+                for w in run.windows(2) {
+                    out.push(w.iter().collect::<String>().to_lowercase());
+                }
+            }
+        } else {
+            // Consume the maximal non-CJK run as one word.
+            let start = i;
+            while i < chars.len() && !is_cjk(chars[i]) {
+                i += 1;
+            }
+            out.push(chars[start..i].iter().collect::<String>().to_lowercase());
+        }
+    }
 }
 
 /// Tokenize `text` into a term→count map plus the total token count (document
@@ -144,6 +200,20 @@ mod tests {
         assert_eq!(tokenize("CAFÉ"), vec!["café"]);
         assert_eq!(tokenize("ÜBER Über über"), vec!["über", "über", "über"]);
         assert_eq!(tokenize("ПРИВЕТ Привет"), vec!["привет", "привет"]);
+    }
+
+    #[test]
+    fn tokenize_cjk_runs_into_overlapping_bigrams() {
+        // A CJK run must become overlapping bigrams so a shorter query matches.
+        assert_eq!(tokenize("東京大学"), vec!["東京", "京大", "大学"]);
+        // A query token is tokenized the same way, so `東京` is findable.
+        assert_eq!(tokenize("東京"), vec!["東京"]);
+        // A length-1 run stays a unigram.
+        assert_eq!(tokenize("犬"), vec!["犬"]);
+        // Mixed Latin + CJK in one segment: Latin word + CJK bigrams.
+        assert_eq!(tokenize("iPhone東京"), vec!["iphone", "東京"]);
+        // Latin words are unaffected.
+        assert_eq!(tokenize("hello world"), vec!["hello", "world"]);
     }
 
     #[test]
