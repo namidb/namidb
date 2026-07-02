@@ -903,14 +903,31 @@ impl WriterSession {
     pub async fn flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
         let _ = self.commit_batch().await?;
         let frozen = self.memtable.freeze();
-        let outcome = flush(
+        let outcome = match flush(
             &self.manifest_store,
             &self.fence,
             &self.current,
             &frozen,
             schema,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The flush failed before the manifest CAS committed the SSTs,
+                // so `frozen` is durable in nothing but its WAL segments (still
+                // referenced by `self.current`, which we did NOT advance). But
+                // `freeze()` already drained those rows out of the live
+                // memtable: without restoring them they would vanish from every
+                // read, and the next *successful* flush — which clears the WAL
+                // segment references — would lose them permanently. Put them
+                // back and re-publish so the rows stay visible and the next
+                // flush retries them.
+                self.memtable.restore(frozen);
+                self.refresh_published();
+                return Err(e);
+            }
+        };
         self.current = outcome.committed.clone();
         // The flush emptied the live memtable (memtable.freeze() drained
         // it), so the published snapshot must reset to empty too.

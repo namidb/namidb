@@ -324,9 +324,17 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 Ok(b) => b,
                 Err(BoltError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("bolt connection closed by client");
+                    // A client that drops mid-transaction (crash, kill, network
+                    // partition) never sends ROLLBACK/GOODBYE; without this the
+                    // staged batch would linger in the shared writer and be
+                    // sealed by the next unrelated commit. Roll it back here.
+                    self.rollback_if_open_tx().await;
                     return Ok(());
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.rollback_if_open_tx().await;
+                    return Err(e);
+                }
             };
             let request = match Request::decode(&body, max) {
                 Ok(r) => r,
@@ -344,11 +352,28 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             let goodbye = matches!(request, Request::Goodbye);
             if let Err(e) = self.handle(request, element_mode).await {
                 warn!(error = %e, "bolt session error");
+                // A transport/protocol error tears the connection down; roll
+                // back any open transaction so its staged writes are discarded
+                // rather than left in the shared writer for the next commit.
+                self.rollback_if_open_tx().await;
                 return Err(e);
             }
             if goodbye || self.state == State::Defunct {
                 return Ok(());
             }
+        }
+    }
+
+    /// Roll back any open/dangling transaction to discard its staged writes and
+    /// release the writer it pins. A no-op when no transaction is open.
+    /// FAILED is included: a statement that failed mid-transaction leaves the
+    /// state FAILED while the writer can still be pinned with a staged batch.
+    async fn rollback_if_open_tx(&mut self) {
+        if matches!(
+            self.state,
+            State::TxReady | State::TxStreaming | State::Failed
+        ) {
+            let _ = self.backend.rollback_tx().await;
         }
     }
 

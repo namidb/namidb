@@ -745,7 +745,17 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
         // One manifest CAS makes the whole transaction durable; then
         // republish so reads see it. Dropping `tx` releases the writer lock.
-        tx.writer.commit_batch().await.map_err(map_storage_err)?;
+        if let Err(e) = tx.writer.commit_batch().await {
+            // The commit failed and this transaction is aborted. Its records are
+            // still staged in the shared writer's pending batch (commit_batch
+            // preserves the batch on error so a retry is possible); since we
+            // have already `take()`n the tx slot, a later ROLLBACK/RESET can no
+            // longer reach them. Discard here so the aborted transaction's
+            // writes can never be sealed by the next unrelated commit — nothing
+            // is durable until the manifest CAS lands, so discarding is safe.
+            tx.writer.discard_batch();
+            return Err(map_storage_err(e));
+        }
         self.state.snapshot.store(tx.writer.owned_snapshot());
         Ok(())
     }

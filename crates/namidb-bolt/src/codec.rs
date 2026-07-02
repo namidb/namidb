@@ -49,6 +49,16 @@ use crate::value::Value;
 /// allocations.
 pub const DEFAULT_MAX_LEN: usize = 1 << 24; // 16 MiB
 
+/// Max container-nesting depth we decode. PackStream values are `List`s,
+/// `Map`s, and `Struct`s that can nest; a malformed message can declare
+/// nesting far deeper than any real value to drive `decode_inner` into
+/// unbounded recursion and overflow the (non-unwindable) worker-thread
+/// stack, aborting the whole process — reachable pre-auth. Legitimate Bolt
+/// values nest only a handful of levels (a Node inside a Relationship inside
+/// a Path inside a result List), so 128 is generous while still bounding the
+/// stack. Exceeding it yields a clean `NestingTooDeep` FAILURE.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
 /// Encode `value` into `out`.
 pub fn encode(out: &mut BytesMut, value: &Value) -> Result<()> {
     match value {
@@ -204,16 +214,21 @@ fn encode_struct_header(out: &mut BytesMut, fields: usize, tag: u8) -> Result<()
 
 /// Decode one value from `buf`, advancing it past the consumed bytes.
 pub fn decode(buf: &mut &[u8]) -> Result<Value> {
-    decode_inner(buf, DEFAULT_MAX_LEN)
+    decode_inner(buf, DEFAULT_MAX_LEN, 0)
 }
 
 /// Decode one value with a custom max-container-length bound. The
 /// session uses a lower bound pre-auth.
 pub fn decode_with_limit(buf: &mut &[u8], max_len: usize) -> Result<Value> {
-    decode_inner(buf, max_len)
+    decode_inner(buf, max_len, 0)
 }
 
-fn decode_inner(buf: &mut &[u8], max_len: usize) -> Result<Value> {
+fn decode_inner(buf: &mut &[u8], max_len: usize, depth: usize) -> Result<Value> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(BoltError::NestingTooDeep {
+            max: MAX_NESTING_DEPTH,
+        });
+    }
     let marker = read_u8(buf, "marker")?;
     // Hot path: tiny structures use the marker's high nibble + low
     // nibble for length. We check ranges in order of expected
@@ -269,51 +284,51 @@ fn decode_inner(buf: &mut &[u8], max_len: usize) -> Result<Value> {
         // TinyList
         0x90..=0x9F => {
             let len = (marker & 0x0F) as usize;
-            decode_list_body(buf, len, max_len)
+            decode_list_body(buf, len, max_len, depth)
         }
         0xD4 => {
             let len = read_u8(buf, "List8 length")? as usize;
-            decode_list_body(buf, len, max_len)
+            decode_list_body(buf, len, max_len, depth)
         }
         0xD5 => {
             let len = read_u16(buf, "List16 length")? as usize;
-            decode_list_body(buf, len, max_len)
+            decode_list_body(buf, len, max_len, depth)
         }
         0xD6 => {
             let len = read_u32(buf, "List32 length")? as usize;
-            decode_list_body(buf, len, max_len)
+            decode_list_body(buf, len, max_len, depth)
         }
 
         // TinyMap
         0xA0..=0xAF => {
             let len = (marker & 0x0F) as usize;
-            decode_map_body(buf, len, max_len)
+            decode_map_body(buf, len, max_len, depth)
         }
         0xD8 => {
             let len = read_u8(buf, "Map8 length")? as usize;
-            decode_map_body(buf, len, max_len)
+            decode_map_body(buf, len, max_len, depth)
         }
         0xD9 => {
             let len = read_u16(buf, "Map16 length")? as usize;
-            decode_map_body(buf, len, max_len)
+            decode_map_body(buf, len, max_len, depth)
         }
         0xDA => {
             let len = read_u32(buf, "Map32 length")? as usize;
-            decode_map_body(buf, len, max_len)
+            decode_map_body(buf, len, max_len, depth)
         }
 
         // TinyStruct
         0xB0..=0xBF => {
             let fields = (marker & 0x0F) as usize;
-            decode_struct_body(buf, fields, max_len)
+            decode_struct_body(buf, fields, max_len, depth)
         }
         0xDC => {
             let fields = read_u8(buf, "Struct8 size")? as usize;
-            decode_struct_body(buf, fields, max_len)
+            decode_struct_body(buf, fields, max_len, depth)
         }
         0xDD => {
             let fields = read_u16(buf, "Struct16 size")? as usize;
-            decode_struct_body(buf, fields, max_len)
+            decode_struct_body(buf, fields, max_len, depth)
         }
 
         other => Err(BoltError::InvalidMarker {
@@ -343,20 +358,20 @@ fn decode_bytes_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Valu
     Ok(Value::Bytes(out))
 }
 
-fn decode_list_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Value> {
+fn decode_list_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) -> Result<Value> {
     bound_check("List", len, max_len)?;
     let mut items = Vec::with_capacity(len);
     for _ in 0..len {
-        items.push(decode_inner(buf, max_len)?);
+        items.push(decode_inner(buf, max_len, depth + 1)?);
     }
     Ok(Value::List(items))
 }
 
-fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Value> {
+fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) -> Result<Value> {
     bound_check("Map", len, max_len)?;
     let mut out = BTreeMap::new();
     for _ in 0..len {
-        let k = decode_inner(buf, max_len)?;
+        let k = decode_inner(buf, max_len, depth + 1)?;
         let key = match k {
             Value::String(s) => s,
             other => {
@@ -366,18 +381,18 @@ fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Value>
                 })
             }
         };
-        let value = decode_inner(buf, max_len)?;
+        let value = decode_inner(buf, max_len, depth + 1)?;
         out.insert(key, value);
     }
     Ok(Value::Map(out))
 }
 
-fn decode_struct_body(buf: &mut &[u8], fields: usize, max_len: usize) -> Result<Value> {
+fn decode_struct_body(buf: &mut &[u8], fields: usize, max_len: usize, depth: usize) -> Result<Value> {
     let tag = read_u8(buf, "Struct tag")?;
     bound_check("Struct", fields, max_len)?;
     let mut out = Vec::with_capacity(fields);
     for _ in 0..fields {
-        out.push(decode_inner(buf, max_len)?);
+        out.push(decode_inner(buf, max_len, depth + 1)?);
     }
     Ok(Value::Struct { tag, fields: out })
 }
@@ -457,6 +472,45 @@ mod tests {
     #[test]
     fn null_roundtrip() {
         assert_eq!(roundtrip(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn deeply_nested_lists_error_instead_of_overflowing_the_stack() {
+        // A malformed message can declare nesting far deeper than any real
+        // value to drive the recursive decoder into a stack overflow (a
+        // non-unwindable process abort), reachable pre-auth. `0x91` is a
+        // TinyList-of-1: a long run of them is a legal-looking but pathological
+        // nesting. The decoder must reject it with a clean `NestingTooDeep`
+        // error, not recurse ~N frames deep. Terminate with a Null leaf.
+        let mut body = vec![0x91u8; MAX_NESTING_DEPTH + 50];
+        body.push(0xC0);
+        let mut slice: &[u8] = &body;
+        let err = decode(&mut slice).expect_err("must reject over-deep nesting");
+        assert!(
+            matches!(err, BoltError::NestingTooDeep { .. }),
+            "expected NestingTooDeep, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nesting_at_the_limit_still_decodes() {
+        // A value nested exactly to the limit must still decode — the guard
+        // rejects only what exceeds it, so legitimate (shallow) values are
+        // unaffected. Build MAX_NESTING_DEPTH TinyLists wrapping a Null.
+        let mut body = vec![0x91u8; MAX_NESTING_DEPTH];
+        body.push(0xC0);
+        let mut slice: &[u8] = &body;
+        let v = decode(&mut slice).expect("nesting at the limit must decode");
+        // Unwrap the nested single-element lists down to the Null leaf.
+        let mut cur = &v;
+        let mut depth = 0;
+        while let Value::List(items) = cur {
+            assert_eq!(items.len(), 1);
+            cur = &items[0];
+            depth += 1;
+        }
+        assert_eq!(cur, &Value::Null);
+        assert_eq!(depth, MAX_NESTING_DEPTH);
     }
 
     #[test]

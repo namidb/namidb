@@ -206,6 +206,51 @@ async fn match_expand_returns_pairs() {
 }
 
 #[tokio::test]
+async fn var_length_expand_does_not_reuse_a_relationship() {
+    // Cypher relationship uniqueness (trail semantics): a relationship may
+    // appear at most once in a matched path. Minimal graph: a single edge
+    // Alice-KNOWS->Bob. Every 2-hop undirected walk (a-r-partner-r-a) would
+    // have to reuse edge `r`, so `*2..2` must return ZERO rows. Before the fix
+    // the executor walked the same edge back and returned phantom rows
+    // (Alice from Bob's walk, Bob from Alice's walk).
+    let mut writer = WriterSession::open(store(), paths("exec-rel-unique"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    writer.upsert_node("Person", bob, &person("Bob", 25)).unwrap();
+    writer.upsert_edge("KNOWS", alice, bob, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse("MATCH (a:Person)-[:KNOWS*2..2]-(x) RETURN x.name AS name").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let got: Vec<Option<RuntimeValue>> = rows.iter().map(|r| r.get("name").cloned()).collect();
+    assert!(
+        rows.is_empty(),
+        "*2..2 over a single edge must not reuse it; got {got:?}"
+    );
+
+    // Sanity: single-hop expansion is unaffected — Alice and Bob are mutual
+    // undirected neighbours at hop 1.
+    let q1 = parse("MATCH (a:Person)-[:KNOWS*1..1]-(x) RETURN x.name AS name ORDER BY name").unwrap();
+    let plan1 = lower(&q1).unwrap();
+    let rows1 = execute(&plan1, &snapshot, &Params::new()).await.unwrap();
+    let names1: Vec<&str> = rows1
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    assert_eq!(names1, vec!["Alice", "Bob"], "single-hop expand still works");
+}
+
+#[tokio::test]
 async fn match_expand_with_limit() {
     let mut writer = WriterSession::open(store(), paths("exec-limit"))
         .await

@@ -174,6 +174,31 @@ impl Memtable {
         FrozenMemtable { inner, bytes }
     }
 
+    /// Restore a previously [`freeze`](Self::freeze)d batch back into the live
+    /// memtable after a **failed** flush. The frozen entries were drained out
+    /// of the live memtable but never made durable in an SST (the manifest CAS
+    /// never committed), so they must stay visible and be retried by the next
+    /// flush — otherwise the next *successful* flush clears their WAL segment
+    /// references and the acked writes are lost forever.
+    ///
+    /// Newest-wins by LSN: any key the live memtable re-wrote at a higher LSN
+    /// while the flush was in flight is kept as-is; the frozen entry is applied
+    /// only where the key is absent or the frozen LSN is newer. (In the
+    /// single-writer model the live memtable is empty across the flush await,
+    /// so this merge is usually a straight re-insert, but keeping the LSN check
+    /// makes it correct regardless.)
+    pub fn restore(&mut self, frozen: FrozenMemtable) {
+        for (key, entry) in frozen.inner {
+            let keep = match self.inner.get(&key) {
+                Some(existing) => existing.lsn < entry.lsn,
+                None => true,
+            };
+            if keep {
+                self.apply(key, entry.lsn, entry.op);
+            }
+        }
+    }
+
     /// Build an immutable [`MemtableSnapshot`] of the current state.
     ///
     /// The snapshot owns its own copy of the `BTreeMap`, so the
@@ -371,6 +396,57 @@ mod tests {
         assert_eq!(mt.iter_nodes().count(), 2);
         assert_eq!(mt.iter_edge_type("KNOWS").count(), 1);
         assert_eq!(mt.iter_edge_type("OTHER").count(), 0);
+    }
+
+    #[test]
+    fn restore_reinstates_frozen_batch_after_failed_flush() {
+        // Simulate a failed flush: freeze drains the memtable, then restore
+        // puts the batch back so the acked rows stay visible and can be
+        // retried. Without this a transient flush error silently drops them.
+        let mut mt = Memtable::new();
+        for i in 0..4 {
+            mt.apply(
+                MemKey::Node { id: nid(i) },
+                i as u64,
+                MemOp::Upsert(Bytes::from_static(b"v")),
+            );
+        }
+        let bytes_before = mt.bytes_estimate();
+        let frozen = mt.freeze();
+        assert_eq!(mt.len(), 0, "freeze drains the live memtable");
+        mt.restore(frozen);
+        assert_eq!(mt.len(), 4, "restore reinstates every frozen row");
+        assert_eq!(mt.bytes_estimate(), bytes_before, "byte accounting restored");
+        for i in 0..4 {
+            assert!(mt.get(&MemKey::Node { id: nid(i) }).is_some());
+        }
+    }
+
+    #[test]
+    fn restore_keeps_newest_by_lsn_on_conflict() {
+        // If the live memtable re-wrote a key at a higher LSN while the flush
+        // was in flight, restore must NOT clobber it with the stale frozen
+        // entry; a lower-LSN frozen entry loses to the live one and a
+        // higher-LSN frozen entry wins over an absent/older live one.
+        let key = MemKey::Node { id: nid(1) };
+        let mut mt = Memtable::new();
+        mt.apply(key.clone(), 5, MemOp::Upsert(Bytes::from_static(b"frozen")));
+        let frozen = mt.freeze();
+        // Live memtable advanced this key to a newer LSN post-freeze.
+        mt.apply(key.clone(), 9, MemOp::Upsert(Bytes::from_static(b"live-newer")));
+        mt.restore(frozen);
+        let e = mt.get(&key).unwrap();
+        assert_eq!(e.lsn, 9, "live newer LSN wins");
+        assert_eq!(e.op, MemOp::Upsert(Bytes::from_static(b"live-newer")));
+
+        // Reverse: frozen entry is newer than the live one → frozen wins.
+        let key2 = MemKey::Node { id: nid(2) };
+        let mut mt2 = Memtable::new();
+        mt2.apply(key2.clone(), 20, MemOp::Upsert(Bytes::from_static(b"frozen-new")));
+        let frozen2 = mt2.freeze();
+        mt2.apply(key2.clone(), 3, MemOp::Upsert(Bytes::from_static(b"live-old")));
+        mt2.restore(frozen2);
+        assert_eq!(mt2.get(&key2).unwrap().lsn, 20, "frozen newer LSN wins");
     }
 
     #[test]

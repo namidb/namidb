@@ -2296,8 +2296,22 @@ impl<'mt> Snapshot<'mt> {
             .map(|d| d.max_lsn)
             .max();
         let Some(idx_lsn) = idx_lsn else {
-            // No index SST yet → the index path is not taken; nothing to gate.
-            return false;
+            // No index SST for this name yet. If any persisted `Nodes` SST
+            // exists, its flushed rows are unabsorbed by the (nonexistent)
+            // index AND are not in the memtable fresh-delta the caller merges,
+            // so the index path would silently miss them — report "outrun" to
+            // force the exact flat scan. (A vector KNN with a just-registered
+            // index but no authoritative `.vg` compaction yet was returning
+            // memtable-only top-k, dropping every flushed neighbour.) When
+            // there is no Nodes SST either, the whole corpus is still in the
+            // memtable, which the caller's fresh-delta merge fully covers, so
+            // the index path stays correct.
+            return self
+                .manifest
+                .manifest
+                .ssts
+                .iter()
+                .any(|d| d.kind == SstKind::Nodes);
         };
         self.manifest
             .manifest

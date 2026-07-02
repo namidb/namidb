@@ -1133,6 +1133,7 @@ pub(crate) async fn execute_expand(
             tail: starting,
             row: row.clone(),
             trail: initial_trail,
+            rels: Vec::new(),
         }];
         let hop_start = min.max(1);
         let _ = hop_start;
@@ -1174,6 +1175,25 @@ pub(crate) async fn execute_expand(
             for (step, neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, step.tail);
+                    // Cypher relationship uniqueness (trail semantics): a
+                    // relationship may appear at most once per matched path.
+                    // Skip an edge already traversed on this path so a
+                    // variable-length pattern cannot walk the same edge back
+                    // (e.g. `-[:R*2..2]-` over a single edge → a-r-b-r-a). Only
+                    // enforced for multi-hop expansions; a single hop can never
+                    // repeat a relationship. The identity is the STORED edge
+                    // `(edge_type, src, dst)`, so a Both-direction traversal of
+                    // the same edge in either orientation collapses to one key.
+                    let edge_key = if max > 1 {
+                        Some((edge.edge_type.clone(), edge.src, edge.dst))
+                    } else {
+                        None
+                    };
+                    if let Some(k) = &edge_key {
+                        if step.rels.contains(k) {
+                            continue;
+                        }
+                    }
                     // Back-reference fast path: skip the lookup_node
                     // (the binding's NodeView is already on the row).
                     // For non-back-reference, fetch the view so we
@@ -1281,10 +1301,15 @@ pub(crate) async fn execute_expand(
                             new_trail.push(RuntimeValue::Null);
                         }
                     }
+                    let mut new_rels = step.rels.clone();
+                    if let Some(k) = &edge_key {
+                        new_rels.push(k.clone());
+                    }
                     next_frontier.push(Step {
                         tail: target_id,
                         row: new_row.clone(),
                         trail: new_trail.clone(),
+                        rels: new_rels,
                     });
                     if hop >= min.max(1) {
                         let keeps = target_is_result
@@ -1350,6 +1375,13 @@ struct Step {
     /// — for shortestPath we only fill it when `path_binding` is
     /// `Some(_)`.
     trail: Vec<RuntimeValue>,
+    /// Relationships already traversed on THIS path, as stored edge
+    /// identities `(edge_type, src, dst)`. Enforces Cypher relationship
+    /// uniqueness (trail semantics): a variable-length path may not reuse a
+    /// relationship, so `-[:R*2..2]-` cannot walk one edge out and back. Only
+    /// populated for multi-hop expansions (`max > 1`); left empty on the
+    /// single-hop hot path, where reuse is impossible.
+    rels: Vec<(String, NodeId, NodeId)>,
 }
 
 /// Resolve the set of labels a `NodeScan` operator must visit.
@@ -4750,19 +4782,30 @@ async fn execute_expand_factor(
         // frontier entry, NOT under the original parent_leaf. That keeps
         // per-step bindings (rel and intermediate target_alias) attached
         // to the correct chain for variable-length paths.
-        let mut frontier: Vec<(crate::exec::FactorIdx, NodeId)> = vec![(parent_leaf, starting)];
+        // Third tuple element: relationships traversed on this path, as stored
+        // edge identities `(edge_type, src, dst)`, for Cypher relationship
+        // uniqueness (trail semantics). Only populated for multi-hop
+        // expansions; empty on the single-hop path where reuse is impossible.
+        let mut frontier: Vec<(crate::exec::FactorIdx, NodeId, Vec<(String, NodeId, NodeId)>)> =
+            vec![(parent_leaf, starting, Vec::new())];
 
         for hop in 1..=max {
-            let mut next_frontier: Vec<(crate::exec::FactorIdx, NodeId)> = Vec::new();
+            let mut next_frontier: Vec<(
+                crate::exec::FactorIdx,
+                NodeId,
+                Vec<(String, NodeId, NodeId)>,
+            )> = Vec::new();
             // Phase 1: pre-collect neighbours per frontier entry so the
             // batch prewarm below can populate L1 with one SST decode
             // (Fix #3b — same rationale as the flat path).
-            let mut step_neighbours: Vec<((crate::exec::FactorIdx, NodeId), Vec<EdgeView>)> =
-                Vec::with_capacity(frontier.len());
+            let mut step_neighbours: Vec<(
+                (crate::exec::FactorIdx, NodeId, Vec<(String, NodeId, NodeId)>),
+                Vec<EdgeView>,
+            )> = Vec::with_capacity(frontier.len());
             let mut unique_targets: Vec<NodeId> = Vec::new();
             let mut seen_targets: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
-            for (cur_parent, tail) in frontier.drain(..) {
+            for (cur_parent, tail, rels) in frontier.drain(..) {
                 let neighbours =
                     neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
                         .await?;
@@ -4774,7 +4817,7 @@ async fn execute_expand_factor(
                         }
                     }
                 }
-                step_neighbours.push(((cur_parent, tail), neighbours));
+                step_neighbours.push(((cur_parent, tail, rels), neighbours));
             }
             // Phase 2: batch prewarm.
             if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
@@ -4782,9 +4825,22 @@ async fn execute_expand_factor(
                     let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
                 }
             }
-            for ((cur_parent, tail), neighbours) in step_neighbours {
+            for ((cur_parent, tail, rels), neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, tail);
+                    // Cypher relationship uniqueness (trail semantics): skip an
+                    // edge already traversed on this path so `-[:R*2..2]-` can't
+                    // walk one edge out and back. Only enforced for multi-hop.
+                    let edge_key = if max > 1 {
+                        Some((edge.edge_type.clone(), edge.src, edge.dst))
+                    } else {
+                        None
+                    };
+                    if let Some(k) = &edge_key {
+                        if rels.contains(k) {
+                            continue;
+                        }
+                    }
                     // Far-end label(s) gate RESULTS, not traversal: for a
                     // multi-hop expansion, traverse through any node and let
                     // `target_is_result` decide the hit (see the flat-path fix).
@@ -4845,7 +4901,11 @@ async fn execute_expand_factor(
                     }
                     // One arena push per (parent, edge) pair. NO Row clone.
                     let new_idx = arena.push(cur_parent, slots);
-                    next_frontier.push((new_idx, target_id));
+                    let mut new_rels = rels.clone();
+                    if let Some(k) = edge_key {
+                        new_rels.push(k);
+                    }
+                    next_frontier.push((new_idx, target_id, new_rels));
                     if hop >= min.max(1) {
                         let keeps = target_is_result
                             && match existing_target_id {

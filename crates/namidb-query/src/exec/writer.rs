@@ -126,7 +126,17 @@ pub async fn execute_write_with_deadline(
             return Err(e);
         }
     };
-    writer.commit_batch().await.map_err(ExecError::Storage)?;
+    if let Err(e) = writer.commit_batch().await {
+        // The commit failed and this statement is aborted. `commit_batch`
+        // preserves the pending batch on error (so an internal retry is
+        // possible), but this writer is long-lived and shared: if we return
+        // without clearing it, the staged records would be sealed by the next
+        // unrelated statement's commit or by the background flush — turning a
+        // negatively-acked write durable. Nothing is durable until the manifest
+        // CAS lands, so discarding here is safe.
+        writer.discard_batch();
+        return Err(ExecError::Storage(e));
+    }
     Ok(outcome)
 }
 

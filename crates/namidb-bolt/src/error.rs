@@ -29,6 +29,9 @@ pub enum BoltError {
         max: usize,
     },
 
+    #[error("value nesting too deep: exceeds maximum depth {max}")]
+    NestingTooDeep { max: usize },
+
     #[error("unsupported struct tag 0x{tag:02X}")]
     UnsupportedStruct { tag: u8 },
 
