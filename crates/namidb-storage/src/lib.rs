@@ -29,6 +29,7 @@ pub mod memtable;
 pub mod node_cache;
 pub mod parquet_loader;
 pub mod paths;
+pub mod pin;
 pub mod property_index;
 pub mod read;
 pub mod recovery;
@@ -66,6 +67,7 @@ pub use parquet_loader::{
     load_edges as load_edges_from_parquet, load_nodes as load_nodes_from_parquet, LoadOutcome,
 };
 pub use paths::NamespacePaths;
+pub use pin::{PinLease, RetentionPin, DEFAULT_PIN_TTL};
 pub use read::{
     EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
 };

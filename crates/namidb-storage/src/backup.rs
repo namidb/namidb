@@ -20,22 +20,28 @@
 //! carrying dangling references to manifest versions that were never copied,
 //! which the orphan sweep's retention horizon would otherwise try to load.
 //!
-//! Caveat: run the copy against a quiescent source, or accept that a
-//! concurrent compaction plus orphan sweep on the source could delete a pinned
-//! object mid-copy if the copy outlives the source's retention horizon. There
-//! is no `FREEZE`; pinning a specific committed `version` narrows the window to
-//! the copy itself.
+//! While the copy runs it holds a **retention pin lease** on the source
+//! (`manifest/pins/<uuid>.json`, [`crate::pin`]): the orphan sweep unions
+//! every unexpired lease into its horizon, so a concurrent compaction plus
+//! sweep cannot delete the pinned closure mid-copy. The lease is renewed as
+//! the copy progresses and released when it finishes (or errors); a crashed
+//! copy leaks a lease that simply expires. Residual window: a sweep already
+//! past its own pin listing when the lease lands can still reclaim a version
+//! *older than every in-process reader*; the copy then fails loudly with
+//! `NotFound` rather than producing a truncated snapshot — retry it.
 
 use std::sync::Arc;
 
 use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, WriteMultipart};
+use tracing::debug;
 
 use crate::error::{Error, Result};
 use crate::fence::Epoch;
 use crate::manifest::{Manifest, ManifestPointer, ManifestStore};
 use crate::paths::NamespacePaths;
+use crate::pin::{RetentionPin, DEFAULT_PIN_TTL};
 
 /// Outcome of a completed [`copy_namespace_snapshot`].
 #[derive(Debug, Clone)]
@@ -70,11 +76,11 @@ pub struct SnapshotCopyReport {
 /// new manifest does not reference; prefer restoring into a fresh location, or
 /// run the orphan sweep afterwards to reclaim the space.
 ///
-/// Run the copy against a quiescent source. The pinned objects are immutable,
-/// but a concurrent compaction plus orphan sweep on the source could delete
-/// one mid-copy if the copy outlives the source's retention horizon, which
-/// surfaces as a non-retriable `NotFound`. There is no `FREEZE` yet; pinning a
-/// committed `version` narrows the window to the copy itself.
+/// The copy holds a retention pin lease on the source for its whole duration
+/// (see the module docs), so it is safe against a concurrent compaction plus
+/// orphan sweep — the janitor keeps the pinned closure alive until the lease
+/// is released or expires. Restore reads from a backup destination, where no
+/// janitor runs; the lease it writes there is inert and removed on completion.
 pub async fn copy_namespace_snapshot(
     src_store: Arc<dyn ObjectStore>,
     src_paths: NamespacePaths,
@@ -104,12 +110,64 @@ pub async fn copy_namespace_snapshot(
 
     // Pin the manifest version to copy.
     let src_manifests = ManifestStore::new(src_store.clone(), src_paths.clone());
-    let mut manifest: Manifest = match version {
+    let manifest: Manifest = match version {
         Some(v) => src_manifests.load_manifest_at(v).await?,
         None => src_manifests.load_current().await?.manifest,
     };
     let source_version = manifest.version;
 
+    // Make the pin durable: a lease object the source's orphan sweep unions
+    // into its horizon, so the pinned closure stays alive across processes
+    // while the copy runs.
+    let mut pin = RetentionPin::acquire(
+        src_store.clone(),
+        &src_paths,
+        source_version,
+        DEFAULT_PIN_TTL,
+    )
+    .await?;
+    // Close the load-then-pin race: a sweep could have reclaimed the pinned
+    // version between our load and the lease becoming visible. Once the body
+    // is confirmed present *after* the lease exists, every later sweep (which
+    // lists pins before deleting) retains the whole closure.
+    if let Err(e) = src_store
+        .head(&src_paths.manifest_version(source_version))
+        .await
+    {
+        let _ = pin.release().await;
+        return Err(Error::precondition(format!(
+            "source manifest version {source_version} was reclaimed while the retention pin was \
+             being acquired — retry the copy: {e}"
+        )));
+    }
+
+    let result = copy_snapshot_pinned(
+        &src_store, &src_paths, &dst_store, &dst_paths, manifest, overwrite, verify, &mut pin,
+    )
+    .await;
+    if let Err(e) = pin.release().await {
+        // Benign: the lease expires on its own; the next sweep reclaims it.
+        debug!(error = %e, "failed to release the backup retention pin");
+    }
+    result
+}
+
+/// The copy body, run while `pin` holds the source's retention horizon. The
+/// lease is renewed as objects are copied (a cheap elapsed-time check per
+/// object) so a long copy — or one large object streaming for a while —
+/// cannot outlive it.
+#[allow(clippy::too_many_arguments)]
+async fn copy_snapshot_pinned(
+    src_store: &Arc<dyn ObjectStore>,
+    src_paths: &NamespacePaths,
+    dst_store: &Arc<dyn ObjectStore>,
+    dst_paths: &NamespacePaths,
+    mut manifest: Manifest,
+    overwrite: bool,
+    verify: bool,
+    pin: &mut RetentionPin,
+) -> Result<SnapshotCopyReport> {
+    let source_version = manifest.version;
     let mut objects_copied = 0usize;
     let mut bytes_copied = 0u64;
 
@@ -141,8 +199,9 @@ pub async fn copy_namespace_snapshot(
         for rel in rels {
             let from = Path::from(format!("{}/{}", src_prefix.as_ref(), rel));
             let to = Path::from(format!("{}/{}", dst_prefix.as_ref(), rel));
-            bytes_copied += copy_object(&src_store, &dst_store, &from, &to).await?;
+            bytes_copied += copy_object(src_store, dst_store, &from, &to).await?;
             objects_copied += 1;
+            pin.renew_if_due().await?;
         }
     }
 
@@ -151,8 +210,9 @@ pub async fn copy_namespace_snapshot(
     for seg in &manifest.wal_segments {
         let from = src_paths.wal_segment(seg.seq);
         let to = dst_paths.wal_segment(seg.seq);
-        bytes_copied += copy_object(&src_store, &dst_store, &from, &to).await?;
+        bytes_copied += copy_object(src_store, dst_store, &from, &to).await?;
         objects_copied += 1;
+        pin.renew_if_due().await?;
     }
 
     // 3. The manifest body, renumbered to a self-contained version 0 / fresh
@@ -287,7 +347,7 @@ pub async fn copy_namespace_snapshot(
     // size. Catches a partial copy (a dropped/short write) before the caller
     // trusts the snapshot.
     if verify {
-        verify_snapshot(&dst_store, &dst_paths, &manifest).await?;
+        verify_snapshot(dst_store, dst_paths, &manifest).await?;
     }
 
     Ok(SnapshotCopyReport {
@@ -344,6 +404,17 @@ async fn verify_snapshot(
     Ok(())
 }
 
+/// Part size for the streaming copy path. Objects at or below one part are
+/// copied with a plain buffered PUT (the common case: manifests, pointers,
+/// small SSTs); larger ones stream through a multipart upload in parts of
+/// this size. 8 MiB clears every cloud store's minimum non-final part size
+/// (S3: 5 MiB) and, with 10k parts, bounds a single object at 80 GB.
+const COPY_PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// Cap on multipart parts concurrently in flight, which bounds the copy's
+/// memory at roughly `COPY_MAX_IN_FLIGHT_PARTS * COPY_PART_SIZE` per object.
+const COPY_MAX_IN_FLIGHT_PARTS: usize = 4;
+
 /// Stream one object from `src` to `dst`, returning its byte length. Plain
 /// GET + PUT so it works across backends (s3 -> file, file -> gs, ...); a
 /// same-store fast path via `ObjectStore::copy` is a later optimisation.
@@ -353,20 +424,71 @@ async fn copy_object(
     from: &Path,
     to: &Path,
 ) -> Result<u64> {
-    let bytes = src.get(from).await?.bytes().await?;
-    let len = bytes.len() as u64;
-    dst.put_opts(
-        to,
-        PutPayload::from(bytes),
-        PutOptions::from(PutMode::Overwrite),
-    )
-    .await?;
-    Ok(len)
+    copy_object_with_part_size(src, dst, from, to, COPY_PART_SIZE).await
+}
+
+/// [`copy_object`] with the part-size threshold explicit so tests can force
+/// the multipart path without allocating multi-MiB fixtures. Never buffers
+/// more than one part (plus the bounded in-flight uploads) regardless of the
+/// object's size, so a multi-GB compacted SST cannot OOM the process.
+async fn copy_object_with_part_size(
+    src: &Arc<dyn ObjectStore>,
+    dst: &Arc<dyn ObjectStore>,
+    from: &Path,
+    to: &Path,
+    part_size: usize,
+) -> Result<u64> {
+    let result = src.get(from).await?;
+    if result.meta.size <= part_size as u64 {
+        let bytes = result.bytes().await?;
+        let len = bytes.len() as u64;
+        dst.put_opts(
+            to,
+            PutPayload::from(bytes),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await?;
+        return Ok(len);
+    }
+
+    let upload = dst.put_multipart(to).await.map_err(Error::ObjectStore)?;
+    let mut write = WriteMultipart::new_with_chunk_size(upload, part_size);
+    let mut stream = result.into_stream();
+    let streamed = async {
+        let mut len = 0u64;
+        while let Some(chunk) = stream.try_next().await.map_err(Error::ObjectStore)? {
+            len += chunk.len() as u64;
+            // Backpressure: don't buffer the source faster than the parts
+            // upload, or the "streaming" copy degrades into buffering.
+            write
+                .wait_for_capacity(COPY_MAX_IN_FLIGHT_PARTS)
+                .await
+                .map_err(Error::ObjectStore)?;
+            write.put(chunk);
+        }
+        Ok::<u64, Error>(len)
+    }
+    .await;
+    match streamed {
+        Ok(len) => {
+            write.finish().await.map_err(Error::ObjectStore)?;
+            Ok(len)
+        }
+        Err(e) => {
+            // Best effort: reclaim already-uploaded parts. The error we
+            // surface is the copy failure, not the abort's.
+            if let Err(abort_err) = write.abort().await {
+                debug!(error = %abort_err, "failed to abort a partial multipart copy");
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use namidb_core::id::{NamespaceId, NodeId};
     use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
@@ -377,6 +499,112 @@ mod tests {
     use crate::flush::NodeWriteRecord;
     use crate::ingest::WriterSession;
     use crate::manifest::ManifestStore;
+
+    /// Delegating store that (a) counts multipart uploads started against it
+    /// and (b), when `pins_prefix` is set, records for every GET of a data
+    /// object (SST body, side-car, WAL segment) whether a retention pin lease
+    /// existed at that moment. (b) proves the copy actually holds its pin
+    /// while reading — equal results alone would pass even without the pin.
+    #[derive(Debug)]
+    struct ProbeStore {
+        inner: Arc<dyn ObjectStore>,
+        pins_prefix: Option<Path>,
+        data_reads: AtomicUsize,
+        unpinned_data_reads: AtomicUsize,
+        multipart_uploads: AtomicUsize,
+    }
+
+    impl ProbeStore {
+        fn new(inner: Arc<dyn ObjectStore>, pins_prefix: Option<Path>) -> Self {
+            Self {
+                inner,
+                pins_prefix,
+                data_reads: AtomicUsize::new(0),
+                unpinned_data_reads: AtomicUsize::new(0),
+                multipart_uploads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ProbeStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.multipart_uploads.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(pins) = &self.pins_prefix {
+                let key = location.as_ref();
+                if key.contains("/sst/") || key.contains("/wal/") {
+                    self.data_reads.fetch_add(1, Ordering::SeqCst);
+                    let lease_present = self.inner.list(Some(pins)).try_next().await?.is_some();
+                    if !lease_present {
+                        self.unpinned_data_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
 
     fn store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
@@ -755,5 +983,117 @@ mod tests {
             err.to_string().to_lowercase().contains("verify"),
             "expected a verify failure, got: {err}"
         );
+    }
+
+    /// The copy must hold a retention pin lease over EVERY data read (so the
+    /// source's orphan sweep keeps the pinned closure alive mid-copy) and
+    /// release the lease once it finishes.
+    #[tokio::test]
+    async fn copy_holds_a_pin_lease_over_every_data_read_and_releases_it() {
+        let src_inner = store();
+        let src_paths = paths("bk-pin-src");
+        {
+            let mut w = WriterSession::open(src_inner.clone(), src_paths.clone())
+                .await
+                .unwrap();
+            // Flushed rows (SST reads) plus an unflushed commit (a WAL read).
+            w.upsert_node("Person", NodeId::new(), &person("Ada"))
+                .unwrap();
+            w.commit_batch().await.unwrap();
+            w.flush(schema()).await.unwrap();
+            w.upsert_node("Person", NodeId::new(), &person("Lin"))
+                .unwrap();
+            w.commit_batch().await.unwrap();
+        }
+
+        let probe = Arc::new(ProbeStore::new(
+            src_inner.clone(),
+            Some(src_paths.pins_dir()),
+        ));
+        let src: Arc<dyn ObjectStore> = probe.clone();
+        let (dst_store, dst_paths) = (store(), paths("bk-pin-dst"));
+        copy_namespace_snapshot(
+            src,
+            src_paths.clone(),
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            probe.data_reads.load(Ordering::SeqCst) >= 2,
+            "the copy must have read SST and WAL bodies through the probe"
+        );
+        assert_eq!(
+            probe.unpinned_data_reads.load(Ordering::SeqCst),
+            0,
+            "every data read must happen under a live pin lease"
+        );
+
+        // The lease is released once the copy completes.
+        let mut pins = src_inner.list(Some(&src_paths.pins_dir()));
+        assert!(
+            pins.try_next().await.unwrap().is_none(),
+            "the pin lease must be released after the copy"
+        );
+
+        // And the destination still round-trips.
+        assert_eq!(names_in(dst_store, dst_paths).await, vec!["Ada", "Lin"]);
+    }
+
+    /// An object larger than one part must stream through a multipart upload
+    /// (never the whole body in one buffer) and land byte-identical; objects
+    /// at or below one part take the buffered PUT fast path.
+    #[tokio::test]
+    async fn streaming_copy_round_trips_an_object_larger_than_one_part() {
+        let src = store();
+        let probe = Arc::new(ProbeStore::new(store(), None));
+        let dst: Arc<dyn ObjectStore> = probe.clone();
+
+        // 10 KiB body, 1 KiB parts → 10 parts through the multipart path.
+        let body: Vec<u8> = (0..10 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let from = Path::from("src/big.bin");
+        let to = Path::from("dst/big.bin");
+        src.put(&from, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let n = copy_object_with_part_size(&src, &dst, &from, &to, 1024)
+            .await
+            .unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(
+            probe.multipart_uploads.load(Ordering::SeqCst),
+            1,
+            "an object larger than one part must stream via multipart"
+        );
+        let copied = dst.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            copied.as_ref(),
+            body.as_slice(),
+            "copy must be byte-identical"
+        );
+
+        // At or below one part: plain buffered PUT, no new multipart upload.
+        let small = b"tiny".to_vec();
+        let from_small = Path::from("src/small.bin");
+        let to_small = Path::from("dst/small.bin");
+        src.put(&from_small, PutPayload::from(small.clone()))
+            .await
+            .unwrap();
+        let n = copy_object_with_part_size(&src, &dst, &from_small, &to_small, 1024)
+            .await
+            .unwrap();
+        assert_eq!(n, small.len() as u64);
+        assert_eq!(
+            probe.multipart_uploads.load(Ordering::SeqCst),
+            1,
+            "a small object must not start a multipart upload"
+        );
+        let copied = dst.get(&to_small).await.unwrap().bytes().await.unwrap();
+        assert_eq!(copied.as_ref(), small.as_slice());
     }
 }

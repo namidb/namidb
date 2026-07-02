@@ -29,6 +29,10 @@
 //!
 //! ## What the janitor does
 //!
+//! 0. Lists `manifest/pins/` for retention pin leases ([`crate::pin`]).
+//! Every unexpired lease lowers the retention horizon to its pinned
+//! version, so a cross-process reader (a running backup) keeps the
+//! closure it is copying alive; expired leases are ignored and deleted.
 //! 1. Loads `manifest/current.json` and, for every manifest version from
 //! the caller-supplied retention horizon to current, unions the "live"
 //! relative paths (SST body, bloom side-car, unique/equality/label index
@@ -133,6 +137,15 @@ pub struct JanitorReport {
     /// Bytes held by the snapshot in `memtable_snapshots_reclaimed` (freed
     /// when `delete = true`, otherwise what *would* be freed).
     pub memtable_snapshot_bytes_freed: u64,
+    /// Unexpired retention pin leases (`manifest/pins/`, see [`crate::pin`])
+    /// found by this sweep. Each one lowered the retention horizon to at most
+    /// its pinned version, so the closure a cross-process reader (a running
+    /// backup) depends on stayed live.
+    pub pins_honoured: usize,
+    /// Expired pin leases reclaimable this sweep. Ignored for the horizon and
+    /// (when `delete = true`) removed, so a crashed holder cannot pin the
+    /// namespace forever. Populated in dry-run too.
+    pub expired_pins_reclaimed: usize,
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
@@ -145,6 +158,12 @@ pub struct JanitorReport {
 /// SSTs that became newly-referenced after our load are still treated as
 /// orphans here — but the `min_age` window protects them from deletion as
 /// long as the operator picks a sensible value.
+///
+/// Retention pin leases (`manifest/pins/`, [`crate::pin`]) are listed once
+/// at the start too: every unexpired lease lowers the horizon to its pinned
+/// version for this whole sweep, expired leases are reclaimed. A lease
+/// written *after* that listing is not seen until the next sweep, which is
+/// why pin holders must re-check their pinned root after acquiring.
 #[instrument(
  skip(manifest_store),
  fields(
@@ -164,9 +183,58 @@ pub async fn sweep_orphans(
 ) -> Result<JanitorReport> {
     let current = manifest_store.load_current().await?;
     let current_version = current.manifest.version;
+
+    let store = manifest_store.store().clone();
+    let paths = manifest_store.paths();
+    let mut report = JanitorReport::default();
+    let min_age_secs = min_age.as_secs() as i64;
+    let now = Utc::now();
+
+    // Retention pin leases (see `crate::pin`): cross-process readers — a
+    // running backup — that the in-process horizon cannot see. Listed BEFORE
+    // anything is classified or deleted, so every unexpired lease lowers the
+    // horizon for the whole sweep. An expired lease is void (its holder
+    // crashed or stalled past the TTL): ignored for the horizon and deleted,
+    // so a dead holder cannot pin the namespace forever. An undecodable body
+    // under the prefix is not ours to judge — it names no version, so it pins
+    // nothing, and it is left alone.
+    let mut pin_floor = u64::MAX;
+    let now_unix = now.timestamp();
+    let mut pins = store.list(Some(&paths.pins_dir()));
+    while let Some(meta) = pins.try_next().await.map_err(Error::ObjectStore)? {
+        let body = match store.get(&meta.location).await {
+            Ok(res) => res.bytes().await.map_err(Error::ObjectStore)?,
+            // Raced a holder's release between LIST and GET: the pin is gone.
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(other) => return Err(Error::ObjectStore(other)),
+        };
+        let Ok(lease) = serde_json::from_slice::<crate::pin::PinLease>(&body) else {
+            debug!(path = %meta.location, "undecodable pin lease; leaving it alone");
+            continue;
+        };
+        if lease.expires_at_unix < now_unix {
+            report.expired_pins_reclaimed += 1;
+            if delete {
+                store
+                    .delete(&meta.location)
+                    .await
+                    .map_err(Error::ObjectStore)?;
+            }
+            continue;
+        }
+        report.pins_honoured += 1;
+        pin_floor = pin_floor.min(lease.version);
+    }
+
     // The horizon is the oldest manifest version any live reader is pinned
-    // to (RFC-027). Clamp defensively to the current version.
-    let horizon = retention_horizon.min(current_version);
+    // to: the in-process reader horizon (RFC-027) unioned with every
+    // unexpired pin lease. Clamp defensively to the current version.
+    let horizon = retention_horizon.min(pin_floor).min(current_version);
+    // Versions at or above this floor are retained for in-process readers and
+    // must load; versions below it are retained only because of a pin lease
+    // and may already have been reclaimed before the lease existed (the pin
+    // holder re-checks its own root and fails loudly in that case).
+    let strict_floor = retention_horizon.min(current_version);
 
     // Build the live object set from the union of every retained manifest
     // version from the horizon to current (inclusive). A reader pinned at
@@ -218,28 +286,45 @@ pub async fn sweep_orphans(
             }
         }
     };
+    let mut horizon_hwm_seen = false;
     for version in horizon..=current_version {
         let loaded;
         let manifest = if version == current_version {
             &current.manifest
         } else {
-            loaded = manifest_store.load_manifest_at(version).await?;
-            &loaded
+            match manifest_store.load_manifest_at(version).await {
+                Ok(m) => {
+                    loaded = m;
+                    &loaded
+                }
+                // A version retained only by a pin lease can predate the
+                // lease's own visibility and be gone already (the holder
+                // detects that itself). It references nothing we could keep
+                // alive, so skip it; a missing version at or above the strict
+                // floor is a real inconsistency and still aborts the sweep.
+                Err(Error::ObjectStore(object_store::Error::NotFound { .. }))
+                    if version < strict_floor =>
+                {
+                    debug!(
+                        version,
+                        "pin-retained manifest version already reclaimed; skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         };
         mark_live(manifest);
-        if version == horizon {
+        if !horizon_hwm_seen {
+            // The oldest retained version that still loads carries the
+            // smallest flushed high-water among the retained set.
             horizon_flushed_hwm = manifest.ssts.iter().map(|s| s.max_lsn).max().unwrap_or(0);
+            horizon_hwm_seen = true;
         }
     }
 
-    let store = manifest_store.store().clone();
-    let paths = manifest_store.paths();
     let ns_prefix = paths.namespace_prefix();
     let ns_prefix_str = ns_prefix.as_ref();
-
-    let mut report = JanitorReport::default();
-    let min_age_secs = min_age.as_secs() as i64;
-    let now = Utc::now();
 
     let scan_max_level = max_level.max(max_seen_level);
     for level in 0..=scan_max_level {
@@ -294,9 +379,13 @@ pub async fn sweep_orphans(
     while let Some(meta) = manifests.try_next().await.map_err(Error::ObjectStore)? {
         // Classify by filename. Manifest bodies are `v{16-hex}.json` directly
         // under `manifest/`; pointer files (RFC-029) are `p{16-hex}.json` under
-        // `manifest/pointer/`, which this recursive LIST also returns. The
-        // legacy `current.json` and anything else fail both parses and are left
+        // `manifest/pointer/`, which this recursive LIST also returns. Pin
+        // leases (`manifest/pins/`) have their own lifecycle above. The legacy
+        // `current.json` and anything else fail both parses and are left
         // untouched.
+        if meta.location.as_ref().contains("/pins/") {
+            continue;
+        }
         let Some(filename) = meta.location.filename() else {
             continue;
         };
@@ -450,12 +539,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::compact::compact_l0_to_l1;
     use crate::fence::WriterFence;
     use crate::flush::{flush, NodeWriteRecord};
     use crate::ingest::{CommitOutcome, WriterSession};
     use crate::manifest::ManifestStore;
     use crate::memtable::{MemKey, MemOp, Memtable};
     use crate::paths::NamespacePaths;
+    use crate::pin::{PinLease, RetentionPin};
     use namidb_core::{DataType, Value};
 
     fn make_store() -> Arc<dyn ObjectStore> {
@@ -961,6 +1052,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.memtable_snapshots_reclaimed, 0);
+    }
+
+    /// A retention pin lease (`manifest/pins/`, written by a running backup)
+    /// holds the sweep's horizon at the pinned version: bodies only that
+    /// version references survive a concurrent compaction + sweep, and the
+    /// same sweep reclaims them once the lease is released.
+    #[tokio::test]
+    async fn sweep_honours_an_unexpired_pin_lease_until_released() {
+        let store = make_store();
+        let paths = make_paths("janitor-pin-honoured");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = person_schema();
+
+        // Two L0 flushes, then a compaction: the L0 bodies stay referenced
+        // only by versions strictly below current — exactly the closure a
+        // backup pinned at the pre-compaction version is still copying.
+        let m1 = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
+        let m2 = flush_one_node(&ms, &fence, &m1, &schema, sorted_node_id(2), "B", 2).await;
+        let pinned_version = m2.manifest.version;
+        let pinned_bodies: Vec<String> = m2.manifest.ssts.iter().map(|s| s.path.clone()).collect();
+        assert_eq!(pinned_bodies.len(), 2);
+        let out = compact_l0_to_l1(&ms, &fence, &m2, &schema).await.unwrap();
+        assert_eq!(out.source_ssts_removed, 2);
+
+        let body_path = |rel: &str| {
+            object_store::path::Path::from(format!("{}/{}", paths.namespace_prefix().as_ref(), rel))
+        };
+
+        // Pin at the pre-compaction version, as copy_namespace_snapshot does.
+        let pin = RetentionPin::acquire(
+            store.clone(),
+            &paths,
+            pinned_version,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+
+        // No in-process reader is pinned (horizon clamps to current): only
+        // the lease protects the pinned closure.
+        let held = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(held.pins_honoured, 1);
+        assert_eq!(held.expired_pins_reclaimed, 0);
+        assert_eq!(held.orphans_found, 0, "the pinned closure is not orphaned");
+        for rel in &pinned_bodies {
+            assert!(
+                store.head(&body_path(rel)).await.is_ok(),
+                "pinned L0 body must survive the sweep: {rel}"
+            );
+        }
+        assert!(
+            store
+                .head(&paths.manifest_version(pinned_version))
+                .await
+                .is_ok(),
+            "the pinned manifest body must survive"
+        );
+        assert!(
+            store.head(pin.path()).await.is_ok(),
+            "an unexpired lease must not be deleted by the sweep"
+        );
+
+        // Release (the backup finished): the same sweep reclaims the closure.
+        pin.release().await.unwrap();
+        let released = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(released.pins_honoured, 0);
+        assert!(
+            released.orphans_found >= 2,
+            "the compacted-away L0 bodies become reclaimable once unpinned"
+        );
+        for rel in &pinned_bodies {
+            assert!(
+                store.head(&body_path(rel)).await.is_err(),
+                "unpinned L0 body must be reclaimed: {rel}"
+            );
+        }
+        assert!(
+            store
+                .head(&paths.manifest_version(pinned_version))
+                .await
+                .is_err(),
+            "the pinned manifest snapshot is reclaimed after release"
+        );
+    }
+
+    /// An expired lease pins nothing: the sweep ignores it for the horizon
+    /// and reclaims the lease object itself, so a crashed backup cannot pin
+    /// the namespace forever. An undecodable body under `pins/` names no
+    /// version, pins nothing, and is left alone.
+    #[tokio::test]
+    async fn sweep_ignores_and_reclaims_expired_pin_leases() {
+        let store = make_store();
+        let paths = make_paths("janitor-pin-expired");
+        let (mut session, commits) = session_with_commits(&store, &paths, &["Ada"]).await;
+        let (v_commit, seq) = commits[0];
+        session.flush(person_schema()).await.unwrap();
+        drop(session);
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+
+        // A live lease at the commit version keeps its WAL segment alive even
+        // though the flush retired it from every later manifest.
+        let lease_path = paths.pin_object("backup-1");
+        let live = PinLease {
+            version: v_commit,
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+        };
+        store
+            .put(
+                &lease_path,
+                PutPayload::from(serde_json::to_vec(&live).unwrap()),
+            )
+            .await
+            .unwrap();
+        let held = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(held.pins_honoured, 1);
+        assert_eq!(held.wal_segments_reclaimed, 0);
+        assert!(store.head(&paths.wal_segment(seq)).await.is_ok());
+        assert!(store.head(&lease_path).await.is_ok());
+
+        // The holder crashed and the lease expired. Plant garbage alongside.
+        let expired = PinLease {
+            version: v_commit,
+            expires_at_unix: chrono::Utc::now().timestamp() - 3600,
+        };
+        store
+            .put(
+                &lease_path,
+                PutPayload::from(serde_json::to_vec(&expired).unwrap()),
+            )
+            .await
+            .unwrap();
+        let garbage_path = paths.pin_object("not-a-lease");
+        store
+            .put(
+                &garbage_path,
+                PutPayload::from(Bytes::from_static(b"not json")),
+            )
+            .await
+            .unwrap();
+
+        // Dry run: the expired lease no longer holds the horizon (the dead
+        // segment is a candidate) and is itself a reclaim candidate — but
+        // nothing is deleted.
+        let dry = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.pins_honoured, 0);
+        assert_eq!(dry.expired_pins_reclaimed, 1);
+        assert_eq!(dry.wal_segments_reclaimed, 1);
+        assert!(
+            store.head(&lease_path).await.is_ok(),
+            "dry run must not delete the expired lease"
+        );
+        assert!(store.head(&paths.wal_segment(seq)).await.is_ok());
+
+        // Real run: the expired lease and the dead segment are reclaimed; the
+        // undecodable object is not ours to judge and survives.
+        let real = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(real.expired_pins_reclaimed, 1);
+        assert_eq!(real.wal_segments_reclaimed, 1);
+        assert!(
+            store.head(&lease_path).await.is_err(),
+            "the expired lease must be reclaimed"
+        );
+        assert!(store.head(&paths.wal_segment(seq)).await.is_err());
+        assert!(store.head(&garbage_path).await.is_ok());
+
+        // Idempotent.
+        let again = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(again.expired_pins_reclaimed, 0);
     }
 
     /// The staleness cut is the HORIZON manifest's flushed high-water, not the

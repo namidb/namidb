@@ -89,6 +89,17 @@ impl NamespacePaths {
             &format!("p{}.json", pad_hex(version, 16)),
         ])
     }
+    /// Directory holding retention pin leases (`manifest/pins/<uuid>.json`).
+    /// Listed by the orphan sweep before it deletes anything; see
+    /// [`crate::pin`].
+    pub fn pins_dir(&self) -> Path {
+        self.join(&["manifest", "pins"])
+    }
+    /// Lease object for one retention pin holder. `id` is the holder's own
+    /// UUID; the sweep identifies leases by prefix, not by name.
+    pub fn pin_object(&self, id: &str) -> Path {
+        self.join(&["manifest", "pins", &format!("{id}.json")])
+    }
     pub fn wal_dir(&self) -> Path {
         self.join(&["wal"])
     }
@@ -160,6 +171,11 @@ mod tests {
         assert_eq!(
             p.pointer_version(1).as_ref(),
             "tenants/acme/manifest/pointer/p0000000000000001.json"
+        );
+        assert_eq!(p.pins_dir().as_ref(), "tenants/acme/manifest/pins");
+        assert_eq!(
+            p.pin_object("abc-123").as_ref(),
+            "tenants/acme/manifest/pins/abc-123.json"
         );
         assert_eq!(
             p.wal_segment(42).as_ref(),
