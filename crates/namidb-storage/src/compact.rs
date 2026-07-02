@@ -765,7 +765,6 @@ fn compact_edge_ssts(
 // stats for declared-but-absent properties during the L0->L1 rebuild; the
 // params are all distinct and bundling them would not aid readability.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn put_node_sst_leveled(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
