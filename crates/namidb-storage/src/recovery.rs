@@ -237,27 +237,48 @@ pub async fn recover_memtable_with_snapshot(
     let mut max_lsn: u64 = 0;
     let mut records_replayed = 0usize;
 
+    // The highest LSN already durable in a persisted SST. A memtable snapshot
+    // is only a cold-start optimisation for UNflushed memtable state; once a
+    // flush drains that state into SSTs (advancing this high-water mark) the
+    // snapshot file is stale — it is never deleted on flush. Trusting a stale
+    // snapshot re-seeds rows that were later flushed and then, crucially,
+    // DELETED and tombstone-GC'd by compaction, resurrecting acked DELETEs.
+    // A genuinely-fresh snapshot is always taken after a flush drained the
+    // memtable, so its `last_lsn` exceeds this mark; a stale one does not.
+    let flushed_hwm = manifest.ssts.iter().map(|s| s.max_lsn).max().unwrap_or(0);
+
     // Phase 0: seed from a checkpoint if available.
     let mut used_snapshot = false;
     let mut snapshot_floor: u64 = 0;
     if let Some(store) = snapshot_store {
         let snap_path = wal_store.paths().memtable_snapshot();
-        if let Some(snap) = try_read_memtable_snapshot(store, &snap_path).await? {
-            debug!(
-                last_lsn = snap.last_lsn,
-                entries = snap.entries.len(),
-                "seeding recovery from memtable snapshot"
-            );
-            for entry in snap.entries {
-                let op = match entry.op {
-                    WalOp::Upsert(v) => MemOp::Upsert(Bytes::from(v)),
-                    WalOp::Tombstone => MemOp::Tombstone,
-                };
-                memtable.apply(entry.key, entry.lsn, op);
+        match try_read_memtable_snapshot(store, &snap_path).await? {
+            Some(snap) if snap.last_lsn <= flushed_hwm => {
+                // Stale: everything in it is already flushed (and possibly
+                // compacted away). Ignore it and rebuild from SSTs + WAL.
+                debug!(
+                    snap_last_lsn = snap.last_lsn,
+                    flushed_hwm, "ignoring stale memtable snapshot (subsumed by flushed SSTs)"
+                );
             }
-            max_lsn = max_lsn.max(snap.last_lsn);
-            snapshot_floor = snap.last_lsn;
-            used_snapshot = true;
+            Some(snap) => {
+                debug!(
+                    last_lsn = snap.last_lsn,
+                    entries = snap.entries.len(),
+                    "seeding recovery from memtable snapshot"
+                );
+                for entry in snap.entries {
+                    let op = match entry.op {
+                        WalOp::Upsert(v) => MemOp::Upsert(Bytes::from(v)),
+                        WalOp::Tombstone => MemOp::Tombstone,
+                    };
+                    memtable.apply(entry.key, entry.lsn, op);
+                }
+                max_lsn = max_lsn.max(snap.last_lsn);
+                snapshot_floor = snap.last_lsn;
+                used_snapshot = true;
+            }
+            None => {}
         }
     }
 
@@ -655,6 +676,69 @@ mod tests {
             }
             other => panic!("expected Corrupted, got {other:?}"),
         }
+    }
+
+    // Minimal Nodes SST descriptor for freshness tests: only `max_lsn` matters.
+    fn nodes_sst_at_lsn(max_lsn: u64) -> crate::manifest::SstDescriptor {
+        use crate::manifest::{KindSpecificStats, SstDescriptor, SstKind, SstLevel};
+        SstDescriptor {
+            id: Uuid::now_v7(),
+            kind: SstKind::Nodes,
+            scope: String::new(),
+            level: SstLevel::L0,
+            path: "sst/level0/x-nodes.parquet".into(),
+            size_bytes: 0,
+            row_count: 0,
+            created_at: chrono::Utc::now(),
+            min_key: [0u8; 16],
+            max_key: [0xFFu8; 16],
+            min_lsn: 0,
+            max_lsn,
+            schema_version_min: 1,
+            schema_version_max: 1,
+            property_stats: Vec::new(),
+            kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
+            bloom: None,
+            unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
+            label_index: None,
+            per_label_property_stats: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_memtable_snapshot_subsumed_by_flushed_sst_is_ignored() {
+        // A snapshot whose last_lsn is at or below the flushed SST high-water
+        // mark is stale (its rows were flushed, possibly deleted+GC'd since).
+        // Recovery must ignore it so it cannot resurrect an acked DELETE.
+        let store = store();
+        let paths = paths("rec-snap-stale");
+        let wal = WalStore::new(store.clone(), paths.clone());
+
+        // Snapshot at LSN 10 with a row that the later flush has superseded.
+        let snap = MemtableSnapshotFile::from_iter(
+            10,
+            vec![(
+                MemKey::Node { id: nid(1) },
+                1,
+                MemOp::Upsert(Bytes::from_static(b"resurrected")),
+            )],
+        );
+        write_memtable_snapshot(&store, &paths, &snap).await.unwrap();
+
+        // Manifest with a flushed Nodes SST at max_lsn=20 (> snapshot's 10) and
+        // no WAL segments (the flush cleared them).
+        let mut manifest = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        manifest.ssts.push(nodes_sst_at_lsn(20));
+
+        let out = recover_memtable_with_snapshot(&manifest, &wal, Some(&store))
+            .await
+            .unwrap();
+        assert!(!out.used_snapshot, "stale snapshot must be ignored");
+        assert!(
+            out.memtable.get(&MemKey::Node { id: nid(1) }).is_none(),
+            "the stale row must NOT be re-seeded into the memtable"
+        );
     }
 
     #[tokio::test]
