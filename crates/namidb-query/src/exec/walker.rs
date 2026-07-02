@@ -2722,7 +2722,14 @@ async fn snapshot_to_algo_graph(
 ) -> Result<namidb_graph::algo::Graph, ExecError> {
     let mut g = namidb_graph::algo::Graph::new();
     for label in snapshot.observed_labels() {
-        for n in snapshot.scan_label(&label).await? {
+        // We only need the node ids, so scan with an EMPTY property projection:
+        // this skips decoding every declared property column AND serde-parsing
+        // __overflow_json per row — the dominant cost of building the algo graph
+        // (millions of JSON parses on a large namespace, per CALL algo.*).
+        for n in snapshot
+            .scan_label_with_predicates_and_projection(&label, &[], Some(&[]))
+            .await?
+        {
             g.add_node(n.id);
         }
     }
