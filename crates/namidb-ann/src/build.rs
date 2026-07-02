@@ -243,14 +243,32 @@ fn brute_force_init<S: VectorSpace>(space: &S, r: usize) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// Random init: `min(r, n-1)` distinct random neighbours per member.
+/// Random init: `min(r, n-1)` distinct random neighbours per member, excluding
+/// the member itself (no self-loops).
+///
+/// Samples in `O(take)` per member via `rand::seq::index::sample` (Floyd /
+/// partial-Fisher-Yates) instead of allocating and fully shuffling a fresh
+/// `0..n` vector per member — the old approach was `O(N²)` time and allocation,
+/// which stalled the authoritative compaction that rebuilds the `.vg` for large
+/// corpora (100k+ vectors), leaving every query parked on the flat scan.
 fn random_init<R: Rng>(n: usize, r: usize, rng: &mut R) -> Vec<Vec<u32>> {
+    use rand::seq::index;
     let take = r.min(n.saturating_sub(1));
     (0..n as u32)
-        .map(|_| {
-            let mut picks: Vec<u32> = (0..n as u32).collect();
-            picks.shuffle(rng);
-            picks.into_iter().take(take).collect()
+        .map(|i| {
+            if take == 0 {
+                return Vec::new();
+            }
+            // Draw `take + 1` distinct ids so that, after dropping self (at most
+            // one), at least `take` remain; then trim to `take`.
+            let amount = (take + 1).min(n);
+            let mut picks: Vec<u32> = index::sample(rng, n, amount)
+                .into_iter()
+                .map(|x| x as u32)
+                .filter(|&x| x != i)
+                .collect();
+            picks.truncate(take);
+            picks
         })
         .collect()
 }

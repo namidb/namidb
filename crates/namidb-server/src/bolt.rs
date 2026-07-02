@@ -962,6 +962,20 @@ pub async fn serve(
     let agent =
         std::env::var("NAMIDB_BOLT_SERVER_AGENT").unwrap_or_else(|_| "Neo4j/5.13.0".to_string());
     info!(server_agent = %agent, "bolt server agent");
+
+    // Cap concurrent Bolt connections so a flood of idle/slowloris sockets
+    // cannot exhaust file descriptors, tasks, and memory. Overridable via
+    // `NAMIDB_BOLT_MAX_CONNECTIONS`; a rejected connection is closed immediately
+    // rather than queued. The handshake timeout bounds how long a connection
+    // may occupy a permit before completing the (unauthenticated) handshake.
+    let max_conns = std::env::var("NAMIDB_BOLT_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    let handshake_timeout = Some(std::time::Duration::from_secs(10));
+    info!(max_connections = max_conns, "bolt connection cap");
     loop {
         let (socket, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -979,6 +993,16 @@ pub async fn serve(
                 break;
             }
         };
+        // Acquire a connection permit before doing any per-connection work.
+        // At the cap the socket is dropped (closed) instead of spawning an
+        // unbounded task — hard backpressure against connection floods.
+        let permit = match conn_limit.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(%peer, max = max_conns, "bolt connection cap reached; rejecting");
+                continue;
+            }
+        };
         if let Err(e) = socket.set_nodelay(true) {
             warn!(error = %e, %peer, "set_nodelay failed");
         }
@@ -994,17 +1018,55 @@ pub async fn serve(
         };
         let tls = tls.clone();
         tokio::spawn(async move {
+            // Hold the permit for the whole connection lifetime; dropping the
+            // task (any exit path) releases it back to the semaphore.
+            let _permit = permit;
             let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state, principal));
             // `Session` is generic over the transport, so the only fork is the
             // optional TLS handshake on the accepted socket.
             match tls {
-                Some(acceptor) => match acceptor.accept(socket).await {
-                    Ok(stream) => {
-                        run_session(stream, info, policy, backend, tx_idle_timeout, peer).await
+                Some(acceptor) => {
+                    // Bound the TLS handshake too: a client that opens the
+                    // socket but never drives the handshake must not pin the
+                    // permit/task indefinitely.
+                    let accepted = match handshake_timeout {
+                        Some(t) => match tokio::time::timeout(t, acceptor.accept(socket)).await {
+                            Ok(r) => r,
+                            Err(_) => {
+                                warn!(%peer, "bolt TLS handshake timed out");
+                                return;
+                            }
+                        },
+                        None => acceptor.accept(socket).await,
+                    };
+                    match accepted {
+                        Ok(stream) => {
+                            run_session(
+                                stream,
+                                info,
+                                policy,
+                                backend,
+                                tx_idle_timeout,
+                                handshake_timeout,
+                                peer,
+                            )
+                            .await
+                        }
+                        Err(e) => warn!(error = %e, %peer, "bolt TLS handshake failed"),
                     }
-                    Err(e) => warn!(error = %e, %peer, "bolt TLS handshake failed"),
-                },
-                None => run_session(socket, info, policy, backend, tx_idle_timeout, peer).await,
+                }
+                None => {
+                    run_session(
+                        socket,
+                        info,
+                        policy,
+                        backend,
+                        tx_idle_timeout,
+                        handshake_timeout,
+                        peer,
+                    )
+                    .await
+                }
             }
         });
     }
@@ -1020,11 +1082,14 @@ async fn run_session<S>(
     policy: AuthPolicy,
     backend: Arc<dyn Backend>,
     tx_idle_timeout: Option<std::time::Duration>,
+    handshake_timeout: Option<std::time::Duration>,
     peer: std::net::SocketAddr,
 ) where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
 {
-    let session = Session::new(socket, info, policy, backend).with_tx_idle_timeout(tx_idle_timeout);
+    let session = Session::new(socket, info, policy, backend)
+        .with_tx_idle_timeout(tx_idle_timeout)
+        .with_handshake_timeout(handshake_timeout);
     if let Err(e) = session.run().await {
         warn!(error = %e, %peer, "bolt session ended with error");
     }

@@ -250,6 +250,12 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// transaction back (releasing the writer) and fails it. `None` (the
     /// default) keeps the legacy unbounded behaviour for test backends.
     tx_idle_timeout: Option<std::time::Duration>,
+    /// Bounds how long a not-yet-authenticated connection may block on a read
+    /// (the version handshake and every pre-auth message). A slowloris client
+    /// that opens a socket and sends nothing (or one byte) would otherwise pin
+    /// a spawned task and a file descriptor forever. `None` (the default)
+    /// disables it for test backends.
+    handshake_timeout: Option<std::time::Duration>,
     /// Whether this session has completed authentication (the v5 HELLO +
     /// LOGON handshake, or the v4 HELLO that carries auth). RESET only
     /// recovers a session to READY once this is set: before auth a RESET
@@ -271,6 +277,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             pending_statement_type: None,
             pending_counters: BTreeMap::new(),
             tx_idle_timeout: None,
+            handshake_timeout: None,
             authenticated: false,
         }
     }
@@ -279,6 +286,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     /// `None` disables it (a transaction may stay open indefinitely).
     pub fn with_tx_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.tx_idle_timeout = timeout;
+        self
+    }
+
+    /// Set the read timeout applied before authentication (handshake + pre-auth
+    /// messages). `None` disables it. Bounds slowloris connections that never
+    /// complete the handshake.
+    pub fn with_handshake_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -301,24 +316,42 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             // in a transaction, roll it back to release the writer and fail
             // the transaction.
             let in_tx = matches!(self.state, State::TxReady | State::TxStreaming);
-            let idle = self.tx_idle_timeout;
+            let pre_auth = !self.authenticated;
             let read = read_message(&mut self.socket, max);
-            let read_result = match (idle, in_tx) {
-                (Some(t), true) => match tokio::time::timeout(t, read).await {
-                    Ok(r) => r,
-                    Err(_elapsed) => {
-                        let _ = self.backend.rollback_tx().await;
-                        self.state = State::Failed;
-                        self.write_failure(
-                            "Neo.TransientError.Transaction.LockClientStopped",
-                            "transaction idle timeout; rolled back to release the writer"
-                                .to_string(),
-                        )
-                        .await?;
-                        continue;
-                    }
-                },
-                _ => read.await,
+            let read_result = if in_tx {
+                match self.tx_idle_timeout {
+                    Some(t) => match tokio::time::timeout(t, read).await {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            let _ = self.backend.rollback_tx().await;
+                            self.state = State::Failed;
+                            self.write_failure(
+                                "Neo.TransientError.Transaction.LockClientStopped",
+                                "transaction idle timeout; rolled back to release the writer"
+                                    .to_string(),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    },
+                    None => read.await,
+                }
+            } else if pre_auth {
+                // Drop a not-yet-authenticated client that stalls a read past
+                // the handshake timeout (slowloris): it never sends HELLO/LOGON
+                // and would otherwise pin this task + FD indefinitely.
+                match self.handshake_timeout {
+                    Some(t) => match tokio::time::timeout(t, read).await {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            debug!("bolt pre-auth read timed out; closing idle connection");
+                            return Ok(());
+                        }
+                    },
+                    None => read.await,
+                }
+            } else {
+                read.await
             };
             let body = match read_result {
                 Ok(b) => b,
@@ -378,7 +411,19 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn do_handshake(&mut self) -> Result<()> {
-        let offers = read_offers(&mut self.socket).await?;
+        // Bound the 20-byte version handshake read: a client that connects and
+        // sends nothing must not pin this task forever (slowloris).
+        let offers = match self.handshake_timeout {
+            Some(t) => match tokio::time::timeout(t, read_offers(&mut self.socket)).await {
+                Ok(r) => r?,
+                Err(_elapsed) => {
+                    debug!("bolt handshake read timed out; closing idle connection");
+                    self.state = State::Defunct;
+                    return Ok(());
+                }
+            },
+            None => read_offers(&mut self.socket).await?,
+        };
         let version = negotiate(&offers);
         write_response(&mut self.socket, version).await?;
         match version {
