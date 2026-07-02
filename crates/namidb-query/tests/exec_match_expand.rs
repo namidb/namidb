@@ -206,6 +206,72 @@ async fn match_expand_returns_pairs() {
 }
 
 #[tokio::test]
+async fn return_distinct_with_limit_dedupes_before_limiting() {
+    // Cypher DISTINCT: project → dedupe → order → limit. Limiting before
+    // deduping under-returns. `UNWIND [1,1,1,2,3] AS x RETURN DISTINCT x
+    // LIMIT 2` must yield [1,2], not [1]. No graph needed.
+    let mut writer = WriterSession::open(store(), paths("exec-distinct-limit"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await; // just to have an open namespace
+    let snapshot = writer.snapshot();
+
+    let q = parse("UNWIND [1,1,1,2,3] AS x RETURN DISTINCT x AS v ORDER BY v LIMIT 2").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let vals: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.get("v") {
+            Some(RuntimeValue::Integer(n)) => *n,
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2], "DISTINCT must dedupe before LIMIT");
+}
+
+#[tokio::test]
+async fn zero_hop_expand_enforces_target_labels() {
+    // `(a)-[:R*0..1]->(x:Label)` binds the source as `x` at hop 0 only if the
+    // source carries every target label. A Person that is not a City must not
+    // be returned as the `:City` far end (schema-on-write, like other tests).
+    fn named(name: &str) -> NodeWriteRecord {
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("name".into(), CoreValue::Str(name.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+    let mut writer = WriterSession::open(store(), paths("exec-zerohop"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    let rome = NodeId::new();
+    writer.upsert_node("Person", alice, &named("Alice")).unwrap();
+    writer.upsert_node("City", rome, &named("Rome")).unwrap();
+    writer.upsert_edge("LIVES_IN", alice, rome, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH (a:Person)-[:LIVES_IN*0..1]->(x:City) RETURN x.name AS name ORDER BY name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    // Only Rome — Alice (Person, not City) must NOT be bound as the :City far end.
+    assert_eq!(names, vec!["Rome"], "zero-hop must honor the :City target label");
+}
+
+#[tokio::test]
 async fn var_length_expand_does_not_reuse_a_relationship() {
     // Cypher relationship uniqueness (trail semantics): a relationship may
     // appear at most once in a matched path. Minimal graph: a single edge

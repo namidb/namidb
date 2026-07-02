@@ -90,6 +90,33 @@ async fn cosine_knn_ranks_by_closeness() {
 }
 
 #[tokio::test]
+async fn cosine_knn_honors_parameterized_limit() {
+    // A parameterized `LIMIT $k` must use the bound value. The vector-search
+    // lowering resolves the KNN into an operator that carries the limit; a
+    // hardcoded `unwrap_or(10)` default silently ignored $k, returning up to 10
+    // rows regardless. Assert $k=1 yields exactly one row (the nearest).
+    let writer = seed_docs("knn-param-limit").await;
+    let snap = writer.snapshot();
+
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    params.insert("k".into(), RuntimeValue::Integer(1));
+
+    let plan = lower(
+        &parse(
+            "MATCH (d:Doc) WHERE d.embedding IS NOT NULL \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT $k",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let rows = execute(&plan, &snap, &params).await.unwrap();
+    assert_eq!(titles(&rows), vec!["x-ish".to_string()], "LIMIT $k=1 → 1 row");
+}
+
+#[tokio::test]
 async fn knn_prefilter_excludes_nodes_without_embedding() {
     let writer = seed_docs("knn-prefilter").await;
     let snap = writer.snapshot();

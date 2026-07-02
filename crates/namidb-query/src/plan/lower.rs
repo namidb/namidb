@@ -1513,24 +1513,60 @@ fn lower_projection(
         })
         .collect();
 
-    if !order_keys.is_empty()
+    let has_topn = !order_keys.is_empty()
         || skip_rc != RowCount::Const(0)
-        || limit_rc != RowCount::Const(u64::MAX)
-    {
-        plan = LogicalPlan::TopN {
+        || limit_rc != RowCount::Const(u64::MAX);
+
+    if distinct && !has_aggs {
+        // Cypher DISTINCT semantics: project → dedupe → order → skip/limit. The
+        // dedup must run BEFORE skip/limit. Stacking TopN under Project (the
+        // non-distinct layout below) truncates to `limit` rows and only THEN
+        // dedupes, under-returning whenever the pre-dedup stream has duplicates
+        // (`UNWIND [1,1,1,2,3] AS x RETURN DISTINCT x LIMIT 2` returned [1], not
+        // [1,2]). So build Project{distinct} first and wrap it in TopN.
+        plan = LogicalPlan::Project {
             input: Box::new(plan),
-            keys: order_keys,
-            skip: skip_rc,
-            limit: limit_rc,
+            items: projection_items,
+            distinct,
+            discard_input_bindings,
+        };
+        if has_topn {
+            // After DISTINCT the pre-projection bindings are gone, so ORDER BY
+            // may only reference the projected output columns — keep alias
+            // references as variables on the deduped row rather than
+            // substituting them back to their (now absent) free variables.
+            let all_aliases: BTreeSet<String> = aliases.iter().cloned().collect();
+            let order_keys_over_output: Vec<OrderKey> = order_by
+                .iter()
+                .map(|k| OrderKey {
+                    expression: substitute_aliases(&k.expression, &alias_map, &all_aliases),
+                    direction: k.direction,
+                })
+                .collect();
+            plan = LogicalPlan::TopN {
+                input: Box::new(plan),
+                keys: order_keys_over_output,
+                skip: skip_rc,
+                limit: limit_rc,
+            };
+        }
+    } else {
+        if has_topn {
+            plan = LogicalPlan::TopN {
+                input: Box::new(plan),
+                keys: order_keys,
+                skip: skip_rc,
+                limit: limit_rc,
+            };
+        }
+
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            items: projection_items,
+            distinct,
+            discard_input_bindings,
         };
     }
-
-    plan = LogicalPlan::Project {
-        input: Box::new(plan),
-        items: projection_items,
-        distinct,
-        discard_input_bindings,
-    };
 
     if discard_input_bindings {
         ctx.reset_to(aliases.iter().cloned());

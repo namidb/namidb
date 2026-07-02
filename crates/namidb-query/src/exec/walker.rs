@@ -1104,10 +1104,23 @@ pub(crate) async fn execute_expand(
                 // No edge traversed at hop 0 → rel binding is NULL.
                 zero_row.set(name, RuntimeValue::Null);
             }
-            let zero_keeps = match existing_target_id {
-                Some(existing) => starting == existing,
-                None => true,
+            // At hop 0 the source node IS the far end, so the pattern's target
+            // labels constrain it: `(a)-[:R*0..n]->(x:Label)` may bind the
+            // source as `x` only if the source itself carries every target
+            // label. Without this, `*0..` returned wrongly-labelled hop-0 rows
+            // (the label check for hops ≥1 lives in the traversal, which hop 0
+            // skips).
+            let source_has_target_labels = match row.get(source) {
+                Some(RuntimeValue::Node(n)) => {
+                    target_labels.iter().all(|l| n.labels.contains(l))
+                }
+                _ => target_labels.is_empty(),
             };
+            let zero_keeps = source_has_target_labels
+                && match existing_target_id {
+                    Some(existing) => starting == existing,
+                    None => true,
+                };
             if zero_keeps {
                 hop_results.push(zero_row);
                 matched_any = true;
@@ -2959,7 +2972,12 @@ async fn flat_vector_search(
     // The query expression carries no row bindings (literal vector or $param);
     // evaluate it once against an empty row.
     let q = evaluate(query, &Row::new(), params)?;
-    let limit = k.as_const().unwrap_or(10) as usize;
+    // Resolve the LIMIT the same way TopN does: a parameterized `LIMIT $k` must
+    // use the bound value, not a hardcoded default. The apply_vector_search
+    // rewrite deletes the TopN that would otherwise have resolved the param, so
+    // if this fell back to `unwrap_or(10)` a `LIMIT $k` silently returned 10
+    // rows regardless of $k. Errors on a missing/invalid $k, exactly like TopN.
+    let limit = resolve_row_count(k, params, "LIMIT")? as usize;
     // The natural/operator form has no syntax for the beam width, so it reads a
     // reserved, namespaced param `$__vector_ef` to tune recall vs latency on the
     // filtered-ANN path (the procedures take a first-class `ef`). It is the
@@ -4758,6 +4776,15 @@ async fn execute_expand_factor(
                     value: RuntimeValue::Null,
                 });
             }
+            // Hop 0 binds the source as the far end, so it must carry every
+            // target label (mirrors the flat-path zero-hop fix).
+            let source_has_target_labels =
+                match arena.lookup_binding(parent_leaf, source) {
+                    Some(RuntimeValue::Node(n)) => {
+                        target_labels.iter().all(|l| n.labels.contains(l))
+                    }
+                    _ => target_labels.is_empty(),
+                };
             if !back_reference {
                 if let Some(RuntimeValue::Node(n)) = arena.lookup_binding(parent_leaf, source) {
                     slots.push(Slot {
@@ -4766,10 +4793,11 @@ async fn execute_expand_factor(
                     });
                 }
             }
-            let zero_keeps = match existing_target_id {
-                Some(existing) => starting == existing,
-                None => true,
-            };
+            let zero_keeps = source_has_target_labels
+                && match existing_target_id {
+                    Some(existing) => starting == existing,
+                    None => true,
+                };
             if zero_keeps {
                 let new_idx = arena.push(parent_leaf, slots);
                 hop_outputs_for_this_input.push(new_idx);
