@@ -584,6 +584,13 @@ pub fn triangle_count(graph: &Graph) -> Triangles {
 }
 
 /// [`triangle_count`] that polls `cancel` periodically.
+///
+/// Uses the compact-forward algorithm (Latapy 2008): rank nodes by degree,
+/// keep only higher-ranked neighbours per node, and count each triangle once
+/// from its lowest-ranked vertex via a sorted-list merge intersection. Total
+/// work is `O(E^1.5)` — the naive per-node neighbour-pair probe is
+/// `Σ deg(v)²`, which degenerates to minutes on power-law graphs where a
+/// single 50k-degree hub alone costs ~1.25e9 hash probes.
 pub fn triangle_count_cancellable(
     graph: &Graph,
     cancel: &dyn Fn() -> bool,
@@ -593,19 +600,57 @@ pub fn triangle_count_cancellable(
     let nodes = graph.nodes();
     let adj = undirected_adjacency(graph, &index);
 
-    let mut per_node: HashMap<NodeId, usize> = HashMap::with_capacity(n);
-    let mut coefficient: HashMap<NodeId, f64> = HashMap::with_capacity(n);
-    let mut triple_total = 0usize; // each triangle counted 3× (once per vertex)
-    let mut since_check = 0usize;
-
+    // Rank by (degree, index); ties on degree break deterministically.
+    let mut rank = vec![0usize; n];
+    {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&v| (adj[v].len(), v));
+        for (r, &v) in order.iter().enumerate() {
+            rank[v] = r;
+        }
+    }
+    // Forward adjacency: each node's strictly higher-ranked neighbours, sorted
+    // by rank so intersections below are linear merges. Every list is bounded
+    // by O(sqrt(E)), which is what caps the total work.
+    let mut fwd: Vec<Vec<usize>> = vec![Vec::new(); n];
     for v in 0..n {
-        let neigh: Vec<usize> = adj[v].iter().copied().collect();
-        let deg = neigh.len();
-        let mut t = 0usize;
-        for i in 0..neigh.len() {
-            for j in (i + 1)..neigh.len() {
-                if adj[neigh[i]].contains(&neigh[j]) {
-                    t += 1;
+        for &u in &adj[v] {
+            if rank[u] > rank[v] {
+                fwd[v].push(u);
+            }
+        }
+        fwd[v].sort_unstable_by_key(|&u| rank[u]);
+    }
+
+    let mut count = vec![0usize; n];
+    let mut total = 0usize;
+    let mut since_check = 0usize;
+    for v in 0..n {
+        for ui in 0..fwd[v].len() {
+            let u = fwd[v][ui];
+            since_check += 1;
+            if since_check >= CANCEL_CHECK_STRIDE {
+                since_check = 0;
+                if cancel() {
+                    return Err(Cancelled);
+                }
+            }
+            // Merge-intersect fwd[v] with fwd[u]: every common w closes the
+            // triangle {v, u, w}, counted exactly once from lowest rank v.
+            let (mut i, mut j) = (0, 0);
+            while i < fwd[v].len() && j < fwd[u].len() {
+                match rank[fwd[v][i]].cmp(&rank[fwd[u][j]]) {
+                    Ordering::Less => i += 1,
+                    Ordering::Greater => j += 1,
+                    Ordering::Equal => {
+                        let w = fwd[v][i];
+                        count[v] += 1;
+                        count[u] += 1;
+                        count[w] += 1;
+                        total += 1;
+                        i += 1;
+                        j += 1;
+                    }
                 }
                 since_check += 1;
                 if since_check >= CANCEL_CHECK_STRIDE {
@@ -616,20 +661,25 @@ pub fn triangle_count_cancellable(
                 }
             }
         }
-        per_node.insert(nodes[v], t);
+    }
+
+    let mut per_node: HashMap<NodeId, usize> = HashMap::with_capacity(n);
+    let mut coefficient: HashMap<NodeId, f64> = HashMap::with_capacity(n);
+    for v in 0..n {
+        let deg = adj[v].len();
+        per_node.insert(nodes[v], count[v]);
         let coef = if deg < 2 {
             0.0
         } else {
-            2.0 * t as f64 / (deg as f64 * (deg as f64 - 1.0))
+            2.0 * count[v] as f64 / (deg as f64 * (deg as f64 - 1.0))
         };
         coefficient.insert(nodes[v], coef);
-        triple_total += t;
     }
 
     Ok(Triangles {
         per_node,
         coefficient,
-        total: triple_total / 3,
+        total,
     })
 }
 
@@ -2159,6 +2209,55 @@ mod tests {
             Some(Cancelled)
         );
         assert_eq!(betweenness_cancellable(&g, &always).err(), Some(Cancelled));
+    }
+
+    #[test]
+    fn triangle_count_matches_naive_reference_on_pseudo_random_graph() {
+        // Deterministic LCG graph with hubs, parallel edges, and self-loops:
+        // the compact-forward count must agree with a naive per-node
+        // neighbour-pair probe on every statistic.
+        let n = 60u128;
+        let ids: Vec<NodeId> = (1..=n).map(|i| nid(i.to_le_bytes())).collect();
+        let mut g = Graph::new();
+        for &id in &ids {
+            g.add_node(id);
+        }
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..400 {
+            let a = next() % ids.len();
+            let b = next() % ids.len();
+            g.add_edge(ids[a], ids[b], None); // self-loops + duplicates included
+        }
+
+        let fast = triangle_count(&g);
+
+        // Naive reference over the same undirected simple-graph view.
+        let index = dense_index(&g);
+        let adj = undirected_adjacency(&g, &index);
+        let mut expected_total = 0usize;
+        for (v, &id) in ids.iter().enumerate() {
+            let _ = id;
+            let neigh: Vec<usize> = adj[v].iter().copied().collect();
+            let mut t = 0usize;
+            for i in 0..neigh.len() {
+                for j in (i + 1)..neigh.len() {
+                    if adj[neigh[i]].contains(&neigh[j]) {
+                        t += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                fast.per_node[&ids[v]], t,
+                "per-node triangle count diverges at node {v}"
+            );
+            expected_total += t;
+        }
+        assert_eq!(fast.total, expected_total / 3, "total triangle count diverges");
+        assert!(fast.total > 0, "fixture should actually contain triangles");
     }
 
     #[test]
