@@ -1157,10 +1157,29 @@ pub(crate) async fn execute_expand(
             trail: initial_trail,
             rels: Vec::new(),
         }];
+        // Shortest-mode BFS pruning (RFC-023): a node reached at an earlier
+        // hop cannot lie on a shortest path discovered later, and every prefix
+        // of an unweighted shortest path is itself a shortest path — so
+        // dropping re-visits preserves ALL shortest paths while bounding the
+        // frontier at O(V) per level. The unpruned frontier enumerates every
+        // WALK from the seed (deg^hop entries, each a full Row + trail clone),
+        // which blows up exponentially on realistic average-degree graphs.
+        // `First` mode additionally keeps a single walk per node within a
+        // level (only one path per target is emitted anyway). Only engaged
+        // for `min <= 1`: a larger minimum needs longer-than-shortest walks,
+        // which the exhaustive frontier still provides.
+        let bfs_prune = shortest != crate::plan::ShortestMode::None && min <= 1;
+        let mut visited: std::collections::HashSet<NodeId> = if bfs_prune {
+            std::collections::HashSet::from([starting])
+        } else {
+            std::collections::HashSet::new()
+        };
         let hop_start = min.max(1);
         let _ = hop_start;
         for hop in 1..=max {
             let mut next_frontier = Vec::new();
+            let mut level_seen: std::collections::HashSet<NodeId> =
+                std::collections::HashSet::new();
             // Phase 1: pre-collect neighbours for every step so we can
             // batch-prewarm `Snapshot::lookup_node` once per hop (Fix #3b).
             // Without this, each (step, edge) pair issues its own
@@ -1197,6 +1216,22 @@ pub(crate) async fn execute_expand(
             for (step, neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, step.tail);
+                    if bfs_prune {
+                        // Reached at an earlier level → any path through it now
+                        // is longer than shortest; skip both as a result and as
+                        // a frontier extension.
+                        if visited.contains(&target_id) {
+                            continue;
+                        }
+                        // One walk per node per level suffices for `First`;
+                        // `All` keeps every same-level arrival (each is a
+                        // distinct shortest path).
+                        if shortest == crate::plan::ShortestMode::First
+                            && !level_seen.insert(target_id)
+                        {
+                            continue;
+                        }
+                    }
                     // Cypher relationship uniqueness (trail semantics): a
                     // relationship may appear at most once per matched path.
                     // Skip an edge already traversed on this path so a
@@ -1365,6 +1400,14 @@ pub(crate) async fn execute_expand(
             // row of this length (already done above), then stop.
             if matched_any && shortest != crate::plan::ShortestMode::None {
                 break;
+            }
+            if bfs_prune {
+                // Seal the level: everything reached this hop is now at its
+                // final (minimal) depth. Deferred to level end so `All` mode
+                // admits every same-level arrival above.
+                for step in &next_frontier {
+                    visited.insert(step.tail);
+                }
             }
             frontier = next_frontier;
             if frontier.is_empty() {
