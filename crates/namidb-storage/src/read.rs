@@ -5102,6 +5102,7 @@ mod tests {
             seq: seg.seq,
             path: seg_path.as_ref().to_string(),
             last_lsn: seg.last_lsn(),
+            xxh3: None,
         });
         let with_wal = ms.commit(&fence, &base, next).await.unwrap();
 

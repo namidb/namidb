@@ -846,6 +846,10 @@ impl WriterSession {
             seq,
             path: segment_path.as_ref().to_string(),
             last_lsn,
+            // Content hash of the exact bytes `append_segment` PUTs, so a
+            // stalled-commit repair can prove the durable slot holds THIS
+            // commit's segment before adopting it (see the descriptor docs).
+            xxh3: Some(xxhash_rust::xxh3::xxh3_64(&self.pending.encode())),
         });
         next
     }
@@ -2887,18 +2891,30 @@ mod tests {
         assert!(err.requires_writer_reopen(), "got {err:?}");
         assert!(session.is_poisoned());
 
-        // The terminal attempt left an orphan manifest body at base+1, which
-        // blocks any claim (`OrphanManifestBody`) until it is removed — a
-        // failed reopen must leave the session untouched (still poisoned).
-        let err = session.reopen().await.unwrap_err();
-        assert!(matches!(err, Error::OrphanManifestBody { .. }), "{err:?}");
-        assert!(session.is_poisoned(), "failed reopen must not clear poison");
-
-        // Once the orphan body is swept (janitor / operator), reopen works
-        // and the fresh session accepts commits again.
-        store.delete(&paths.manifest_version(1)).await.unwrap();
+        // The terminal attempt left an orphan manifest body at base+1 whose
+        // WAL slot holds the FOREIGN ghost segment (coinciding last_lsn,
+        // different content). The stalled-commit repair must refuse to adopt
+        // it — the content hash vetoes — and delete the orphan instead, so
+        // reopen succeeds directly, clears the poison, and neither Ada's
+        // never-acked write nor the ghost record is resurrected.
         session.reopen().await.unwrap();
         assert!(!session.is_poisoned());
+        let snap = session.snapshot();
+        assert!(
+            snap.lookup_node("Person", sorted_node_id(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "the never-acked write must not survive the repair"
+        );
+        assert!(
+            snap.lookup_node("Person", sorted_node_id(99))
+                .await
+                .unwrap()
+                .is_none(),
+            "the foreign ghost record must not be adopted"
+        );
+        drop(snap);
         session
             .upsert_node("Person", sorted_node_id(2), &node_record("Bea", None))
             .unwrap();

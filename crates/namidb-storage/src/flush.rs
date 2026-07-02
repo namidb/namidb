@@ -2071,6 +2071,7 @@ mod tests {
             seq: 1,
             path: "wal/0000000000000001.wal".into(),
             last_lsn: 9,
+            xxh3: None,
         });
         let with_wal = ms.commit(&fence, &base, step1).await.unwrap();
         assert_eq!(with_wal.manifest.wal_segments.len(), 1);

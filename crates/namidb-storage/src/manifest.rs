@@ -569,6 +569,15 @@ pub struct WalSegmentDescriptor {
     pub path: String,
     /// Inclusive max LSN durably written in this segment.
     pub last_lsn: u64,
+    /// xxh3-64 of the segment's encoded bytes. Proves, during stalled-commit
+    /// repair, that the durable object at `path` is the interrupted commit's
+    /// OWN segment — an lsn-range match alone can collide with a fenced peer's
+    /// segment written into the same Create-once slot, and adopting foreign
+    /// records would commit writes their client saw fail. `None` in manifests
+    /// written before the field existed: those orphans are deleted, never
+    /// adopted (only ever discarding a never-acked commit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xxh3: Option<u64>,
 }
 
 /// Wraps an [`ObjectStore`] with the manifest CAS protocol bound to a single
@@ -1313,7 +1322,7 @@ impl ManifestStore {
                 return Ok(None);
             }
             if !self
-                .wal_slot_matches(seg.seq, seg.last_lsn, &seg_path)
+                .wal_slot_matches(seg.seq, seg.last_lsn, seg.xxh3, &seg_path)
                 .await?
             {
                 return Ok(None);
@@ -1338,6 +1347,7 @@ impl ManifestStore {
         &self,
         seq: u64,
         declared_last_lsn: u64,
+        declared_xxh3: Option<u64>,
         seg_path: &Path,
     ) -> Result<bool> {
         loop {
@@ -1363,8 +1373,21 @@ impl ManifestStore {
                 }
                 Err(e) => return Err(Error::ObjectStore(e)),
             };
+            // Adoption requires proof the durable bytes are the interrupted
+            // commit's own segment: a Create-once slot can equally hold a
+            // fenced peer's segment whose lsn range coincides, and adopting
+            // foreign records would commit writes their client saw fail. A
+            // descriptor without a hash (pre-hash manifest) is unverifiable —
+            // refuse, so the repair deletes the orphan instead (discarding
+            // only a never-acked commit).
+            let content_verified = declared_xxh3
+                .is_some_and(|h| xxhash_rust::xxh3::xxh3_64(&bytes) == h);
             return Ok(match WalSegment::decode(seq, bytes) {
-                Ok(segment) => !segment.is_empty() && segment.last_lsn() == declared_last_lsn,
+                Ok(segment) => {
+                    !segment.is_empty()
+                        && segment.last_lsn() == declared_last_lsn
+                        && content_verified
+                }
                 Err(_) => false,
             });
         }
@@ -1757,6 +1780,7 @@ mod tests {
             seq: 1,
             path: paths.wal_segment(1).as_ref().to_string(),
             last_lsn: 7,
+            xxh3: Some(xxhash_rust::xxh3::xxh3_64(&segment.encode())),
         });
         plant_orphan_body(&store, &paths, &orphan).await;
 
@@ -1787,6 +1811,7 @@ mod tests {
             seq: 1,
             path: paths.wal_segment(1).as_ref().to_string(),
             last_lsn: 42,
+            xxh3: None,
         });
         plant_orphan_body(&store, &paths, &orphan).await;
 
@@ -1837,6 +1862,7 @@ mod tests {
             seq: 1,
             path: paths.wal_segment(1).as_ref().to_string(),
             last_lsn: 7, // declared 7, body carries 9
+            xxh3: Some(xxhash_rust::xxh3::xxh3_64(&segment.encode())),
         });
         plant_orphan_body(&store, &paths, &orphan).await;
 
@@ -1845,6 +1871,50 @@ mod tests {
         assert!(loaded.manifest.wal_segments.is_empty());
         // The mismatched segment itself is untouched (the janitor owns it).
         assert!(store.head(&paths.wal_segment(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn claim_writer_refuses_foreign_segment_with_coinciding_lsn() {
+        // The Create-once WAL slot holds a FENCED PEER's segment whose
+        // last_lsn coincides with the orphan's declaration (both writers at
+        // the same base number their lsns identically). Adopting it would
+        // commit records whose client saw the write fail — the content hash
+        // must veto the adoption and the orphan must be deleted instead.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
+        // The peer's segment: same seq, same last_lsn, different records.
+        let mut foreign = crate::wal::WalSegment::new(1);
+        foreign.push(crate::wal::WalRecord {
+            lsn: 7,
+            payload: Bytes::from_static(b"the fenced peer's write"),
+        });
+        let wal_store = crate::wal::WalStore::new(store.clone(), paths.clone());
+        wal_store.append_segment(&foreign).await.unwrap();
+
+        // What the interrupted commit ACTUALLY tried to write (never landed).
+        let mut ours = crate::wal::WalSegment::new(1);
+        ours.push(crate::wal::WalRecord {
+            lsn: 7,
+            payload: Bytes::from_static(b"our write"),
+        });
+
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 7,
+            xxh3: Some(xxhash_rust::xxh3::xxh3_64(&ours.encode())),
+        });
+        plant_orphan_body(&store, &paths, &orphan).await;
+
+        let (loaded, _fence) = ms.claim_writer().await.unwrap();
+        assert_eq!(loaded.manifest.version, 1, "orphan deleted, not adopted");
+        assert!(
+            loaded.manifest.wal_segments.is_empty(),
+            "the foreign segment must never be published"
+        );
     }
 
     #[tokio::test]
@@ -1953,6 +2023,7 @@ mod tests {
             seq: 1,
             path: paths.wal_segment(1).as_ref().to_string(),
             last_lsn: 100,
+            xxh3: None,
         });
         ms.put_body(&fence, &base, &first).await.unwrap();
 
@@ -1961,6 +2032,7 @@ mod tests {
             seq: 1,
             path: paths.wal_segment(1).as_ref().to_string(),
             last_lsn: 150,
+            xxh3: None,
         });
         let err = ms.put_body(&fence, &base, &second).await.unwrap_err();
         assert!(

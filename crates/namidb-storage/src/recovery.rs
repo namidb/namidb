@@ -479,6 +479,7 @@ mod tests {
             seq: seg.seq,
             path: format!("tenants/rec-single/wal/{:016x}.wal", seg.seq),
             last_lsn: seg.last_lsn(),
+            xxh3: None,
         });
 
         let out = recover_memtable(&manifest, &wal).await.unwrap();
@@ -550,11 +551,13 @@ mod tests {
             seq: 2,
             path: format!("tenants/rec-multi/wal/{:016x}.wal", 2),
             last_lsn: 6,
+            xxh3: None,
         });
         manifest.wal_segments.push(WalSegmentDescriptor {
             seq: 1,
             path: format!("tenants/rec-multi/wal/{:016x}.wal", 1),
             last_lsn: 5,
+            xxh3: None,
         });
 
         let out = recover_memtable(&manifest, &wal).await.unwrap();
@@ -590,6 +593,7 @@ mod tests {
             seq: 1,
             path: "tenants/rec-lsnmismatch/wal/0000000000000001.wal".into(),
             last_lsn: 1,
+            xxh3: None,
         });
 
         let err = recover_memtable(&manifest, &wal).await.unwrap_err();
@@ -630,6 +634,7 @@ mod tests {
             seq: 4,
             path: "tenants/rec-lsnunder/wal/0000000000000004.wal".into(),
             last_lsn: 50,
+            xxh3: None,
         });
 
         let err = recover_memtable(&manifest, &wal).await.unwrap_err();
@@ -666,6 +671,7 @@ mod tests {
             seq: 3,
             path: "tenants/rec-lsnover/wal/0000000000000003.wal".into(),
             last_lsn: 50,
+            xxh3: None,
         });
 
         let err = recover_memtable(&manifest, &wal).await.unwrap_err();
@@ -797,11 +803,13 @@ mod tests {
             seq: 0,
             path: format!("wal#{}", 0),
             last_lsn: 1,
+            xxh3: None,
         });
         manifest.wal_segments.push(WalSegmentDescriptor {
             seq: 1,
             path: format!("wal#{}", 1),
             last_lsn: 11,
+            xxh3: None,
         });
 
         let out = recover_memtable_with_snapshot(&manifest, &wal, Some(&store))
@@ -841,6 +849,7 @@ mod tests {
             seq: 0,
             path: "wal#0".into(),
             last_lsn: 1,
+            xxh3: None,
         });
 
         let out = recover_memtable(&manifest, &wal).await.unwrap();

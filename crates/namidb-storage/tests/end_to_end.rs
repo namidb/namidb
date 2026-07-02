@@ -69,6 +69,7 @@ async fn bootstrap_then_first_write_cycle() {
         seq: seg.seq,
         path: segment_path_str.clone(),
         last_lsn: seg.last_lsn(),
+        xxh3: None,
     });
     current = manifest_store
         .commit(&fence, &current, next_manifest)
