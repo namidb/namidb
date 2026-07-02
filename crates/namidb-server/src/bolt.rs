@@ -1087,9 +1087,16 @@ async fn run_session<S>(
 ) where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
 {
+    // Cap total transaction lifetime so a client that stays under the idle
+    // timeout cannot pin the shared writer forever. Overridable; default 5 min.
+    let max_tx_lifetime = std::env::var("NAMIDB_BOLT_MAX_TX_LIFETIME")
+        .ok()
+        .and_then(|s| humantime::parse_duration(&s).ok())
+        .or_else(|| Some(std::time::Duration::from_secs(300)));
     let session = Session::new(socket, info, policy, backend)
         .with_tx_idle_timeout(tx_idle_timeout)
-        .with_handshake_timeout(handshake_timeout);
+        .with_handshake_timeout(handshake_timeout)
+        .with_max_tx_lifetime(max_tx_lifetime);
     if let Err(e) = session.run().await {
         warn!(error = %e, %peer, "bolt session ended with error");
     }

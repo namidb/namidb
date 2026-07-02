@@ -345,7 +345,37 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/admin/flush", post(admin_flush))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    Router::new().merge(public).merge(private).with_state(state)
+    harden_router(Router::new().merge(public).merge(private).with_state(state))
+}
+
+/// Default request-processing deadline and global in-flight cap for the HTTP
+/// listener. The timeout bounds how long a single request (body read + handler)
+/// may run so a slow/stuck client cannot pin a task indefinitely; the
+/// concurrency limit caps total in-flight requests so slow connections cannot
+/// accumulate without bound and starve the server. Overridable via env.
+fn http_request_timeout() -> Duration {
+    std::env::var("NAMIDB_HTTP_REQUEST_TIMEOUT")
+        .ok()
+        .and_then(|s| humantime::parse_duration(&s).ok())
+        .unwrap_or_else(|| Duration::from_secs(120))
+}
+
+fn http_max_concurrency() -> usize {
+    std::env::var("NAMIDB_HTTP_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024)
+}
+
+/// Apply the shared HTTP hardening layers (request timeout + global concurrency
+/// limit) to a fully-built router.
+fn harden_router(router: Router) -> Router {
+    router
+        .layer(tower_http::timeout::TimeoutLayer::new(http_request_timeout()))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            http_max_concurrency(),
+        ))
 }
 
 /// Build the multi-tenant router with namespace extraction.
@@ -386,10 +416,12 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
             require_auth_multi,
         ));
 
-    Router::new()
-        .merge(public)
-        .merge(namespace_routes)
-        .with_state(shared)
+    harden_router(
+        Router::new()
+            .merge(public)
+            .merge(namespace_routes)
+            .with_state(shared),
+    )
 }
 
 /// Resolve the namespace for an unprefixed request: the `X-NamiDB-Namespace`

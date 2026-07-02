@@ -256,6 +256,14 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// a spawned task and a file descriptor forever. `None` (the default)
     /// disables it for test backends.
     handshake_timeout: Option<std::time::Duration>,
+    /// Maximum total lifetime of an open transaction. The idle timeout only
+    /// bounds the gap between messages, so a client that sends a trivial message
+    /// just under the idle window can pin the writer forever; this caps the
+    /// whole transaction. `None` disables it. Checked at message boundaries.
+    max_tx_lifetime: Option<std::time::Duration>,
+    /// When the currently-open transaction first blocked on a read. Reset to
+    /// `None` whenever no transaction is open. Used to enforce `max_tx_lifetime`.
+    tx_started: Option<tokio::time::Instant>,
     /// Whether this session has completed authentication (the v5 HELLO +
     /// LOGON handshake, or the v4 HELLO that carries auth). RESET only
     /// recovers a session to READY once this is set: before auth a RESET
@@ -278,6 +286,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             pending_counters: BTreeMap::new(),
             tx_idle_timeout: None,
             handshake_timeout: None,
+            max_tx_lifetime: None,
+            tx_started: None,
             authenticated: false,
         }
     }
@@ -294,6 +304,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     /// complete the handshake.
     pub fn with_handshake_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum total lifetime of an open transaction. `None` disables
+    /// it (a transaction may stay open indefinitely as long as it stays under
+    /// the idle timeout).
+    pub fn with_max_tx_lifetime(mut self, lifetime: Option<std::time::Duration>) -> Self {
+        self.max_tx_lifetime = lifetime;
         self
     }
 
@@ -316,6 +334,29 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             // in a transaction, roll it back to release the writer and fail
             // the transaction.
             let in_tx = matches!(self.state, State::TxReady | State::TxStreaming);
+            // Enforce total transaction lifetime at message boundaries: a client
+            // that stays just under the idle timeout could otherwise hold the
+            // writer forever. Roll back and fail once the cap is exceeded.
+            if in_tx {
+                let started = *self.tx_started.get_or_insert_with(tokio::time::Instant::now);
+                if let Some(max) = self.max_tx_lifetime {
+                    if started.elapsed() >= max {
+                        let _ = self.backend.rollback_tx().await;
+                        self.state = State::Failed;
+                        self.tx_started = None;
+                        self.write_failure(
+                            "Neo.TransientError.Transaction.LockClientStopped",
+                            "transaction exceeded maximum lifetime; rolled back to release \
+                             the writer"
+                                .to_string(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            } else {
+                self.tx_started = None;
+            }
             let pre_auth = !self.authenticated;
             let read = read_message(&mut self.socket, max);
             let read_result = if in_tx {

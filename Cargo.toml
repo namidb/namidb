@@ -114,8 +114,8 @@ console = "0.15"
 
 # HTTP server (later)
 axum = "0.7"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 
 # Local workspace crates
 namidb-core = { path = "crates/namidb-core", version = "1.5.0" }
