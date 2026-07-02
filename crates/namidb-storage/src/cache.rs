@@ -261,6 +261,25 @@ impl SstCache {
         map.insert(key, meta);
     }
 
+    /// Drop side-map entries (Parquet metadata, decoded edge streams, edge
+    /// readers) whose SST path is no longer `live`. The three maps are keyed by
+    /// absolute SST path and were insert-only, so under normal flush/compaction
+    /// churn they grew without bound (a 10M-edge SST's decoded streams are
+    /// ~1 GB per entry). Called after a manifest commit with the paths the new
+    /// manifest still references; the byte-bounded body cache (`inner`) is
+    /// unaffected. Over-eviction is safe (entries re-decode on demand).
+    pub fn retain_paths(&self, live: &std::collections::HashSet<String>) {
+        self.metadata.lock().unwrap().retain(|k, _| live.contains(k));
+        self.edge_streams
+            .lock()
+            .unwrap()
+            .retain(|k, _| live.contains(k));
+        self.edge_readers
+            .lock()
+            .unwrap()
+            .retain(|k, _| live.contains(k));
+    }
+
     pub fn metadata_hits(&self) -> u64 {
         self.stats.meta_hits.load(Ordering::Relaxed)
     }

@@ -872,7 +872,29 @@ impl WriterSession {
         let outcome =
             compact_l0_to_l1(&self.manifest_store, &self.fence, &self.current, schema).await?;
         self.current = outcome.committed.clone();
+        // Reclaim cache side-map entries for SSTs this compaction merged away.
+        self.prune_sst_cache();
         Ok(outcome)
+    }
+
+    /// Drop `SstCache` side-map entries (Parquet metadata, decoded edge streams,
+    /// edge readers) for SSTs the current manifest no longer references. Those
+    /// maps are insert-only and keyed by absolute SST path, so without this they
+    /// grow without bound as flush/compaction churns SSTs.
+    fn prune_sst_cache(&self) {
+        let Some(cache) = &self.sst_cache else {
+            return;
+        };
+        let prefix = self.manifest_store.paths().namespace_prefix();
+        let prefix = prefix.as_ref();
+        let live: std::collections::HashSet<String> = self
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .map(|d| format!("{prefix}/{}", d.path))
+            .collect();
+        cache.retain_paths(&live);
     }
 
     /// Flush the live memtable iff the current manifest already references
@@ -939,6 +961,10 @@ impl WriterSession {
             }
         };
         self.current = outcome.committed.clone();
+        // Drop cache side-map entries for SSTs this flush superseded, so the
+        // (formerly insert-only) metadata/edge-stream/edge-reader maps do not
+        // grow without bound under flush/compaction churn.
+        self.prune_sst_cache();
         // The flush emptied the live memtable (memtable.freeze() drained
         // it), so the published snapshot must reset to empty too.
         self.refresh_published();
