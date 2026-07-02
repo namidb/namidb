@@ -4729,6 +4729,15 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
     .boxed()
 }
 
+/// A stored edge's identity `(edge_type, src, dst)` — the key for Cypher
+/// relationship uniqueness in variable-length expansion.
+type EdgeIdentity = (String, NodeId, NodeId);
+
+/// A factor-path expansion frontier entry: the factor node the path was reached
+/// under, its tail node, and the relationships already traversed on the path
+/// (for relationship-uniqueness; empty on the single-hop path).
+type FactorFrontierEntry = (crate::exec::FactorIdx, NodeId, Vec<EdgeIdentity>);
+
 // Pointer-based Expand that avoids the per-edge `BTreeMap` clone in
 // walker.rs:544 / 554. Each surviving (parent_leaf, edge, target) tuple
 // produces one new `FactorNode` carrying just the rel and target slots;
@@ -4856,22 +4865,16 @@ async fn execute_expand_factor(
         // edge identities `(edge_type, src, dst)`, for Cypher relationship
         // uniqueness (trail semantics). Only populated for multi-hop
         // expansions; empty on the single-hop path where reuse is impossible.
-        let mut frontier: Vec<(crate::exec::FactorIdx, NodeId, Vec<(String, NodeId, NodeId)>)> =
+        let mut frontier: Vec<FactorFrontierEntry> =
             vec![(parent_leaf, starting, Vec::new())];
 
         for hop in 1..=max {
-            let mut next_frontier: Vec<(
-                crate::exec::FactorIdx,
-                NodeId,
-                Vec<(String, NodeId, NodeId)>,
-            )> = Vec::new();
+            let mut next_frontier: Vec<FactorFrontierEntry> = Vec::new();
             // Phase 1: pre-collect neighbours per frontier entry so the
             // batch prewarm below can populate L1 with one SST decode
             // (Fix #3b — same rationale as the flat path).
-            let mut step_neighbours: Vec<(
-                (crate::exec::FactorIdx, NodeId, Vec<(String, NodeId, NodeId)>),
-                Vec<EdgeView>,
-            )> = Vec::with_capacity(frontier.len());
+            let mut step_neighbours: Vec<(FactorFrontierEntry, Vec<EdgeView>)> =
+                Vec::with_capacity(frontier.len());
             let mut unique_targets: Vec<NodeId> = Vec::new();
             let mut seen_targets: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
