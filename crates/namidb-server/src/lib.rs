@@ -685,12 +685,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         Err(e) => error!(error = %e, "periodic compaction failed"),
                     }
                 }
-                // Orphan sweep — no writer lock. `max_level = 1` because the
-                // engine only produces L0 + L1 today. The retention horizon
-                // (RFC-027) is the oldest manifest version any live reader is
-                // pinned to; the sweep keeps every object referenced from the
-                // horizon to current, so it can never delete a body a reader
-                // still needs.
+                // Orphan sweep — no writer lock. The `max_level` arg is only a
+                // floor now: sweep_orphans scans up to the deepest level any
+                // retained manifest occupies, so L2+ compaction outputs are
+                // reclaimed too. The retention horizon (RFC-027) is the oldest
+                // manifest version any live reader is pinned to; the sweep keeps
+                // every object referenced from the horizon to current, so it can
+                // never delete a body a reader still needs.
                 let horizon = state_for_maint.snapshot.retention_horizon();
                 match sweep_orphans(
                     &maint_manifest_store,

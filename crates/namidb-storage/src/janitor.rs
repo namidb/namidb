@@ -147,8 +147,16 @@ pub async fn sweep_orphans(
     // set and becomes reclaimable. This is what makes deletion safe by
     // construction rather than by a wall-clock guess.
     let mut referenced: HashSet<String> = HashSet::new();
+    // Deepest SST level occupied by ANY retained manifest version. Leveled-lite
+    // compaction cascades output to deeper levels (L2, L3, …) as buckets grow,
+    // and levels only ever increase, so the deepest level any retained manifest
+    // references bounds where every reclaimable orphan can live. The passed
+    // `max_level` is treated as a floor: hardcoding it to 1 (as the callers used
+    // to) leaked the entire superseded body of every L2+ rewrite forever.
+    let mut max_seen_level: u32 = 0;
     let mut mark_live = |ssts: &[crate::manifest::SstDescriptor]| {
         for desc in ssts {
+            max_seen_level = max_seen_level.max(desc.level.as_u32());
             referenced.insert(desc.path.clone());
             if let Some(b) = &desc.bloom {
                 referenced.insert(b.path.clone());
@@ -187,7 +195,8 @@ pub async fn sweep_orphans(
     let min_age_secs = min_age.as_secs() as i64;
     let now = Utc::now();
 
-    for level in 0..=max_level {
+    let scan_max_level = max_level.max(max_seen_level);
+    for level in 0..=scan_max_level {
         let level_dir = paths.sst_dir(level);
         let mut stream = store.list(Some(&level_dir));
         while let Some(meta) = stream.try_next().await.map_err(Error::ObjectStore)? {
