@@ -132,7 +132,7 @@ pub struct MemtableSnapshotEntry {
     pub op: WalOp,
 }
 
-const MEMTABLE_SNAPSHOT_VERSION: u32 = 1;
+pub(crate) const MEMTABLE_SNAPSHOT_VERSION: u32 = 1;
 
 impl MemtableSnapshotFile {
     /// Build a snapshot file from the current `(MemKey, lsn, MemOp)`

@@ -708,7 +708,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     Ok(report)
                         if report.orphans_found > 0
                             || report.manifest_snapshots_reclaimed > 0
-                            || report.pointer_files_reclaimed > 0 =>
+                            || report.pointer_files_reclaimed > 0
+                            || report.wal_segments_reclaimed > 0
+                            || report.memtable_snapshots_reclaimed > 0 =>
                     {
                         info!(
                             found = report.orphans_found,
@@ -718,6 +720,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                             manifest_bytes_freed = report.manifest_bytes_freed,
                             pointer_files = report.pointer_files_reclaimed,
                             pointer_bytes_freed = report.pointer_bytes_freed,
+                            wal_segments = report.wal_segments_reclaimed,
+                            wal_bytes_freed = report.wal_bytes_freed,
+                            memtable_snapshots = report.memtable_snapshots_reclaimed,
+                            memtable_snapshot_bytes_freed = report.memtable_snapshot_bytes_freed,
                             dry_run = !sweep_delete,
                             "orphan sweep"
                         )

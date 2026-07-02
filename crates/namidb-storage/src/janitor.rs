@@ -17,9 +17,15 @@
 //! but the source bodies in `sst/level0/` remain readable. Any reader
 //! pinned at the pre-compaction manifest version still relies on them.
 //! - **Crashed writers.** A process can die after `wal_store.append_segment`
-//! but before the manifest CAS, leaving a WAL segment unreferenced. The
-//! write-side WAL janitor lives elsewhere (TODO); here we focus on SSTs
-//! and their bloom side-cars.
+//! but before the manifest CAS, leaving a WAL segment unreferenced.
+//! - **Flushed WAL segments.** A flush clears `wal_segments` from the new
+//! manifest version but never deletes the segment objects, so every
+//! commit leaves one immutable `wal/<seq>.wal` behind forever — and
+//! `WriterSession::open` LISTs the whole `wal/` prefix, so cold-open
+//! cost grows with total history, not live state.
+//! - **Superseded memtable snapshots.** `memtable_snapshot.bin` is
+//! overwritten in place but a flush can strand it stale (recovery
+//! already ignores a stale one; the object is pure storage cost).
 //!
 //! ## What the janitor does
 //!
@@ -42,6 +48,10 @@
 //! load — under the same `min_age` guard. `current.json` and every version
 //! at or above the horizon are kept. Without this the `manifest/` prefix
 //! grows by one immutable snapshot per commit forever.
+//! 6. Lists `wal/` and reclaims every segment referenced by no retained
+//! manifest version, under the same `min_age` guard (see the deletion
+//! rule inline at the sweep). Also removes a stale `memtable_snapshot.bin`
+//! once the horizon manifest's flushed high-water subsumes it.
 //!
 //! ## Safety
 //!
@@ -104,6 +114,25 @@ pub struct JanitorReport {
     /// Bytes held by the pointer files in `pointer_files_reclaimed` (freed when
     /// `delete = true`, otherwise what *would* be freed).
     pub pointer_bytes_freed: u64,
+    /// Dead WAL segments (`wal/<seq>.wal` referenced by no manifest version
+    /// at or above the retention horizon, older than `min_age`) reclaimable
+    /// this sweep. Populated in dry-run too; bodies removed only when
+    /// `delete = true`. Counted separately from `orphans_found` because a
+    /// flushed segment is not an orphan — every retained version stopped
+    /// referencing it on purpose.
+    pub wal_segments_reclaimed: usize,
+    /// Bytes held by the segments in `wal_segments_reclaimed` (freed when
+    /// `delete = true`, otherwise what *would* be freed).
+    pub wal_bytes_freed: u64,
+    /// Stale `memtable_snapshot.bin` objects reclaimable this sweep (0 or 1:
+    /// there is one snapshot path per namespace). Stale means its `last_lsn`
+    /// is at or below the flushed high-water of the horizon manifest, so no
+    /// retained version's recovery would consume it. Populated in dry-run
+    /// too; the body is removed only when `delete = true`.
+    pub memtable_snapshots_reclaimed: usize,
+    /// Bytes held by the snapshot in `memtable_snapshots_reclaimed` (freed
+    /// when `delete = true`, otherwise what *would* be freed).
+    pub memtable_snapshot_bytes_freed: u64,
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
@@ -154,8 +183,20 @@ pub async fn sweep_orphans(
     // `max_level` is treated as a floor: hardcoding it to 1 (as the callers used
     // to) leaked the entire superseded body of every L2+ rewrite forever.
     let mut max_seen_level: u32 = 0;
-    let mut mark_live = |ssts: &[crate::manifest::SstDescriptor]| {
-        for desc in ssts {
+    // WAL seqs referenced by ANY retained manifest version. Recovery replays
+    // exactly the `wal_segments` list of the manifest it is handed, so this
+    // union is the complete read surface of the `wal/` prefix (see the WAL
+    // sweep below for the full deletion rule).
+    let mut referenced_wal: HashSet<u64> = HashSet::new();
+    // Flushed LSN high-water of the HORIZON manifest — the oldest retained
+    // version and therefore the smallest high-water among them (flush only
+    // ever raises it). Governs the stale-snapshot reclaim below.
+    let mut horizon_flushed_hwm: u64 = 0;
+    let mut mark_live = |manifest: &crate::manifest::Manifest| {
+        for seg in &manifest.wal_segments {
+            referenced_wal.insert(seg.seq);
+        }
+        for desc in &manifest.ssts {
             max_seen_level = max_seen_level.max(desc.level.as_u32());
             referenced.insert(desc.path.clone());
             if let Some(b) = &desc.bloom {
@@ -178,11 +219,16 @@ pub async fn sweep_orphans(
         }
     };
     for version in horizon..=current_version {
-        if version == current_version {
-            mark_live(&current.manifest.ssts);
+        let loaded;
+        let manifest = if version == current_version {
+            &current.manifest
         } else {
-            let manifest = manifest_store.load_manifest_at(version).await?;
-            mark_live(&manifest.ssts);
+            loaded = manifest_store.load_manifest_at(version).await?;
+            &loaded
+        };
+        mark_live(manifest);
+        if version == horizon {
+            horizon_flushed_hwm = manifest.ssts.iter().map(|s| s.max_lsn).max().unwrap_or(0);
         }
     }
 
@@ -292,6 +338,103 @@ pub async fn sweep_orphans(
         }
     }
 
+    // Reclaim dead WAL segments. Without this every `commit_batch` leaves one
+    // immutable `wal/<seq>.wal` behind forever (flush only clears the manifest
+    // references). Derived safety rule — a segment may be deleted iff BOTH hold:
+    //
+    // 1. No manifest version at or above the retention horizon lists its `seq`
+    //    in `wal_segments`. Recovery (`recover_memtable_with_snapshot`) replays
+    //    exactly the segments the manifest it is handed references — it never
+    //    lists the `wal/` prefix — and `WriterSession::open` uses the `wal/`
+    //    LIST only to seed the next seq above every visible segment. So an
+    //    unreferenced segment is read by nobody: it is either an orphan from a
+    //    commit that failed before the pointer CAS (its records were never
+    //    acked) or a segment a flush already drained into SSTs that every
+    //    retained version references (its records are durable elsewhere).
+    // 2. The object is older than `min_age`. A commit PUTs the segment BEFORE
+    //    the pointer CAS lands; in that window it is referenced by no version
+    //    yet, but the very next manifest will reference it and the client is
+    //    acked on the CAS — deleting it then would lose acked writes at the
+    //    next crash. Same guard as the SST body-PUT-then-CAS race above.
+    //
+    // Deleting a segment cannot cause a later seq collision either: writers
+    // pick the next seq strictly above every segment still VISIBLE, and once
+    // the object is gone `PutMode::Create` on its path succeeds again, while
+    // a re-used seq can never interleave with retained history because every
+    // retained seq is, by rule 1, still visible.
+    let wal_dir = paths.wal_dir();
+    let mut wal_objects = store.list(Some(&wal_dir));
+    while let Some(meta) = wal_objects.try_next().await.map_err(Error::ObjectStore)? {
+        // Segments are `<16-hex-digits>.wal`; anything else under the prefix
+        // is not ours to judge, so leave it alone.
+        let Some(seq) = meta
+            .location
+            .filename()
+            .and_then(|name| name.strip_suffix(".wal"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        else {
+            continue;
+        };
+        if referenced_wal.contains(&seq) {
+            continue;
+        }
+        let age_secs = (now - meta.last_modified).num_seconds();
+        if age_secs < min_age_secs {
+            report.skipped_too_young += 1;
+            debug!(path = %meta.location, age_secs, "dead WAL segment too young, deferring");
+            continue;
+        }
+        report.wal_segments_reclaimed += 1;
+        report.wal_bytes_freed = report.wal_bytes_freed.saturating_add(meta.size);
+        if delete {
+            store
+                .delete(&meta.location)
+                .await
+                .map_err(Error::ObjectStore)?;
+        }
+    }
+
+    // Reclaim a stale `memtable_snapshot.bin`. The snapshot is a cold-start
+    // cache over UNflushed memtable state; recovery ignores it whenever its
+    // `last_lsn` is at or below the flushed SST high-water of the manifest it
+    // recovers against. Once `last_lsn <= horizon_flushed_hwm` — the smallest
+    // high-water any retained version presents — no retained version's
+    // recovery will ever consume it, so the object is pure storage cost.
+    // This is a cost measure, not a correctness one (recovery already refuses
+    // stale snapshots), so on any doubt — undecodable body, unknown version —
+    // the object is left alone. `min_age` guards the window where the writer
+    // overwrites the object with a fresh snapshot right after our GET.
+    let snap_path = paths.memtable_snapshot();
+    match store.get(&snap_path).await {
+        Ok(res) => {
+            let meta = res.meta.clone();
+            let body = res.bytes().await.map_err(Error::ObjectStore)?;
+            let stale = bincode::deserialize::<crate::recovery::MemtableSnapshotFile>(&body)
+                .map(|snap| {
+                    snap.version == crate::recovery::MEMTABLE_SNAPSHOT_VERSION
+                        && snap.last_lsn <= horizon_flushed_hwm
+                })
+                .unwrap_or(false);
+            if stale {
+                let age_secs = (now - meta.last_modified).num_seconds();
+                if age_secs < min_age_secs {
+                    report.skipped_too_young += 1;
+                    debug!(path = %snap_path, age_secs, "stale memtable snapshot too young, deferring");
+                } else {
+                    report.memtable_snapshots_reclaimed += 1;
+                    report.memtable_snapshot_bytes_freed = report
+                        .memtable_snapshot_bytes_freed
+                        .saturating_add(meta.size);
+                    if delete {
+                        store.delete(&snap_path).await.map_err(Error::ObjectStore)?;
+                    }
+                }
+            }
+        }
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(other) => return Err(Error::ObjectStore(other)),
+    }
+
     Ok(report)
 }
 
@@ -309,6 +452,7 @@ mod tests {
     use super::*;
     use crate::fence::WriterFence;
     use crate::flush::{flush, NodeWriteRecord};
+    use crate::ingest::{CommitOutcome, WriterSession};
     use crate::manifest::ManifestStore;
     use crate::memtable::{MemKey, MemOp, Memtable};
     use crate::paths::NamespacePaths;
@@ -329,7 +473,7 @@ mod tests {
         }
     }
 
-    fn node_payload(name: &str) -> Bytes {
+    fn node_record(name: &str) -> NodeWriteRecord {
         let mut props = std::collections::BTreeMap::new();
         props.insert("name".into(), Value::Str(name.into()));
         NodeWriteRecord {
@@ -337,8 +481,42 @@ mod tests {
             schema_version: 1,
             ..Default::default()
         }
-        .encode()
-        .unwrap()
+    }
+
+    fn node_payload(name: &str) -> Bytes {
+        node_record(name).encode().unwrap()
+    }
+
+    fn person_schema() -> Schema {
+        SchemaBuilder::new().label(person_label()).unwrap().build()
+    }
+
+    /// Commit `names` through a fresh `WriterSession`, one commit (= one WAL
+    /// segment) per name, and return the session plus the per-commit
+    /// `(manifest_version, wal_seq)` pairs.
+    async fn session_with_commits(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        names: &[&str],
+    ) -> (WriterSession, Vec<(u64, u64)>) {
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut commits = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            session
+                .upsert_node("Person", sorted_node_id(i as u8 + 1), &node_record(name))
+                .unwrap();
+            match session.commit_batch().await.unwrap() {
+                CommitOutcome::Committed {
+                    manifest_version,
+                    wal_seq,
+                    ..
+                } => commits.push((manifest_version, wal_seq)),
+                other => panic!("expected Committed, got {other:?}"),
+            }
+        }
+        (session, commits)
     }
 
     fn sorted_node_id(b: u8) -> NodeId {
@@ -592,5 +770,240 @@ mod tests {
             "the current snapshot must survive"
         );
         assert!(store.head(&paths.pointer_version(current)).await.is_ok());
+    }
+
+    /// Acked-but-unflushed durability: a WAL segment the current manifest
+    /// still references must survive the sweep, and a cold reopen must
+    /// replay the committed rows out of it.
+    #[tokio::test]
+    async fn wal_sweep_preserves_acked_unflushed_writes() {
+        let store = make_store();
+        let paths = make_paths("janitor-wal-unflushed");
+        let (session, commits) = session_with_commits(&store, &paths, &["Ada"]).await;
+        let (_, seq) = commits[0];
+        drop(session);
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.wal_segments_reclaimed, 0,
+            "a manifest-referenced segment is not reclaimable"
+        );
+        assert!(
+            store.head(&paths.wal_segment(seq)).await.is_ok(),
+            "the referenced segment body must survive the sweep"
+        );
+
+        // Cold reopen: recovery replays the segment; the acked row is there.
+        let session2 = WriterSession::open(store, paths).await.unwrap();
+        let snap = session2.snapshot();
+        let view = snap
+            .lookup_node("Person", sorted_node_id(1))
+            .await
+            .unwrap()
+            .expect("acked-but-unflushed row must survive the sweep");
+        assert_eq!(view.properties.get("name"), Some(&Value::Str("Ada".into())));
+    }
+
+    /// Once a flush drains the WAL into SSTs (and the horizon passes the
+    /// flush), the segments are dead: the sweep reclaims them after
+    /// `min_age`, and the rows still read back from the SSTs on reopen.
+    #[tokio::test]
+    async fn wal_sweep_reclaims_flushed_segments_after_min_age() {
+        let store = make_store();
+        let paths = make_paths("janitor-wal-flushed");
+        let (mut session, commits) = session_with_commits(&store, &paths, &["Ada", "Bob"]).await;
+        session.flush(person_schema()).await.unwrap();
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+
+        // min_age = 24h: the segments are unreferenced but too young.
+        let young = sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(young.wal_segments_reclaimed, 0);
+        for (_, seq) in &commits {
+            assert!(
+                store.head(&paths.wal_segment(*seq)).await.is_ok(),
+                "young dead segment {seq} must be deferred"
+            );
+        }
+
+        // Dry run past min_age: counted, not deleted.
+        let dry = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.wal_segments_reclaimed, 2);
+        assert!(dry.wal_bytes_freed > 0);
+        assert!(store.head(&paths.wal_segment(commits[0].1)).await.is_ok());
+
+        // Real run: both segments are reclaimed.
+        let real = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(real.wal_segments_reclaimed, 2);
+        for (_, seq) in &commits {
+            assert!(
+                store.head(&paths.wal_segment(*seq)).await.is_err(),
+                "dead segment {seq} must be reclaimed"
+            );
+        }
+
+        // Idempotent, and the flushed rows still read back after a cold
+        // reopen (they live in SSTs now).
+        let again = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(again.wal_segments_reclaimed, 0);
+        drop(session);
+        let session2 = WriterSession::open(store, paths).await.unwrap();
+        let snap = session2.snapshot();
+        for (i, name) in ["Ada", "Bob"].iter().enumerate() {
+            let view = snap
+                .lookup_node("Person", sorted_node_id(i as u8 + 1))
+                .await
+                .unwrap()
+                .expect("flushed row must survive the WAL sweep");
+            assert_eq!(
+                view.properties.get("name"),
+                Some(&Value::Str((*name).into()))
+            );
+        }
+    }
+
+    /// A segment referenced by a retained older manifest version (retention
+    /// horizon below current) is kept even though the current version no
+    /// longer references it.
+    #[tokio::test]
+    async fn wal_sweep_keeps_segments_referenced_by_retained_versions() {
+        let store = make_store();
+        let paths = make_paths("janitor-wal-horizon");
+        let (mut session, commits) = session_with_commits(&store, &paths, &["Ada"]).await;
+        let (v_commit, seq) = commits[0];
+        // The flush clears the WAL refs from the NEW version; v_commit still
+        // references the segment.
+        session.flush(person_schema()).await.unwrap();
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let pinned = sweep_orphans(&ms, v_commit, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.wal_segments_reclaimed, 0,
+            "a segment referenced by a retained version must be kept"
+        );
+        assert!(store.head(&paths.wal_segment(seq)).await.is_ok());
+
+        // Horizon advances past the flush: the segment becomes dead.
+        let free = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(free.wal_segments_reclaimed, 1);
+        assert!(store.head(&paths.wal_segment(seq)).await.is_err());
+    }
+
+    /// A `memtable_snapshot.bin` is kept while it still covers unflushed
+    /// state and reclaimed once a flush supersedes it (its `last_lsn` falls
+    /// at or below the horizon manifest's flushed high-water).
+    #[tokio::test]
+    async fn sweep_reclaims_stale_memtable_snapshot_once_superseded() {
+        let store = make_store();
+        let paths = make_paths("janitor-snap-stale");
+        let (mut session, _) = session_with_commits(&store, &paths, &["Ada"]).await;
+        session.write_memtable_snapshot_now().await.unwrap();
+        let snap_path = paths.memtable_snapshot();
+        assert!(store.head(&snap_path).await.is_ok());
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+
+        // Fresh snapshot (covers unflushed rows): must be kept.
+        let fresh = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(fresh.memtable_snapshots_reclaimed, 0);
+        assert!(
+            store.head(&snap_path).await.is_ok(),
+            "a snapshot covering unflushed state must survive"
+        );
+
+        // Flush drains the covered rows into SSTs: the snapshot is stale now.
+        session.flush(person_schema()).await.unwrap();
+
+        // min_age guard still applies.
+        let young = sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(young.memtable_snapshots_reclaimed, 0);
+        assert!(store.head(&snap_path).await.is_ok());
+
+        // Dry run: counted, not deleted.
+        let dry = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, false)
+            .await
+            .unwrap();
+        assert_eq!(dry.memtable_snapshots_reclaimed, 1);
+        assert!(dry.memtable_snapshot_bytes_freed > 0);
+        assert!(store.head(&snap_path).await.is_ok());
+
+        // Real run: the stale snapshot is reclaimed.
+        let real = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(real.memtable_snapshots_reclaimed, 1);
+        assert!(
+            store.head(&snap_path).await.is_err(),
+            "the superseded snapshot must be reclaimed"
+        );
+
+        // Idempotent.
+        let again = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(again.memtable_snapshots_reclaimed, 0);
+    }
+
+    /// The staleness cut is the HORIZON manifest's flushed high-water, not the
+    /// current one: a snapshot newer than what a retained older version has
+    /// flushed is kept until the horizon passes it.
+    #[tokio::test]
+    async fn sweep_keeps_memtable_snapshot_above_horizon_high_water() {
+        let store = make_store();
+        let paths = make_paths("janitor-snap-horizon");
+        let (mut session, _) = session_with_commits(&store, &paths, &["Ada"]).await;
+        // First flush: SST high-water = 1 at version v_f.
+        let v_f = session
+            .flush(person_schema())
+            .await
+            .unwrap()
+            .committed
+            .manifest
+            .version;
+        // Second row (lsn 2), snapshot at last_lsn = 2, then flush again so
+        // the CURRENT high-water (2) subsumes the snapshot but v_f's (1)
+        // does not.
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob"))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        session.write_memtable_snapshot_now().await.unwrap();
+        session.flush(person_schema()).await.unwrap();
+        let snap_path = paths.memtable_snapshot();
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let pinned = sweep_orphans(&ms, v_f, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.memtable_snapshots_reclaimed, 0,
+            "the horizon manifest has not flushed past the snapshot"
+        );
+        assert!(store.head(&snap_path).await.is_ok());
+
+        let free = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(free.memtable_snapshots_reclaimed, 1);
+        assert!(store.head(&snap_path).await.is_err());
     }
 }
