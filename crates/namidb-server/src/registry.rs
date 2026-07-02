@@ -23,7 +23,8 @@ use namidb_storage::{
     sweep_orphans, Manifest, ManifestStore, NamespacePaths, SnapshotCell, WriterSession,
 };
 use object_store::ObjectStore;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::metrics::Metrics;
@@ -158,7 +159,15 @@ impl NamespaceRegistry {
         while self.at_capacity(sessions.len()) {
             if let Some(to_evict) = self.find_idle_oldest(&sessions) {
                 tracing::info!("evicting idle namespace: {}", to_evict);
-                sessions.remove(&to_evict);
+                if let Some(evicted) = sessions.remove(&to_evict) {
+                    // Stop the namespace's flush/compaction loops so the
+                    // evicted state (writer, memtable, caches) is actually
+                    // released instead of living on as a zombie second
+                    // writer. Dropping the memtable loses nothing: acked
+                    // writes are WAL-committed before the ack, and reopen
+                    // replays the WAL.
+                    evicted.cancel_maintenance();
+                }
             } else {
                 return Err(RegistryError::AtCapacity);
             }
@@ -191,12 +200,14 @@ impl NamespaceRegistry {
             snapshot,
             last_access: std::sync::atomic::AtomicU64::new(now),
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
+            cancel_tx: watch::channel(false).0,
+            maintenance_tasks: std::sync::Mutex::new(Vec::new()),
         });
 
         // Spawn per-namespace background maintenance (flush / compaction /
         // orphan sweep) so a multi-tenant namespace is as durable and
         // read-amplification-bounded as a single-tenant process. The tasks
-        // hold their own Arc clones and run for the lifetime of the state.
+        // hold their own Arc clones and run until eviction cancels them.
         self.spawn_maintenance(Arc::clone(&state), paths);
 
         sessions.insert(namespace.to_string(), Arc::clone(&state));
@@ -212,6 +223,11 @@ impl NamespaceRegistry {
     /// mirroring the single-tenant `run()` maintenance. Each task takes its
     /// own `Arc<NamespaceState>` clone and a per-namespace `ManifestStore`
     /// (for the lock-free orphan sweep). A zero interval disables that task.
+    ///
+    /// Both loops `select!` the state's cancellation signal against the tick,
+    /// so eviction stops them promptly — even mid-sleep — while an operation
+    /// already in flight always runs to completion (the signal is only
+    /// observed between operations).
     fn spawn_maintenance(&self, state: Arc<NamespaceState>, paths: NamespacePaths) {
         let maint = self.maintenance;
         let maint_store = Arc::new(ManifestStore::new(self.store.clone(), paths));
@@ -219,14 +235,19 @@ impl NamespaceRegistry {
         // Periodic flush (+ reactive compaction on L0 high-water).
         if maint.flush_interval > Duration::ZERO {
             let s = Arc::clone(&state);
+            let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
             let ns = state.namespace.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await; // first tick fires immediately; skip
                 loop {
-                    tick.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.wait_for(|evicted| *evicted) => break,
+                        _ = tick.tick() => {}
+                    }
                     let mut w = s.writer.lock().await;
                     let schema = w.snapshot().manifest().manifest.schema.clone();
                     match w.flush(schema.clone()).await {
@@ -244,21 +265,31 @@ impl NamespaceRegistry {
                     }
                 }
             });
+            state
+                .maintenance_tasks
+                .lock()
+                .expect("maintenance handles poisoned")
+                .push(handle);
         }
 
         // Periodic compaction (L0->L1) + orphan sweep.
         if maint.compaction_interval > Duration::ZERO {
             let s = Arc::clone(&state);
+            let mut cancel = state.cancel_tx.subscribe();
             let ms = Arc::clone(&maint_store);
             let interval = maint.compaction_interval;
             let sweep_min_age = maint.sweep_min_age;
             let sweep_delete = maint.sweep_delete;
             let ns = state.namespace.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await; // first tick fires immediately; skip
                 loop {
-                    tick.tick().await;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.wait_for(|evicted| *evicted) => break,
+                        _ = tick.tick() => {}
+                    }
                     {
                         let mut w = s.writer.lock().await;
                         let schema = w.snapshot().manifest().manifest.schema.clone();
@@ -289,6 +320,11 @@ impl NamespaceRegistry {
                     }
                 }
             });
+            state
+                .maintenance_tasks
+                .lock()
+                .expect("maintenance handles poisoned")
+                .push(handle);
         }
     }
 
@@ -337,9 +373,37 @@ pub struct NamespaceState {
     /// catalog is `O(ssts)`; without this every multi-tenant read query
     /// rebuilt it from scratch.
     pub catalog_cache: CatalogCache,
+    /// Flipped to `true` when the registry evicts this namespace. The
+    /// maintenance loops `select!` over it so they exit promptly (even
+    /// mid-sleep) and drop their `Arc<Self>` clones — without it an evicted
+    /// state lived on as a zombie second writer with its memtable and caches.
+    cancel_tx: watch::Sender<bool>,
+    /// Handles of the spawned maintenance tasks, populated by
+    /// `spawn_maintenance`, so an eviction observer can await task exit
+    /// (each task finishes any in-flight flush/compaction first).
+    maintenance_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl NamespaceState {
+    /// Signal the maintenance tasks to stop. An in-flight flush or
+    /// compaction runs to completion; the loops observe the signal between
+    /// operations (and while sleeping) and then exit, releasing their
+    /// references to this state.
+    pub fn cancel_maintenance(&self) {
+        let _ = self.cancel_tx.send(true);
+    }
+
+    /// Take the maintenance task handles (empty after the first call).
+    /// They complete shortly after [`Self::cancel_maintenance`].
+    pub fn take_maintenance_handles(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(
+            &mut self
+                .maintenance_tasks
+                .lock()
+                .expect("maintenance handles poisoned"),
+        )
+    }
+
     /// Optimizer [`StatsCatalog`] for `manifest`, built once per manifest
     /// version and reused across queries until the next write bumps the
     /// version. Mirrors the single-tenant `AppState::catalog_for`.
@@ -397,5 +461,170 @@ impl IntoResponse for RegistryError {
             Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use namidb_query::{
+        execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
+        StatsCatalog,
+    };
+
+    /// Registry over a fresh in-memory store with `max_namespaces = 1` and
+    /// `idle_timeout = 0`: opening a second namespace evicts the first as
+    /// soon as it is at least one second idle (the idle clock has 1s
+    /// granularity).
+    fn evicting_registry(uri_ns: &str, maint: MaintenanceConfig) -> NamespaceRegistry {
+        let (store, _) = namidb_storage::parse_uri(&format!("memory://{uri_ns}")).unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        NamespaceRegistry::new(store, String::new(), 1, Duration::ZERO, metrics, maint)
+    }
+
+    /// Open `ns`, retrying while the current occupant ages past the idle
+    /// threshold (whole-second granularity means the first tries can hit
+    /// `AtCapacity`).
+    async fn open_evicting(reg: &NamespaceRegistry, ns: &str) -> Arc<NamespaceState> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match reg.get_or_open(ns).await {
+                Ok(state) => return state,
+                Err(RegistryError::AtCapacity) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the idle namespace was never evicted to make room for {ns}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("open {ns}: {e}"),
+            }
+        }
+    }
+
+    async fn create_person(state: &NamespaceState, name: &str) {
+        let q = format!("CREATE (:Person {{name: '{name}'}})");
+        let parsed = cypher_parse(&q).expect("parse");
+        let mut w = state.writer.lock().await;
+        let catalog = StatsCatalog::from_manifest(&w.snapshot().manifest().manifest);
+        let plan = build_plan(&parsed, &catalog).expect("plan");
+        execute_write(&plan, &mut w, &Params::new())
+            .await
+            .expect("write");
+        state.snapshot.store(w.owned_snapshot());
+    }
+
+    async fn count_persons(state: &NamespaceState) -> i64 {
+        let parsed = cypher_parse("MATCH (p:Person) RETURN count(p) AS c").expect("parse");
+        let snap = state.snapshot.load();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+        let plan = build_plan(&parsed, &catalog).expect("plan");
+        let borrowed = snap.borrow();
+        let rows = execute(&plan, &borrowed, &Params::new())
+            .await
+            .expect("read");
+        match rows.first().and_then(|r| r.get("c")) {
+            Some(RuntimeValue::Integer(n)) => *n,
+            other => panic!("unexpected count row: {other:?}"),
+        }
+    }
+
+    async fn join_with_timeout(handles: Vec<tokio::task::JoinHandle<()>>) {
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("maintenance task did not exit after eviction")
+                .expect("maintenance task panicked");
+        }
+    }
+
+    /// Eviction must stop BOTH maintenance loops (they used to run forever,
+    /// pinning the state) and release every long-lived reference to the
+    /// evicted `NamespaceState`.
+    #[tokio::test]
+    async fn eviction_stops_maintenance_and_releases_the_state() {
+        let maint = MaintenanceConfig {
+            flush_interval: Duration::from_millis(20),
+            compaction_interval: Duration::from_millis(20),
+            ..MaintenanceConfig::default()
+        };
+        let reg = evicting_registry("registry-evict-cancel", maint);
+        let acme = reg.get_or_open("acme").await.expect("open acme");
+        let handles = acme.take_maintenance_handles();
+        assert_eq!(handles.len(), 2, "flush + compaction tasks spawn");
+
+        let _beta = open_evicting(&reg, "beta").await;
+        assert_eq!(reg.len().await, 1, "acme was evicted");
+
+        // Without the cancel signal both loops spin forever and this joins
+        // time out.
+        join_with_timeout(handles).await;
+
+        // With the tasks gone and the registry entry removed, the test's
+        // clone is the only remaining reference: the writer, memtable, and
+        // caches of the evicted state are released, not leaked.
+        assert_eq!(
+            Arc::strong_count(&acme),
+            1,
+            "evicted NamespaceState is still referenced somewhere"
+        );
+    }
+
+    /// Acked writes survive evict + reopen. They are WAL-committed before
+    /// the ack, so dropping the memtable on evict loses nothing: the long
+    /// maintenance intervals here guarantee nothing was flushed to SSTs,
+    /// and reopen recovers the writes purely from WAL replay.
+    #[tokio::test]
+    async fn evicted_namespace_retains_acked_writes_on_reopen() {
+        let maint = MaintenanceConfig {
+            flush_interval: Duration::from_secs(3600),
+            compaction_interval: Duration::from_secs(3600),
+            ..MaintenanceConfig::default()
+        };
+        let reg = evicting_registry("registry-evict-durability", maint);
+        let acme = reg.get_or_open("acme").await.expect("open acme");
+        for name in ["ada", "grace", "edsger"] {
+            create_person(&acme, name).await;
+        }
+        let handles = acme.take_maintenance_handles();
+        drop(acme);
+
+        let _beta = open_evicting(&reg, "beta").await;
+        join_with_timeout(handles).await;
+
+        let reopened = open_evicting(&reg, "acme").await;
+        assert_eq!(
+            count_persons(&reopened).await,
+            3,
+            "acked writes were lost across evict/reopen"
+        );
+    }
+
+    /// After evict + reopen the new incarnation is the only writer — the
+    /// old maintenance tasks are gone, so its writes succeed with no
+    /// fencing churn from a zombie sibling.
+    #[tokio::test]
+    async fn reopened_namespace_accepts_writes_after_evict() {
+        let maint = MaintenanceConfig {
+            flush_interval: Duration::from_millis(20),
+            compaction_interval: Duration::from_millis(20),
+            ..MaintenanceConfig::default()
+        };
+        let reg = evicting_registry("registry-evict-reopen", maint);
+        let acme = reg.get_or_open("acme").await.expect("open acme");
+        create_person(&acme, "before-evict").await;
+        let handles = acme.take_maintenance_handles();
+        drop(acme);
+
+        let _beta = open_evicting(&reg, "beta").await;
+        join_with_timeout(handles).await;
+
+        let reopened = open_evicting(&reg, "acme").await;
+        create_person(&reopened, "after-evict").await;
+        assert_eq!(
+            count_persons(&reopened).await,
+            2,
+            "the reopened namespace must see the pre-evict write and accept new ones"
+        );
     }
 }
