@@ -33,10 +33,18 @@ pub const B: f64 = 0.75;
 
 /// Tokenize text into lowercased alphanumeric terms (split on non-alphanumeric
 /// runs; no stemming, no stopwords).
+///
+/// Case folding is Unicode-aware (`to_lowercase`), so `CAFÉ`, `ÜBER`, `ПРИВЕТ`
+/// fold to `café`, `über`, `привет` and match their lowercase forms. Using
+/// `to_ascii_lowercase` here left every non-ASCII capital un-folded, so
+/// case-insensitive full-text search silently failed for all non-English text.
+/// The index and the flat `bm25` scalar both call this, so they stay in exact
+/// agreement (an index built by an older binary reindexes on the next
+/// authoritative compaction).
 pub fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
+        .map(|s| s.to_lowercase())
         .collect()
 }
 
@@ -127,6 +135,15 @@ mod tests {
         assert_eq!(len, 4);
         assert_eq!(counts.get("fox").copied(), Some(3));
         assert_eq!(counts.get("bird").copied(), Some(1));
+    }
+
+    #[test]
+    fn tokenize_case_folds_non_ascii_letters() {
+        // Non-ASCII capitals must fold so case-insensitive search works for
+        // non-English text (the ASCII-only fold left É/Ü/П un-folded).
+        assert_eq!(tokenize("CAFÉ"), vec!["café"]);
+        assert_eq!(tokenize("ÜBER Über über"), vec!["über", "über", "über"]);
+        assert_eq!(tokenize("ПРИВЕТ Привет"), vec!["привет", "привет"]);
     }
 
     #[test]

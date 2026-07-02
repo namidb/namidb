@@ -572,6 +572,44 @@ async fn merge_create_path_creates_and_runs_on_create_sets() {
 }
 
 #[tokio::test]
+async fn create_with_colliding_explicit_id_errors() {
+    // CREATE must create a NEW node: an explicit `_id` that already exists must
+    // fail, not silently overwrite the existing node (a data-integrity /
+    // security hole — a client could clobber another node by its id).
+    let mut writer = WriterSession::open(store(), paths("w-id-collide"))
+        .await
+        .unwrap();
+    let nid = NodeId::new();
+    let mut params = Params::new();
+    params.insert("nid".into(), RuntimeValue::String(nid.to_string()));
+
+    let q = parse("CREATE (n:Foo {_id: $nid, name: 'first'}) RETURN n").unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    writer.commit_batch().await.unwrap();
+
+    // Second CREATE with the same _id must be rejected as a constraint error.
+    let q2 = parse("CREATE (n:Foo {_id: $nid, name: 'second'}) RETURN n").unwrap();
+    let plan2 = lower(&q2).unwrap();
+    let err = execute_write(&plan2, &mut writer, &params).await.unwrap_err();
+    assert!(
+        matches!(err, namidb_query::ExecError::Constraint(_)),
+        "expected a constraint error on id collision, got: {err:?}"
+    );
+
+    // The original node must be untouched (name still 'first').
+    writer.discard_batch();
+    let snap = writer.snapshot();
+    let stored = snap.lookup_node("Foo", nid).await.unwrap().expect("Foo present");
+    assert_eq!(
+        stored.properties.get("name"),
+        Some(&CoreValue::Str("first".into())),
+        "the existing node must not be overwritten",
+    );
+}
+
+#[tokio::test]
 async fn id_property_is_user_owned_after_reservation_lifted() {
     // Regression for Bug #1: `id` used to be reserved as the internal
     // NodeId sigil; after the rename to `_id`, `id` is just another

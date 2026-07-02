@@ -1181,7 +1181,27 @@ async fn apply_create(
                     runtime_props.insert(k.clone(), v);
                 }
                 let id = match explicit_id {
-                    Some(id) => id,
+                    Some(id) => {
+                        // CREATE must create a NEW node. With an explicit `_id`
+                        // (literal or via a `$props`-spread map) `upsert_node`
+                        // would silently OVERWRITE an existing node — a
+                        // correctness and data-integrity hole (a client could
+                        // clobber another node by supplying its id). Reject a
+                        // collision against the read-your-own-writes overlay
+                        // (committed + staged) instead.
+                        let exists = {
+                            let snap = writer.overlay_snapshot();
+                            crate::exec::walker::scan_node_for_id(&snap, id)
+                                .await?
+                                .is_some()
+                        };
+                        if exists {
+                            return Err(ExecError::Constraint(format!(
+                                "CREATE with _id {id} conflicts with an existing node"
+                            )));
+                        }
+                        id
+                    }
                     None => NodeId::new(),
                 };
                 // Enforce declared unique constraints against the
