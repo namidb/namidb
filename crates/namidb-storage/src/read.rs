@@ -546,7 +546,22 @@ impl<'mt> Snapshot<'mt> {
 
             return match winner {
                 Some((_, _, true)) => Ok(None), // tombstone-on-winner
-                Some((_, id, false)) => self.lookup_node(label, id).await,
+                Some((_, id, false)) => match self.lookup_node(label, id).await? {
+                    // Re-verify the current value: the SST sidecar maps
+                    // `value → id` as of flush time, but a later SET may have
+                    // renamed the property. If the live node no longer carries
+                    // `value`, the sidecar entry is stale — return no match so a
+                    // rename can't trigger a false unique-constraint violation
+                    // or a wrong MATCH hit. A memtable winner already matched at
+                    // its current value, so this never rejects a live match.
+                    Some(view)
+                        if matches!(view.properties.get(property),
+                            Some(namidb_core::Value::Str(s)) if s == value) =>
+                    {
+                        Ok(Some(view))
+                    }
+                    _ => Ok(None),
+                },
                 None => Ok(None), // not in any sidecar
             };
         }

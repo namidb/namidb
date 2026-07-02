@@ -372,6 +372,16 @@ impl WriterSession {
                 set.insert(edge_type.clone());
             }
         }
+        // Include edge types that only exist in the staged (uncommitted) batch,
+        // so DETACH DELETE inside the same statement/transaction enumerates —
+        // and deletes — edges of a type first introduced in that batch. Without
+        // this a same-batch `CREATE (a)-[:NEWTYPE]->(b)` survives a subsequent
+        // `DETACH DELETE a`, committing a dangling edge to a deleted node.
+        for (key, _, _) in &self.pending_payloads {
+            if let crate::memtable::MemKey::Edge { edge_type, .. } = key {
+                set.insert(edge_type.clone());
+            }
+        }
         for sst in &self.current.manifest.ssts {
             if matches!(
                 sst.kind,

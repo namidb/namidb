@@ -1343,7 +1343,26 @@ async fn apply_set(
                             )));
                         }
                     }
-                    let mut core_props = node_runtime_props_to_core(&n.properties)?;
+                    // Base the full-record rewrite on the node's CURRENT staged
+                    // property map (read-your-own-writes overlay), not the row's
+                    // clone captured at match time: two SETs to the same node in
+                    // one statement (e.g. under different aliases) would
+                    // otherwise each rewrite from their stale clone and the
+                    // earlier one's delta would be lost (last-LSN-wins). Fall
+                    // back to the row clone if the node isn't yet visible.
+                    let mut core_props = {
+                        let snap = writer.overlay_snapshot();
+                        let current = match n.labels.iter().next() {
+                            Some(label) => {
+                                snap.lookup_node(label, n.id).await.map_err(ExecError::Storage)?
+                            }
+                            None => None,
+                        };
+                        match current {
+                            Some(view) => view.properties,
+                            None => node_runtime_props_to_core(&n.properties)?,
+                        }
+                    };
                     core_props.insert(key.clone(), core);
                     // Composite uniqueness is checked against the node's full
                     // post-SET property set, excluding the node itself.

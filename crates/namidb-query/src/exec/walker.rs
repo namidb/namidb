@@ -3387,7 +3387,17 @@ async fn neighbours_of(
             }
             RelationshipDirection::Both => {
                 let mut out = snapshot.out_edges_via_sst(edge_type, node).await?.edges;
-                out.extend(snapshot.in_edges_via_sst(edge_type, node).await?.edges);
+                // A self-loop (src == dst == node) is in BOTH out and in edges;
+                // out_edges already yielded it, so drop it from the in half or
+                // an undirected match returns/counts it twice.
+                out.extend(
+                    snapshot
+                        .in_edges_via_sst(edge_type, node)
+                        .await?
+                        .edges
+                        .into_iter()
+                        .filter(|e| e.src != e.dst),
+                );
                 Ok(out)
             }
         };
@@ -3397,7 +3407,16 @@ async fn neighbours_of(
         RelationshipDirection::Left => Ok(snapshot.in_edges(edge_type, node).await?.edges),
         RelationshipDirection::Both => {
             let mut out = snapshot.out_edges(edge_type, node).await?.edges;
-            out.extend(snapshot.in_edges(edge_type, node).await?.edges);
+            // Drop self-loops from the in half — out_edges already yielded them
+            // (see the via_sst path above).
+            out.extend(
+                snapshot
+                    .in_edges(edge_type, node)
+                    .await?
+                    .edges
+                    .into_iter()
+                    .filter(|e| e.src != e.dst),
+            );
             Ok(out)
         }
     }
@@ -4698,11 +4717,18 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     .to_string(),
             )),
 
-            LogicalPlan::EdgeTypeCount { .. } => Err(ExecError::Runtime(
-                "EdgeTypeCount is a non-factorised leaf and cannot appear inside a \
-                 factorised (MultiwayJoin) plan"
-                    .to_string(),
-            )),
+            LogicalPlan::EdgeTypeCount { edge_types, output } => {
+                // Same per-type sum as the flat path. The edge-count pushdown
+                // pass runs unconditionally in optimize(), so this leaf reaches
+                // the factor executor too; erroring here regressed a common
+                // `RETURN count(r)` query for every NAMIDB_FACTORIZE=1 deployment.
+                let mut total: i64 = 0;
+                for et in edge_types {
+                    total += snapshot.count_edge_type(et).await? as i64;
+                }
+                Ok(FactorRowSet::from_flat(vec![Row::new()
+                    .with(output.clone(), RuntimeValue::Integer(total))]))
+            }
 
             LogicalPlan::MultiwayJoin {
                 vars,

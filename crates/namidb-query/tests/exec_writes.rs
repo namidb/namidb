@@ -572,6 +572,36 @@ async fn merge_create_path_creates_and_runs_on_create_sets() {
 }
 
 #[tokio::test]
+async fn two_sets_to_same_node_via_different_aliases_both_persist() {
+    // MATCH (a) MATCH (b) binding the same node, SET a.c=1 SET b.d=2 must keep
+    // BOTH properties. The second SET must rebuild from the node's current
+    // staged state (with c=1), not from a stale match-time clone (which loses c).
+    let mut writer = WriterSession::open(store(), paths("w-set-alias"))
+        .await
+        .unwrap();
+    let nid = NodeId::new();
+    let mut params = Params::new();
+    params.insert("nid".into(), RuntimeValue::String(nid.to_string()));
+    let q0 = parse("CREATE (n:P {_id: $nid, k: 1}) RETURN n").unwrap();
+    execute_write(&lower(&q0).unwrap(), &mut writer, &params).await.unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let q = parse(
+        "MATCH (a:P {k:1}) MATCH (b:P {k:1}) SET a.c = 1 SET b.d = 2 RETURN a",
+    )
+    .unwrap();
+    execute_write(&lower(&q).unwrap(), &mut writer, &Params::new())
+        .await
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let snap = writer.snapshot();
+    let stored = snap.lookup_node("P", nid).await.unwrap().expect("P present");
+    assert_eq!(stored.properties.get("c"), Some(&CoreValue::I64(1)), "c must survive");
+    assert_eq!(stored.properties.get("d"), Some(&CoreValue::I64(2)), "d must survive");
+}
+
+#[tokio::test]
 async fn create_with_colliding_explicit_id_errors() {
     // CREATE must create a NEW node: an explicit `_id` that already exists must
     // fail, not silently overwrite the existing node (a data-integrity /

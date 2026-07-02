@@ -307,6 +307,34 @@ async fn zero_hop_expand_enforces_target_labels() {
 }
 
 #[tokio::test]
+async fn undirected_self_loop_is_returned_once() {
+    // An undirected match over a self-loop must return it ONCE (Neo4j
+    // semantics), not twice: the self-loop appears in both out_edges and
+    // in_edges, so the Both path must dedupe it.
+    let mut writer = WriterSession::open(store(), paths("exec-self-loop"))
+        .await
+        .unwrap();
+    let alice = NodeId::new();
+    writer
+        .upsert_node("Person", alice, &person("Alice", 30))
+        .unwrap();
+    writer.upsert_edge("KNOWS", alice, alice, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let q = parse("MATCH (a:Person)-[r:KNOWS]-(b) RETURN b.name AS name").unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1, "self-loop must yield exactly one undirected row");
+
+    // count(*) over the undirected pattern must be 1, not 2.
+    let qc = parse("MATCH (a:Person)-[r:KNOWS]-(b) RETURN count(*) AS c").unwrap();
+    let planc = lower(&qc).unwrap();
+    let rowsc = execute(&planc, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rowsc[0].get("c"), Some(&RuntimeValue::Integer(1)));
+}
+
+#[tokio::test]
 async fn var_length_expand_does_not_reuse_a_relationship() {
     // Cypher relationship uniqueness (trail semantics): a relationship may
     // appear at most once in a matched path. Minimal graph: a single edge
