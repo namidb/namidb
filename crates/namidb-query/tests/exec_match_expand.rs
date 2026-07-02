@@ -230,6 +230,41 @@ async fn return_distinct_with_limit_dedupes_before_limiting() {
 }
 
 #[tokio::test]
+async fn return_distinct_order_by_pre_projection_var_without_limit() {
+    // With DISTINCT but no SKIP/LIMIT, ORDER BY may reference a pre-projection
+    // expression (`b.name`, referencing the pre-projection variable `b`) that
+    // is only exposed under an alias. Dedup and ordering commute here, so the
+    // legacy layout is kept and this must not error — the regression the MCP
+    // `notes_by_tag`/tag-graph tools hit when the reorder was unconditional.
+    let mut writer = WriterSession::open(store(), paths("exec-distinct-orderby"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+         RETURN DISTINCT b.name AS name ORDER BY b.name",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    // Must not error (the reorder would have dropped `b`); the distinct KNOWS
+    // targets are exactly {Alice, Bob, Carol, Dave, Eve}. (Deduped-result
+    // ordering is a separate, pre-existing concern of `dedup_rows`; this test
+    // fixes only the no-error + correct-set guarantee of the reorder change.)
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let mut names: Vec<&str> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(s)) => s.as_str(),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice", "Bob", "Carol", "Dave", "Eve"]);
+}
+
+#[tokio::test]
 async fn zero_hop_expand_enforces_target_labels() {
     // `(a)-[:R*0..1]->(x:Label)` binds the source as `x` at hop 0 only if the
     // source carries every target label. A Person that is not a City must not

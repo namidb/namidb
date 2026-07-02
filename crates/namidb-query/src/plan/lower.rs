@@ -1513,43 +1513,48 @@ fn lower_projection(
         })
         .collect();
 
-    let has_topn = !order_keys.is_empty()
-        || skip_rc != RowCount::Const(0)
-        || limit_rc != RowCount::Const(u64::MAX);
+    let has_limit_or_skip =
+        skip_rc != RowCount::Const(0) || limit_rc != RowCount::Const(u64::MAX);
+    let has_topn = !order_keys.is_empty() || has_limit_or_skip;
 
-    if distinct && !has_aggs {
+    if distinct && !has_aggs && has_limit_or_skip {
         // Cypher DISTINCT semantics: project → dedupe → order → skip/limit. The
         // dedup must run BEFORE skip/limit. Stacking TopN under Project (the
         // non-distinct layout below) truncates to `limit` rows and only THEN
         // dedupes, under-returning whenever the pre-dedup stream has duplicates
         // (`UNWIND [1,1,1,2,3] AS x RETURN DISTINCT x LIMIT 2` returned [1], not
         // [1,2]). So build Project{distinct} first and wrap it in TopN.
+        //
+        // Only when a SKIP/LIMIT is actually present: for a bare `ORDER BY`
+        // (no skip/limit) dedupe and ordering commute, so the legacy layout
+        // below is already correct AND still lets ORDER BY reference a
+        // pre-projection variable (e.g. `RETURN DISTINCT n.title AS title
+        // ORDER BY n.title`) — which this reordered layout cannot, since those
+        // bindings are gone after the projection.
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             items: projection_items,
             distinct,
             discard_input_bindings,
         };
-        if has_topn {
-            // After DISTINCT the pre-projection bindings are gone, so ORDER BY
-            // may only reference the projected output columns — keep alias
-            // references as variables on the deduped row rather than
-            // substituting them back to their (now absent) free variables.
-            let all_aliases: BTreeSet<String> = aliases.iter().cloned().collect();
-            let order_keys_over_output: Vec<OrderKey> = order_by
-                .iter()
-                .map(|k| OrderKey {
-                    expression: substitute_aliases(&k.expression, &alias_map, &all_aliases),
-                    direction: k.direction,
-                })
-                .collect();
-            plan = LogicalPlan::TopN {
-                input: Box::new(plan),
-                keys: order_keys_over_output,
-                skip: skip_rc,
-                limit: limit_rc,
-            };
-        }
+        // After DISTINCT the pre-projection bindings are gone, so ORDER BY may
+        // only reference the projected output columns — keep alias references
+        // as variables on the deduped row rather than substituting them back to
+        // their (now absent) free variables.
+        let all_aliases: BTreeSet<String> = aliases.iter().cloned().collect();
+        let order_keys_over_output: Vec<OrderKey> = order_by
+            .iter()
+            .map(|k| OrderKey {
+                expression: substitute_aliases(&k.expression, &alias_map, &all_aliases),
+                direction: k.direction,
+            })
+            .collect();
+        plan = LogicalPlan::TopN {
+            input: Box::new(plan),
+            keys: order_keys_over_output,
+            skip: skip_rc,
+            limit: limit_rc,
+        };
     } else {
         if has_topn {
             plan = LogicalPlan::TopN {

@@ -512,19 +512,21 @@ fn compare(a: &RuntimeValue, b: &RuntimeValue) -> Option<Ordering> {
 /// Public comparator used by Sort/TopN. Returns `Ordering::Equal` for
 /// uncomparable values to preserve input order (stable sort).
 pub fn order_for_sort(a: &RuntimeValue, b: &RuntimeValue, direction_desc: bool) -> Ordering {
-    // NULL sorts last by default (Cypher semantics).
-    match (a.is_null(), b.is_null()) {
+    // Cypher orders NULL as larger than any value, so it appears LAST in
+    // ascending order and FIRST in descending order. Fold the null handling
+    // into the base comparison so the direction reversal applies to it
+    // uniformly — previously NULL was forced last in BOTH directions because
+    // the null check ran before the reversal.
+    let base = match (a.is_null(), b.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => {
-            let o = compare(a, b).unwrap_or(Ordering::Equal);
-            if direction_desc {
-                o.reverse()
-            } else {
-                o
-            }
-        }
+        (false, false) => compare(a, b).unwrap_or(Ordering::Equal),
+    };
+    if direction_desc {
+        base.reverse()
+    } else {
+        base
     }
 }
 
@@ -1628,6 +1630,21 @@ mod tests {
             eval_str("1 < 2.5", &Row::new(), &Params::new()),
             RuntimeValue::Bool(true)
         );
+    }
+
+    #[test]
+    fn null_sorts_last_ascending_first_descending() {
+        let n = RuntimeValue::Null;
+        let v = RuntimeValue::Integer(1);
+        // Ascending: NULL is the larger value → sorts after non-null.
+        assert_eq!(order_for_sort(&n, &v, false), Ordering::Greater);
+        assert_eq!(order_for_sort(&v, &n, false), Ordering::Less);
+        // Descending: reversed → NULL sorts before non-null (first).
+        assert_eq!(order_for_sort(&n, &v, true), Ordering::Less);
+        assert_eq!(order_for_sort(&v, &n, true), Ordering::Greater);
+        // Two nulls tie in both directions.
+        assert_eq!(order_for_sort(&n, &n, false), Ordering::Equal);
+        assert_eq!(order_for_sort(&n, &n, true), Ordering::Equal);
     }
 
     #[test]
