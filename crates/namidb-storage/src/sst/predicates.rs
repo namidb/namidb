@@ -149,7 +149,19 @@ pub fn eval_row_group(predicate: &ScanPredicate, stats: &PropertyColumnStats) ->
         },
 
         P::IsNull { .. } => {
-            if stats.null_count > 0 {
+            // `null_count > 0` proves some row is null. But `null_count == 0`
+            // alone does NOT prove the column is fully populated:
+            // `PropertyColumnStats::empty` — used for a predicate column that is
+            // undeclared in this SST's schema, or a chunk with no statistics —
+            // also reports 0 with no min/max. For an id-primary node store an
+            // ABSENT property is a Cypher NULL that `IS NULL` must match, so
+            // pruning those row groups silently dropped every matching flushed
+            // row. Only prune when we have positive evidence the column was
+            // populated with non-null values (a min or max is present); with no
+            // such evidence, stay `MaybePresent` and let the row-level Filter
+            // decide (honouring `synthesize_property_stats`' documented "empty
+            // ⇒ MaybePresent" contract).
+            if stats.null_count > 0 || (stats.min.is_none() && stats.max.is_none()) {
                 MaybePresent
             } else {
                 Absent
@@ -540,6 +552,20 @@ mod tests {
             column: "age".into(),
         };
         assert_eq!(eval_row_group(&p, &s), RowGroupVerdict::Absent);
+    }
+
+    #[test]
+    fn is_null_on_empty_stats_is_maybe_present_not_absent() {
+        // Regression: an undeclared/unresolved column (or a chunk without
+        // statistics) yields `PropertyColumnStats::empty` — null_count 0 and no
+        // min/max. For an id-primary node store an absent property is a Cypher
+        // NULL, so `IS NULL` must NOT prune such a row group (it previously did,
+        // dropping every flushed matching row).
+        let s = PropertyColumnStats::empty("age");
+        let p = ScanPredicate::IsNull {
+            column: "age".into(),
+        };
+        assert_eq!(eval_row_group(&p, &s), RowGroupVerdict::MaybePresent);
     }
 
     #[test]

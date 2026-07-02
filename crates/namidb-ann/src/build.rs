@@ -106,7 +106,15 @@ pub fn robust_prune<S: VectorSpace>(
         for j in (i + 1)..candidates.len() {
             let (d_anchor_pp, p_pp) = candidates[j];
             let d_star_pp = space.pair_distance(p_star, p_pp);
-            if alpha * d_star_pp <= d_anchor_pp {
+            // Occlude p'' when the already-kept p_star reaches its region more
+            // directly (`α·d(p_star,p'') ≤ d(anchor,p'')`) — EXCEPT when p'' is
+            // an exact duplicate of p_star (`d(p_star,p'') == 0`). A zero
+            // distance makes the test `0 ≤ d_anchor_pp` trivially true, so a
+            // duplicate is occluded out of every neighbour list its twin
+            // appears in and becomes unreachable — a query that exactly matches
+            // it then can't retrieve it. Keeping duplicates linked costs a
+            // little list diversity but restores their reachability.
+            if d_star_pp > 0.0 && alpha * d_star_pp <= d_anchor_pp {
                 // redundant — drop (don't copy forward)
             } else {
                 candidates[write] = candidates[j];
@@ -450,6 +458,40 @@ mod tests {
         let out = robust_prune(&space, 0, cands, 1.0, 2);
         assert!(out.len() <= 2);
         assert!(!out.contains(&0), "anchor must be excluded");
+    }
+
+    #[test]
+    fn duplicate_vectors_stay_reachable() {
+        // Exact duplicates must remain retrievable: a query matching them
+        // should return every copy, not just one. Before the fix, robust_prune
+        // occluded a duplicate out of every neighbour list its twin appeared
+        // in, so the copies were unreachable and recall on them collapsed.
+        // 3 identical vectors + 3 distinct ones; query the duplicated point.
+        let dup = vec![1.0f32, 0.0, 0.0];
+        let space = F32CosineSpace::new(vec![
+            dup.clone(),
+            dup.clone(),
+            dup.clone(),
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.5, 0.5, 0.0],
+        ]);
+        let params = BuildParams {
+            r: 4,
+            l_build: 8,
+            alpha: 1.2,
+            init: InitStrategy::BruteForce,
+        };
+        let g = build(&space, params, &mut ChaCha8Rng::seed_from_u64(11));
+        // Ask for the 3 nearest to the duplicated direction: all three copies
+        // (ids 0,1,2) must come back, each at distance ~0.
+        let hits = search(&space, &g, &dup, 3, 8);
+        let ids: std::collections::HashSet<u32> = hits.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            [0u32, 1, 2].into_iter().collect(),
+            "all three duplicate copies must be reachable, got {hits:?}"
+        );
     }
 
     #[test]
