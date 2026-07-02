@@ -174,9 +174,12 @@ struct Cli {
 
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error
-    /// instead of risking an out-of-memory blow-up. Set to `0` to allow read
-    /// queries to materialise without limit.
-    #[arg(long, env = "NAMIDB_QUERY_ROW_CAP", default_value_t = 0)]
+    /// instead of risking an out-of-memory blow-up. Defaults to 1,000,000 — a
+    /// backstop against a runaway cross-product or full scan OOMing the whole
+    /// process (results are buffered, not streamed), high enough that ordinary
+    /// queries never hit it. Raise it for genuinely large result sets, or set
+    /// `0` to allow read queries to materialise without limit.
+    #[arg(long, env = "NAMIDB_QUERY_ROW_CAP", default_value_t = 1_000_000)]
     query_row_cap: usize,
 
     /// L0-count high-water mark per bucket that triggers a compaction as
