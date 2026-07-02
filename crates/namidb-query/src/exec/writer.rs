@@ -29,7 +29,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use namidb_core::id::NodeId;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, WriterSession};
+use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, UniqueProbe, WriterSession};
 
 use super::expr::{evaluate, Params};
 use super::row::Row;
@@ -743,11 +743,12 @@ fn apply_spread_properties(
 /// read-your-own-writes overlay (RFC-026), so a value staged earlier in the
 /// same uncommitted statement/transaction is seen too.
 ///
-/// A string value uses the `O(log N)` property index. Any other type falls
-/// back to a label scan and a typed-value compare, because the persisted
-/// property index keys on strings; this enforces non-string unique
-/// constraints correctly, at a scan's cost per check (a typed index is a
-/// later optimisation).
+/// Scalar values (strings, integers, floats, bools, dates, bytes) probe the
+/// writer's transactional unique-value index: one label scan populates it,
+/// then every check is O(1) and staged upserts/tombstones keep it current —
+/// a constraint-bearing bulk write no longer re-scans the label per row.
+/// Values without a canonical scalar encoding fall back to the label scan
+/// with a typed-value compare, which is the source of truth.
 async fn find_unique_conflict(
     writer: &WriterSession,
     label: &str,
@@ -755,30 +756,29 @@ async fn find_unique_conflict(
     value: &CoreValue,
     exclude: Option<NodeId>,
 ) -> Result<Option<NodeId>, ExecError> {
-    let snap = writer.overlay_snapshot();
-    let conflict = match value {
-        CoreValue::Str(v) => snap
-            .lookup_node_by_property(label, prop, v)
-            .await
-            .map_err(ExecError::Storage)?
-            .map(|node| node.id)
-            .filter(|id| Some(*id) != exclude),
-        other => {
+    match writer
+        .unique_probe(label, &[(prop, value)], exclude)
+        .await
+        .map_err(ExecError::Storage)?
+    {
+        UniqueProbe::Conflict(id) => Ok(Some(id)),
+        UniqueProbe::NoConflict => Ok(None),
+        UniqueProbe::Unindexable => {
+            let snap = writer.overlay_snapshot();
             let mut found = None;
             for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
                 if Some(node.id) == exclude {
                     continue;
                 }
-                if node.properties.get(prop) == Some(other) {
+                if node.properties.get(prop) == Some(value) {
                     found = Some(node.id);
                     break;
                 }
             }
-            found
+            drop(snap);
+            Ok(found)
         }
-    };
-    drop(snap);
-    Ok(conflict)
+    }
 }
 
 /// Enforce declared unique constraints for a node about to be created. Each
@@ -848,7 +848,7 @@ pub async fn enforce_node_unique_constraints(
 /// If `key` is a declared unique property on any of the node's labels and a
 /// different node already holds `value`, reject. Setting the node's own
 /// current value (self-update) is allowed. Values of any type are checked;
-/// see [`find_unique_conflict`] for how string vs non-string is resolved.
+/// see [`find_unique_conflict`] for how scalar vs non-scalar is resolved.
 async fn enforce_unique_on_set(
     writer: &WriterSession,
     labels: &[String],
@@ -888,29 +888,43 @@ async fn enforce_unique_on_set(
 }
 
 /// Find a node, other than `exclude`, that already holds the same value for
-/// EVERY property in `props` — a composite-uniqueness conflict. Scans the
-/// label against the read-your-own-writes overlay (RFC-026); the scan IS the
-/// source of truth, so it cannot drift from a sidecar index. `props` is assumed
-/// complete (every value present and non-null), which the caller guarantees.
+/// EVERY property in `props` — a composite-uniqueness conflict. All-scalar
+/// tuples probe the writer's transactional unique-value index (one label
+/// scan to populate, O(1) per check thereafter); tuples containing a
+/// non-scalar value scan the label against the read-your-own-writes overlay
+/// (RFC-026) — the scan IS the source of truth, so the index cannot drift
+/// from it. `props` is assumed complete (every value present and non-null),
+/// which the caller guarantees.
 async fn find_composite_conflict(
     writer: &WriterSession,
     label: &str,
     props: &[(String, CoreValue)],
     exclude: Option<NodeId>,
 ) -> Result<Option<NodeId>, ExecError> {
-    let snap = writer.overlay_snapshot();
-    let mut found = None;
-    for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
-        if Some(node.id) == exclude {
-            continue;
-        }
-        if props.iter().all(|(k, v)| node.properties.get(k) == Some(v)) {
-            found = Some(node.id);
-            break;
+    let pairs: Vec<(&str, &CoreValue)> = props.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    match writer
+        .unique_probe(label, &pairs, exclude)
+        .await
+        .map_err(ExecError::Storage)?
+    {
+        UniqueProbe::Conflict(id) => Ok(Some(id)),
+        UniqueProbe::NoConflict => Ok(None),
+        UniqueProbe::Unindexable => {
+            let snap = writer.overlay_snapshot();
+            let mut found = None;
+            for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
+                if Some(node.id) == exclude {
+                    continue;
+                }
+                if props.iter().all(|(k, v)| node.properties.get(k) == Some(v)) {
+                    found = Some(node.id);
+                    break;
+                }
+            }
+            drop(snap);
+            Ok(found)
         }
     }
-    drop(snap);
-    Ok(found)
 }
 
 /// Enforce declared COMPOSITE uniqueness constraints (two or more properties)

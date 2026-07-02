@@ -1759,3 +1759,212 @@ async fn composite_unique_add_label_rejects_collision() {
     write_q(&mut writer, "CREATE (:Tmp {a: 9, b: 9})").await;
     write_q(&mut writer, "MATCH (x:Tmp {a: 9}) SET x:Person").await;
 }
+
+// ─────────────── unique-constraint fast path (finding 37) ───────────────
+//
+// Uniqueness checks must probe the writer's transactional unique-value
+// index — one label scan per (label, property-set) per batch, O(1) per row
+// after that — instead of re-scanning the label for every written row. The
+// tests below assert the path taken via the writer's index counters, per
+// the parity-test invariant (equal results alone are trivially satisfied
+// by the scan fallback).
+
+#[tokio::test]
+async fn string_unique_checks_probe_index_once_in_multi_label_deployment() {
+    // Multi-label deployment: an unrelated label's SST used to demote the
+    // string fast path to a full label scan per written row.
+    let mut writer = WriterSession::open(store(), paths("w-unique-idx-multilabel"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Widget {sku: 'w-1'})").await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("email", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    // Persist the schema AND put the Widget rows into an SST.
+    writer.flush(schema).await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let outcome = write_q(
+        &mut writer,
+        "CREATE (:Account {email: 'a@x'}), (:Account {email: 'b@x'}), \
+         (:Account {email: 'c@x'})",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 3);
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "one populating scan for the whole statement, not one per row"
+    );
+    assert!(
+        writer.unique_index().probes() >= 3,
+        "every row's check must go through the index probe"
+    );
+
+    // Conflict against a committed value still surfaces through the index.
+    let plan = lower(&parse("CREATE (:Account {email: 'a@x'})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate string unique value must be rejected");
+    assert!(format!("{err:?}").contains("unique"), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn integer_unique_checks_probe_index_conflict_and_non_conflict() {
+    let mut writer = WriterSession::open(store(), paths("w-unique-idx-int"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 1})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    // Non-conflict: a fresh value is accepted through the index probe.
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    write_q(&mut writer, "CREATE (:Account {account_no: 2})").await;
+    assert_eq!(writer.unique_index().populate_scans() - scans_before, 1);
+    assert!(writer.unique_index().probes() > probes_before);
+
+    // Conflict: a duplicate integer is rejected through the index probe.
+    let probes_before = writer.unique_index().probes();
+    let plan = lower(&parse("CREATE (:Account {account_no: 1})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate integer unique value must be rejected");
+    assert!(format!("{err:?}").contains("unique"), "got: {err:?}");
+    assert!(
+        writer.unique_index().probes() > probes_before,
+        "the conflict must be found by an index probe, not a scan"
+    );
+}
+
+#[tokio::test]
+async fn composite_unique_checks_probe_index_conflict_and_non_conflict() {
+    let mut writer = WriterSession::open(store(), paths("w-unique-idx-composite"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Person {name: 'Ann', age: 30})").await;
+    let props = vec!["name".to_string(), "age".to_string()];
+    writer
+        .create_unique_constraint_named(None, "Person", &props, false)
+        .await
+        .unwrap();
+
+    // Non-conflict: same name, different age — one scan, probed per row.
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    let outcome = write_q(
+        &mut writer,
+        "CREATE (:Person {name: 'Ann', age: 31}), (:Person {name: 'Bob', age: 30})",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 2);
+    assert_eq!(writer.unique_index().populate_scans() - scans_before, 1);
+    assert!(writer.unique_index().probes() >= probes_before + 2);
+
+    // Conflict: the exact committed tuple is rejected through the probe.
+    let probes_before = writer.unique_index().probes();
+    let plan = lower(&parse("CREATE (:Person {name: 'Ann', age: 30})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate composite tuple must be rejected");
+    assert!(
+        format!("{err:?}").contains("composite unique"),
+        "got: {err:?}"
+    );
+    assert!(writer.unique_index().probes() > probes_before);
+}
+
+#[tokio::test]
+async fn set_can_reuse_unique_value_freed_earlier_in_same_batch() {
+    // RYOW inside one uncommitted transaction: a SET that moves a node off
+    // its unique value frees it for a later SET in the same batch; the
+    // check sees the staged state, not the committed one.
+    let mut writer = WriterSession::open(store(), paths("w-unique-ryow-freed"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 1})").await;
+    write_q(&mut writer, "CREATE (:Account {account_no: 2})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    // Statement 1 (staged, uncommitted): account 1 → 3, freeing value 1.
+    let plan = lower(&parse("MATCH (a:Account {account_no: 1}) SET a.account_no = 3").unwrap())
+        .unwrap();
+    execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    // Statement 2 (same batch): account 2 → 1 must be allowed, because the
+    // staged statement above freed the value.
+    let plan = lower(&parse("MATCH (a:Account {account_no: 2}) SET a.account_no = 1").unwrap())
+        .unwrap();
+    execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .expect("value freed earlier in the batch must be reusable");
+    writer.commit_batch().await.unwrap();
+
+    let snap = writer.snapshot();
+    let mut values: Vec<i64> = snap
+        .scan_label("Account")
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|v| match v.properties.get("account_no") {
+            Some(CoreValue::I64(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 3]);
+
+    // Negative control: moving onto a value that is STILL held is rejected.
+    let plan = lower(&parse("MATCH (a:Account {account_no: 3}) SET a.account_no = 1").unwrap())
+        .unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("value still held by another node must be rejected");
+    assert!(format!("{err:?}").contains("unique"), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn bulk_create_under_unique_constraint_pays_one_scan_not_one_per_row() {
+    // Smoke test for the O(N²) fix: 2k rows under a unique constraint in a
+    // single statement must populate the index once and probe per row. The
+    // wall-clock bound is a coarse sanity net, not a benchmark.
+    let mut writer = WriterSession::open(store(), paths("w-unique-bulk"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 0})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let started = std::time::Instant::now();
+    let outcome = write_q(
+        &mut writer,
+        "UNWIND range(1, 2000) AS i CREATE (:Account {account_no: i})",
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.nodes_created, 2000);
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "bulk write must not re-scan the label per row"
+    );
+    assert!(writer.unique_index().probes() >= 2000);
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "2k constrained creates took {elapsed:?}"
+    );
+
+    // The constraint still holds after the bulk load.
+    let plan = lower(&parse("CREATE (:Account {account_no: 1234})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("duplicate after bulk load must be rejected");
+    assert!(format!("{err:?}").contains("unique"), "got: {err:?}");
+}

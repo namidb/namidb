@@ -35,6 +35,7 @@ pub mod read;
 pub mod recovery;
 pub mod sst;
 pub mod text;
+pub mod unique_index;
 pub mod uri;
 pub mod wal;
 
@@ -80,5 +81,6 @@ pub use sst::{
     EdgeSstReader, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions, NodeSstReader, NodeSstWriter,
     NodeSstWriterOptions, PropertyColumnStats, StatScalar,
 };
+pub use unique_index::UniqueProbe;
 pub use uri::{parse_uri, UriError};
 pub use wal::{WalRecord, WalSegment, WalSegmentRef, WalStore};

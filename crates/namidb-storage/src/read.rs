@@ -66,7 +66,7 @@ use crate::adjacency::{
 use crate::cache::{EdgeStreamBundle, SstCache};
 use crate::error::{Error, Result};
 use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
-use crate::manifest::{LoadedManifest, SstDescriptor, SstKind};
+use crate::manifest::{LoadedManifest, Manifest, SstDescriptor, SstKind};
 use crate::memtable::{MemEntry, MemKey, MemOp, MemtableSnapshot};
 use crate::node_cache::{NodeCacheKey, NodeViewCache};
 use crate::paths::NamespacePaths;
@@ -439,8 +439,20 @@ impl<'mt> Snapshot<'mt> {
         // every candidate SST carries the sidecar for `property`, we
         // can resolve the lookup with one bincode decode per SST
         // instead of a full label scan.
-        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
-        let all_have_sidecar = !sst_idxs.is_empty()
+        //
+        // "Candidate" is scoped to SSTs that can actually contain a live
+        // row of `label`: an unrelated label's SST lacking the sidecar must
+        // not demote this label's lookups to a full scan (previously any
+        // multi-label deployment degraded this way). Excluded SSTs cannot
+        // contribute a live match, and their tombstones still apply at
+        // confirm time via `lookup_node`, which consults every SST.
+        let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        let have_node_ssts = !node_sst_idxs.is_empty();
+        let sst_idxs: Vec<usize> = node_sst_idxs
+            .into_iter()
+            .filter(|i| node_sst_can_contain_label(&self.manifest.manifest, *i, label))
+            .collect();
+        let all_have_sidecar = have_node_ssts
             && sst_idxs.iter().all(|i| {
                 self.manifest.manifest.ssts[*i]
                     .unique_property_indices
@@ -616,8 +628,16 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Vec<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property");
 
-        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
-        let all_have_sidecar = !sst_idxs.is_empty()
+        // Same label scoping as `lookup_node_by_property`: only SSTs that
+        // can contain a live row of `label` need the sidecar; the rest can
+        // contribute no posting and must not disable the fast path.
+        let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        let have_node_ssts = !node_sst_idxs.is_empty();
+        let sst_idxs: Vec<usize> = node_sst_idxs
+            .into_iter()
+            .filter(|i| node_sst_can_contain_label(&self.manifest.manifest, *i, label))
+            .collect();
+        let all_have_sidecar = have_node_ssts
             && sst_idxs.iter().all(|i| {
                 self.manifest.manifest.ssts[*i]
                     .equality_property_indices
@@ -2781,6 +2801,42 @@ fn record_carries_label(rec: &NodeWriteRecord, label: &str, dict: &LabelDictiona
     dict.id(label)
         .map(|lid| rec.labels.contains(&lid.get()))
         .unwrap_or(false)
+}
+
+/// Whether the node SST at `idx` can contain a LIVE row carrying `label`.
+///
+/// Scopes the sidecar-completeness checks in `lookup_node_by_property` /
+/// `lookup_nodes_by_property`: an SST that provably holds no row of `label`
+/// must not disable a sidecar fast path it could never contribute to.
+/// Conservative — answers `true` unless the manifest proves absence:
+///
+/// - Legacy per-label SSTs name their single label as `scope`; a different
+///   label's SST cannot contain this one's rows.
+/// - id-primary SSTs (`scope == ""`) carry per-label posting counts in their
+///   label-index descriptor (live rows only): a label with no postings — or
+///   one the namespace dictionary never interned — has no live row in the
+///   SST. Pre-counts manifests (`per_label_counts` empty) and pre-label-index
+///   SSTs stay `true`.
+///
+/// Excluding tombstone-only coverage is safe: sidecar winners are re-confirmed
+/// through `lookup_node`, which resolves last-LSN-wins across EVERY SST.
+fn node_sst_can_contain_label(manifest: &Manifest, idx: usize, label: &str) -> bool {
+    let desc = &manifest.ssts[idx];
+    if !desc.scope.is_empty() {
+        return desc.scope == label;
+    }
+    if let Some(li) = &desc.label_index {
+        if !li.per_label_counts.is_empty() {
+            return match manifest.label_dict.id(label) {
+                Some(lid) => li
+                    .per_label_counts
+                    .iter()
+                    .any(|(id, count)| *id == lid.get() && *count > 0),
+                None => false,
+            };
+        }
+    }
+    true
 }
 
 /// Decode an embedding property value to `Vec<f32>` for a vector delta scan:
@@ -5450,5 +5506,278 @@ mod tests {
 
         reg.release(7);
         assert_eq!(reg.min_live(), None, "no live readers");
+    }
+
+    /// Node payload carrying one string property under an explicit label id.
+    fn coded_node_payload(prop: &str, value: &str, label_id: u32) -> Bytes {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        props.insert(prop.into(), Value::Str(value.into()));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            labels: vec![label_id],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unique_sidecar_fast_path_is_scoped_to_the_labels_ssts() {
+        // Regression (finding 37): the sidecar-completeness check used to run
+        // over EVERY node SST, so a different label's SST lacking an unrelated
+        // sidecar demoted the lookup to a full label scan in any multi-label
+        // deployment. The check must be scoped to SSTs that can contain the
+        // label being probed.
+        let store = make_store();
+        let paths = make_paths("sidecar-scope");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let account_lid = base.manifest.label_dict.intern("Account").get();
+        let widget_lid = base.manifest.label_dict.intern("Widget").get();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().build();
+
+        // Flush 1: two Account rows carrying the unique property `code`.
+        let a1 = sorted_node_id(1);
+        let a2 = sorted_node_id(2);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: a1 },
+            10,
+            MemOp::Upsert(coded_node_payload("code", "a-1", account_lid)),
+        );
+        mt.apply(
+            MemKey::Node { id: a2 },
+            11,
+            MemOp::Upsert(coded_node_payload("code", "a-2", account_lid)),
+        );
+        let out1 = flush(&ms, &fence, &base, &mt.freeze(), schema.clone())
+            .await
+            .unwrap();
+
+        // Flush 2: one Widget row WITHOUT `code` — its SST carries no
+        // sidecar for the property (and never could).
+        let w1 = sorted_node_id(3);
+        let mut mt2 = Memtable::new();
+        mt2.apply(
+            MemKey::Node { id: w1 },
+            12,
+            MemOp::Upsert(coded_node_payload("sku", "w-1", widget_lid)),
+        );
+        let out2 = flush(&ms, &fence, &out1.committed, &mt2.freeze(), schema)
+            .await
+            .unwrap();
+
+        // Attach a unique-property sidecar to the Account SST, exactly as a
+        // per-label build would have emitted it (the id-primary flush path
+        // does not): a bincode `value → NodeId` map next to the body.
+        let mut committed = out2.committed.clone();
+        let account_sst = committed
+            .manifest
+            .ssts
+            .iter()
+            .position(|d| {
+                d.kind == SstKind::Nodes
+                    && d.label_index.as_ref().is_some_and(|li| {
+                        li.per_label_counts
+                            .iter()
+                            .any(|(id, c)| *id == account_lid && *c > 0)
+                    })
+            })
+            .expect("Account SST present");
+        let mut sidecar: BTreeMap<String, [u8; 16]> = BTreeMap::new();
+        sidecar.insert("a-1".into(), *a1.as_bytes());
+        sidecar.insert("a-2".into(), *a2.as_bytes());
+        let body = Bytes::from(bincode::serialize(&sidecar).unwrap());
+        let relative = "sst/L0/fabricated.idx_code.bin".to_string();
+        let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), relative);
+        store
+            .put(&object_store::path::Path::from(absolute), body.clone().into())
+            .await
+            .unwrap();
+        committed.manifest.ssts[account_sst].unique_property_indices.push(
+            crate::manifest::UniquePropertyIndexDescriptor {
+                property: "code".into(),
+                path: relative,
+                size_bytes: body.len() as u64,
+                entry_count: 2,
+            },
+        );
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let cache = Arc::new(crate::property_index::PropertyIndexCache::new());
+        let snap = Snapshot::new(committed, &empty_view, store.clone(), paths.clone())
+            .with_property_index_cache(cache.clone());
+
+        // The lookup resolves through the sidecar even though the Widget SST
+        // has none for `code`.
+        let hit = snap
+            .lookup_node_by_property("Account", "code", "a-2")
+            .await
+            .unwrap();
+        assert_eq!(hit.map(|v| v.id), Some(a2));
+        // Path assertion: the legacy fallback populates the property-index
+        // cache from its full label scan; the sidecar path never does.
+        assert!(
+            cache.get("Account", "code").is_none(),
+            "lookup fell back to the full label scan — the sidecar check was \
+             not scoped to the Account SSTs"
+        );
+
+        // A miss through the sidecar path is a definitive negative.
+        assert!(snap
+            .lookup_node_by_property("Account", "code", "zz")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(cache.get("Account", "code").is_none());
+    }
+
+    #[tokio::test]
+    async fn unique_lookup_for_memtable_only_label_skips_other_labels_ssts() {
+        // A label that lives only in the memtable must resolve via the
+        // memtable-side sidecar pass; another label's SSTs (which cannot
+        // contain it) must neither be required to carry sidecars nor force
+        // the full-scan fallback.
+        let store = make_store();
+        let paths = make_paths("sidecar-scope-mem");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let widget_lid = base.manifest.label_dict.intern("Widget").get();
+        let fresh_lid = base.manifest.label_dict.intern("Fresh").get();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().build();
+
+        // Widget rows flushed to an SST with no sidecars.
+        let w1 = sorted_node_id(1);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: w1 },
+            10,
+            MemOp::Upsert(coded_node_payload("sku", "w-1", widget_lid)),
+        );
+        let out = flush(&ms, &fence, &base, &mt.freeze(), schema)
+            .await
+            .unwrap();
+
+        // A Fresh row only in the live memtable.
+        let f1 = sorted_node_id(2);
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Node { id: f1 },
+            20,
+            MemOp::Upsert(coded_node_payload("email", "f@x", fresh_lid)),
+        );
+        let live_view = live.snapshot_view();
+        let cache = Arc::new(crate::property_index::PropertyIndexCache::new());
+        let snap = Snapshot::new(out.committed, &live_view, store, paths)
+            .with_property_index_cache(cache.clone());
+
+        let hit = snap
+            .lookup_node_by_property("Fresh", "email", "f@x")
+            .await
+            .unwrap();
+        assert_eq!(hit.map(|v| v.id), Some(f1));
+        assert!(
+            cache.get("Fresh", "email").is_none(),
+            "memtable-only label fell back to the full label scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn equality_sidecar_fast_path_never_consults_other_labels_ssts() {
+        // Same scoping for the non-unique equality index: plant an unreadable
+        // equality-sidecar descriptor on the OTHER label's SST. If the lookup
+        // consults that SST at all (pre-fix it made `all_have_sidecar` true
+        // and probed it), the GET fails and the lookup errors; correctly
+        // scoped, the SST is never touched.
+        let store = make_store();
+        let paths = make_paths("sidecar-scope-eq");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let person_lid = base.manifest.label_dict.intern("Person").get();
+        let widget_lid = base.manifest.label_dict.intern("Widget").get();
+        let fence = WriterFence::new(base.manifest.epoch);
+        // `city` is declared indexed, so the Person flush emits an equality
+        // sidecar for it.
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("city", DataType::Utf8, true)
+                    .unwrap()
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .build();
+
+        let p1 = sorted_node_id(1);
+        let p2 = sorted_node_id(2);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: p1 },
+            10,
+            MemOp::Upsert(coded_node_payload("city", "Lisbon", person_lid)),
+        );
+        mt.apply(
+            MemKey::Node { id: p2 },
+            11,
+            MemOp::Upsert(coded_node_payload("city", "Porto", person_lid)),
+        );
+        let out1 = flush(&ms, &fence, &base, &mt.freeze(), schema.clone())
+            .await
+            .unwrap();
+        assert!(
+            out1.committed.manifest.ssts.iter().any(|d| d
+                .equality_property_indices
+                .iter()
+                .any(|e| e.property == "city")),
+            "Person flush must emit the city equality sidecar"
+        );
+
+        let w1 = sorted_node_id(3);
+        let mut mt2 = Memtable::new();
+        mt2.apply(
+            MemKey::Node { id: w1 },
+            12,
+            MemOp::Upsert(coded_node_payload("sku", "w-1", widget_lid)),
+        );
+        let out2 = flush(&ms, &fence, &out1.committed, &mt2.freeze(), schema)
+            .await
+            .unwrap();
+
+        let mut committed = out2.committed.clone();
+        let widget_sst = committed
+            .manifest
+            .ssts
+            .iter()
+            .position(|d| {
+                d.kind == SstKind::Nodes
+                    && d.label_index.as_ref().is_some_and(|li| {
+                        li.per_label_counts
+                            .iter()
+                            .any(|(id, c)| *id == widget_lid && *c > 0)
+                    })
+            })
+            .expect("Widget SST present");
+        committed.manifest.ssts[widget_sst].equality_property_indices.push(
+            crate::manifest::EqualityIndexDescriptor {
+                property: "city".into(),
+                path: "sst/L0/does-not-exist.eqidx_city.bin".into(),
+                size_bytes: 1,
+                distinct_values: 1,
+            },
+        );
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+
+        let hits = snap
+            .lookup_nodes_by_property("Person", "city", "Lisbon")
+            .await
+            .expect("the Widget SST must not be consulted for a Person lookup");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, p1);
     }
 }

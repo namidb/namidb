@@ -144,6 +144,14 @@ pub struct WriterSession {
     /// Reset on `flush` because a flush bumps the manifest version and
     /// can introduce new nodes.
     property_index_cache: Arc<crate::property_index::PropertyIndexCache>,
+    /// Per-writer transactional index over declared-unique property values
+    /// (committed + staged), consulted by [`Self::unique_probe`] so a
+    /// constraint-bearing bulk write pays one label scan instead of one per
+    /// row. Maintained by the node staging chokepoints
+    /// (`upsert_node_with_labels` / `tombstone_node`) and reset wherever
+    /// `property_index_cache` is, plus on `discard_batch` (staged entries
+    /// are baked into its populated maps).
+    unique_index: crate::unique_index::UniqueConstraintIndex,
     /// Object store handle kept around so [`Self::commit_batch`] can
     /// fire the auto-snapshot path without re-deriving it from the
     /// manifest store. Same `Arc` we hand `Snapshot::new`.
@@ -261,6 +269,7 @@ impl WriterSession {
             node_cache,
             sst_cache,
             property_index_cache: Arc::new(crate::property_index::PropertyIndexCache::new()),
+            unique_index: crate::unique_index::UniqueConstraintIndex::new(),
             store,
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
@@ -281,6 +290,55 @@ impl WriterSession {
     /// warm-path `lookup_node_by_property` calls hit the same `HashMap`.
     pub fn property_index_cache(&self) -> &Arc<crate::property_index::PropertyIndexCache> {
         &self.property_index_cache
+    }
+
+    /// Probe the writer's transactional unique-value index: which node
+    /// (other than `exclude`) currently holds the given value tuple for
+    /// `label`? "Currently" spans committed state AND this writer's staged,
+    /// uncommitted batch — the same read-your-own-writes view the flat scan
+    /// sees — so a value claimed or freed earlier in the batch is visible.
+    ///
+    /// The first probe per `(label, property-set)` pays one label scan over
+    /// the overlay snapshot to populate the index; subsequent probes are
+    /// O(1) and every staged node upsert/tombstone keeps the populated maps
+    /// current. Returns [`UniqueProbe::Unindexable`] when a probe value has
+    /// no canonical scalar encoding (vector/list/map/null/NaN); the caller
+    /// must then fall back to its scan-based check.
+    pub async fn unique_probe(
+        &self,
+        label: &str,
+        props: &[(&str, &Value)],
+        exclude: Option<NodeId>,
+    ) -> Result<crate::unique_index::UniqueProbe> {
+        use crate::unique_index::{encode_probe_key, UniqueProbe};
+        debug_assert!(!props.is_empty(), "unique_probe needs at least one property");
+        // Canonical constraint identity: property names sorted, values aligned.
+        let mut sorted: Vec<(&str, &Value)> = props.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let names: Vec<String> = sorted.iter().map(|(n, _)| n.to_string()).collect();
+        let values: Vec<&Value> = sorted.iter().map(|(_, v)| *v).collect();
+        let Some(key) = encode_probe_key(&values) else {
+            return Ok(UniqueProbe::Unindexable);
+        };
+        if let Some(answer) = self.unique_index.probe(label, &names, &key, exclude) {
+            return Ok(answer);
+        }
+        // Not populated yet: one label scan over the RYOW overlay — the same
+        // source of truth the per-row scan fallback uses — then re-probe.
+        let views = self.overlay_snapshot().scan_label(label).await?;
+        self.unique_index
+            .populate(label, &names, views.iter().map(|v| (v.id, &v.properties)));
+        Ok(self
+            .unique_index
+            .probe(label, &names, &key, exclude)
+            .unwrap_or(UniqueProbe::Unindexable))
+    }
+
+    /// The per-writer unique-value index (RFC-026 constraint fast path).
+    /// Exposed so tests can assert the probe path actually ran (populate
+    /// scans / probe counters) instead of a per-row label scan.
+    pub fn unique_index(&self) -> &crate::unique_index::UniqueConstraintIndex {
+        &self.unique_index
     }
 
     /// Adjacency cache attached to this writer (RFC-018). `None`
@@ -383,6 +441,9 @@ impl WriterSession {
         let discarded = self.pending.records.len();
         self.pending = WalSegment::new(self.pending.seq);
         self.pending_payloads.clear();
+        // The unique-value index tracked the discarded staged writes; drop it
+        // so the next probe repopulates from committed state only.
+        self.unique_index.reset();
         discarded
     }
 
@@ -583,6 +644,15 @@ impl WriterSession {
             lsn,
         };
         self.append_pending(entry, MemOp::Upsert(payload), lsn, key)?;
+        // Keep the transactional unique-value index in step with the staged
+        // batch: the upsert is a full-record replacement, so the record's
+        // label set + property map fully determine the node's tuples.
+        let names: Vec<&str> = record
+            .labels
+            .iter()
+            .filter_map(|&lid| self.label_dict.name(namidb_core::LabelId::new(lid)))
+            .collect();
+        self.unique_index.apply_upsert(id, &names, &record.properties);
         Ok(lsn)
     }
 
@@ -598,6 +668,7 @@ impl WriterSession {
             lsn,
         };
         self.append_pending(entry, MemOp::Tombstone, lsn, key)?;
+        self.unique_index.apply_tombstone(id);
         Ok(lsn)
     }
 
@@ -806,6 +877,7 @@ impl WriterSession {
         // (read-after-write bug). Subsequent snapshots rebuild on their
         // first miss. Mirrors the reset in `flush`/`attach_ssts`.
         self.property_index_cache.reset();
+        self.unique_index.reset();
 
         // Auto-snapshot tick. Best effort: a snapshot is a cache, the
         // WAL is the source of truth. Log the failure and keep going
@@ -1012,6 +1084,7 @@ impl WriterSession {
         // new manifest version. Subsequent snapshots will rebuild on
         // their first miss.
         self.property_index_cache.reset();
+        self.unique_index.reset();
         Ok(outcome)
     }
 
@@ -1113,6 +1186,7 @@ impl WriterSession {
         self.next_lsn = self.next_lsn.max(attached_max_lsn.saturating_add(1)).max(1);
         self.refresh_published();
         self.property_index_cache.reset();
+        self.unique_index.reset();
 
         Ok(FlushOutcome {
             committed,
@@ -1204,6 +1278,7 @@ impl WriterSession {
         self.current = committed;
         self.refresh_published();
         self.property_index_cache.reset();
+        self.unique_index.reset();
         Ok(version)
     }
 
@@ -1254,6 +1329,7 @@ impl WriterSession {
         self.current = committed;
         self.refresh_published();
         self.property_index_cache.reset();
+        self.unique_index.reset();
         Ok(version)
     }
 
@@ -1510,6 +1586,7 @@ impl WriterSession {
         self.current = committed;
         self.refresh_published();
         self.property_index_cache.reset();
+        self.unique_index.reset();
         Ok(version)
     }
 
@@ -1606,6 +1683,7 @@ impl WriterSession {
         self.current = committed;
         self.refresh_published();
         self.property_index_cache.reset();
+        self.unique_index.reset();
         Ok(version)
     }
 
@@ -3633,5 +3711,155 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v2, v1, "IF NOT EXISTS must not commit a new version");
+    }
+
+    fn int_record(prop: &str, n: i64) -> NodeWriteRecord {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        props.insert(prop.into(), Value::I64(n));
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unique_probe_tracks_committed_staged_and_discarded_writes() {
+        use crate::unique_index::UniqueProbe;
+
+        let store = make_store();
+        let paths = make_paths("ingest-unique-probe");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+
+        // Committed holder of code=7.
+        let x = sorted_node_id(1);
+        s.upsert_node("Account", x, &int_record("code", 7)).unwrap();
+        s.commit_batch().await.unwrap();
+
+        let seven = Value::I64(7);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None).await.unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1, "first probe scans once");
+        // A node may keep / rewrite its own value.
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], Some(x)).await.unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1, "warm probes do not rescan");
+
+        // Read-your-own-writes: a STAGED (uncommitted) node claims code=9…
+        let y = sorted_node_id(2);
+        let nine = Value::I64(9);
+        s.upsert_node("Account", y, &int_record("code", 9)).unwrap();
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &nine)], None).await.unwrap(),
+            UniqueProbe::Conflict(y)
+        );
+        // …a staged rewrite frees 9 and claims 10 in the same batch…
+        let ten = Value::I64(10);
+        s.upsert_node("Account", y, &int_record("code", 10)).unwrap();
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &nine)], None).await.unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &ten)], None).await.unwrap(),
+            UniqueProbe::Conflict(y)
+        );
+        // …and a staged tombstone frees 10 too.
+        s.tombstone_node("Account", y).unwrap();
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &ten)], None).await.unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            1,
+            "staged maintenance must not force rescans"
+        );
+
+        // Stage a claim on 11, then discard the batch: the index must forget
+        // the staged state and answer from committed state after a rescan.
+        s.upsert_node("Account", y, &int_record("code", 11)).unwrap();
+        s.discard_batch();
+        let eleven = Value::I64(11);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &eleven)], None).await.unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None).await.unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            2,
+            "discard invalidates; the next probe repopulates once"
+        );
+
+        // Values without a canonical scalar encoding are not indexed.
+        let list = Value::List(vec![Value::I64(1)]);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &list)], None).await.unwrap(),
+            UniqueProbe::Unindexable
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_probe_composite_tuples_and_label_scope() {
+        use crate::unique_index::UniqueProbe;
+
+        let store = make_store();
+        let paths = make_paths("ingest-unique-probe-composite");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+
+        let a = sorted_node_id(1);
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        props.insert("name".into(), Value::Str("Ann".into()));
+        props.insert("age".into(), Value::I64(30));
+        s.upsert_node(
+            "Person",
+            a,
+            &NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.commit_batch().await.unwrap();
+
+        let ann = Value::Str("Ann".into());
+        let thirty = Value::I64(30);
+        let forty = Value::I64(40);
+        // Full tuple match conflicts regardless of the pair order passed in.
+        assert_eq!(
+            s.unique_probe("Person", &[("name", &ann), ("age", &thirty)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(a)
+        );
+        assert_eq!(
+            s.unique_probe("Person", &[("age", &thirty), ("name", &ann)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(a)
+        );
+        // A differing element is no conflict.
+        assert_eq!(
+            s.unique_probe("Person", &[("name", &ann), ("age", &forty)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::NoConflict
+        );
+        // The same tuple under a different label is out of scope.
+        assert_eq!(
+            s.unique_probe("Robot", &[("name", &ann), ("age", &thirty)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::NoConflict
+        );
     }
 }
