@@ -168,12 +168,20 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
         other => panic!("expected head SUCCESS, got {other:?}"),
     };
 
-    // RECORDs streamed by the server, terminated by the closing
-    // SUCCESS after we send PULL.
+    // Demand-driven streaming: RECORDs arrive only after PULL. Ask for
+    // everything and read RECORDs until the closing SUCCESS.
+    let pull = Value::Struct {
+        tag: struct_tag::PULL,
+        fields: vec![Value::Map({
+            let mut m = BTreeMap::new();
+            m.insert("n".into(), Value::Int(-1));
+            m
+        })],
+    };
+    send_msg(stream, &pack(&pull)).await;
     let mut rows: Vec<RowMap> = Vec::new();
     loop {
-        let msg = recv_msg(stream).await;
-        match msg {
+        match recv_msg(stream).await {
             Response::Record(values) => {
                 let mut row = BTreeMap::new();
                 for (k, v) in fields.iter().cloned().zip(values) {
@@ -181,26 +189,6 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
                 }
                 rows.push(row);
             }
-            other => panic!("unexpected message during RUN stream: {other:?}"),
-        }
-        if rows.len() > 10_000 {
-            panic!("runaway result set");
-        }
-        // No clean signal in the buffered model that the last RECORD
-        // arrived, so request the close after each RECORD; the
-        // server answers PULL with a closing SUCCESS that drops us
-        // out of the loop.
-        let pull = Value::Struct {
-            tag: struct_tag::PULL,
-            fields: vec![Value::Map({
-                let mut m = BTreeMap::new();
-                m.insert("n".into(), Value::Int(-1));
-                m
-            })],
-        };
-        send_msg(stream, &pack(&pull)).await;
-        let closer = recv_msg(stream).await;
-        match closer {
             Response::Success(meta) => {
                 assert!(
                     meta.contains_key("type"),
@@ -208,14 +196,10 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
                 );
                 return (fields, rows);
             }
-            Response::Record(values) => {
-                let mut row = BTreeMap::new();
-                for (k, v) in fields.iter().cloned().zip(values) {
-                    row.insert(k, v);
-                }
-                rows.push(row);
-            }
-            other => panic!("unexpected closer: {other:?}"),
+            other => panic!("unexpected message during PULL stream: {other:?}"),
+        }
+        if rows.len() > 10_000 {
+            panic!("runaway result set");
         }
     }
 }

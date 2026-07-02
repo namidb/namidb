@@ -241,6 +241,10 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// closing `SUCCESS` after PULL/DISCARD. `None` while no stream
     /// is active.
     pending_statement_type: Option<StatementType>,
+    /// Rows buffered by the last RUN, already converted to Bolt values,
+    /// drained by PULL in client-demanded batches (`n` per PULL). DISCARD
+    /// drops them without emitting. Cleared on RESET.
+    pending_rows: std::collections::VecDeque<Vec<Value>>,
     /// Write counters of the in-flight stream, emitted as `stats` in the
     /// closing `SUCCESS` after PULL/DISCARD. Empty for reads.
     pending_counters: BTreeMap<String, i64>,
@@ -284,6 +288,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             version: None,
             pending_statement_type: None,
             pending_counters: BTreeMap::new(),
+            pending_rows: std::collections::VecDeque::new(),
             tx_idle_timeout: None,
             handshake_timeout: None,
             max_tx_lifetime: None,
@@ -499,6 +504,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             ) {
                 let _ = self.backend.rollback_tx().await;
             }
+            self.pending_rows.clear();
             self.state = State::Ready;
             return self.write_response(Response::success_empty()).await;
         }
@@ -656,11 +662,38 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     ) -> Result<()> {
         let _ = element_mode;
         match req {
-            Request::Pull { extra: _ } | Request::Discard { extra: _ } => {
-                // The current backend buffers the whole result inside
-                // `execute_run`, so the cached rows already streamed.
-                // We just answer the PULL/DISCARD with an empty
-                // SUCCESS marking the stream done.
+            Request::Pull { ref extra } | Request::Discard { ref extra } => {
+                // `n` is the batch size the client is ready for; -1 (or a
+                // missing key, which real drivers never send) means "all
+                // remaining". PULL emits that many RECORDs, DISCARD drops
+                // them unsent; a non-empty remainder answers
+                // SUCCESS { has_more: true } and stays STREAMING so the next
+                // PULL continues — this is what makes a driver's fetch_size
+                // actually page a large result.
+                let is_pull = matches!(req, Request::Pull { .. });
+                let n = match extra.get("n") {
+                    Some(Value::Int(i)) => *i,
+                    _ => -1,
+                };
+                let take = if n < 0 {
+                    self.pending_rows.len()
+                } else {
+                    (n as usize).min(self.pending_rows.len())
+                };
+                for _ in 0..take {
+                    let values = self
+                        .pending_rows
+                        .pop_front()
+                        .expect("take is bounded by len");
+                    if is_pull {
+                        self.write_response(Response::Record(values)).await?;
+                    }
+                }
+                if !self.pending_rows.is_empty() {
+                    let mut meta = BTreeMap::new();
+                    meta.insert("has_more".into(), Value::Bool(true));
+                    return self.write_response(Response::Success(meta)).await;
+                }
                 let mut meta = BTreeMap::new();
                 let stype = self
                     .pending_statement_type
@@ -727,7 +760,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             }
         };
 
-        // 1) SUCCESS { fields, qid? } announcing the field list.
+        // 1) SUCCESS { fields } announcing the field list. RECORDs are NOT
+        //    emitted here: the Bolt contract is demand-driven — the client
+        //    asks for batches with PULL {n}, and a driver's fetch_size must
+        //    actually bound what is in flight. The rows are buffered as Bolt
+        //    values and drained by handle_in_streaming.
         let mut head_meta = BTreeMap::new();
         head_meta.insert(
             "fields".into(),
@@ -736,22 +773,26 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         head_meta.insert("t_first".into(), Value::Int(0));
         self.write_response(Response::Success(head_meta)).await?;
 
-        // 2) one RECORD per row.
-        for row in &outcome.rows {
-            let mut values = Vec::with_capacity(outcome.fields.len());
-            for name in &outcome.fields {
-                let v = row
-                    .bindings
-                    .get(name)
-                    .cloned()
-                    .unwrap_or(RuntimeValue::Null);
-                values.push(runtime_to_bolt(&v, element_mode));
-            }
-            self.write_response(Response::Record(values)).await?;
-        }
+        self.pending_rows = outcome
+            .rows
+            .iter()
+            .map(|row| {
+                outcome
+                    .fields
+                    .iter()
+                    .map(|name| {
+                        let v = row
+                            .bindings
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(RuntimeValue::Null);
+                        runtime_to_bolt(&v, element_mode)
+                    })
+                    .collect()
+            })
+            .collect();
 
-        // 3) Transition to STREAMING and wait for PULL/DISCARD that
-        //    will close the stream. The Bolt protocol requires it.
+        // 2) Transition to STREAMING; PULL/DISCARD drain or drop the buffer.
         self.state = if inside_tx {
             State::TxStreaming
         } else {
@@ -759,9 +800,6 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         };
         self.pending_statement_type = Some(outcome.statement_type);
         self.pending_counters = outcome.counters;
-        // Buffered model: rows already emitted. PULL/DISCARD will
-        // observe the streaming state and answer with a closing
-        // SUCCESS in handle_in_streaming.
         Ok(())
     }
 
@@ -1091,6 +1129,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_n_pages_the_result_with_has_more() {
+        // Five rows, PULL {n: 2} three times: 2 + 2 + 1 records, the first
+        // two closes carry has_more=true, the final one the summary — the
+        // demand-driven contract a driver's fetch_size relies on. A DISCARD
+        // mid-stream must also drop the remainder and close.
+        let rows: Vec<Row> = (0..5)
+            .map(|i| {
+                let mut bindings = std::collections::BTreeMap::new();
+                bindings.insert("n".to_string(), RuntimeValue::Integer(i));
+                Row { bindings }
+            })
+            .collect();
+        let outcome = RunOutcome {
+            fields: vec!["n".into()],
+            rows,
+            ..Default::default()
+        };
+        let (mut client, server) = duplex(64 * 1024);
+        let session = fixture_session(server, outcome, AuthPolicy::Open);
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        for (tag, m) in [
+            (crate::value::struct_tag::HELLO, BTreeMap::new()),
+            (crate::value::struct_tag::LOGON, {
+                let mut m = BTreeMap::new();
+                m.insert("scheme".into(), Value::String("none".into()));
+                m
+            }),
+        ] {
+            write_msg(
+                &mut client,
+                &pack_request(&Value::Struct {
+                    tag,
+                    fields: vec![Value::Map(m)],
+                }),
+            )
+            .await;
+            let _ = read_msg(&mut client).await;
+        }
+
+        let run = Value::Struct {
+            tag: crate::value::struct_tag::RUN,
+            fields: vec![
+                Value::String("MATCH (n) RETURN n".into()),
+                Value::Map(BTreeMap::new()),
+                Value::Map(BTreeMap::new()),
+            ],
+        };
+        write_msg(&mut client, &pack_request(&run)).await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        let pull_two = || Value::Struct {
+            tag: crate::value::struct_tag::PULL,
+            fields: vec![Value::Map({
+                let mut m = BTreeMap::new();
+                m.insert("n".into(), Value::Int(2));
+                m
+            })],
+        };
+        // Batch 1: records 0, 1 + has_more.
+        write_msg(&mut client, &pack_request(&pull_two())).await;
+        for want in [0i64, 1] {
+            match decode_response(&read_msg(&mut client).await) {
+                Response::Record(v) => assert_eq!(v, vec![Value::Int(want)]),
+                other => panic!("expected RECORD {want}, got {other:?}"),
+            }
+        }
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => {
+                assert_eq!(meta.get("has_more"), Some(&Value::Bool(true)))
+            }
+            other => panic!("expected has_more SUCCESS, got {other:?}"),
+        }
+        // Batch 2: records 2, 3 + has_more.
+        write_msg(&mut client, &pack_request(&pull_two())).await;
+        for want in [2i64, 3] {
+            match decode_response(&read_msg(&mut client).await) {
+                Response::Record(v) => assert_eq!(v, vec![Value::Int(want)]),
+                other => panic!("expected RECORD {want}, got {other:?}"),
+            }
+        }
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => {
+                assert_eq!(meta.get("has_more"), Some(&Value::Bool(true)))
+            }
+            other => panic!("expected has_more SUCCESS, got {other:?}"),
+        }
+        // Batch 3: record 4 + closing summary (no has_more).
+        write_msg(&mut client, &pack_request(&pull_two())).await;
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Record(v) => assert_eq!(v, vec![Value::Int(4)]),
+            other => panic!("expected RECORD 4, got {other:?}"),
+        }
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => {
+                assert!(!meta.contains_key("has_more"));
+                assert!(meta.contains_key("type"), "closing summary meta");
+            }
+            other => panic!("expected closing SUCCESS, got {other:?}"),
+        }
+
+        // A fresh RUN then DISCARD {n: -1} drops everything and closes.
+        write_msg(&mut client, &pack_request(&run)).await;
+        let _ = read_msg(&mut client).await; // fields SUCCESS
+        let discard = Value::Struct {
+            tag: crate::value::struct_tag::DISCARD,
+            fields: vec![Value::Map({
+                let mut m = BTreeMap::new();
+                m.insert("n".into(), Value::Int(-1));
+                m
+            })],
+        };
+        write_msg(&mut client, &pack_request(&discard)).await;
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => assert!(!meta.contains_key("has_more")),
+            other => panic!("expected closing SUCCESS, got {other:?}"),
+        }
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn happy_path_run_with_one_row() {
         let outcome = RunOutcome {
             fields: vec!["n".into()],
@@ -1142,22 +1316,15 @@ mod tests {
             ],
         };
         write_msg(&mut client, &pack_request(&run)).await;
-        // First response: SUCCESS { fields: ["n"] }
+        // First response: SUCCESS { fields: ["n"] } — no records yet: they
+        // are demand-driven by PULL.
         let r1 = read_msg(&mut client).await;
         match decode_response(&r1) {
             Response::Success(meta) => assert!(meta.contains_key("fields")),
             other => panic!("expected SUCCESS, got {:?}", other),
         }
-        // Second response: RECORD [42]
-        let r2 = read_msg(&mut client).await;
-        match decode_response(&r2) {
-            Response::Record(values) => {
-                assert_eq!(values, vec![Value::Int(42)]);
-            }
-            other => panic!("expected RECORD, got {:?}", other),
-        }
 
-        // PULL — closes the stream.
+        // PULL — emits the RECORD then the closing SUCCESS.
         let pull = Value::Struct {
             tag: crate::value::struct_tag::PULL,
             fields: vec![Value::Map({
@@ -1167,6 +1334,13 @@ mod tests {
             })],
         };
         write_msg(&mut client, &pack_request(&pull)).await;
+        let r2 = read_msg(&mut client).await;
+        match decode_response(&r2) {
+            Response::Record(values) => {
+                assert_eq!(values, vec![Value::Int(42)]);
+            }
+            other => panic!("expected RECORD, got {:?}", other),
+        }
         let r3 = read_msg(&mut client).await;
         assert!(matches!(decode_response(&r3), Response::Success(_)));
 
