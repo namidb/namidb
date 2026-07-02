@@ -12,9 +12,11 @@
 //! search`] navigates with a metric-appropriate space and then **reranks the
 //! candidates with the real metric**, so the returned score equals the flat
 //! scan's `vector_score` exactly (to f32 tolerance): cosine similarity and raw
-//! dot product (higher = closer), L2 distance (lower = closer). `cosine`/`dot`
-//! navigate with cosine (scale-invariant — a fine, rank-correlated navigator for
-//! dot); `euclidean` navigates with an L2 space (cosine would mis-rank whenever
+//! dot product (higher = closer), L2 distance (lower = closer). `cosine`
+//! navigates with cosine; `dot` navigates with cosine over **MIPS-augmented**
+//! vectors (see [`mips_augment`] — plain cosine is magnitude-blind and misses
+//! the large-norm vectors that dominate a true inner-product top-k);
+//! `euclidean` navigates with an L2 space (cosine would mis-rank whenever
 //! magnitudes vary).
 
 use bytes::Bytes;
@@ -154,14 +156,54 @@ fn metric_score(metric: VectorMetric, a: &[f32], query: &[f32]) -> (f64, bool) {
     }
 }
 
-/// Parse the canonical metric name stored in a `.vg` body back into the enum.
-fn metric_from_name(name: &str) -> Option<VectorMetric> {
+/// Parse the metric name stored in a `.vg` body back into the enum plus
+/// whether the navigation graph was built over MIPS-augmented vectors.
+/// `"dot"` is a legacy body whose graph was built with plain cosine over the
+/// raw vectors (magnitude-blind — poor recall when norms vary); `"dot-mips"`
+/// marks the current reduction, so old bodies keep working until the next
+/// authoritative compaction rebuilds them.
+fn metric_from_name(name: &str) -> Option<(VectorMetric, bool)> {
     match name {
-        "cosine" => Some(VectorMetric::Cosine),
-        "dot" => Some(VectorMetric::Dot),
-        "euclidean" => Some(VectorMetric::Euclidean),
+        "cosine" => Some((VectorMetric::Cosine, false)),
+        "dot" => Some((VectorMetric::Dot, false)),
+        "dot-mips" => Some((VectorMetric::Dot, true)),
+        "euclidean" => Some((VectorMetric::Euclidean, false)),
         _ => None,
     }
+}
+
+/// Bachrach et al. (2014) MIPS→cosine reduction: append `sqrt(M² − ‖x‖²)`
+/// to every vector (`M` = max corpus norm), making them all norm `M`. Against
+/// a zero-augmented query, cosine over the augmented set orders EXACTLY by
+/// inner product — so a Vamana graph built/navigated with cosine on the
+/// augmented vectors surfaces the true dot-nearest candidates, magnitudes
+/// included. Plain cosine navigation is magnitude-blind, and dot's top-k is
+/// dominated by large-norm vectors — exactly the case users pick `dot` for.
+fn mips_augment(vectors: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let max_sq = vectors
+        .iter()
+        .map(|v| v.iter().map(|x| x * x).sum::<f32>())
+        .fold(0.0f32, f32::max);
+    vectors
+        .iter()
+        .map(|v| {
+            let sq: f32 = v.iter().map(|x| x * x).sum();
+            let mut a = Vec::with_capacity(v.len() + 1);
+            a.extend_from_slice(v);
+            a.push((max_sq - sq).max(0.0).sqrt());
+            a
+        })
+        .collect()
+}
+
+/// The navigation query for a MIPS-augmented graph: the raw query with a 0
+/// appended (its dot with the augmentation coordinate vanishes, leaving the
+/// pure inner product in the cosine numerator).
+fn mips_query(query: &[f32]) -> Vec<f32> {
+    let mut q = Vec::with_capacity(query.len() + 1);
+    q.extend_from_slice(query);
+    q.push(0.0);
+    q
 }
 
 /// Build a `.vg` body from `(node_id, embedding)` pairs for one index.
@@ -241,7 +283,15 @@ pub fn build_body(
                 VectorMetric::Euclidean => {
                     build_with_seed(&L2Space::new(vectors.clone()), params, seed)
                 }
-                _ => build_with_seed(&F32CosineSpace::new(vectors.clone()), params, seed),
+                // MIPS: build the graph over the augmented vectors so cosine
+                // navigation orders by true inner product (see mips_augment);
+                // the body stores the ORIGINALS for the exact rerank.
+                VectorMetric::Dot => {
+                    build_with_seed(&F32CosineSpace::new(mips_augment(&vectors)), params, seed)
+                }
+                VectorMetric::Cosine => {
+                    build_with_seed(&F32CosineSpace::new(vectors.clone()), params, seed)
+                }
             };
             (graph, VectorStorage::F32(vectors))
         }
@@ -257,9 +307,19 @@ pub fn build_body(
         entry_medoid: graph.entry,
     };
 
+    // The body's metric string doubles as the navigation-geometry marker:
+    // a dot graph built over MIPS-augmented vectors is tagged "dot-mips" so
+    // decode() knows to augment (legacy "dot" bodies keep plain-cosine
+    // navigation until an authoritative compaction rebuilds them). The
+    // descriptor-facing stats keep the canonical "dot".
+    let body_metric = if desc.metric == VectorMetric::Dot {
+        "dot-mips".to_string()
+    } else {
+        metric_name(desc.metric).to_string()
+    };
     let body = VectorGraphBody {
         dim: desc.dim,
-        metric: metric_name(desc.metric).to_string(),
+        metric: body_metric,
         ids,
         storage,
         graph,
@@ -287,6 +347,9 @@ pub struct VectorGraphIndex {
     body: VectorGraphBody,
     metric: VectorMetric,
     nav: NavSpace,
+    /// The graph was built over MIPS-augmented vectors ("dot-mips"): navigate
+    /// with the zero-augmented query, not the raw one.
+    mips: bool,
 }
 
 impl VectorGraphIndex {
@@ -308,7 +371,7 @@ impl VectorGraphIndex {
         }
         let body: VectorGraphBody = bincode::deserialize(rest)
             .map_err(|e| Error::invariant(format!("vector graph decode failed: {e}")))?;
-        let metric = metric_from_name(&body.metric).ok_or_else(|| {
+        let (metric, mips) = metric_from_name(&body.metric).ok_or_else(|| {
             Error::invariant(format!("vector graph unknown metric: {}", body.metric))
         })?;
         // Validate the graph's internal consistency before trusting it: the entry
@@ -333,9 +396,18 @@ impl VectorGraphIndex {
             VectorStorage::F32(v) if metric == VectorMetric::Euclidean => {
                 NavSpace::L2(L2Space::new(v.clone()))
             }
+            // dot-mips: rebuild the augmentation the graph was constructed
+            // over (deterministic from the stored originals, so no format
+            // field is needed).
+            VectorStorage::F32(v) if mips => NavSpace::Cosine(F32CosineSpace::new(mips_augment(v))),
             VectorStorage::F32(v) => NavSpace::Cosine(F32CosineSpace::new(v.clone())),
         };
-        Ok(Self { body, metric, nav })
+        Ok(Self {
+            body,
+            metric,
+            nav,
+            mips,
+        })
     }
 
     /// Number of vectors indexed.
@@ -382,10 +454,19 @@ impl VectorGraphIndex {
         // navigation metric — cosine — differs, so the wider pool surfaces the
         // true dot-nearest); for int8 the navigation distance already IS the
         // (cosine-only) score, so we just flip distance → similarity.
+        // dot-mips navigates in the augmented space (query gains a zero
+        // coordinate); every other geometry navigates with the raw query.
+        let nav_query: Vec<f32>;
+        let nq: &[f32] = if self.mips {
+            nav_query = mips_query(query);
+            &nav_query
+        } else {
+            query
+        };
         let cands = match &self.nav {
-            NavSpace::Cosine(s) => search(s, &self.body.graph, query, ef, ef),
-            NavSpace::L2(s) => search(s, &self.body.graph, query, ef, ef),
-            NavSpace::Int8(s) => search(s, &self.body.graph, query, ef, ef),
+            NavSpace::Cosine(s) => search(s, &self.body.graph, nq, ef, ef),
+            NavSpace::L2(s) => search(s, &self.body.graph, nq, ef, ef),
+            NavSpace::Int8(s) => search(s, &self.body.graph, nq, ef, ef),
         };
         let is_int8 = matches!(self.nav, NavSpace::Int8(_));
         let mut scored: Vec<([u8; 16], f32)> = cands
@@ -521,6 +602,78 @@ mod tests {
                 "{metric:?}: index score {top_score} != metric {want}"
             );
         }
+    }
+
+    #[test]
+    fn dot_index_surfaces_large_norm_vectors_beyond_the_cosine_beam() {
+        // Adversarial MIPS fixture: 200 small-norm vectors (0.5–1.5) biased
+        // toward the query direction (cosine ≈ 0.3–0.95, so their dot tops out
+        // ~1.4) plus ONE norm-10 vector at ~80° (dot ≈ 1.74 — the true top-1,
+        // but cosine rank near dead last). A cosine-navigated graph fills its
+        // ef=64 beam with the small cluster and never even reranks the
+        // big-norm vector; MIPS-augmented navigation must put it first.
+        let dim = 8usize;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut members: Vec<([u8; 16], Vec<f32>)> = Vec::new();
+        for i in 0..200u64 {
+            let mut v = vec![0.0f32; dim];
+            v[0] = 0.5;
+            for x in v.iter_mut().skip(1) {
+                *x = rng.gen_range(-0.5..0.5);
+            }
+            normalize(&mut v);
+            let norm = rng.gen_range(0.5..1.5);
+            for x in v.iter_mut() {
+                *x *= norm;
+            }
+            let mut id = [0u8; 16];
+            id[0..8].copy_from_slice(&i.to_be_bytes());
+            members.push((id, v));
+        }
+        let mut big = vec![0.0f32; dim];
+        big[0] = (80.0f32).to_radians().cos() * 10.0;
+        big[1] = (80.0f32).to_radians().sin() * 10.0;
+        let big_id = [0xBB; 16];
+        members.push((big_id, big.clone()));
+
+        let d = desc("mips", VectorMetric::Dot, dim as u32);
+        let (body, _) = build_body(&d, members).unwrap().unwrap();
+        let idx = VectorGraphIndex::decode(&body).unwrap();
+        assert_eq!(idx.metric(), "dot-mips");
+
+        let query = {
+            let mut q = vec![0.0f32; dim];
+            q[0] = 1.0;
+            q
+        };
+        let hits = idx.search(&query, 5, 64);
+        assert_eq!(
+            hits[0].0, big_id,
+            "true dot top-1 (norm 10, dot ≈ 1.74) must surface: {hits:?}"
+        );
+        let want = big[0] as f64; // dot(query, big) = big[0]
+        assert!(
+            (hits[0].1 as f64 - want).abs() < 1e-4,
+            "score is the exact dot: {} vs {want}",
+            hits[0].1
+        );
+    }
+
+    #[test]
+    fn legacy_plain_dot_bodies_still_decode() {
+        // A pre-MIPS body carries metric "dot": it must decode and search
+        // (plain-cosine navigation) rather than being rejected, so existing
+        // indexes keep serving until compaction rebuilds them.
+        let d = desc("legacy", VectorMetric::Dot, 8);
+        let (bytes, _) = build_body(&d, clustered_members(40, 8, 3)).unwrap().unwrap();
+        // Rewrite the body's metric tag to the legacy name.
+        let mut body: VectorGraphBody = bincode::deserialize(&bytes[MAGIC.len()..]).unwrap();
+        body.metric = "dot".to_string();
+        let mut legacy = MAGIC.to_vec();
+        legacy.extend_from_slice(&bincode::serialize(&body).unwrap());
+        let idx = VectorGraphIndex::decode(&legacy).unwrap();
+        assert_eq!(idx.metric(), "dot");
+        assert!(!idx.search(&clustered_members(1, 8, 3)[0].1, 3, 16).is_empty());
     }
 
     #[test]
