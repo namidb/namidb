@@ -787,8 +787,12 @@ impl Server {
             "MATCH (n:{label}) WHERE n.placeholder IS NULL \
              RETURN id(n) AS id, n.title AS title, n.path AS path"
         );
+        // Pin ONE snapshot for both the node and edge queries: a concurrent
+        // watch_vault republish between them would otherwise yield a torn graph
+        // (nodes from the old view, edges from the new) and a wrong result.
+        let pinned = self.snapshot.load();
         let node_rows = self
-            .run_read_query(&nodes_cypher, &Params::new())
+            .run_read_query_on(&pinned, &nodes_cypher, &Params::new())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -830,7 +834,7 @@ impl Server {
              RETURN id(a) AS src, id(b) AS dst"
         );
         let edge_rows = self
-            .run_read_query(&edges_cypher, &Params::new())
+            .run_read_query_on(&pinned, &edges_cypher, &Params::new())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1072,11 +1076,24 @@ impl Server {
     /// Parse, plan, and execute a read-only Cypher query, returning rows as
     /// JSON objects. Rejects write plans.
     async fn run_read_query(&self, cypher: &str, params: &Params) -> anyhow::Result<Vec<Value>> {
-        let parsed = cypher_parse(cypher).map_err(|errs| anyhow::anyhow!(fmt_parse_errs(&errs)))?;
         // Serve from the published snapshot rather than the writer lock, so a
         // concurrent load/sync (which holds the lock to write) never blocks a
         // read. The snapshot is a consistent committed view.
         let owned = self.snapshot.load();
+        self.run_read_query_on(&owned, cypher, params).await
+    }
+
+    /// Like [`run_read_query`], but against an already-pinned snapshot so a
+    /// caller can run several queries over ONE consistent view — a concurrent
+    /// `watch_vault` republish between two separate loads would otherwise tear
+    /// the result (e.g. graph nodes from an old view, edges from a new one).
+    async fn run_read_query_on(
+        &self,
+        owned: &namidb_storage::PinnedSnapshot,
+        cypher: &str,
+        params: &Params,
+    ) -> anyhow::Result<Vec<Value>> {
+        let parsed = cypher_parse(cypher).map_err(|errs| anyhow::anyhow!(fmt_parse_errs(&errs)))?;
         let snap = owned.borrow().with_cache(self.cache.clone());
         let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
         let plan = build_plan(&parsed, &catalog).map_err(|e| anyhow::anyhow!("{e}"))?;

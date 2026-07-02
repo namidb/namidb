@@ -520,7 +520,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?
                 };
                 if !keys.is_empty() {
-                    sort_rows(&mut rows, keys, params)?;
+                    // Bounded top-k when a finite LIMIT keeps fewer rows than the
+                    // input has: O(n log k) heap instead of a full O(n log n)
+                    // sort of every row (identical result — same stable order).
+                    let bound = (skip as usize)
+                        .saturating_add(if limit == u64::MAX { usize::MAX } else { limit as usize });
+                    if bound != usize::MAX && bound < rows.len() {
+                        rows = bounded_topk(rows, keys, params, bound)?;
+                    } else {
+                        sort_rows(&mut rows, keys, params)?;
+                    }
                 }
                 let skip = skip as usize;
                 if skip >= rows.len() {
@@ -3626,6 +3635,79 @@ impl PartialEq for TopNItem {
     }
 }
 impl Eq for TopNItem {}
+
+/// Flat-path bounded top-k heap element: like [`TopNItem`] but carries the full
+/// [`Row`] instead of a factor leaf. Same key-then-position ordering.
+struct FlatTopNItem {
+    vals: Vec<RuntimeValue>,
+    pos: usize,
+    row: Row,
+    descs: std::sync::Arc<[bool]>,
+}
+impl Ord for FlatTopNItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (i, &desc) in self.descs.iter().enumerate() {
+            let o = order_for_sort(&self.vals[i], &other.vals[i], desc);
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        self.pos.cmp(&other.pos)
+    }
+}
+impl PartialOrd for FlatTopNItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for FlatTopNItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for FlatTopNItem {}
+
+/// Return the `bound` best rows for `keys`, already ordered, using an
+/// `O(n log bound)` bounded max-heap instead of a full `O(n log n)` sort — the
+/// standard `ORDER BY … LIMIT k` optimization (e.g. a KNN fallback over a 1M-row
+/// label materialised only `k` rows' worth of keyed state, not 1M). Ties break
+/// by input position, reproducing the stable full sort's first `bound` rows.
+fn bounded_topk(
+    rows: Vec<Row>,
+    keys: &[OrderKey],
+    params: &Params,
+    bound: usize,
+) -> Result<Vec<Row>, ExecError> {
+    use std::collections::BinaryHeap;
+    if bound == 0 {
+        return Ok(Vec::new());
+    }
+    let descs: std::sync::Arc<[bool]> = keys
+        .iter()
+        .map(|k| matches!(k.direction, crate::parser::OrderDirection::Desc))
+        .collect();
+    let mut heap: BinaryHeap<FlatTopNItem> = BinaryHeap::with_capacity(bound + 1);
+    for (pos, row) in rows.into_iter().enumerate() {
+        let mut vals = Vec::with_capacity(keys.len());
+        for k in keys {
+            vals.push(evaluate(&k.expression, &row, params)?);
+        }
+        heap.push(FlatTopNItem {
+            vals,
+            pos,
+            row,
+            descs: descs.clone(),
+        });
+        // Max-heap: the root is the worst kept row; evict it once over budget so
+        // only the `bound` best remain.
+        if heap.len() > bound {
+            heap.pop();
+        }
+    }
+    let mut items = heap.into_vec();
+    items.sort();
+    Ok(items.into_iter().map(|it| it.row).collect())
+}
 
 pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
     if left.is_empty() || right.is_empty() {
