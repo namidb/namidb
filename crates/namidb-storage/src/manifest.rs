@@ -19,9 +19,12 @@
 //! `version <= current.version`. Epoch may only increase.
 //!
 //! Recovery: any version `v` we created locally that did not become
-//! `current` is garbage. A future janitor will delete orphan manifests.
+//! `current` is garbage below the pointer; at `pointer + 1` it is a stalled
+//! commit that [`ManifestStore::claim_writer`] repairs (publish or delete —
+//! see `repair_stalled_commit`). A future janitor will delete orphan
+//! manifests below the pointer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -40,6 +43,7 @@ use crate::fence::{Epoch, WriterFence};
 use crate::paths::NamespacePaths;
 use crate::sst::bloom::BloomDescriptor;
 use crate::sst::stats::{DegreeHistogram, HllSketchBytes, PropertyColumnStats, StatScalar};
+use crate::wal::WalSegment;
 
 /// Top-level versioned manifest. Self-contained snapshot of every artefact
 /// that belongs to the namespace at this version.
@@ -943,29 +947,46 @@ impl ManifestStore {
         }
 
         let manifest_path = self.paths.manifest_version(new_manifest.version);
+        let body: Bytes = serde_json::to_vec(new_manifest)?.into();
         debug!(path = %manifest_path, "writing immutable manifest body");
-        match self
-            .put_create(&manifest_path, serde_json::to_vec(new_manifest)?.into())
-            .await
-        {
+        match self.put_create(&manifest_path, body.clone()).await {
             Ok(_) => {}
             Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {
-                // Another writer chose the same version. Before raising
-                // a plain CAS loss, reload to discover whether the
-                // namespace has actually advanced past our epoch — in
-                // that case we are fenced and the caller must drop
-                // this writer state, not retry.
-                let reloaded = self.load_current().await?;
-                if reloaded.manifest.epoch > fence.epoch {
-                    return Err(Error::Fenced {
-                        mine: fence.epoch.as_u64(),
-                        current: reloaded.manifest.epoch.as_u64(),
+                // `AlreadyExists` does not always mean a competitor: the
+                // existing body can be OUR OWN from a prior attempt of this
+                // same commit — a retry after the create landed but its
+                // response was lost, or a retry after the pipelined WAL PUT
+                // failed while this body PUT succeeded (see
+                // `WriterSession::commit_batch`). Failing such a retry as a
+                // CAS loss strands an orphan body at `base + 1` that no
+                // writer can supersede (versions are Create-only), wedging
+                // the namespace until `claim_writer`'s stall repair runs.
+                // Adopt the body instead and proceed to the pointer CAS.
+                if !self
+                    .existing_body_is_ours(&manifest_path, &body, new_manifest)
+                    .await?
+                {
+                    // A genuine competitor chose the same version. Before
+                    // raising a plain CAS loss, reload to discover whether
+                    // the namespace has actually advanced past our epoch —
+                    // in that case we are fenced and the caller must drop
+                    // this writer state, not retry.
+                    let reloaded = self.load_current().await?;
+                    if reloaded.manifest.epoch > fence.epoch {
+                        return Err(Error::Fenced {
+                            mine: fence.epoch.as_u64(),
+                            current: reloaded.manifest.epoch.as_u64(),
+                        });
+                    }
+                    return Err(Error::ManifestCommitCas {
+                        expected: base.pointer.version,
+                        found: new_manifest.version,
                     });
                 }
-                return Err(Error::ManifestCommitCas {
-                    expected: base.pointer.version,
-                    found: new_manifest.version,
-                });
+                debug!(
+                    path = %manifest_path,
+                    "manifest body already durable from a prior attempt; adopting it"
+                );
             }
             Err(other) => return Err(other),
         }
@@ -975,6 +996,36 @@ impl ManifestStore {
             epoch: new_manifest.epoch,
             manifest_path: manifest_path.as_ref().to_string(),
         })
+    }
+
+    /// `true` iff the durable body at `manifest_path` is the one this writer
+    /// attempted to PUT: byte-identical to `attempted`, or equal to
+    /// `new_manifest` in every field except `created_at` (each retry
+    /// re-stamps the timestamp; it is audit-only). Manifests embed the
+    /// writer's `writer_id`, so equality modulo `created_at` proves the body
+    /// is ours — no other writer can produce it.
+    async fn existing_body_is_ours(
+        &self,
+        manifest_path: &Path,
+        attempted: &Bytes,
+        new_manifest: &Manifest,
+    ) -> Result<bool> {
+        let existing = match self.store.get(manifest_path).await {
+            Ok(res) => res.bytes().await?,
+            // Deleted between the failed create and this read (a concurrent
+            // claim repair); report the CAS loss and let the caller retry
+            // from a fresh base.
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(Error::ObjectStore(e)),
+        };
+        if existing == *attempted {
+            return Ok(true);
+        }
+        let Ok(mut parsed) = serde_json::from_slice::<Manifest>(&existing) else {
+            return Ok(false);
+        };
+        parsed.created_at = new_manifest.created_at;
+        Ok(parsed == *new_manifest)
     }
 
     /// Phase 2 of [`Self::commit`]: publish the pointer for the body
@@ -1048,12 +1099,23 @@ impl ManifestStore {
         // pointer NEVER advances is the signature of an orphan manifest
         // body at `base.version + 1` — a writer wrote the body via
         // `PutMode::Create` but crashed before the pointer CAS (e.g. a
-        // transient error in `cas_pointer`). Nobody can supersede that
+        // transient error in `cas_pointer`, or mid-`commit_batch` between
+        // the body PUT and the pointer CAS). Nobody can supersede that
         // version under `Create`, so an unbounded loop would spin forever.
         // Bound the *stall* (consecutive CAS losses at the same pointer
-        // version) and surface a distinct terminal error instead of hanging.
+        // version), then run the orphan repair: publish the orphan's pointer
+        // when it is a complete, durable commit, or delete it otherwise (see
+        // `repair_stalled_commit` for the decision rule and its safety
+        // argument). The stall rounds double as a grace period for a live
+        // writer mid-commit to finish on its own.
         const MAX_STALLED_ROUNDS: usize = 8;
+        // A repair can legitimately need more than one pass (fence the WAL
+        // slot + delete the body, then commit fresh). If the stall persists
+        // beyond a few passes, something keeps re-creating unpublishable
+        // bodies — surface the terminal error instead of looping forever.
+        const MAX_REPAIR_PASSES: usize = 4;
         let mut stalled_rounds = 0usize;
+        let mut repair_passes = 0usize;
         let mut last_version: Option<u64> = None;
         loop {
             let base = self.load_current().await?;
@@ -1070,16 +1132,21 @@ impl ManifestStore {
             match self.commit(&pretend, &base, new_manifest).await {
                 Ok(loaded) => return Ok((loaded, fence)),
                 Err(Error::ManifestCommitCas { .. }) => {
-                    // Reload and retry only while we keep making progress
-                    // (the pointer version advances). If it stalls at the
-                    // same version, we are colliding with an orphan body
-                    // and must stop rather than loop forever.
+                    // Reload and retry while we keep making progress (the
+                    // pointer version advances). If it stalls at the same
+                    // version, we are colliding with an orphan body: repair
+                    // it, then keep claiming.
                     if last_version == Some(base.pointer.version) {
                         stalled_rounds += 1;
                         if stalled_rounds >= MAX_STALLED_ROUNDS {
-                            return Err(Error::OrphanManifestBody {
-                                version: base.pointer.version.saturating_add(1),
-                            });
+                            if repair_passes >= MAX_REPAIR_PASSES {
+                                return Err(Error::OrphanManifestBody {
+                                    version: base.pointer.version.saturating_add(1),
+                                });
+                            }
+                            repair_passes += 1;
+                            self.repair_stalled_commit(&base).await?;
+                            stalled_rounds = 0;
                         }
                     } else {
                         last_version = Some(base.pointer.version);
@@ -1089,6 +1156,217 @@ impl ManifestStore {
                 }
                 Err(other) => return Err(other),
             }
+        }
+    }
+
+    /// Repair a stalled commit at `base.pointer.version + 1`: a manifest
+    /// body exists there but its pointer was never created, so every
+    /// writer's Create at that version loses and the pointer can never
+    /// advance — without intervention the namespace is permanently
+    /// unwritable. Decision rule:
+    ///
+    /// - **Adopt** (publish `p<N+1>`) when the body is a well-formed
+    ///   manifest extending the current lineage AND every object it
+    ///   references beyond the current manifest's set is durable — for WAL
+    ///   segments, durable with exactly the declared `last_lsn` (recovery
+    ///   refuses a mismatch). Publishing writes the exact pointer bytes the
+    ///   interrupted writer's own `cas_pointer` would have written (the
+    ///   content is deterministic), so it is safe even if that writer is
+    ///   still alive mid-commit: its pointer Create merely observes
+    ///   `AlreadyExists` and reports a CAS loss / fence, which its contract
+    ///   already maps to "drop the session and reopen". Acked data is
+    ///   unaffected; the interrupted commit's unacked records become
+    ///   durable, which at-least-once semantics permit.
+    /// - **Delete** the body otherwise. Deletion is safe against a live
+    ///   writer because it is only reached when (a) the body is not a
+    ///   protocol-written manifest (no writer holds it mid-commit), or
+    ///   (b) a referenced WAL slot is empty — in which case we first FENCE
+    ///   the slot by Create-ing an empty segment there, so the interrupted
+    ///   commit's WAL PUT can never succeed and its `cas_pointer` (which
+    ///   runs only after a WAL success) can never fire — or (c) the WAL
+    ///   slot's content mismatches the descriptor, which only sequential
+    ///   failed attempts of an already-abandoned commit can produce (slots
+    ///   are Create-once), or (d) a referenced SST is missing, which — since
+    ///   flush/compaction PUT every SST strictly before the manifest body —
+    ///   means the janitor swept the unpublished orphan's outputs long after
+    ///   any in-flight commit window.
+    async fn repair_stalled_commit(&self, base: &LoadedManifest) -> Result<()> {
+        let version = base.pointer.version.saturating_add(1);
+        let body_path = self.paths.manifest_version(version);
+
+        // The stall signature is "body exists, pointer does not". Re-check
+        // the pointer: if it landed while we were losing CAS rounds, the
+        // namespace is advancing and there is nothing to repair.
+        match self.store.head(&self.paths.pointer_version(version)).await {
+            Ok(_) => return Ok(()),
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(Error::ObjectStore(e)),
+        }
+
+        let body = match self.store.get(&body_path).await {
+            Ok(res) => res.bytes().await?,
+            // The orphan vanished (a concurrent repairer deleted it); the
+            // claim loop's next commit attempt finds the version free.
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(Error::ObjectStore(e)),
+        };
+
+        match self.orphan_ready_to_publish(base, version, &body).await? {
+            Some(orphan) => {
+                let pointer = ManifestPointer {
+                    version,
+                    epoch: orphan.epoch,
+                    manifest_path: body_path.as_ref().to_string(),
+                };
+                let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
+                match self
+                    .put_create(&self.paths.pointer_version(version), pointer_bytes.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        warn!(
+                            version,
+                            "adopted orphan manifest body: published the pointer of an \
+                             interrupted commit"
+                        );
+                        self.write_advisory_current(pointer_bytes).await?;
+                    }
+                    // Someone (possibly the interrupted writer itself)
+                    // published first; the pointer advances either way.
+                    Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            None => {
+                warn!(
+                    version,
+                    "deleting unpublishable orphan manifest body (incomplete interrupted commit)"
+                );
+                match self.store.delete(&body_path).await {
+                    Ok(()) => {}
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => return Err(Error::ObjectStore(e)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decide whether the orphan body at `version` is a complete commit that
+    /// may be published. Returns the parsed manifest when it is; `None` when
+    /// the body must be deleted instead. When a referenced WAL slot is
+    /// empty, this FENCES it (Create of an empty segment) before answering,
+    /// so a `None` answer guarantees the interrupted commit can never
+    /// complete concurrently with the caller's deletion.
+    async fn orphan_ready_to_publish(
+        &self,
+        base: &LoadedManifest,
+        version: u64,
+        body: &[u8],
+    ) -> Result<Option<Manifest>> {
+        // Not a manifest, or one that does not extend the current lineage:
+        // no protocol writer produced it for this slot (put_body validates
+        // version and epoch against the same base before writing).
+        let Ok(orphan) = serde_json::from_slice::<Manifest>(body) else {
+            return Ok(None);
+        };
+        if orphan.version != version || orphan.epoch < base.manifest.epoch {
+            return Ok(None);
+        }
+
+        // Every SST the orphan adds over the base must still be durable.
+        // Flush/compaction PUT SSTs strictly before the manifest body, so
+        // they existed when the body was created; a missing one means the
+        // janitor has since swept the unpublished orphan's outputs.
+        let base_ssts: HashSet<&str> = base.manifest.ssts.iter().map(|s| s.path.as_str()).collect();
+        for sst in orphan
+            .ssts
+            .iter()
+            .filter(|s| !base_ssts.contains(s.path.as_str()))
+        {
+            // SST descriptor paths are relative to the namespace prefix
+            // (same resolution the read path uses).
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), sst.path);
+            match self.store.head(&Path::from(absolute)).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(Error::ObjectStore(e)),
+            }
+        }
+
+        // Every WAL segment the orphan adds over the base must be durable
+        // with exactly the declared `last_lsn`. `commit_batch` pipelines the
+        // WAL PUT with the body PUT (and `commit_body_first` PUTs the body
+        // first), so a body can exist whose WAL segment never landed —
+        // publishing it would wedge recovery on a missing/mismatched
+        // segment instead.
+        let base_wal: HashSet<u64> = base.manifest.wal_segments.iter().map(|s| s.seq).collect();
+        for seg in orphan
+            .wal_segments
+            .iter()
+            .filter(|s| !base_wal.contains(&s.seq))
+        {
+            let seg_path = self.paths.wal_segment(seg.seq);
+            if seg.path != seg_path.as_ref() {
+                // Descriptor/path mismatch: not written by this namespace's
+                // protocol. Recovery would read `seg_path` and miss.
+                return Ok(None);
+            }
+            if !self
+                .wal_slot_matches(seg.seq, seg.last_lsn, &seg_path)
+                .await?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(orphan))
+    }
+
+    /// `true` iff the WAL object at `seg_path` is durable and carries
+    /// exactly the records the manifest descriptor declares (recovery
+    /// matches on `last_lsn`). When the slot is empty, first fence it by
+    /// Create-ing an *empty* segment there: WAL slots are Create-once, so
+    /// winning that create atomically guarantees the interrupted commit's
+    /// own WAL PUT — possibly still in flight — fails `AlreadyExists`, and
+    /// without a WAL success it never reaches `cas_pointer`. Losing the
+    /// create means the real segment just landed; re-read and re-judge. The
+    /// fence sentinel is a valid empty segment (`last_lsn = 0`, which no
+    /// real commit declares), so a peer repairer that reads it reaches the
+    /// same "mismatch → delete" verdict, and the janitor eventually sweeps
+    /// it as an unreferenced segment.
+    async fn wal_slot_matches(
+        &self,
+        seq: u64,
+        declared_last_lsn: u64,
+        seg_path: &Path,
+    ) -> Result<bool> {
+        loop {
+            let bytes = match self.store.get(seg_path).await {
+                Ok(res) => res.bytes().await?,
+                Err(object_store::Error::NotFound { .. }) => {
+                    let sentinel = WalSegment::new(seq).encode();
+                    let opts = PutOptions::from(PutMode::Create);
+                    match self
+                        .store
+                        .put_opts(seg_path, PutPayload::from(sentinel), opts)
+                        .await
+                    {
+                        Ok(_) => {
+                            warn!(seq, path = %seg_path, "fenced missing WAL slot of an interrupted commit");
+                            return Ok(false);
+                        }
+                        // Raced the in-flight WAL PUT; the slot settled —
+                        // re-read it and judge the real content.
+                        Err(object_store::Error::AlreadyExists { .. }) => continue,
+                        Err(e) => return Err(Error::ObjectStore(e)),
+                    }
+                }
+                Err(e) => return Err(Error::ObjectStore(e)),
+            };
+            return Ok(match WalSegment::decode(seq, bytes) {
+                Ok(segment) => !segment.is_empty() && segment.last_lsn() == declared_last_lsn,
+                Err(_) => false,
+            });
         }
     }
 
@@ -1398,42 +1676,297 @@ mod tests {
         }
     }
 
+    /// Plant an orphan manifest body at `version` (Create), pointer left
+    /// behind — the crash window between the body PUT and the pointer CAS.
+    async fn plant_orphan_body(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        orphan: &Manifest,
+    ) {
+        store
+            .put_opts(
+                &paths.manifest_version(orphan.version),
+                PutPayload::from(serde_json::to_vec(orphan).unwrap()),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn claim_writer_surfaces_orphan_manifest_body_instead_of_hanging() {
+    async fn claim_writer_adopts_orphan_body_and_unwedges_namespace() {
         // Reproduce the partial-commit window: a writer wrote the manifest
         // body at version 1 via PutMode::Create but never advanced the
-        // pointer (e.g. a transient, non-Precondition error in cas_pointer).
-        // The body at v1 is now a durable orphan with the pointer stuck at
-        // v0. Without a stall bound, claim_writer would spin forever (Create
-        // at v1 -> AlreadyExists -> ManifestCommitCas -> reload still v0 ->
-        // repeat). It must instead terminate with a distinct error.
+        // pointer (crash between the body PUT and the pointer CAS). The
+        // orphan references no new WAL segment or SST, so it is a complete
+        // commit — claim_writer must publish its pointer (completing the
+        // interrupted commit) and then claim on top of it, instead of
+        // wedging the namespace forever.
         let (store, paths) = store();
         let ms = ManifestStore::new(store.clone(), paths.clone());
         let w = Uuid::now_v7();
         let base = ms.bootstrap(w).await.unwrap();
         assert_eq!(base.manifest.version, 0);
 
-        // Plant the orphan body at v1, pointer left at v0.
         let orphan = base.manifest.next_version(Uuid::now_v7());
         assert_eq!(orphan.version, 1);
+        plant_orphan_body(&store, &paths, &orphan).await;
+
+        let (loaded, fence) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ms.claim_writer())
+                .await
+                .expect("claim_writer must not hang on an orphan manifest body")
+                .expect("claim_writer must repair the stalled commit");
+        // The adopted orphan became v1 and the claim landed on top at v2.
+        assert_eq!(loaded.manifest.version, 2);
+        assert_eq!(loaded.manifest.epoch, Epoch(1));
+        assert_eq!(fence.epoch, Epoch(1));
+        assert!(
+            store.head(&paths.pointer_version(1)).await.is_ok(),
+            "adoption must publish the orphan's pointer p1"
+        );
+        let adopted = ms.load_manifest_at(1).await.unwrap();
+        assert_eq!(adopted, orphan, "v1 must still be the orphan body");
+
+        // The namespace is writable again.
+        let next = loaded.manifest.next_version(fence.writer_id);
+        let committed = ms.commit(&fence, &loaded, next).await.unwrap();
+        assert_eq!(committed.manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn claim_writer_adopts_orphan_whose_wal_segment_is_durable() {
+        // The interrupted commit's WAL PUT landed (pipelined with the body
+        // PUT in commit_batch) but the pointer CAS never ran. The orphan is
+        // a complete commit: adopt it, keeping the WAL segment referenced so
+        // no durable records are dropped.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
+        let mut segment = crate::wal::WalSegment::new(1);
+        segment.push(crate::wal::WalRecord {
+            lsn: 7,
+            payload: Bytes::from_static(b"payload"),
+        });
+        let wal_store = crate::wal::WalStore::new(store.clone(), paths.clone());
+        wal_store.append_segment(&segment).await.unwrap();
+
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 7,
+        });
+        plant_orphan_body(&store, &paths, &orphan).await;
+
+        let (loaded, _fence) = ms.claim_writer().await.unwrap();
+        assert_eq!(loaded.manifest.version, 2);
+        assert_eq!(loaded.manifest.epoch, Epoch(1));
+        assert_eq!(
+            loaded.manifest.wal_segments.len(),
+            1,
+            "the adopted commit's WAL segment must stay referenced"
+        );
+        assert_eq!(loaded.manifest.wal_segments[0].seq, 1);
+        assert_eq!(loaded.manifest.wal_segments[0].last_lsn, 7);
+    }
+
+    #[tokio::test]
+    async fn claim_writer_deletes_orphan_with_missing_wal_segment() {
+        // The interrupted commit's pipelined WAL PUT never landed: the body
+        // references a segment that does not exist. Publishing it would
+        // wedge recovery on the missing segment, so the repair must fence
+        // the WAL slot, delete the orphan, and let the claim proceed.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 42,
+        });
+        plant_orphan_body(&store, &paths, &orphan).await;
+
+        let (loaded, _fence) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ms.claim_writer())
+                .await
+                .expect("claim_writer must not hang")
+                .expect("claim_writer must delete the incomplete orphan and claim");
+        // The claim itself became v1 (the orphan was deleted, freeing the
+        // version), and the phantom segment is NOT referenced.
+        assert_eq!(loaded.manifest.version, 1);
+        assert_eq!(loaded.manifest.epoch, Epoch(1));
+        assert!(
+            loaded.manifest.wal_segments.is_empty(),
+            "the phantom WAL segment must not be published"
+        );
+        let body = ms.load_manifest_at(1).await.unwrap();
+        assert_ne!(body, orphan, "the orphan body must have been replaced");
+
+        // The WAL slot was fenced with a valid empty segment so the
+        // interrupted commit can never complete it.
+        let sentinel = store.get(&paths.wal_segment(1)).await.unwrap();
+        let bytes = sentinel.bytes().await.unwrap();
+        let decoded = crate::wal::WalSegment::decode(1, bytes).unwrap();
+        assert!(decoded.is_empty(), "the fence sentinel must be empty");
+    }
+
+    #[tokio::test]
+    async fn claim_writer_deletes_orphan_with_mismatched_wal_segment() {
+        // The WAL slot holds a segment whose content does not match the
+        // orphan's descriptor (a later attempt of the same seq, or a fence
+        // sentinel from a crashed repairer). Recovery refuses last_lsn
+        // mismatches, so the orphan must be deleted, not published.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
+        let mut segment = crate::wal::WalSegment::new(1);
+        segment.push(crate::wal::WalRecord {
+            lsn: 9,
+            payload: Bytes::from_static(b"payload"),
+        });
+        let wal_store = crate::wal::WalStore::new(store.clone(), paths.clone());
+        wal_store.append_segment(&segment).await.unwrap();
+
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 7, // declared 7, body carries 9
+        });
+        plant_orphan_body(&store, &paths, &orphan).await;
+
+        let (loaded, _fence) = ms.claim_writer().await.unwrap();
+        assert_eq!(loaded.manifest.version, 1);
+        assert!(loaded.manifest.wal_segments.is_empty());
+        // The mismatched segment itself is untouched (the janitor owns it).
+        assert!(store.head(&paths.wal_segment(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn claim_writer_deletes_corrupt_orphan_body() {
+        // A body that does not parse as a manifest was not produced by any
+        // protocol writer; it can never be completed, only removed.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let _ = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+
         store
             .put_opts(
                 &paths.manifest_version(1),
-                PutPayload::from(serde_json::to_vec(&orphan).unwrap()),
+                PutPayload::from(&b"not json"[..]),
                 PutOptions::from(PutMode::Create),
             )
             .await
             .unwrap();
 
-        // Must terminate (not hang) and surface OrphanManifestBody.
-        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ms.claim_writer())
-            .await
-            .expect("claim_writer must not hang on an orphan manifest body")
-            .unwrap_err();
+        let (loaded, _fence) = ms.claim_writer().await.unwrap();
+        assert_eq!(loaded.manifest.version, 1);
+        assert_eq!(loaded.manifest.epoch, Epoch(1));
+    }
+
+    #[tokio::test]
+    async fn put_body_retry_with_identical_body_adopts_existing() {
+        // Retry-after-lost-response: the first put_body landed but the
+        // caller never saw the success (e.g. a CAS-pointer timeout forced a
+        // whole-commit retry). The second attempt writes byte-identical
+        // content and must adopt the durable body instead of failing with
+        // ManifestCommitCas — which would strand an orphan nobody can
+        // supersede.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store, paths);
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let next = base.manifest.next_version(fence.writer_id);
+        let first = ms.put_body(&fence, &base, &next).await.unwrap();
+        // Same Manifest value → byte-identical body.
+        let second = ms.put_body(&fence, &base, &next).await.unwrap();
+        assert_eq!(first, second);
+
+        let committed = ms.cas_pointer(&fence, &base, next, second).await.unwrap();
+        assert_eq!(committed.manifest.version, 1);
+        assert_eq!(ms.load_current().await.unwrap().manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn put_body_retry_adopts_body_differing_only_in_created_at() {
+        // A rebuilt retry (commit_batch re-derives the next manifest after a
+        // transient WAL PUT failure) re-stamps created_at, so the bytes are
+        // not identical — but the manifest is semantically the same commit
+        // from the same writer. It must still be adopted.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store, paths);
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut next = base.manifest.next_version(fence.writer_id);
+        ms.put_body(&fence, &base, &next).await.unwrap();
+
+        next.created_at += chrono::Duration::seconds(3);
+        let pointer = ms.put_body(&fence, &base, &next).await.unwrap();
+        let committed = ms.cas_pointer(&fence, &base, next, pointer).await.unwrap();
+        assert_eq!(committed.manifest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn put_body_still_loses_cas_to_a_competitor_body() {
+        // A different writer's body at the same version is NOT ours: the
+        // adoption path must not fire and the CAS loss must surface.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store, paths);
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        // Competitor (different writer_id) creates v1 first.
+        let competitor = base.manifest.next_version(Uuid::now_v7());
+        ms.put_body(&fence, &base, &competitor).await.unwrap();
+
+        let ours = base.manifest.next_version(fence.writer_id);
+        let err = ms.put_body(&fence, &base, &ours).await.unwrap_err();
         match err {
-            Error::OrphanManifestBody { version } => assert_eq!(version, 1),
-            other => panic!("expected OrphanManifestBody, got {other:?}"),
+            Error::ManifestCommitCas { expected, found } => {
+                assert_eq!(expected, 0);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected ManifestCommitCas, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn put_body_does_not_adopt_own_body_with_different_content() {
+        // Same writer, same version, but the durable body references a
+        // different WAL set (records were appended between attempts).
+        // Adopting it would publish a manifest that disagrees with what the
+        // caller is about to apply — must stay a CAS loss.
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store, paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut first = base.manifest.next_version(fence.writer_id);
+        first.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 100,
+        });
+        ms.put_body(&fence, &base, &first).await.unwrap();
+
+        let mut second = base.manifest.next_version(fence.writer_id);
+        second.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: paths.wal_segment(1).as_ref().to_string(),
+            last_lsn: 150,
+        });
+        let err = ms.put_body(&fence, &base, &second).await.unwrap_err();
+        assert!(
+            matches!(err, Error::ManifestCommitCas { .. }),
+            "expected ManifestCommitCas, got {err:?}"
+        );
     }
 
     #[tokio::test]

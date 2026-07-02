@@ -2440,6 +2440,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopen_repairs_interrupted_commit_and_preserves_acked_data() {
+        // Crash in the window between the manifest body PUT and the pointer
+        // CAS, with the pipelined WAL PUT already durable. Before the repair,
+        // reopen wedged forever: claim_writer built base+1, hit AlreadyExists
+        // on the orphan body, and stalled into OrphanManifestBody on every
+        // open. Now the orphan is a complete commit — reopen must adopt it
+        // and the namespace stays writable with no acked data lost.
+        let store = make_store();
+        let paths = make_paths("ingest-adopt-orphan");
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap(); // acked
+
+        // Second commit interrupted: WAL PUT + body PUT landed, pointer
+        // CAS never ran (the crash window commit_batch pipelines across).
+        session
+            .upsert_node("Person", bob, &node_record("Bob", None))
+            .unwrap();
+        let next = session.build_next(session.pending.seq, session.pending.last_lsn());
+        session
+            .wal_store
+            .append_segment(&session.pending)
+            .await
+            .unwrap();
+        session
+            .manifest_store
+            .put_body(&session.fence, &session.current, &next)
+            .await
+            .unwrap();
+        drop(session); // crash
+
+        let mut session = WriterSession::open(store, paths)
+            .await
+            .expect("open must repair the stalled commit, not wedge");
+        let snap = session.snapshot();
+        assert!(
+            snap.lookup_node("Person", alice).await.unwrap().is_some(),
+            "acked data must survive the repair"
+        );
+        assert!(
+            snap.lookup_node("Person", bob).await.unwrap().is_some(),
+            "the adopted commit's durable WAL records must be recovered"
+        );
+        drop(snap);
+
+        // Writable again.
+        let carol = sorted_node_id(3);
+        session
+            .upsert_node("Person", carol, &node_record("Carol", None))
+            .unwrap();
+        let out = session.commit_batch().await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }));
+    }
+
+    #[tokio::test]
+    async fn reopen_repairs_interrupted_commit_with_missing_wal() {
+        // Crash where the body PUT won the pipelined race but the WAL PUT
+        // never landed: the orphan references a segment that does not
+        // exist. Publishing it would wedge recovery on the missing segment,
+        // so reopen must delete the orphan instead — and still succeed.
+        let store = make_store();
+        let paths = make_paths("ingest-drop-orphan");
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        let _ = session.commit_batch().await.unwrap(); // acked
+
+        session
+            .upsert_node("Person", bob, &node_record("Bob", None))
+            .unwrap();
+        let phantom_seq = session.pending.seq;
+        let next = session.build_next(phantom_seq, session.pending.last_lsn());
+        // Body PUT only — the WAL PUT "failed" (never landed).
+        session
+            .manifest_store
+            .put_body(&session.fence, &session.current, &next)
+            .await
+            .unwrap();
+        drop(session); // crash
+
+        let mut session = WriterSession::open(store, paths)
+            .await
+            .expect("open must delete the incomplete orphan, not wedge");
+        assert!(
+            session
+                .current
+                .manifest
+                .wal_segments
+                .iter()
+                .all(|s| s.seq != phantom_seq),
+            "the phantom WAL segment must never be published"
+        );
+        let snap = session.snapshot();
+        assert!(
+            snap.lookup_node("Person", alice).await.unwrap().is_some(),
+            "acked data must survive the repair"
+        );
+        assert!(
+            snap.lookup_node("Person", bob).await.unwrap().is_none(),
+            "the unacked record whose WAL never landed must not resurface"
+        );
+        drop(snap);
+
+        let carol = sorted_node_id(3);
+        session
+            .upsert_node("Person", carol, &node_record("Carol", None))
+            .unwrap();
+        let out = session.commit_batch().await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }));
+    }
+
+    #[tokio::test]
+    async fn commit_batch_retry_after_transient_wal_failure_succeeds() {
+        // Attempt 0: the pipelined WAL PUT fails transiently while the body
+        // PUT lands. The retry re-PUTs the WAL (Create succeeds — the slot
+        // is empty) and hits AlreadyExists on its own body; put_body must
+        // adopt it (identical modulo created_at) and complete the commit.
+        // Before the fix the retry died with ManifestCommitCas and the
+        // orphan body wedged the namespace.
+        let fault = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = fault.clone();
+        let paths = make_paths("ingest-wal-retry");
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+
+        fault.fail_next_put_containing(paths.wal_segment(1).as_ref());
+        let err = session.commit_batch().await.unwrap_err();
+        assert!(
+            !matches!(err, Error::ManifestCommitCas { .. }),
+            "a transient WAL failure is retryable, got {err:?}"
+        );
+
+        // Same pending batch, same seq — the retry must succeed.
+        let out = session.commit_batch().await.unwrap();
+        match out {
+            CommitOutcome::Committed { wal_seq, .. } => assert_eq!(wal_seq, 1),
+            other => panic!("expected Committed, got {other:?}"),
+        }
+        let snap = session.snapshot();
+        assert!(snap.lookup_node("Person", alice).await.unwrap().is_some());
+        drop(snap);
+        drop(session);
+
+        // And the namespace reopens cleanly (no orphan wedge left behind).
+        let session = WriterSession::open(store, paths).await.unwrap();
+        let snap = session.snapshot();
+        assert!(snap.lookup_node("Person", alice).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn max_l0_bucket_len_counts_l0_and_drops_after_compaction() {
         // RFC-027 P5 signal: each flush adds one L0 SST to the node bucket,
         // so the worst-bucket L0 count grows with flushes and collapses to
