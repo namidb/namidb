@@ -320,6 +320,17 @@ async fn compact_leveled(
             name: label.clone(),
             properties: vec![],
         });
+        // Sidecar-harvesting def: for the id-primary "" bucket the label_def is
+        // empty (no declared columns), so unique/equality sidecars would be
+        // harvested from zero properties and silently dropped on every
+        // compaction — degrading indexed lookups to full label scans. Mirror
+        // flush: harvest from the schema's union of indexed properties. Legacy
+        // per-label buckets keep their own def.
+        let sidecar_def = if label.is_empty() {
+            crate::flush::union_indexed_props(schema)
+        } else {
+            label_def.clone()
+        };
         let mut readers: Vec<NodeSstReader> = Vec::with_capacity(plan.inputs.len());
         for desc in &plan.inputs {
             let body = get_sst_body(store.as_ref(), paths, desc).await?;
@@ -348,7 +359,7 @@ async fn compact_leveled(
             paths,
             plan.target_level,
             &label,
-            &label_def,
+            &sidecar_def,
             &merged_rows,
             finish,
             schema,
@@ -746,12 +757,18 @@ fn compact_edge_ssts(
 // stats for declared-but-absent properties during the L0->L1 rebuild; the
 // params are all distinct and bundling them would not aid readability.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn put_node_sst_leveled(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
     label: &str,
-    label_def: &LabelDef,
+    // Property def used for harvesting unique/equality sidecars. For the
+    // id-primary "" bucket the caller passes `union_indexed_props(schema)` (the
+    // body has no declared property columns but indexed props still need
+    // sidecars); for legacy per-label buckets it's the label's own def. Mirrors
+    // flush, which harvests from `union_indexed_props`.
+    sidecar_def: &LabelDef,
     merged_rows: &[NodeRow],
     finish: NodeSstFinish,
     schema: &Schema,
@@ -794,7 +811,7 @@ async fn put_node_sst_leveled(
             level.as_u32(),
             &id,
             label,
-            label_def,
+            sidecar_def,
             merged_rows,
         )?;
     // Re-emit equality-index posting-list sidecars too, rebuilt from the
@@ -806,7 +823,7 @@ async fn put_node_sst_leveled(
             level.as_u32(),
             &id,
             label,
-            label_def,
+            sidecar_def,
             merged_rows,
         )?;
     index_sidecars.extend(equality_sidecars);

@@ -381,7 +381,7 @@ fn bucket_nodes_and_edges(
 /// `unique` is intentionally cleared: a single-value unique sidecar cannot
 /// represent per-label uniqueness across a multi-label SST, so unique-property
 /// lookups fall back to a (correct) scan rather than risk a false negative.
-fn union_indexed_props(schema: &Schema) -> LabelDef {
+pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
     let mut by_name: BTreeMap<String, PropertyDef> = BTreeMap::new();
     for label in schema.labels.values() {
         for p in &label.properties {
