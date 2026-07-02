@@ -396,6 +396,20 @@ impl<'src> Parser<'src> {
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SHOW") => {
                 self.parse_show_schema().map(Clause::ShowSchema)
             }
+            // `DROP …` is schema DDL only (there is no graph `DROP`). Like
+            // `CALL`/`SHOW`, `DROP` is a soft keyword: route off the second
+            // token — `VECTOR` → vector index, `INDEX`/`FULLTEXT` → fulltext.
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DROP") => {
+                if matches!(
+                    self.peek_at(1),
+                    Some(Token::Ident(n)) if n.eq_ignore_ascii_case("VECTOR")
+                ) {
+                    self.parse_drop_vector_index().map(Clause::DropVectorIndex)
+                } else {
+                    self.parse_drop_fulltext_index()
+                        .map(Clause::DropFulltextIndex)
+                }
+            }
             Some(other) => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 format!("expected a clause keyword, found `{}`", other.label()),
@@ -676,6 +690,66 @@ impl<'src> Parser<'src> {
             if_not_exists,
             span: SourceSpan::new(start, end),
         })
+    }
+
+    /// `DROP VECTOR INDEX <name> [IF EXISTS]`. Routed here off the
+    /// `DROP VECTOR` two-token prefix. Never reaches the lowerer; the server
+    /// intercepts it via `Query::as_drop_vector_index`.
+    fn parse_drop_vector_index(&mut self) -> Result<DropVectorIndexClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("DROP")?;
+        self.expect_soft_keyword("VECTOR")?;
+        self.expect_soft_keyword("INDEX")?;
+        let name = self.expect_identifier()?;
+        let if_exists = self.parse_if_exists()?;
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(DropVectorIndexClause {
+            name,
+            if_exists,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// `DROP INDEX <name> [IF EXISTS]` / `DROP FULLTEXT INDEX <name>
+    /// [IF EXISTS]` — both spellings drop a fulltext index. Routed here off a
+    /// `DROP` prefix that is not `DROP VECTOR`. Never reaches the lowerer; the
+    /// server intercepts it via `Query::as_drop_fulltext_index`.
+    fn parse_drop_fulltext_index(&mut self) -> Result<DropFulltextIndexClause, ParseError> {
+        let start = self.peek_span().start;
+        self.expect_soft_keyword("DROP")?;
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("FULLTEXT")) {
+            self.bump();
+        }
+        self.expect_soft_keyword("INDEX")?;
+        let name = self.expect_identifier()?;
+        let if_exists = self.parse_if_exists()?;
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(DropFulltextIndexClause {
+            name,
+            if_exists,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// Optional `IF EXISTS` (after a DROP target's name) — the DROP-side twin
+    /// of [`parse_if_not_exists`](Self::parse_if_not_exists). Consumes both
+    /// tokens only when `IF` is present; returns whether the clause was seen.
+    fn parse_if_exists(&mut self) -> Result<bool, ParseError> {
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("IF")) {
+            self.bump(); // IF
+            self.expect_soft_keyword("EXISTS")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Optional constraint/index name: an identifier that is not a soft keyword
@@ -2904,6 +2978,100 @@ mod tests {
             q.as_create_vector_index().is_none(),
             "a non-standalone DDL must not be intercepted"
         );
+    }
+
+    #[test]
+    fn drop_vector_index_parses() {
+        let q = ok("DROP VECTOR INDEX doc_emb");
+        assert_eq!(q.head.clauses.len(), 1);
+        let c = match &q.head.clauses[0] {
+            Clause::DropVectorIndex(c) => c,
+            other => panic!("expected DropVectorIndex, got {other:?}"),
+        };
+        assert_eq!(c.name.name, "doc_emb");
+        assert!(!c.if_exists, "no IF EXISTS by default");
+        assert_eq!(c.to_string(), "DROP VECTOR INDEX doc_emb");
+        // The server-side DDL hook recognises a standalone statement.
+        assert!(q.as_drop_vector_index().is_some());
+    }
+
+    #[test]
+    fn drop_vector_index_if_exists() {
+        let q = ok("DROP VECTOR INDEX doc_emb IF EXISTS");
+        let c = match &q.head.clauses[0] {
+            Clause::DropVectorIndex(c) => c,
+            other => panic!("expected DropVectorIndex, got {other:?}"),
+        };
+        assert!(c.if_exists);
+        assert_eq!(c.to_string(), "DROP VECTOR INDEX doc_emb IF EXISTS");
+    }
+
+    #[test]
+    fn drop_index_parses_both_spellings_as_fulltext_drop() {
+        // `DROP INDEX` and the `DROP FULLTEXT INDEX` alias both drop a
+        // fulltext index; the canonical display is the bare `DROP INDEX`.
+        for src in ["DROP INDEX note_ft", "DROP FULLTEXT INDEX note_ft"] {
+            let q = ok(src);
+            let c = match &q.head.clauses[0] {
+                Clause::DropFulltextIndex(c) => c,
+                other => panic!("expected DropFulltextIndex for {src:?}, got {other:?}"),
+            };
+            assert_eq!(c.name.name, "note_ft");
+            assert!(!c.if_exists);
+            assert_eq!(c.to_string(), "DROP INDEX note_ft");
+            assert!(q.as_drop_fulltext_index().is_some());
+        }
+    }
+
+    #[test]
+    fn drop_index_if_exists() {
+        let q = ok("DROP INDEX note_ft IF EXISTS");
+        let c = match &q.head.clauses[0] {
+            Clause::DropFulltextIndex(c) => c,
+            other => panic!("expected DropFulltextIndex, got {other:?}"),
+        };
+        assert!(c.if_exists);
+        assert_eq!(c.to_string(), "DROP INDEX note_ft IF EXISTS");
+        // A dangling `IF` (no `EXISTS`) is a parse error, not a silent flag.
+        assert_eq!(err_code("DROP INDEX note_ft IF"), ErrorCode::UnexpectedEof);
+    }
+
+    #[test]
+    fn drop_index_requires_a_name() {
+        assert_eq!(err_code("DROP INDEX"), ErrorCode::UnexpectedEof);
+        assert_eq!(err_code("DROP VECTOR INDEX"), ErrorCode::UnexpectedEof);
+    }
+
+    #[test]
+    fn drop_index_roundtrips() {
+        // parse → format → parse must yield the same AST modulo spans.
+        let cases = [
+            "DROP VECTOR INDEX doc_emb",
+            "DROP VECTOR INDEX doc_emb IF EXISTS",
+            "DROP INDEX note_ft",
+            "DROP INDEX note_ft IF EXISTS",
+            "DROP FULLTEXT INDEX note_ft IF EXISTS",
+        ];
+        for src in cases {
+            let q1 = ok(src);
+            let rendered = format!("{}", q1);
+            let q2 = ok(&rendered);
+            assert_eq!(
+                format!("{}", q1),
+                format!("{}", q2),
+                "round-trip diverged for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_index_combined_with_return_is_not_standalone() {
+        // DDL is standalone-only; a following RETURN means the server hook
+        // does not fire and the lowerer rejects it.
+        let q = ok("DROP VECTOR INDEX ix RETURN 1");
+        assert!(q.as_drop_vector_index().is_none());
+        let q = ok("DROP INDEX ix RETURN 1");
+        assert!(q.as_drop_fulltext_index().is_none());
     }
 
     #[test]

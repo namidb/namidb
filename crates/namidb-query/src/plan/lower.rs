@@ -174,6 +174,22 @@ fn lower_clause_seq(
                     clause.span(),
                 ));
             }
+            Clause::DropVectorIndex(_) => {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "DROP VECTOR INDEX is a schema command and must be the \
+                     sole statement; it cannot be lowered to a query plan",
+                    clause.span(),
+                ));
+            }
+            Clause::DropFulltextIndex(_) => {
+                return Err(LowerError::new(
+                    LowerErrorKind::UnsupportedFeature,
+                    "DROP INDEX is a schema command and must be the sole \
+                     statement; it cannot be lowered to a query plan",
+                    clause.span(),
+                ));
+            }
             Clause::CreateConstraint(_) => {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,

@@ -232,6 +232,126 @@ impl ServerBackend {
         }
     }
 
+    /// Bolt shape for `DROP VECTOR INDEX` (mirrors `run_create_vector_index`,
+    /// same authz treatment as CREATE).
+    #[cfg(feature = "vector-index")]
+    async fn run_drop_vector_index(
+        &self,
+        dvi: &namidb_query::parser::ast::DropVectorIndexClause,
+        started: std::time::Instant,
+    ) -> RunObservation {
+        if let Some(err) = self.write_forbidden() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
+        let op = crate::authz::SchemaOp::DropVectorIndex {
+            name: &dvi.name.name,
+        };
+        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        let mut writer = self.state.writer.lock().await;
+        let result = crate::apply_drop_vector_index(&mut writer, &self.state.snapshot, dvi).await;
+        drop(writer);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed,
+                result: Ok(RunOutcome {
+                    fields: vec![],
+                    rows: vec![],
+                    statement_type: StatementType::Schema,
+                    counters: BTreeMap::new(),
+                }),
+            },
+            Err(e) => {
+                // A missing index (without IF EXISTS) is a user (semantic)
+                // error; a fence or lost CAS is a transient storage error.
+                let is_user = matches!(
+                    &e,
+                    namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_)
+                );
+                let err = if is_user {
+                    BackendError::Semantic(e.to_string())
+                } else {
+                    map_storage_err(e)
+                };
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Err(err),
+                }
+            }
+        }
+    }
+
+    /// Bolt shape for `DROP INDEX` / `DROP FULLTEXT INDEX` (mirrors
+    /// `run_drop_vector_index`).
+    #[cfg(feature = "text-index")]
+    async fn run_drop_fulltext_index(
+        &self,
+        dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
+        started: std::time::Instant,
+    ) -> RunObservation {
+        if let Some(err) = self.write_forbidden() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(err),
+            };
+        }
+        let op = crate::authz::SchemaOp::DropFulltextIndex {
+            name: &dfi.name.name,
+        };
+        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        let mut writer = self.state.writer.lock().await;
+        let result = crate::apply_drop_fulltext_index(&mut writer, &self.state.snapshot, dfi).await;
+        drop(writer);
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed,
+                result: Ok(RunOutcome {
+                    fields: vec![],
+                    rows: vec![],
+                    statement_type: StatementType::Schema,
+                    counters: BTreeMap::new(),
+                }),
+            },
+            Err(e) => {
+                let is_user = matches!(
+                    &e,
+                    namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_)
+                );
+                let err = if is_user {
+                    BackendError::Semantic(e.to_string())
+                } else {
+                    map_storage_err(e)
+                };
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Err(err),
+                }
+            }
+        }
+    }
+
     /// Bolt shape for `CREATE CONSTRAINT`/`CREATE INDEX` (always-on schema DDL).
     async fn run_create_property_ddl(
         &self,
@@ -350,6 +470,18 @@ impl ServerBackend {
         #[cfg(feature = "text-index")]
         if let Some(cfi) = parsed.as_create_fulltext_index() {
             return self.run_create_fulltext_index(cfi, started).await;
+        }
+
+        // `DROP VECTOR INDEX` is schema DDL: intercept before planning.
+        #[cfg(feature = "vector-index")]
+        if let Some(dvi) = parsed.as_drop_vector_index() {
+            return self.run_drop_vector_index(dvi, started).await;
+        }
+
+        // `DROP INDEX` / `DROP FULLTEXT INDEX`: schema DDL, intercept pre-plan.
+        #[cfg(feature = "text-index")]
+        if let Some(dfi) = parsed.as_drop_fulltext_index() {
+            return self.run_drop_fulltext_index(dfi, started).await;
         }
 
         // `CREATE CONSTRAINT` / `CREATE INDEX`: schema DDL, intercept pre-plan.
@@ -540,6 +672,26 @@ impl ServerBackend {
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Unsupported(
                     "CREATE FULLTEXT INDEX cannot run inside a transaction".into(),
+                )),
+            };
+        }
+        #[cfg(feature = "vector-index")]
+        if parsed.as_drop_vector_index().is_some() {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Unsupported(
+                    "DROP VECTOR INDEX cannot run inside a transaction".into(),
+                )),
+            };
+        }
+        #[cfg(feature = "text-index")]
+        if parsed.as_drop_fulltext_index().is_some() {
+            return RunObservation {
+                kind: None,
+                elapsed: started.elapsed(),
+                result: Err(BackendError::Unsupported(
+                    "DROP INDEX cannot run inside a transaction".into(),
                 )),
             };
         }

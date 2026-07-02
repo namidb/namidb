@@ -1490,6 +1490,200 @@ async fn run_create_fulltext_index(
     }
 }
 
+/// Drop a vector index (metadata-only: descriptor + `.vg` SST refs in one
+/// commit) and republish the snapshot. Shared by the HTTP and Bolt DDL paths.
+#[cfg(feature = "vector-index")]
+async fn apply_drop_vector_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    dvi: &namidb_query::parser::ast::DropVectorIndexClause,
+) -> Result<u64, namidb_storage::Error> {
+    let version = writer
+        .drop_vector_index(&dvi.name.name, dvi.if_exists)
+        .await?;
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// HTTP shape for a `DROP VECTOR INDEX`: gate on role + authz, run the DDL,
+/// return an empty `CypherResponse` on success. Mirrors
+/// `run_create_vector_index` (same authz treatment as CREATE).
+#[cfg(feature = "vector-index")]
+async fn run_drop_vector_index(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    authz: &Arc<dyn authz::AuthzHook>,
+    dvi: &namidb_query::parser::ast::DropVectorIndexClause,
+    principal: &Principal,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    if !principal.allows_write() {
+        return ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: "this token is read-only; schema commands are forbidden".into(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let op = authz::SchemaOp::DropVectorIndex {
+        name: &dvi.name.name,
+    };
+    if let Err(denied) = authz.check_schema(principal, op).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let mut w = writer.lock().await;
+    let result = apply_drop_vector_index(&mut w, snapshot, dvi).await;
+    drop(w);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
+        Err(e) => {
+            // A missing index (without IF EXISTS) is a user error (400); a
+            // fence or lost CAS is a server-side condition (503).
+            let status = match &e {
+                namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    status,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+/// Drop a full-text index (metadata-only: descriptor + `.ft` SST refs in one
+/// commit) and republish the snapshot. Shared by the HTTP and Bolt DDL paths.
+#[cfg(feature = "text-index")]
+async fn apply_drop_fulltext_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
+) -> Result<u64, namidb_storage::Error> {
+    let version = writer.drop_text_index(&dfi.name.name, dfi.if_exists).await?;
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
+/// HTTP shape for a `DROP INDEX` / `DROP FULLTEXT INDEX`: gate on role +
+/// authz, run the DDL, return an empty `CypherResponse` on success. Mirrors
+/// `run_drop_vector_index`.
+#[cfg(feature = "text-index")]
+async fn run_drop_fulltext_index(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    authz: &Arc<dyn authz::AuthzHook>,
+    dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
+    principal: &Principal,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    if !principal.allows_write() {
+        return ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: "this token is read-only; schema commands are forbidden".into(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let op = authz::SchemaOp::DropFulltextIndex {
+        name: &dfi.name.name,
+    };
+    if let Err(denied) = authz.check_schema(principal, op).await {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: (
+                StatusCode::FORBIDDEN,
+                Json(ErrorBody {
+                    error: denied.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+    let mut w = writer.lock().await;
+    let result = apply_drop_fulltext_index(&mut w, snapshot, dfi).await;
+    drop(w);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
+        Err(e) => {
+            let status = match &e {
+                namidb_storage::Error::Precondition(_) | namidb_storage::Error::Invariant(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed,
+                response: (
+                    status,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
 /// Apply a `CREATE CONSTRAINT … IS UNIQUE` (single- or multi-property) and
 /// republish the snapshot. A metadata-only schema commit in the writer.
 async fn apply_create_constraint(
@@ -1695,6 +1889,34 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.authz,
             cfi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `DROP VECTOR INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "vector-index")]
+    if let Some(dvi) = parsed.as_drop_vector_index() {
+        return run_drop_vector_index(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            dvi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `DROP INDEX` / `DROP FULLTEXT INDEX` is schema DDL: intercept pre-plan.
+    #[cfg(feature = "text-index")]
+    if let Some(dfi) = parsed.as_drop_fulltext_index() {
+        return run_drop_fulltext_index(
+            &state.writer,
+            &state.snapshot,
+            &state.authz,
+            dfi,
             principal,
             started,
         )
@@ -2136,6 +2358,34 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &shared.authz,
             cfi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `DROP VECTOR INDEX` is schema DDL: intercept before planning.
+    #[cfg(feature = "vector-index")]
+    if let Some(dvi) = parsed.as_drop_vector_index() {
+        return run_drop_vector_index(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            &shared.authz,
+            dvi,
+            principal,
+            started,
+        )
+        .await;
+    }
+
+    // `DROP INDEX` / `DROP FULLTEXT INDEX` is schema DDL: intercept pre-plan.
+    #[cfg(feature = "text-index")]
+    if let Some(dfi) = parsed.as_drop_fulltext_index() {
+        return run_drop_fulltext_index(
+            &ns_state.writer,
+            &ns_state.snapshot,
+            &shared.authz,
+            dfi,
             principal,
             started,
         )
@@ -2778,6 +3028,117 @@ mod tests {
         let app_ro = fixture_with_tokens("ftidx-ro", ROLE_TOKENS).await;
         let ro = post_cypher(&app_ro, Some("rkey"), q).await;
         assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `DROP VECTOR INDEX` end-to-end over HTTP: unregisters the descriptor
+    /// (so the slot can be re-created), reports a missing index with 400 unless
+    /// `IF EXISTS`, and is forbidden for a read-only token — the same authz
+    /// treatment as CREATE.
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn drop_vector_index_unregisters_and_reports_missing() {
+        let app = fixture(None).await;
+
+        let create = "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16";
+        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+
+        // Drop succeeds with an empty response…
+        let r = post_cypher(&app, None, "DROP VECTOR INDEX doc_emb").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["rows"].as_array().unwrap().is_empty());
+
+        // …and the slot is free: the same CREATE is no longer a duplicate.
+        let recreate = post_cypher(&app, None, create).await;
+        assert_eq!(
+            recreate.status(),
+            StatusCode::OK,
+            "re-creating over the dropped slot must succeed"
+        );
+
+        // A missing index is a 400 without IF EXISTS, a no-op 200 with it.
+        let missing = post_cypher(&app, None, "DROP VECTOR INDEX nope").await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let ine = post_cypher(&app, None, "DROP VECTOR INDEX nope IF EXISTS").await;
+        assert_eq!(ine.status(), StatusCode::OK);
+
+        // A read-only token may not run schema DDL.
+        let app_ro = fixture_with_tokens("dropvec-ro", ROLE_TOKENS).await;
+        let ro = post_cypher(&app_ro, Some("rkey"), "DROP VECTOR INDEX doc_emb IF EXISTS").await;
+        assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `DROP INDEX` (fulltext) end-to-end over HTTP: unregisters the
+    /// descriptor, accepts the `DROP FULLTEXT INDEX` alias, reports a missing
+    /// index with 400 unless `IF EXISTS`, and is forbidden for a read-only
+    /// token.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn drop_index_unregisters_fulltext_and_reports_missing() {
+        let app = fixture(None).await;
+
+        let create = "CREATE FULLTEXT INDEX note_ft ON :Note(body, title)";
+        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+
+        // Drop, then re-create over the freed (label, properties) slot.
+        let r = post_cypher(&app, None, "DROP INDEX note_ft").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let recreate = post_cypher(&app, None, create).await;
+        assert_eq!(
+            recreate.status(),
+            StatusCode::OK,
+            "re-creating over the dropped slot must succeed"
+        );
+
+        // The `DROP FULLTEXT INDEX` alias drops it too.
+        let alias = post_cypher(&app, None, "DROP FULLTEXT INDEX note_ft").await;
+        assert_eq!(alias.status(), StatusCode::OK);
+
+        // A missing index is a 400 without IF EXISTS, a no-op 200 with it.
+        let missing = post_cypher(&app, None, "DROP INDEX note_ft").await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let ine = post_cypher(&app, None, "DROP INDEX note_ft IF EXISTS").await;
+        assert_eq!(ine.status(), StatusCode::OK);
+
+        // A read-only token may not run schema DDL.
+        let app_ro = fixture_with_tokens("dropft-ro", ROLE_TOKENS).await;
+        let ro = post_cypher(&app_ro, Some("rkey"), "DROP INDEX note_ft IF EXISTS").await;
+        assert_eq!(ro.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The wrong-dimension unbrick scenario end-to-end over HTTP: a dim-1536
+    /// index rejects a 768-dim write (400), `DROP VECTOR INDEX` removes it,
+    /// and the identical write then succeeds.
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn drop_vector_index_unbricks_wrong_dim_writes_over_http() {
+        let app = fixture(None).await;
+
+        let create = "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 1536";
+        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+
+        // A 768-dim embedding violates the (misconfigured) declared dimension.
+        let vec768 = format!(
+            "CREATE (:Doc {{embedding: vector([{}])}})",
+            vec!["0.5"; 768].join(", ")
+        );
+        let rejected = post_cypher(&app, None, &vec768).await;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::CONFLICT,
+            "wrong-dim write must be rejected (dimension constraint) while the index exists"
+        );
+
+        // Drop the misconfigured index: the identical write now succeeds.
+        let dropped = post_cypher(&app, None, "DROP VECTOR INDEX doc_emb").await;
+        assert_eq!(dropped.status(), StatusCode::OK);
+        let accepted = post_cypher(&app, None, &vec768).await;
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "the write must succeed once the index is dropped"
+        );
     }
 
     #[tokio::test]

@@ -81,6 +81,15 @@ pub enum Clause {
     /// `CreateVectorIndex` it never lowers to a `LogicalPlan` — the server
     /// intercepts it via [`Query::as_create_fulltext_index`].
     CreateFulltextIndex(CreateFulltextIndexClause),
+    /// `DROP VECTOR INDEX <name> [IF EXISTS]` — schema DDL, the undo of
+    /// `CREATE VECTOR INDEX`. Like its create counterpart it never lowers to
+    /// a `LogicalPlan`; the server intercepts it via
+    /// [`Query::as_drop_vector_index`].
+    DropVectorIndex(DropVectorIndexClause),
+    /// `DROP INDEX <name> [IF EXISTS]` (also spelled `DROP FULLTEXT INDEX`) —
+    /// schema DDL, the undo of `CREATE FULLTEXT INDEX`. Never lowered; the
+    /// server intercepts it via [`Query::as_drop_fulltext_index`].
+    DropFulltextIndex(DropFulltextIndexClause),
     /// `CREATE CONSTRAINT … IS UNIQUE` — schema DDL declaring a uniqueness
     /// constraint. Always a variant; intercepted out-of-band by the server via
     /// [`Query::as_create_constraint`] (never lowered).
@@ -121,6 +130,8 @@ impl Clause {
             Clause::Delete(c) => c.span,
             Clause::CreateVectorIndex(c) => c.span,
             Clause::CreateFulltextIndex(c) => c.span,
+            Clause::DropVectorIndex(c) => c.span,
+            Clause::DropFulltextIndex(c) => c.span,
             Clause::CreateConstraint(c) => c.span,
             Clause::CreateIndex(c) => c.span,
             Clause::ShowSchema(c) => c.span,
@@ -156,6 +167,30 @@ impl Query {
     pub fn as_create_fulltext_index(&self) -> Option<&CreateFulltextIndexClause> {
         if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
             if let Clause::CreateFulltextIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `DROP VECTOR INDEX` interception hook (mirrors
+    /// [`as_create_vector_index`](Self::as_create_vector_index)): `Some` only
+    /// when the DDL is the sole statement (no `RETURN`/`UNION`/`EXPLAIN`).
+    pub fn as_drop_vector_index(&self) -> Option<&DropVectorIndexClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::DropVectorIndex(c) = &self.head.clauses[0] {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// `DROP INDEX` / `DROP FULLTEXT INDEX` interception hook (mirrors
+    /// [`as_create_fulltext_index`](Self::as_create_fulltext_index)): `Some`
+    /// only when the DDL is the sole statement.
+    pub fn as_drop_fulltext_index(&self) -> Option<&DropFulltextIndexClause> {
+        if self.tail.is_empty() && !self.explain && self.head.clauses.len() == 1 {
+            if let Clause::DropFulltextIndex(c) = &self.head.clauses[0] {
                 return Some(c);
             }
         }
@@ -362,6 +397,39 @@ pub struct CreateFulltextIndexClause {
     /// `CREATE FULLTEXT INDEX <name> IF NOT EXISTS …` — a duplicate is a no-op
     /// success instead of an "already exists" error.
     pub if_not_exists: bool,
+    pub span: SourceSpan,
+}
+
+/// `DROP VECTOR INDEX <name> [IF EXISTS]`.
+///
+/// The undo of [`CreateVectorIndexClause`]: a standalone schema command the
+/// server executes out-of-band (see [`Query::as_drop_vector_index`]) — it
+/// never becomes a `LogicalPlan`. Dropping removes the manifest descriptor
+/// (and its `.vg` SSTs), which is the remedy for a misconfigured index — e.g.
+/// a wrong `DIMENSION` that rejects every write to the property.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DropVectorIndexClause {
+    pub name: Identifier,
+    /// `DROP VECTOR INDEX <name> IF EXISTS` — a missing index is a no-op
+    /// success instead of a "does not exist" error.
+    pub if_exists: bool,
+    pub span: SourceSpan,
+}
+
+/// `DROP INDEX <name> [IF EXISTS]`, also spelled
+/// `DROP FULLTEXT INDEX <name> [IF EXISTS]`.
+///
+/// The undo of [`CreateFulltextIndexClause`]: a standalone schema command the
+/// server executes out-of-band (see [`Query::as_drop_fulltext_index`]) — it
+/// never becomes a `LogicalPlan`. Dropping removes the manifest descriptor
+/// (and its `.ft` SSTs), so `CALL search.bm25` falls back to the exact flat
+/// scan and the `(label, properties)` slot can be re-created.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DropFulltextIndexClause {
+    pub name: Identifier,
+    /// `DROP INDEX <name> IF EXISTS` — a missing index is a no-op success
+    /// instead of a "does not exist" error.
+    pub if_exists: bool,
     pub span: SourceSpan,
 }
 

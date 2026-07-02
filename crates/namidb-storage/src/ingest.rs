@@ -1257,6 +1257,97 @@ impl WriterSession {
         Ok(version)
     }
 
+    /// Drop a vector index — the execution half of `DROP VECTOR INDEX`, the
+    /// unregister counterpart of [`register_vector_index`](Self::register_vector_index).
+    ///
+    /// A **metadata-only** manifest commit that removes the descriptor from
+    /// [`Manifest::vector_indexes`] AND drops every `SstKind::VectorGraph`
+    /// descriptor scoped to the index in the **same** commit, so no manifest
+    /// version ever shows a `.vg` body without its descriptor (the janitor
+    /// reclaims the unreferenced bodies on its next sweep). Once committed the
+    /// write path stops enforcing the index's dimension and compaction stops
+    /// rebuilding the graph — this is the remedy for a misconfigured
+    /// `CREATE VECTOR INDEX` (e.g. a wrong `DIMENSION`) that would otherwise
+    /// reject writes to the property forever.
+    ///
+    /// A missing name is an error; with `if_exists` it is instead a no-op
+    /// success returning the current manifest version (`IF EXISTS`). Returns
+    /// the new manifest version. Error contract mirrors
+    /// [`register_vector_index`](Self::register_vector_index).
+    pub async fn drop_vector_index(&mut self, name: &str, if_exists: bool) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        if !self
+            .current
+            .manifest
+            .vector_indexes
+            .iter()
+            .any(|d| d.name == name)
+        {
+            if if_exists {
+                return Ok(self.current.manifest.version);
+            }
+            return Err(Error::precondition(format!(
+                "no vector index named `{name}` exists"
+            )));
+        }
+
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.vector_indexes.retain(|d| d.name != name);
+        next.ssts
+            .retain(|d| !(d.kind == SstKind::VectorGraph && d.scope == name));
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
+    }
+
+    /// Drop a full-text (BM25) index — the execution half of `DROP INDEX`, the
+    /// unregister counterpart of [`register_text_index`](Self::register_text_index)
+    /// (mirrors [`drop_vector_index`](Self::drop_vector_index)): removes the
+    /// descriptor from [`Manifest::text_indexes`] and every `SstKind::TextIndex`
+    /// descriptor scoped to the index in the same metadata-only commit. Once
+    /// committed `CALL search.bm25` falls back to the exact flat scan and
+    /// compaction stops re-tokenizing the corpus; the `(label, properties)`
+    /// slot is free for a corrected `CREATE FULLTEXT INDEX`. A missing name is
+    /// an error, or a no-op success with `if_exists`. Returns the new manifest
+    /// version.
+    pub async fn drop_text_index(&mut self, name: &str, if_exists: bool) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        if !self
+            .current
+            .manifest
+            .text_indexes
+            .iter()
+            .any(|d| d.name == name)
+        {
+            if if_exists {
+                return Ok(self.current.manifest.version);
+            }
+            return Err(Error::precondition(format!(
+                "no text index named `{name}` exists"
+            )));
+        }
+
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.text_indexes.retain(|d| d.name != name);
+        next.ssts
+            .retain(|d| !(d.kind == SstKind::TextIndex && d.scope == name));
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset();
+        Ok(version)
+    }
+
     /// `CREATE CONSTRAINT … IS UNIQUE`: declare `(label, property)` unique so the
     /// write path rejects duplicate values (`CREATE`/`MERGE`/`SET` and the bulk
     /// API all consult `PropertyDef::unique`). Validates the existing data first
@@ -1781,6 +1872,245 @@ mod tests {
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
         // int8/cosine misconfiguration is NOT suppressed by IF NOT EXISTS.
         let err = session.register_vector_index(bad, true).await.unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn drop_vector_index_removes_descriptor_and_vg_ssts_in_one_commit() {
+        use crate::manifest::{VectorMetric, VectorQuantization};
+
+        let store = make_store();
+        let paths = make_paths("ingest-drop-vecidx");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        let doc_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 4 }, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        fn emb_record(v: Vec<f32>) -> NodeWriteRecord {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("emb".into(), Value::Vec(v));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        }
+        let desc = VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 4,
+            metric: VectorMetric::Cosine,
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        };
+        session
+            .register_vector_index(desc.clone(), false)
+            .await
+            .unwrap();
+
+        // Two flushes → two L0 Nodes SSTs; the authoritative L0→L1 compaction
+        // then materializes the `.vg` body for the registered descriptor.
+        session
+            .upsert_node("Doc", sorted_node_id(1), &emb_record(vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        session
+            .upsert_node("Doc", sorted_node_id(2), &emb_record(vec![0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        session.flush(doc_schema.clone()).await.unwrap();
+        session
+            .upsert_node("Doc", sorted_node_id(3), &emb_record(vec![0.0, 0.0, 1.0, 0.0]))
+            .unwrap();
+        session.flush(doc_schema.clone()).await.unwrap();
+        session.compact_l0(&doc_schema).await.unwrap();
+        assert!(
+            session
+                .current
+                .manifest
+                .ssts
+                .iter()
+                .any(|d| d.kind == SstKind::VectorGraph && d.scope == "doc_emb"),
+            "compaction must have built the .vg SST for the registered index"
+        );
+        // The index path actually serves (fresh, and the .vg answers the KNN) —
+        // not the trivially-equal flat fallback.
+        let snap = session.snapshot();
+        assert!(!snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        let hits = snap
+            .vector_search("doc_emb", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the .vg must answer the KNN before the drop");
+        assert_eq!(hits[0].0, sorted_node_id(1));
+        drop(snap);
+
+        // A registration over the occupied (label, property, metric) slot is
+        // still a duplicate at this point.
+        let corrected = VectorIndexDescriptor {
+            name: "doc_emb_v2".into(),
+            dim: 8,
+            ..desc
+        };
+        let err = session
+            .register_vector_index(corrected.clone(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+
+        // Missing name: an error without IF EXISTS, a version-preserving no-op
+        // with it.
+        let err = session.drop_vector_index("nope", false).await.unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        let before = session.manifest_version();
+        let v = session.drop_vector_index("nope", true).await.unwrap();
+        assert_eq!(v, before, "IF EXISTS on a missing index is a no-op");
+
+        // Drop: the descriptor AND the `.vg` SST refs disappear in ONE commit,
+        // so no manifest version shows one without the other.
+        let v = session.drop_vector_index("doc_emb", false).await.unwrap();
+        assert_eq!(v, before + 1, "one commit removes descriptor + SST refs");
+        let m = &session.current.manifest;
+        assert!(m.vector_indexes.is_empty(), "descriptor removed");
+        assert!(
+            !m.ssts.iter().any(|d| d.kind == SstKind::VectorGraph),
+            "the .vg SST refs are gone from the same manifest version"
+        );
+
+        // The flat scan still sees every row — dropping the index loses no data.
+        let snap = session.snapshot();
+        assert_eq!(snap.scan_label("Doc").await.unwrap().len(), 3);
+        drop(snap);
+
+        // The slot is free: the corrected re-create (dim 8) is now accepted.
+        session
+            .register_vector_index(corrected, false)
+            .await
+            .unwrap();
+        // Dropping it again after a drop errors without IF EXISTS.
+        session.drop_vector_index("doc_emb_v2", false).await.unwrap();
+        let err = session
+            .drop_vector_index("doc_emb_v2", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn drop_text_index_removes_descriptor_and_ft_ssts_and_falls_back() {
+        let store = make_store();
+        let paths = make_paths("ingest-drop-ftidx");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        let note_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        fn body_record(text: &str) -> NodeWriteRecord {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("body".into(), Value::Str(text.into()));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        }
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Two flushes → two L0 Nodes SSTs; the authoritative L0→L1 compaction
+        // then materializes the `.ft` body for the registered descriptor.
+        session
+            .upsert_node("Note", sorted_node_id(1), &body_record("fox the cat"))
+            .unwrap();
+        session.flush(note_schema.clone()).await.unwrap();
+        session
+            .upsert_node("Note", sorted_node_id(2), &body_record("common the dog"))
+            .unwrap();
+        session.flush(note_schema.clone()).await.unwrap();
+        session.compact_l0(&note_schema).await.unwrap();
+        assert!(
+            session
+                .current
+                .manifest
+                .ssts
+                .iter()
+                .any(|d| d.kind == SstKind::TextIndex && d.scope == "note_ft"),
+            "compaction must have built the .ft SST for the registered index"
+        );
+        // The index path actually serves (`Some`, not the flat fallback).
+        let snap = session.snapshot();
+        let hits = snap
+            .text_search("note_ft", "Note", &["fox".to_string()], None)
+            .await
+            .unwrap()
+            .expect("the .ft must serve before the drop");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, sorted_node_id(1));
+        drop(snap);
+
+        // Missing name: an error without IF EXISTS, a version-preserving no-op
+        // with it.
+        let err = session.drop_text_index("nope", false).await.unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        let before = session.manifest_version();
+        let v = session.drop_text_index("nope", true).await.unwrap();
+        assert_eq!(v, before, "IF EXISTS on a missing index is a no-op");
+
+        // Drop: the descriptor AND the `.ft` SST refs disappear in ONE commit.
+        let v = session.drop_text_index("note_ft", false).await.unwrap();
+        assert_eq!(v, before + 1, "one commit removes descriptor + SST refs");
+        let m = &session.current.manifest;
+        assert!(m.text_indexes.is_empty(), "descriptor removed");
+        assert!(
+            !m.ssts.iter().any(|d| d.kind == SstKind::TextIndex),
+            "the .ft SST refs are gone from the same manifest version"
+        );
+
+        // The read path reports "no index" (`None` → the caller flat-scans) and
+        // the flat scan still sees the full corpus — the fallback stays correct.
+        let snap = session.snapshot();
+        assert!(
+            snap.text_search("note_ft", "Note", &["fox".to_string()], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a dropped index must not serve"
+        );
+        assert_eq!(snap.scan_label("Note").await.unwrap().len(), 2);
+        drop(snap);
+
+        // The (label, properties) slot is free: a corrected re-create works.
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("note_ft_v2".into(), "Note".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        // Dropping it again after a drop errors without IF EXISTS.
+        session.drop_text_index("note_ft_v2", false).await.unwrap();
+        let err = session
+            .drop_text_index("note_ft_v2", false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
     }
 

@@ -59,6 +59,8 @@ impl fmt::Display for Clause {
             Clause::Delete(d) => fmt::Display::fmt(d, f),
             Clause::CreateVectorIndex(c) => fmt::Display::fmt(c, f),
             Clause::CreateFulltextIndex(c) => fmt::Display::fmt(c, f),
+            Clause::DropVectorIndex(c) => fmt::Display::fmt(c, f),
+            Clause::DropFulltextIndex(c) => fmt::Display::fmt(c, f),
             Clause::CreateConstraint(c) => fmt::Display::fmt(c, f),
             Clause::CreateIndex(c) => fmt::Display::fmt(c, f),
             Clause::ShowSchema(c) => fmt::Display::fmt(c, f),
@@ -178,6 +180,28 @@ impl fmt::Display for CreateFulltextIndexClause {
             f.write_str("IF NOT EXISTS ")?;
         }
         write!(f, "ON :{}({})", self.label, props)
+    }
+}
+
+impl fmt::Display for DropVectorIndexClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DROP VECTOR INDEX {}", self.name)?;
+        if self.if_exists {
+            f.write_str(" IF EXISTS")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for DropFulltextIndexClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Canonical spelling: the `FULLTEXT` marker is an accepted input alias
+        // but is not re-emitted (both spellings parse to this clause).
+        write!(f, "DROP INDEX {}", self.name)?;
+        if self.if_exists {
+            f.write_str(" IF EXISTS")?;
+        }
+        Ok(())
     }
 }
 

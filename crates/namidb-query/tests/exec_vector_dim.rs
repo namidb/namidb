@@ -207,6 +207,49 @@ async fn unrelated_set_on_legacy_wrong_dim_node_succeeds() {
 }
 
 #[tokio::test]
+async fn drop_vector_index_unbricks_wrong_dim_writes() {
+    // The misconfiguration remedy end-to-end: an index declared with the wrong
+    // dimension (1536) rejects every write of the real embedding size (768)
+    // — with no other way out, since the index would otherwise be permanent.
+    // DROP VECTOR INDEX removes the descriptor; the same write then succeeds,
+    // and a corrected re-create over the same slot enforces the right dim.
+    let mut w = WriterSession::open(store(), paths("vdim-drop-unbrick"))
+        .await
+        .unwrap();
+    w.register_vector_index(doc_index(1536), false)
+        .await
+        .unwrap();
+
+    let mut params = Params::new();
+    params.insert("v".into(), RuntimeValue::Vector(vec![0.5; 768]));
+    let plan = lower(&parse("CREATE (:Doc {embedding: $v})").unwrap()).unwrap();
+    let err = execute_write(&plan, &mut w, &params)
+        .await
+        .expect_err("a 768-dim write against the dim-1536 index must be rejected");
+    assert!(is_dim_constraint(&err), "{err:?}");
+    assert_eq!(doc_count(&w).await, 0);
+
+    // Drop the misconfigured index: the identical write now succeeds.
+    w.drop_vector_index("doc_emb", false).await.unwrap();
+    execute_write(&plan, &mut w, &params)
+        .await
+        .expect("the write must succeed once the index is dropped");
+    assert_eq!(doc_count(&w).await, 1);
+
+    // Re-create corrected (dim 768) over the same (label, property, metric)
+    // slot: accepted, and it enforces the corrected dimension.
+    w.register_vector_index(doc_index(768), false)
+        .await
+        .unwrap();
+    execute_write(&plan, &mut w, &params)
+        .await
+        .expect("a correct-dim write against the corrected index must succeed");
+    assert_eq!(doc_count(&w).await, 2);
+    let err = write_err(&mut w, "CREATE (:Doc {embedding: vector([1.0, 2.0])})").await;
+    assert!(is_dim_constraint(&err), "{err:?}");
+}
+
+#[tokio::test]
 async fn no_index_means_no_dim_enforcement() {
     // Part A boundary: with no vector index registered, any dimension is accepted
     // (the silent-mismatch behaviour the RFC's Part B would close via a typed

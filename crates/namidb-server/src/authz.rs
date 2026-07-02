@@ -77,6 +77,10 @@ pub enum SchemaOp<'a> {
         label: &'a str,
         properties: &'a [String],
     },
+    /// `DROP VECTOR INDEX <name>`.
+    DropVectorIndex { name: &'a str },
+    /// `DROP INDEX <name>` / `DROP FULLTEXT INDEX <name>`.
+    DropFulltextIndex { name: &'a str },
     /// `CREATE CONSTRAINT … IS UNIQUE` over `(label, properties)` — one entry
     /// for a single-property constraint, several for a composite one.
     CreateConstraint {

@@ -211,6 +211,22 @@ impl AuthzHook for OpaAuthz {
                 "label": label,
                 "properties": properties,
             }),
+            SchemaOp::DropVectorIndex { name } => serde_json::json!({
+                "subject": principal.subject,
+                "role": role_str(principal),
+                "groups": principal.groups,
+                "action": "schema",
+                "schema_op": "drop_vector_index",
+                "index_name": name,
+            }),
+            SchemaOp::DropFulltextIndex { name } => serde_json::json!({
+                "subject": principal.subject,
+                "role": role_str(principal),
+                "groups": principal.groups,
+                "action": "schema",
+                "schema_op": "drop_fulltext_index",
+                "index_name": name,
+            }),
             SchemaOp::CreateConstraint { label, properties } => serde_json::json!({
                 "subject": principal.subject,
                 "role": role_str(principal),
