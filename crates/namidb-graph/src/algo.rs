@@ -341,10 +341,17 @@ pub fn pagerank_cancellable(
         // weight sum, not the edge count. A non-positive weight sum is degenerate
         // and was already counted as dangling above (its mass is redistributed),
         // so skip it here rather than divide by zero / produce NaN.
-        for (&src, nbrs) in &graph.out {
-            if nbrs.is_empty() {
-                continue;
-            }
+        // Iterate sources in `nodes()` (insertion) order, NOT `graph.out`
+        // HashMap order: f64 addition is non-associative, so accumulating each
+        // dst's incoming mass in HashMap-iteration order (randomised per process)
+        // made scores — and thus near-tie rankings — differ run-to-run for the
+        // same graph. Insertion order is deterministic, so results are now
+        // reproducible.
+        for &src in graph.nodes() {
+            let nbrs = match graph.out.get(&src) {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
             let weight_sum = positive_sum(nbrs);
             if weight_sum <= 0.0 {
                 continue;
