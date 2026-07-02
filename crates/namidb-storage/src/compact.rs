@@ -331,16 +331,22 @@ async fn compact_leveled(
         } else {
             label_def.clone()
         };
-        let mut readers: Vec<NodeSstReader> = Vec::with_capacity(plan.inputs.len());
+        // Extract each source's rows as soon as its body arrives and drop the
+        // reader before fetching the next: holding every input body + decoded
+        // Arrow batches simultaneously scaled compaction's peak memory with
+        // the whole level. The working set is the merged rows; bodies persist
+        // only in the byte-bounded SstCache.
+        let mut input_rows: Vec<NodeRow> = Vec::new();
         for desc in &plan.inputs {
             let body = get_sst_body(store.as_ref(), paths, desc).await?;
-            readers.push(NodeSstReader::open(label_def.clone(), body)?);
+            let reader = NodeSstReader::open(label_def.clone(), body)?;
+            input_rows.extend(extract_node_rows_from_reader(&reader, &label_def)?);
         }
         // GC tombstones only when this merge is authoritative: a single node
         // scope (no other scope can hold the key) AND the output is the
         // bucket's deepest level (no older un-merged level below it).
         let gc = node_gc_safe && plan.is_deepest;
-        let (finish, merged_rows) = compact_node_ssts(&label_def, &readers, gc)?;
+        let (finish, merged_rows) = compact_node_rows(&label_def, input_rows, gc)?;
         // The highest LSN in the merged corpus — stamped onto any SST-backed
         // index (vector / text) rebuilt from these rows so a later freshness
         // check can tell whether a newer Nodes SST has outrun the index.
@@ -530,18 +536,20 @@ async fn compact_and_write_edges(
     gc_tombstones: bool,
 ) -> Result<(Option<SstDescriptor>, bool, Vec<Uuid>)> {
     let edge_def = schema.edge_type(edge_type).cloned();
-    let mut readers: Vec<EdgeSstReader> = Vec::with_capacity(sources.len());
+    let declared_property_names: Vec<String> = edge_def
+        .as_ref()
+        .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+    // Same early-drop discipline as the node path: extract each source's
+    // rows as its body arrives instead of holding every reader (body +
+    // decoded streams) across the whole merge.
+    let mut rows: Vec<EdgeRecord> = Vec::new();
     for desc in sources {
         let body = get_sst_body(store, paths, desc).await?;
-        readers.push(EdgeSstReader::open(body)?);
+        let reader = EdgeSstReader::open(body)?;
+        extract_edge_rows_from_reader(&reader, &declared_property_names, &mut rows)?;
     }
-    let finish = compact_edge_ssts(
-        edge_type,
-        edge_def.as_ref(),
-        &readers,
-        direction,
-        gc_tombstones,
-    )?;
+    let finish = compact_edge_rows(edge_type, edge_def.as_ref(), rows, direction, gc_tombstones)?;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
     if finish.stats.edge_count == 0 {
         return Ok((None, false, removed));
@@ -551,15 +559,11 @@ async fn compact_and_write_edges(
     Ok((Some(descriptor), wrote_bloom, removed))
 }
 
-fn compact_node_ssts(
+fn compact_node_rows(
     label_def: &LabelDef,
-    sources: &[NodeSstReader],
+    mut rows: Vec<NodeRow>,
     gc_tombstones: bool,
 ) -> Result<(NodeSstFinish, Vec<NodeRow>)> {
-    let mut rows: Vec<NodeRow> = Vec::new();
-    for reader in sources {
-        rows.extend(extract_node_rows_from_reader(reader, label_def)?);
-    }
     // Sort by node_id ascending; within ties, highest LSN first so the
     // dedup_by_key below preserves the winner.
     rows.sort_by(|a, b| a.id.cmp(&b.id).then(b.lsn.cmp(&a.lsn)));
@@ -683,60 +687,60 @@ fn raw_labels_from_batch(batch: &arrow_array::RecordBatch, row: usize) -> Vec<u3
     }
 }
 
-fn compact_edge_ssts(
+/// Decode one edge SST's rows into `out`. Each source SST is already in the
+/// caller's orientation (grouped by SstKind::EdgesFwd vs EdgesInv), so
+/// `(key_id, partner_id)` pass to the writer unchanged.
+///
+/// Property streams: each source SST exposes
+/// - `__overflow_json` (a single Utf8 column of ad-hoc / undeclared
+///   properties) via `read_overflow_strings`, and
+/// - one declared property stream per `EdgeTypeDef.properties` name
+///   (RFC-002 §3.2.7) via `read_declared_property_strings(name)`.
+/// The compactor reads both kinds and threads them through to the merged SST
+/// so reads at the merged version see the same property maps.
+fn extract_edge_rows_from_reader(
+    reader: &EdgeSstReader,
+    declared_property_names: &[String],
+    out: &mut Vec<EdgeRecord>,
+) -> Result<()> {
+    let edges = reader.scan_all_edges()?;
+    let overflows = reader.read_overflow_strings()?;
+    // For each declared property name, fetch the stream once per reader;
+    // `None` if this SST has no such stream (legacy pre-RFC-005 body, or
+    // all-null column).
+    let mut declared_streams: Vec<Option<Vec<Option<String>>>> =
+        Vec::with_capacity(declared_property_names.len());
+    for name in declared_property_names {
+        declared_streams.push(reader.read_declared_property_strings(name)?);
+    }
+    for (idx, e) in edges.into_iter().enumerate() {
+        let overflow_json = overflows
+            .as_ref()
+            .and_then(|v| v.get(idx).cloned())
+            .flatten();
+        let declared_properties: Vec<Option<String>> = declared_streams
+            .iter()
+            .map(|s| s.as_ref().and_then(|v| v.get(idx).cloned()).flatten())
+            .collect();
+        out.push(EdgeRecord {
+            key_id: e.key_id,
+            partner_id: e.partner_id,
+            lsn: e.lsn,
+            tombstone: e.tombstone,
+            declared_properties,
+            overflow_json,
+        });
+    }
+    Ok(())
+}
+
+fn compact_edge_rows(
     edge_type: &str,
     edge_def: Option<&namidb_core::EdgeTypeDef>,
-    sources: &[EdgeSstReader],
+    mut rows: Vec<EdgeRecord>,
     direction: EdgeDirection,
     gc_tombstones: bool,
 ) -> Result<EdgeSstFinish> {
-    // Each source SST is already in `direction` orientation (the
-    // caller groups by SstKind::EdgesFwd vs EdgesInv before invoking
-    // us), so we can read `(key_id, partner_id)` straight from the
-    // scan and pass them to the writer unchanged.
-    //
-    // Property streams: each source SST exposes
-    // - `__overflow_json` (a single Utf8 column of ad-hoc / undeclared
-    // properties) via `read_overflow_strings`, and
-    // - one declared property stream per `EdgeTypeDef.properties` name
-    // (RFC-002 §3.2.7) via `read_declared_property_strings(name)`.
-    // The compactor reads both kinds and threads them through to the
-    // L1 SST so reads at the merged version see the same property maps.
-    let declared_property_names: Vec<String> = edge_def
-        .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
-        .unwrap_or_default();
-    let mut rows: Vec<EdgeRecord> = Vec::new();
-    for reader in sources {
-        let edges = reader.scan_all_edges()?;
-        let overflows = reader.read_overflow_strings()?;
-        // For each declared property name, fetch the stream once per
-        // reader; `None` if this SST has no such stream (legacy
-        // pre-RFC-005 body, or all-null column).
-        let mut declared_streams: Vec<Option<Vec<Option<String>>>> =
-            Vec::with_capacity(declared_property_names.len());
-        for name in &declared_property_names {
-            declared_streams.push(reader.read_declared_property_strings(name)?);
-        }
-        for (idx, e) in edges.into_iter().enumerate() {
-            let overflow_json = overflows
-                .as_ref()
-                .and_then(|v| v.get(idx).cloned())
-                .flatten();
-            let declared_properties: Vec<Option<String>> = declared_streams
-                .iter()
-                .map(|s| s.as_ref().and_then(|v| v.get(idx).cloned()).flatten())
-                .collect();
-            rows.push(EdgeRecord {
-                key_id: e.key_id,
-                partner_id: e.partner_id,
-                lsn: e.lsn,
-                tombstone: e.tombstone,
-                declared_properties,
-                overflow_json,
-            });
-        }
-    }
-
     // Sort by (key, partner) asc, then by lsn desc so the dedup keeps
     // the highest-LSN observation per (key, partner).
     rows.sort_by(|a, b| {

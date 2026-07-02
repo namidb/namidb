@@ -409,9 +409,17 @@ pub(crate) fn build_node_sst(label: &LabelDef, rows: &[NodeRow]) -> Result<NodeS
     };
     let mut writer = NodeSstWriter::new(label.clone(), options)?;
     let arrow_schema = node_arrow_schema(label);
-    let batch = build_node_record_batch(&arrow_schema, label, rows)?;
-    if batch.num_rows() > 0 {
-        writer.write_batch(&batch)?;
+    // Feed the writer in bounded chunks rather than one monolithic
+    // RecordBatch: a deep-level compaction merges the whole bucket, and the
+    // single all-rows batch (every column fully materialised a second time)
+    // was the largest single allocation of the merge. The writer accepts any
+    // number of ascending-ordered batches; `rows` are already sorted.
+    const BATCH_ROWS: usize = 16 * 1024;
+    for chunk in rows.chunks(BATCH_ROWS) {
+        let batch = build_node_record_batch(&arrow_schema, label, chunk)?;
+        if batch.num_rows() > 0 {
+            writer.write_batch(&batch)?;
+        }
     }
     writer.finish()
 }
@@ -1777,6 +1785,44 @@ mod tests {
                 PropertyDef::new("age", DataType::Int32, true).unwrap(),
             ],
         }
+    }
+
+    #[test]
+    fn build_node_sst_chunked_batches_round_trip() {
+        // Enough rows to force several 16k-row write_batch chunks; the body
+        // must read back complete, ordered, and value-faithful — the writer
+        // enforces ascending ids ACROSS batches, so this also guards the
+        // chunk-boundary ordering contract.
+        let label = person_label();
+        let n: usize = 40_000;
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut id = [0u8; 16];
+            id[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("name".to_string(), Value::Str(format!("p{i}")));
+            rows.push(NodeRow {
+                id,
+                lsn: i as u64 + 1,
+                op: MemOp::Upsert(
+                    NodeWriteRecord {
+                        properties: props,
+                        schema_version: 1,
+                        labels: vec![],
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            });
+        }
+        let finish = build_node_sst(&label, &rows).unwrap();
+        assert_eq!(finish.stats.row_count, n as u64);
+        assert_eq!(finish.stats.max_lsn, n as u64);
+
+        let reader = NodeSstReader::open(label, finish.body.clone()).unwrap();
+        let batches = reader.scan().unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, n, "all chunked rows must be readable");
     }
 
     fn knows_edge() -> EdgeTypeDef {
