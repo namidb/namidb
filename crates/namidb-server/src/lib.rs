@@ -792,6 +792,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 // manifest version any live reader is pinned to; the sweep keeps
                 // every object referenced from the horizon to current, so it can
                 // never delete a body a reader still needs.
+                // Read-side fence probe (RFC-027): drop readiness if a peer
+                // writer's epoch has fenced this node, so a zombie replica
+                // stops serving stale reads behind a green health check.
+                recovery::probe_read_fence(
+                    &maint_manifest_store,
+                    &state_for_maint.snapshot,
+                    &state_for_maint.writer_health,
+                    &state_for_maint.namespace,
+                )
+                .await;
                 let horizon = state_for_maint.snapshot.retention_horizon();
                 match sweep_orphans(
                     &maint_manifest_store,

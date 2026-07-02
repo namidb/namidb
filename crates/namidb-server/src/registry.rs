@@ -335,6 +335,10 @@ impl NamespaceRegistry {
                     {
                         error!(namespace = %ns, error = %e, "orphan sweep failed");
                     }
+                    // Read-side fence probe (RFC-027): drop readiness if a
+                    // peer writer's epoch has fenced this namespace, so a
+                    // zombie replica stops serving stale reads silently.
+                    recovery::probe_read_fence(&ms, &s.snapshot, &s.writer_health, &ns).await;
                 }
             });
             state
