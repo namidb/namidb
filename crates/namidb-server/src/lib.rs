@@ -372,7 +372,10 @@ fn http_max_concurrency() -> usize {
 /// limit) to a fully-built router.
 fn harden_router(router: Router) -> Router {
     router
-        .layer(tower_http::timeout::TimeoutLayer::new(http_request_timeout()))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            http_request_timeout(),
+        ))
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
             http_max_concurrency(),
         ))

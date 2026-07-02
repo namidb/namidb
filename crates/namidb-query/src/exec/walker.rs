@@ -1597,6 +1597,14 @@ async fn flat_call_procedure(
         }
         "shortest_path" => {
             let (source, weighted) = shortest_path_options(args, params)?;
+            // Dijkstra is unsound with negative weights; reject the query rather
+            // than silently skipping those edges and returning wrong distances
+            // (matches Neo4j GDS, which validates non-negative weights).
+            if weighted && graph.has_negative_weight() {
+                return Err(proc_unsupported(
+                    "algo.shortest_path with weighted:true does not support negative edge weights",
+                ));
+            }
             let sp = namidb_graph::algo::shortest_paths_cancellable(
                 &graph,
                 source,

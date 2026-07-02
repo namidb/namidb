@@ -448,6 +448,37 @@ mod indexed {
         );
     }
 
+    /// WITH-based KNN shapes must ALSO reach the index. Real lowering emits a
+    /// Project directly above the TopN per stage, so a WITH stage produces
+    /// Project{Project{TopN}} — which the rewrite used to miss, silently
+    /// flat-scanning despite the index.
+    #[tokio::test]
+    async fn with_based_knn_reaches_the_index() {
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let (w, _) = build_index("idx-with-reach", &docs).await;
+        let snap = w.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+
+        for cypher in [
+            // WITH carrying the score forward, then RETURN.
+            "MATCH (d:Doc) WITH d, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 3 RETURN d.title AS title, score",
+            // WITH ordering by the distance expression, projecting only d.
+            "MATCH (d:Doc) WITH d ORDER BY cosine_similarity(d.embedding, $q) DESC \
+             LIMIT 3 RETURN d.title AS title",
+        ] {
+            let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+            assert!(
+                serde_json::to_string(&plan).unwrap().contains("VectorSearch"),
+                "WITH-based KNN must reach the index, plan: {cypher}"
+            );
+        }
+    }
+
     /// Build a `.vg` for an arbitrary metric (mirrors `build_index`, which is
     /// cosine-only).
     async fn build_index_metric(

@@ -116,6 +116,15 @@ impl Graph {
         &self.nodes
     }
 
+    /// `true` if any edge carries a negative weight. Weighted shortest-path
+    /// (Dijkstra) is unsound on negative weights, so the caller rejects the
+    /// query rather than returning silently-wrong distances.
+    pub fn has_negative_weight(&self) -> bool {
+        self.out
+            .values()
+            .any(|nbrs| nbrs.iter().any(|&(_, w)| w < 0.0))
+    }
+
     /// Out-edges of `src`, if any.
     pub fn out_edges(&self, src: NodeId) -> Option<&[(NodeId, f64)]> {
         self.out.get(&src).map(Vec::as_slice)
@@ -1745,6 +1754,17 @@ mod tests {
         let sp = shortest_paths(&g, a, true);
         assert_eq!(sp.distance.len(), 1);
         assert_eq!(sp.distance[&a], 0.0);
+    }
+
+    #[test]
+    fn has_negative_weight_detects_negative_edges() {
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, Some(5.0));
+        assert!(!g.has_negative_weight());
+        g.add_edge(b, a, Some(-1.0));
+        assert!(g.has_negative_weight());
     }
 
     // --- cancellation of the new kernels ------------------------------------

@@ -126,32 +126,47 @@ fn outer_score_alias_of(items: &[ProjectionItem], keys: &[OrderKey]) -> Option<S
 /// sub-plan from its own root. Leaves and write operators fall through unchanged.
 fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     match plan {
+        // For the KNN-chain wrappers, rebuild the child THEN re-attempt the
+        // rewrite at this node — so an interposed WITH stage (`Project{TopN}`
+        // wrapped by an outer `Project`/`Filter`, i.e. `Project{Project{TopN}}`
+        // or `Filter{Project{TopN}}`) collapses to a VectorSearch instead of
+        // silently flat-scanning. Without this re-attempt only the single-stage
+        // terminal-RETURN form ever reached the index.
         LogicalPlan::TopN {
             input,
             keys,
             skip,
             limit,
-        } => LogicalPlan::TopN {
-            input: Box::new(recurse(*input, catalog)),
-            keys,
-            skip,
-            limit,
-        },
+        } => try_rewrite_here(
+            LogicalPlan::TopN {
+                input: Box::new(recurse(*input, catalog)),
+                keys,
+                skip,
+                limit,
+            },
+            catalog,
+        ),
         LogicalPlan::Project {
             input,
             items,
             distinct,
             discard_input_bindings,
-        } => LogicalPlan::Project {
-            input: Box::new(recurse(*input, catalog)),
-            items,
-            distinct,
-            discard_input_bindings,
-        },
-        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(recurse(*input, catalog)),
-            predicate,
-        },
+        } => try_rewrite_here(
+            LogicalPlan::Project {
+                input: Box::new(recurse(*input, catalog)),
+                items,
+                distinct,
+                discard_input_bindings,
+            },
+            catalog,
+        ),
+        LogicalPlan::Filter { input, predicate } => try_rewrite_here(
+            LogicalPlan::Filter {
+                input: Box::new(recurse(*input, catalog)),
+                predicate,
+            },
+            catalog,
+        ),
         // Binary operators that can host a complete KNN sub-plan in a branch.
         LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
             left: Box::new(apply_vector_search(*left, catalog)),
