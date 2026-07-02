@@ -2257,6 +2257,105 @@ mod tests {
         );
     }
 
+    /// A `.ft` body with a legacy magic (a NAMIFT01 file left behind by a
+    /// format bump) must not error queries: `text_search` treats the index as
+    /// absent (`Ok(None)` → flat-scan fallback, the `.vg` convention) until
+    /// the next authoritative compaction rebuilds it.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn legacy_text_index_body_falls_back_to_flat_scan() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::text::parse_query;
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+
+        let s = store();
+        let p = paths("compact-text-legacy");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut cur = base;
+        for (i, body) in ["fox the cat", "common the dog"].iter().enumerate() {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("body".into(), Value::Str((*body).into()));
+            let rec = NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![note_id.0],
+            };
+            let mut mt = Memtable::new();
+            mt.apply(
+                MemKey::Node {
+                    id: idx_id(i as u64 + 1),
+                },
+                i as u64 + 1,
+                MemOp::Upsert(rec.encode().unwrap()),
+            );
+            cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+        let out = compact_l0_to_l1(&ms, &fence, &cur, &schema)
+            .await
+            .unwrap()
+            .committed;
+        let ft = out
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::TextIndex)
+            .expect("compaction builds the .ft SST")
+            .clone();
+
+        let empty = Memtable::new();
+        let mt_view = empty.snapshot_view();
+        let snap = Snapshot::new(out.clone(), &mt_view, s.clone(), p.clone());
+        let q = parse_query("fox");
+
+        // Sanity: the freshly-built v2 body serves.
+        let hits = snap
+            .text_search("note_ft", "Note", &q, Some(5))
+            .await
+            .unwrap()
+            .expect("the compacted index must serve");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, idx_id(1));
+
+        // Overwrite the object with an old-magic body: decode fails, and the
+        // search reports "index absent" instead of erroring the query.
+        let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), ft.path);
+        s.put(
+            &Path::from(absolute),
+            PutPayload::from_static(b"NAMIFT01legacy-postings"),
+        )
+        .await
+        .unwrap();
+        let got = snap
+            .text_search("note_ft", "Note", &q, Some(5))
+            .await
+            .unwrap();
+        assert!(got.is_none(), "a legacy body must fall back, not error");
+    }
+
     #[cfg(feature = "vector-index")]
     #[tokio::test]
     async fn compaction_builds_a_searchable_vector_graph() {

@@ -1821,7 +1821,10 @@ async fn flat_search_procedure(
 /// candidate document with [`text_scoring::bm25_term_score`] and an IDF derived
 /// from the corpus. Yields `node` (the matched node) + `score`, ordered by
 /// score descending. Unlike the per-row `bm25()` scalar, this weights rare
-/// terms above common ones.
+/// terms above common ones. The query string supports quoted phrases
+/// (`'"graph database"'` — the words must be adjacent) and trailing-`*`
+/// prefixes (`'data*'`), interpreted identically by the index path and the
+/// flat scan.
 ///
 /// `CALL search.bm25({label: 'Note', text_properties: ['body','title'],
 /// query: $q, k: 10})`
@@ -1852,6 +1855,14 @@ async fn bm25_search(
 /// `(label, props)` and is authoritative for the corpus, else the exact flat
 /// scan; either way the result is freshness-equivalent to the flat scan. `k`
 /// caps the result (`None` = all). The empty-query case returns an empty vec.
+///
+/// The query string carries syntax beyond bag-of-words, parsed once by
+/// [`text_scoring::parse_query`] and interpreted identically here and in the
+/// index (`TextIndex::search_query`): quoted phrases are a hard adjacency
+/// constraint on candidacy (a passing document scores the phrase's tokens as
+/// ordinary terms), and a trailing-`*` prefix expands to the
+/// lexicographically-first [`text_scoring::PREFIX_EXPANSION_LIMIT`] corpus
+/// terms carrying it, scored normally.
 async fn bm25_ranked(
     snapshot: &Snapshot<'_>,
     label: &str,
@@ -1859,13 +1870,15 @@ async fn bm25_ranked(
     query: &str,
     k: Option<usize>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
-    use crate::exec::text_scoring::{bm25_idf, bm25_term_score, tokenize_counts};
+    use crate::exec::text_scoring::{
+        bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize,
+        PREFIX_EXPANSION_LIMIT,
+    };
+    use std::collections::{BTreeMap, HashMap};
+    use std::ops::Bound;
 
-    // Distinct query terms (a repeated query term is scored once), sorted for a
-    // deterministic df/idf index order.
-    let mut qterms: Vec<String> = tokenize_counts(query).0.into_keys().collect();
-    qterms.sort();
-    if qterms.is_empty() {
+    let parsed = parse_query(query);
+    if parsed.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1882,7 +1895,7 @@ async fn bm25_ranked(
             .find(|d| d.matches(label, props))
             .map(|d| d.name.clone());
         if let Some(index_name) = index_name {
-            if let Some(hits) = snapshot.text_search(&index_name, label, &qterms, k).await? {
+            if let Some(hits) = snapshot.text_search(&index_name, label, &parsed, k).await? {
                 return Ok(hits);
             }
         }
@@ -1890,32 +1903,59 @@ async fn bm25_ranked(
 
     let views = snapshot.scan_label(label).await?;
 
-    // One pass: corpus stats over every document (a node with the text field)
-    // and the per-query-term frequencies of the candidate documents.
+    // Fixed scored terms (plain + phrase tokens), distinct and sorted; prefix
+    // expansions join after the pass discovers the corpus vocabulary.
+    let fixed: Vec<String> = parsed.base_terms().into_iter().map(String::from).collect();
+
+    // One pass: corpus stats over every document (a node with the text field),
+    // per-fixed-term frequencies, prefix-matched term frequencies, and the
+    // phrase constraint of the candidate documents. df is corpus-wide (counted
+    // for every document, candidate or not) — exactly the index's postings df.
     let mut n_docs = 0usize;
     let mut total_len = 0usize;
-    let mut df = vec![0usize; qterms.len()];
-    let mut candidates: Vec<(usize, Vec<u32>, usize)> = Vec::new(); // (view idx, tf per qterm, len)
+    let mut df = vec![0usize; fixed.len()];
+    let mut expanded_df: BTreeMap<String, usize> = BTreeMap::new();
+    // (view idx, tf per fixed term, prefix-matched term → tf, len)
+    type Candidate = (usize, Vec<u32>, HashMap<String, u32>, usize);
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut since_check = 0usize;
     for (vi, view) in views.iter().enumerate() {
         let Some(text) = doc_text(view, props) else {
             continue; // not part of the searchable corpus
         };
-        let (counts, len) = tokenize_counts(&text);
+        let tokens = tokenize(&text);
+        let len = tokens.len();
         n_docs += 1;
         total_len += len;
-        let mut tfs = vec![0u32; qterms.len()];
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for t in &tokens {
+            *counts.entry(t.as_str()).or_insert(0) += 1;
+        }
+        let mut tfs = vec![0u32; fixed.len()];
         let mut any = false;
-        for (i, qt) in qterms.iter().enumerate() {
-            let tf = counts.get(qt).copied().unwrap_or(0);
+        for (i, qt) in fixed.iter().enumerate() {
+            let tf = counts.get(qt.as_str()).copied().unwrap_or(0);
             tfs[i] = tf;
             if tf > 0 {
                 df[i] += 1;
                 any = true;
             }
         }
-        if any {
-            candidates.push((vi, tfs, len));
+        let mut ptfs: HashMap<String, u32> = HashMap::new();
+        if !parsed.prefixes.is_empty() {
+            for (t, &tf) in &counts {
+                if parsed.prefixes.iter().any(|p| t.starts_with(p.as_str())) {
+                    *expanded_df.entry((*t).to_string()).or_insert(0) += 1;
+                    ptfs.insert((*t).to_string(), tf);
+                    any = true;
+                }
+            }
+        }
+        // Phrase hard constraint: every phrase must occur at adjacent token
+        // positions, else the document is not a candidate even when it
+        // matches other query terms (same rule the index applies).
+        if any && parsed.phrases.iter().all(|ph| contains_phrase(&tokens, ph)) {
+            candidates.push((vi, tfs, ptfs, len));
         }
         since_check += 1;
         if since_check >= 4096 {
@@ -1931,19 +1971,43 @@ async fn bm25_ranked(
     } else {
         1.0
     };
-    let idf: Vec<f64> = df.iter().map(|&d| bm25_idf(n_docs, d)).collect();
 
-    let mut scored: Vec<(usize, f64)> = candidates
-        .into_iter()
-        .map(|(vi, tfs, len)| {
-            let s: f64 = tfs
-                .iter()
-                .enumerate()
-                .map(|(i, &tf)| bm25_term_score(idf[i], tf, len, avg_len))
-                .sum();
-            (vi, s)
-        })
-        .collect();
+    // Final scored term set: fixed terms plus, per prefix, the
+    // lexicographically-first PREFIX_EXPANSION_LIMIT vocabulary terms — the
+    // same deterministic pick the index makes over its postings range. The
+    // map is sorted so per-document score summation runs in the same term
+    // order as the index path (bit-identical floats).
+    let mut qmap: BTreeMap<&str, (f64, Option<usize>)> = BTreeMap::new(); // term → (idf, fixed idx)
+    for (i, t) in fixed.iter().enumerate() {
+        qmap.insert(t.as_str(), (bm25_idf(n_docs, df[i]), Some(i)));
+    }
+    for prefix in &parsed.prefixes {
+        let matched = expanded_df
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .take_while(|(t, _)| t.starts_with(prefix.as_str()))
+            .take(PREFIX_EXPANSION_LIMIT);
+        for (t, &d) in matched {
+            qmap.entry(t.as_str())
+                .or_insert((bm25_idf(n_docs, d), None));
+        }
+    }
+
+    let mut scored: Vec<(usize, f64)> = Vec::new();
+    for (vi, tfs, ptfs, len) in &candidates {
+        let mut s = 0.0;
+        for (term, (idf, fixed_ix)) in &qmap {
+            let tf = match fixed_ix {
+                Some(i) => tfs[*i],
+                None => ptfs.get(*term).copied().unwrap_or(0),
+            };
+            s += bm25_term_score(*idf, tf, *len, avg_len);
+        }
+        // A candidate whose only matches were expansion terms past the cap
+        // scores nothing — the index never surfaces it either.
+        if s > 0.0 {
+            scored.push((*vi, s));
+        }
+    }
     // Score descending, node id ascending for a deterministic tie-break.
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)

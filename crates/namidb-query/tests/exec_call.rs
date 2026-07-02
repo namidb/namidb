@@ -656,6 +656,180 @@ async fn call_search_bm25_uses_the_index() {
     );
 }
 
+/// Phrase (`"..."`) and prefix (`foo*`) query syntax must behave identically
+/// on the index path and the flat scan. Two namespaces share one corpus with
+/// the same deterministic node ids: one flushed + compacted (the `.ft` index
+/// serves — asserted at the storage layer, where `Some` IS the index-vs-
+/// fallback decision) and one memtable-only (the exact flat scan serves).
+/// Every query must yield the same ranked `(id, score)` rows on both.
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn bm25_phrase_and_prefix_parity_between_index_and_flat() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::{ManifestStore, TextIndexDescriptor};
+    use namidb_storage::memtable::{MemKey, MemOp, Memtable};
+    use namidb_storage::text::parse_query;
+    use namidb_storage::{compact_l0_to_l1, flush, WriterFence};
+
+    fn det_id(i: u64) -> NodeId {
+        let mut bytes = [0u8; 16];
+        bytes[8..16].copy_from_slice(&i.to_be_bytes());
+        NodeId::from_uuid(uuid::Uuid::from_bytes(bytes))
+    }
+
+    // Docs 1 and 2 both contain "graph" AND "database" — only doc 1 has them
+    // adjacent. `data*` expands to {database, dataset} → docs 1, 2, 3.
+    let bodies = [
+        "graph database systems",
+        "a database of graph paper",
+        "dataset curation",
+        "plain cat text",
+    ];
+    let ids: Vec<NodeId> = (1..=bodies.len() as u64).map(det_id).collect();
+
+    // Namespace 1: flushed + compacted → the index is authoritative.
+    let store_idx = store();
+    let p_idx = paths("bm25-syntax-idx");
+    let ms = ManifestStore::new(store_idx.clone(), p_idx.clone());
+    let mut base = ms.bootstrap(uuid::Uuid::now_v7()).await.unwrap();
+    let note_id = base.manifest.label_dict.intern("Note");
+    base.manifest.text_indexes.push(TextIndexDescriptor::new(
+        "note_ft".into(),
+        "Note".into(),
+        vec!["body".into()],
+    ));
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+        })
+        .unwrap()
+        .build();
+    let fence = WriterFence::new(base.manifest.epoch);
+    let mut cur = base;
+    for (chunk_i, chunk) in bodies.chunks(2).enumerate() {
+        let mut mt = Memtable::new();
+        for (j, b) in chunk.iter().enumerate() {
+            let i = chunk_i * 2 + j;
+            let mut props = BTreeMap::new();
+            props.insert("body".to_string(), namidb_core::Value::Str(b.to_string()));
+            let rec = NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![note_id.0],
+            };
+            mt.apply(
+                MemKey::Node { id: ids[i] },
+                i as u64 + 1,
+                MemOp::Upsert(rec.encode().unwrap()),
+            );
+        }
+        cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+            .await
+            .unwrap()
+            .committed;
+    }
+    compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+    let writer_idx = WriterSession::open(store_idx, p_idx).await.unwrap();
+    let snap_idx = writer_idx.snapshot();
+
+    // Namespace 2: memtable-only, same ids → the flat scan serves.
+    let mut writer_flat = WriterSession::open(store(), paths("bm25-syntax-flat"))
+        .await
+        .unwrap();
+    for (id, b) in ids.iter().zip(bodies) {
+        writer_flat
+            .upsert_node("Note", *id, &node_with_body(b))
+            .unwrap();
+    }
+    writer_flat.commit_batch().await.unwrap();
+    let snap_flat = writer_flat.snapshot();
+
+    let extract = |rows: &[namidb_query::Row]| -> Vec<(NodeId, f64)> {
+        rows.iter()
+            .map(|r| {
+                let id = match r.get("node") {
+                    Some(RuntimeValue::Node(n)) => n.id,
+                    other => panic!("node not a node: {other:?}"),
+                };
+                let s = match r.get("score") {
+                    Some(RuntimeValue::Float(s)) => *s,
+                    other => panic!("score not a float: {other:?}"),
+                };
+                (id, s)
+            })
+            .collect()
+    };
+
+    for query in ["\"graph database\"", "data*", "\"graph database\" data*"] {
+        // The index path must actually be taken: storage-level `Some` IS the
+        // decision (equal results alone would be trivially satisfied by the
+        // flat fallback).
+        let via_index = snap_idx
+            .text_search("note_ft", "Note", &parse_query(query), Some(10))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the index must serve `{query}`"));
+        assert!(!via_index.is_empty(), "`{query}` must match something");
+
+        let cypher = format!(
+            "CALL search.bm25({{label: 'Note', text_property: 'body', query: '{query}'}}) \
+             YIELD node, score RETURN node, score"
+        );
+        let got_idx = extract(&run(&snap_idx, &cypher).await);
+        let got_flat = extract(&run(&snap_flat, &cypher).await);
+
+        assert_eq!(
+            got_idx, via_index,
+            "the procedure must surface the index hits verbatim for `{query}`"
+        );
+        assert_eq!(
+            got_idx.len(),
+            got_flat.len(),
+            "index/flat row-count parity for `{query}`"
+        );
+        for (a, b) in got_idx.iter().zip(got_flat.iter()) {
+            assert_eq!(a.0, b.0, "index/flat rank parity for `{query}`");
+            assert!(
+                (a.1 - b.1).abs() < 1e-12,
+                "index/flat score parity for `{query}`: {} vs {}",
+                a.1,
+                b.1
+            );
+        }
+    }
+
+    // Phrase semantics: doc 2 has both words in the wrong order → excluded on
+    // BOTH paths, even though it matches every bag-of-words term.
+    for snap in [&snap_idx, &snap_flat] {
+        let rows = run(
+            snap,
+            "CALL search.bm25({label: 'Note', text_property: 'body', \
+             query: '\"graph database\"'}) YIELD node, score RETURN node, score",
+        )
+        .await;
+        let got = extract(&rows);
+        assert_eq!(got.len(), 1, "adjacency must exclude doc 2: {got:?}");
+        assert_eq!(got[0].0, ids[0]);
+    }
+
+    // Prefix semantics: `data*` reaches database (docs 1, 2) and dataset
+    // (doc 3) but not the term-free doc 4 — identically on both paths.
+    for snap in [&snap_idx, &snap_flat] {
+        let rows = run(
+            snap,
+            "CALL search.bm25({label: 'Note', text_property: 'body', query: 'data*'}) \
+             YIELD node, score RETURN node, score",
+        )
+        .await;
+        let got: Vec<NodeId> = extract(&rows).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        for expect in &ids[..3] {
+            assert!(got.contains(expect), "missing {expect} in {got:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn call_search_bm25_requires_text_property() {
     let mut writer = WriterSession::open(store(), paths("call-bm25-noprop"))
@@ -1021,7 +1195,7 @@ async fn text_index_gate_is_label_scoped() {
     compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
 
     let mut writer = WriterSession::open(store.clone(), p.clone()).await.unwrap();
-    let fox = vec!["fox".to_string()];
+    let fox = namidb_storage::text::parse_query("fox");
 
     // Baseline: compacted, no delta → the index serves.
     assert!(

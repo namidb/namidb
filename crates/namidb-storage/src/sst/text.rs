@@ -1,31 +1,38 @@
 //! Full-text inverted-index SST body (`text-index` feature).
 //!
 //! A `.ft` body is self-contained: it carries an inverted index (term →
-//! postings) plus the corpus statistics BM25 needs (document count, per-document
-//! length, and — implicitly, as posting-list length — per-term document
-//! frequency), so a query answers a top-k by touching only the documents that
-//! contain the query terms, never re-scanning the whole label. The format is an
-//! 8-byte magic + a bincode-serialised [`TextIndexBody`]. Built during
-//! compaction from the merged node rows ([`build_body`]); searched by decoding
-//! into a [`TextIndex`] and calling [`TextIndex::search`].
+//! postings of document, term frequency and token positions) plus the corpus
+//! statistics BM25 needs (document count, per-document length, and —
+//! implicitly, as posting-list length — per-term document frequency), so a
+//! query answers a top-k by touching only the documents that contain the query
+//! terms, never re-scanning the whole label. The positions make quoted-phrase
+//! adjacency answerable from the index alone. The format is an 8-byte magic +
+//! a bincode-serialised [`TextIndexBody`]. Built during compaction from the
+//! merged node rows ([`build_body`]); searched by decoding into a [`TextIndex`]
+//! and calling [`TextIndex::search_query`].
 //!
-//! The scoring math is shared with the query-time flat scan via
-//! [`crate::text`], so the index and the scan return identical BM25 scores for
-//! the same corpus. Like the vector index, a `.ft` body reflects the **compacted**
-//! corpus as of the last compaction; documents written since are served by the
-//! flat-scan fallback, not this index.
+//! The scoring math and the query syntax ([`crate::text::parse_query`]) are
+//! shared with the query-time flat scan via [`crate::text`], so the index and
+//! the scan return identical results for the same corpus. Like the vector
+//! index, a `.ft` body reflects the **compacted** corpus as of the last
+//! compaction; documents written since are served by the flat-scan fallback,
+//! not this index.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::text::{avg_len, bm25_idf, bm25_term_score, tokenize_counts};
+use crate::text::{avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT};
 
-/// On-disk magic + format major version (`NAMI` `FT` `01`). Bumped on any
-/// incompatible layout change so a reader never silently misparses a file.
-const MAGIC: &[u8; 8] = b"NAMIFT01";
+/// On-disk magic + format major version (`NAMI` `FT` `02`). Bumped on any
+/// incompatible layout change so a reader never silently misparses a file —
+/// v2 added token positions to the postings (phrase queries). A v1 body fails
+/// [`TextIndex::decode`]; the read path treats that as "index absent" and
+/// serves the flat scan until the next authoritative compaction rebuilds it.
+const MAGIC: &[u8; 8] = b"NAMIFT02";
 
 /// The body of a `SstKind::TextIndex` SST, bincode-serialised after [`MAGIC`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,9 +45,12 @@ pub struct TextIndexBody {
     pub doc_ids: Vec<[u8; 16]>,
     /// Token count per document index `i`.
     pub doc_lens: Vec<u32>,
-    /// Inverted index: term → postings of `(document index, term frequency)`,
-    /// ascending by document index. `postings[t].len()` is `df(t)`.
-    pub postings: BTreeMap<String, Vec<(u32, u32)>>,
+    /// Inverted index: term → postings of `(document index, term frequency,
+    /// ascending token offsets of the term in the document)`, ascending by
+    /// document index. `postings[t].len()` is `df(t)`; the offsets are
+    /// [`tokenize`] emission positions, which is what makes quoted-phrase
+    /// adjacency answerable from the index alone.
+    pub postings: BTreeMap<String, Vec<(u32, u32, Vec<u32>)>>,
 }
 
 /// Stats harvested at build time, mirrored into
@@ -64,7 +74,8 @@ pub fn build_body(
     }
     let mut body = TextIndexBody::default();
     for (id, text) in members {
-        let (counts, len) = tokenize_counts(&text);
+        let tokens = tokenize(&text);
+        let len = tokens.len();
         // A document with no tokens still counts toward N and average length
         // (it is a document); it simply contributes no postings.
         let di = body.doc_ids.len() as u32;
@@ -72,8 +83,15 @@ pub fn build_body(
         body.doc_lens.push(len as u32);
         body.n_docs += 1;
         body.total_len += len as u64;
-        for (term, tf) in counts {
-            body.postings.entry(term).or_default().push((di, tf));
+        let mut positions: HashMap<String, Vec<u32>> = HashMap::new();
+        for (pos, term) in tokens.into_iter().enumerate() {
+            positions.entry(term).or_default().push(pos as u32);
+        }
+        for (term, pos) in positions {
+            body.postings
+                .entry(term)
+                .or_default()
+                .push((di, pos.len() as u32, pos));
         }
     }
     // We pushed postings in ascending document order, so each list is already
@@ -101,8 +119,11 @@ pub struct TextIndex {
 }
 
 impl TextIndex {
-    /// Decode a `.ft` body (magic + bincode). Errors on a truncated/foreign file
-    /// or a magic mismatch.
+    /// Decode a `.ft` body (magic + bincode). Errors on a truncated/foreign
+    /// file or a magic mismatch — including a legacy `NAMIFT01` body, which
+    /// carries no positions. The read path maps that error to "index absent"
+    /// (flat-scan fallback, the `.vg` convention) so a format bump degrades
+    /// performance, never correctness, until recompaction rebuilds the SST.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < MAGIC.len() {
             return Err(Error::invariant("text index body too short for magic"));
@@ -130,28 +151,72 @@ impl TextIndex {
         self.sorted_ids.binary_search(id).is_ok()
     }
 
-    /// Full BM25 top-`k` for `query_terms` (already tokenized + lowercased;
-    /// duplicates are scored once). Returns `(NodeId, score)` best-first, with a
-    /// node-id tie-break for determinism. Only documents in the postings of a
-    /// query term are scored — the rest of the corpus is never touched. `k =
-    /// None` returns every matching document.
+    /// Full BM25 top-`k` for pre-tokenized bag-of-words `query_terms`
+    /// (duplicates are scored once) — equivalent to [`Self::search_query`]
+    /// with no phrase or prefix syntax.
     pub fn search(&self, query_terms: &[String], k: Option<usize>) -> Vec<([u8; 16], f64)> {
+        self.search_query(&TextQuery::from_terms(query_terms), k)
+    }
+
+    /// Full BM25 top-`k` for a parsed [`TextQuery`]. Returns `(NodeId, score)`
+    /// best-first, with a node-id tie-break for determinism; `k = None`
+    /// returns every matching document. Only documents in the postings of a
+    /// scored term are touched.
+    ///
+    /// Semantics (shared verbatim with the flat-scan fallback):
+    /// - every quoted phrase is a hard candidacy constraint — a document must
+    ///   contain the phrase's tokens at adjacent positions, else it is
+    ///   excluded even when it matches other query terms; passing documents
+    ///   score the phrase's tokens as ordinary BM25 terms (adjacency gates
+    ///   candidacy, it does not change the formula);
+    /// - each prefix expands to the lexicographically-first
+    ///   [`PREFIX_EXPANSION_LIMIT`] vocabulary terms carrying it, scored as
+    ///   ordinary terms;
+    /// - plain terms are bag-of-words BM25, each distinct term scored once.
+    pub fn search_query(&self, query: &TextQuery, k: Option<usize>) -> Vec<([u8; 16], f64)> {
         let n = self.body.n_docs as usize;
         let avgdl = avg_len(self.body.total_len, n);
 
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut scores: HashMap<u32, f64> = HashMap::new();
-        for term in query_terms {
-            if !seen.insert(term.as_str()) {
-                continue;
+        // Scored terms: plain + phrase tokens + prefix expansions, distinct
+        // and sorted so both paths sum per-term contributions in one order.
+        let mut scored_terms = query.base_terms();
+        for prefix in &query.prefixes {
+            scored_terms.extend(
+                self.body
+                    .postings
+                    .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+                    .take_while(|(t, _)| t.starts_with(prefix.as_str()))
+                    .take(PREFIX_EXPANSION_LIMIT)
+                    .map(|(t, _)| t.as_str()),
+            );
+        }
+
+        // Phrase hard constraint: intersect the per-phrase adjacency-passing
+        // document sets. `Some(set)` restricts scoring to `set`.
+        let mut allowed: Option<HashSet<u32>> = None;
+        for phrase in &query.phrases {
+            let docs = self.phrase_docs(phrase);
+            allowed = Some(match allowed {
+                None => docs,
+                Some(acc) => acc.intersection(&docs).copied().collect(),
+            });
+            if allowed.as_ref().is_some_and(HashSet::is_empty) {
+                return Vec::new();
             }
+        }
+
+        let mut scores: HashMap<u32, f64> = HashMap::new();
+        for term in scored_terms {
             let Some(postings) = self.body.postings.get(term) else {
                 continue;
             };
             let idf = bm25_idf(n, postings.len());
-            for &(di, tf) in postings {
-                let len = self.body.doc_lens[di as usize] as usize;
-                *scores.entry(di).or_insert(0.0) += bm25_term_score(idf, tf, len, avgdl);
+            for (di, tf, _positions) in postings {
+                if allowed.as_ref().is_some_and(|a| !a.contains(di)) {
+                    continue;
+                }
+                let len = self.body.doc_lens[*di as usize] as usize;
+                *scores.entry(*di).or_insert(0.0) += bm25_term_score(idf, *tf, len, avgdl);
             }
         }
 
@@ -169,11 +234,48 @@ impl TextIndex {
         }
         scored
     }
+
+    /// Document indexes containing `phrase`'s tokens at adjacent token
+    /// positions: for some start offset `p`, token `i` of the phrase occurs
+    /// at `p + i`. A phrase token absent from the vocabulary matches nothing.
+    fn phrase_docs(&self, phrase: &[String]) -> HashSet<u32> {
+        let Some(lists) = phrase
+            .iter()
+            .map(|t| self.body.postings.get(t))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return HashSet::new();
+        };
+        let mut out = HashSet::new();
+        // Postings are ascending by document index and positions are
+        // ascending offsets (build order), so both probes binary-search.
+        'docs: for (di, _tf, first) in lists[0] {
+            let mut rest: Vec<&[u32]> = Vec::with_capacity(lists.len() - 1);
+            for list in &lists[1..] {
+                match list.binary_search_by_key(di, |(d, _, _)| *d) {
+                    Ok(ix) => rest.push(&list[ix].2),
+                    Err(_) => continue 'docs,
+                }
+            }
+            for &p in first {
+                if rest
+                    .iter()
+                    .enumerate()
+                    .all(|(j, ps)| ps.binary_search(&(p + 1 + j as u32)).is_ok())
+                {
+                    out.insert(*di);
+                    continue 'docs;
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::{parse_query, tokenize_counts};
 
     fn id(b: u8) -> [u8; 16] {
         let mut a = [0u8; 16];
@@ -242,6 +344,104 @@ mod tests {
     fn decode_rejects_bad_magic() {
         assert!(TextIndex::decode(b"XXXXXXXXjunk").is_err());
         assert!(TextIndex::decode(b"short").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_legacy_v1_body() {
+        // A well-formed NAMIFT01 body (position-less postings) must fail
+        // decode rather than silently misparse — the read path then treats
+        // the index as absent and the flat scan serves.
+        #[derive(Serialize)]
+        struct V1Body {
+            n_docs: u32,
+            total_len: u64,
+            doc_ids: Vec<[u8; 16]>,
+            doc_lens: Vec<u32>,
+            postings: BTreeMap<String, Vec<(u32, u32)>>,
+        }
+        let mut postings = BTreeMap::new();
+        postings.insert("fox".to_string(), vec![(0u32, 1u32)]);
+        let v1 = V1Body {
+            n_docs: 1,
+            total_len: 1,
+            doc_ids: vec![id(1)],
+            doc_lens: vec![1],
+            postings,
+        };
+        let mut bytes = b"NAMIFT01".to_vec();
+        bytes.extend_from_slice(&bincode::serialize(&v1).unwrap());
+        assert!(TextIndex::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn phrase_query_requires_adjacency() {
+        // Both docs contain "graph" AND "database"; only doc 1 has them
+        // adjacent, so the quoted query must return doc 1 alone.
+        let idx = build(&[
+            (1, "graph database systems"),
+            (2, "a database of graph paper"),
+        ]);
+        let q = parse_query("\"graph database\"");
+        let hits = idx.search_query(&q, None);
+        assert_eq!(hits.len(), 1, "adjacency must exclude doc 2: {hits:?}");
+        assert_eq!(hits[0].0, id(1));
+
+        // Once adjacency passes, the phrase's tokens score as plain terms:
+        // doc 1's score equals its bag-of-words score for the same terms.
+        let bag = idx.search(&terms("graph database"), None);
+        let doc1_bag = bag.iter().find(|(i, _)| *i == id(1)).unwrap().1;
+        assert!((hits[0].1 - doc1_bag).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quoted_single_token_is_a_containment_constraint() {
+        // Doc 2 matches "beta" but lacks the required quoted "alpha".
+        let idx = build(&[(1, "alpha beta"), (2, "gamma beta")]);
+        let hits = idx.search_query(&parse_query("\"alpha\" beta"), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, id(1));
+    }
+
+    #[test]
+    fn cjk_phrase_requires_adjacent_bigrams() {
+        // `"東京大"` tokenizes to the bigrams [東京, 京大]; only the
+        // contiguous run 東京大学 carries them at adjacent positions.
+        let idx = build(&[(1, "東京大学"), (2, "東京の大学")]);
+        let hits = idx.search_query(&parse_query("\"東京大\""), None);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0, id(1));
+    }
+
+    #[test]
+    fn prefix_query_expands_over_the_vocabulary() {
+        let idx = build(&[
+            (1, "database systems"),
+            (2, "dataset curation"),
+            (3, "cat dog"),
+        ]);
+        let hits = idx.search_query(&parse_query("data*"), None);
+        let ids: Vec<[u8; 16]> = hits.iter().map(|(i, _)| *i).collect();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(ids.contains(&id(1)) && ids.contains(&id(2)));
+    }
+
+    #[test]
+    fn prefix_expansion_cap_is_deterministic() {
+        // 80 single-term docs t00..t79: `t*` must expand to exactly the
+        // lexicographically-first PREFIX_EXPANSION_LIMIT terms (t00..t63).
+        let bodies: Vec<String> = (0..80).map(|i| format!("t{i:02}")).collect();
+        let docs: Vec<(u8, &str)> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as u8, b.as_str()))
+            .collect();
+        let idx = build(&docs);
+        let hits = idx.search_query(&parse_query("t*"), None);
+        assert_eq!(hits.len(), PREFIX_EXPANSION_LIMIT);
+        let got: HashSet<[u8; 16]> = hits.iter().map(|(i, _)| *i).collect();
+        let want: HashSet<[u8; 16]> =
+            (0..PREFIX_EXPANSION_LIMIT as u8).map(id).collect();
+        assert_eq!(got, want, "expansion must pick the lexicographic head");
     }
 
     #[test]

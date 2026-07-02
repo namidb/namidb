@@ -11,7 +11,10 @@
 //!
 //! Keeping the math here (rather than duplicated across the storage/query
 //! boundary) guarantees the index and the flat scan return identical scores for
-//! the same corpus.
+//! the same corpus. The same goes for the query **syntax**: [`parse_query`]
+//! turns a raw query string into a [`TextQuery`] — quoted phrases (adjacency
+//! constraints), trailing-`*` prefixes (bounded vocabulary expansion), plain
+//! bag-of-words terms — that both consumers interpret with the same rules.
 //!
 //! **The BM25 model.** For query term `t` in document `d`:
 //!
@@ -24,12 +27,156 @@
 //! documents containing `t`, and `avgdl` the average document length. The `+1`
 //! inside the IDF log is the Lucene form that keeps IDF non-negative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// BM25 `k1` — term-frequency saturation point.
 pub const K1: f64 = 1.5;
 /// BM25 `b` — field-length normalization strength.
 pub const B: f64 = 0.75;
+
+/// Cap on how many vocabulary terms one `foo*` prefix pattern may expand to:
+/// the lexicographically-first N matching terms, picked identically on the
+/// index path (postings `BTreeMap` range) and the flat scan (sorted corpus
+/// vocabulary), so both paths score the same expansion. Bounded so a short
+/// prefix over a large vocabulary cannot blow one query up into thousands of
+/// scored terms.
+pub const PREFIX_EXPANSION_LIMIT: usize = 64;
+
+/// A parsed full-text query: quoted phrases (position-adjacency required),
+/// trailing-`*` prefixes (expanded over the corpus vocabulary), and plain
+/// bag-of-words terms. Produced by [`parse_query`], consumed by both the
+/// persistent index and the flat-scan fallback so their semantics agree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextQuery {
+    /// Distinct plain terms, sorted — ordinary bag-of-words BM25.
+    pub terms: Vec<String>,
+    /// Quoted phrases as token sequences. A document must contain every
+    /// phrase's tokens at adjacent token positions (a hard constraint on
+    /// candidacy); a passing document then scores the phrase's tokens as
+    /// ordinary BM25 terms — adjacency gates candidacy, it does not change
+    /// the scoring formula.
+    pub phrases: Vec<Vec<String>>,
+    /// Distinct lowercased prefixes from trailing-`*` patterns, sorted. Each
+    /// expands to at most [`PREFIX_EXPANSION_LIMIT`] vocabulary terms scored
+    /// normally.
+    pub prefixes: Vec<String>,
+}
+
+impl TextQuery {
+    /// A plain bag-of-words query over pre-tokenized terms (no phrases or
+    /// prefixes; duplicates collapse) — the historical search entry point.
+    pub fn from_terms(terms: &[String]) -> Self {
+        let set: BTreeSet<String> = terms.iter().cloned().collect();
+        Self {
+            terms: set.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `true` when nothing was parsed — there is nothing to search for.
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.phrases.is_empty() && self.prefixes.is_empty()
+    }
+
+    /// Distinct sorted scored terms before prefix expansion: the plain terms
+    /// plus every phrase token. Sorted so both consumers sum per-term score
+    /// contributions in the same order (bit-identical floats).
+    pub fn base_terms(&self) -> BTreeSet<&str> {
+        let mut out: BTreeSet<&str> = self.terms.iter().map(String::as_str).collect();
+        for phrase in &self.phrases {
+            for t in phrase {
+                out.insert(t);
+            }
+        }
+        out
+    }
+}
+
+/// Parse a raw query string into [`TextQuery`] syntax:
+///
+/// - `"..."` — a quoted span is a **phrase**: its tokens (via [`tokenize`],
+///   so a CJK span becomes adjacent bigrams) must appear at adjacent token
+///   positions in a document. A single-token phrase degrades to a required
+///   containment constraint. `*` inside quotes is ordinary punctuation. An
+///   unclosed quote runs to the end of the string.
+/// - `foo*` — a `*` immediately after an alphanumeric run marks the run's
+///   **last** emitted token as a prefix pattern (for a Latin word, the word
+///   itself; earlier tokens of the run stay plain terms). A `*` not preceded
+///   by an alphanumeric character is ignored.
+/// - everything else — plain bag-of-words terms.
+///
+/// A query with no `"` and no `*` parses to plain terms only, keeping the
+/// historical bag-of-words behaviour untouched.
+pub fn parse_query(query: &str) -> TextQuery {
+    let mut terms: BTreeSet<String> = BTreeSet::new();
+    let mut phrases: Vec<Vec<String>> = Vec::new();
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+
+    let mut in_quotes = false;
+    for span in query.split('"') {
+        if in_quotes {
+            let tokens = tokenize(span);
+            if !tokens.is_empty() {
+                phrases.push(tokens);
+            }
+        } else {
+            parse_unquoted_span(span, &mut terms, &mut prefixes);
+        }
+        in_quotes = !in_quotes;
+    }
+
+    TextQuery {
+        terms: terms.into_iter().collect(),
+        phrases,
+        prefixes: prefixes.into_iter().collect(),
+    }
+}
+
+/// Split one unquoted span into plain terms and trailing-`*` prefixes.
+fn parse_unquoted_span(
+    span: &str,
+    terms: &mut BTreeSet<String>,
+    prefixes: &mut BTreeSet<String>,
+) {
+    let mut flush = |run: &mut String, starred: bool| {
+        if run.is_empty() {
+            return;
+        }
+        let mut tokens = Vec::new();
+        emit_segment_tokens(run, &mut tokens);
+        run.clear();
+        if starred {
+            if let Some(last) = tokens.pop() {
+                prefixes.insert(last);
+            }
+        }
+        terms.extend(tokens);
+    };
+    let mut run = String::new();
+    for c in span.chars() {
+        if c.is_alphanumeric() {
+            run.push(c);
+        } else {
+            flush(&mut run, c == '*');
+        }
+    }
+    flush(&mut run, false);
+}
+
+/// `true` when `phrase` (a non-empty token sequence) occurs at adjacent token
+/// positions in `tokens` — the flat-scan side of the phrase constraint. The
+/// persistent index answers the same question from stored posting positions;
+/// both operate on the offsets of [`tokenize`]-emitted tokens (CJK bigrams
+/// included), so they agree exactly.
+pub fn contains_phrase(tokens: &[String], phrase: &[String]) -> bool {
+    if phrase.is_empty() {
+        return true;
+    }
+    if tokens.len() < phrase.len() {
+        return false;
+    }
+    tokens.windows(phrase.len()).any(|w| w == phrase)
+}
 
 /// `true` for scripts written without spaces between words (CJK ideographs,
 /// kana, Hangul), where whitespace/punctuation splitting yields one giant token.
@@ -220,5 +367,75 @@ mod tests {
     fn avg_len_guards_empty_corpus() {
         assert_eq!(avg_len(0, 0), 1.0);
         assert_eq!(avg_len(300, 3), 100.0);
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_query_plain_matches_tokenize() {
+        // No quotes/asterisks → distinct sorted terms, nothing else: the
+        // historical bag-of-words path.
+        let q = parse_query("Fox common, fox!");
+        assert_eq!(q.terms, strs(&["common", "fox"]));
+        assert!(q.phrases.is_empty());
+        assert!(q.prefixes.is_empty());
+        assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn parse_query_extracts_quoted_phrases() {
+        let q = parse_query("\"Graph Database\" fast");
+        assert_eq!(q.phrases, vec![strs(&["graph", "database"])]);
+        assert_eq!(q.terms, strs(&["fast"]));
+
+        // Unclosed quote runs to the end; empty quotes are ignored.
+        let q = parse_query("\"graph database");
+        assert_eq!(q.phrases, vec![strs(&["graph", "database"])]);
+        assert!(parse_query("\"\"").is_empty());
+
+        // `*` inside quotes is ordinary punctuation, not prefix syntax.
+        let q = parse_query("\"data* base\"");
+        assert_eq!(q.phrases, vec![strs(&["data", "base"])]);
+        assert!(q.prefixes.is_empty());
+    }
+
+    #[test]
+    fn parse_query_extracts_trailing_star_prefixes() {
+        let q = parse_query("data* base");
+        assert_eq!(q.prefixes, strs(&["data"]));
+        assert_eq!(q.terms, strs(&["base"]));
+
+        // The `*` binds to the last token of the run before it; a bare `*`
+        // (no preceding alphanumeric) is ignored.
+        let q = parse_query("e-mail* *");
+        assert_eq!(q.prefixes, strs(&["mail"]));
+        assert_eq!(q.terms, strs(&["e"]));
+        assert!(parse_query("*").is_empty());
+
+        // A CJK run before `*`: the last emitted bigram is the prefix.
+        let q = parse_query("東京大*");
+        assert_eq!(q.prefixes, strs(&["京大"]));
+        assert_eq!(q.terms, strs(&["東京"]));
+    }
+
+    #[test]
+    fn contains_phrase_requires_adjacency() {
+        let doc = tokenize("a database of graph paper");
+        assert!(!contains_phrase(&doc, &strs(&["graph", "database"])));
+        let doc = tokenize("graph database systems");
+        assert!(contains_phrase(&doc, &strs(&["graph", "database"])));
+        // Single-token phrase = containment; longer-than-doc phrase never hits.
+        assert!(contains_phrase(&doc, &strs(&["systems"])));
+        assert!(!contains_phrase(
+            &tokenize("graph"),
+            &strs(&["graph", "database"])
+        ));
+        // CJK: positions are per emitted bigram, so `東京大` (→ 東京, 京大)
+        // matches the contiguous run but not the particle-split one.
+        let phrase = tokenize("東京大");
+        assert!(contains_phrase(&tokenize("東京大学"), &phrase));
+        assert!(!contains_phrase(&tokenize("東京の大学"), &phrase));
     }
 }

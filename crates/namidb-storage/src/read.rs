@@ -2464,26 +2464,32 @@ impl<'mt> Snapshot<'mt> {
     }
 
     /// Decoded `.ft` index for `desc`, via the process-wide [`SstCache`] (same
-    /// once-per-SST story as [`Self::fetch_vector_index`]). Unlike `.vg`, a
-    /// corrupt text body is a hard error (the historical behaviour).
+    /// once-per-SST story as [`Self::fetch_vector_index`]). Mirrors the `.vg`
+    /// convention: a body that fails decode — a legacy magic after a format
+    /// bump, or corruption — is `None`, so the caller treats the index as
+    /// absent and the flat scan serves until the next authoritative
+    /// compaction rebuilds the SST, rather than erroring every query.
     #[cfg(feature = "text-index")]
     async fn fetch_text_index(
         &self,
         desc: &crate::manifest::SstDescriptor,
-    ) -> Result<Arc<crate::sst::text::TextIndex>> {
+    ) -> Result<Option<Arc<crate::sst::text::TextIndex>>> {
         use crate::sst::text::TextIndex;
         let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
         if let Some(cache) = self.cache.as_ref() {
             if let Some(idx) = cache.get_text_index(&absolute) {
-                return Ok(idx);
+                return Ok(Some(idx));
             }
         }
         let body = self.get_sst_body(desc).await?;
-        let idx = Arc::new(TextIndex::decode(&body)?);
+        let Ok(idx) = TextIndex::decode(&body) else {
+            return Ok(None);
+        };
+        let idx = Arc::new(idx);
         if let Some(cache) = self.cache.as_ref() {
             cache.insert_text_index(absolute, idx.clone());
         }
-        Ok(idx)
+        Ok(Some(idx))
     }
 
     #[cfg(feature = "vector-index")]
@@ -2635,13 +2641,15 @@ impl<'mt> Snapshot<'mt> {
     /// `Ok(Some(hits))` is the BM25 result: `(NodeId, score)` best-first with a
     /// node-id tie-break, unioned across every in-scope TextIndex SST (normally
     /// one per index; a partial rebuild can briefly leave two). `k = None`
-    /// returns every match.
+    /// returns every match. `query` is the parsed query — phrases, prefixes
+    /// and plain terms — whose semantics `TextIndex::search_query` shares
+    /// verbatim with the executor's flat scan.
     #[cfg(feature = "text-index")]
     pub async fn text_search(
         &self,
         index_name: &str,
         label: &str,
-        query_terms: &[String],
+        query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
 
@@ -2695,7 +2703,12 @@ impl<'mt> Snapshot<'mt> {
             if desc.kind != SstKind::TextIndex || desc.scope != index_name {
                 continue;
             }
-            let idx = self.fetch_text_index(desc).await?;
+            // An undecodable body (legacy magic after a format bump, or
+            // corruption): BM25 depends on whole-corpus stats, so a partial
+            // serve would skew them — treat the index as absent and flat-scan.
+            let Some(idx) = self.fetch_text_index(desc).await? else {
+                return Ok(None);
+            };
             // A dirty id that IS an indexed document means a stale doc (delete/
             // relabel) the index would still serve, and its removal also shifts
             // the corpus stats — only the flat scan is exact then.
@@ -2703,7 +2716,7 @@ impl<'mt> Snapshot<'mt> {
                 return Ok(None);
             }
             all.extend(
-                idx.search(query_terms, k)
+                idx.search_query(query, k)
                     .into_iter()
                     .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
             );

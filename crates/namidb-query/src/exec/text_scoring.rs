@@ -35,7 +35,10 @@
 //! full-text index and this query-time path score identically; they are
 //! re-exported here for the procedure and the scalar below.
 
-pub use namidb_storage::text::{bm25_idf, bm25_term_score, tokenize, tokenize_counts, B, K1};
+pub use namidb_storage::text::{
+    bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize, tokenize_counts, TextQuery,
+    B, K1, PREFIX_EXPANSION_LIMIT,
+};
 
 /// Reference average document length (in tokens) for the corpus-free scalar
 /// builtin, where the true corpus average is unavailable. A document of this
