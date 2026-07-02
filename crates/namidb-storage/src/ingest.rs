@@ -332,6 +332,14 @@ impl WriterSession {
         counts.values().copied().max().unwrap_or(0)
     }
 
+    /// Best-effort byte size of the live memtable — the committed,
+    /// un-flushed working set. The server uses it for the byte-based flush
+    /// trigger and write backpressure, so a burst ingest cannot grow the
+    /// memtable unboundedly between flush ticks.
+    pub fn memtable_bytes(&self) -> usize {
+        self.memtable.bytes_estimate()
+    }
+
     /// Number of mutations queued and not yet durable.
     pub fn pending_len(&self) -> usize {
         self.pending.records.len()

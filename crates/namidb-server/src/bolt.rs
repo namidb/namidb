@@ -446,8 +446,9 @@ impl ServerBackend {
                 Ok(outcome) => {
                     self.state.snapshot.store(writer.owned_snapshot());
                     // Soft write stall (RFC-027 P5): sample under the lock,
-                    // release, then back off this request if L0 is piling up.
-                    let stall = self.state.write_stall_for(writer.max_l0_bucket_len());
+                    // release, then back off this request if L0 (or the
+                    // memtable byte budget) is piling up.
+                    let stall = self.state.after_commit_backpressure(&writer);
                     drop(writer);
                     let elapsed = started.elapsed();
                     if let Some(delay) = stall {

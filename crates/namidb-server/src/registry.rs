@@ -204,6 +204,7 @@ impl NamespaceRegistry {
             cancel_tx: watch::channel(false).0,
             maintenance_tasks: std::sync::Mutex::new(Vec::new()),
             writer_health: WriterHealth::new(),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Spawn per-namespace background maintenance (flush / compaction /
@@ -249,6 +250,7 @@ impl NamespaceRegistry {
                         biased;
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
+                        _ = s.flush_notify.notified() => {}
                     }
                     let mut w = s.writer.lock().await;
                     let schema = w.snapshot().manifest().manifest.schema.clone();
@@ -400,6 +402,9 @@ pub struct NamespaceState {
     /// Writer status for this namespace's readiness probe: degraded from a
     /// terminal commit/flush failure until the automatic reopen succeeds.
     pub writer_health: Arc<WriterHealth>,
+    /// Wakes this namespace's flush task early when a committed write
+    /// crosses the memtable byte threshold (see `SharedAppState`).
+    pub flush_notify: Arc<tokio::sync::Notify>,
 }
 
 impl NamespaceState {

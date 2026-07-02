@@ -37,6 +37,11 @@ pub struct SharedAppState {
     pub write_stall_l0: usize,
     /// Soft write-stall delay when L0 is above the threshold.
     pub write_stall_delay: Duration,
+    /// Memtable bytes at which a committed write nudges the namespace's
+    /// flush task early (see the single-tenant twin on `AppState`).
+    pub memtable_flush_bytes: usize,
+    /// Memtable bytes above which writes are softly stalled (backpressure).
+    pub memtable_stall_bytes: usize,
     /// Default namespace for unprefixed requests (`/v0/...` without a
     /// `/:namespace/` segment) and for requests that omit the
     /// `X-NamiDB-Namespace` header.
@@ -58,6 +63,8 @@ impl SharedAppState {
         query_row_cap: usize,
         write_stall_l0: usize,
         write_stall_delay: Duration,
+        memtable_flush_bytes: usize,
+        memtable_stall_bytes: usize,
         default_namespace: String,
     ) -> Self {
         Self {
@@ -69,6 +76,8 @@ impl SharedAppState {
             query_row_cap,
             write_stall_l0,
             write_stall_delay,
+            memtable_flush_bytes,
+            memtable_stall_bytes,
             default_namespace,
             authz: Arc::new(NoOpAuthz),
         }
@@ -99,11 +108,22 @@ impl SharedAppState {
     }
 
     /// If a write should be stalled given the worst bucket's current L0
-    /// count, the delay to apply; otherwise `None`.
-    pub fn write_stall_for(&self, max_l0: usize) -> Option<Duration> {
-        (self.write_stall_l0 > 0
+    /// count and memtable size, the delay to apply; otherwise `None`.
+    /// Mirrors `AppState::write_stall_for`.
+    pub fn write_stall_for(&self, max_l0: usize, memtable_bytes: usize) -> Option<Duration> {
+        if self.write_stall_l0 > 0
             && max_l0 >= self.write_stall_l0
-            && self.write_stall_delay > Duration::ZERO)
-            .then_some(self.write_stall_delay)
+            && self.write_stall_delay > Duration::ZERO
+        {
+            return Some(self.write_stall_delay);
+        }
+        if self.memtable_stall_bytes > 0 && memtable_bytes >= self.memtable_stall_bytes {
+            return Some(if self.write_stall_delay > Duration::ZERO {
+                self.write_stall_delay
+            } else {
+                Duration::from_millis(20)
+            });
+        }
+        None
     }
 }

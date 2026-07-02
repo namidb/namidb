@@ -120,6 +120,16 @@ pub struct Config {
     pub write_stall_l0: usize,
     /// Delay applied to a write when L0 is above `write_stall_l0`.
     pub write_stall_delay: Duration,
+    /// Memtable byte size at which a committed write triggers a flush
+    /// immediately (instead of waiting for `flush_interval`). Bounds the
+    /// un-flushed working set by bytes, not just wall clock — a burst loader
+    /// at hundreds of MB/s can otherwise accept gigabytes between ticks and
+    /// OOM when the flush's CPU phase (~2-3x amplification) runs. `0`
+    /// disables the trigger.
+    pub memtable_flush_bytes: usize,
+    /// Memtable byte size above which writes are softly stalled
+    /// (backpressure) until the flush catches up. `0` disables the stall.
+    pub memtable_stall_bytes: usize,
     /// PEM certificate-chain file enabling TLS on the HTTP and Bolt
     /// listeners. Must be set together with `tls_key`; when both are `None`
     /// the server serves plaintext.
@@ -188,6 +198,21 @@ pub struct AppState {
     /// disabled; the server sets them from [`Config`] at boot.
     write_stall_l0: usize,
     write_stall_delay: Duration,
+    /// Byte thresholds for memtable-driven flushing: at
+    /// `memtable_flush_bytes` a committed write nudges the flush task
+    /// (`flush_notify`) instead of waiting out the timer; at
+    /// `memtable_stall_bytes` the write is additionally stalled, so a burst
+    /// loader cannot grow the memtable to OOM between ticks (the flush's CPU
+    /// phase amplifies RAM ~2-3x, so wall-clock alone is not a bound). `0`
+    /// disables each. The server sets them from [`Config`] at boot.
+    memtable_flush_bytes: usize,
+    memtable_stall_bytes: usize,
+    /// Wakes the periodic flush task early when the byte threshold is
+    /// crossed by a committed write.
+    pub flush_notify: Arc<tokio::sync::Notify>,
+    /// Last observed memtable size, published by the write/flush paths so
+    /// `/v0/health` can report it without touching the writer lock.
+    pub memtable_bytes_gauge: Arc<std::sync::atomic::AtomicUsize>,
     /// Process-wide query metrics, shared across every connection on both
     /// serving paths. Rendered at `/v0/metrics` and the home of the
     /// slow-query log. Defaults to a registry with the slow-query log
@@ -226,6 +251,10 @@ impl AppState {
             query_row_cap: 0,
             write_stall_l0: 0,
             write_stall_delay: Duration::ZERO,
+            memtable_flush_bytes: 0,
+            memtable_stall_bytes: 0,
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            memtable_bytes_gauge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
             authz: Arc::new(authz::NoOpAuthz),
             writer_health: WriterHealth::new(),
@@ -255,15 +284,50 @@ impl AppState {
         self
     }
 
+    /// Set the memtable byte thresholds (builder style): `flush_bytes` nudges
+    /// the flush task early, `stall_bytes` applies write backpressure. `0`
+    /// disables each.
+    pub fn with_memtable_thresholds(mut self, flush_bytes: usize, stall_bytes: usize) -> Self {
+        self.memtable_flush_bytes = flush_bytes;
+        self.memtable_stall_bytes = stall_bytes;
+        self
+    }
+
     /// If a write should be stalled given the worst bucket's current L0
-    /// count, the delay to apply; otherwise `None`. The caller samples
-    /// `max_l0_bucket_len()` while holding the writer lock, then sleeps
-    /// after releasing it.
-    pub(crate) fn write_stall_for(&self, max_l0: usize) -> Option<Duration> {
-        (self.write_stall_l0 > 0
+    /// count and the live memtable size, the delay to apply; otherwise
+    /// `None`. The caller samples both while holding the writer lock, then
+    /// sleeps after releasing it.
+    pub(crate) fn write_stall_for(&self, max_l0: usize, memtable_bytes: usize) -> Option<Duration> {
+        if self.write_stall_l0 > 0
             && max_l0 >= self.write_stall_l0
-            && self.write_stall_delay > Duration::ZERO)
-            .then_some(self.write_stall_delay)
+            && self.write_stall_delay > Duration::ZERO
+        {
+            return Some(self.write_stall_delay);
+        }
+        if self.memtable_stall_bytes > 0 && memtable_bytes >= self.memtable_stall_bytes {
+            // The byte backstop must bite even when the L0 stall is not
+            // configured; fall back to a small fixed delay.
+            return Some(if self.write_stall_delay > Duration::ZERO {
+                self.write_stall_delay
+            } else {
+                Duration::from_millis(20)
+            });
+        }
+        None
+    }
+
+    /// Post-commit bookkeeping, sampled while the writer lock is still held:
+    /// publish the memtable gauge, nudge the flush task when the byte
+    /// threshold is crossed, and return the backpressure delay (if any) to
+    /// apply AFTER the lock is released.
+    pub(crate) fn after_commit_backpressure(&self, writer: &WriterSession) -> Option<Duration> {
+        let bytes = writer.memtable_bytes();
+        self.memtable_bytes_gauge
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        if self.memtable_flush_bytes > 0 && bytes >= self.memtable_flush_bytes {
+            self.flush_notify.notify_one();
+        }
+        self.write_stall_for(writer.max_l0_bucket_len(), bytes)
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -570,6 +634,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.query_row_cap,
             config.write_stall_l0,
             config.write_stall_delay,
+            config.memtable_flush_bytes,
+            config.memtable_stall_bytes,
             config.default_namespace.clone(),
         )
         .with_authz(authz.clone());
@@ -615,6 +681,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_write_timeout(config.write_timeout)
         .with_query_row_cap(config.query_row_cap)
         .with_write_stall(config.write_stall_l0, config.write_stall_delay)
+        .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
         .with_slow_query_threshold(config.slow_query_threshold);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
@@ -630,12 +697,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // first tick fires immediately; skip.
             loop {
-                tick.tick().await;
+                // Flush on the timer OR when a committed write crossed the
+                // memtable byte threshold (`after_commit_backpressure`
+                // notifies), so a burst loader's working set is bounded by
+                // bytes, not just wall clock.
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = state_for_flush.flush_notify.notified() => {}
+                }
                 let mut w = state_for_flush.writer.lock().await;
                 let schema = w.snapshot().manifest().manifest.schema.clone();
                 match w.flush(schema.clone()).await {
                     Ok(_) => {
                         state_for_flush.snapshot.store(w.owned_snapshot());
+                        state_for_flush
+                            .memtable_bytes_gauge
+                            .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
                         if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
                             match w.compact_l0(&schema).await {
                                 Ok(outcome) if outcome.source_ssts_removed > 0 => {
@@ -1005,6 +1082,11 @@ struct HealthResponse {
     /// The commit/flush failure keeping the writer degraded, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     writer_error: Option<String>,
+    /// Last observed live-memtable size in bytes (the un-flushed working
+    /// set), published lock-free by the write/flush paths. `None` on the
+    /// multi-tenant probe, which has no single gauge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memtable_bytes: Option<usize>,
 }
 
 /// Build the health payload + status code from the published snapshot and
@@ -1016,6 +1098,7 @@ fn health_response(
     namespace: String,
     manifest: &Manifest,
     writer_health: &WriterHealth,
+    memtable_bytes: Option<usize>,
 ) -> Response {
     let writer_error = writer_health.degraded_reason();
     let degraded = writer_error.is_some();
@@ -1026,6 +1109,7 @@ fn health_response(
         epoch: manifest.epoch.as_u64(),
         writer: if degraded { "degraded" } else { "ok" },
         writer_error,
+        memtable_bytes,
     };
     let code = if degraded {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1054,7 +1138,16 @@ async fn livez() -> impl IntoResponse {
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let owned = state.snapshot.load();
     let m = &owned.manifest().manifest;
-    health_response(state.namespace.clone(), m, &state.writer_health)
+    health_response(
+        state.namespace.clone(),
+        m,
+        &state.writer_health,
+        Some(
+            state
+                .memtable_bytes_gauge
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    )
 }
 
 #[derive(Serialize)]
@@ -1729,7 +1822,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 // Refresh the published snapshot so subsequent reads see the
                 // just-committed records (RFC-021).
                 state.snapshot.store(writer.owned_snapshot());
-                state.write_stall_for(writer.max_l0_bucket_len())
+                state.after_commit_backpressure(&writer)
             }
             Err(e) => {
                 // A fenced/poisoned session would fail every later write;
@@ -1904,7 +1997,7 @@ async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Re
         Ok(ns_state) => {
             let owned = ns_state.snapshot.load();
             let m = &owned.manifest().manifest;
-            health_response(namespace, m, &ns_state.writer_health)
+            health_response(namespace, m, &ns_state.writer_health, None)
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2163,7 +2256,11 @@ async fn run_cypher_multi(
         let stall = match &result {
             Ok(_) => {
                 ns_state.snapshot.store(writer.owned_snapshot());
-                shared.write_stall_for(writer.max_l0_bucket_len())
+                let bytes = writer.memtable_bytes();
+                if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
+                    ns_state.flush_notify.notify_one();
+                }
+                shared.write_stall_for(writer.max_l0_bucket_len(), bytes)
             }
             Err(e) => {
                 // Reopen a fenced/poisoned namespace writer in place, under
@@ -3036,7 +3133,7 @@ mod tests {
             "t".into(),
         );
         assert!(
-            off.write_stall_for(1_000).is_none(),
+            off.write_stall_for(1_000, usize::MAX).is_none(),
             "disabled: never stalls"
         );
 
@@ -3048,16 +3145,74 @@ mod tests {
             "t".into(),
         )
         .with_write_stall(8, Duration::from_millis(50));
-        assert_eq!(on.write_stall_for(7), None, "below threshold");
+        assert_eq!(on.write_stall_for(7, 0), None, "below threshold");
         assert_eq!(
-            on.write_stall_for(8),
+            on.write_stall_for(8, 0),
             Some(Duration::from_millis(50)),
             "at threshold"
         );
         assert_eq!(
-            on.write_stall_for(99),
+            on.write_stall_for(99, 0),
             Some(Duration::from_millis(50)),
             "above threshold"
+        );
+
+        // Byte backstop: stalls at/above the memtable threshold even when the
+        // L0 stall never trips, with the fixed fallback delay when no
+        // write_stall_delay is configured.
+        let (store3, paths3) = namidb_storage::parse_uri("memory://test-stall-bytes").unwrap();
+        let bytes_only = AppState::new(
+            WriterSession::open(store3, paths3).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_memtable_thresholds(0, 1024);
+        assert_eq!(bytes_only.write_stall_for(0, 1023), None, "below bytes");
+        assert_eq!(
+            bytes_only.write_stall_for(0, 1024),
+            Some(Duration::from_millis(20)),
+            "byte backstop with default delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_threshold_nudges_flush_and_publishes_gauge() {
+        // A committed write at/above `memtable_flush_bytes` must leave a
+        // stored permit on `flush_notify` (so the flush task's next
+        // `notified()` resolves immediately instead of waiting out the
+        // interval) and publish the lock-free gauge health reads.
+        let (store, paths) = namidb_storage::parse_uri("memory://test-bytes-flush").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_memtable_thresholds(1, 0);
+        {
+            let mut w = state.writer.lock().await;
+            w.upsert_node(
+                "P",
+                namidb_core::id::NodeId::new(),
+                &namidb_storage::NodeWriteRecord {
+                    properties: std::collections::BTreeMap::new(),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            w.commit_batch().await.unwrap();
+            let stall = state.after_commit_backpressure(&w);
+            assert!(stall.is_none(), "no stall threshold configured");
+        }
+        tokio::time::timeout(Duration::from_secs(1), state.flush_notify.notified())
+            .await
+            .expect("the byte trigger must have nudged the flush task");
+        assert!(
+            state
+                .memtable_bytes_gauge
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "gauge must reflect the committed bytes"
         );
     }
 
@@ -3585,6 +3740,8 @@ mod tests {
             0,
             0,
             Duration::ZERO,
+            0,
+            0,
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)
@@ -3673,6 +3830,8 @@ mod tests {
             0,
             0,
             Duration::ZERO,
+            0,
+            0,
             "default".to_string(),
         );
         let app = build_multi_tenant_router(shared);
@@ -3739,6 +3898,8 @@ mod tests {
             0,
             0,
             Duration::ZERO,
+            0,
+            0,
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)

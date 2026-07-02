@@ -79,6 +79,8 @@ async fn serves_https_and_bolt_over_tls() {
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
         write_stall_delay: Duration::ZERO,
+        memtable_flush_bytes: 0,
+        memtable_stall_bytes: 0,
         tls_cert: Some(certs.cert_path.to_path_buf()),
         tls_key: Some(certs.key_path.to_path_buf()),
         slow_query_threshold: Duration::ZERO,

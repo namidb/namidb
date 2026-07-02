@@ -208,6 +208,26 @@ struct Cli {
     )]
     write_stall_delay: Duration,
 
+    /// Memtable byte size at which a committed write triggers a flush
+    /// immediately instead of waiting for `--flush-interval`, bounding the
+    /// un-flushed working set by bytes under burst ingest. `0` disables.
+    #[arg(
+        long,
+        env = "NAMIDB_MEMTABLE_FLUSH_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
+    memtable_flush_bytes: usize,
+
+    /// Memtable byte size above which committed writes are softly stalled
+    /// (backpressure) until the flush catches up — the OOM backstop for
+    /// loaders that outrun the flush. `0` disables.
+    #[arg(
+        long,
+        env = "NAMIDB_MEMTABLE_STALL_BYTES",
+        default_value_t = 256 * 1024 * 1024
+    )]
+    memtable_stall_bytes: usize,
+
     /// PEM certificate-chain file. Set together with `--tls-key` to serve the
     /// HTTP and Bolt listeners over TLS; omit both to serve plaintext.
     #[arg(long, env = "NAMIDB_TLS_CERT")]
@@ -300,6 +320,8 @@ fn main() -> anyhow::Result<()> {
         compaction_l0_trigger: cli.compaction_l0_trigger,
         write_stall_l0: cli.write_stall_l0,
         write_stall_delay: cli.write_stall_delay,
+        memtable_flush_bytes: cli.memtable_flush_bytes,
+        memtable_stall_bytes: cli.memtable_stall_bytes,
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,
         slow_query_threshold: cli.slow_query_threshold,
