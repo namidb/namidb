@@ -2,8 +2,10 @@
 //! flush.
 //!
 //! Single-writer model: a [`Memtable`] is owned by exactly one writer task,
-//! so we get away with a `BTreeMap` and no synchronisation. Reads come
-//! through the same task, or through immutable snapshots (later).
+//! so we get away with an unsynchronised map. The map is a persistent
+//! [`imbl::OrdMap`], so publishing a read snapshot on every commit is O(1)
+//! structural sharing instead of a full tree clone. Reads come through the
+//! same task, or through immutable snapshots.
 //!
 //! ## Semantics
 //!
@@ -18,7 +20,7 @@
 //! call [`Memtable::apply`] only after the WAL append for that record has
 //! returned success.
 
-use std::collections::BTreeMap;
+use imbl::OrdMap;
 use std::ops::Bound;
 
 use bytes::Bytes;
@@ -95,7 +97,7 @@ pub struct MemEntry {
 /// any writer lock. See RFC-021.
 #[derive(Debug, Default)]
 pub struct Memtable {
-    inner: BTreeMap<MemKey, MemEntry>,
+    inner: OrdMap<MemKey, MemEntry>,
     bytes: usize,
 }
 
@@ -157,7 +159,7 @@ impl Memtable {
         &'a self,
         edge_type: &'a str,
     ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
-        // We cannot tightly bound the BTreeMap range across the (src, dst)
+        // We cannot tightly bound the map range across the (src, dst)
         // pair without overflow gymnastics; a filtering scan is fine for the
         // memtable since it is bounded by the flush threshold.
         self.inner.iter().filter(
@@ -201,11 +203,14 @@ impl Memtable {
 
     /// Build an immutable [`MemtableSnapshot`] of the current state.
     ///
-    /// The snapshot owns its own copy of the `BTreeMap`, so the
-    /// returned value lives independently of the writer that produced
-    /// it. Readers consume the snapshot via `Arc<MemtableSnapshot>` so
-    /// many concurrent reads share the same allocation without locking
-    /// the writer (RFC-021).
+    /// O(1): the persistent `OrdMap` shares structure between the live
+    /// memtable and every published snapshot, so this no longer deep-clones
+    /// the whole tree on every commit (which made per-commit cost grow
+    /// linearly with memtable size — quadratic over a flush interval — while
+    /// holding the writer lock). Later writes copy-on-write only the tree
+    /// chunks they touch; values are `Bytes` (refcounted), so a chunk copy
+    /// never duplicates payloads. Readers consume the snapshot via
+    /// `Arc<MemtableSnapshot>` (RFC-021).
     pub fn snapshot_view(&self) -> MemtableSnapshot {
         MemtableSnapshot {
             inner: self.inner.clone(),
@@ -221,7 +226,7 @@ impl Memtable {
 /// surface. See RFC-021.
 #[derive(Debug, Default, Clone)]
 pub struct MemtableSnapshot {
-    inner: BTreeMap<MemKey, MemEntry>,
+    inner: OrdMap<MemKey, MemEntry>,
 }
 
 impl MemtableSnapshot {
@@ -273,7 +278,7 @@ impl MemtableSnapshot {
 /// SSTs.
 #[derive(Debug, Clone)]
 pub struct FrozenMemtable {
-    inner: BTreeMap<MemKey, MemEntry>,
+    inner: OrdMap<MemKey, MemEntry>,
     bytes: usize,
 }
 
@@ -298,6 +303,32 @@ mod tests {
 
     fn nid(byte: u8) -> NodeId {
         NodeId::from_uuid(uuid::Uuid::from_bytes([byte; 16]))
+    }
+
+    #[test]
+    fn snapshot_view_is_structural_sharing_not_a_clone() {
+        // Publishing on every commit must be O(1): two views with no write
+        // in between share the same root, and a published view is immune to
+        // later writes (copy-on-write on the touched chunks only).
+        let mut mt = Memtable::new();
+        for i in 0..500u16 {
+            let mut b = [0u8; 16];
+            b[14..16].copy_from_slice(&i.to_be_bytes());
+            mt.apply(
+                MemKey::Node {
+                    id: NodeId::from_uuid(uuid::Uuid::from_bytes(b)),
+                },
+                u64::from(i) + 1,
+                MemOp::Upsert(Bytes::from_static(b"v")),
+            );
+        }
+        let a = mt.snapshot_view();
+        let b = mt.snapshot_view();
+        assert!(a.inner.ptr_eq(&b.inner), "no-write views must share the root");
+
+        mt.apply(MemKey::Node { id: nid(255) }, 1000, MemOp::Tombstone);
+        assert_eq!(a.len(), 500, "published view unaffected by later writes");
+        assert_eq!(mt.len(), 501);
     }
 
     #[test]
