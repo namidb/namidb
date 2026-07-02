@@ -42,7 +42,9 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore};
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -85,11 +87,23 @@ pub struct NodeSstWriterOptions {
     pub schema_version: u64,
 }
 
+/// Row-group row target for node SST writers. Reads
+/// `NAMIDB_NODE_SST_ROW_GROUP_ROWS`; falls back to 128 Ki rows. Small
+/// values force multi-row-group SSTs — used by row-group-pruning tests
+/// so they don't have to write 128 k+ rows per fixture.
+pub fn node_sst_row_group_target_rows() -> usize {
+    std::env::var("NAMIDB_NODE_SST_ROW_GROUP_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128 * 1024)
+}
+
 impl Default for NodeSstWriterOptions {
     fn default() -> Self {
         Self {
             compression: Compression::ZSTD(ZstdLevel::try_new(6).unwrap()),
-            row_group_target_rows: 128 * 1024,
+            row_group_target_rows: node_sst_row_group_target_rows(),
             data_page_size: 1024 * 1024,
             write_batch_size: 8192,
             bits_per_key: DEFAULT_BITS_PER_KEY,
@@ -638,6 +652,166 @@ impl NodeSstReader {
         }
         Ok(batches)
     }
+
+    /// Decode exactly `row_groups` (ascending footer indices), in order.
+    /// The caller has already done the pruning — typically via
+    /// [`row_groups_for_keys`] against cached footer metadata.
+    pub fn scan_row_groups(&self, row_groups: Vec<usize>) -> Result<Vec<RecordBatch>> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(self.body.clone())
+            .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
+        let reader = builder
+            .with_row_groups(row_groups)
+            .build()
+            .map_err(|e| Error::invariant(format!("parquet build: {e}")))?;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for b in reader {
+            batches.push(b.map_err(|e| Error::invariant(format!("parquet read: {e}")))?);
+        }
+        Ok(batches)
+    }
+
+    /// Decode each of `row_groups` into its own batch vector, reusing the
+    /// caller's parsed footer `md` (no per-group footer re-parse).
+    ///
+    /// Unlike [`Self::scan_row_groups`] — where the sync arrow reader
+    /// streams the selected groups contiguously and a batch can span two
+    /// of them, sharing decode buffers across the boundary — this decodes
+    /// one group per reader, so every returned vector owns right-sized
+    /// buffers. That matters for the decoded row-group cache: entries
+    /// must not pin each other's memory, and their byte weights must
+    /// reflect what eviction actually frees.
+    pub fn scan_row_groups_each(
+        &self,
+        md: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+    ) -> Result<Vec<(usize, Vec<RecordBatch>)>> {
+        let meta = ArrowReaderMetadata::try_new(md.clone(), ArrowReaderOptions::new())
+            .map_err(|e| Error::invariant(format!("parquet metadata reuse: {e}")))?;
+        let mut out: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(row_groups.len());
+        for &rg in row_groups {
+            let reader =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(self.body.clone(), meta.clone())
+                    .with_row_groups(vec![rg])
+                    .build()
+                    .map_err(|e| Error::invariant(format!("parquet build: {e}")))?;
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            for b in reader {
+                batches.push(b.map_err(|e| Error::invariant(format!("parquet read: {e}")))?);
+            }
+            out.push((rg, batches));
+        }
+        Ok(out)
+    }
+}
+
+/// Row groups whose `node_id` min/max range can contain at least one of
+/// `sorted_keys` (ascending). The writer keeps `node_id` strictly
+/// ascending across the SST, so per-row-group stats partition the key
+/// space and a sorted probe set resolves each row group with one
+/// binary search. Row groups without stats are admitted (defensive —
+/// every writer path we control emits `EnabledStatistics::Chunk`),
+/// matching [`NodeSstReader::targeted_scan`].
+pub fn row_groups_for_keys(md: &ParquetMetaData, sorted_keys: &[[u8; 16]]) -> Result<Vec<usize>> {
+    let leaf_idx = md
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.name() == COL_NODE_ID)
+        .ok_or_else(|| Error::invariant("node_id column not in parquet schema"))?;
+    let mut keep: Vec<usize> = Vec::new();
+    for (rg_idx, rg) in md.row_groups().iter().enumerate() {
+        let cc = rg.column(leaf_idx);
+        let in_range = match cc.statistics() {
+            Some(stats) => match (stats.min_bytes_opt(), stats.max_bytes_opt()) {
+                (Some(min), Some(max)) => {
+                    let start = sorted_keys.partition_point(|k| k.as_slice() < min);
+                    start < sorted_keys.len() && sorted_keys[start].as_slice() <= max
+                }
+                _ => true,
+            },
+            None => true,
+        };
+        if in_range {
+            keep.push(rg_idx);
+        }
+    }
+    Ok(keep)
+}
+
+/// Partition `batches` (decoded from `row_groups`, in order) back into
+/// per-row-group vectors using the footer's per-row-group row counts.
+/// The arrow readers never emit a batch spanning two row groups, but the
+/// split slices defensively (zero-copy) rather than relying on that, and
+/// errors out on any row-count mismatch so a partial decode can never be
+/// cached as a complete row group.
+pub fn split_batches_by_row_group(
+    md: &ParquetMetaData,
+    row_groups: &[usize],
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<(usize, Vec<RecordBatch>)>> {
+    let mut out: Vec<(usize, Vec<RecordBatch>)> =
+        row_groups.iter().map(|&rg| (rg, Vec::new())).collect();
+    let mut slot = 0usize;
+    let mut remaining: usize = match out.first() {
+        Some((rg, _)) => md.row_group(*rg).num_rows() as usize,
+        None => 0,
+    };
+    for batch in batches {
+        let mut rest = batch;
+        while rest.num_rows() > 0 {
+            while remaining == 0 {
+                slot += 1;
+                if slot >= out.len() {
+                    return Err(Error::invariant(
+                        "row-group split: decoded more rows than the footer declares",
+                    ));
+                }
+                remaining = md.row_group(out[slot].0).num_rows() as usize;
+            }
+            let take = rest.num_rows().min(remaining);
+            out[slot].1.push(rest.slice(0, take));
+            remaining -= take;
+            rest = rest.slice(take, rest.num_rows() - take);
+        }
+    }
+    if !out.is_empty() && (slot != out.len() - 1 || remaining != 0) {
+        return Err(Error::invariant(
+            "row-group split: decoded fewer rows than the footer declares",
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse the footer + page index of an in-memory node SST body into the
+/// same `Arc<ParquetMetaData>` shape the ranged path produces, so both
+/// can share one entry in [`crate::cache::SstCache`]'s metadata map.
+pub fn parse_node_sst_metadata(body: &Bytes) -> Result<Arc<ParquetMetaData>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        body.clone(),
+        ArrowReaderOptions::new().with_page_index(true),
+    )
+    .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
+    Ok(builder.metadata().clone())
+}
+
+/// Fetch the footer + page index of a node SST over ranged GETs, without
+/// pulling the body. Used by `Snapshot::batch_lookup_nodes` when ranged
+/// reads are in effect and the body is not cached.
+pub async fn load_node_sst_metadata_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+) -> Result<Arc<ParquetMetaData>> {
+    let mut reader = ObjectStoreRangedReader {
+        store,
+        path: path.clone(),
+        file_size,
+        cached_metadata: None,
+    };
+    AsyncFileReader::get_metadata(&mut reader, None)
+        .await
+        .map_err(|e| Error::invariant(format!("parquet metadata async {path}: {e}")))
 }
 
 /// Thin `parquet::AsyncFileReader` wrapper around our
@@ -776,6 +950,47 @@ pub async fn targeted_scan_async(
     target: &[u8; 16],
     cached_metadata: Option<Arc<ParquetMetaData>>,
 ) -> Result<(Vec<RecordBatch>, Arc<ParquetMetaData>)> {
+    // Row-group prune by min/max stats on node_id. Same logic as
+    // `targeted_scan`.
+    let target = *target;
+    ranged_scan_selected_row_groups(store, path, file_size, label, cached_metadata, move |md| {
+        row_groups_for_keys(md, std::slice::from_ref(&target))
+    })
+    .await
+}
+
+/// Ranged-read decode of caller-selected row groups (no pruning of its
+/// own — pair with [`row_groups_for_keys`] against cached metadata).
+/// Used by `Snapshot::batch_lookup_nodes` so a multi-id probe over a
+/// large SST fetches only the column pages of the row groups that can
+/// contain a probe id.
+pub async fn scan_row_groups_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    row_groups: Vec<usize>,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> Result<Vec<RecordBatch>> {
+    let (batches, _md) =
+        ranged_scan_selected_row_groups(store, path, file_size, label, cached_metadata, move |_| {
+            Ok(row_groups)
+        })
+        .await?;
+    Ok(batches)
+}
+
+/// Shared driver for the ranged-read scans: open the stream builder over
+/// byte-ranged GETs, sanity-check the schema, let `select` pick the row
+/// groups from the footer metadata, and collect the decoded batches.
+async fn ranged_scan_selected_row_groups(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+    select: impl FnOnce(&ParquetMetaData) -> Result<Vec<usize>>,
+) -> Result<(Vec<RecordBatch>, Arc<ParquetMetaData>)> {
     let reader = ObjectStoreRangedReader {
         store,
         path: path.clone(),
@@ -805,32 +1020,7 @@ pub async fn targeted_scan_async(
         });
     }
 
-    // Find the leaf index for the `node_id` column.
-    let leaf_idx = md
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|c| c.name() == COL_NODE_ID)
-        .ok_or_else(|| Error::invariant("node_id column not in parquet schema"))?;
-
-    // Row-group prune by min/max stats on node_id. Same logic as
-    // `targeted_scan`.
-    let mut keep: Vec<usize> = Vec::new();
-    for (rg_idx, rg) in md.row_groups().iter().enumerate() {
-        let cc = rg.column(leaf_idx);
-        let in_range = match cc.statistics() {
-            Some(stats) => match (stats.min_bytes_opt(), stats.max_bytes_opt()) {
-                (Some(min), Some(max)) => target.as_slice() >= min && target.as_slice() <= max,
-                _ => true,
-            },
-            None => true,
-        };
-        if in_range {
-            keep.push(rg_idx);
-        }
-    }
-
+    let keep = select(&md)?;
     if keep.is_empty() {
         return Ok((Vec::new(), md));
     }
@@ -1968,5 +2158,84 @@ mod tests {
         let batch = &batches[0];
         // Engine + age present; missing property simply not included.
         assert!(batch.column_by_name("prop_age").is_some());
+    }
+
+    /// 12 rows at 4 per row group → 3 row groups over seeds 1..=12.
+    fn build_multi_row_group_sst() -> (LabelDef, Bytes) {
+        let label = person_label();
+        let opts = NodeSstWriterOptions {
+            row_group_target_rows: 4,
+            ..Default::default()
+        };
+        let mut w = NodeSstWriter::new(label.clone(), opts).unwrap();
+        let rows: Vec<Row<'_>> = (1..=12u8)
+            .map(|seed| (seed, false, 10 + seed as u64, Some("n"), Some(1), 1, None))
+            .collect();
+        w.write_batch(&build_batch(&rows)).unwrap();
+        (label, w.finish().unwrap().body)
+    }
+
+    fn seed_key(seed: u8) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[15] = seed;
+        k
+    }
+
+    #[test]
+    fn row_groups_for_keys_prunes_by_node_id_stats() {
+        let (_label, body) = build_multi_row_group_sst();
+        let md = parse_node_sst_metadata(&body).unwrap();
+        assert_eq!(md.num_row_groups(), 3);
+
+        // Keys in row group 0 (seeds 1..=4) and 2 (seeds 9..=12) only.
+        let keys = [seed_key(2), seed_key(3), seed_key(10)];
+        assert_eq!(row_groups_for_keys(&md, &keys).unwrap(), vec![0, 2]);
+        // A key between row groups' rows still maps to exactly its group.
+        assert_eq!(row_groups_for_keys(&md, &[seed_key(6)]).unwrap(), vec![1]);
+        // Out-of-range keys prune everything.
+        assert_eq!(
+            row_groups_for_keys(&md, &[seed_key(0), seed_key(200)]).unwrap(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn scan_row_groups_split_reassembles_footer_row_counts() {
+        let (label, body) = build_multi_row_group_sst();
+        let md = parse_node_sst_metadata(&body).unwrap();
+        let reader = NodeSstReader::open(label, body).unwrap();
+
+        let selected = vec![0usize, 2];
+        let batches = reader.scan_row_groups(selected.clone()).unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 8, "two row groups of 4 rows each");
+
+        let split = split_batches_by_row_group(&md, &selected, batches).unwrap();
+        assert_eq!(split.len(), 2);
+        for (rg, group) in &split {
+            let rows: usize = group.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, md.row_group(*rg).num_rows() as usize);
+        }
+        // Row group 2 holds seeds 9..=12; its first row must be seed 9.
+        let (rg, group) = &split[1];
+        assert_eq!(*rg, 2);
+        let id_col = group[0]
+            .column_by_name(COL_NODE_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), seed_key(9));
+    }
+
+    #[test]
+    fn split_batches_rejects_row_count_mismatch() {
+        let (label, body) = build_multi_row_group_sst();
+        let md = parse_node_sst_metadata(&body).unwrap();
+        let reader = NodeSstReader::open(label, body).unwrap();
+        let batches = reader.scan_row_groups(vec![0]).unwrap();
+        // Claiming two row groups for one row group's rows must fail, so a
+        // partial decode can never be cached as a complete row group.
+        assert!(split_batches_by_row_group(&md, &[0, 1], batches).is_err());
     }
 }

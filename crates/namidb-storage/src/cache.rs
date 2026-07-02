@@ -24,6 +24,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
 use parquet::file::metadata::ParquetMetaData;
@@ -32,6 +33,43 @@ use std::collections::HashMap;
 /// Default budget for an [`SstCache`]: 256 MiB. Override via
 /// `NAMIDB_SST_CACHE_BUDGET_MIB`.
 pub const DEFAULT_SST_CACHE_BUDGET_MIB: usize = 256;
+
+/// Default budget for the decoded node row-group cache: 256 MiB.
+/// Override via `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`. Decoded
+/// `RecordBatch`es are typically several times their on-disk size, so
+/// this tier gets its own budget rather than sharing the body budget.
+pub const DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB: usize = 256;
+
+/// Read `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB` or fall back to
+/// [`DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB`].
+pub fn decoded_node_rg_cache_budget_bytes() -> usize {
+    let mib = std::env::var("NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB);
+    mib.saturating_mul(1024 * 1024)
+}
+
+/// Key for one decoded node-SST row group: `(absolute SST path,
+/// row-group index)`.
+pub type NodeRowGroupKey = (String, usize);
+/// Decoded batches of one node-SST row group.
+pub type DecodedNodeRowGroup = Arc<Vec<RecordBatch>>;
+
+/// Weight of one decoded node row-group entry: key bytes plus the
+/// Arrow-reported memory footprint of every decoded batch. Shared with
+/// tests so budget assertions use the exact accounting the cache does.
+pub(crate) fn decoded_node_row_group_weight(
+    key: &NodeRowGroupKey,
+    value: &DecodedNodeRowGroup,
+) -> usize {
+    key.0.len()
+        + std::mem::size_of::<usize>()
+        + value
+            .iter()
+            .map(|b| b.get_array_memory_size())
+            .sum::<usize>()
+}
 
 /// Read `NAMIDB_SST_CACHE` and return `false` only for `"0"`. Default
 /// flipped to ON — the cross-snapshot edge property stream
@@ -91,12 +129,24 @@ struct CacheStats {
     edge_readers_hits: AtomicU64,
     edge_readers_misses: AtomicU64,
     edge_readers_inserts: AtomicU64,
+    /// Decoded node row-group cache counters. `inserts` doubles as the
+    /// "row groups decoded" probe for the batch-lookup pruning tests.
+    node_rg_hits: AtomicU64,
+    node_rg_misses: AtomicU64,
+    node_rg_inserts: AtomicU64,
 }
 
 /// Process-wide cache shared between [`crate::Snapshot`] instances.
 #[derive(Clone)]
 pub struct SstCache {
     inner: Arc<Cache<String, Bytes>>,
+    /// Decoded node-SST row groups keyed by `(absolute SST path, row-group
+    /// index)`. Populated by `Snapshot::batch_lookup_nodes` and consulted by
+    /// the per-id lookup cold path so a batch prewarm keeps paying off across
+    /// snapshots. Weighted by the decoded Arrow footprint against its own
+    /// byte budget (see [`decoded_node_rg_cache_budget_bytes`]); over-eviction
+    /// is safe because the read path re-decodes evicted row groups on demand.
+    decoded_node_row_groups: Arc<Cache<NodeRowGroupKey, DecodedNodeRowGroup>>,
     /// Parsed Parquet metadata (footer + page index) per SST path.
     /// Populated by the RFC-003 ranged-read path; saves one round-trip
     /// per warm ranged lookup. Unbounded map for now — capped by the
@@ -147,19 +197,48 @@ impl std::fmt::Debug for SstCache {
                 "meta_inserts",
                 &self.stats.meta_inserts.load(Ordering::Relaxed),
             )
+            .field(
+                "node_rg_usage_bytes",
+                &self.decoded_node_row_groups.usage(),
+            )
+            .field(
+                "node_rg_hits",
+                &self.stats.node_rg_hits.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_rg_misses",
+                &self.stats.node_rg_misses.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_rg_inserts",
+                &self.stats.node_rg_inserts.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
 
 impl SstCache {
     /// Build a new cache sized for `capacity_bytes`. Entries weight as
-    /// `key.len() + value.len()` so the budget is in real bytes.
+    /// `key.len() + value.len()` so the budget is in real bytes. The decoded
+    /// node row-group tier gets its own budget from
+    /// [`decoded_node_rg_cache_budget_bytes`].
     pub fn new(capacity_bytes: usize) -> Self {
+        Self::with_budgets(capacity_bytes, decoded_node_rg_cache_budget_bytes())
+    }
+
+    /// Like [`Self::new`] but with an explicit byte budget for the decoded
+    /// node row-group tier. Used by tests that need a tight decoded budget
+    /// without touching env state.
+    pub fn with_budgets(capacity_bytes: usize, decoded_node_rg_bytes: usize) -> Self {
         let inner = CacheBuilder::new(capacity_bytes.max(1))
             .with_weighter(|key: &String, value: &Bytes| key.len() + value.len())
             .build();
+        let decoded_node_row_groups = CacheBuilder::new(decoded_node_rg_bytes.max(1))
+            .with_weighter(decoded_node_row_group_weight)
+            .build();
         Self {
             inner: Arc::new(inner),
+            decoded_node_row_groups: Arc::new(decoded_node_row_groups),
             metadata: Arc::new(Mutex::new(HashMap::new())),
             edge_streams: Arc::new(Mutex::new(HashMap::new())),
             edge_readers: Arc::new(Mutex::new(HashMap::new())),
@@ -238,6 +317,57 @@ impl SstCache {
     }
     pub fn edge_readers_inserts(&self) -> u64 {
         self.stats.edge_readers_inserts.load(Ordering::Relaxed)
+    }
+
+    /// Look up the decoded batches for one node-SST row group. Returns
+    /// `None` on miss (never cached, or evicted under the byte budget);
+    /// the caller decodes the row group and re-inserts via
+    /// [`Self::insert_decoded_node_row_group`].
+    pub fn get_decoded_node_row_group(
+        &self,
+        key: &str,
+        row_group: usize,
+    ) -> Option<Arc<Vec<RecordBatch>>> {
+        match self
+            .decoded_node_row_groups
+            .get(&(key.to_string(), row_group))
+        {
+            Some(entry) => {
+                self.stats.node_rg_hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry.value().clone())
+            }
+            None => {
+                self.stats.node_rg_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Store the decoded batches for one node-SST row group. SSTs are
+    /// immutable per UUIDv7-keyed path so cached row groups never go stale.
+    pub fn insert_decoded_node_row_group(
+        &self,
+        key: String,
+        row_group: usize,
+        batches: Arc<Vec<RecordBatch>>,
+    ) {
+        self.stats.node_rg_inserts.fetch_add(1, Ordering::Relaxed);
+        self.decoded_node_row_groups.insert((key, row_group), batches);
+    }
+
+    /// Bytes held by the decoded node row-group tier (sum of entry weights).
+    pub fn decoded_node_row_groups_usage(&self) -> usize {
+        self.decoded_node_row_groups.usage()
+    }
+
+    pub fn decoded_node_row_group_hits(&self) -> u64 {
+        self.stats.node_rg_hits.load(Ordering::Relaxed)
+    }
+    pub fn decoded_node_row_group_misses(&self) -> u64 {
+        self.stats.node_rg_misses.load(Ordering::Relaxed)
+    }
+    pub fn decoded_node_row_group_inserts(&self) -> u64 {
+        self.stats.node_rg_inserts.load(Ordering::Relaxed)
     }
 
     /// Look up decoded edge property streams for an SST path.

@@ -55,6 +55,7 @@ use arrow_array::{
 use bytes::Bytes;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
+use parquet::file::metadata::ParquetMetaData;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -63,7 +64,7 @@ use namidb_core::{DataType, LabelDef, LabelDictionary, LabelId, NodeId, Value};
 use crate::adjacency::{
     adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey, EdgeAdjacency,
 };
-use crate::cache::{EdgeStreamBundle, SstCache};
+use crate::cache::{DecodedNodeRowGroup, EdgeStreamBundle, NodeRowGroupKey, SstCache};
 use crate::error::{Error, Result};
 use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
 use crate::manifest::{LoadedManifest, Manifest, SstDescriptor, SstKind};
@@ -74,8 +75,10 @@ use crate::sst::bloom::BloomFilter;
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
-    prop_column_name, targeted_scan_async as node_targeted_scan_async, NodeSstReader, COL_LABELS,
-    COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    load_node_sst_metadata_async, parse_node_sst_metadata, prop_column_name, row_groups_for_keys,
+    scan_row_groups_async as node_scan_row_groups_async, split_batches_by_row_group,
+    targeted_scan_async as node_targeted_scan_async, NodeSstReader, COL_LABELS, COL_LSN,
+    COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
@@ -188,14 +191,15 @@ pub struct Snapshot<'mt> {
     /// `Snapshot::lookup_node_by_property` populates it on first miss
     /// and reuses it for the warm-path point lookups.
     property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
-    /// Intra-snapshot cache of decoded Parquet `RecordBatch`es keyed by
-    /// the absolute SST path. Populated by [`Self::batch_lookup_nodes`]
-    /// on the first probe of an SST; subsequent probes within the same
-    /// snapshot reuse the decoded batches via `Arc::clone` instead of
-    /// re-parsing the body. Amortises the SST decode cost across the N
-    /// per-parent batch calls the factor-path executor issues during a
-    /// 2-hop Expand chain (LDBC SNB IC09: 150+ calls/query).
-    decoded_node_sst_batches: Mutex<HashMap<String, Arc<Vec<RecordBatch>>>>,
+    /// Per-snapshot fallback for decoded node-SST row groups, keyed by
+    /// `(absolute SST path, row-group index)`. Used by
+    /// [`Self::batch_lookup_nodes`] ONLY when no process-wide [`SstCache`]
+    /// is attached; with a cache attached, decoded row groups live in the
+    /// byte-budgeted `SstCache` tier and are shared across snapshots.
+    /// Holding row groups (not whole SSTs) bounds this map by what one
+    /// query actually touches — an L1-compacted whole-dataset SST no
+    /// longer materialises in full per snapshot.
+    decoded_node_row_groups: Mutex<HashMap<NodeRowGroupKey, DecodedNodeRowGroup>>,
     /// Read-your-own-writes overlay (RFC-026). A writer's staged-but-
     /// uncommitted batch, materialised as a second memtable and consulted
     /// alongside the committed `memtable`. The staged ops carry LSNs
@@ -268,7 +272,7 @@ impl<'mt> Snapshot<'mt> {
             adjacency_cache: None,
             shared_node_cache: None,
             property_index_cache: None,
-            decoded_node_sst_batches: Mutex::new(HashMap::new()),
+            decoded_node_row_groups: Mutex::new(HashMap::new()),
             overlay: None,
         }
     }
@@ -1078,9 +1082,15 @@ impl<'mt> Snapshot<'mt> {
     /// (`(a)-[:KNOWS]->(b)-[:KNOWS]->(c)`) the per-edge `lookup_node`
     /// loop in `walker::execute_expand` issues N×M calls (~2 k for SF1).
     /// Each call decodes the same Person SST once. The batched variant
-    /// decodes each candidate SST once total and matches all `ids`
-    /// against the resulting `RecordBatch`es in one pass — turning a
-    /// linear N×M ladder into one SST decode per `(label, scope)`.
+    /// maps the probe ids to the row groups that can contain them (the
+    /// writer keeps `node_id` ascending, so per-row-group stats
+    /// partition the key space), decodes ONLY those row groups, and
+    /// matches all `ids` against them in one pass. Decoded row groups
+    /// are shared process-wide through the byte-budgeted [`SstCache`]
+    /// tier, so neither repeated batch calls nor repeated snapshots
+    /// (one per commit) re-decode — and an L1-compacted whole-dataset
+    /// SST costs only the row groups actually probed, not a full
+    /// materialisation.
     ///
     /// Layered consistency: results are LSN-merged across memtable + all
     /// candidate SSTs, exactly like the single-id path. The cache tiers
@@ -1186,9 +1196,12 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // 2. SST pass: iterate every node descriptor (id-primary partition +
-        // any legacy per-label SSTs) exactly once, decode its body, and harvest
-        // every pending id in one sweep over the record batches.
+        // 2. SST pass: for every node descriptor (id-primary partition + any
+        // legacy per-label SSTs), prune to the row groups whose `node_id`
+        // min/max range can contain a pending id, decode ONLY those, and
+        // harvest every pending id in one sweep over the record batches.
+        let mut sorted_pending: Vec<[u8; 16]> = pending.iter().copied().collect();
+        sorted_pending.sort_unstable();
         let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
         for idx in sst_idxs {
             let desc = &self.manifest.manifest.ssts[idx];
@@ -1202,43 +1215,73 @@ impl<'mt> Snapshot<'mt> {
             if !pending.iter().any(|id| id >= &min_key && id <= &max_key) {
                 continue;
             }
-            // Intra-snapshot decoded-batches cache: amortises the
-            // per-call `reader.scan()` Parquet decode across the N
-            // batch calls a factor-path Expand chain issues (one per
-            // parent_leaf). Without this, SF1 IC09 cold pays the SST
-            // decode ~150 times.
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
-            // Probe the cache in a separate scope so the MutexGuard is
-            // released before the await — futures-Send requires the guard
-            // type itself to be Send + Sync, which `MutexGuard` isn't.
-            let cached: Option<Arc<Vec<RecordBatch>>> = self
-                .decoded_node_sst_batches
-                .lock()
-                .unwrap()
-                .get(&absolute)
-                .cloned();
-            let batches: Arc<Vec<RecordBatch>> = if let Some(b) = cached {
-                b
-            } else {
-                let body = self.get_sst_body(desc).await?;
-                let reader = NodeSstReader::open(self.label_def_for_node_sst(desc), body)?;
-                let decoded = Arc::new(reader.scan()?);
-                // Re-acquire the lock to insert — last write wins on
-                // a race because both threads decoded identical bytes.
-                self.decoded_node_sst_batches
-                    .lock()
-                    .unwrap()
-                    .insert(absolute.clone(), decoded.clone());
-                decoded
-            };
-            batch_harvest_node_rows(
-                &batches,
-                &self.label_def_for_node_sst(desc),
-                &self.manifest.manifest.label_dict,
-                &desc.scope,
-                &pending,
-                &mut winners,
-            )?;
+            let label_def = self.label_def_for_node_sst(desc);
+            let md = self.node_sst_metadata(desc, &absolute).await?;
+            let needed = row_groups_for_keys(&md, &sorted_pending)?;
+            if needed.is_empty() {
+                continue;
+            }
+            // Decoded row-group cache: process-wide + byte-budgeted when an
+            // SstCache is attached, per-snapshot fallback otherwise. Either
+            // way it amortises the Parquet decode across the N batch calls a
+            // factor-path Expand chain issues (one per parent_leaf); without
+            // it, SF1 IC09 cold pays the decode ~150 times. Probe the
+            // fallback map in a bounded scope so the MutexGuard is released
+            // before the decode await below.
+            let mut decoded: Vec<Arc<Vec<RecordBatch>>> = Vec::with_capacity(needed.len());
+            let mut missing: Vec<usize> = Vec::new();
+            for &rg in &needed {
+                let hit = match &self.cache {
+                    Some(cache) => cache.get_decoded_node_row_group(&absolute, rg),
+                    None => self
+                        .decoded_node_row_groups
+                        .lock()
+                        .unwrap()
+                        .get(&(absolute.clone(), rg))
+                        .cloned(),
+                };
+                match hit {
+                    Some(b) => decoded.push(b),
+                    None => missing.push(rg),
+                }
+            }
+            if !missing.is_empty() {
+                let fresh = self
+                    .decode_node_row_groups(desc, &absolute, &label_def, &md, &missing)
+                    .await?;
+                for (rg, batches) in fresh {
+                    let batches = Arc::new(batches);
+                    // Last write wins on a race because both threads
+                    // decoded identical bytes.
+                    match &self.cache {
+                        Some(cache) => {
+                            cache.insert_decoded_node_row_group(
+                                absolute.clone(),
+                                rg,
+                                batches.clone(),
+                            );
+                        }
+                        None => {
+                            self.decoded_node_row_groups
+                                .lock()
+                                .unwrap()
+                                .insert((absolute.clone(), rg), batches.clone());
+                        }
+                    }
+                    decoded.push(batches);
+                }
+            }
+            for batches in &decoded {
+                batch_harvest_node_rows(
+                    batches,
+                    &label_def,
+                    &self.manifest.manifest.label_dict,
+                    &desc.scope,
+                    &pending,
+                    &mut winners,
+                )?;
+            }
         }
 
         // 3. Push every (resolved or negative) outcome into the output
@@ -1306,6 +1349,84 @@ impl<'mt> Snapshot<'mt> {
         }
     }
 
+    /// Footer + page-index metadata for a node SST, through the
+    /// process-wide metadata cache when one is attached (RFC-003 — SSTs
+    /// are immutable per UUIDv7 path, so a cached entry never goes
+    /// stale). Cold: parses in-process when the body is local anyway
+    /// (full-body routing, or an existing body-cache entry); otherwise
+    /// fetches footer + page index over ranged GETs without pulling the
+    /// body.
+    async fn node_sst_metadata(
+        &self,
+        desc: &SstDescriptor,
+        absolute: &str,
+    ) -> Result<Arc<ParquetMetaData>> {
+        if let Some(cache) = &self.cache {
+            if let Some(md) = cache.get_metadata(absolute) {
+                return Ok(md);
+            }
+        }
+        let use_ranged = self
+            .ranged_mode
+            .enable_for(desc.size_bytes, self.ranged_threshold_bytes);
+        let md = if !use_ranged || self.cache_get(absolute).is_some() {
+            let body = self.get_sst_body(desc).await?;
+            parse_node_sst_metadata(&body)?
+        } else {
+            load_node_sst_metadata_async(
+                self.store.clone(),
+                Path::from(absolute),
+                desc.size_bytes,
+            )
+            .await?
+        };
+        if let Some(cache) = &self.cache {
+            cache.insert_metadata(absolute.to_string(), md.clone());
+        }
+        Ok(md)
+    }
+
+    /// Decode `row_groups` (ascending) from the node SST at `desc`,
+    /// split back into per-row-group batch vectors ready for the decoded
+    /// cache. Routing mirrors the per-id cold path: full-body GET when
+    /// ranged reads are off for this SST size (populates the body cache)
+    /// or when the body is already cached; byte-ranged GETs of just the
+    /// selected row groups otherwise.
+    async fn decode_node_row_groups(
+        &self,
+        desc: &SstDescriptor,
+        absolute: &str,
+        label_def: &LabelDef,
+        md: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+    ) -> Result<Vec<(usize, Vec<RecordBatch>)>> {
+        let use_ranged = self
+            .ranged_mode
+            .enable_for(desc.size_bytes, self.ranged_threshold_bytes);
+        let local_body = if !use_ranged {
+            Some(self.get_sst_body(desc).await?)
+        } else {
+            self.cache_get(absolute)
+        };
+        if let Some(body) = local_body {
+            // Per-group decode so each cache entry owns right-sized buffers
+            // (a multi-group sync scan can emit batches spanning groups,
+            // whose slices would pin — and double-count — shared buffers).
+            let reader = NodeSstReader::open(label_def.clone(), body)?;
+            return reader.scan_row_groups_each(md, row_groups);
+        }
+        let batches = node_scan_row_groups_async(
+            self.store.clone(),
+            Path::from(absolute),
+            desc.size_bytes,
+            label_def,
+            row_groups.to_vec(),
+            Some(md.clone()),
+        )
+        .await?;
+        split_batches_by_row_group(md, row_groups, batches)
+    }
+
     /// Id-primary cold lookup: resolve the last-LSN-wins record for `id` across
     /// the memtable and every node SST (decoding each row's label set), with no
     /// label scoping. `lookup_node` filters the result by label.
@@ -1334,6 +1455,57 @@ impl<'mt> Snapshot<'mt> {
             .node_candidates(&self.manifest.manifest.ssts, &id_bytes);
         for idx in candidates {
             let desc = &self.manifest.manifest.ssts[idx];
+            // Decoded row-group tier, shared with `batch_lookup_nodes`: when
+            // this SST's footer metadata is already cached, resolve which row
+            // groups could hold `id` and serve the probe straight from the
+            // process-wide decoded cache — no bloom fetch, no body GET, no
+            // re-decode. This is what keeps a batch prewarm paying off for
+            // the per-id lookups that follow it, even across snapshots. Any
+            // miss (metadata or row group) falls through to the cold path
+            // unchanged. Correctness: the writer keeps `node_id` ascending,
+            // so the row-group stats are authoritative — an id outside every
+            // kept row group is provably absent from this SST.
+            if let Some(cache) = &self.cache {
+                let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+                if let Some(md) = cache.get_metadata(&absolute) {
+                    let needed = row_groups_for_keys(&md, std::slice::from_ref(&id_bytes))?;
+                    let mut cached_groups: Option<Vec<Arc<Vec<RecordBatch>>>> =
+                        Some(Vec::with_capacity(needed.len()));
+                    for &rg in &needed {
+                        match cache.get_decoded_node_row_group(&absolute, rg) {
+                            Some(b) => cached_groups.as_mut().unwrap().push(b),
+                            None => {
+                                cached_groups = None;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(groups) = cached_groups {
+                        let label_def = self.label_def_for_node_sst(desc);
+                        let mut candidate: Option<(u64, Option<NodeView>)> = None;
+                        for batches in &groups {
+                            if let Some(found) = find_node_row_in_batches(
+                                batches,
+                                &label_def,
+                                id,
+                                dict,
+                                &desc.scope,
+                            )? {
+                                candidate = Some(found);
+                                break;
+                            }
+                        }
+                        if let Some((lsn, view)) = candidate {
+                            match &winner {
+                                None => winner = Some((lsn, view)),
+                                Some((w_lsn, _)) if lsn > *w_lsn => winner = Some((lsn, view)),
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             if !self.bloom_admits(desc, &id_bytes).await? {
                 continue;
             }
@@ -5480,6 +5652,336 @@ mod tests {
         // happens to store it as Int64 in the SST, the declared type
         // is what surfaces in the schema introspection.
         assert_eq!(props.get("age"), Some(&DataType::Int32));
+    }
+
+    // ── batch_lookup_nodes row-group pruning + decoded cache ──
+
+    /// Serialises the tests that force small node-SST row groups through
+    /// `NAMIDB_NODE_SST_ROW_GROUP_ROWS`, restoring the previous value so
+    /// parallel tests never observe a partial state.
+    static ROW_GROUP_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Intentional: the guard serialises env mutation across the whole
+    // flush; each test drives its own single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn flush_batch_with_row_group_rows(
+        rows_per_group: usize,
+        ms: &ManifestStore,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        schema: &namidb_core::Schema,
+        rows: Vec<(NodeId, u64, MemOp)>,
+    ) -> LoadedManifest {
+        let _guard = ROW_GROUP_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("NAMIDB_NODE_SST_ROW_GROUP_ROWS").ok();
+        std::env::set_var("NAMIDB_NODE_SST_ROW_GROUP_ROWS", rows_per_group.to_string());
+        let committed = flush_batch(ms, fence, base, schema, rows).await;
+        match prev {
+            Some(v) => std::env::set_var("NAMIDB_NODE_SST_ROW_GROUP_ROWS", v),
+            None => std::env::remove_var("NAMIDB_NODE_SST_ROW_GROUP_ROWS"),
+        }
+        committed
+    }
+
+    /// `(committed, node SST absolute path)` for a Person namespace whose
+    /// single node SST holds ids 1..=n at `rows_per_group` rows per row
+    /// group. Id 5 is tombstoned when `n >= 5`.
+    async fn multi_row_group_fixture(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        n: u8,
+        rows_per_group: usize,
+    ) -> (LoadedManifest, String) {
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+
+        let mut rows: Vec<(NodeId, u64, MemOp)> = (1..=n)
+            .map(|i| {
+                (
+                    sorted_node_id(i),
+                    10 + i as u64,
+                    MemOp::Upsert(node_payload(&format!("n{i}"), Some(i as i32))),
+                )
+            })
+            .collect();
+        if n >= 5 {
+            rows.push((sorted_node_id(5), 500, MemOp::Tombstone));
+        }
+        let committed =
+            flush_batch_with_row_group_rows(rows_per_group, &ms, &fence, &base, &schema, rows)
+                .await;
+        let desc = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| matches!(d.kind, SstKind::Nodes))
+            .expect("flush produced a node SST");
+        let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
+        (committed, absolute)
+    }
+
+    #[tokio::test]
+    async fn batch_lookup_prunes_row_groups_and_matches_uncached() {
+        let store = make_store();
+        let paths = make_paths("batch-rg-prune");
+        // 64 nodes at 8 rows per row group → 8 row groups in one SST.
+        let (committed, absolute) = multi_row_group_fixture(&store, &paths, 64, 8).await;
+
+        let cache = SstCache::new(64 * 1024 * 1024);
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+
+        // Live ids 2..=4 plus the tombstoned id 5 all live in row group 0
+        // (rows 0..8 = ids 1..=8); id 200 is absent; a duplicate id must
+        // resolve to the same view.
+        let probes = vec![
+            sorted_node_id(2),
+            sorted_node_id(3),
+            sorted_node_id(5),
+            sorted_node_id(4),
+            sorted_node_id(200),
+            sorted_node_id(2),
+        ];
+        let got = snap.batch_lookup_nodes("Person", &probes).await.unwrap();
+
+        // Correctness parity against the per-id uncached walk.
+        let flat = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone());
+        for (i, id) in probes.iter().enumerate() {
+            let want = flat.lookup_node_via_uncached("Person", *id).await.unwrap();
+            assert_eq!(got[i], want, "probe #{i} diverged from the flat walk");
+        }
+        assert_eq!(
+            got[0].as_ref().unwrap().properties.get("name"),
+            Some(&Value::Str("n2".into()))
+        );
+        assert!(got[2].is_none(), "tombstoned id must resolve to None");
+        assert!(got[4].is_none(), "absent id must resolve to None");
+        assert_eq!(got[5], got[0], "duplicate probe must match");
+
+        // The pruning path is actually in use: the SST really has 8 row
+        // groups and the batch decoded ONLY the one that can hold the
+        // probes — not the whole SST.
+        let md = cache
+            .get_metadata(&absolute)
+            .expect("batch path caches footer metadata");
+        assert_eq!(md.num_row_groups(), 8);
+        assert_eq!(
+            cache.decoded_node_row_group_inserts(),
+            1,
+            "ids 2..=5 share row group 0; nothing else may decode"
+        );
+
+        // Cross-snapshot reuse: a FRESH snapshot over the same cache
+        // re-answers from the decoded tier without re-decoding.
+        let snap2 = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        let again = snap2.batch_lookup_nodes("Person", &probes).await.unwrap();
+        assert_eq!(again, got);
+        assert_eq!(cache.decoded_node_row_group_inserts(), 1, "no re-decode");
+        assert!(cache.decoded_node_row_group_hits() >= 1);
+    }
+
+    #[tokio::test]
+    async fn batch_lookup_ranged_path_decodes_only_needed_row_groups() {
+        // RFC-003 routing for the batch path: with ranged reads forced on
+        // (the post-compaction large-SST scenario) the batch must resolve
+        // through footer + row-group GETs — never a full-body pull — and
+        // still decode only the row groups that can hold a probe id.
+        let store = make_store();
+        let paths = make_paths("batch-rg-ranged");
+        let (committed, absolute) = multi_row_group_fixture(&store, &paths, 64, 8).await;
+
+        let cache = SstCache::new(64 * 1024 * 1024);
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+            .with_cache(cache.clone())
+            .with_ranged_reads(true);
+        let probes = vec![sorted_node_id(2), sorted_node_id(11), sorted_node_id(200)];
+        let got = snap.batch_lookup_nodes("Person", &probes).await.unwrap();
+
+        let flat = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone());
+        for (i, id) in probes.iter().enumerate() {
+            let want = flat.lookup_node_via_uncached("Person", *id).await.unwrap();
+            assert_eq!(got[i], want, "probe #{i} diverged from the flat walk");
+        }
+        assert_eq!(
+            cache.decoded_node_row_group_inserts(),
+            2,
+            "ids 2 and 11 land in row groups 0 and 1; nothing else may decode"
+        );
+        assert!(
+            cache.get(&absolute).is_none(),
+            "ranged batch path must not pull the whole body"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_prewarm_serves_per_id_lookup_from_shared_row_group_cache() {
+        let store = make_store();
+        let paths = make_paths("batch-rg-prewarm");
+        let (committed, _absolute) = multi_row_group_fixture(&store, &paths, 64, 8).await;
+
+        let cache = SstCache::new(64 * 1024 * 1024);
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        {
+            let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+                .with_cache(cache.clone());
+            let _ = snap
+                .batch_lookup_nodes("Person", &[sorted_node_id(2), sorted_node_id(11)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            cache.decoded_node_row_group_inserts(),
+            2,
+            "ids 2 and 11 land in row groups 0 and 1"
+        );
+
+        // A per-id lookup on a FRESH snapshot (empty L1, no L2 attached)
+        // must be served by the shared decoded row-group tier: no new
+        // decode, no body or bloom GET.
+        let body_misses = cache.misses();
+        let rg_hits = cache.decoded_node_row_group_hits();
+        let snap2 = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        let got = snap2
+            .lookup_node("Person", sorted_node_id(11))
+            .await
+            .unwrap()
+            .expect("live node");
+        assert_eq!(got.properties.get("name"), Some(&Value::Str("n11".into())));
+        assert!(
+            cache.decoded_node_row_group_hits() > rg_hits,
+            "per-id lookup must hit the decoded row-group tier"
+        );
+        assert_eq!(cache.decoded_node_row_group_inserts(), 2, "no re-decode");
+        assert_eq!(
+            cache.misses(),
+            body_misses,
+            "warm per-id path must not touch the object store"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_row_group_cache_respects_byte_budget_across_snapshots() {
+        let store = make_store();
+        let paths = make_paths("batch-rg-budget");
+        // 128 nodes at 4 rows per row group → 32 row groups.
+        let (committed, absolute) = multi_row_group_fixture(&store, &paths, 128, 4).await;
+
+        // Ground-truth decoded footprint: decode every row group once and
+        // weigh it exactly as the cache does.
+        let object_path = Path::from(absolute.clone());
+        let body = store
+            .get(&object_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let md = parse_node_sst_metadata(&body).unwrap();
+        assert_eq!(md.num_row_groups(), 32);
+        let empty_label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        let reader = NodeSstReader::open(empty_label, body).unwrap();
+        let mut total_weight = 0usize;
+        let mut max_weight = 0usize;
+        for rg in 0..md.num_row_groups() {
+            let batches = Arc::new(reader.scan_row_groups(vec![rg]).unwrap());
+            let w =
+                crate::cache::decoded_node_row_group_weight(&(absolute.clone(), rg), &batches);
+            total_weight += w;
+            max_weight = max_weight.max(w);
+        }
+
+        // Budget for an eighth of the decoded set; every round probes ALL
+        // row groups, over fresh snapshots, so an unbounded cache would
+        // converge on `total_weight`.
+        let budget = total_weight / 8;
+        let cache = SstCache::with_budgets(64 * 1024 * 1024, budget);
+        let ids: Vec<NodeId> = (1..=128u8)
+            .filter(|&i| i != 5) // id 5 is tombstoned by the fixture
+            .map(sorted_node_id)
+            .collect();
+        for round in 0..3 {
+            let empty = Memtable::new();
+            let view = empty.snapshot_view();
+            let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+                .with_cache(cache.clone());
+            let got = snap.batch_lookup_nodes("Person", &ids).await.unwrap();
+            assert!(
+                got.iter().all(|v| v.is_some()),
+                "round {round}: over-eviction must re-decode, never lose rows"
+            );
+        }
+
+        let usage = cache.decoded_node_row_groups_usage();
+        assert!(
+            usage < total_weight / 2,
+            "decoded cache must stay bounded: usage={usage}, unbounded total={total_weight}"
+        );
+        // foyer's 8 shards evict independently, so allow one entry of
+        // slack per shard on top of the configured budget.
+        assert!(
+            usage <= budget + 8 * max_weight,
+            "usage={usage} exceeds budget={budget} (+ shard slack {})",
+            8 * max_weight
+        );
+        assert!(
+            cache.decoded_node_row_group_inserts() > 32,
+            "budget pressure must evict + re-decode, not grow without bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_lookup_single_row_group_sst_stays_equivalent() {
+        let store = make_store();
+        let paths = make_paths("batch-rg-single");
+        // Default row-group sizing → one row group; the pruned path must
+        // behave exactly like the historical full decode.
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
+        let rows: Vec<(NodeId, u64, MemOp)> = (1..=6u8)
+            .map(|i| {
+                (
+                    sorted_node_id(i),
+                    10 + i as u64,
+                    MemOp::Upsert(node_payload(&format!("n{i}"), Some(i as i32))),
+                )
+            })
+            .collect();
+        let committed = flush_batch(&ms, &fence, &base, &schema, rows).await;
+
+        let cache = SstCache::new(64 * 1024 * 1024);
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        let probes = vec![sorted_node_id(1), sorted_node_id(6), sorted_node_id(99)];
+        let got = snap.batch_lookup_nodes("Person", &probes).await.unwrap();
+
+        let flat = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone());
+        for (i, id) in probes.iter().enumerate() {
+            let want = flat.lookup_node_via_uncached("Person", *id).await.unwrap();
+            assert_eq!(got[i], want, "probe #{i} diverged from the flat walk");
+        }
+        assert_eq!(
+            cache.decoded_node_row_group_inserts(),
+            1,
+            "a single-row-group SST decodes exactly once"
+        );
     }
 
     #[test]
