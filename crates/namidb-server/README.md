@@ -64,7 +64,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET`  | `/v0/livez`        | public  | Lock-free liveness (process is up) |
-| `GET`  | `/v0/health`       | public  | Readiness + manifest version + epoch |
+| `GET`  | `/v0/health`       | public  | Readiness + manifest version + epoch + writer status (503 while the writer is degraded) |
 | `GET`  | `/v0/version`      | public  | Server build version |
 | `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |

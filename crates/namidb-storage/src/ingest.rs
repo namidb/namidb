@@ -337,6 +337,32 @@ impl WriterSession {
         self.pending.records.len()
     }
 
+    /// `true` when a prior terminal commit failure poisoned this session:
+    /// every further `commit_batch` is refused and the caller must drop the
+    /// session and reopen the namespace (or call [`Self::reopen`]). The
+    /// refusal itself surfaces as [`Error::Precondition`], which user-level
+    /// failures also use, so hosts pair this accessor with
+    /// [`Error::requires_writer_reopen`] to classify a commit failure.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Drop this session's state and re-run [`Self::open`] against the same
+    /// store and namespace. This is the "drop the session and reopen" the
+    /// commit contract prescribes for a fenced / lost-CAS / poisoned writer,
+    /// packaged so a long-lived host can recover in place: on success `self`
+    /// IS the fresh session — new epoch (fencing whoever fenced us),
+    /// WAL-recovered memtable, empty pending batch, poison cleared. On
+    /// failure `self` is left untouched (still broken) and the caller may
+    /// retry. Uncommitted pending records are dropped either way; they were
+    /// never ACKed, so nothing durable is lost.
+    pub async fn reopen(&mut self) -> Result<()> {
+        let store = Arc::clone(&self.store);
+        let paths = self.manifest_store.paths().clone();
+        *self = Self::open(store, paths).await?;
+        Ok(())
+    }
+
     /// Drop the uncommitted batch without making it durable, returning the
     /// number of mutations discarded. Used to roll back an explicit
     /// transaction. Safe because staged writes only touch `pending` /
@@ -2768,6 +2794,115 @@ mod tests {
         }
         // session_b can still ingest cleanly.
         drop(session_b);
+    }
+
+    #[tokio::test]
+    async fn reopen_recovers_a_fenced_session_in_place() {
+        let store = make_store();
+        let paths = make_paths("ingest-reopen");
+
+        let mut session_a = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        // A durable record from before the fence must survive the reopen.
+        let alice = sorted_node_id(1);
+        session_a
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session_a.commit_batch().await.unwrap();
+
+        // A second open fences session_a; its next commit is terminal.
+        let session_b = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        drop(session_b);
+        session_a
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        let err = session_a.commit_batch().await.unwrap_err();
+        assert!(
+            err.requires_writer_reopen(),
+            "a fence must classify as drop-and-reopen, got {err:?}"
+        );
+
+        // Reopen in place: the session claims a fresh epoch and writes again.
+        session_a.reopen().await.unwrap();
+        assert!(!session_a.is_poisoned());
+        assert_eq!(
+            session_a.pending_len(),
+            0,
+            "the un-ACKed pending batch must not survive the reopen"
+        );
+        session_a
+            .upsert_node("Person", sorted_node_id(3), &node_record("Cara", None))
+            .unwrap();
+        session_a.commit_batch().await.unwrap();
+
+        let snap = session_a.snapshot();
+        assert!(snap.lookup_node("Person", alice).await.unwrap().is_some());
+        assert!(snap
+            .lookup_node("Person", sorted_node_id(3))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            snap.lookup_node("Person", sorted_node_id(2))
+                .await
+                .unwrap()
+                .is_none(),
+            "the fenced commit was never ACKed and must not resurrect"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_clears_a_poisoned_session() {
+        // Same orphan-collision terminal failure as the poisoning test
+        // above; `reopen` must clear the poison and accept commits again.
+        let store = make_store();
+        let paths = make_paths("ingest-reopen-poison");
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let wal_store = WalStore::new(store.clone(), paths.clone());
+        let mut orphan = WalSegment::new(1);
+        orphan.push(WalRecord {
+            lsn: 1,
+            payload: WalEntry {
+                key: MemKey::Node {
+                    id: sorted_node_id(99),
+                },
+                op: WalOp::Upsert(b"ghost".to_vec()),
+                lsn: 1,
+            }
+            .encode()
+            .unwrap(),
+        });
+        wal_store.append_segment(&orphan).await.unwrap();
+
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Ada", None))
+            .unwrap();
+        let err = session.commit_batch().await.unwrap_err();
+        assert!(err.requires_writer_reopen(), "got {err:?}");
+        assert!(session.is_poisoned());
+
+        // The terminal attempt left an orphan manifest body at base+1, which
+        // blocks any claim (`OrphanManifestBody`) until it is removed — a
+        // failed reopen must leave the session untouched (still poisoned).
+        let err = session.reopen().await.unwrap_err();
+        assert!(matches!(err, Error::OrphanManifestBody { .. }), "{err:?}");
+        assert!(session.is_poisoned(), "failed reopen must not clear poison");
+
+        // Once the orphan body is swept (janitor / operator), reopen works
+        // and the fresh session accepts commits again.
+        store.delete(&paths.manifest_version(1)).await.unwrap();
+        session.reopen().await.unwrap();
+        assert!(!session.is_poisoned());
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bea", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
     }
 
     #[tokio::test]

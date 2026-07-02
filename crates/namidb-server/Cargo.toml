@@ -77,6 +77,7 @@ tempfile = { workspace = true }
 reqwest = { workspace = true }
 tokio-test = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 tracing-subscriber = { workspace = true }
 rcgen = "0.13"
 # Also dev-deps so the TLS integration test (a separate crate) can drive a

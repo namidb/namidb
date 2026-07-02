@@ -11,6 +11,7 @@ pub mod authz;
 pub mod bolt;
 mod introspect;
 pub mod metrics;
+pub mod recovery;
 pub mod registry;
 pub mod shared;
 pub mod tls;
@@ -45,6 +46,7 @@ use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, Write
 
 use crate::auth::{AuthConfig, Principal};
 use crate::metrics::{Metrics, Protocol, QueryKind};
+use crate::recovery::WriterHealth;
 use crate::registry::{NamespaceRegistry, NamespaceState};
 use crate::shared::SharedAppState;
 
@@ -195,6 +197,11 @@ pub struct AppState {
     /// [`authz::NoOpAuthz`] (allow-all), so the gate is behavior-preserving
     /// until a real policy is configured.
     authz: Arc<dyn authz::AuthzHook>,
+    /// Writer status for the readiness probe: degraded from a terminal
+    /// commit/flush failure (fenced / lost CAS / poisoned) until the
+    /// automatic reopen ([`recovery`]) succeeds. Read lock-free by
+    /// `/v0/health`.
+    pub writer_health: Arc<WriterHealth>,
 }
 
 impl AppState {
@@ -221,6 +228,7 @@ impl AppState {
             write_stall_delay: Duration::ZERO,
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
             authz: Arc::new(authz::NoOpAuthz),
+            writer_health: WriterHealth::new(),
         }
     }
 
@@ -643,7 +651,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Err(e) => error!(error = %e, "periodic flush failed"),
+                    Err(e) => {
+                        error!(error = %e, "periodic flush failed");
+                        // A fenced/poisoned writer would fail every later
+                        // flush AND every write; reopen under the held lock.
+                        recovery::recover_writer_if_needed(
+                            &mut w,
+                            &state_for_flush.snapshot,
+                            &state_for_flush.writer_health,
+                            &state_for_flush.namespace,
+                            &e,
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -977,6 +997,42 @@ struct HealthResponse {
     namespace: String,
     manifest_version: u64,
     epoch: u64,
+    /// `"ok"` or `"degraded"`. Degraded means the writer session is
+    /// fenced/poisoned and the automatic reopen has not yet succeeded:
+    /// reads still work (the published snapshot serves them) but every
+    /// write fails, so the probe as a whole reports 503 / not-ready.
+    writer: &'static str,
+    /// The commit/flush failure keeping the writer degraded, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writer_error: Option<String>,
+}
+
+/// Build the health payload + status code from the published snapshot and
+/// the writer health. Shared by the single- and multi-tenant probes. A
+/// degraded writer is a readiness failure (503): the server can still
+/// serve reads, but an orchestrator must not treat it as fully healthy
+/// while every write is failing.
+fn health_response(
+    namespace: String,
+    manifest: &Manifest,
+    writer_health: &WriterHealth,
+) -> Response {
+    let writer_error = writer_health.degraded_reason();
+    let degraded = writer_error.is_some();
+    let body = HealthResponse {
+        status: if degraded { "degraded" } else { "ok" },
+        namespace,
+        manifest_version: manifest.version,
+        epoch: manifest.epoch.as_u64(),
+        writer: if degraded { "degraded" } else { "ok" },
+        writer_error,
+    };
+    let code = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, Json(body)).into_response()
 }
 
 /// Liveness: the process is up and its async runtime is responsive. Takes no
@@ -991,16 +1047,14 @@ async fn livez() -> impl IntoResponse {
 /// Readiness: report the latest published snapshot's manifest version and
 /// epoch WITHOUT taking the writer lock. The snapshot is republished after
 /// every commit, so it reflects committed state; a long write or compaction
-/// holding the writer lock does not stall the probe.
+/// holding the writer lock does not stall the probe. The writer status
+/// ([`WriterHealth`]) rides along: a fenced/poisoned writer whose automatic
+/// reopen has not yet landed turns the probe 503 so writes are not routed
+/// to a server that can only fail them.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let owned = state.snapshot.load();
     let m = &owned.manifest().manifest;
-    Json(HealthResponse {
-        status: "ok",
-        namespace: state.namespace.clone(),
-        manifest_version: m.version,
-        epoch: m.epoch.as_u64(),
-    })
+    health_response(state.namespace.clone(), m, &state.writer_health)
 }
 
 #[derive(Serialize)]
@@ -1670,13 +1724,26 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Sample the soft write-stall decision while still holding the lock
         // (RFC-027 P5), then release it and sleep — backpressure applies to
         // this request, not to the writer mutex other connections need.
-        let stall = if result.is_ok() {
-            // Refresh the published snapshot so subsequent reads see the
-            // just-committed records (RFC-021).
-            state.snapshot.store(writer.owned_snapshot());
-            state.write_stall_for(writer.max_l0_bucket_len())
-        } else {
-            None
+        let stall = match &result {
+            Ok(_) => {
+                // Refresh the published snapshot so subsequent reads see the
+                // just-committed records (RFC-021).
+                state.snapshot.store(writer.owned_snapshot());
+                state.write_stall_for(writer.max_l0_bucket_len())
+            }
+            Err(e) => {
+                // A fenced/poisoned session would fail every later write;
+                // reopen it in place under the lock we already hold.
+                recovery::recover_after_write_error(
+                    &mut writer,
+                    &state.snapshot,
+                    &state.writer_health,
+                    &state.namespace,
+                    e,
+                )
+                .await;
+                None
+            }
         };
         drop(writer);
         // Stop the clock before the backpressure sleep: the stall is
@@ -1786,13 +1853,23 @@ async fn admin_flush(
             })
             .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: format!("flush failed: {e}"),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            recovery::recover_writer_if_needed(
+                &mut w,
+                &state.snapshot,
+                &state.writer_health,
+                &state.namespace,
+                &e,
+            )
+            .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: format!("flush failed: {e}"),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1827,13 +1904,7 @@ async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Re
         Ok(ns_state) => {
             let owned = ns_state.snapshot.load();
             let m = &owned.manifest().manifest;
-            Json(HealthResponse {
-                status: "ok",
-                namespace,
-                manifest_version: m.version,
-                epoch: m.epoch.as_u64(),
-            })
-            .into_response()
+            health_response(namespace, m, &ns_state.writer_health)
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2089,11 +2160,24 @@ async fn run_cypher_multi(
         let mut writer = ns_state.writer.lock().await;
         let result =
             execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
-        let stall = if result.is_ok() {
-            ns_state.snapshot.store(writer.owned_snapshot());
-            shared.write_stall_for(writer.max_l0_bucket_len())
-        } else {
-            None
+        let stall = match &result {
+            Ok(_) => {
+                ns_state.snapshot.store(writer.owned_snapshot());
+                shared.write_stall_for(writer.max_l0_bucket_len())
+            }
+            Err(e) => {
+                // Reopen a fenced/poisoned namespace writer in place, under
+                // the lock we already hold (mirrors the single-tenant path).
+                recovery::recover_after_write_error(
+                    &mut writer,
+                    &ns_state.snapshot,
+                    &ns_state.writer_health,
+                    &ns_state.namespace,
+                    e,
+                )
+                .await;
+                None
+            }
         };
         drop(writer);
         let elapsed = started.elapsed();
@@ -2217,13 +2301,23 @@ async fn dispatch_admin_flush_multi(
             })
             .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: format!("flush failed: {e}"),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            recovery::recover_writer_if_needed(
+                &mut w,
+                &ns_state.snapshot,
+                &ns_state.writer_health,
+                &ns_state.namespace,
+                &e,
+            )
+            .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: format!("flush failed: {e}"),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2984,6 +3078,251 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["namespace"], "test");
+        assert_eq!(v["writer"], "ok");
+    }
+
+    /// GET /v0/health; return `(status, body)`.
+    async fn get_health(app: &Router) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v0/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap())
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// Regression for the fenced-writer dead end: a second `WriterSession`
+    /// against the same store fences the server's writer; the failing write
+    /// must trigger the automatic reopen so the NEXT write succeeds — no
+    /// restart, no operator intervention.
+    #[tokio::test]
+    async fn write_path_recovers_after_writer_is_fenced() {
+        let (store, paths) = namidb_storage::parse_uri("memory://fence-recover").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "fence-recover".into());
+        let app = build_router(state);
+
+        // Seed a committed record that must survive the recovery.
+        let seed = post_cypher(&app, None, "CREATE (:Person {name: 'Alice'}) RETURN 1").await;
+        assert_eq!(seed.status(), StatusCode::OK);
+
+        // An interloper claims the namespace, fencing the server's writer.
+        let interloper = WriterSession::open(store, paths).await.unwrap();
+        drop(interloper);
+
+        // The next write hits the fence and fails…
+        let fenced = post_cypher(&app, None, "CREATE (:Person {name: 'Bob'}) RETURN 1").await;
+        assert_eq!(fenced.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // …but the failure ran the reopen, so a subsequent write succeeds.
+        let recovered = post_cypher(&app, None, "CREATE (:Person {name: 'Cara'}) RETURN 1").await;
+        assert_eq!(
+            recovered.status(),
+            StatusCode::OK,
+            "the write path must recover automatically after a fence"
+        );
+
+        // Committed data survived; the fenced (never-ACKed) write did not
+        // resurrect through the reopen's WAL replay.
+        let read = post_cypher(&app, None, "MATCH (p:Person) RETURN p.name AS name").await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(read.into_body(), 65536).await.unwrap()).unwrap();
+        let names: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"Alice"), "committed row lost: {names:?}");
+        assert!(names.contains(&"Cara"), "post-recovery row lost: {names:?}");
+        assert!(
+            !names.contains(&"Bob"),
+            "never-ACKed row must not resurrect: {names:?}"
+        );
+
+        // Readiness is green again after the recovery.
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["writer"], "ok");
+    }
+
+    /// `ObjectStore` wrapper that, while enabled, fails any PUT of a manifest
+    /// body that does not already exist. An existing body still surfaces the
+    /// real `AlreadyExists` (the fence signal), while every `claim_writer`
+    /// (i.e. every reopen attempt) fails cleanly without leaving an orphan
+    /// body — so the writer stays broken until the fault is lifted.
+    #[derive(Debug)]
+    struct BrokenClaimStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail_new_manifest_bodies: std::sync::atomic::AtomicBool,
+    }
+
+    impl BrokenClaimStore {
+        fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+            Self {
+                inner,
+                fail_new_manifest_bodies: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn set_broken(&self, broken: bool) {
+            self.fail_new_manifest_bodies
+                .store(broken, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for BrokenClaimStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BrokenClaimStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for BrokenClaimStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            use object_store::ObjectStoreExt as _;
+            if self
+                .fail_new_manifest_bodies
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && location.as_ref().contains("manifest/v")
+                && matches!(
+                    self.inner.head(location).await,
+                    Err(object_store::Error::NotFound { .. })
+                )
+            {
+                return Err(object_store::Error::Generic {
+                    store: "BrokenClaimStore",
+                    source: "injected manifest body put failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// While the writer is fenced AND the reopen cannot succeed, `/v0/health`
+    /// must report 503 with `writer: "degraded"`; once the reopen lands it
+    /// must report 200 / `writer: "ok"` again.
+    #[tokio::test]
+    async fn health_reports_degraded_writer_until_reopen_succeeds() {
+        let broken = Arc::new(BrokenClaimStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )));
+        let store: Arc<dyn object_store::ObjectStore> = broken.clone();
+        let paths = namidb_storage::NamespacePaths::new(
+            "",
+            namidb_core::NamespaceId::new("health-degraded").unwrap(),
+        );
+
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "health-degraded".into());
+        let app = build_router(state);
+
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["writer"], "ok");
+
+        // Fence the server's writer, then break the claim path so the
+        // automatic reopen cannot succeed.
+        let interloper = WriterSession::open(store, paths).await.unwrap();
+        drop(interloper);
+        broken.set_broken(true);
+
+        // The write fails on the fence and every reopen attempt fails too.
+        let failed = post_cypher(&app, None, "CREATE (:T {k: 1})").await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{health}");
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["writer"], "degraded");
+        assert!(
+            health["writer_error"].as_str().unwrap().contains("fenced"),
+            "the degraded reason must carry the failure: {health}"
+        );
+
+        // Reads still work while the writer is degraded (published snapshot).
+        let read = post_cypher(&app, None, "MATCH (n) RETURN n").await;
+        assert_eq!(read.status(), StatusCode::OK);
+
+        // Lift the fault: the next failed write triggers a successful reopen…
+        broken.set_broken(false);
+        let retried = post_cypher(&app, None, "CREATE (:T {k: 2})").await;
+        assert_eq!(retried.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // …after which writes succeed and readiness is green again.
+        let recovered = post_cypher(&app, None, "CREATE (:T {k: 3}) RETURN 1").await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(health["writer"], "ok");
+        assert!(health.get("writer_error").is_none() || health["writer_error"].is_null());
     }
 
     #[tokio::test]
@@ -3308,6 +3647,76 @@ mod tests {
             StatusCode::OK,
             "default namespace is isolated from acme"
         );
+    }
+
+    /// The multi-tenant registry holds its own per-namespace writers; a
+    /// fenced one must recover through the same reopen orchestration as the
+    /// single-tenant path, and the namespace health probe must reflect it.
+    #[tokio::test]
+    async fn multi_tenant_write_path_recovers_after_fencing() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-fence").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store.clone(),
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new(
+            registry,
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            "default".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+
+        let q1 = "CREATE (:P {n: 1}) RETURN 1";
+        assert_eq!(
+            mt_cypher(&app, "/acme/v0/cypher", None, q1).await,
+            StatusCode::OK
+        );
+
+        // Fence the registry-held writer for `acme` (flat layout: root "").
+        let paths = namidb_storage::NamespacePaths::new(
+            "",
+            namidb_core::NamespaceId::new("acme").unwrap(),
+        );
+        let interloper = WriterSession::open(store, paths).await.unwrap();
+        drop(interloper);
+
+        // The fenced write fails once, triggers the reopen, then writes flow.
+        assert_eq!(
+            mt_cypher(&app, "/acme/v0/cypher", None, "CREATE (:P {n: 2}) RETURN 1").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            mt_cypher(&app, "/acme/v0/cypher", None, "CREATE (:P {n: 3}) RETURN 1").await,
+            StatusCode::OK,
+            "the multi-tenant write path must recover automatically"
+        );
+
+        // The namespace readiness probe is green again.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/acme/v0/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let health: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(health["writer"], "ok");
     }
 
     async fn multi_tenant_app_auth(auth: Arc<AuthConfig>, default_ns: &str) -> Router {

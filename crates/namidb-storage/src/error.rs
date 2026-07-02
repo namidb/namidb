@@ -97,4 +97,21 @@ impl Error {
     pub fn precondition(msg: impl Into<String>) -> Self {
         Error::Precondition(msg.into())
     }
+
+    /// `true` when the single-writer contract's remedy for this error is to
+    /// drop the `WriterSession` and reopen the namespace rather than retry
+    /// in place: the writer was fenced by a newer epoch, or it lost the
+    /// manifest CAS (its view of the current version is stale for good).
+    ///
+    /// The third drop-and-reopen state — a session poisoned by a terminal
+    /// commit failure — surfaces as [`Error::Precondition`], which is also
+    /// how user-level failures (e.g. duplicate DDL) are reported, so it
+    /// cannot be classified from the error alone. Callers must consult
+    /// `WriterSession::is_poisoned()` alongside this method.
+    pub fn requires_writer_reopen(&self) -> bool {
+        matches!(
+            self,
+            Error::Fenced { .. } | Error::ManifestCommitCas { .. }
+        )
+    }
 }

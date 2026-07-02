@@ -460,6 +460,16 @@ impl ServerBackend {
                     }
                 }
                 Err(e) => {
+                    // A fenced/poisoned session would fail every later write
+                    // on both protocols; reopen it in place under the lock.
+                    crate::recovery::recover_after_write_error(
+                        &mut writer,
+                        &self.state.snapshot,
+                        &self.state.writer_health,
+                        &self.state.namespace,
+                        &e,
+                    )
+                    .await;
                     drop(writer);
                     RunObservation {
                         kind: Some(QueryKind::Write),
@@ -745,19 +755,31 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
         // One manifest CAS makes the whole transaction durable; then
         // republish so reads see it. Dropping `tx` releases the writer lock.
-        if let Err(e) = tx.writer.commit_batch().await {
-            // The commit failed and this transaction is aborted. Its records are
-            // still staged in the shared writer's pending batch (commit_batch
-            // preserves the batch on error so a retry is possible); since we
-            // have already `take()`n the tx slot, a later ROLLBACK/RESET can no
-            // longer reach them. Discard here so the aborted transaction's
-            // writes can never be sealed by the next unrelated commit — nothing
-            // is durable until the manifest CAS lands, so discarding is safe.
-            tx.writer.discard_batch();
-            return Err(map_storage_err(e));
+        match tx.writer.commit_batch().await {
+            Ok(_) => {
+                self.state.snapshot.store(tx.writer.owned_snapshot());
+                Ok(())
+            }
+            Err(e) => {
+                // The COMMIT failed, so the transaction is over: drop the
+                // staged batch (we have already `take()`n the tx slot, so a
+                // later ROLLBACK/RESET can no longer reach it, and nothing is
+                // durable until the manifest CAS lands) so the aborted writes
+                // can never be sealed by the next unrelated commit — then
+                // reopen a fenced/poisoned session in place while we still
+                // hold the writer lock.
+                tx.writer.discard_batch();
+                crate::recovery::recover_writer_if_needed(
+                    &mut tx.writer,
+                    &self.state.snapshot,
+                    &self.state.writer_health,
+                    &self.state.namespace,
+                    &e,
+                )
+                .await;
+                Err(map_storage_err(e))
+            }
         }
-        self.state.snapshot.store(tx.writer.owned_snapshot());
-        Ok(())
     }
 
     async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
@@ -844,9 +866,10 @@ fn show_run_outcome(rows: Vec<Row>) -> RunOutcome {
 }
 
 /// Map a storage commit failure to a Bolt error. A failed manifest CAS
-/// poisons the `WriterSession` (its contract is "drop and reopen"); the
-/// reopen orchestration is a documented follow-up, so for now the client
-/// sees a retryable storage error.
+/// fences/poisons the `WriterSession` (its contract is "drop and reopen");
+/// the commit paths run [`crate::recovery::recover_writer_if_needed`] before
+/// returning, so the client sees a retryable storage error and the retry
+/// lands on a reopened session.
 fn map_storage_err(e: namidb_storage::Error) -> BackendError {
     BackendError::Storage(format!("{e}"))
 }
@@ -1162,6 +1185,58 @@ mod tests {
         let backend = backend_with_authz(Arc::new(crate::authz::NoOpAuthz)).await;
         let out = backend.run("MATCH (n) RETURN n", Params::new()).await;
         assert!(out.is_ok(), "default authz should allow: {out:?}");
+    }
+
+    /// Regression for the fenced-writer dead end over Bolt: a COMMIT that
+    /// hits the fence must trigger the automatic reopen so the next
+    /// transaction on this server commits — no restart required.
+    #[tokio::test]
+    async fn bolt_commit_tx_recovers_after_writer_is_fenced() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-fence-recover").unwrap();
+        let writer = namidb_storage::WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "bolt-fence".into());
+        let principal = Arc::new(std::sync::Mutex::new(None));
+        let backend = ServerBackend::new(state.clone(), principal);
+
+        // An interloper claims the namespace, fencing the server's writer.
+        let interloper = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        drop(interloper);
+
+        // An explicit transaction stages a write; COMMIT hits the fence.
+        backend.begin_tx().await.unwrap();
+        backend
+            .run_in_tx("CREATE (:T {k: 1})", Params::new())
+            .await
+            .unwrap();
+        let err = backend
+            .commit_tx()
+            .await
+            .expect_err("the commit must fail on the fence");
+        assert!(matches!(err, BackendError::Storage(_)), "got {err:?}");
+
+        // The failed COMMIT ran the reopen: the next transaction commits.
+        backend.begin_tx().await.unwrap();
+        backend
+            .run_in_tx("CREATE (:T {k: 2})", Params::new())
+            .await
+            .unwrap();
+        backend
+            .commit_tx()
+            .await
+            .expect("the Bolt commit path must recover after the reopen");
+        assert_eq!(state.writer_health.status(), "ok");
+
+        // Only the recovered commit is visible; the fenced (never-ACKed)
+        // transaction did not resurrect.
+        let out = backend
+            .run("MATCH (t:T) RETURN t.k AS k", Params::new())
+            .await
+            .unwrap();
+        assert_eq!(out.rows.len(), 1, "exactly the recovered write is durable");
     }
 
     #[tokio::test]

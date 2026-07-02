@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::metrics::Metrics;
+use crate::recovery::{self, WriterHealth};
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
 /// cloned [`NamespaceState`]s. `None` until the first read query builds it.
@@ -202,6 +203,7 @@ impl NamespaceRegistry {
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             cancel_tx: watch::channel(false).0,
             maintenance_tasks: std::sync::Mutex::new(Vec::new()),
+            writer_health: WriterHealth::new(),
         });
 
         // Spawn per-namespace background maintenance (flush / compaction /
@@ -261,7 +263,20 @@ impl NamespaceRegistry {
                                 }
                             }
                         }
-                        Err(e) => error!(namespace = %ns, error = %e, "periodic flush failed"),
+                        Err(e) => {
+                            error!(namespace = %ns, error = %e, "periodic flush failed");
+                            // A fenced/poisoned writer would fail every later
+                            // flush AND every write on this namespace; reopen
+                            // it under the lock we already hold.
+                            recovery::recover_writer_if_needed(
+                                &mut w,
+                                &s.snapshot,
+                                &s.writer_health,
+                                &ns,
+                                &e,
+                            )
+                            .await;
+                        }
                     }
                 }
             });
@@ -382,6 +397,9 @@ pub struct NamespaceState {
     /// `spawn_maintenance`, so an eviction observer can await task exit
     /// (each task finishes any in-flight flush/compaction first).
     maintenance_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Writer status for this namespace's readiness probe: degraded from a
+    /// terminal commit/flush failure until the automatic reopen succeeds.
+    pub writer_health: Arc<WriterHealth>,
 }
 
 impl NamespaceState {

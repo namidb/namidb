@@ -2380,6 +2380,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "futures",
  "humantime",
  "jsonwebtoken",
  "namidb-bolt",
