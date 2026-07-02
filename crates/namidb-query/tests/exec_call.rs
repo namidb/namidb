@@ -236,21 +236,31 @@ async fn call_pagerank_accepts_options_map() {
 }
 
 #[tokio::test]
-async fn call_wcc_rejects_arguments() {
+async fn call_wcc_rejects_non_projection_arguments() {
     let mut writer = WriterSession::open(store(), paths("call-wcc-args"))
         .await
         .unwrap();
     build(&mut writer).await;
     let snapshot = writer.snapshot();
 
-    let q = parse("CALL algo.wcc({}) YIELD node_id, component").unwrap();
-    let plan = lower(&q).unwrap();
-    let plan = optimize(plan, &StatsCatalog::empty());
-    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
-    assert!(
-        err.is_unsupported(),
-        "algo.wcc takes no arguments — should be unsupported, got {err}"
-    );
+    // An empty map is a valid (no-op) projection…
+    let rows = run(&snapshot, "CALL algo.wcc({}) YIELD node_id, component").await;
+    assert_eq!(rows.len(), 5);
+
+    // …but algorithm options wcc doesn't have, or a non-map argument, error.
+    for bad in [
+        "CALL algo.wcc({damping: 0.9}) YIELD node_id, component",
+        "CALL algo.wcc(1) YIELD node_id, component",
+    ] {
+        let q = parse(bad).unwrap();
+        let plan = lower(&q).unwrap();
+        let plan = optimize(plan, &StatsCatalog::empty());
+        let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+        assert!(
+            err.is_unsupported(),
+            "{bad} should be unsupported, got {err}"
+        );
+    }
 }
 
 /// A directed triangle a→b→c→a (one SCC, one undirected triangle) plus a node
@@ -698,4 +708,255 @@ async fn call_shortest_path_requires_source() {
         err.is_unsupported(),
         "shortest_path without a source should be unsupported, got {err}"
     );
+}
+
+/// Two "domains" in one namespace: Person nodes p0→p1→p2 chained by KNOWS,
+/// Post nodes q0, q1, and cross-domain LIKES edges p0→q0, p1→q1. Used by the
+/// projection tests: filtering to {Person, KNOWS} must hide the posts and the
+/// LIKES edges entirely. Returns ([p0, p1, p2], [q0, q1]).
+async fn build_two_domains(writer: &mut WriterSession) -> ([NodeId; 3], [NodeId; 2]) {
+    let people: [NodeId; 3] = std::array::from_fn(|_| NodeId::new());
+    let posts: [NodeId; 2] = std::array::from_fn(|_| NodeId::new());
+    for id in &people {
+        writer.upsert_node("Person", *id, &node()).unwrap();
+    }
+    for id in &posts {
+        writer.upsert_node("Post", *id, &node()).unwrap();
+    }
+    writer
+        .upsert_edge("KNOWS", people[0], people[1], &edge())
+        .unwrap();
+    writer
+        .upsert_edge("KNOWS", people[1], people[2], &edge())
+        .unwrap();
+    writer
+        .upsert_edge("LIKES", people[0], posts[0], &edge())
+        .unwrap();
+    writer
+        .upsert_edge("LIKES", people[1], posts[1], &edge())
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    (people, posts)
+}
+
+#[tokio::test]
+async fn call_wcc_projection_filters_labels_and_edge_types() {
+    let mut writer = WriterSession::open(store(), paths("call-wcc-proj"))
+        .await
+        .unwrap();
+    let (people, _posts) = build_two_domains(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    // Whole graph: everything is connected through LIKES → 1 component, 5 rows.
+    let rows = run(&snapshot, "CALL algo.wcc() YIELD node_id, component").await;
+    assert_eq!(rows.len(), 5);
+    let comps: std::collections::BTreeSet<i64> =
+        rows.iter().map(|r| int_col(r, "component")).collect();
+    assert_eq!(comps.len(), 1, "LIKES bridges people and posts");
+
+    // Projected to Person/KNOWS: only the 3 people, still 1 chain component.
+    let rows = run(
+        &snapshot,
+        "CALL algo.wcc({labels: ['Person'], edge_types: ['KNOWS']}) \
+         YIELD node_id, component",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "posts are projected out");
+    let ids: std::collections::BTreeSet<[u8; 16]> = rows.iter().map(node_of).collect();
+    for p in &people {
+        assert!(ids.contains(p.as_bytes()), "person missing from projection");
+    }
+
+    // Label filter alone induces the subgraph: LIKES edges to projected-out
+    // posts must not smuggle the posts back in.
+    let rows = run(
+        &snapshot,
+        "CALL algo.wcc({labels: ['Person']}) YIELD node_id, component",
+    )
+    .await;
+    assert_eq!(rows.len(), 3);
+}
+
+#[tokio::test]
+async fn call_degree_projection_direction_reverse_and_undirected() {
+    let mut writer = WriterSession::open(store(), paths("call-degree-proj"))
+        .await
+        .unwrap();
+    let (people, _posts) = build_two_domains(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let proj = "labels: ['Person'], edge_types: ['KNOWS']";
+
+    // Natural: p0 →1 out, p1 1 in/1 out, p2 1 in.
+    let rows = run(
+        &snapshot,
+        &format!("CALL algo.degree({{{proj}}}) YIELD node_id, in_degree, out_degree, degree"),
+    )
+    .await;
+    let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
+        .iter()
+        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .collect();
+    assert_eq!(by_node[people[0].as_bytes()], (0, 1));
+    assert_eq!(by_node[people[2].as_bytes()], (1, 0));
+
+    // Reverse: in/out swap.
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.degree({{{proj}, direction: 'reverse'}}) \
+             YIELD node_id, in_degree, out_degree, degree"
+        ),
+    )
+    .await;
+    let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
+        .iter()
+        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .collect();
+    assert_eq!(by_node[people[0].as_bytes()], (1, 0));
+    assert_eq!(by_node[people[2].as_bytes()], (0, 1));
+
+    // Undirected: every incident edge counts both ways.
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.degree({{{proj}, direction: 'undirected'}}) \
+             YIELD node_id, in_degree, out_degree, degree"
+        ),
+    )
+    .await;
+    let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
+        .iter()
+        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .collect();
+    assert_eq!(by_node[people[1].as_bytes()], (2, 2));
+}
+
+#[tokio::test]
+async fn call_projection_unknown_label_errors() {
+    let mut writer = WriterSession::open(store(), paths("call-proj-unknown"))
+        .await
+        .unwrap();
+    build_two_domains(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    for bad in [
+        "CALL algo.wcc({labels: ['Nope']}) YIELD node_id, component",
+        "CALL algo.wcc({edge_types: ['NOPE']}) YIELD node_id, component",
+        "CALL algo.wcc({direction: 'sideways'}) YIELD node_id, component",
+        "CALL algo.wcc({labels: []}) YIELD node_id, component",
+    ] {
+        let q = parse(bad).unwrap();
+        let plan = lower(&q).unwrap();
+        let plan = optimize(plan, &StatsCatalog::empty());
+        let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+        assert!(err.is_unsupported(), "{bad} should error, got {err}");
+    }
+}
+
+#[tokio::test]
+async fn call_pagerank_accepts_projection_keys() {
+    let mut writer = WriterSession::open(store(), paths("call-pr-proj"))
+        .await
+        .unwrap();
+    let (people, _posts) = build_two_domains(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let rows = run(
+        &snapshot,
+        "CALL algo.pagerank({labels: ['Person'], edge_types: ['KNOWS'], damping: 0.85}) \
+         YIELD node_id, score",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "only people are ranked");
+    // End of the p0→p1→p2 chain accumulates the most rank.
+    assert_eq!(node_of(&rows[0]), *people[2].as_bytes());
+}
+
+/// Two triangles of Person/KNOWS joined by one bridge edge → Louvain finds the
+/// two triangle communities.
+#[tokio::test]
+async fn call_louvain_separates_bridged_triangles() {
+    let mut writer = WriterSession::open(store(), paths("call-louvain"))
+        .await
+        .unwrap();
+    let t1: [NodeId; 3] = std::array::from_fn(|_| NodeId::new());
+    let t2: [NodeId; 3] = std::array::from_fn(|_| NodeId::new());
+    for id in t1.iter().chain(t2.iter()) {
+        writer.upsert_node("N", *id, &node()).unwrap();
+    }
+    for tri in [&t1, &t2] {
+        writer.upsert_edge("E", tri[0], tri[1], &edge()).unwrap();
+        writer.upsert_edge("E", tri[1], tri[2], &edge()).unwrap();
+        writer.upsert_edge("E", tri[2], tri[0], &edge()).unwrap();
+    }
+    writer.upsert_edge("E", t1[0], t2[0], &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let rows = run(&snapshot, "CALL algo.louvain() YIELD node_id, community").await;
+    assert_eq!(rows.len(), 6);
+    let by_node: BTreeMap<[u8; 16], i64> = rows
+        .iter()
+        .map(|r| (node_of(r), int_col(r, "community")))
+        .collect();
+    let c1 = by_node[t1[0].as_bytes()];
+    let c2 = by_node[t2[0].as_bytes()];
+    assert_ne!(c1, c2, "the two triangles are distinct communities");
+    assert!(t1.iter().all(|n| by_node[n.as_bytes()] == c1));
+    assert!(t2.iter().all(|n| by_node[n.as_bytes()] == c2));
+}
+
+/// Directed path a→b→c→d→e: Brandes betweenness has exact known values
+/// (b=3, c=4, d=3, endpoints 0), and the rows come back score-descending.
+#[tokio::test]
+async fn call_betweenness_directed_path() {
+    let mut writer = WriterSession::open(store(), paths("call-betweenness"))
+        .await
+        .unwrap();
+    let ids: [NodeId; 5] = std::array::from_fn(|_| NodeId::new());
+    for id in &ids {
+        writer.upsert_node("N", *id, &node()).unwrap();
+    }
+    for w in ids.windows(2) {
+        writer.upsert_edge("E", w[0], w[1], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let rows = run(&snapshot, "CALL algo.betweenness() YIELD node_id, score").await;
+    assert_eq!(rows.len(), 5);
+    let by_node: BTreeMap<[u8; 16], f64> = rows
+        .iter()
+        .map(|r| {
+            let s = match r.get("score") {
+                Some(RuntimeValue::Float(v)) => *v,
+                other => panic!("score not a float: {other:?}"),
+            };
+            (node_of(r), s)
+        })
+        .collect();
+    assert_eq!(by_node[ids[0].as_bytes()], 0.0);
+    assert_eq!(by_node[ids[1].as_bytes()], 3.0);
+    assert_eq!(by_node[ids[2].as_bytes()], 4.0);
+    assert_eq!(by_node[ids[3].as_bytes()], 3.0);
+    assert_eq!(by_node[ids[4].as_bytes()], 0.0);
+    // Highest-scoring row first.
+    assert_eq!(node_of(&rows[0]), *ids[2].as_bytes());
+
+    // Undirected projection halves the doubled raw scores: c carries the
+    // same 4 pass-through pairs in the undirected P5.
+    let rows = run(
+        &snapshot,
+        "CALL algo.betweenness({direction: 'undirected'}) YIELD node_id, score",
+    )
+    .await;
+    let c_score = rows
+        .iter()
+        .find(|r| node_of(r) == *ids[2].as_bytes())
+        .map(|r| match r.get("score") {
+            Some(RuntimeValue::Float(v)) => *v,
+            other => panic!("score not a float: {other:?}"),
+        })
+        .unwrap();
+    assert_eq!(c_score, 4.0);
 }

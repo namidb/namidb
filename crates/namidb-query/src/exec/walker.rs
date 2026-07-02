@@ -1464,14 +1464,15 @@ async fn flat_call_procedure(
         )));
     }
 
-    let graph = snapshot_to_algo_graph(snapshot).await?;
+    // Shared projection options ({labels, edge_types, direction}) restrict the
+    // graph build; algorithm-specific keys are parsed per procedure below.
+    let projection = algo_projection(args, params)?;
+    let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
 
     // Canonical output: column names + one RuntimeValue per column per row.
     let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match name {
         "wcc" => {
-            if !args.is_empty() {
-                return Err(proc_unsupported("algo.wcc takes no arguments"));
-            }
+            require_projection_only("wcc", args, params)?;
             // Poll the query deadline mid-computation so a runaway CALL on a
             // huge graph is interruptible, not just at the operator boundary.
             let comps = namidb_graph::algo::weakly_connected_components_cancellable(
@@ -1510,9 +1511,7 @@ async fn flat_call_procedure(
             (vec!["node_id", "score"], raw)
         }
         "degree" => {
-            if !args.is_empty() {
-                return Err(proc_unsupported("algo.degree takes no arguments"));
-            }
+            require_projection_only("degree", args, params)?;
             let deg = namidb_graph::algo::degrees_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -1535,9 +1534,7 @@ async fn flat_call_procedure(
             (vec!["node_id", "in_degree", "out_degree", "degree"], raw)
         }
         "scc" => {
-            if !args.is_empty() {
-                return Err(proc_unsupported("algo.scc takes no arguments"));
-            }
+            require_projection_only("scc", args, params)?;
             let comps = namidb_graph::algo::strongly_connected_components_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -1552,9 +1549,7 @@ async fn flat_call_procedure(
             (vec!["node_id", "component"], raw)
         }
         "triangle_count" => {
-            if !args.is_empty() {
-                return Err(proc_unsupported("algo.triangle_count takes no arguments"));
-            }
+            require_projection_only("triangle_count", args, params)?;
             let tri = namidb_graph::algo::triangle_count_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -1649,11 +1644,60 @@ async fn flat_call_procedure(
                 .collect();
             (vec!["node_id", "embedding"], raw)
         }
+        "louvain" => {
+            let opts = louvain_options(args, params)?;
+            let res = namidb_graph::algo::louvain_cancellable(
+                &graph,
+                &opts,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            let mut entries: Vec<(NodeId, usize)> = res.assignment.into_iter().collect();
+            entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            let raw = entries
+                .into_iter()
+                .map(|(id, c)| vec![node_runtime(id), RuntimeValue::Integer(c as i64)])
+                .collect();
+            (vec!["node_id", "community"], raw)
+        }
+        "betweenness" => {
+            require_projection_only("betweenness", args, params)?;
+            let res = namidb_graph::algo::betweenness_cancellable(
+                &graph,
+                &namidb_storage::cancel::deadline_exceeded,
+            )
+            .map_err(|_| ExecError::Timeout)?;
+            // Raw Brandes counts each s→t dependency once per direction, so an
+            // undirected projection doubles every score; halve back to the
+            // conventional undirected centrality.
+            let scale = if projection.direction == AlgoDirection::Undirected {
+                0.5
+            } else {
+                1.0
+            };
+            let mut entries: Vec<(NodeId, f64)> = res
+                .scores
+                .into_iter()
+                .map(|(id, s)| (id, s * scale))
+                .collect();
+            // Descending by score, then by node id for stability.
+            entries.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let raw = entries
+                .into_iter()
+                .map(|(id, s)| vec![node_runtime(id), RuntimeValue::Float(s)])
+                .collect();
+            (vec!["node_id", "score"], raw)
+        }
         other => {
             return Err(proc_unsupported(format!(
                 "unknown procedure `algo.{other}` (supported: algo.wcc, algo.scc, \
                  algo.pagerank, algo.degree, algo.triangle_count, \
-                 algo.label_propagation, algo.shortest_path, algo.fastRP)"
+                 algo.label_propagation, algo.louvain, algo.betweenness, \
+                 algo.shortest_path, algo.fastRP)"
             )));
         }
     };
@@ -2715,28 +2759,201 @@ fn node_runtime(id: NodeId) -> RuntimeValue {
     }))
 }
 
-/// Build an in-memory `algo::Graph` from the snapshot: every node (isolates
-/// included) and every edge (with an optional `weight` property).
+/// How projected edges enter the algo graph (Neo4j GDS "orientation"): as
+/// stored, reversed, or both ways.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlgoDirection {
+    Natural,
+    Reverse,
+    Undirected,
+}
+
+/// The shared graph-projection options every `algo.*` procedure accepts in its
+/// option map: `{labels: [...], edge_types: [...], direction: 'natural'}`.
+/// `None` filters mean "everything observed" — the whole-graph behaviour when
+/// no projection is given.
+struct AlgoProjection {
+    labels: Option<Vec<String>>,
+    edge_types: Option<Vec<String>>,
+    direction: AlgoDirection,
+}
+
+impl Default for AlgoProjection {
+    fn default() -> Self {
+        Self {
+            labels: None,
+            edge_types: None,
+            direction: AlgoDirection::Natural,
+        }
+    }
+}
+
+/// Extract the shared projection keys from a procedure's single-map argument.
+/// Non-map argument shapes yield the default projection — the per-procedure
+/// option parsers own their validation and error messages.
+fn algo_projection(args: &[Expression], params: &Params) -> Result<AlgoProjection, ExecError> {
+    let mut proj = AlgoProjection::default();
+    let [arg] = args else { return Ok(proj) };
+    let RuntimeValue::Map(map) = evaluate(arg, &Row::new(), params)? else {
+        return Ok(proj);
+    };
+    if let Some(v) = map.get("labels") {
+        proj.labels = Some(string_list(v).ok_or_else(|| {
+            proc_unsupported("algo projection `labels` must be a non-empty list of strings")
+        })?);
+    }
+    if let Some(v) = map.get("edge_types") {
+        proj.edge_types = Some(string_list(v).ok_or_else(|| {
+            proc_unsupported("algo projection `edge_types` must be a non-empty list of strings")
+        })?);
+    }
+    if let Some(v) = map.get("direction") {
+        let s = match v {
+            RuntimeValue::String(s) => s.as_str(),
+            _ => "",
+        };
+        proj.direction = match s.to_ascii_lowercase().as_str() {
+            "natural" => AlgoDirection::Natural,
+            "reverse" => AlgoDirection::Reverse,
+            "undirected" => AlgoDirection::Undirected,
+            _ => {
+                return Err(proc_unsupported(
+                    "algo projection `direction` must be 'natural', 'reverse', or 'undirected'",
+                ));
+            }
+        };
+    }
+    Ok(proj)
+}
+
+fn string_list(v: &RuntimeValue) -> Option<Vec<String>> {
+    let RuntimeValue::List(items) = v else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .map(|it| match it {
+            RuntimeValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Validate that a procedure with no algorithm-specific options was called
+/// either bare or with a map carrying only the shared projection keys.
+fn require_projection_only(
+    name: &str,
+    args: &[Expression],
+    params: &Params,
+) -> Result<(), ExecError> {
+    match args {
+        [] => Ok(()),
+        [arg] => {
+            let map = match evaluate(arg, &Row::new(), params)? {
+                RuntimeValue::Map(m) => m,
+                _ => {
+                    return Err(proc_unsupported(format!(
+                        "algo.{name} accepts only a projection map argument, \
+                         e.g. {{labels: ['Person']}}"
+                    )));
+                }
+            };
+            for key in map.keys() {
+                if !matches!(key.as_str(), "labels" | "edge_types" | "direction") {
+                    return Err(proc_unsupported(format!(
+                        "algo.{name} accepts only projection options \
+                         (labels, edge_types, direction); unknown option `{key}`"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(proc_unsupported(format!(
+            "algo.{name} takes at most one (map) argument"
+        ))),
+    }
+}
+
+/// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
+/// (isolates included) and the projected edges (with an optional `weight`
+/// property), oriented per `projection.direction`.
 async fn snapshot_to_algo_graph(
     snapshot: &Snapshot<'_>,
+    projection: &AlgoProjection,
 ) -> Result<namidb_graph::algo::Graph, ExecError> {
+    // Requested labels/edge types are validated against the observed sets so a
+    // typo errors instead of silently projecting an empty graph (GDS parity).
+    let labels = match &projection.labels {
+        Some(ls) => {
+            let known = snapshot.observed_labels();
+            for l in ls {
+                if !known.iter().any(|k| k == l) {
+                    return Err(proc_unsupported(format!(
+                        "unknown label `{l}` in algo projection (known: {})",
+                        known.join(", ")
+                    )));
+                }
+            }
+            ls.clone()
+        }
+        None => snapshot.observed_labels(),
+    };
     let mut g = namidb_graph::algo::Graph::new();
-    for label in snapshot.observed_labels() {
+    for label in &labels {
         // We only need the node ids, so scan with an EMPTY property projection:
         // this skips decoding every declared property column AND serde-parsing
         // __overflow_json per row — the dominant cost of building the algo graph
         // (millions of JSON parses on a large namespace, per CALL algo.*).
         for n in snapshot
-            .scan_label_with_predicates_and_projection(&label, &[], Some(&[]))
+            .scan_label_with_predicates_and_projection(label, &[], Some(&[]))
             .await?
         {
             g.add_node(n.id);
         }
     }
-    for et in snapshot.observed_edge_types() {
-        for e in snapshot.scan_edge_type(&et).await? {
+    // A label filter projects the *induced* subgraph: an edge survives only
+    // when both endpoints survived the node projection (GDS semantics).
+    let projected: Option<std::collections::HashSet<NodeId>> = projection
+        .labels
+        .as_ref()
+        .map(|_| g.nodes().iter().copied().collect());
+    let edge_types = match &projection.edge_types {
+        Some(ts) => {
+            let known = snapshot.observed_edge_types();
+            for t in ts {
+                if !known.iter().any(|k| k == t) {
+                    return Err(proc_unsupported(format!(
+                        "unknown edge type `{t}` in algo projection (known: {})",
+                        known.join(", ")
+                    )));
+                }
+            }
+            ts.clone()
+        }
+        None => snapshot.observed_edge_types(),
+    };
+    for et in &edge_types {
+        for e in snapshot.scan_edge_type(et).await? {
+            if let Some(keep) = &projected {
+                if !keep.contains(&e.src) || !keep.contains(&e.dst) {
+                    continue;
+                }
+            }
             let w = e.properties.get("weight").and_then(numeric_weight);
-            g.add_edge(e.src, e.dst, w);
+            match projection.direction {
+                AlgoDirection::Natural => g.add_edge(e.src, e.dst, w),
+                AlgoDirection::Reverse => g.add_edge(e.dst, e.src, w),
+                AlgoDirection::Undirected => {
+                    g.add_edge(e.src, e.dst, w);
+                    // A self-loop is the same edge both ways — add it once.
+                    if e.src != e.dst {
+                        g.add_edge(e.dst, e.src, w);
+                    }
+                }
+            }
         }
     }
     Ok(g)
@@ -2908,6 +3125,49 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
         }
     }
     Ok(max_iters)
+}
+
+/// Resolve `algo.louvain` options from its optional single map argument:
+/// `CALL algo.louvain({max_levels: 5, max_iterations: 10, tolerance: 1e-4})`.
+/// The shared projection keys are parsed separately and ignored here.
+fn louvain_options(
+    args: &[Expression],
+    params: &Params,
+) -> Result<namidb_graph::algo::LouvainOptions, ExecError> {
+    let mut opts = namidb_graph::algo::LouvainOptions::default();
+    match args {
+        [] => {}
+        [arg] => {
+            let map = match evaluate(arg, &Row::new(), params)? {
+                RuntimeValue::Map(m) => m,
+                _ => {
+                    return Err(proc_unsupported(
+                        "algo.louvain expects a single map argument, e.g. {max_levels: 5}",
+                    ));
+                }
+            };
+            if let Some(v) = map.get("max_levels") {
+                opts.max_levels = as_usize(v).ok_or_else(|| {
+                    proc_unsupported("algo.louvain `max_levels` must be a non-negative integer")
+                })?;
+            }
+            if let Some(v) = map.get("max_iterations") {
+                opts.max_iterations = as_usize(v).ok_or_else(|| {
+                    proc_unsupported("algo.louvain `max_iterations` must be a non-negative integer")
+                })?;
+            }
+            if let Some(v) = map.get("tolerance") {
+                opts.tolerance = as_f64(v)
+                    .ok_or_else(|| proc_unsupported("algo.louvain `tolerance` must be a number"))?;
+            }
+        }
+        _ => {
+            return Err(proc_unsupported(
+                "algo.louvain takes at most one (map) argument",
+            ));
+        }
+    }
+    Ok(opts)
 }
 
 /// Resolve `algo.shortest_path` options from its required single map arg:

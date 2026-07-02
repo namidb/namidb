@@ -1130,6 +1130,353 @@ impl UnionFind {
     }
 }
 
+// ===========================================================================
+// Louvain community detection
+// ===========================================================================
+
+/// Knobs for [`louvain`]. Defaults follow Neo4j GDS: up to 10 aggregation
+/// levels, 10 local-move sweeps per level, and a modularity-gain tolerance of
+/// 1e-4 between levels for early convergence.
+#[derive(Clone, Debug)]
+pub struct LouvainOptions {
+    /// Maximum dendrogram height (levels of community aggregation).
+    pub max_levels: usize,
+    /// Maximum local-move sweeps within one level.
+    pub max_iterations: usize,
+    /// Stop adding levels once a level improves modularity by less than this.
+    pub tolerance: f64,
+}
+
+impl Default for LouvainOptions {
+    fn default() -> Self {
+        Self {
+            max_levels: 10,
+            max_iterations: 10,
+            tolerance: 1e-4,
+        }
+    }
+}
+
+/// Result of a Louvain run: the final community per node plus the modularity
+/// of that partition. Like WCC, Louvain works on the *undirected* view of the
+/// edges (each stored directed edge is one undirected edge of its weight).
+#[derive(Debug, Clone)]
+pub struct Louvain {
+    /// `node -> community id`, dense in `[0, count)`.
+    pub assignment: HashMap<NodeId, usize>,
+    /// Number of distinct communities.
+    pub count: usize,
+    /// Modularity of the returned partition.
+    pub modularity: f64,
+}
+
+/// Louvain modularity-based community detection over the undirected view of
+/// the graph (Blondel et al. 2008): repeated local-move sweeps that greedily
+/// maximise modularity, then community aggregation into super-nodes, until the
+/// modularity gain between levels drops below `tolerance` or `max_levels` is
+/// hit. Deterministic: nodes are swept in insertion order and ties prefer the
+/// current community, then the lowest community id.
+pub fn louvain(graph: &Graph, opts: &LouvainOptions) -> Louvain {
+    louvain_cancellable(graph, opts, &|| false).expect("never cancels")
+}
+
+/// [`louvain`] that polls `cancel` periodically.
+pub fn louvain_cancellable(
+    graph: &Graph,
+    opts: &LouvainOptions,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Louvain, Cancelled> {
+    let n = graph.node_count();
+    let mut index: HashMap<NodeId, usize> = HashMap::with_capacity(n);
+    for (i, &node) in graph.nodes().iter().enumerate() {
+        index.insert(node, i);
+    }
+
+    // Level-0 undirected working graph: non-loop incidences in BOTH directions
+    // plus per-node self-loop weight (each self-loop counted once).
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    let mut loops: Vec<f64> = vec![0.0; n];
+    let mut m = 0.0f64;
+    for (&src, nbrs) in &graph.out {
+        let si = index[&src];
+        for &(dst, w) in nbrs {
+            let di = index[&dst];
+            m += w;
+            if si == di {
+                loops[si] += w;
+            } else {
+                adj[si].push((di, w));
+                adj[di].push((si, w));
+            }
+        }
+    }
+    if m <= 0.0 || n == 0 {
+        // Edgeless graph: every node is its own community, modularity 0.
+        let assignment = graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, &node)| (node, i))
+            .collect();
+        return Ok(Louvain {
+            assignment,
+            count: n,
+            modularity: 0.0,
+        });
+    }
+
+    // `membership[orig]` tracks each original node's community through the
+    // levels; level-local ids are composed into it after each aggregation.
+    let mut membership: Vec<usize> = (0..n).collect();
+    let mut prev_q = f64::NEG_INFINITY;
+    let mut since_check = 0usize;
+
+    for _level in 0..opts.max_levels.max(1) {
+        let ln = adj.len();
+        // Weighted degree: incident non-loop weight + 2x self-loops.
+        let k: Vec<f64> = (0..ln)
+            .map(|i| adj[i].iter().map(|&(_, w)| w).sum::<f64>() + 2.0 * loops[i])
+            .collect();
+        let mut comm: Vec<usize> = (0..ln).collect();
+        let mut sigma_tot = k.clone();
+        let two_m = 2.0 * m;
+
+        // Local-move phase: sweep nodes in index order until a full sweep
+        // makes no move (or the sweep cap is hit).
+        let mut moved_any = false;
+        for _sweep in 0..opts.max_iterations.max(1) {
+            let mut moved = false;
+            let mut neigh: HashMap<usize, f64> = HashMap::new();
+            for i in 0..ln {
+                let c0 = comm[i];
+                neigh.clear();
+                for &(j, w) in &adj[i] {
+                    *neigh.entry(comm[j]).or_insert(0.0) += w;
+                    since_check += 1;
+                    if since_check >= CANCEL_CHECK_STRIDE {
+                        since_check = 0;
+                        if cancel() {
+                            return Err(Cancelled);
+                        }
+                    }
+                }
+                sigma_tot[c0] -= k[i];
+                // Gain of joining community c (up to terms constant across
+                // choices): k_i_in(c) - sigma_tot(c) * k_i / 2m. Scan
+                // candidates in ascending community id and require a strictly
+                // better gain, so ties keep the current community first and
+                // the lowest id otherwise — deterministic regardless of
+                // HashMap iteration order.
+                let stay = neigh.get(&c0).copied().unwrap_or(0.0) - sigma_tot[c0] * k[i] / two_m;
+                let mut candidates: Vec<usize> = neigh.keys().copied().collect();
+                candidates.sort_unstable();
+                let (mut best_c, mut best_gain) = (c0, stay);
+                for c in candidates {
+                    if c == c0 {
+                        continue;
+                    }
+                    let gain = neigh[&c] - sigma_tot[c] * k[i] / two_m;
+                    if gain > best_gain + f64::EPSILON {
+                        best_c = c;
+                        best_gain = gain;
+                    }
+                }
+                sigma_tot[best_c] += k[i];
+                if best_c != c0 {
+                    comm[i] = best_c;
+                    moved = true;
+                    moved_any = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+
+        // Renumber communities densely by first occurrence (node order).
+        let mut renumber: HashMap<usize, usize> = HashMap::new();
+        for c in comm.iter_mut() {
+            let next = renumber.len();
+            *c = *renumber.entry(*c).or_insert(next);
+        }
+        let cn = renumber.len();
+        for slot in membership.iter_mut() {
+            *slot = comm[*slot];
+        }
+
+        // Modularity of this level's partition (networkx convention:
+        // Q = sum_c internal(c)/m - (sigma_tot(c)/2m)^2, internal counting
+        // each undirected edge and each self-loop once).
+        let mut internal = vec![0.0f64; cn];
+        let mut tot = vec![0.0f64; cn];
+        for i in 0..ln {
+            tot[comm[i]] += k[i];
+            internal[comm[i]] += loops[i];
+            for &(j, w) in &adj[i] {
+                if comm[j] == comm[i] {
+                    internal[comm[i]] += w / 2.0; // both directions stored
+                }
+            }
+        }
+        let q: f64 = (0..cn)
+            .map(|c| internal[c] / m - (tot[c] / two_m).powi(2))
+            .sum();
+
+        let done = !moved_any || cn == ln || q - prev_q < opts.tolerance;
+        prev_q = q;
+        if done {
+            break;
+        }
+
+        // Aggregate: communities become super-nodes; inter-community weights
+        // sum (both directions preserved), intra-community weight becomes the
+        // super-node's self-loop.
+        let mut new_adj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); cn];
+        let mut new_loops = vec![0.0f64; cn];
+        for i in 0..ln {
+            new_loops[comm[i]] += loops[i];
+            for &(j, w) in &adj[i] {
+                if comm[j] == comm[i] {
+                    new_loops[comm[i]] += w / 2.0;
+                } else {
+                    *new_adj[comm[i]].entry(comm[j]).or_insert(0.0) += w;
+                }
+            }
+        }
+        // new_loops double-added intra weight (w/2 from each direction) — that
+        // is exactly once per undirected edge, as required.
+        adj = new_adj
+            .into_iter()
+            .map(|mp| {
+                let mut v: Vec<(usize, f64)> = mp.into_iter().collect();
+                v.sort_unstable_by_key(|&(c, _)| c);
+                v
+            })
+            .collect();
+        loops = new_loops;
+    }
+
+    // Final relabel: dense ids by first occurrence in node-insertion order,
+    // matching WCC/label_propagation's deterministic output.
+    let mut relabel: HashMap<usize, usize> = HashMap::new();
+    let mut assignment = HashMap::with_capacity(n);
+    for (i, &node) in graph.nodes().iter().enumerate() {
+        let next = relabel.len();
+        let c = *relabel.entry(membership[i]).or_insert(next);
+        assignment.insert(node, c);
+    }
+    Ok(Louvain {
+        assignment,
+        count: relabel.len(),
+        modularity: prev_q.max(0.0),
+    })
+}
+
+// ===========================================================================
+// Betweenness centrality (Brandes)
+// ===========================================================================
+
+/// Result of [`betweenness`]: raw (unnormalised) betweenness centrality per
+/// node over directed unit-cost shortest paths, Neo4j GDS's default. On an
+/// undirected projection every s→t pair is counted in both directions, so raw
+/// scores come out doubled — the caller halves them for undirected semantics.
+#[derive(Debug, Clone)]
+pub struct Betweenness {
+    /// `node -> centrality score`.
+    pub scores: HashMap<NodeId, f64>,
+}
+
+/// Brandes' exact betweenness centrality (2001): one BFS + dependency
+/// accumulation per source, `O(V·E)` total for unweighted graphs.
+/// Deterministic: sources are processed in insertion order and the algorithm's
+/// result is order-independent.
+pub fn betweenness(graph: &Graph) -> Betweenness {
+    betweenness_cancellable(graph, &|| false).expect("never cancels")
+}
+
+/// [`betweenness`] that polls `cancel` periodically (per source and inside the
+/// BFS inner loop).
+pub fn betweenness_cancellable(
+    graph: &Graph,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Betweenness, Cancelled> {
+    let n = graph.node_count();
+    let mut index: HashMap<NodeId, usize> = HashMap::with_capacity(n);
+    for (i, &node) in graph.nodes().iter().enumerate() {
+        index.insert(node, i);
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (&src, nbrs) in &graph.out {
+        let si = index[&src];
+        for &(dst, _) in nbrs {
+            adj[si].push(index[&dst]);
+        }
+    }
+
+    let mut bc = vec![0.0f64; n];
+    // Per-source scratch, reset via the visit stack instead of re-allocating.
+    let mut sigma = vec![0.0f64; n];
+    let mut dist = vec![-1i64; n];
+    let mut delta = vec![0.0f64; n];
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut since_check = 0usize;
+
+    for s in 0..n {
+        let mut stack: Vec<usize> = Vec::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        sigma[s] = 1.0;
+        dist[s] = 0;
+        queue.push_back(s);
+        while let Some(u) = queue.pop_front() {
+            stack.push(u);
+            for &v in &adj[u] {
+                if dist[v] < 0 {
+                    dist[v] = dist[u] + 1;
+                    queue.push_back(v);
+                }
+                if dist[v] == dist[u] + 1 {
+                    sigma[v] += sigma[u];
+                    pred[v].push(u);
+                }
+                since_check += 1;
+                if since_check >= CANCEL_CHECK_STRIDE {
+                    since_check = 0;
+                    if cancel() {
+                        return Err(Cancelled);
+                    }
+                }
+            }
+        }
+        // Dependency accumulation in reverse BFS order.
+        for &w in stack.iter().rev() {
+            for &v in &pred[w] {
+                delta[v] += sigma[v] / sigma[w] * (1.0 + delta[w]);
+            }
+            if w != s {
+                bc[w] += delta[w];
+            }
+        }
+        // Reset only what this source touched.
+        for &w in &stack {
+            sigma[w] = 0.0;
+            dist[w] = -1;
+            delta[w] = 0.0;
+            pred[w].clear();
+        }
+        if cancel() {
+            return Err(Cancelled);
+        }
+    }
+
+    let scores = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| (node, bc[i]))
+        .collect();
+    Ok(Betweenness { scores })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1804,5 +2151,116 @@ mod tests {
         assert!(triangle_count_cancellable(&g, &never).is_ok());
         assert!(label_propagation_cancellable(&g, 10, &never).is_ok());
         assert!(shortest_paths_cancellable(&g, hub, false, &never).is_ok());
+        assert!(louvain_cancellable(&g, &LouvainOptions::default(), &never).is_ok());
+        assert!(betweenness_cancellable(&g, &never).is_ok());
+        let always = || true;
+        assert_eq!(
+            louvain_cancellable(&g, &LouvainOptions::default(), &always).err(),
+            Some(Cancelled)
+        );
+        assert_eq!(betweenness_cancellable(&g, &always).err(), Some(Cancelled));
+    }
+
+    #[test]
+    fn louvain_separates_two_bridged_cliques() {
+        // Two 4-cliques joined by one bridge edge: the canonical Louvain
+        // fixture. Each clique must land in one community, distinct from the
+        // other clique's, with clearly positive modularity.
+        let c1: Vec<NodeId> = (1u8..=4).map(|b| nid([b; 16])).collect();
+        let c2: Vec<NodeId> = (5u8..=8).map(|b| nid([b; 16])).collect();
+        let mut g = Graph::new();
+        for cl in [&c1, &c2] {
+            for i in 0..cl.len() {
+                for j in (i + 1)..cl.len() {
+                    g.add_edge(cl[i], cl[j], None);
+                }
+            }
+        }
+        g.add_edge(c1[0], c2[0], None);
+
+        let res = louvain(&g, &LouvainOptions::default());
+        assert_eq!(res.count, 2, "two cliques → two communities");
+        let comm1 = res.assignment[&c1[0]];
+        let comm2 = res.assignment[&c2[0]];
+        assert_ne!(comm1, comm2);
+        assert!(c1.iter().all(|n| res.assignment[n] == comm1), "clique 1 intact");
+        assert!(c2.iter().all(|n| res.assignment[n] == comm2), "clique 2 intact");
+        assert!(
+            res.modularity > 0.3,
+            "bridged cliques have high modularity, got {}",
+            res.modularity
+        );
+    }
+
+    #[test]
+    fn louvain_edgeless_graph_is_all_singletons() {
+        let mut g = Graph::new();
+        let nodes: Vec<NodeId> = (1u8..=3).map(|b| nid([b; 16])).collect();
+        for &n in &nodes {
+            g.add_node(n);
+        }
+        let res = louvain(&g, &LouvainOptions::default());
+        assert_eq!(res.count, 3);
+        assert_eq!(res.modularity, 0.0);
+        let distinct: HashSet<usize> = res.assignment.values().copied().collect();
+        assert_eq!(distinct.len(), 3);
+    }
+
+    #[test]
+    fn louvain_is_deterministic() {
+        let c1: Vec<NodeId> = (1u8..=5).map(|b| nid([b; 16])).collect();
+        let c2: Vec<NodeId> = (6u8..=10).map(|b| nid([b; 16])).collect();
+        let mut g = Graph::new();
+        for cl in [&c1, &c2] {
+            for i in 0..cl.len() {
+                for j in (i + 1)..cl.len() {
+                    g.add_edge(cl[i], cl[j], None);
+                }
+            }
+        }
+        g.add_edge(c1[4], c2[0], None);
+        let a = louvain(&g, &LouvainOptions::default());
+        for _ in 0..5 {
+            let b = louvain(&g, &LouvainOptions::default());
+            assert_eq!(a.assignment, b.assignment);
+            assert_eq!(a.modularity, b.modularity);
+        }
+    }
+
+    #[test]
+    fn betweenness_directed_path_exact_values() {
+        // a→b→c→d→e: interior nodes carry all pass-through pairs.
+        // b: a→{c,d,e} = 3; c: {a,b}→{d,e} = 4; d: {a,b,c}→e = 3; ends 0.
+        let ids: Vec<NodeId> = (1u8..=5).map(|b| nid([b; 16])).collect();
+        let mut g = Graph::new();
+        for w in ids.windows(2) {
+            g.add_edge(w[0], w[1], None);
+        }
+        let bc = betweenness(&g);
+        assert_eq!(bc.scores[&ids[0]], 0.0);
+        assert_eq!(bc.scores[&ids[1]], 3.0);
+        assert_eq!(bc.scores[&ids[2]], 4.0);
+        assert_eq!(bc.scores[&ids[3]], 3.0);
+        assert_eq!(bc.scores[&ids[4]], 0.0);
+    }
+
+    #[test]
+    fn betweenness_splits_over_equal_shortest_paths() {
+        // Diamond a→{b,c}→d: two equal-length paths, so b and c each carry
+        // half of the single a→d dependency.
+        let a = nid([1; 16]);
+        let b = nid([2; 16]);
+        let c = nid([3; 16]);
+        let d = nid([4; 16]);
+        let mut g = Graph::new();
+        g.add_edge(a, b, None);
+        g.add_edge(a, c, None);
+        g.add_edge(b, d, None);
+        g.add_edge(c, d, None);
+        let bc = betweenness(&g);
+        assert_eq!(bc.scores[&b], 0.5);
+        assert_eq!(bc.scores[&c], 0.5);
+        assert_eq!(bc.scores[&a], 0.0);
+        assert_eq!(bc.scores[&d], 0.0);
     }
 }
