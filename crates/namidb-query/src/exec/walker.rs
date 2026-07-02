@@ -3645,54 +3645,96 @@ fn row_fingerprint(row: &Row) -> String {
     out
 }
 
+/// Content-faithful equality key for DISTINCT, GROUP BY, and hash-join
+/// build/probe keys. Two [`RuntimeValue`]s must map to the same string iff they
+/// are equal. Every variable-length payload is length-prefixed so distinct
+/// values cannot collide through a shared separator (the old `,`-joined form
+/// made `["a,s:b"]` and `["a","b"]` identical), and Float/Vector/Bytes encode
+/// full content — the old length-only encoding collapsed every same-dimension
+/// vector, every same-length byte string, and floats differing past 10 decimals
+/// into one group / one join bucket.
 fn fingerprint_value(v: &RuntimeValue) -> String {
+    let mut out = String::new();
+    fingerprint_into(&mut out, v);
+    out
+}
+
+fn fingerprint_into(out: &mut String, v: &RuntimeValue) {
+    use std::fmt::Write;
     match v {
-        RuntimeValue::Null => "<null>".into(),
-        RuntimeValue::Bool(b) => b.to_string(),
-        RuntimeValue::Integer(n) => format!("i:{}", n),
-        RuntimeValue::Float(f) => format!("f:{:.10}", f),
-        RuntimeValue::String(s) => format!("s:{}", s),
-        RuntimeValue::List(items) => {
-            let mut s = "[".to_string();
-            for (i, it) in items.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&fingerprint_value(it));
+        RuntimeValue::Null => out.push_str("Z;"),
+        RuntimeValue::Bool(b) => {
+            out.push('B');
+            out.push(if *b { '1' } else { '0' });
+        }
+        RuntimeValue::Integer(n) => {
+            let _ = write!(out, "I{n};");
+        }
+        RuntimeValue::Float(f) => {
+            // Full-precision, exact: bit pattern (with -0.0 canonicalised to
+            // +0.0 so the two compare equal, as `==` does). Beats `{:.10}`,
+            // which merged values differing past the 10th decimal.
+            let bits = if *f == 0.0 { 0u64 } else { f.to_bits() };
+            let _ = write!(out, "F{bits:016x};");
+        }
+        RuntimeValue::String(s) => {
+            // Length-prefixed content: self-delimiting, so no separator in the
+            // string can be confused with a structural one.
+            let _ = write!(out, "S{}:", s.len());
+            out.push_str(s);
+        }
+        RuntimeValue::Bytes(b) => {
+            let _ = write!(out, "Y{}:", b.len());
+            for byte in b {
+                let _ = write!(out, "{byte:02x}");
             }
-            s.push(']');
-            s
+        }
+        RuntimeValue::Vector(vec) => {
+            // Full component content (bit-exact), not just the dimension.
+            let _ = write!(out, "V{}:", vec.len());
+            for x in vec {
+                let _ = write!(out, "{:08x}", x.to_bits());
+            }
+        }
+        RuntimeValue::Vector8 { codes, scale } => {
+            let _ = write!(out, "W{:08x}:{}:", scale.to_bits(), codes.len());
+            for c in codes {
+                let _ = write!(out, "{:02x}", *c as u8);
+            }
+        }
+        RuntimeValue::List(items) => {
+            let _ = write!(out, "L{}:", items.len());
+            for it in items {
+                fingerprint_into(out, it);
+            }
         }
         RuntimeValue::Map(m) => {
-            let mut s = "{".to_string();
-            for (i, (k, v)) in m.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(k);
-                s.push(':');
-                s.push_str(&fingerprint_value(v));
+            let _ = write!(out, "M{}:", m.len());
+            for (k, val) in m {
+                let _ = write!(out, "{}=", k.len());
+                out.push_str(k);
+                fingerprint_into(out, val);
             }
-            s.push('}');
-            s
         }
-        RuntimeValue::Node(n) => format!("n:{}", n.id),
-        RuntimeValue::Rel(r) => format!("r:{}:{}->{}", r.edge_type, r.src, r.dst),
-        RuntimeValue::Date(d) => format!("d:{}", d),
-        RuntimeValue::DateTime(d) => format!("dt:{}", d),
-        RuntimeValue::Bytes(b) => format!("b:{}", b.len()),
-        RuntimeValue::Vector(v) => format!("v:{}", v.len()),
-        RuntimeValue::Vector8 { codes, .. } => format!("v8:{}", codes.len()),
+        // A node's id is its identity; an edge's identity is (type, src, dst)
+        // — the storage key for edges — with the type length-prefixed.
+        RuntimeValue::Node(n) => {
+            let _ = write!(out, "N{};", n.id);
+        }
+        RuntimeValue::Rel(r) => {
+            let _ = write!(out, "R{}:{}{}>{};", r.edge_type.len(), r.edge_type, r.src, r.dst);
+        }
+        RuntimeValue::Date(d) => {
+            let _ = write!(out, "D{d};");
+        }
+        RuntimeValue::DateTime(d) => {
+            let _ = write!(out, "T{d};");
+        }
         RuntimeValue::Path(items) => {
-            let mut s = "p:[".to_string();
-            for (i, it) in items.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&fingerprint_value(it));
+            let _ = write!(out, "P{}:", items.len());
+            for it in items {
+                fingerprint_into(out, it);
             }
-            s.push(']');
-            s
         }
     }
 }
@@ -5896,6 +5938,40 @@ mod tests {
         let v = RuntimeValue::String(id.to_string());
         let parsed = node_id_from_value(&v, SourceSpan::point(0)).unwrap();
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn fingerprint_is_content_faithful_and_collision_free() {
+        // Distinct same-length vectors must NOT share a fingerprint (the old
+        // length-only encoding collapsed them → wrong count(DISTINCT)/GROUP BY).
+        let v1 = RuntimeValue::Vector(vec![1.0, 2.0]);
+        let v2 = RuntimeValue::Vector(vec![3.0, 4.0]);
+        assert_ne!(fingerprint_value(&v1), fingerprint_value(&v2));
+        assert_eq!(fingerprint_value(&v1), fingerprint_value(&RuntimeValue::Vector(vec![1.0, 2.0])));
+
+        // Distinct same-length byte strings (e.g. two 2-byte hashes).
+        let b1 = RuntimeValue::Bytes(vec![0x01, 0x02]);
+        let b2 = RuntimeValue::Bytes(vec![0x03, 0x04]);
+        assert_ne!(fingerprint_value(&b1), fingerprint_value(&b2));
+
+        // Floats differing past the 10th decimal must be distinct.
+        let f1 = RuntimeValue::Float(1.000_000_000_01);
+        let f2 = RuntimeValue::Float(1.000_000_000_02);
+        assert_ne!(fingerprint_value(&f1), fingerprint_value(&f2));
+        // +0.0 and -0.0 compare equal, so they must share a fingerprint.
+        assert_eq!(
+            fingerprint_value(&RuntimeValue::Float(0.0)),
+            fingerprint_value(&RuntimeValue::Float(-0.0))
+        );
+
+        // Separator collision: a string containing the old separators must not
+        // collide with a differently-structured list.
+        let l1 = RuntimeValue::List(vec![RuntimeValue::String("a,s:b".into())]);
+        let l2 = RuntimeValue::List(vec![
+            RuntimeValue::String("a".into()),
+            RuntimeValue::String("b".into()),
+        ]);
+        assert_ne!(fingerprint_value(&l1), fingerprint_value(&l2));
     }
 
     #[test]
