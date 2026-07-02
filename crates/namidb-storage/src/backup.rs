@@ -212,6 +212,37 @@ pub async fn copy_namespace_snapshot(
                 .await
                 .map_err(Error::ObjectStore)?;
         }
+        // Delete leftover write-once manifest version bodies above the restored
+        // v0. They would otherwise collide with the reopened writer's
+        // PutMode::Create on v1..vN → ManifestCommitCas → the restored namespace
+        // could never accept a write again (permanently bricked). Keep the v0
+        // body we just published; skip the pointer/ subdir and current.json.
+        let v0_str = dst_paths.manifest_version(0).as_ref().to_string();
+        let mut stale_bodies = Vec::new();
+        let mut ms = dst_store.list(Some(&dst_paths.manifest_dir()));
+        while let Some(meta) = ms.try_next().await.map_err(Error::ObjectStore)? {
+            let s = meta.location.as_ref();
+            let is_version_body = !s.contains("/pointer/")
+                && s.rsplit('/')
+                    .next()
+                    .map(|f| f.starts_with('v') && f.ends_with(".json"))
+                    .unwrap_or(false);
+            if is_version_body && s != v0_str {
+                stale_bodies.push(meta.location);
+            }
+        }
+        for loc in stale_bodies {
+            dst_store.delete(&loc).await.map_err(Error::ObjectStore)?;
+        }
+        // Delete the destination's stale memtable snapshot: recovery trusts it
+        // unconditionally, so leaving it would resurrect pre-restore rows and
+        // drop the restored WAL tail.
+        if dst_store.head(&dst_paths.memtable_snapshot()).await.is_ok() {
+            dst_store
+                .delete(&dst_paths.memtable_snapshot())
+                .await
+                .map_err(Error::ObjectStore)?;
+        }
     }
     let pointer = ManifestPointer {
         version: 0,

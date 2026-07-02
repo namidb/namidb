@@ -384,7 +384,13 @@ async fn compact_leveled(
                 store.as_ref(),
                 paths,
                 plan.target_level,
-                plan.is_deepest,
+                // Authoritative only when this merge spans the FULL corpus:
+                // deepest level AND a single node scope. `plan.is_deepest` alone
+                // treated a per-bucket deepest merge in a mixed-scope namespace
+                // (legacy per-label + id-primary "" scopes) as corpus-complete,
+                // rebuilding the index from one bucket and permanently
+                // truncating it — the same rule node-tombstone GC (`gc`) uses.
+                gc,
                 finish_max_lsn,
                 &base.manifest.label_dict,
                 &base.manifest.vector_indexes,
@@ -405,7 +411,9 @@ async fn compact_leveled(
                 store.as_ref(),
                 paths,
                 plan.target_level,
-                plan.is_deepest,
+                // Same corpus-authority rule as the vector build above and
+                // node-tombstone GC: deepest level AND single node scope.
+                gc,
                 finish_max_lsn,
                 &base.manifest.label_dict,
                 &base.manifest.text_indexes,
