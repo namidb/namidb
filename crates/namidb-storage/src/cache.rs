@@ -114,6 +114,17 @@ pub struct SstCache {
     /// SST run in `O(deg)` instead of `O(edge_count)`. Memory: ~8 B per
     /// edge in the SST.
     edge_readers: Arc<Mutex<HashMap<String, Arc<crate::sst::edges::EdgeSstReader>>>>,
+    /// Decoded `.ft` text indexes per SST path. Decoding bincode-deserialises
+    /// the whole inverted index; without this every `search.bm25` paid
+    /// `O(index size)` per query even with the body bytes cached.
+    #[cfg(feature = "text-index")]
+    text_indexes: Arc<Mutex<HashMap<String, Arc<crate::sst::text::TextIndex>>>>,
+    /// Decoded `.vg` vector indexes per SST path. Decoding deserialises every
+    /// stored vector plus the full Vamana adjacency AND clones the vectors into
+    /// the navigation space; without this every KNN (and each widening round)
+    /// paid `O(index size)` per query.
+    #[cfg(feature = "vector-index")]
+    vector_indexes: Arc<Mutex<HashMap<String, Arc<crate::sst::vector::VectorGraphIndex>>>>,
     stats: Arc<CacheStats>,
 }
 
@@ -152,8 +163,40 @@ impl SstCache {
             metadata: Arc::new(Mutex::new(HashMap::new())),
             edge_streams: Arc::new(Mutex::new(HashMap::new())),
             edge_readers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "text-index")]
+            text_indexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vector-index")]
+            vector_indexes: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(CacheStats::default()),
         }
+    }
+
+    /// Look up a decoded text index for an SST path. Returns `None` on miss;
+    /// the caller decodes once and re-inserts via [`Self::insert_text_index`].
+    /// SSTs are immutable per UUIDv7-keyed path so cached indexes never go
+    /// stale; superseded paths are pruned by [`Self::retain_paths`].
+    #[cfg(feature = "text-index")]
+    pub fn get_text_index(&self, key: &str) -> Option<Arc<crate::sst::text::TextIndex>> {
+        self.text_indexes.lock().unwrap().get(key).cloned()
+    }
+
+    /// Store a decoded text index for an SST path.
+    #[cfg(feature = "text-index")]
+    pub fn insert_text_index(&self, key: String, idx: Arc<crate::sst::text::TextIndex>) {
+        self.text_indexes.lock().unwrap().insert(key, idx);
+    }
+
+    /// Look up a decoded vector index for an SST path. Same contract as
+    /// [`Self::get_text_index`].
+    #[cfg(feature = "vector-index")]
+    pub fn get_vector_index(&self, key: &str) -> Option<Arc<crate::sst::vector::VectorGraphIndex>> {
+        self.vector_indexes.lock().unwrap().get(key).cloned()
+    }
+
+    /// Store a decoded vector index for an SST path.
+    #[cfg(feature = "vector-index")]
+    pub fn insert_vector_index(&self, key: String, idx: Arc<crate::sst::vector::VectorGraphIndex>) {
+        self.vector_indexes.lock().unwrap().insert(key, idx);
     }
 
     /// Look up a cached [`crate::sst::edges::EdgeSstReader`] for an SST
@@ -275,6 +318,16 @@ impl SstCache {
             .unwrap()
             .retain(|k, _| live.contains(k));
         self.edge_readers
+            .lock()
+            .unwrap()
+            .retain(|k, _| live.contains(k));
+        #[cfg(feature = "text-index")]
+        self.text_indexes
+            .lock()
+            .unwrap()
+            .retain(|k, _| live.contains(k));
+        #[cfg(feature = "vector-index")]
+        self.vector_indexes
             .lock()
             .unwrap()
             .retain(|k, _| live.contains(k));

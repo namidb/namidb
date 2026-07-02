@@ -2242,6 +2242,58 @@ impl<'mt> Snapshot<'mt> {
     /// VectorGraph SST and re-ranks — there is normally exactly one per index
     /// for an id-primary namespace, but a partial rebuild can briefly leave
     /// two. `ef` is the search beam width (≥ `k`).
+    /// Decoded `.vg` index for `desc`, via the process-wide [`SstCache`]:
+    /// decoding deserialises every stored vector plus the whole adjacency and
+    /// clones the vectors into the navigation space, so paying it once per SST
+    /// (instead of per query, and per widening round) is the difference between
+    /// `O(k)`-ish and `O(index size)` KNN latency. `Ok(None)` = undecodable
+    /// (legacy/corrupt) body — the caller skips it and the flat scan covers.
+    #[cfg(feature = "vector-index")]
+    async fn fetch_vector_index(
+        &self,
+        desc: &crate::manifest::SstDescriptor,
+    ) -> Result<Option<Arc<crate::sst::vector::VectorGraphIndex>>> {
+        use crate::sst::vector::VectorGraphIndex;
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(idx) = cache.get_vector_index(&absolute) {
+                return Ok(Some(idx));
+            }
+        }
+        let body = self.get_sst_body(desc).await?;
+        let Ok(idx) = VectorGraphIndex::decode(&body) else {
+            return Ok(None);
+        };
+        let idx = Arc::new(idx);
+        if let Some(cache) = self.cache.as_ref() {
+            cache.insert_vector_index(absolute, idx.clone());
+        }
+        Ok(Some(idx))
+    }
+
+    /// Decoded `.ft` index for `desc`, via the process-wide [`SstCache`] (same
+    /// once-per-SST story as [`Self::fetch_vector_index`]). Unlike `.vg`, a
+    /// corrupt text body is a hard error (the historical behaviour).
+    #[cfg(feature = "text-index")]
+    async fn fetch_text_index(
+        &self,
+        desc: &crate::manifest::SstDescriptor,
+    ) -> Result<Arc<crate::sst::text::TextIndex>> {
+        use crate::sst::text::TextIndex;
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(idx) = cache.get_text_index(&absolute) {
+                return Ok(idx);
+            }
+        }
+        let body = self.get_sst_body(desc).await?;
+        let idx = Arc::new(TextIndex::decode(&body)?);
+        if let Some(cache) = self.cache.as_ref() {
+            cache.insert_text_index(absolute, idx.clone());
+        }
+        Ok(idx)
+    }
+
     #[cfg(feature = "vector-index")]
     pub async fn vector_search(
         &self,
@@ -2250,8 +2302,6 @@ impl<'mt> Snapshot<'mt> {
         k: usize,
         ef: usize,
     ) -> Result<Vec<(NodeId, f32)>> {
-        use crate::sst::vector::VectorGraphIndex;
-
         let mut all: Vec<(NodeId, f32)> = Vec::new();
         // Score orientation is metric-dependent: cosine/dot are higher-is-closer,
         // euclidean is lower-is-closer. All `.vg` SSTs for one index share a
@@ -2261,10 +2311,9 @@ impl<'mt> Snapshot<'mt> {
             if desc.kind != SstKind::VectorGraph || desc.scope != index_name {
                 continue;
             }
-            let body = self.get_sst_body(desc).await?;
             // A legacy (v1) or corrupt body fails to decode; skip it so the read
             // falls back to the flat scan rather than erroring the whole query.
-            let Ok(idx) = VectorGraphIndex::decode(&body) else {
+            let Some(idx) = self.fetch_vector_index(desc).await? else {
                 continue;
             };
             higher_is_better = idx.higher_is_better();
@@ -2403,7 +2452,6 @@ impl<'mt> Snapshot<'mt> {
         query_terms: &[String],
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
-        use crate::sst::text::TextIndex;
 
         // Authoritative only if a TextIndex SST exists for this index...
         let has_index_sst = self
@@ -2416,15 +2464,38 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         // ...and there is no un-compacted node delta the index has not absorbed:
-        // any node memtable entry (committed or staged), or a persisted `Nodes`
-        // SST newer than the index (flushed/partially-merged but not yet folded
-        // into the index by an authoritative compaction). The LSN comparison
-        // catches data that a partial merge moved to L1+ as well as fresh L0
-        // flushes — see `index_outrun_by_nodes`.
-        let _ = label;
-        let memtable_delta = self.node_entries().next().is_some();
-        if memtable_delta || self.index_outrun_by_nodes(index_name, SstKind::TextIndex) {
+        // a persisted `Nodes` SST newer than the index (flushed/partially-merged
+        // but not yet folded in by an authoritative compaction — the LSN
+        // comparison catches both, see `index_outrun_by_nodes`)...
+        if self.index_outrun_by_nodes(index_name, SstKind::TextIndex) {
             return Ok(None);
+        }
+        // ...and no memtable/overlay entry that touches the indexed corpus. The
+        // check is label-scoped: an unflushed write to an UNRELATED label must
+        // not disable the index (it used to — under live mixed traffic every
+        // `search.bm25` became an `O(corpus)` flat scan). BM25 scores depend on
+        // corpus-wide stats (N, avgdl, df), so exact flat-scan parity allows
+        // serving only when the delta provably does not touch the corpus:
+        //   - an upsert CARRYING `label` is a live document delta → flat scan;
+        //   - a tombstone, or an upsert NOT carrying `label` (a possible
+        //     relabel), affects the corpus only if its id is an indexed
+        //     document — probed against the decoded index below.
+        let dict = &self.manifest.manifest.label_dict;
+        let mut dirty: Vec<[u8; 16]> = Vec::new();
+        for (mk, entry) in self.node_entries() {
+            let MemKey::Node { id } = mk else {
+                continue;
+            };
+            match &entry.op {
+                MemOp::Tombstone => dirty.push(*id.0.as_bytes()),
+                MemOp::Upsert(payload) => {
+                    let rec = NodeWriteRecord::decode(payload)?;
+                    if record_carries_label(&rec, label, dict) {
+                        return Ok(None);
+                    }
+                    dirty.push(*id.0.as_bytes());
+                }
+            }
         }
 
         let mut all: Vec<(NodeId, f64)> = Vec::new();
@@ -2432,8 +2503,13 @@ impl<'mt> Snapshot<'mt> {
             if desc.kind != SstKind::TextIndex || desc.scope != index_name {
                 continue;
             }
-            let body = self.get_sst_body(desc).await?;
-            let idx = TextIndex::decode(&body)?;
+            let idx = self.fetch_text_index(desc).await?;
+            // A dirty id that IS an indexed document means a stale doc (delete/
+            // relabel) the index would still serve, and its removal also shifts
+            // the corpus stats — only the flat scan is exact then.
+            if dirty.iter().any(|id| idx.contains_doc(id)) {
+                return Ok(None);
+            }
             all.extend(
                 idx.search(query_terms, k)
                     .into_iter()

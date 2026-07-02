@@ -94,6 +94,10 @@ pub fn build_body(
 #[derive(Debug)]
 pub struct TextIndex {
     body: TextIndexBody,
+    /// Sorted copy of `doc_ids` for `O(log n)` membership probes
+    /// ([`Self::contains_doc`] — the label-scoped freshness gate asks whether a
+    /// dirty memtable id is one of the indexed documents).
+    sorted_ids: Vec<[u8; 16]>,
 }
 
 impl TextIndex {
@@ -111,12 +115,19 @@ impl TextIndex {
         }
         let body: TextIndexBody = bincode::deserialize(rest)
             .map_err(|e| Error::invariant(format!("text index decode failed: {e}")))?;
-        Ok(Self { body })
+        let mut sorted_ids = body.doc_ids.clone();
+        sorted_ids.sort_unstable();
+        Ok(Self { body, sorted_ids })
     }
 
     /// Number of documents indexed.
     pub fn doc_count(&self) -> u64 {
         self.body.n_docs as u64
+    }
+
+    /// `true` when `id` is one of the indexed documents.
+    pub fn contains_doc(&self, id: &[u8; 16]) -> bool {
+        self.sorted_ids.binary_search(id).is_ok()
     }
 
     /// Full BM25 top-`k` for `query_terms` (already tokenized + lowercased;

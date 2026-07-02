@@ -960,3 +960,128 @@ async fn call_betweenness_directed_path() {
         .unwrap();
     assert_eq!(c_score, 4.0);
 }
+
+/// The text-index freshness gate is label-scoped: an unflushed write to an
+/// UNRELATED label (or a tombstone of a never-indexed id) must not disable the
+/// index, while any delta that touches the indexed corpus — a live :Note
+/// upsert, or a relabel/delete of an indexed document — still forces the exact
+/// flat scan. Asserted at the storage layer, where `Some` vs `None` IS the
+/// index-vs-fallback decision.
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn text_index_gate_is_label_scoped() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::{ManifestStore, TextIndexDescriptor};
+    use namidb_storage::memtable::{MemKey, MemOp, Memtable};
+    use namidb_storage::{compact_l0_to_l1, flush, WriterFence};
+
+    let store = store();
+    let p = paths("bm25-gate");
+    let ms = ManifestStore::new(store.clone(), p.clone());
+    let mut base = ms.bootstrap(uuid::Uuid::now_v7()).await.unwrap();
+    let note_id = base.manifest.label_dict.intern("Note");
+    base.manifest.text_indexes.push(TextIndexDescriptor::new(
+        "note_ft".into(),
+        "Note".into(),
+        vec!["body".into()],
+    ));
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+        })
+        .unwrap()
+        .build();
+    let fence = WriterFence::new(base.manifest.epoch);
+
+    let bodies = ["fox the cat", "common the dog", "common the bird"];
+    let mut ids: Vec<NodeId> = Vec::new();
+    let mut cur = base;
+    let mut lsn: u64 = 0;
+    for chunk in bodies.chunks(2) {
+        let mut mt = Memtable::new();
+        for b in chunk {
+            let id = NodeId::new();
+            ids.push(id);
+            let mut props = BTreeMap::new();
+            props.insert("body".to_string(), namidb_core::Value::Str(b.to_string()));
+            let rec = NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![note_id.0],
+            };
+            lsn += 1;
+            mt.apply(MemKey::Node { id }, lsn, MemOp::Upsert(rec.encode().unwrap()));
+        }
+        cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+            .await
+            .unwrap()
+            .committed;
+    }
+    compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+
+    let mut writer = WriterSession::open(store.clone(), p.clone()).await.unwrap();
+    let fox = vec!["fox".to_string()];
+
+    // Baseline: compacted, no delta → the index serves.
+    assert!(
+        writer
+            .snapshot()
+            .text_search("note_ft", "Note", &fox, Some(5))
+            .await
+            .unwrap()
+            .is_some(),
+        "compacted index must serve"
+    );
+
+    // Unrelated-label write (fresh id): the index must KEEP serving — this was
+    // the O(corpus)-scan-per-query regression under live mixed traffic.
+    writer
+        .upsert_node("Other", NodeId::new(), &node_with_body("noise"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let hits = writer
+        .snapshot()
+        .text_search("note_ft", "Note", &fox, Some(5))
+        .await
+        .unwrap()
+        .expect("unrelated-label delta must not disable the index");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, ids[0], "the fox doc still ranks");
+
+    // Tombstone of a never-indexed id: still clean for this corpus.
+    writer.tombstone_node("Other", NodeId::new()).unwrap();
+    writer.commit_batch().await.unwrap();
+    assert!(
+        writer
+            .snapshot()
+            .text_search("note_ft", "Note", &fox, Some(5))
+            .await
+            .unwrap()
+            .is_some(),
+        "tombstone of a non-corpus id must not disable the index"
+    );
+
+    // Relabel of an INDEXED document (upsert without :Note): the index would
+    // serve the stale doc and its removal shifts the corpus stats → flat scan.
+    writer
+        .upsert_node("Other", ids[0], &node_with_body("fox the cat"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snap = writer.snapshot();
+    assert!(
+        snap.text_search("note_ft", "Note", &fox, Some(5))
+            .await
+            .unwrap()
+            .is_none(),
+        "a dirty id inside the corpus must force the flat scan"
+    );
+    // End-to-end parity: the flat fallback no longer finds the relabeled doc.
+    let rows = run(
+        &snap,
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox'}) \
+         YIELD node, score RETURN node",
+    )
+    .await;
+    assert!(rows.is_empty(), "relabeled doc must not be served: {rows:?}");
+}
