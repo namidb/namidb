@@ -152,14 +152,23 @@ CALL algo.triangle_count() YIELD node_id, triangles, coefficient RETURN *;
 -- Hop distance from a starting node (BFS; pass weighted: true for Dijkstra).
 CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops RETURN *;
 
+-- Modularity communities (Louvain) and bridge nodes (Brandes betweenness).
+CALL algo.louvain() YIELD node_id, community RETURN node_id, community;
+CALL algo.betweenness() YIELD node_id, score RETURN node_id, score ORDER BY score DESC LIMIT 10;
+
 -- Structural embeddings from pure graph shape (FastRP) — no model, no service.
 -- The output is a FloatVector, ready to store and serve from a vector index:
 -- "find structurally similar nodes" becomes a KNN over the graph itself.
 CALL algo.fastRP({dimension: 256, iterations: 4, seed: 42}) YIELD node_id, embedding
 RETURN node_id, embedding;
+
+-- Every algo.* takes an optional graph projection: restrict to labels /
+-- edge types (the induced subgraph) and pick the orientation.
+CALL algo.pagerank({labels: ['Person'], edge_types: ['KNOWS'], direction: 'undirected'})
+YIELD node_id, score RETURN node_id, score ORDER BY score DESC LIMIT 10;
 ```
 
-The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `shortest_path`, `fastRP`. They run exact (no sampling), are deterministic, and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
+The full set: `wcc`, `scc`, `pagerank`, `degree`, `triangle_count`, `label_propagation`, `louvain`, `betweenness`, `shortest_path`, `fastRP`. They run exact (no sampling), are deterministic, and honour the query deadline, so a heavy call on a large graph is interruptible. The same algorithms are one call away for agents through the MCP `graph_algorithm` tool.
 
 <br />
 
@@ -268,6 +277,8 @@ YIELD node, score
 RETURN node.title AS title, score ORDER BY score DESC;
 ```
 
+The query string understands quoted **phrases** and trailing-`*` **prefixes** alongside plain terms — `'"graph database" stor*'` requires the exact adjacent phrase and expands the prefix over the vocabulary — with identical semantics on the index path and the flat-scan fallback.
+
 By default this scans the label and computes corpus statistics on the fly. For large collections, register a persistent inverted index so the same query answers from precomputed postings instead of re-scanning — build the server with `--features text-index` (or use the prebuilt server, below), then:
 
 ```cypher
@@ -277,6 +288,8 @@ CREATE FULLTEXT INDEX doc_ft IF NOT EXISTS ON :Doc(title, body);
 `IF NOT EXISTS` sits between the name and `ON` here too, keeping migration scripts idempotent.
 
 The index is built during compaction and `CALL search.bm25` uses it automatically when its `(label, properties)` match (falling back to the scan otherwise).
+
+A mis-created index is not permanent: `DROP INDEX doc_ft [IF EXISTS]` removes a fulltext index and `DROP VECTOR INDEX doc_emb [IF EXISTS]` a vector one — the descriptor and the index's SSTs go in one commit, writes constrained by a wrong-dimension vector index are immediately un-bricked, and the freed `(label, properties)` slot can be re-created corrected.
 
 **Hybrid search** fuses both channels natively — `CALL search.hybrid(...)` runs the dense (vector KNN) and sparse (BM25) retrievals and combines them with **Reciprocal Rank Fusion** (the default; `fusion: 'linear'` for a weighted blend). Each leg serves from its index or its exact flat scan, so the result is always fresh:
 
