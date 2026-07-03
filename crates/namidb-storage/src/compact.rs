@@ -53,39 +53,74 @@
 //! folds the result into the manifest **current at commit time** and runs
 //! the fence-checked CAS. [`crate::ingest::WriterSession::compaction_basis`]
 //! snapshots the inputs under the lock so the prepare can run off it.
+//!
+//! ## Streaming merge
+//!
+//! The prepare phase merges each bucket with a k-way streaming merge
+//! instead of materialising every decoded source row. Per-source cursors
+//! decode one row group (nodes) / one partner block + property-stream
+//! mini-batch (edges) at a time; a binary heap keyed by
+//! `(key asc, lsn desc, source order)` picks the winner per key, shadowed
+//! duplicates are skipped without ever being converted, and only winners
+//! pay the row materialisation (for nodes, the JSON property-map
+//! re-encode — typically 3-10x the Parquet size) on their way into a
+//! bounded chunk buffer feeding the incremental SST writer. The
+//! sidecar/stat harvesters and the vector/text index member collectors
+//! observe the same winner stream, so nothing retains the merged bucket.
+//!
+//! Residual memory per bucket, by design: the **compressed** source bodies
+//! (all sources must be open simultaneously; their sum is bounded by the
+//! level budget), one decoded row group per node source, one chunk of
+//! winner rows, the sidecar maps, and — the true lower bound — the
+//! embeddings / documents collected for a vector/text index rebuild, which
+//! the Vamana/BM25 builders inherently need in full.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, FixedSizeBinaryArray, ListArray, StringArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, FixedSizeBinaryArray, ListArray, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
+use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use parquet::file::metadata::ParquetMetaData;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
+use namidb_core::{EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
-use crate::flush::{build_edge_sst, build_node_sst, NodeRow, NodeWriteRecord};
+use crate::flush::{
+    EqualitySidecarCollector, IncrementalNodeSstWriter, LabelIndexCollector, NodeRow,
+    NodeWriteRecord, PerLabelStatsCollector, UniqueSidecarCollector, NODE_SST_BATCH_ROWS,
+};
 #[cfg(feature = "vector-index")]
 use crate::manifest::VectorIndexDescriptor;
 use crate::manifest::{
-    KindSpecificStats, LoadedManifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
+    KindSpecificStats, LoadedManifest, ManifestStore, PerLabelPropertyStat, SstDescriptor, SstKind,
+    SstLevel,
 };
 use crate::memtable::MemOp;
 use crate::paths::NamespacePaths;
 use crate::read::arrow_value_to_value;
 use crate::sst::bloom::{BloomDescriptor, BloomFilter};
+use crate::sst::edges::encoding::{read_offset, read_partner_block, OffsetWidth};
+use crate::sst::edges::format::{
+    CODEC_NONE, CODEC_ZSTD, OVERFLOW_JSON_NAME, SECTION_KEY_IDS, SECTION_OFFSETS, SECTION_PARTNERS,
+    SECTION_PER_EDGE_LSN, SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
+};
 use crate::sst::edges::reader::EdgeSstReader;
-use crate::sst::edges::writer::{EdgeRecord, EdgeSstFinish};
+use crate::sst::edges::writer::{EdgeRecord, EdgeSstFinish, EdgeSstWriter, EdgeSstWriterOptions};
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
-    prop_column_name, NodeSstFinish, NodeSstReader, COL_LABELS, COL_LSN, COL_NODE_ID,
-    COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    parse_node_sst_metadata, prop_column_name, NodeSstFinish, NodeSstReader, NodeSstWriterOptions,
+    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 
 /// Outcome of [`compact_l0_to_l1`].
@@ -497,33 +532,71 @@ async fn prepare_leveled(
         } else {
             label_def.clone()
         };
-        // Extract each source's rows as soon as its body arrives and drop the
-        // reader before fetching the next: holding every input body + decoded
-        // Arrow batches simultaneously scaled compaction's peak memory with
-        // the whole level. The working set is the merged rows; bodies persist
-        // only in the byte-bounded SstCache.
-        let mut input_rows: Vec<NodeRow> = Vec::new();
-        for desc in &plan.inputs {
-            let body = get_sst_body(store.as_ref(), paths, desc).await?;
-            let reader = NodeSstReader::open(label_def.clone(), body)?;
-            input_rows.extend(extract_node_rows_from_reader(&reader, &label_def)?);
-        }
         // GC tombstones only when this merge is authoritative: a single node
         // scope (no other scope can hold the key) AND the output is the
         // bucket's deepest level (no older un-merged level below it).
         let gc = node_gc_safe && plan.is_deepest;
-        // The sort + dedup + Arrow re-encode is pure CPU over the collected
-        // rows; run it on the blocking pool so a large bucket does not stall
-        // the async runtime for its duration.
+        // GET every input body up front: the k-way merge needs each source
+        // open simultaneously, but only as COMPRESSED bytes — the level
+        // budget bounds their sum. Decoded rows never accumulate; the merge
+        // streams them row-group by row-group.
+        let mut bodies: Vec<Bytes> = Vec::with_capacity(plan.inputs.len());
+        for desc in &plan.inputs {
+            bodies.push(get_sst_body(store.as_ref(), paths, desc).await?);
+        }
+        // Vector/text member collection happens during the winner stream, and
+        // is gated on the merge being authoritative for the FULL corpus:
+        // deepest level AND a single node scope (`gc`). `plan.is_deepest`
+        // alone treated a per-bucket deepest merge in a mixed-scope namespace
+        // (legacy per-label + id-primary "" scopes) as corpus-complete,
+        // rebuilding the index from one bucket and permanently truncating it
+        // — the same rule node-tombstone GC uses. On a partial merge the
+        // spec list stays empty: the existing `.vg`/`.ft` is left untouched
+        // and the freshness gate (`index_outrun_by_nodes`) routes reads to
+        // the exact flat scan until an authoritative merge rebuilds it.
+        let index_specs = NodeMergeIndexSpecs {
+            #[cfg(feature = "vector-index")]
+            vector: if gc {
+                base.manifest.vector_indexes.clone()
+            } else {
+                Vec::new()
+            },
+            #[cfg(feature = "text-index")]
+            text: if gc {
+                base.manifest.text_indexes.clone()
+            } else {
+                Vec::new()
+            },
+        };
+        // The whole k-way merge (per-row-group decode, heap, winner
+        // re-encode, incremental Parquet write, sidecar/stat/index-member
+        // harvesting) is pure CPU over the owned bodies; run it on the
+        // blocking pool so a large bucket does not stall the async runtime
+        // for its duration.
         let merge_def = label_def.clone();
-        let (finish, merged_rows) =
-            run_cpu(move || compact_node_rows(&merge_def, input_rows, gc)).await??;
+        let merge_sidecar_def = sidecar_def;
+        let merge_schema = schema.clone();
+        let merge_dict = base.manifest.label_dict.clone();
+        let merge_scope = label.clone();
+        let out = run_cpu(move || {
+            merge_node_sources(
+                bodies,
+                &merge_def,
+                &merge_sidecar_def,
+                gc,
+                &merge_schema,
+                &merge_dict,
+                &merge_scope,
+                index_specs,
+            )
+        })
+        .await??;
         // The highest LSN in the merged corpus — stamped onto any SST-backed
         // index (vector / text) rebuilt from these rows so a later freshness
         // check can tell whether a newer Nodes SST has outrun the index.
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
-        let finish_max_lsn = finish.stats.max_lsn;
-        if finish.stats.row_count == 0 {
+        let finish_max_lsn = out.finish.stats.max_lsn;
+        if out.finish.stats.row_count == 0 {
             // Nothing to write; still mark the merged sources for removal so
             // the bucket truly shrinks.
             for src in &plan.inputs {
@@ -536,11 +609,8 @@ async fn prepare_leveled(
             paths,
             plan.target_level,
             &label,
-            &sidecar_def,
-            &merged_rows,
-            finish,
-            schema,
-            &base.manifest.label_dict,
+            out.sidecars,
+            out.finish,
         )
         .await?;
         if wrote_bloom {
@@ -554,25 +624,15 @@ async fn prepare_leveled(
         // RFC-030 (`vector-index`): rebuild Vamana indexes whose label has
         // nodes in this bucket. A graph is not row-mergeable, so any prior
         // VectorGraph SST for a rebuilt index is dropped (replaced) and the
-        // fresh one written from the GC'd merged node rows.
+        // fresh one built from the members the winner stream collected.
         #[cfg(feature = "vector-index")]
         {
-            let (new_vg, old_vg_ids) = build_vector_indexes_for_nodes(
+            let (new_vg, old_vg_ids) = build_vector_indexes_from_members(
                 store.as_ref(),
                 paths,
                 plan.target_level,
-                // Authoritative only when this merge spans the FULL corpus:
-                // deepest level AND a single node scope. `plan.is_deepest` alone
-                // treated a per-bucket deepest merge in a mixed-scope namespace
-                // (legacy per-label + id-primary "" scopes) as corpus-complete,
-                // rebuilding the index from one bucket and permanently
-                // truncating it — the same rule node-tombstone GC (`gc`) uses.
-                gc,
                 finish_max_lsn,
-                &base.manifest.label_dict,
-                &base.manifest.vector_indexes,
-                &merged_rows,
-                &label,
+                out.vector_members,
                 &vector_buckets,
             )
             .await?;
@@ -581,21 +641,15 @@ async fn prepare_leveled(
         }
 
         // (`text-index`): rebuild full-text indexes whose label has nodes in this
-        // bucket, from the same GC'd merged node rows (rebuild-not-merge).
+        // bucket, from the same winner stream (rebuild-not-merge).
         #[cfg(feature = "text-index")]
         {
-            let (new_ft, old_ft_ids) = build_text_indexes_for_nodes(
+            let (new_ft, old_ft_ids) = build_text_indexes_from_members(
                 store.as_ref(),
                 paths,
                 plan.target_level,
-                // Same corpus-authority rule as the vector build above and
-                // node-tombstone GC: deepest level AND single node scope.
-                gc,
                 finish_max_lsn,
-                &base.manifest.label_dict,
-                &base.manifest.text_indexes,
-                &merged_rows,
-                &label,
+                out.text_members,
                 &text_buckets,
             )
             .await?;
@@ -761,21 +815,25 @@ async fn compact_and_write_edges(
         .as_ref()
         .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default();
-    // Same early-drop discipline as the node path: extract each source's
-    // rows as its body arrives instead of holding every reader (body +
-    // decoded streams) across the whole merge.
-    let mut rows: Vec<EdgeRecord> = Vec::new();
+    // GET every source body up front (compressed bytes only; the level
+    // budget bounds their sum), then k-way stream the merge on the blocking
+    // pool — decoded partner blocks and property strings never accumulate
+    // beyond the per-source cursor positions.
+    let mut bodies: Vec<Bytes> = Vec::with_capacity(sources.len());
     for desc in sources {
-        let body = get_sst_body(store, paths, desc).await?;
-        let reader = EdgeSstReader::open(body)?;
-        extract_edge_rows_from_reader(&reader, &declared_property_names, &mut rows)?;
+        bodies.push(get_sst_body(store, paths, desc).await?);
     }
-    // Pure-CPU merge (sort + dedup + CSR re-encode) on the blocking pool,
-    // same reasoning as the node path.
     let merge_type = edge_type.to_string();
     let merge_def = edge_def.clone();
     let finish = run_cpu(move || {
-        compact_edge_rows(&merge_type, merge_def.as_ref(), rows, direction, gc_tombstones)
+        merge_edge_sources(
+            bodies,
+            &merge_type,
+            merge_def.as_ref(),
+            &declared_property_names,
+            direction,
+            gc_tombstones,
+        )
     })
     .await??;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
@@ -787,111 +845,407 @@ async fn compact_and_write_edges(
     Ok((Some(descriptor), wrote_bloom, removed))
 }
 
-fn compact_node_rows(
-    label_def: &LabelDef,
-    mut rows: Vec<NodeRow>,
-    gc_tombstones: bool,
-) -> Result<(NodeSstFinish, Vec<NodeRow>)> {
-    // Sort by node_id ascending; within ties, highest LSN first so the
-    // dedup_by_key below preserves the winner.
-    rows.sort_by(|a, b| a.id.cmp(&b.id).then(b.lsn.cmp(&a.lsn)));
-    rows.dedup_by_key(|r| r.id);
-    // Tombstone GC (RFC-027 P3): a key whose winning op is a tombstone has
-    // no live value, and when this merge is authoritative for the node
-    // keyspace (`gc_tombstones`, see the caller) it is the only SST that
-    // could hold the key at the new manifest version, so the tombstone
-    // shadows nothing and is dropped entirely. Readers pinned at older
-    // versions still see the delete through the retained source bodies (the
-    // horizon-aware sweep keeps them). This is what stops a delete-heavy
-    // workload from carrying its tombstones forever.
-    if gc_tombstones {
-        rows.retain(|r| !matches!(r.op, MemOp::Tombstone));
-    }
-    let finish = build_node_sst(label_def, &rows)?;
-    // Caller (`put_node_sst_l1`) consumes the merged rows to re-emit
-    // the unique-property side-cars; without this, post-compaction
-    // lookups on `(label, unique_prop)` fall back to the legacy full
-    // scan (P4.19 sidecar emission only happened in flush).
-    Ok((finish, rows))
+// ── Streaming k-way node merge ──────────────────────────────────────────
+
+/// Typed column accessors for one decoded batch of a node source, downcast
+/// once per batch so per-row peeks during the merge stay cheap.
+struct NodeBatchView {
+    batch: RecordBatch,
+    ids: FixedSizeBinaryArray,
+    tombstones: BooleanArray,
+    lsns: UInt64Array,
+    overflow: StringArray,
+    schema_versions: UInt64Array,
 }
 
-fn extract_node_rows_from_reader(
-    reader: &NodeSstReader,
-    label_def: &LabelDef,
-) -> Result<Vec<NodeRow>> {
-    let batches = reader.scan()?;
-    let mut out: Vec<NodeRow> = Vec::new();
-    for batch in batches {
-        let id_col = batch
-            .column_by_name(COL_NODE_ID)
-            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
-            .ok_or_else(|| Error::invariant("node_id column missing"))?;
-        let tomb_col = batch
-            .column_by_name(COL_TOMBSTONE)
-            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
-            .ok_or_else(|| Error::invariant("tombstone column missing"))?;
-        let lsn_col = batch
-            .column_by_name(COL_LSN)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| Error::invariant("lsn column missing"))?;
-        let ovf_col = batch
-            .column_by_name(OVERFLOW_JSON)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
-        let sv_col = batch
-            .column_by_name(SCHEMA_VERSION)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
+impl NodeBatchView {
+    fn new(batch: RecordBatch) -> Result<Self> {
+        fn col<T: Clone + 'static>(batch: &RecordBatch, name: &str) -> Result<T> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<T>())
+                .cloned()
+                .ok_or_else(|| Error::invariant(format!("{name} column missing")))
+        }
+        Ok(Self {
+            ids: col(&batch, COL_NODE_ID)?,
+            tombstones: col(&batch, COL_TOMBSTONE)?,
+            lsns: col(&batch, COL_LSN)?,
+            overflow: col(&batch, OVERFLOW_JSON)?,
+            schema_versions: col(&batch, SCHEMA_VERSION)?,
+            batch,
+        })
+    }
 
-        for row in 0..batch.num_rows() {
-            let id: [u8; 16] = id_col
-                .value(row)
-                .try_into()
-                .map_err(|_| Error::invariant("node_id row length != 16"))?;
-            let lsn = lsn_col.value(row);
-            let tomb = tomb_col.value(row);
-            if tomb {
-                out.push(NodeRow {
+    fn len(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    fn key(&self, row: usize) -> Result<([u8; 16], u64)> {
+        let id: [u8; 16] = self
+            .ids
+            .value(row)
+            .try_into()
+            .map_err(|_| Error::invariant("node_id row length != 16"))?;
+        Ok((id, self.lsns.value(row)))
+    }
+
+    /// Convert one row to a [`NodeRow`] — the JSON property-map re-encode
+    /// the merge pays for winners only. Returns the decoded record alongside
+    /// so the sidecar/stat/index-member collectors don't re-decode it.
+    fn materialize(
+        &self,
+        row: usize,
+        label_def: &LabelDef,
+    ) -> Result<(NodeRow, Option<NodeWriteRecord>)> {
+        let (id, lsn) = self.key(row)?;
+        if self.tombstones.value(row) {
+            return Ok((
+                NodeRow {
                     id,
                     lsn,
                     op: MemOp::Tombstone,
-                });
-                continue;
+                },
+                None,
+            ));
+        }
+        // Rebuild properties: declared columns + overflow_json.
+        let mut properties: BTreeMap<String, Value> = BTreeMap::new();
+        for p in &label_def.properties {
+            let col_name = prop_column_name(p);
+            let col = self
+                .batch
+                .column_by_name(&col_name)
+                .ok_or_else(|| Error::invariant(format!("missing column {col_name}")))?;
+            if let Some(v) = arrow_value_to_value(col.as_ref(), row, &p.data_type)? {
+                properties.insert(p.name.clone(), v);
             }
-
-            // Rebuild properties: declared columns + overflow_json.
-            let mut properties: BTreeMap<String, Value> = BTreeMap::new();
-            for p in &label_def.properties {
-                let col_name = prop_column_name(p);
-                let col = batch
-                    .column_by_name(&col_name)
-                    .ok_or_else(|| Error::invariant(format!("missing column {col_name}")))?;
-                if let Some(v) = arrow_value_to_value(col.as_ref(), row, &p.data_type)? {
-                    properties.insert(p.name.clone(), v);
-                }
-            }
-            if !ovf_col.is_null(row) {
-                let extra: BTreeMap<String, Value> = serde_json::from_str(ovf_col.value(row))?;
-                properties.extend(extra);
-            }
-            let schema_version = sv_col.value(row);
-            let payload = NodeWriteRecord {
-                properties,
-                schema_version,
-                // Preserve the on-row label set (raw LabelIds) so the merged L1
-                // SST keeps it. Legacy SSTs have no __labels column and yield an
-                // empty set; their L1 stays scope-typed and reads via fallback.
-                labels: raw_labels_from_batch(&batch, row),
-            }
-            .encode()?;
-            out.push(NodeRow {
+        }
+        if !self.overflow.is_null(row) {
+            let extra: BTreeMap<String, Value> = serde_json::from_str(self.overflow.value(row))?;
+            properties.extend(extra);
+        }
+        let rec = NodeWriteRecord {
+            properties,
+            schema_version: self.schema_versions.value(row),
+            // Preserve the on-row label set (raw LabelIds) so the merged
+            // SST keeps it. Legacy SSTs have no __labels column and yield an
+            // empty set; their output stays scope-typed and reads via
+            // fallback.
+            labels: raw_labels_from_batch(&self.batch, row),
+        };
+        let payload = rec.encode()?;
+        Ok((
+            NodeRow {
                 id,
                 lsn,
                 op: MemOp::Upsert(payload),
-            });
+            },
+            Some(rec),
+        ))
+    }
+}
+
+/// Sorted row cursor over one node source SST. Decodes ON DEMAND, one row
+/// group at a time (the writer keeps `node_id` strictly ascending across
+/// the SST, so cursor order is key order); at any moment only the current
+/// row group's batches are resident. `row_groups_decoded` is the probe the
+/// laziness tests assert on.
+struct NodeSourceCursor {
+    reader: NodeSstReader,
+    md: Arc<ParquetMetaData>,
+    next_row_group: usize,
+    row_group_count: usize,
+    /// Decoded batches of the CURRENT row group, front-first.
+    views: VecDeque<NodeBatchView>,
+    /// Row index into `views.front()`.
+    row: usize,
+    /// `(id, lsn)` of the current row; `None` once exhausted.
+    current: Option<([u8; 16], u64)>,
+    /// Row groups decoded so far (test probe).
+    row_groups_decoded: usize,
+    /// Total row count per the Parquet footer (bloom sizing upper bound).
+    total_rows: u64,
+}
+
+impl NodeSourceCursor {
+    fn open(label_def: &LabelDef, body: Bytes) -> Result<Self> {
+        let md = parse_node_sst_metadata(&body)?;
+        let reader = NodeSstReader::open(label_def.clone(), body)?;
+        let row_group_count = md.num_row_groups();
+        let total_rows = md.file_metadata().num_rows().max(0) as u64;
+        let mut cursor = Self {
+            reader,
+            md,
+            next_row_group: 0,
+            row_group_count,
+            views: VecDeque::new(),
+            row: 0,
+            current: None,
+            row_groups_decoded: 0,
+            total_rows,
+        };
+        cursor.position()?;
+        Ok(cursor)
+    }
+
+    /// Advance `views`/`row` to the next available row (decoding further row
+    /// groups as needed) and cache its key in `current`.
+    fn position(&mut self) -> Result<()> {
+        loop {
+            if let Some(front) = self.views.front() {
+                if self.row < front.len() {
+                    self.current = Some(front.key(self.row)?);
+                    return Ok(());
+                }
+                self.views.pop_front();
+                self.row = 0;
+                continue;
+            }
+            if self.next_row_group >= self.row_group_count {
+                self.current = None;
+                return Ok(());
+            }
+            let rg = self.next_row_group;
+            self.next_row_group += 1;
+            self.row_groups_decoded += 1;
+            for (_, batches) in self.reader.scan_row_groups_each(&self.md, &[rg])? {
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        self.views.push_back(NodeBatchView::new(batch)?);
+                    }
+                }
+            }
+            self.row = 0;
         }
     }
-    Ok(out)
+
+    /// `(id, lsn)` of the current row without materialising it.
+    fn peek(&self) -> Option<([u8; 16], u64)> {
+        self.current
+    }
+
+    /// Materialise the current row (winners only — losers skip straight to
+    /// [`Self::advance`]).
+    fn materialize_current(
+        &self,
+        label_def: &LabelDef,
+    ) -> Result<(NodeRow, Option<NodeWriteRecord>)> {
+        let view = self
+            .views
+            .front()
+            .ok_or_else(|| Error::invariant("node merge cursor materialised past its end"))?;
+        view.materialize(self.row, label_def)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.row += 1;
+        self.position()
+    }
+}
+
+/// Heap key for the node k-way merge: id ascending, then LSN **descending**
+/// (the first entry popped for an id is its winner), then source order —
+/// the same total order the materialised merge's stable
+/// `sort_by(id, lsn desc)` over plan-input-concatenated rows produced, so
+/// exact `(id, lsn)` ties still resolve to the earlier source.
+#[derive(PartialEq, Eq)]
+struct NodeHeapEntry {
+    id: [u8; 16],
+    lsn: u64,
+    src: usize,
+}
+
+impl Ord for NodeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id
+            .cmp(&other.id)
+            .then(other.lsn.cmp(&self.lsn))
+            .then(self.src.cmp(&other.src))
+    }
+}
+
+impl PartialOrd for NodeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Index descriptors whose members the streaming node merge collects while
+/// the winner stream advances. Populated only for authoritative merges;
+/// empty otherwise (and empty with the features off).
+#[derive(Default)]
+struct NodeMergeIndexSpecs {
+    #[cfg(feature = "vector-index")]
+    vector: Vec<VectorIndexDescriptor>,
+    #[cfg(feature = "text-index")]
+    text: Vec<crate::manifest::TextIndexDescriptor>,
+}
+
+/// Everything the streaming node merge harvests from the winner stream for
+/// [`put_node_sst_leveled`], in place of the old `&merged_rows` re-walks.
+struct NodeSidecarHarvest {
+    unique: UniqueSidecarCollector,
+    equality: EqualitySidecarCollector,
+    label_index: LabelIndexCollector,
+    per_label_property_stats: Vec<PerLabelPropertyStat>,
+}
+
+/// Per-index `(descriptor, collected (id, embedding) members)` pairs the
+/// winner stream produced. Aliased for clippy's type-complexity lint.
+#[cfg(feature = "vector-index")]
+type VectorIndexMembers = Vec<(VectorIndexDescriptor, Vec<([u8; 16], Vec<f32>)>)>;
+
+/// Per-index `(descriptor, collected (id, document) members)` pairs the
+/// winner stream produced. Aliased for clippy's type-complexity lint.
+#[cfg(feature = "text-index")]
+type TextIndexMembers = Vec<(
+    crate::manifest::TextIndexDescriptor,
+    Vec<([u8; 16], String)>,
+)>;
+
+/// Output of [`merge_node_sources`].
+struct NodeMergeOutput {
+    finish: NodeSstFinish,
+    sidecars: NodeSidecarHarvest,
+    #[cfg(feature = "vector-index")]
+    vector_members: VectorIndexMembers,
+    #[cfg(feature = "text-index")]
+    text_members: TextIndexMembers,
+}
+
+/// Rows buffered per output chunk during the streaming merge. Reads
+/// `NAMIDB_COMPACTION_MERGE_CHUNK_ROWS` so chunk-boundary tests can force
+/// tiny chunks; falls back to the flush path's 16 Ki.
+fn merge_chunk_rows() -> usize {
+    std::env::var("NAMIDB_COMPACTION_MERGE_CHUNK_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(NODE_SST_BATCH_ROWS)
+}
+
+/// K-way streaming merge of one node bucket. Preserves the materialised
+/// merge's semantics exactly: per id the highest-LSN row wins (source order
+/// breaks exact ties), lower-LSN versions are dropped, and a winning
+/// tombstone is dropped entirely when `gc_tombstones` (RFC-027 P3 — see the
+/// caller for the authority rule; readers pinned at older versions still
+/// see the delete through the retained source bodies). Winners stream into
+/// the incremental SST writer in bounded chunks and are observed by the
+/// sidecar/stat harvesters and the vector/text member collectors as they
+/// pass; shadowed duplicates are skipped without ever being materialised.
+#[allow(clippy::too_many_arguments)]
+fn merge_node_sources(
+    bodies: Vec<Bytes>,
+    label_def: &LabelDef,
+    sidecar_def: &LabelDef,
+    gc_tombstones: bool,
+    schema: &Schema,
+    label_dict: &LabelDictionary,
+    bucket_scope: &str,
+    index_specs: NodeMergeIndexSpecs,
+) -> Result<NodeMergeOutput> {
+    let mut cursors: Vec<NodeSourceCursor> = Vec::with_capacity(bodies.len());
+    let mut total_rows: u64 = 0;
+    for body in bodies {
+        let cursor = NodeSourceCursor::open(label_def, body)?;
+        total_rows = total_rows.saturating_add(cursor.total_rows);
+        cursors.push(cursor);
+    }
+
+    // `expected_keys` sizes the bloom from the pre-dedup input total — an
+    // upper bound (the merged count is unknowable without a second pass),
+    // so the filter errs slightly larger / lower-FP than the materialised
+    // merge's exact sizing. Everything else about the output is identical.
+    let options = NodeSstWriterOptions {
+        expected_keys: total_rows,
+        ..Default::default()
+    };
+    let mut writer = IncrementalNodeSstWriter::new(label_def, options, merge_chunk_rows())?;
+    let mut unique = UniqueSidecarCollector::new(sidecar_def);
+    let mut equality = EqualitySidecarCollector::new(sidecar_def);
+    let mut label_index = LabelIndexCollector::new();
+    let mut stats = PerLabelStatsCollector::new();
+    #[cfg(feature = "vector-index")]
+    let mut vector_collectors: Vec<VectorMemberCollector> = index_specs
+        .vector
+        .into_iter()
+        .map(|desc| VectorMemberCollector::new(desc, label_dict))
+        .collect();
+    #[cfg(feature = "text-index")]
+    let mut text_collectors: Vec<TextMemberCollector> = index_specs
+        .text
+        .into_iter()
+        .map(|desc| TextMemberCollector::new(desc, label_dict))
+        .collect();
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let _ = &index_specs;
+
+    let mut heap: BinaryHeap<Reverse<NodeHeapEntry>> = BinaryHeap::with_capacity(cursors.len());
+    for (src, cursor) in cursors.iter().enumerate() {
+        if let Some((id, lsn)) = cursor.peek() {
+            heap.push(Reverse(NodeHeapEntry { id, lsn, src }));
+        }
+    }
+
+    let mut last_id: Option<[u8; 16]> = None;
+    while let Some(Reverse(entry)) = heap.pop() {
+        let cursor = &mut cursors[entry.src];
+        if last_id != Some(entry.id) {
+            // First (highest-LSN) observation of this id: the winner.
+            last_id = Some(entry.id);
+            let (row, rec) = cursor.materialize_current(label_def)?;
+            if !(gc_tombstones && matches!(row.op, MemOp::Tombstone)) {
+                if let Some(rec) = &rec {
+                    unique.observe(row.id, rec);
+                    equality.observe(row.id, rec);
+                    label_index.observe(row.id, rec);
+                    stats.observe(rec);
+                    #[cfg(feature = "vector-index")]
+                    for collector in &mut vector_collectors {
+                        collector.observe(row.id, rec, bucket_scope);
+                    }
+                    #[cfg(feature = "text-index")]
+                    for collector in &mut text_collectors {
+                        collector.observe(row.id, rec, bucket_scope);
+                    }
+                }
+                writer.push(row)?;
+            }
+        }
+        // Shadowed duplicate or consumed winner: step past it and re-arm.
+        cursor.advance()?;
+        if let Some((id, lsn)) = cursor.peek() {
+            heap.push(Reverse(NodeHeapEntry {
+                id,
+                lsn,
+                src: entry.src,
+            }));
+        }
+    }
+
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let _ = bucket_scope;
+
+    Ok(NodeMergeOutput {
+        finish: writer.finish()?,
+        sidecars: NodeSidecarHarvest {
+            unique,
+            equality,
+            label_index,
+            per_label_property_stats: stats.finish(schema, label_dict)?,
+        },
+        #[cfg(feature = "vector-index")]
+        vector_members: vector_collectors
+            .into_iter()
+            .map(|c| (c.desc, c.members))
+            .collect(),
+        #[cfg(feature = "text-index")]
+        text_members: text_collectors
+            .into_iter()
+            .map(|c| (c.desc, c.members))
+            .collect(),
+    })
 }
 
 /// Read a node row's `__labels` column as raw `LabelId` values. Empty when the
@@ -915,103 +1269,494 @@ fn raw_labels_from_batch(batch: &arrow_array::RecordBatch, row: usize) -> Vec<u3
     }
 }
 
-/// Decode one edge SST's rows into `out`. Each source SST is already in the
-/// caller's orientation (grouped by SstKind::EdgesFwd vs EdgesInv), so
-/// `(key_id, partner_id)` pass to the writer unchanged.
-///
-/// Property streams: each source SST exposes
-/// - `__overflow_json` (a single Utf8 column of ad-hoc / undeclared
-///   properties) via `read_overflow_strings`, and
-/// - one declared property stream per `EdgeTypeDef.properties` name
-///   (RFC-002 §3.2.7) via `read_declared_property_strings(name)`.
-/// The compactor reads both kinds and threads them through to the merged SST
-/// so reads at the merged version see the same property maps.
-fn extract_edge_rows_from_reader(
-    reader: &EdgeSstReader,
-    declared_property_names: &[String],
-    out: &mut Vec<EdgeRecord>,
-) -> Result<()> {
-    let edges = reader.scan_all_edges()?;
-    let overflows = reader.read_overflow_strings()?;
-    // For each declared property name, fetch the stream once per reader;
-    // `None` if this SST has no such stream (legacy pre-RFC-005 body, or
-    // all-null column).
-    let mut declared_streams: Vec<Option<Vec<Option<String>>>> =
-        Vec::with_capacity(declared_property_names.len());
-    for name in declared_property_names {
-        declared_streams.push(reader.read_declared_property_strings(name)?);
-    }
-    for (idx, e) in edges.into_iter().enumerate() {
-        let overflow_json = overflows
-            .as_ref()
-            .and_then(|v| v.get(idx).cloned())
-            .flatten();
-        let declared_properties: Vec<Option<String>> = declared_streams
-            .iter()
-            .map(|s| s.as_ref().and_then(|v| v.get(idx).cloned()).flatten())
-            .collect();
-        out.push(EdgeRecord {
-            key_id: e.key_id,
-            partner_id: e.partner_id,
-            lsn: e.lsn,
-            tombstone: e.tombstone,
-            declared_properties,
-            overflow_json,
-        });
-    }
-    Ok(())
+// ── Streaming k-way edge merge ──────────────────────────────────────────
+
+/// Incremental reader over one edge property stream (Arrow IPC of
+/// JSON-encoded `Value` strings, optionally zstd-compressed). Yields values
+/// in edge-enumeration order one mini-batch at a time — the zstd frame is
+/// decoded through a streaming `Read`, so at no point does the whole
+/// stream's `String` set exist in memory.
+struct PropertyStreamCursor {
+    name: String,
+    reader: StreamReader<Box<dyn std::io::Read + Send>>,
+    current: Option<StringArray>,
+    row: usize,
+    rows_read: u64,
+    edge_count: u64,
 }
 
-fn compact_edge_rows(
+impl PropertyStreamCursor {
+    fn open(name: &str, bytes: Bytes, codec: u8, edge_count: u64) -> Result<Self> {
+        let read: Box<dyn std::io::Read + Send> = match codec {
+            CODEC_NONE => Box::new(std::io::Cursor::new(bytes)),
+            CODEC_ZSTD => Box::new(
+                zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes)).map_err(|e| {
+                    Error::invariant(format!("zstd decode (property stream {name}): {e}"))
+                })?,
+            ),
+            other => {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!("unknown codec {other} for property stream {name}"),
+                });
+            }
+        };
+        let reader = StreamReader::try_new(read, None)
+            .map_err(|e| Error::invariant(format!("property IPC reader ({name}): {e}")))?;
+        Ok(Self {
+            name: name.to_string(),
+            reader,
+            current: None,
+            row: 0,
+            rows_read: 0,
+            edge_count,
+        })
+    }
+
+    /// Value for the next edge in enumeration order. `want == false` (a
+    /// shadowed loser) still advances the stream but skips materialising
+    /// the string.
+    fn next(&mut self, want: bool) -> Result<Option<String>> {
+        loop {
+            if let Some(current) = &self.current {
+                if self.row < current.len() {
+                    let out = if want && !current.is_null(self.row) {
+                        Some(current.value(self.row).to_string())
+                    } else {
+                        None
+                    };
+                    self.row += 1;
+                    self.rows_read += 1;
+                    return Ok(out);
+                }
+                self.current = None;
+            }
+            match self.reader.next() {
+                Some(batch) => {
+                    let batch = batch.map_err(|e| {
+                        Error::invariant(format!("property IPC batch ({}): {e}", self.name))
+                    })?;
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            Error::invariant(format!(
+                                "property IPC column ({}) is not Utf8",
+                                self.name
+                            ))
+                        })?
+                        .clone();
+                    self.current = Some(column);
+                    self.row = 0;
+                }
+                None => {
+                    return Err(Error::Corrupted {
+                        path: "<edges>".into(),
+                        detail: format!(
+                            "property stream {} row count {} != edge_count {}",
+                            self.name, self.rows_read, self.edge_count
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// After the cursor consumed exactly `edge_count` values, the stream
+    /// must be empty too — the streaming equivalent of the whole-stream
+    /// row-count check the materialised decode performed.
+    fn assert_exhausted(&mut self) -> Result<()> {
+        let leftover = match &self.current {
+            Some(current) if self.row < current.len() => true,
+            _ => match self.reader.next() {
+                Some(batch) => {
+                    batch
+                        .map_err(|e| {
+                            Error::invariant(format!("property IPC batch ({}): {e}", self.name))
+                        })?
+                        .num_rows()
+                        > 0
+                }
+                None => false,
+            },
+        };
+        if leftover {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "property stream {} carries more than edge_count {} rows",
+                    self.name, self.edge_count
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Verified owned slice of one edge-SST section: `reader.section` checks the
+/// xxhash, then the shared `body` handle is re-sliced so the cursor owns the
+/// bytes without borrowing from the reader. `Ok(None)` when the section is
+/// absent.
+fn edge_section_slice(
+    body: &Bytes,
+    reader: &EdgeSstReader,
+    kind: u16,
+    name: &str,
+) -> Result<Option<(Bytes, u8)>> {
+    let entry = if name.is_empty() {
+        reader.footer().find_kind(kind)
+    } else {
+        reader.footer().find(kind, name)
+    };
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let codec = entry.codec;
+    let (start, end) = (
+        entry.offset as usize,
+        (entry.offset + entry.length) as usize,
+    );
+    reader.section(kind, name)?;
+    Ok(Some((body.slice(start..end), codec)))
+}
+
+/// Sorted row cursor over one edge source SST. Walks keys in `key_ids`
+/// order, one decoded partner block at a time, with each property stream
+/// read incrementally alongside — the per-source working set is one partner
+/// block plus one IPC mini-batch per stream. Each source SST is already in
+/// the caller's orientation (grouped by SstKind::EdgesFwd vs EdgesInv), so
+/// `(key_id, partner_id)` pass to the writer unchanged.
+///
+/// Property streams (RFC-002 §3.2.7): `__overflow_json` (ad-hoc /
+/// undeclared properties) plus one named stream per declared property.
+/// `None` cursors mean the SST has no such stream (legacy pre-RFC-005 body,
+/// or an all-null column the writer elided); every edge then yields `None`.
+struct EdgeSourceCursor {
+    key_ids: Bytes,
+    offsets: Bytes,
+    partners: Bytes,
+    lsns: Bytes,
+    tombstones: Option<Bytes>,
+    offset_width: OffsetWidth,
+    key_count: usize,
+    key_idx: usize,
+    current_key: [u8; 16],
+    current_partners: Vec<[u8; 16]>,
+    partner_idx: usize,
+    /// Global edge-enumeration index of the current edge.
+    edge_idx: usize,
+    overflow: Option<PropertyStreamCursor>,
+    declared: Vec<Option<PropertyStreamCursor>>,
+}
+
+impl EdgeSourceCursor {
+    fn open(body: Bytes, declared_property_names: &[String]) -> Result<Self> {
+        // `EdgeSstReader::open` validates the header/footer and cross-checks
+        // the offsets/partners sections against `edge_count`; the cursor
+        // then re-slices the verified sections out of the shared body.
+        let reader = EdgeSstReader::open(body.clone())?;
+        let key_count = reader.key_count() as usize;
+        let edge_count = reader.edge_count();
+        let offset_width = OffsetWidth::from_bits(reader.footer().offsets_bits)?;
+        let required = |kind: u16, what: &str| -> Result<Bytes> {
+            edge_section_slice(&body, &reader, kind, "")?
+                .map(|(bytes, _)| bytes)
+                .ok_or_else(|| Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!("edge SST missing mandatory section {what}"),
+                })
+        };
+        let key_ids = required(SECTION_KEY_IDS, "key_ids")?;
+        let offsets = required(SECTION_OFFSETS, "offsets")?;
+        let partners = required(SECTION_PARTNERS, "partners")?;
+        let lsns = required(SECTION_PER_EDGE_LSN, "per_edge_lsn")?;
+        let tombstones = edge_section_slice(&body, &reader, SECTION_PER_EDGE_TOMBSTONES, "")?
+            .map(|(bytes, _)| bytes);
+        // Validate section geometry once so per-row access can index
+        // directly.
+        if key_ids.len() != key_count * 16 {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "key_ids section is {} bytes for {} keys",
+                    key_ids.len(),
+                    key_count
+                ),
+            });
+        }
+        if lsns.len() != edge_count as usize * 8 {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "per_edge_lsn section is {} bytes for {} edges",
+                    lsns.len(),
+                    edge_count
+                ),
+            });
+        }
+        if let Some(tombstones) = &tombstones {
+            if tombstones.len() < edge_count.div_ceil(8) as usize {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!(
+                        "per_edge_tombstones section is {} bytes for {} edges",
+                        tombstones.len(),
+                        edge_count
+                    ),
+                });
+            }
+        }
+        let overflow = match edge_section_slice(
+            &body,
+            &reader,
+            SECTION_PROPERTY_STREAM,
+            OVERFLOW_JSON_NAME,
+        )? {
+            Some((bytes, codec)) => Some(PropertyStreamCursor::open(
+                OVERFLOW_JSON_NAME,
+                bytes,
+                codec,
+                edge_count,
+            )?),
+            None => None,
+        };
+        let mut declared: Vec<Option<PropertyStreamCursor>> =
+            Vec::with_capacity(declared_property_names.len());
+        for name in declared_property_names {
+            declared.push(
+                match edge_section_slice(&body, &reader, SECTION_PROPERTY_STREAM, name)? {
+                    Some((bytes, codec)) => {
+                        Some(PropertyStreamCursor::open(name, bytes, codec, edge_count)?)
+                    }
+                    None => None,
+                },
+            );
+        }
+        let mut cursor = Self {
+            key_ids,
+            offsets,
+            partners,
+            lsns,
+            tombstones,
+            offset_width,
+            key_count,
+            key_idx: 0,
+            current_key: [0u8; 16],
+            current_partners: Vec::new(),
+            partner_idx: 0,
+            edge_idx: 0,
+            overflow,
+            declared,
+        };
+        cursor.load_key()?;
+        Ok(cursor)
+    }
+
+    /// Decode the key + partner block at `key_idx` (no-op past the end).
+    fn load_key(&mut self) -> Result<()> {
+        if self.key_idx >= self.key_count {
+            self.current_partners.clear();
+            self.partner_idx = 0;
+            return Ok(());
+        }
+        self.current_key = self.key_ids[self.key_idx * 16..(self.key_idx + 1) * 16]
+            .try_into()
+            .map_err(|_| Error::invariant("key_ids row length != 16"))?;
+        let start = read_offset(
+            &self.offsets,
+            self.key_idx * self.offset_width.bytes(),
+            self.offset_width,
+        )? as usize;
+        let (partners, _consumed) = read_partner_block(&self.partners, start)?;
+        self.current_partners = partners;
+        self.partner_idx = 0;
+        Ok(())
+    }
+
+    /// `(key, partner, lsn)` of the current edge; `None` once exhausted.
+    fn peek(&self) -> Option<([u8; 16], [u8; 16], u64)> {
+        if self.partner_idx >= self.current_partners.len() {
+            return None;
+        }
+        let off = self.edge_idx * 8;
+        let lsn = u64::from_le_bytes(self.lsns[off..off + 8].try_into().unwrap());
+        Some((
+            self.current_key,
+            self.current_partners[self.partner_idx],
+            lsn,
+        ))
+    }
+
+    /// Consume the current edge, advancing every property stream in
+    /// lockstep. Returns the full record when `want_props` (the winner);
+    /// a shadowed loser passes `false` and skips the string materialisation.
+    fn pop(&mut self, want_props: bool) -> Result<Option<EdgeRecord>> {
+        let Some((key_id, partner_id, lsn)) = self.peek() else {
+            return Err(Error::invariant("edge merge cursor popped past its end"));
+        };
+        let tombstone = match &self.tombstones {
+            Some(bits) => (bits[self.edge_idx / 8] >> (self.edge_idx % 8)) & 1 == 1,
+            None => false,
+        };
+        let overflow_json = match &mut self.overflow {
+            Some(cursor) => cursor.next(want_props)?,
+            None => None,
+        };
+        let mut declared_properties: Vec<Option<String>> = Vec::with_capacity(self.declared.len());
+        for stream in &mut self.declared {
+            declared_properties.push(match stream {
+                Some(cursor) => cursor.next(want_props)?,
+                None => None,
+            });
+        }
+        self.edge_idx += 1;
+        self.partner_idx += 1;
+        if self.partner_idx >= self.current_partners.len() {
+            self.key_idx += 1;
+            self.load_key()?;
+            if self.key_idx >= self.key_count {
+                // Fully drained: every property stream must be too.
+                for stream in self
+                    .overflow
+                    .iter_mut()
+                    .chain(self.declared.iter_mut().flatten())
+                {
+                    stream.assert_exhausted()?;
+                }
+            }
+        }
+        Ok(want_props.then_some(EdgeRecord {
+            key_id,
+            partner_id,
+            lsn,
+            tombstone,
+            declared_properties,
+            overflow_json,
+        }))
+    }
+}
+
+/// Heap key for the edge k-way merge: `(key, partner)` ascending, then LSN
+/// **descending** (first popped per pair is its winner), then source order —
+/// mirroring the materialised merge's stable sort tie-breaks.
+#[derive(PartialEq, Eq)]
+struct EdgeHeapEntry {
+    key_id: [u8; 16],
+    partner_id: [u8; 16],
+    lsn: u64,
+    src: usize,
+}
+
+impl Ord for EdgeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key_id
+            .cmp(&other.key_id)
+            .then(self.partner_id.cmp(&other.partner_id))
+            .then(other.lsn.cmp(&self.lsn))
+            .then(self.src.cmp(&other.src))
+    }
+}
+
+impl PartialOrd for EdgeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// K-way streaming merge of one edge bucket. Per `(key, partner)` the
+/// highest-LSN observation wins (source order breaks exact ties); a winning
+/// tombstone is dropped when `gc_tombstones` — same reasoning as the node
+/// path: when this merge is authoritative for the `(edge_type, direction)`
+/// bucket (its output is the bucket's deepest level) the tombstone shadows
+/// nothing. Otherwise a deeper un-merged level may still hold a row the
+/// tombstone masks, so it is kept. Old readers see the delete through the
+/// retained source bodies. Winners feed the row-at-a-time [`EdgeSstWriter`]
+/// directly.
+fn merge_edge_sources(
+    bodies: Vec<Bytes>,
     edge_type: &str,
-    edge_def: Option<&namidb_core::EdgeTypeDef>,
-    mut rows: Vec<EdgeRecord>,
+    edge_def: Option<&EdgeTypeDef>,
+    declared_property_names: &[String],
     direction: EdgeDirection,
     gc_tombstones: bool,
 ) -> Result<EdgeSstFinish> {
-    // Sort by (key, partner) asc, then by lsn desc so the dedup keeps
-    // the highest-LSN observation per (key, partner).
-    rows.sort_by(|a, b| {
-        a.key_id
-            .cmp(&b.key_id)
-            .then(a.partner_id.cmp(&b.partner_id))
-            .then(b.lsn.cmp(&a.lsn))
-    });
-    rows.dedup_by_key(|r| (r.key_id, r.partner_id));
-    // Tombstone GC (RFC-027 P3), same reasoning as the node path: when this
-    // merge is authoritative for the (edge_type, direction) bucket — its
-    // output is the bucket's deepest level — a winning tombstone shadows
-    // nothing and is dropped. Otherwise a deeper un-merged level may still
-    // hold a row the tombstone masks, so it is kept. Old readers see the
-    // delete through the retained source bodies.
-    if gc_tombstones {
-        rows.retain(|r| !r.tombstone);
+    let mut cursors: Vec<EdgeSourceCursor> = Vec::with_capacity(bodies.len());
+    let mut total_keys: u64 = 0;
+    for body in bodies {
+        let cursor = EdgeSourceCursor::open(body, declared_property_names)?;
+        total_keys = total_keys.saturating_add(cursor.key_count as u64);
+        cursors.push(cursor);
     }
 
-    build_edge_sst(edge_type, edge_def, &rows, direction)
+    let (src_label, dst_label) = match edge_def {
+        Some(def) => (def.src_label.clone(), def.dst_label.clone()),
+        None => ("_".to_string(), "_".to_string()),
+    };
+    let mut options = EdgeSstWriterOptions::new(direction, edge_type, src_label, dst_label);
+    // Pre-dedup upper bound (see the node merge for why); sizes the bloom
+    // and the skew threshold slightly conservatively.
+    options.expected_keys = total_keys.max(1);
+    if let Some(def) = edge_def {
+        options.declared_properties = def.properties.iter().map(|p| p.name.clone()).collect();
+    }
+    let mut writer = EdgeSstWriter::new(options);
+
+    let mut heap: BinaryHeap<Reverse<EdgeHeapEntry>> = BinaryHeap::with_capacity(cursors.len());
+    for (src, cursor) in cursors.iter().enumerate() {
+        if let Some((key_id, partner_id, lsn)) = cursor.peek() {
+            heap.push(Reverse(EdgeHeapEntry {
+                key_id,
+                partner_id,
+                lsn,
+                src,
+            }));
+        }
+    }
+
+    let mut last: Option<([u8; 16], [u8; 16])> = None;
+    while let Some(Reverse(entry)) = heap.pop() {
+        let cursor = &mut cursors[entry.src];
+        let pair = (entry.key_id, entry.partner_id);
+        if last != Some(pair) {
+            last = Some(pair);
+            let record = cursor
+                .pop(true)?
+                .ok_or_else(|| Error::invariant("edge merge winner yielded no record"))?;
+            if !(gc_tombstones && record.tombstone) {
+                writer.append(record)?;
+            }
+        } else {
+            // Shadowed duplicate: advance without materialising strings.
+            cursor.pop(false)?;
+        }
+        if let Some((key_id, partner_id, lsn)) = cursor.peek() {
+            heap.push(Reverse(EdgeHeapEntry {
+                key_id,
+                partner_id,
+                lsn,
+                src: entry.src,
+            }));
+        }
+    }
+
+    writer.finish()
 }
 
 // ── PUT helpers (L1 variants) ───────────────────────────────────────────
 
-// `schema` + `label_dict` join the existing five to seed per-label property
-// stats for declared-but-absent properties during the L0->L1 rebuild; the
-// params are all distinct and bundling them would not aid readability.
-#[allow(clippy::too_many_arguments)]
 async fn put_node_sst_leveled(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
     label: &str,
-    // Property def used for harvesting unique/equality sidecars. For the
-    // id-primary "" bucket the caller passes `union_indexed_props(schema)` (the
-    // body has no declared property columns but indexed props still need
-    // sidecars); for legacy per-label buckets it's the label's own def. Mirrors
-    // flush, which harvests from `union_indexed_props`.
-    sidecar_def: &LabelDef,
-    merged_rows: &[NodeRow],
+    // Sidecar/stat harvest the streaming merge collected off the winner
+    // stream (unique + equality maps keyed by the sidecar def — for the
+    // id-primary "" bucket that's `union_indexed_props(schema)`, mirroring
+    // flush; for legacy per-label buckets the label's own def — plus the
+    // label-index postings and the RFC-025 per-(label, property) stats).
+    sidecars: NodeSidecarHarvest,
     finish: NodeSstFinish,
-    schema: &Schema,
-    label_dict: &LabelDictionary,
 ) -> Result<(SstDescriptor, bool)> {
     let id = Uuid::now_v7();
     let level = SstLevel(out_level);
@@ -1045,36 +1790,23 @@ async fn put_node_sst_leveled(
     // demotes affected queries back to the legacy full label scan
     // (P4.19 only emitted sidecars on flush).
     let (unique_property_indices, mut index_sidecars) =
-        crate::flush::prepare_unique_property_sidecars(
-            paths,
-            level.as_u32(),
-            &id,
-            label,
-            sidecar_def,
-            merged_rows,
-        )?;
-    // Re-emit equality-index posting-list sidecars too, rebuilt from the
-    // already-reconciled `merged_rows` (tombstones dropped, highest-lsn per
+        sidecars.unique.finish(paths, level.as_u32(), &id, label)?;
+    // Re-emit equality-index posting-list sidecars too, harvested from the
+    // already-reconciled winner stream (tombstones dropped, highest-lsn per
     // id), so the L1 sidecar supersedes all the L0 partials.
     let (equality_property_indices, equality_sidecars) =
-        crate::flush::prepare_equality_property_sidecars(
-            paths,
-            level.as_u32(),
-            &id,
-            label,
-            sidecar_def,
-            merged_rows,
-        )?;
+        sidecars
+            .equality
+            .finish(paths, level.as_u32(), &id, label)?;
     index_sidecars.extend(equality_sidecars);
     // Rebuild the label-index sidecar from the reconciled rows. id-primary
-    // buckets (scope == "") carry per-row label sets in `merged_rows`, so this
-    // re-emits the `LabelId -> [NodeId]` postings (with per-label counts) the
-    // cost model needs; without it, every compaction would silently reset
-    // per-label `node_count` to 0 and the optimizer would prune non-empty
-    // labels again. Legacy per-label buckets have empty label sets and yield
+    // buckets (scope == "") carry per-row label sets, so this re-emits the
+    // `LabelId -> [NodeId]` postings (with per-label counts) the cost model
+    // needs; without it, every compaction would silently reset per-label
+    // `node_count` to 0 and the optimizer would prune non-empty labels
+    // again. Legacy per-label buckets have empty label sets and yield
     // `None` here, falling back to `scope`-based counting downstream.
-    let (label_index, label_sidecar) =
-        crate::flush::prepare_label_index_sidecar(paths, level.as_u32(), &id, merged_rows)?;
+    let (label_index, label_sidecar) = sidecars.label_index.finish(paths, level.as_u32(), &id)?;
     if let Some(sidecar) = label_sidecar {
         index_sidecars.push(sidecar);
     }
@@ -1106,90 +1838,140 @@ async fn put_node_sst_leveled(
         unique_property_indices,
         equality_property_indices,
         label_index,
-        // Recompute per-(label, property) stats from the merged rows so they
-        // survive L0->L1 the same way the label index does (RFC 025).
-        per_label_property_stats: crate::flush::compute_per_label_property_stats(
-            merged_rows,
-            schema,
-            label_dict,
-        )?,
+        // Per-(label, property) stats recomputed off the winner stream so
+        // they survive L0->L1 the same way the label index does (RFC 025).
+        per_label_property_stats: sidecars.per_label_property_stats,
     };
     Ok((descriptor, wrote_bloom))
 }
 
-/// RFC-030 (`vector-index`): for every registered index whose label has nodes
-/// in `merged_rows`, build a fresh Vamana `VectorGraph` SST from those nodes'
-/// embeddings and return the new descriptors **plus** the ids of any prior
-/// VectorGraph SSTs for the same index (which must be removed — a graph is not
-/// row-mergeable, so compaction rebuilds rather than merges). Descriptors whose
-/// label is absent from the bucket, whose metric is not indexable (`euclidean`),
-/// or with fewer than two live embeddings yield nothing.
+/// Streaming member collector for one registered vector index: observes
+/// each reconciled winner row as the merge advances and keeps the
+/// `(id, embedding)` pairs the Vamana build needs — the inherent lower
+/// bound, since graph construction requires every member vector at once.
+/// Only instantiated for authoritative merges (see the caller): on a
+/// partial merge the winner stream is a strict subset of the corpus and
+/// rebuilding from it would silently truncate the index.
 #[cfg(feature = "vector-index")]
-#[allow(clippy::too_many_arguments)]
-async fn build_vector_indexes_for_nodes(
+struct VectorMemberCollector {
+    desc: VectorIndexDescriptor,
+    /// The index label resolved to its raw dictionary id (if interned).
+    label_id: Option<u32>,
+    members: Vec<([u8; 16], Vec<f32>)>,
+}
+
+#[cfg(feature = "vector-index")]
+impl VectorMemberCollector {
+    fn new(desc: VectorIndexDescriptor, label_dict: &LabelDictionary) -> Self {
+        Self {
+            label_id: label_dict.id(&desc.label).map(|lid| lid.0),
+            desc,
+            members: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) {
+        // id-primary rows carry an authoritative label set; legacy rows
+        // (empty set) fall back to the bucket scope as their label.
+        let carries_label = match self.label_id {
+            Some(lid) => {
+                rec.labels.contains(&lid)
+                    || (rec.labels.is_empty() && bucket_scope == self.desc.label)
+            }
+            None => rec.labels.is_empty() && bucket_scope == self.desc.label,
+        };
+        if !carries_label {
+            return;
+        }
+        let Some(val) = rec.properties.get(&self.desc.property) else {
+            return;
+        };
+        let v: Vec<f32> = match val {
+            Value::Vec(v) => v.clone(),
+            Value::VecI8 { codes, scale } => codes.iter().map(|&c| c as f32 * *scale).collect(),
+            _ => return,
+        };
+        self.members.push((id, v));
+    }
+}
+
+/// Streaming member collector for one registered full-text index: keeps
+/// `(id, concatenated document)` pairs for the BM25 build (which needs the
+/// whole corpus for its N / avgdl / df statistics — the text analogue of
+/// the vector lower bound). Same label-filter and authority rules as
+/// [`VectorMemberCollector`].
+#[cfg(feature = "text-index")]
+struct TextMemberCollector {
+    desc: crate::manifest::TextIndexDescriptor,
+    label_id: Option<u32>,
+    members: Vec<([u8; 16], String)>,
+}
+
+#[cfg(feature = "text-index")]
+impl TextMemberCollector {
+    fn new(desc: crate::manifest::TextIndexDescriptor, label_dict: &LabelDictionary) -> Self {
+        Self {
+            label_id: label_dict.id(&desc.label).map(|lid| lid.0),
+            desc,
+            members: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) {
+        // Same legacy-row fallback as the vector collector above.
+        let carries_label = match self.label_id {
+            Some(lid) => {
+                rec.labels.contains(&lid)
+                    || (rec.labels.is_empty() && bucket_scope == self.desc.label)
+            }
+            None => rec.labels.is_empty() && bucket_scope == self.desc.label,
+        };
+        if !carries_label {
+            return;
+        }
+        // Concatenate the indexed properties' string values into one document.
+        let mut parts: Vec<&str> = Vec::new();
+        for prop in &self.desc.properties {
+            if let Some(Value::Str(s)) = rec.properties.get(prop) {
+                parts.push(s.as_str());
+            }
+        }
+        if parts.is_empty() {
+            return; // not a member of this index's corpus
+        }
+        self.members.push((id, parts.join(" ")));
+    }
+}
+
+/// RFC-030 (`vector-index`): for every registered index, build a fresh
+/// Vamana `VectorGraph` SST from the members the winner stream collected
+/// and return the new descriptors **plus** the ids of any prior VectorGraph
+/// SSTs for the same index (which must be removed — a graph is not
+/// row-mergeable, so compaction rebuilds rather than merges). Indexes whose
+/// label had no nodes in the bucket, or with fewer than two live
+/// embeddings, yield nothing (and keep their prior SST).
+///
+/// The authority gate lives at the collection site (`prepare_leveled`): on
+/// a partial (non-authoritative) merge no members are collected, this
+/// receives an empty list, and the existing `.vg` is left untouched — the
+/// freshness gate (`index_outrun_by_nodes`) detects the now-newer Nodes SST
+/// and falls back to the exact flat scan until an authoritative merge
+/// rebuilds the index.
+#[cfg(feature = "vector-index")]
+async fn build_vector_indexes_from_members(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
-    authoritative: bool,
     corpus_max_lsn: u64,
-    label_dict: &LabelDictionary,
-    descriptors: &[VectorIndexDescriptor],
-    merged_rows: &[NodeRow],
-    bucket_scope: &str,
+    collected: VectorIndexMembers,
     old_vector_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
     use crate::sst::vector::build_body;
 
-    // A Vamana graph is not row-mergeable, so this hook rebuilds it from scratch
-    // and drops the prior `.vg`. That is only sound when the merge is
-    // **authoritative** for the full label corpus — i.e. the output is the
-    // bucket's deepest level (`is_deepest`), so `merged_rows` spans every node
-    // SST for the label. On a partial (non-deepest) merge `merged_rows` is a
-    // strict subset; rebuilding from it and deleting the deep `.vg` would
-    // silently truncate the index to the shallow rows (permanent recall loss vs
-    // the flat scan). Leave the existing `.vg` untouched instead — the freshness
-    // gate (`index_outrun_by_nodes`) detects the now-newer Nodes SST and falls back
-    // to the exact flat scan until an authoritative merge rebuilds the index.
-    if !authoritative {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
 
-    for desc in descriptors {
-        let label_id = label_dict.id(&desc.label);
-        let mut members: Vec<([u8; 16], Vec<f32>)> = Vec::new();
-        for row in merged_rows {
-            let MemOp::Upsert(payload) = &row.op else {
-                continue;
-            };
-            let Ok(rec) = NodeWriteRecord::decode(payload) else {
-                continue;
-            };
-            // id-primary rows carry an authoritative label set; legacy rows
-            // (empty set) fall back to the bucket scope as their label.
-            let carries_label = match label_id {
-                Some(lid) => {
-                    rec.labels.contains(&lid.0)
-                        || (rec.labels.is_empty() && bucket_scope == desc.label)
-                }
-                None => rec.labels.is_empty() && bucket_scope == desc.label,
-            };
-            if !carries_label {
-                continue;
-            }
-            let Some(val) = rec.properties.get(&desc.property) else {
-                continue;
-            };
-            let v: Vec<f32> = match val {
-                Value::Vec(v) => v.clone(),
-                Value::VecI8 { codes, scale } => codes.iter().map(|&c| c as f32 * *scale).collect(),
-                _ => continue,
-            };
-            members.push((row.id, v));
-        }
-
+    for (desc, members) in collected {
         // Skip-and-warn on a per-index build error (e.g. a malformed descriptor)
         // rather than `?`-aborting the whole compaction — one bad index must
         // never wedge the namespace's compaction permanently. The Vamana
@@ -1264,74 +2046,32 @@ async fn build_vector_indexes_for_nodes(
     Ok((new_descs, removed))
 }
 
-/// (`text-index`): for every registered full-text index whose label has nodes in
-/// `merged_rows`, build a fresh `TextIndex` SST from those nodes' text and return
-/// the new descriptors **plus** the ids of any prior TextIndex SSTs for the same
-/// index (rebuild-not-merge, like the vector hook). A document is the
-/// space-joined string value of the index's properties; nodes carrying none of
-/// them are not part of the corpus.
+/// (`text-index`): for every registered full-text index, build a fresh
+/// `TextIndex` SST from the documents the winner stream collected and return
+/// the new descriptors **plus** the ids of any prior TextIndex SSTs for the
+/// same index (rebuild-not-merge, like the vector hook). A document is the
+/// space-joined string value of the index's properties; nodes carrying none
+/// of them are not part of the corpus.
+///
+/// Like [`build_vector_indexes_from_members`], the authority gate lives at
+/// the collection site: on a partial merge no members are collected, the
+/// prior `.ft` is kept, and the freshness gate falls back to the flat scan
+/// rather than truncating the index to the shallow subset.
 #[cfg(feature = "text-index")]
-#[allow(clippy::too_many_arguments)]
-async fn build_text_indexes_for_nodes(
+async fn build_text_indexes_from_members(
     store: &dyn ObjectStore,
     paths: &NamespacePaths,
     out_level: u32,
-    authoritative: bool,
     corpus_max_lsn: u64,
-    label_dict: &LabelDictionary,
-    descriptors: &[crate::manifest::TextIndexDescriptor],
-    merged_rows: &[NodeRow],
-    bucket_scope: &str,
+    collected: TextIndexMembers,
     old_text_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
     use crate::sst::text::build_body;
 
-    // Rebuild-not-merge, like the vector hook — only sound on an authoritative
-    // (deepest-level) merge whose `merged_rows` span the full label corpus. On a
-    // partial merge, keep the prior `.ft` and let the freshness gate fall back to
-    // the flat scan, rather than truncate the index to the shallow subset.
-    if !authoritative {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
 
-    for desc in descriptors {
-        let label_id = label_dict.id(&desc.label);
-        let mut members: Vec<([u8; 16], String)> = Vec::new();
-        for row in merged_rows {
-            let MemOp::Upsert(payload) = &row.op else {
-                continue;
-            };
-            let Ok(rec) = NodeWriteRecord::decode(payload) else {
-                continue;
-            };
-            // id-primary rows carry an authoritative label set; legacy rows
-            // (empty set) fall back to the bucket scope as their label.
-            let carries_label = match label_id {
-                Some(lid) => {
-                    rec.labels.contains(&lid.0)
-                        || (rec.labels.is_empty() && bucket_scope == desc.label)
-                }
-                None => rec.labels.is_empty() && bucket_scope == desc.label,
-            };
-            if !carries_label {
-                continue;
-            }
-            // Concatenate the indexed properties' string values into one document.
-            let mut parts: Vec<&str> = Vec::new();
-            for prop in &desc.properties {
-                if let Some(Value::Str(s)) = rec.properties.get(prop) {
-                    parts.push(s.as_str());
-                }
-            }
-            if parts.is_empty() {
-                continue; // not a member of this index's corpus
-            }
-            members.push((row.id, parts.join(" ")));
-        }
-
+    for (desc, members) in collected {
         // BM25 postings construction is pure CPU over the collected corpus;
         // run it on the blocking pool like the Vamana build above.
         let Some((body, stats)) = run_cpu(move || build_body(members)).await?? else {
@@ -2656,6 +3396,838 @@ mod tests {
         assert!(got.is_none(), "a legacy body must fall back, not error");
     }
 
+    // ── Streaming k-way merge ───────────────────────────────────────────
+
+    fn indexed_person_label() -> LabelDef {
+        LabelDef {
+            name: "Person".into(),
+            properties: vec![
+                PropertyDef::new("name", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true),
+                PropertyDef::new("age", DataType::Int32, true).unwrap(),
+            ],
+        }
+    }
+
+    fn parity_schema() -> Schema {
+        SchemaBuilder::new()
+            .label(indexed_person_label())
+            .unwrap()
+            .edge_type(knows_edge_with_declared_props())
+            .unwrap()
+            .build()
+    }
+
+    fn props_payload(pairs: &[(&str, Value)]) -> Bytes {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        for (k, v) in pairs {
+            props.insert((*k).to_string(), v.clone());
+        }
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            labels: vec![0],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// Multi-level fixture the streaming-merge tests share: overlapping node
+    /// keys with declared + overflow properties and a node tombstone across
+    /// L0s AND an L1 (from an intermediate compaction), plus fwd+inv edges
+    /// with declared + overflow properties and an edge tombstone. Returned
+    /// at the point where a three-bucket merge (nodes, fwd, inv) is pending.
+    async fn multi_level_fixture(
+        ns: &str,
+    ) -> (
+        Arc<dyn ObjectStore>,
+        NamespacePaths,
+        ManifestStore,
+        WriterFence,
+        LoadedManifest,
+    ) {
+        let s = store();
+        let p = paths(ns);
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let sc = parity_schema();
+
+        let a = sorted_node_id(1);
+        let b = sorted_node_id(2);
+        let c = sorted_node_id(3);
+        let d = sorted_node_id(4);
+        let knows = |src, dst| MemKey::Edge {
+            edge_type: "KNOWS".into(),
+            src,
+            dst,
+        };
+
+        // Flush 1: first versions of a and b; edges a->b and a->c.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: a },
+            10,
+            MemOp::Upsert(props_payload(&[
+                ("name", Value::Str("a0".into())),
+                ("age", Value::I64(30)),
+            ])),
+        );
+        mt.apply(
+            MemKey::Node { id: b },
+            11,
+            MemOp::Upsert(props_payload(&[("name", Value::Str("b0".into()))])),
+        );
+        let mut ab: BTreeMap<String, Value> = BTreeMap::new();
+        ab.insert("since".into(), Value::I64(2020));
+        ab.insert("weight".into(), Value::F64(0.5));
+        ab.insert("note".into(), Value::Str("first".into()));
+        mt.apply(knows(a, b), 12, MemOp::Upsert(edge_payload_with_props(ab)));
+        let mut ac: BTreeMap<String, Value> = BTreeMap::new();
+        ac.insert("since".into(), Value::I64(2021));
+        mt.apply(knows(a, c), 13, MemOp::Upsert(edge_payload_with_props(ac)));
+        let m = flush(&ms, &fence, &base, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        // Flush 2: overlapping updates — a gets a newer version, c appears
+        // with an overflow (undeclared) property, edge a->b is rewritten.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: c },
+            20,
+            MemOp::Upsert(props_payload(&[
+                ("name", Value::Str("c0".into())),
+                ("nickname", Value::Str("ce".into())),
+            ])),
+        );
+        mt.apply(
+            MemKey::Node { id: a },
+            21,
+            MemOp::Upsert(props_payload(&[
+                ("name", Value::Str("a1".into())),
+                ("age", Value::I64(31)),
+            ])),
+        );
+        let mut ab2: BTreeMap<String, Value> = BTreeMap::new();
+        ab2.insert("since".into(), Value::I64(2024));
+        ab2.insert("weight".into(), Value::F64(0.9));
+        ab2.insert("note".into(), Value::Str("second".into()));
+        mt.apply(knows(a, b), 22, MemOp::Upsert(edge_payload_with_props(ab2)));
+        let m = flush(&ms, &fence, &m, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        // Intermediate compaction: every bucket lands in L1.
+        let m = compact_leveled(&ms, &fence, &m, &sc, 1, 2)
+            .await
+            .unwrap()
+            .committed;
+
+        // Flush 3: d re-uses b's name (equality posting with two ids across
+        // time), b is deleted, edge a->c is deleted.
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: d },
+            30,
+            MemOp::Upsert(props_payload(&[("name", Value::Str("b0".into()))])),
+        );
+        mt.apply(MemKey::Node { id: b }, 31, MemOp::Tombstone);
+        mt.apply(knows(a, c), 32, MemOp::Tombstone);
+        let m = flush(&ms, &fence, &m, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        (s, p, ms, fence, m)
+    }
+
+    #[tokio::test]
+    async fn streaming_merge_multi_level_parity_nodes_and_edges() {
+        let (s, p, ms, fence, m) = multi_level_fixture("compact-stream-parity").await;
+        let sc = parity_schema();
+
+        // Merge the pending L0s + L1s (tiny budget → cascade to the deepest
+        // level, so tombstone GC applies), then add one more flush and merge
+        // again so the final node merge spans L0 + a deep level.
+        let m = compact_leveled(&ms, &fence, &m, &sc, 1, 2)
+            .await
+            .unwrap()
+            .committed;
+        let e = sorted_node_id(5);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: e },
+            40,
+            MemOp::Upsert(props_payload(&[("name", Value::Str("e0".into()))])),
+        );
+        let m = flush(&ms, &fence, &m, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+        let m = compact_leveled(&ms, &fence, &m, &sc, 1, 2)
+            .await
+            .unwrap()
+            .committed;
+
+        let a = sorted_node_id(1);
+        let b = sorted_node_id(2);
+        let c = sorted_node_id(3);
+        let d = sorted_node_id(4);
+
+        // Structural checks on the merged node SST: counts, key/LSN ranges,
+        // GC'd tombstones, sidecar descriptors.
+        let node_desc = m
+            .manifest
+            .ssts
+            .iter()
+            .find(|dsc| dsc.kind == SstKind::Nodes)
+            .expect("one merged node SST");
+        assert_eq!(node_desc.row_count, 4, "a, c, d, e survive; b is GC'd");
+        assert_eq!(
+            node_desc.kind_specific,
+            KindSpecificStats::Nodes { tombstone_count: 0 }
+        );
+        assert_eq!(node_desc.min_key, *a.as_bytes());
+        assert_eq!(node_desc.max_key, *e.as_bytes());
+        assert_eq!(node_desc.min_lsn, 20);
+        assert_eq!(node_desc.max_lsn, 40);
+        assert!(
+            node_desc
+                .equality_property_indices
+                .iter()
+                .any(|d| d.property == "name"),
+            "the equality sidecar for the indexed property must survive the merge"
+        );
+        let label_index = node_desc
+            .label_index
+            .as_ref()
+            .expect("label-index sidecar re-emitted");
+        assert_eq!(label_index.per_label_counts, vec![(0, 4)]);
+
+        // Read parity: winners, overflow properties, tombstones, edges.
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(m.clone(), &mt_view, s, p);
+
+        let va = snap.lookup_node("Person", a).await.unwrap().unwrap();
+        assert_eq!(va.lsn, 21);
+        assert_eq!(va.properties.get("name"), Some(&Value::Str("a1".into())));
+        assert_eq!(va.properties.get("age"), Some(&Value::I64(31)));
+        assert!(snap.lookup_node("Person", b).await.unwrap().is_none());
+        let vc = snap.lookup_node("Person", c).await.unwrap().unwrap();
+        assert_eq!(vc.properties.get("name"), Some(&Value::Str("c0".into())));
+        assert_eq!(
+            vc.properties.get("nickname"),
+            Some(&Value::Str("ce".into())),
+            "overflow (undeclared) properties must survive the merge"
+        );
+        assert!(snap.lookup_node("Person", d).await.unwrap().is_some());
+        assert!(snap.lookup_node("Person", e).await.unwrap().is_some());
+
+        // Equality sidecar still resolves: "b0" now maps to d only (b is
+        // deleted), "a1" to a.
+        let hits = snap
+            .lookup_nodes_by_property("Person", "name", "b0")
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, d);
+        let hits = snap
+            .lookup_nodes_by_property("Person", "name", "a1")
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a);
+
+        // Edges: a->b carries the rewritten declared + overflow properties;
+        // the tombstoned a->c is gone in both orientations.
+        let outs = snap.out_edges("KNOWS", a).await.unwrap();
+        assert_eq!(outs.edges.len(), 1);
+        assert_eq!(outs.edges[0].dst, b);
+        assert_eq!(outs.edges[0].lsn, 22);
+        assert_eq!(
+            outs.edges[0].properties.get("since"),
+            Some(&Value::I64(2024))
+        );
+        assert_eq!(
+            outs.edges[0].properties.get("weight"),
+            Some(&Value::F64(0.9))
+        );
+        assert_eq!(
+            outs.edges[0].properties.get("note"),
+            Some(&Value::Str("second".into()))
+        );
+        let ins = snap.in_edges("KNOWS", b).await.unwrap();
+        assert_eq!(ins.edges.len(), 1);
+        assert_eq!(ins.edges[0].src, a);
+        assert!(snap.in_edges("KNOWS", c).await.unwrap().edges.is_empty());
+
+        for desc in m
+            .manifest
+            .ssts
+            .iter()
+            .filter(|dsc| matches!(dsc.kind, SstKind::EdgesFwd | SstKind::EdgesInv))
+        {
+            assert_eq!(desc.row_count, 1, "only a->b survives ({:?})", desc.kind);
+            match &desc.kind_specific {
+                KindSpecificStats::Edges {
+                    key_count,
+                    tombstone_count,
+                    ..
+                } => {
+                    assert_eq!(*key_count, 1);
+                    assert_eq!(*tombstone_count, 0, "the GC'd edge tombstone is gone");
+                }
+                other => panic!("expected edge stats, got {other:?}"),
+            }
+        }
+    }
+
+    /// `SstDescriptor` reduced to its deterministic parts: everything except
+    /// the freshly-minted UUID, the UUID-derived paths, and `created_at`.
+    fn normalized_desc(d: &SstDescriptor) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            d.kind,
+            d.scope,
+            d.level.as_u32(),
+            d.size_bytes,
+            d.row_count,
+            d.min_key,
+            d.max_key,
+            d.min_lsn,
+            d.max_lsn,
+            d.schema_version_min,
+            d.schema_version_max,
+            d.kind_specific,
+            d.bloom.is_some(),
+            d.unique_property_indices
+                .iter()
+                .map(|u| (u.property.clone(), u.size_bytes, u.entry_count))
+                .collect::<Vec<_>>(),
+            d.equality_property_indices
+                .iter()
+                .map(|u| (u.property.clone(), u.size_bytes, u.distinct_values))
+                .collect::<Vec<_>>(),
+            d.label_index.as_ref().map(|l| (
+                l.size_bytes,
+                l.label_count,
+                l.posting_count,
+                l.per_label_counts.clone()
+            )),
+            d.per_label_property_stats,
+        )
+    }
+
+    // Holds the chunk-env lock READ-side: a concurrent
+    // `NAMIDB_COMPACTION_MERGE_CHUNK_ROWS` mutation between the two prepare
+    // runs would legitimately change Parquet page boundaries and fail the
+    // byte comparison.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn streaming_prepare_is_deterministic_modulo_uuids() {
+        let _guard = MERGE_CHUNK_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, p, ms, fence, m) = multi_level_fixture("compact-stream-determinism").await;
+        let sc = parity_schema();
+
+        let first = prepare_compaction(&ms, &fence, &m, &sc).await.unwrap();
+        let second = prepare_compaction(&ms, &fence, &m, &sc).await.unwrap();
+        assert!(!first.is_noop());
+        assert_eq!(
+            first.new_descs.len(),
+            3,
+            "nodes + fwd + inv buckets all plan a merge"
+        );
+
+        let normalize = |descs: &[SstDescriptor]| {
+            let mut v: Vec<String> = descs.iter().map(normalized_desc).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            normalize(&first.new_descs),
+            normalize(&second.new_descs),
+            "two prepares over the same basis must agree modulo UUIDs"
+        );
+
+        // Body bytes are identical too: match descriptors by (kind, scope)
+        // and GET both runs' durable bodies.
+        for d1 in &first.new_descs {
+            let d2 = second
+                .new_descs
+                .iter()
+                .find(|d| d.kind == d1.kind && d.scope == d1.scope)
+                .expect("matching descriptor in the second run");
+            let get = |rel: &str| {
+                let path = Path::from(format!("{}/{}", p.namespace_prefix().as_ref(), rel));
+                let store = s.clone();
+                async move { store.get(&path).await.unwrap().bytes().await.unwrap() }
+            };
+            let b1 = get(&d1.path).await;
+            let b2 = get(&d2.path).await;
+            assert_eq!(
+                b1, b2,
+                "{:?}/{} bodies must be byte-identical",
+                d1.kind, d1.scope
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_across_three_sources_keeps_only_the_highest_lsn() {
+        let s = store();
+        let p = paths("compact-stream-shadow");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let x = sorted_node_id(1);
+        let anchor = sorted_node_id(2);
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &base,
+            x,
+            5,
+            MemOp::Upsert(node_payload("v1", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            x,
+            9,
+            MemOp::Upsert(node_payload("v2", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            x,
+            12,
+            MemOp::Upsert(node_payload("v3", None)),
+        )
+        .await;
+        let m = flush_node_op(
+            &ms,
+            &fence,
+            &m,
+            anchor,
+            13,
+            MemOp::Upsert(node_payload("anchor", None)),
+        )
+        .await;
+
+        let out = compact_l0_to_l1(&ms, &fence, &m, &schema()).await.unwrap();
+        assert_eq!(out.source_ssts_removed, 4);
+        let node_desc = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::Nodes)
+            .unwrap();
+        assert_eq!(node_desc.row_count, 2, "x deduped to one version + anchor");
+
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
+        let vx = snap.lookup_node("Person", x).await.unwrap().unwrap();
+        assert_eq!(vx.lsn, 12, "exactly the highest-LSN version survives");
+        assert_eq!(vx.properties.get("name"), Some(&Value::Str("v3".into())));
+    }
+
+    #[tokio::test]
+    async fn tombstone_winner_across_three_sources_gcs_only_when_authoritative() {
+        // Authoritative (deepest) merge: the tombstone winner disappears.
+        {
+            let s = store();
+            let p = paths("compact-stream-tomb-gc");
+            let ms = ManifestStore::new(s.clone(), p.clone());
+            let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+            base.manifest.label_dict.intern("Person");
+            let fence = WriterFence::new(base.manifest.epoch);
+
+            let x = sorted_node_id(1);
+            let anchor = sorted_node_id(2);
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &base,
+                x,
+                5,
+                MemOp::Upsert(node_payload("v1", None)),
+            )
+            .await;
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                x,
+                9,
+                MemOp::Upsert(node_payload("v2", None)),
+            )
+            .await;
+            let m = flush_node_op(&ms, &fence, &m, x, 12, MemOp::Tombstone).await;
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                anchor,
+                13,
+                MemOp::Upsert(node_payload("anchor", None)),
+            )
+            .await;
+            let out = compact_l0_to_l1(&ms, &fence, &m, &schema()).await.unwrap();
+            let node_desc = out
+                .committed
+                .manifest
+                .ssts
+                .iter()
+                .find(|d| d.kind == SstKind::Nodes)
+                .unwrap();
+            assert_eq!(node_desc.row_count, 1, "only the anchor survives GC");
+            assert_eq!(
+                node_desc.kind_specific,
+                KindSpecificStats::Nodes { tombstone_count: 0 }
+            );
+            let mt = Memtable::new();
+            let mt_view = mt.snapshot_view();
+            let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
+            assert!(snap.lookup_node("Person", x).await.unwrap().is_none());
+        }
+
+        // Non-authoritative merge (a deeper level exists): the tombstone
+        // winner is preserved so it keeps shadowing.
+        {
+            let s = store();
+            let p = paths("compact-stream-tomb-keep");
+            let ms = ManifestStore::new(s.clone(), p.clone());
+            let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+            base.manifest.label_dict.intern("Person");
+            let fence = WriterFence::new(base.manifest.epoch);
+
+            let x = sorted_node_id(1);
+            let y = sorted_node_id(2);
+            let z = sorted_node_id(3);
+            let big = 16 * 1024 * 1024u64;
+
+            // Push y and z down to L2 with tiny budgets.
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &base,
+                y,
+                1,
+                MemOp::Upsert(node_payload("y", None)),
+            )
+            .await;
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                z,
+                2,
+                MemOp::Upsert(node_payload("z", None)),
+            )
+            .await;
+            let m = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+                .await
+                .unwrap()
+                .committed;
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                y,
+                3,
+                MemOp::Upsert(node_payload("y2", None)),
+            )
+            .await;
+            let m = compact_leveled(&ms, &fence, &m, &schema(), 1, 2)
+                .await
+                .unwrap()
+                .committed;
+            assert_eq!(node_levels(&m), vec![2]);
+
+            // Three L0 sources for x, tombstone at the highest LSN; a big
+            // budget keeps the merge at L1 above the untouched L2.
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                x,
+                5,
+                MemOp::Upsert(node_payload("v1", None)),
+            )
+            .await;
+            let m = flush_node_op(
+                &ms,
+                &fence,
+                &m,
+                x,
+                9,
+                MemOp::Upsert(node_payload("v2", None)),
+            )
+            .await;
+            let m = flush_node_op(&ms, &fence, &m, x, 12, MemOp::Tombstone).await;
+            let m = compact_leveled(&ms, &fence, &m, &schema(), big, 10)
+                .await
+                .unwrap()
+                .committed;
+            assert_eq!(node_levels(&m), vec![1, 2]);
+            let l1 = m
+                .manifest
+                .ssts
+                .iter()
+                .find(|d| d.kind == SstKind::Nodes && d.level == SstLevel(1))
+                .unwrap();
+            assert_eq!(l1.row_count, 1, "the winning tombstone is the only row");
+            assert_eq!(
+                l1.kind_specific,
+                KindSpecificStats::Nodes { tombstone_count: 1 },
+                "a non-authoritative merge must keep the tombstone"
+            );
+
+            let mt = Memtable::new();
+            let mt_view = mt.snapshot_view();
+            let snap = Snapshot::new(m.clone(), &mt_view, s, p);
+            assert!(snap.lookup_node("Person", x).await.unwrap().is_none());
+            assert!(snap.lookup_node("Person", y).await.unwrap().is_some());
+            assert!(snap.lookup_node("Person", z).await.unwrap().is_some());
+        }
+    }
+
+    /// Serialises the tests that mutate `NAMIDB_COMPACTION_MERGE_CHUNK_ROWS`
+    /// (process-global), restoring the previous value afterwards.
+    static MERGE_CHUNK_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Intentional: the guard serialises the env mutation across the whole
+    // compaction; the test drives its own single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn tiny_merge_chunks_round_trip_the_whole_bucket() {
+        let _guard = MERGE_CHUNK_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("NAMIDB_COMPACTION_MERGE_CHUNK_ROWS").ok();
+        std::env::set_var("NAMIDB_COMPACTION_MERGE_CHUNK_ROWS", "5");
+
+        let s = store();
+        let p = paths("compact-stream-chunks");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        // Two 40-row flushes overlapping on ids 21..=40; the merged bucket
+        // (60 rows) spans many 5-row chunks and the overlap crosses several
+        // chunk boundaries.
+        let mut mt = Memtable::new();
+        for i in 1..=40u8 {
+            mt.apply(
+                MemKey::Node {
+                    id: sorted_node_id(i),
+                },
+                100 + i as u64,
+                MemOp::Upsert(node_payload(&format!("first{i}"), None)),
+            );
+        }
+        let m = flush(&ms, &fence, &base, &mt.freeze(), schema())
+            .await
+            .unwrap()
+            .committed;
+        let mut mt = Memtable::new();
+        for i in 21..=60u8 {
+            mt.apply(
+                MemKey::Node {
+                    id: sorted_node_id(i),
+                },
+                200 + i as u64,
+                MemOp::Upsert(node_payload(&format!("second{i}"), None)),
+            );
+        }
+        let m = flush(&ms, &fence, &m, &mt.freeze(), schema())
+            .await
+            .unwrap()
+            .committed;
+
+        let out = compact_l0_to_l1(&ms, &fence, &m, &schema()).await;
+        match prev {
+            Some(v) => std::env::set_var("NAMIDB_COMPACTION_MERGE_CHUNK_ROWS", v),
+            None => std::env::remove_var("NAMIDB_COMPACTION_MERGE_CHUNK_ROWS"),
+        }
+        drop(_guard);
+
+        let out = out.unwrap();
+        let node_desc = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::Nodes)
+            .unwrap();
+        assert_eq!(node_desc.row_count, 60);
+        assert_eq!(node_desc.min_key, *sorted_node_id(1).as_bytes());
+        assert_eq!(node_desc.max_key, *sorted_node_id(60).as_bytes());
+
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
+        for i in 1..=60u8 {
+            let v = snap
+                .lookup_node("Person", sorted_node_id(i))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("node {i} lost across a chunk boundary"));
+            let expected = if i >= 21 {
+                format!("second{i}")
+            } else {
+                format!("first{i}")
+            };
+            assert_eq!(
+                v.properties.get("name"),
+                Some(&Value::Str(expected)),
+                "wrong winner for overlapping id {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_cursor_decodes_row_groups_lazily() {
+        let label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        // 16 rows at 4 rows per row group → 4 row groups.
+        let options = NodeSstWriterOptions {
+            row_group_target_rows: 4,
+            expected_keys: 16,
+            ..Default::default()
+        };
+        let mut writer = IncrementalNodeSstWriter::new(&label, options, 4).unwrap();
+        for i in 1..=16u8 {
+            writer
+                .push(NodeRow {
+                    id: *sorted_node_id(i).as_bytes(),
+                    lsn: i as u64,
+                    op: MemOp::Upsert(node_payload(&format!("n{i}"), None)),
+                })
+                .unwrap();
+        }
+        let finish = writer.finish().unwrap();
+
+        let mut cursor = NodeSourceCursor::open(&label, finish.body).unwrap();
+        assert_eq!(cursor.row_group_count, 4, "fixture must be multi-row-group");
+        assert_eq!(
+            cursor.row_groups_decoded, 1,
+            "open decodes only the first row group, not the whole body"
+        );
+        let mut seen = 0u8;
+        while let Some((id, lsn)) = cursor.peek() {
+            seen += 1;
+            assert_eq!(id, *sorted_node_id(seen).as_bytes());
+            assert_eq!(lsn, seen as u64);
+            if seen <= 4 {
+                assert_eq!(
+                    cursor.row_groups_decoded, 1,
+                    "rows of the first group must not trigger further decodes"
+                );
+            }
+            cursor.advance().unwrap();
+        }
+        assert_eq!(seen, 16);
+        assert_eq!(
+            cursor.row_groups_decoded, 4,
+            "all groups decoded exactly on demand"
+        );
+    }
+
+    #[test]
+    fn merge_node_sources_streams_across_row_group_boundaries() {
+        let label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        // Two multi-row-group sources overlapping on ids 11..=20; source B's
+        // higher LSNs win the overlap.
+        let build = |ids: std::ops::RangeInclusive<u8>, lsn_base: u64, tag: &str| {
+            let options = NodeSstWriterOptions {
+                row_group_target_rows: 3,
+                expected_keys: 20,
+                ..Default::default()
+            };
+            let mut writer = IncrementalNodeSstWriter::new(&label, options, 3).unwrap();
+            for i in ids {
+                writer
+                    .push(NodeRow {
+                        id: *sorted_node_id(i).as_bytes(),
+                        lsn: lsn_base + i as u64,
+                        op: MemOp::Upsert(node_payload(&format!("{tag}{i}"), None)),
+                    })
+                    .unwrap();
+            }
+            writer.finish().unwrap().body
+        };
+        let body_a = build(1..=20, 100, "a");
+        let body_b = build(11..=30, 200, "b");
+
+        let out = merge_node_sources(
+            vec![body_a, body_b],
+            &label,
+            &label,
+            true,
+            &schema(),
+            &LabelDictionary::new(),
+            "",
+            NodeMergeIndexSpecs::default(),
+        )
+        .unwrap();
+        assert_eq!(out.finish.stats.row_count, 30);
+        assert_eq!(out.finish.stats.min_lsn, 101);
+        assert_eq!(out.finish.stats.max_lsn, 230);
+
+        // Decode the merged body and verify order + winners row by row.
+        let reader = NodeSstReader::open(label.clone(), out.finish.body).unwrap();
+        let mut rows: Vec<([u8; 16], u64)> = Vec::new();
+        for batch in reader.scan().unwrap() {
+            let ids = batch
+                .column_by_name(COL_NODE_ID)
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                .unwrap()
+                .clone();
+            let lsns = batch
+                .column_by_name(COL_LSN)
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .unwrap()
+                .clone();
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row).try_into().unwrap(), lsns.value(row)));
+            }
+        }
+        assert_eq!(rows.len(), 30);
+        for (idx, (id, lsn)) in rows.iter().enumerate() {
+            let i = idx as u8 + 1;
+            assert_eq!(
+                *id,
+                *sorted_node_id(i).as_bytes(),
+                "output must stay sorted"
+            );
+            let expected_lsn = if i >= 11 {
+                200 + i as u64
+            } else {
+                100 + i as u64
+            };
+            assert_eq!(*lsn, expected_lsn, "id {i} must keep the highest LSN");
+        }
+    }
+
     #[cfg(feature = "vector-index")]
     #[tokio::test]
     async fn compaction_builds_a_searchable_vector_graph() {
@@ -2793,5 +4365,181 @@ mod tests {
             cluster0_hits >= 8,
             "expected >= 8/10 hits from cluster 0, got {cluster0_hits}"
         );
+    }
+
+    /// End-to-end index parity through the streaming merge: overlapping doc
+    /// updates + a tombstone across two L0s, an authoritative compaction
+    /// rebuilds the `.vg` and `.ft` from the winner stream, and both serve
+    /// results that match a brute-force flat scan of the reconciled corpus
+    /// (including the freshness stamps that keep them servable at all).
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn streaming_compaction_index_results_match_flat_scan() {
+        use rand::{Rng, SeedableRng};
+
+        use crate::manifest::{TextIndexDescriptor, VectorIndexDescriptor, VectorMetric};
+        use crate::text::parse_query;
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(emb: Vec<f32>, body: &str, label_id: u32) -> Bytes {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("emb".into(), Value::Vec(emb));
+            props.insert("body".into(), Value::Str(body.into()));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        }
+
+        let s = store();
+        let p = paths("compact-stream-index-parity");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let doc_label = base.manifest.label_dict.intern("Doc");
+        base.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 8,
+            metric: VectorMetric::Cosine,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+            quantization: crate::manifest::VectorQuantization::None,
+        });
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Doc".into(),
+            vec!["body".into()],
+        ));
+        let sc = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 8 }, false).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let mut corpus: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
+
+        // Flush 1: docs 1..=12.
+        let mut mt = Memtable::new();
+        for i in 1..=12u64 {
+            let emb: Vec<f32> = (0..8).map(|_| rng.gen::<f32>()).collect();
+            corpus.insert(i, emb.clone());
+            mt.apply(
+                MemKey::Node { id: idx_id(i) },
+                i,
+                MemOp::Upsert(doc_payload(emb, "alpha common", doc_label.0)),
+            );
+        }
+        let m = flush(&ms, &fence, &base, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        // Flush 2: doc 3 rewritten (new embedding, new body), doc 5 deleted.
+        let mut mt = Memtable::new();
+        let new_emb: Vec<f32> = (0..8).map(|_| rng.gen::<f32>()).collect();
+        corpus.insert(3, new_emb.clone());
+        corpus.remove(&5);
+        mt.apply(
+            MemKey::Node { id: idx_id(3) },
+            20,
+            MemOp::Upsert(doc_payload(new_emb, "bravo target", doc_label.0)),
+        );
+        mt.apply(MemKey::Node { id: idx_id(5) }, 21, MemOp::Tombstone);
+        let m = flush(&ms, &fence, &m, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        let out = compact_l0_to_l1(&ms, &fence, &m, &sc).await.unwrap();
+        let manifest = &out.committed.manifest;
+        let node_desc = manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::Nodes)
+            .unwrap();
+        let vg = manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::VectorGraph)
+            .expect("authoritative merge rebuilds the .vg");
+        let ft = manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::TextIndex)
+            .expect("authoritative merge rebuilds the .ft");
+        assert_eq!(vg.row_count, 11, "12 docs - 1 tombstone, update deduped");
+        assert_eq!(ft.row_count, 11);
+        // Freshness stamps: both indexes carry the merged corpus's
+        // high-water LSN, so the gate lets them serve.
+        assert_eq!(vg.max_lsn, node_desc.max_lsn);
+        assert_eq!(ft.max_lsn, node_desc.max_lsn);
+
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &mt_view, s, p);
+
+        // KNN parity: with ef >= corpus size the Vamana search is exhaustive,
+        // so the ids must equal the brute-force cosine top-k over the
+        // reconciled corpus (updated doc 3 in, deleted doc 5 out).
+        let query: Vec<f32> = corpus[&3].iter().map(|x| x + 0.01).collect();
+        let hits = snap.vector_search("doc_emb", &query, 5, 64).await.unwrap();
+        assert_eq!(hits.len(), 5);
+        let got: Vec<NodeId> = hits.iter().map(|(id, _)| *id).collect();
+        let mut flat: Vec<(u64, f32)> = corpus
+            .iter()
+            .map(|(i, emb)| (*i, cosine(&query, emb)))
+            .collect();
+        flat.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let expected: Vec<NodeId> = flat.iter().take(5).map(|(i, _)| idx_id(*i)).collect();
+        assert_eq!(
+            got, expected,
+            "KNN through the rebuilt index must match the flat scan"
+        );
+        assert_eq!(
+            got[0],
+            idx_id(3),
+            "the updated embedding wins, not the stale one"
+        );
+
+        // BM25 parity: "bravo" exists only in doc 3's REWRITTEN body; "alpha"
+        // matches the other 10 live docs (not the deleted 5, not the stale 3).
+        let hits = snap
+            .text_search("note_ft", "Doc", &parse_query("bravo"), Some(5))
+            .await
+            .unwrap()
+            .expect("the rebuilt .ft must serve (freshness gate passes)");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, idx_id(3));
+        let hits = snap
+            .text_search("note_ft", "Doc", &parse_query("alpha"), None)
+            .await
+            .unwrap()
+            .expect("the rebuilt .ft must serve");
+        let ids: std::collections::BTreeSet<NodeId> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), 10);
+        assert!(!ids.contains(&idx_id(3)), "doc 3's old body must be gone");
+        assert!(!ids.contains(&idx_id(5)), "the deleted doc must be gone");
     }
 }

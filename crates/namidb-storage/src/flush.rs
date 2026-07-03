@@ -402,24 +402,81 @@ pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
 
 // ── Node SST building ──────────────────────────────────────────────────
 
+/// Rows buffered per `RecordBatch` handed to the underlying
+/// [`NodeSstWriter`]. Bounds the second materialisation of the row data
+/// (Arrow builders) regardless of how many rows the caller streams in.
+pub(crate) const NODE_SST_BATCH_ROWS: usize = 16 * 1024;
+
+/// Incremental node-SST writer: accepts reconciled [`NodeRow`]s one at a
+/// time (`node_id` ascending), buffers them into bounded chunks, and feeds
+/// each chunk to the underlying [`NodeSstWriter`] as its own
+/// `RecordBatch`. [`build_node_sst`] and the compaction streaming merge
+/// (`compact.rs`) share it so the two write paths cannot drift: peak
+/// memory per output SST is one chunk of rows plus the Parquet encoder's
+/// own state, independent of the total row count.
+pub(crate) struct IncrementalNodeSstWriter {
+    writer: NodeSstWriter,
+    arrow_schema: arrow_schema::SchemaRef,
+    label: LabelDef,
+    chunk: Vec<NodeRow>,
+    chunk_rows: usize,
+}
+
+impl IncrementalNodeSstWriter {
+    pub(crate) fn new(
+        label: &LabelDef,
+        options: NodeSstWriterOptions,
+        chunk_rows: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            writer: NodeSstWriter::new(label.clone(), options)?,
+            arrow_schema: node_arrow_schema(label),
+            label: label.clone(),
+            chunk: Vec::new(),
+            chunk_rows: chunk_rows.max(1),
+        })
+    }
+
+    /// Buffer one row; flushes a full chunk into the Parquet writer.
+    pub(crate) fn push(&mut self, row: NodeRow) -> Result<()> {
+        self.chunk.push(row);
+        if self.chunk.len() >= self.chunk_rows {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> Result<()> {
+        if self.chunk.is_empty() {
+            return Ok(());
+        }
+        let batch = build_node_record_batch(&self.arrow_schema, &self.label, &self.chunk)?;
+        if batch.num_rows() > 0 {
+            self.writer.write_batch(&batch)?;
+        }
+        self.chunk.clear();
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<NodeSstFinish> {
+        self.flush_chunk()?;
+        self.writer.finish()
+    }
+}
+
 pub(crate) fn build_node_sst(label: &LabelDef, rows: &[NodeRow]) -> Result<NodeSstFinish> {
     let options = NodeSstWriterOptions {
         expected_keys: rows.len() as u64,
         ..Default::default()
     };
-    let mut writer = NodeSstWriter::new(label.clone(), options)?;
-    let arrow_schema = node_arrow_schema(label);
     // Feed the writer in bounded chunks rather than one monolithic
     // RecordBatch: a deep-level compaction merges the whole bucket, and the
     // single all-rows batch (every column fully materialised a second time)
     // was the largest single allocation of the merge. The writer accepts any
     // number of ascending-ordered batches; `rows` are already sorted.
-    const BATCH_ROWS: usize = 16 * 1024;
-    for chunk in rows.chunks(BATCH_ROWS) {
-        let batch = build_node_record_batch(&arrow_schema, label, chunk)?;
-        if batch.num_rows() > 0 {
-            writer.write_batch(&batch)?;
-        }
+    let mut writer = IncrementalNodeSstWriter::new(label, options, NODE_SST_BATCH_ROWS)?;
+    for row in rows {
+        writer.push(row.clone())?;
     }
     writer.finish()
 }
@@ -705,48 +762,78 @@ pub(crate) fn prepare_label_index_sidecar(
     sst_id: &Uuid,
     rows: &[NodeRow],
 ) -> Result<LabelIndexSidecar> {
-    let mut index: BTreeMap<u32, Vec<[u8; 16]>> = BTreeMap::new();
+    let mut collector = LabelIndexCollector::new();
     for row in rows {
         if let MemOp::Upsert(payload) = &row.op {
             let rec = NodeWriteRecord::decode(payload)?;
-            for &lid in &rec.labels {
-                let ids = index.entry(lid).or_default();
-                if !ids.contains(&row.id) {
-                    ids.push(row.id);
-                }
+            collector.observe(row.id, &rec);
+        }
+    }
+    collector.finish(paths, level, sst_id)
+}
+
+/// Streaming harvester behind [`prepare_label_index_sidecar`]: the
+/// compaction merge feeds it one reconciled winner row at a time (id
+/// ascending, tombstones excluded) so the label postings never require the
+/// whole merged bucket in memory — only the posting lists themselves.
+#[derive(Debug, Default)]
+pub(crate) struct LabelIndexCollector {
+    index: BTreeMap<u32, Vec<[u8; 16]>>,
+}
+
+impl LabelIndexCollector {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
+        for &lid in &rec.labels {
+            let ids = self.index.entry(lid).or_default();
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }
-    if index.is_empty() {
-        return Ok((None, None));
+
+    /// Serialise the harvested postings into the sidecar body + descriptor.
+    pub(crate) fn finish(
+        self,
+        paths: &NamespacePaths,
+        level: u32,
+        sst_id: &Uuid,
+    ) -> Result<LabelIndexSidecar> {
+        let index = self.index;
+        if index.is_empty() {
+            return Ok((None, None));
+        }
+        // `per_label_counts` mirrors each posting list's length so the cost
+        // model can recover per-label `node_count` from the manifest alone (no
+        // sidecar body read); `posting_count` is just their sum.
+        let per_label_counts: Vec<(u32, u64)> = index
+            .iter()
+            .map(|(&lid, ids)| (lid, ids.len() as u64))
+            .collect();
+        let label_count = index.len() as u64;
+        let posting_count = per_label_counts.iter().map(|(_, c)| *c).sum();
+        let body_bytes = bincode::serialize(&index)
+            .map_err(|e| Error::invariant(format!("label-index bincode: {e}")))?;
+        let body = Bytes::from(body_bytes);
+        let file_name = format!(
+            "{}-{}.labelidx.bin",
+            uuid_path_id(sst_id),
+            SstKind::Nodes.path_tag()
+        );
+        let object_path = paths.sst_object(level, &file_name);
+        let relative = relative_sst_path(level, &file_name);
+        let descriptor = crate::manifest::LabelIndexDescriptor {
+            path: relative,
+            size_bytes: body.len() as u64,
+            label_count,
+            posting_count,
+            per_label_counts,
+        };
+        Ok((Some(descriptor), Some((object_path, body))))
     }
-    // `per_label_counts` mirrors each posting list's length so the cost model
-    // can recover per-label `node_count` from the manifest alone (no sidecar
-    // body read); `posting_count` is just their sum.
-    let per_label_counts: Vec<(u32, u64)> = index
-        .iter()
-        .map(|(&lid, ids)| (lid, ids.len() as u64))
-        .collect();
-    let label_count = index.len() as u64;
-    let posting_count = per_label_counts.iter().map(|(_, c)| *c).sum();
-    let body_bytes = bincode::serialize(&index)
-        .map_err(|e| Error::invariant(format!("label-index bincode: {e}")))?;
-    let body = Bytes::from(body_bytes);
-    let file_name = format!(
-        "{}-{}.labelidx.bin",
-        uuid_path_id(sst_id),
-        SstKind::Nodes.path_tag()
-    );
-    let object_path = paths.sst_object(level, &file_name);
-    let relative = relative_sst_path(level, &file_name);
-    let descriptor = crate::manifest::LabelIndexDescriptor {
-        path: relative,
-        size_bytes: body.len() as u64,
-        label_count,
-        posting_count,
-        per_label_counts,
-    };
-    Ok((Some(descriptor), Some((object_path, body))))
 }
 
 /// Compute per-(label, property) statistics for an id-primary node SST
@@ -761,32 +848,58 @@ pub(crate) fn compute_per_label_property_stats(
     schema: &Schema,
     label_dict: &LabelDictionary,
 ) -> Result<Vec<PerLabelPropertyStat>> {
-    struct Acc {
-        min: Option<StatScalar>,
-        max: Option<StatScalar>,
-        hll: Hll,
-        non_null: u64,
-    }
-    let mut accs: BTreeMap<(u32, String), Acc> = BTreeMap::new();
-    let mut live_per_label: BTreeMap<u32, u64> = BTreeMap::new();
-
+    let mut collector = PerLabelStatsCollector::new();
     for row in rows {
         let MemOp::Upsert(payload) = &row.op else {
             continue;
         };
         let rec = NodeWriteRecord::decode(payload)?;
+        collector.observe(&rec);
+    }
+    collector.finish(schema, label_dict)
+}
+
+/// One `(LabelId, property)` accumulator of [`PerLabelStatsCollector`].
+struct PerLabelStatAcc {
+    min: Option<StatScalar>,
+    max: Option<StatScalar>,
+    hll: Hll,
+    non_null: u64,
+}
+
+/// Streaming accumulator behind [`compute_per_label_property_stats`]: the
+/// compaction merge feeds it one reconciled winner record at a time, so the
+/// stats only ever hold the per-`(label, property)` accumulators — never
+/// the merged rows themselves.
+pub(crate) struct PerLabelStatsCollector {
+    accs: BTreeMap<(u32, String), PerLabelStatAcc>,
+    live_per_label: BTreeMap<u32, u64>,
+}
+
+impl PerLabelStatsCollector {
+    pub(crate) fn new() -> Self {
+        Self {
+            accs: BTreeMap::new(),
+            live_per_label: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, rec: &NodeWriteRecord) {
         for &lid in &rec.labels {
-            *live_per_label.entry(lid).or_default() += 1;
+            *self.live_per_label.entry(lid).or_default() += 1;
             for (name, value) in &rec.properties {
                 let Some(scalar) = value_to_stat_scalar(value) else {
                     continue;
                 };
-                let acc = accs.entry((lid, name.clone())).or_insert_with(|| Acc {
-                    min: None,
-                    max: None,
-                    hll: Hll::new(DEFAULT_PRECISION),
-                    non_null: 0,
-                });
+                let acc = self
+                    .accs
+                    .entry((lid, name.clone()))
+                    .or_insert_with(|| PerLabelStatAcc {
+                        min: None,
+                        max: None,
+                        hll: Hll::new(DEFAULT_PRECISION),
+                        non_null: 0,
+                    });
                 acc.non_null += 1;
                 acc.hll.add_scalar(&scalar);
                 acc.min = Some(match acc.min.take() {
@@ -801,54 +914,67 @@ pub(crate) fn compute_per_label_property_stats(
         }
     }
 
-    // Seed declared-but-absent properties. A property declared on a label but
-    // null on every row of this SST yields no accumulator above, so it would
-    // emit no entry; the cost model's backfill (`non_null = node_count -
-    // null_count`) then leaves `null_count = 0` and the property reads as fully
-    // non-null. Seeding an empty accumulator for every declared property of a
-    // label present here makes its `null_count` resolve to `live` (all rows
-    // null), which is correct and additive across SSTs. Only labels present in
-    // this SST are seeded; their declared set comes from the schema, resolved
-    // through the label dictionary (an un-resolvable or undeclared label simply
-    // falls back to the observed-only behavior).
-    for &label_id in live_per_label.keys() {
-        let Some(name) = label_dict.name(LabelId(label_id)) else {
-            continue;
-        };
-        let Some(def) = schema.label(name) else {
-            continue;
-        };
-        for prop in &def.properties {
-            accs.entry((label_id, prop.name.clone()))
-                .or_insert_with(|| Acc {
-                    min: None,
-                    max: None,
-                    hll: Hll::new(DEFAULT_PRECISION),
-                    non_null: 0,
-                });
-        }
-    }
+    /// Fold the accumulators into the manifest-level stat rows.
+    pub(crate) fn finish(
+        self,
+        schema: &Schema,
+        label_dict: &LabelDictionary,
+    ) -> Result<Vec<PerLabelPropertyStat>> {
+        let Self {
+            mut accs,
+            live_per_label,
+        } = self;
 
-    let mut out = Vec::with_capacity(accs.len());
-    for ((label_id, property), acc) in accs {
-        let live = live_per_label
-            .get(&label_id)
-            .copied()
-            .unwrap_or(acc.non_null);
-        out.push(PerLabelPropertyStat {
-            label_id,
-            property,
-            null_count: live.saturating_sub(acc.non_null),
-            min: acc.min,
-            max: acc.max,
-            ndv_estimate: if acc.hll.is_empty() {
-                None
-            } else {
-                Some(acc.hll.to_sketch_bytes())
-            },
-        });
+        // Seed declared-but-absent properties. A property declared on a label
+        // but null on every row of this SST yields no accumulator above, so it
+        // would emit no entry; the cost model's backfill (`non_null =
+        // node_count - null_count`) then leaves `null_count = 0` and the
+        // property reads as fully non-null. Seeding an empty accumulator for
+        // every declared property of a label present here makes its
+        // `null_count` resolve to `live` (all rows null), which is correct and
+        // additive across SSTs. Only labels present in this SST are seeded;
+        // their declared set comes from the schema, resolved through the label
+        // dictionary (an un-resolvable or undeclared label simply falls back
+        // to the observed-only behavior).
+        for &label_id in live_per_label.keys() {
+            let Some(name) = label_dict.name(LabelId(label_id)) else {
+                continue;
+            };
+            let Some(def) = schema.label(name) else {
+                continue;
+            };
+            for prop in &def.properties {
+                accs.entry((label_id, prop.name.clone()))
+                    .or_insert_with(|| PerLabelStatAcc {
+                        min: None,
+                        max: None,
+                        hll: Hll::new(DEFAULT_PRECISION),
+                        non_null: 0,
+                    });
+            }
+        }
+
+        let mut out = Vec::with_capacity(accs.len());
+        for ((label_id, property), acc) in accs {
+            let live = live_per_label
+                .get(&label_id)
+                .copied()
+                .unwrap_or(acc.non_null);
+            out.push(PerLabelPropertyStat {
+                label_id,
+                property,
+                null_count: live.saturating_sub(acc.non_null),
+                min: acc.min,
+                max: acc.max,
+                ndv_estimate: if acc.hll.is_empty() {
+                    None
+                } else {
+                    Some(acc.hll.to_sketch_bytes())
+                },
+            });
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Map a core [`Value`] to the [`StatScalar`] the optimizer's min/max/ndv
@@ -902,50 +1028,87 @@ pub(crate) fn prepare_unique_property_sidecars(
     label_def: &LabelDef,
     rows: &[NodeRow],
 ) -> Result<UniquePropertySidecars> {
-    let mut descriptors = Vec::new();
-    let mut bodies = Vec::new();
-    for prop in &label_def.properties {
-        if !prop.unique {
-            continue;
+    let mut collector = UniqueSidecarCollector::new(label_def);
+    for row in rows {
+        if let MemOp::Upsert(payload) = &row.op {
+            let rec = NodeWriteRecord::decode(payload)?;
+            collector.observe(row.id, &rec);
         }
-        let mut index: BTreeMap<String, [u8; 16]> = BTreeMap::new();
-        for row in rows {
-            if let MemOp::Upsert(payload) = &row.op {
-                let rec = NodeWriteRecord::decode(payload)?;
-                if let Some(Value::Str(s)) = rec.properties.get(&prop.name) {
-                    // Last-write-wins within one SST; the BTreeMap
-                    // overwrites cleanly when the same value re-occurs
-                    // (writer guarantees row order matches lsn order).
-                    index.insert(s.clone(), row.id);
-                }
+    }
+    collector.finish(paths, level, sst_id, label)
+}
+
+/// Streaming harvester behind [`prepare_unique_property_sidecars`]: fed one
+/// reconciled winner row at a time by the compaction merge, so only the
+/// sidecar-relevant `(value → id)` maps stay in memory. Entries keep the
+/// def's property order so the emitted descriptors match the row-slice path
+/// exactly.
+#[derive(Debug)]
+pub(crate) struct UniqueSidecarCollector {
+    entries: Vec<(String, BTreeMap<String, [u8; 16]>)>,
+}
+
+impl UniqueSidecarCollector {
+    pub(crate) fn new(label_def: &LabelDef) -> Self {
+        Self {
+            entries: label_def
+                .properties
+                .iter()
+                .filter(|p| p.unique)
+                .map(|p| (p.name.clone(), BTreeMap::new()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
+        for (name, index) in &mut self.entries {
+            if let Some(Value::Str(s)) = rec.properties.get(name) {
+                // Last-write-wins within one SST; the BTreeMap
+                // overwrites cleanly when the same value re-occurs
+                // (writer guarantees row order matches lsn order).
+                index.insert(s.clone(), id);
             }
         }
-        if index.is_empty() {
-            continue;
-        }
-        let body_bytes = bincode::serialize(&index)
-            .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?;
-        let entry_count = index.len() as u64;
-        let body = Bytes::from(body_bytes);
-
-        let file_name = format!(
-            "{}-{}-{}.idx_{}.bin",
-            uuid_path_id(sst_id),
-            SstKind::Nodes.path_tag(),
-            label,
-            prop.name,
-        );
-        let object_path = paths.sst_object(level, &file_name);
-        let relative = relative_sst_path(level, &file_name);
-        descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
-            property: prop.name.clone(),
-            path: relative,
-            size_bytes: body.len() as u64,
-            entry_count,
-        });
-        bodies.push((object_path, body));
     }
-    Ok((descriptors, bodies))
+
+    /// Serialise the harvested maps into one sidecar per non-empty property.
+    pub(crate) fn finish(
+        self,
+        paths: &NamespacePaths,
+        level: u32,
+        sst_id: &Uuid,
+        label: &str,
+    ) -> Result<UniquePropertySidecars> {
+        let mut descriptors = Vec::new();
+        let mut bodies = Vec::new();
+        for (name, index) in self.entries {
+            if index.is_empty() {
+                continue;
+            }
+            let body_bytes = bincode::serialize(&index)
+                .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?;
+            let entry_count = index.len() as u64;
+            let body = Bytes::from(body_bytes);
+
+            let file_name = format!(
+                "{}-{}-{}.idx_{}.bin",
+                uuid_path_id(sst_id),
+                SstKind::Nodes.path_tag(),
+                label,
+                name,
+            );
+            let object_path = paths.sst_object(level, &file_name);
+            let relative = relative_sst_path(level, &file_name);
+            descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
+                property: name,
+                path: relative,
+                size_bytes: body.len() as u64,
+                entry_count,
+            });
+            bodies.push((object_path, body));
+        }
+        Ok((descriptors, bodies))
+    }
 }
 
 /// Parallel outputs of [`prepare_equality_property_sidecars`].
@@ -971,49 +1134,88 @@ pub(crate) fn prepare_equality_property_sidecars(
     label_def: &LabelDef,
     rows: &[NodeRow],
 ) -> Result<EqualityPropertySidecars> {
-    let mut descriptors = Vec::new();
-    let mut bodies = Vec::new();
-    for prop in &label_def.properties {
-        if !prop.indexed {
-            continue;
+    let mut collector = EqualitySidecarCollector::new(label_def);
+    for row in rows {
+        if let MemOp::Upsert(payload) = &row.op {
+            let rec = NodeWriteRecord::decode(payload)?;
+            collector.observe(row.id, &rec);
         }
-        let mut index: BTreeMap<String, Vec<[u8; 16]>> = BTreeMap::new();
-        for row in rows {
-            if let MemOp::Upsert(payload) = &row.op {
-                let rec = NodeWriteRecord::decode(payload)?;
-                if let Some(Value::Str(s)) = rec.properties.get(&prop.name) {
-                    let ids = index.entry(s.clone()).or_default();
-                    if !ids.contains(&row.id) {
-                        ids.push(row.id);
-                    }
+    }
+    collector.finish(paths, level, sst_id, label)
+}
+
+/// One property's harvested `value → [id, ...]` postings, in def order.
+/// Aliased for clippy's type-complexity lint.
+type EqualityPostingEntries = Vec<(String, BTreeMap<String, Vec<[u8; 16]>>)>;
+
+/// Streaming harvester behind [`prepare_equality_property_sidecars`]; the
+/// posting-list analogue of [`UniqueSidecarCollector`].
+#[derive(Debug)]
+pub(crate) struct EqualitySidecarCollector {
+    entries: EqualityPostingEntries,
+}
+
+impl EqualitySidecarCollector {
+    pub(crate) fn new(label_def: &LabelDef) -> Self {
+        Self {
+            entries: label_def
+                .properties
+                .iter()
+                .filter(|p| p.indexed)
+                .map(|p| (p.name.clone(), BTreeMap::new()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
+        for (name, index) in &mut self.entries {
+            if let Some(Value::Str(s)) = rec.properties.get(name) {
+                let ids = index.entry(s.clone()).or_default();
+                if !ids.contains(&id) {
+                    ids.push(id);
                 }
             }
         }
-        if index.is_empty() {
-            continue;
-        }
-        let distinct_values = index.len() as u64;
-        let body_bytes = bincode::serialize(&index)
-            .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?;
-        let body = Bytes::from(body_bytes);
-        let file_name = format!(
-            "{}-{}-{}.eqidx_{}.bin",
-            uuid_path_id(sst_id),
-            SstKind::Nodes.path_tag(),
-            label,
-            prop.name,
-        );
-        let object_path = paths.sst_object(level, &file_name);
-        let relative = relative_sst_path(level, &file_name);
-        descriptors.push(crate::manifest::EqualityIndexDescriptor {
-            property: prop.name.clone(),
-            path: relative,
-            size_bytes: body.len() as u64,
-            distinct_values,
-        });
-        bodies.push((object_path, body));
     }
-    Ok((descriptors, bodies))
+
+    /// Serialise the harvested postings into one sidecar per non-empty
+    /// property.
+    pub(crate) fn finish(
+        self,
+        paths: &NamespacePaths,
+        level: u32,
+        sst_id: &Uuid,
+        label: &str,
+    ) -> Result<EqualityPropertySidecars> {
+        let mut descriptors = Vec::new();
+        let mut bodies = Vec::new();
+        for (name, index) in self.entries {
+            if index.is_empty() {
+                continue;
+            }
+            let distinct_values = index.len() as u64;
+            let body_bytes = bincode::serialize(&index)
+                .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?;
+            let body = Bytes::from(body_bytes);
+            let file_name = format!(
+                "{}-{}-{}.eqidx_{}.bin",
+                uuid_path_id(sst_id),
+                SstKind::Nodes.path_tag(),
+                label,
+                name,
+            );
+            let object_path = paths.sst_object(level, &file_name);
+            let relative = relative_sst_path(level, &file_name);
+            descriptors.push(crate::manifest::EqualityIndexDescriptor {
+                property: name,
+                path: relative,
+                size_bytes: body.len() as u64,
+                distinct_values,
+            });
+            bodies.push((object_path, body));
+        }
+        Ok((descriptors, bodies))
+    }
 }
 
 fn prepare_edge_pending(
