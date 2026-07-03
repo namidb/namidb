@@ -31,7 +31,7 @@ What you get out of the box:
 - **Schema when you want it** — `CREATE CONSTRAINT` for uniqueness (single- *and* multi-property), `NOT NULL`, and `CREATE INDEX` for equality lookups, with `IF NOT EXISTS` and `SHOW CONSTRAINTS` / `SHOW INDEXES`. Schema-optional: the engine enforces only what you declare.
 - **Vector search** — store embeddings as node properties and rank with `cosine_similarity`, or build a real `CREATE VECTOR INDEX` (DiskANN/Vamana) for ANN over cosine, dot, *and* Euclidean — with optional int8 quantization for a ~4× smaller index. Reachable from idiomatic Cypher KNN or `CALL search.vector` / Neo4j-style `db.index.vector.queryNodes`.
 - **Hybrid search** — BM25 lexical + dense vector, fused with Reciprocal Rank Fusion (or a weighted blend), in one `CALL search.hybrid`.
-- **Graph algorithms** — connected components (weak & strong), PageRank, degree centrality, triangle count, community detection, shortest paths, and FastRP structural embeddings over `CALL algo.*`.
+- **Graph algorithms** — connected components (weak & strong), PageRank, degree & betweenness centrality, triangle count, community detection (label propagation *and* Louvain modularity), shortest paths, and FastRP structural embeddings over `CALL algo.*`, each with an optional `{labels, edge_types, direction}` subgraph projection.
 - **Obsidian / Markdown ingestion** — turn a folder of notes into a live graph (wikilinks, embeds, tags, frontmatter) in one command.
 - **Auth that's real** — static tokens, OIDC/JWT, per-namespace scoping, and an external policy hook (OPA).
 
@@ -341,7 +341,7 @@ The tools it exposes:
 | `list_tags`, `notes_by_tag`, `subtags`, `tags_of` | Tag queries over the `:Tag` tree |
 | `vector_search` | Semantic K-NN by cosine similarity |
 | `hybrid_search` | BM25 lexical + semantic, fused with reciprocal rank fusion |
-| `graph_algorithm` | Run `wcc`/`scc`/`pagerank`/`degree`/`triangle_count`/`label_propagation`/`shortest_path` over a subgraph |
+| `graph_algorithm` | Run `wcc`/`scc`/`pagerank`/`degree`/`betweenness`/`triangle_count`/`label_propagation`/`louvain`/`shortest_path` over a subgraph |
 | `cypher` | Read-only Cypher escape hatch |
 
 <br />
@@ -473,6 +473,16 @@ The defaults are fine for almost everything; reach for these when chasing a perf
 | `NAMIDB_FACTORIZE` | OFF | Factorized intermediate results in the executor. |
 | `NAMIDB_EMBED_PROVIDER` | unset | Remote embedder for `load-vault --embed` (`openai`/`voyage`/`cohere`/`gemini`/`jina`; needs `--features remote-embedder`). |
 
+The cache budgets (`NAMIDB_SST_CACHE_BUDGET_MIB`, `NAMIDB_NODE_CACHE_*`, `NAMIDB_ADJACENCY_*`, `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`) are **process-wide** — one shared pool across every namespace, so a busy tenant cannot starve the box. The server also takes durability/backpressure knobs for critical workloads:
+
+| Flag (env var) | Default | What it does |
+|---|---|---|
+| `--memtable-flush-bytes` (`NAMIDB_MEMTABLE_FLUSH_BYTES`) | 64 MiB | Flush as soon as a committed write crosses this — bounds the un-flushed working set by bytes, not just the flush interval. |
+| `--memtable-stall-bytes` (`NAMIDB_MEMTABLE_STALL_BYTES`) | 256 MiB | Soft write backpressure so a burst loader can't OOM the process between flushes. |
+| `--writer-lock-timeout` (`NAMIDB_WRITER_LOCK_TIMEOUT`) | 30s | Cap how long a foreground write/DDL waits for the writer; a stuck writer returns 503 fast instead of growing an unbounded queue. |
+
+A fenced or poisoned writer reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers — a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
+
 <br />
 
 ## Repository layout
@@ -502,6 +512,7 @@ crates/
 |---|---|
 | Website | [namidb.com](https://namidb.com) |
 | Reference docs & guides | [docs.namidb.com](https://docs.namidb.com) |
+| **Engine internals (technical report)** | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) |
 | Design RFCs | [`docs/rfc/`](./docs/rfc/) |
 | Python bindings | [`crates/namidb-py/README.md`](./crates/namidb-py/README.md) |
 | HTTP / Bolt server | [`crates/namidb-server/README.md`](./crates/namidb-server/README.md) |
