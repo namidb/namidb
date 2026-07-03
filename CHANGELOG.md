@@ -11,6 +11,139 @@ the release notes.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-03: Enterprise-grade hardening — durability, resilience, and search completeness
+
+A deep audit of the vector / text / graph search stack and the enterprise
+durability path, followed by the full remediation. The major version marks the
+milestone — the engine is now hardened for critical multi-tenant workloads —
+**not** a breaking API change: everything that worked on 1.5.0 keeps working,
+so the **Breaking** section is intentionally empty. New surfaces are additive
+and new tuning knobs default to safe values.
+
+### Added
+
+- **`DROP VECTOR INDEX <name> [IF EXISTS]`** and **`DROP INDEX <name> [IF
+  EXISTS]`** (drops a fulltext index) — a mis-created index is no longer
+  permanent. The descriptor and the index's SSTs are removed in one manifest
+  commit (the janitor reclaims the bodies), writes constrained by a
+  wrong-dimension vector index are immediately un-bricked, and the freed
+  `(label, properties)` slot can be re-created corrected. Wired through HTTP,
+  Bolt, and the authz hook, mirroring the `CREATE` path.
+- **Louvain and Brandes betweenness** — `CALL algo.louvain()` (modularity
+  community detection, reports the partition's modularity) and `CALL
+  algo.betweenness()` (bridge-node centrality), both deterministic and
+  deadline-aware. Also exposed through the MCP `graph_algorithm` tool.
+- **Graph projections on every `algo.*`.** An optional `{labels, edge_types,
+  direction: 'natural'|'reverse'|'undirected'}` map restricts a procedure to the
+  induced subgraph (unknown labels/types error rather than silently projecting
+  nothing) — the canonical Neo4j GDS graph-projection workflow.
+- **Phrase and prefix full-text queries.** The `search.bm25` query string now
+  understands quoted `"exact phrase"` (position-adjacency, backed by positional
+  postings in the new `.ft` v2 format) and trailing-`*` prefixes (vocabulary
+  expansion), with identical semantics on the index path and the flat-scan
+  fallback. Plain-term queries are byte-for-byte unchanged.
+- **Demand-driven Bolt result streaming.** `RUN` answers `SUCCESS {fields}` only;
+  each `PULL {n}` emits at most `n` records and reports `has_more` while rows
+  remain, and `DISCARD` drops the remainder unsent — so a driver's `fetch_size`
+  finally bounds what is buffered in flight instead of the server materialising
+  and streaming the whole result at `RUN` time.
+- **Writer health in the readiness probe.** `/v0/health` now reports `writer:
+  "ok" | "degraded"` (plus a reason) and returns 503 while the writer is
+  fenced/poisoned and the automatic reopen has not yet landed, so an orchestrator
+  stops routing writes to a server that can only fail them. A lock-free read-side
+  fence probe degrades readiness when a peer writer's epoch has fenced this node
+  — a zombie replica no longer serves stale reads behind a green health check.
+- **Byte-based flush + write backpressure knobs.** `NAMIDB_MEMTABLE_FLUSH_BYTES`
+  (default 64 MiB) triggers a flush as soon as a committed write crosses it, and
+  `NAMIDB_MEMTABLE_STALL_BYTES` (default 256 MiB) stalls writes until the flush
+  catches up — bounding the un-flushed working set by bytes, not just the wall
+  clock, so a burst loader cannot OOM the process between flush ticks.
+  `/v0/health` exposes the live memtable size.
+- **Bounded writer-lock acquisition.** `NAMIDB_WRITER_LOCK_TIMEOUT` (default 30s)
+  caps how long a foreground write / DDL / admin flush / Bolt `BEGIN` waits for
+  the writer mutex before failing fast with 503 (or a transient Bolt error), so a
+  stuck or long-held writer no longer grows an unbounded request queue.
+  Background tasks keep waiting as long as it takes.
+- **Consistent online backups.** A backup now holds a persistent retention pin
+  (a lease object under `manifest/pins/`, renewed as it copies) that the janitor
+  honours, so a concurrent compaction + sweep can no longer delete objects out
+  from under a running backup. Object copies stream via multipart instead of
+  buffering each object whole in memory.
+
+### Changed — performance
+
+- **Compaction runs off the writer lock.** Split into a `prepare` phase
+  (downloads, k-way merge, index rebuilds, and all object PUTs — off-lock) and a
+  brief `install` phase that only re-takes the lock for the fence-checked
+  manifest CAS. A multi-second compaction no longer blocks every concurrent
+  write, and an abandoned prepare's bodies (at immutable UUID paths) are
+  reclaimed by the orphan sweep.
+- **Streaming compaction merge.** The merge is now a k-way streaming merge over
+  per-source row-group cursors (only winning rows are materialised, into bounded
+  chunks; sidecar / label-stats / vector / text builders observe the winner
+  stream) instead of materialising the entire merged level in RAM, so peak
+  compaction memory no longer scales with the level budget up to OOM.
+- **O(1) published-memtable snapshots.** The memtable is a persistent
+  `imbl::OrdMap`; publishing the read snapshot on every commit is now structural
+  sharing instead of a full tree clone (which grew per-commit cost linearly with
+  memtable size, quadratically across a flush interval, under the writer lock).
+- **O(1) unique-constraint checks.** A per-writer transactional index replaces
+  the full-label scan per written row, so constraint-bearing bulk writes are no
+  longer O(N²); the sidecar fast-path scoping bug that disabled it in any
+  multi-label deployment is fixed.
+- **MIPS-correct dot-metric vector search.** Dot indexes are built and navigated
+  over MIPS-augmented vectors, so the large-norm vectors that dominate a true
+  inner-product top-k are actually surfaced (plain cosine navigation missed
+  them). int8 index hits are rescored with the exact f32 metric, so served
+  scores and top-k membership match the flat scan.
+- **Faster graph & lookup paths.** Triangle counting is the compact-forward
+  `O(E^1.5)` algorithm (was quadratic in hub degree); `shortestPath` /
+  `allShortestPaths` use a per-seed visited-set BFS (was enumerating every walk);
+  whole-graph `algo.*` builds do one label-agnostic id pass (was one full-store
+  pass per label); `batch_lookup_nodes` prunes to the needed row groups with a
+  byte-budgeted decoded cache (was decoding whole node SSTs into an unbounded
+  per-snapshot cache); decoded `.vg`/`.ft` indexes are cached process-wide.
+- **Multi-tenant cache memory is bounded.** The SST / node-view / adjacency
+  caches are process-wide shared instances with global byte budgets (was a
+  per-namespace budget each, so 100 namespaces could hold ~125 GiB); cache keys
+  carry the namespace so tenants never collide, and eviction prunes the evicted
+  namespace's entries.
+
+### Fixed
+
+- **A fenced or poisoned writer now recovers automatically.** Previously a single
+  transient CAS/fence failure — or a second replica pointed at the same bucket —
+  left every subsequent write failing forever while `/v0/health` still reported
+  ok. All write paths, DDL handlers, flush ticks, and compaction-install paths
+  now reopen the session in place (bounded retries), and health reports degraded
+  until it lands.
+- **Interrupted commits no longer wedge a namespace.** A crash between the
+  manifest body PUT and the pointer CAS left an orphan body that blocked every
+  future writer claim. `WriterSession::open` now repairs the stall — adopting the
+  orphan when its WAL segment is durable and **content-verified** (an xxh3 in the
+  descriptor proves the durable segment is ours, so a fenced peer's segment with
+  a coinciding LSN can never be adopted, which would have committed
+  negatively-acked writes), otherwise deleting it.
+- **WAL segments and stale memtable snapshots are garbage-collected.** They were
+  never deleted — unbounded object-store growth and an ever-growing cold-open
+  `LIST` on every namespace. The janitor now reclaims dead WAL segments (under
+  the same retention-horizon + min-age safety rule as SSTs) and superseded
+  snapshots.
+- **Multi-tenant namespace eviction no longer leaks.** Evicting a namespace now
+  cancels its flush/compaction tasks (previously zombie tasks kept an `Arc` to
+  the whole state — memtable and ~1 GiB of caches — alive forever and raced the
+  namespace's next incarnation as a second writer).
+- **Full-text index no longer disabled by an unrelated write.** The freshness
+  gate is label-scoped: a write to a different label no longer turns every
+  `search.bm25` into an `O(corpus)` flat scan; exact index-vs-flat parity is
+  preserved by probing dirty ids against the index's document set.
+- **Bolt decode is bounded** (a depth guard stops a pre-auth stack-overflow
+  abort), the pre-delete pin re-check closes a mid-sweep backup race, and a batch
+  of query-correctness fixes (relationship-uniqueness in variable-length expand,
+  `LIMIT $k`, `DISTINCT` before `LIMIT`, `fingerprint_value` collisions, NULL
+  ordering, self-loop double-counting, `SET` from a stale row clone,
+  unique-sidecar re-verification) round out the audit.
+
 ## [1.5.0] - 2026-06-26: Vector search hardening — filtering, idempotent DDL, dimension safety
 
 ### Added

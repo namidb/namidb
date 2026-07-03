@@ -7,7 +7,7 @@ name = "namidb"
 # Keep in sync with the workspace `version` in /Cargo.toml.
 # `python-wheels.yml` publishes a wheel whose filename uses THIS
 # version; the release tag `py-vX.Y.Z` must match X.Y.Z exactly.
-version = "1.5.0"
+version = "2.0.0"
 description = "Cloud-native graph database on object storage (Python bindings)"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
