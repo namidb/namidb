@@ -13,6 +13,9 @@
 //! 4. The orphan sweep finds the now-unreferenced L0 bodies, deletes them
 //!    when asked, and a re-run finds nothing — and reads still hold.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, Params, RuntimeValue,
     StatsCatalog,
@@ -20,6 +23,7 @@ use namidb_query::{
 use namidb_storage::{
     sweep_orphans, ManifestStore, OwnedSnapshot, SstKind, SstLevel, WriterSession,
 };
+use object_store::ObjectStore;
 
 const NS: &str = "maint-test";
 
@@ -224,5 +228,175 @@ async fn compaction_collapses_l0_and_sweep_reclaims_orphans() {
         count_persons(&final_snap).await,
         total,
         "count still correct after the sweep deleted the orphaned bodies"
+    );
+}
+
+/// `ObjectStore` wrapper that sleeps before every GET of an SST body, making
+/// a compaction prepare (which downloads all its inputs) deterministically
+/// slow while writes — WAL and manifest PUTs, no SST GETs — stay fast.
+#[derive(Debug)]
+struct SlowSstGets {
+    inner: Arc<dyn ObjectStore>,
+    delay: Duration,
+}
+
+impl std::fmt::Display for SlowSstGets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowSstGets({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SlowSstGets {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if location.as_ref().contains("/sst/") {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+}
+
+/// Finding 32: the maintenance loops snapshot a compaction basis under a
+/// brief writer lock, run the expensive prepare (input downloads, merge,
+/// index rebuilds, output uploads) WITHOUT the lock, and re-take it only
+/// for the manifest CAS. This drives that exact sequence against an
+/// `AppState` whose SST GETs are artificially slow and asserts that writes
+/// issued while the prepare is in flight complete without waiting for it —
+/// under the old under-lock compaction every one of them would block for
+/// the full prepare duration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_complete_while_a_slow_prepare_runs_off_lock() {
+    const SST_GET_DELAY: Duration = Duration::from_millis(300);
+    const SLOW_NS: &str = "maint-offlock";
+
+    // Reuse parse_uri only for the canonical paths; the store itself is a
+    // fresh in-memory one behind the GET-delaying wrapper.
+    let (_discard, paths) = namidb_storage::parse_uri(&format!("memory://{SLOW_NS}")).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(SlowSstGets {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        delay: SST_GET_DELAY,
+    });
+    let writer = WriterSession::open(store, paths).await.unwrap();
+    let state = namidb_server::AppState::new(writer, None, SLOW_NS.into());
+
+    // Two flushed batches → two L0 SSTs in the node bucket, so the prepare
+    // downloads (at least) two bodies and takes >= 2 * SST_GET_DELAY.
+    const SEEDED: usize = 6;
+    for b in 0..2 {
+        for j in 0..3 {
+            create_person(&state, b * 3 + j).await;
+        }
+        flush(&state).await;
+    }
+    assert!(node_ssts(&state.snapshot.load(), SstLevel::L0) >= 2);
+
+    // ── The off-lock maintenance sequence: brief lock → basis → UNLOCK ──
+    let (basis, schema) = {
+        let w = state.writer.lock().await;
+        let schema = w.snapshot().manifest().manifest.schema.clone();
+        (w.compaction_basis(), schema)
+    };
+    assert!(basis.needs_compaction());
+
+    let prepare_started = Instant::now();
+    let prepare = tokio::spawn(async move {
+        let prepared = basis.prepare(&schema).await.expect("prepare");
+        (prepared, prepare_started.elapsed())
+    });
+
+    // Writes issued while the slow prepare is in flight.
+    let mut writes_during_prepare = 0usize;
+    let mut max_write = Duration::ZERO;
+    while !prepare.is_finished() {
+        let t0 = Instant::now();
+        create_person(&state, 100 + writes_during_prepare).await;
+        max_write = max_write.max(t0.elapsed());
+        writes_during_prepare += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (prepared, prepare_elapsed) = prepare.await.expect("prepare task");
+
+    assert!(
+        prepare_elapsed >= 2 * SST_GET_DELAY,
+        "the delayed SST GETs must make the prepare measurably slow, took {prepare_elapsed:?}"
+    );
+    assert!(
+        writes_during_prepare >= 1,
+        "at least one write must land while the prepare runs"
+    );
+    assert!(
+        max_write < prepare_elapsed / 2,
+        "a write ({max_write:?}) must not wait out the prepare ({prepare_elapsed:?})"
+    );
+
+    // ── Re-lock only for the install; the interleaved writes survive. ──
+    {
+        let mut w = state.writer.lock().await;
+        let outcome = w
+            .install_prepared_compaction(prepared)
+            .await
+            .expect("install");
+        assert!(outcome.source_ssts_removed >= 2);
+        state.snapshot.store(w.owned_snapshot());
+    }
+    let after = state.snapshot.load();
+    assert_eq!(
+        count_persons(&after).await,
+        (SEEDED + writes_during_prepare) as i64,
+        "every write issued during the prepare must survive the install"
     );
 }

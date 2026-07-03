@@ -705,42 +705,65 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     _ = tick.tick() => {}
                     _ = state_for_flush.flush_notify.notified() => {}
                 }
-                let mut w = state_for_flush.writer.lock().await;
-                let schema = w.snapshot().manifest().manifest.schema.clone();
-                match w.flush(schema.clone()).await {
-                    Ok(_) => {
-                        state_for_flush.snapshot.store(w.owned_snapshot());
-                        state_for_flush
-                            .memtable_bytes_gauge
-                            .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
-                        if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
-                            match w.compact_l0(&schema).await {
-                                Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                                    state_for_flush.snapshot.store(w.owned_snapshot());
-                                    info!(
-                                        removed = outcome.source_ssts_removed,
-                                        written = outcome.new_ssts_written,
-                                        "reactive compaction (L0 high-water)"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => error!(error = %e, "reactive compaction failed"),
+                // Flush under the writer lock; when the L0 high-water mark
+                // trips, snapshot a compaction basis and RELEASE the lock
+                // before the expensive prepare, so writes are not stalled
+                // behind the merge (finding 32).
+                let basis = {
+                    let mut w = state_for_flush.writer.lock().await;
+                    let schema = w.snapshot().manifest().manifest.schema.clone();
+                    match w.flush(schema.clone()).await {
+                        Ok(_) => {
+                            state_for_flush.snapshot.store(w.owned_snapshot());
+                            state_for_flush
+                                .memtable_bytes_gauge
+                                .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
+                            if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
+                                Some((w.compaction_basis(), schema))
+                            } else {
+                                None
                             }
                         }
+                        Err(e) => {
+                            error!(error = %e, "periodic flush failed");
+                            // A fenced/poisoned writer would fail every later
+                            // flush AND every write; reopen under the held lock.
+                            recovery::recover_writer_if_needed(
+                                &mut w,
+                                &state_for_flush.snapshot,
+                                &state_for_flush.writer_health,
+                                &state_for_flush.namespace,
+                                &e,
+                            )
+                            .await;
+                            None
+                        }
                     }
-                    Err(e) => {
-                        error!(error = %e, "periodic flush failed");
-                        // A fenced/poisoned writer would fail every later
-                        // flush AND every write; reopen under the held lock.
-                        recovery::recover_writer_if_needed(
-                            &mut w,
-                            &state_for_flush.snapshot,
-                            &state_for_flush.writer_health,
-                            &state_for_flush.namespace,
-                            &e,
-                        )
-                        .await;
+                };
+                // Reactive compaction (RFC-027 P5): prepare off-lock (input
+                // GETs, merge, index rebuilds, output PUTs), then re-lock
+                // only for the brief manifest CAS.
+                let Some((basis, schema)) = basis else { continue };
+                if !basis.needs_compaction() {
+                    continue;
+                }
+                match basis.prepare(&schema).await {
+                    Ok(prepared) => {
+                        let mut w = state_for_flush.writer.lock().await;
+                        match w.install_prepared_compaction(prepared).await {
+                            Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                state_for_flush.snapshot.store(w.owned_snapshot());
+                                info!(
+                                    removed = outcome.source_ssts_removed,
+                                    written = outcome.new_ssts_written,
+                                    "reactive compaction (L0 high-water)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!(error = %e, "reactive compaction failed"),
+                        }
                     }
+                    Err(e) => error!(error = %e, "reactive compaction failed"),
                 }
             }
         });
@@ -748,9 +771,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Periodic background maintenance: compact L0 SSTs to L1 (bounds read
     // amplification), then sweep orphaned SST bodies left behind by
-    // compaction. Compaction is a writer mutation, so it goes through the
-    // ONE writer lock — never a second `WriterSession`, which would bump the
-    // epoch and fence the foreground writer. The sweep takes no lock (it
+    // compaction. Compaction commits through the ONE writer lock — never a
+    // second `WriterSession`, which would bump the epoch and fence the
+    // foreground writer — but only the manifest CAS holds it: the expensive
+    // prepare (downloads, merge, index rebuilds, uploads) runs off-lock
+    // from a basis snapshotted under it. The sweep takes no lock (it
     // reads the committed manifest itself); the retention horizon (RFC-027)
     // is what keeps it from deleting a body a slow reader's pinned snapshot
     // still references, so it is safe to enable by default.
@@ -764,25 +789,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             tick.tick().await; // first tick fires immediately; skip.
             loop {
                 tick.tick().await;
-                // Compaction under the writer lock. `compact_l0` self-no-ops
-                // below 2 L0 SSTs per bucket, so an idle tick is cheap and
-                // does not commit. Republish only when it actually merged,
-                // so reads pick up the new L1 SST and release the removed L0
-                // descriptors.
+                // Compaction: snapshot the basis under a brief writer lock,
+                // run the expensive prepare (input GETs, merge, index
+                // rebuilds, output PUTs) WITHOUT the lock so writes proceed
+                // concurrently, then re-lock only for the manifest CAS
+                // (finding 32). An idle tick is cheap: the metadata-only
+                // `needs_compaction` predicate skips the prepare entirely.
+                // Republish only when it actually merged, so reads pick up
+                // the new L1 SST and release the removed L0 descriptors.
                 {
-                    let mut w = state_for_maint.writer.lock().await;
-                    let schema = w.snapshot().manifest().manifest.schema.clone();
-                    match w.compact_l0(&schema).await {
-                        Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                            state_for_maint.snapshot.store(w.owned_snapshot());
-                            info!(
-                                removed = outcome.source_ssts_removed,
-                                written = outcome.new_ssts_written,
-                                "compacted L0 into L1"
-                            );
+                    let basis = state_for_maint.writer.lock().await.compaction_basis();
+                    if basis.needs_compaction() {
+                        let schema = basis.schema().clone();
+                        match basis.prepare(&schema).await {
+                            Ok(prepared) => {
+                                let mut w = state_for_maint.writer.lock().await;
+                                match w.install_prepared_compaction(prepared).await {
+                                    Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                        state_for_maint.snapshot.store(w.owned_snapshot());
+                                        info!(
+                                            removed = outcome.source_ssts_removed,
+                                            written = outcome.new_ssts_written,
+                                            "compacted L0 into L1"
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => error!(error = %e, "periodic compaction failed"),
+                                }
+                            }
+                            Err(e) => error!(error = %e, "periodic compaction failed"),
                         }
-                        Ok(_) => {}
-                        Err(e) => error!(error = %e, "periodic compaction failed"),
                     }
                 }
                 // Orphan sweep — no writer lock. The `max_level` arg is only a

@@ -59,7 +59,9 @@ use namidb_core::{
 
 use crate::adjacency::{adjacency_budget_bytes, adjacency_enabled, AdjacencyCache};
 use crate::cache::{sst_cache_budget_bytes, sst_cache_enabled, SstCache};
-use crate::compact::{compact_l0_to_l1, CompactionOutcome};
+use crate::compact::{
+    install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome, PreparedCompaction,
+};
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
@@ -975,12 +977,53 @@ impl WriterSession {
     /// Compact every `(kind, scope)` bucket in L0 that holds more than
     /// one SST into a single L1 SST. No-op if every bucket has ≤1 SST.
     /// Does NOT touch the memtable or the pending batch.
+    ///
+    /// Single-call form: prepare and install run back-to-back under
+    /// whatever lock the caller holds. Hosts that must not stall writes
+    /// for the duration of the merge use [`Self::compaction_basis`] /
+    /// [`CompactionBasis::prepare`] / [`Self::install_prepared_compaction`]
+    /// instead, keeping only the manifest CAS under the writer lock.
     #[instrument(skip(self, schema), fields(
  manifest_version = self.current.manifest.version,
  ))]
     pub async fn compact_l0(&mut self, schema: &Schema) -> Result<CompactionOutcome> {
+        let prepared =
+            prepare_compaction(&self.manifest_store, &self.fence, &self.current, schema).await?;
+        self.install_prepared_compaction(prepared).await
+    }
+
+    /// Snapshot everything [`CompactionBasis::prepare`] needs — the manifest
+    /// store, the fence, and the current manifest — so the caller can
+    /// release the writer lock before the expensive prepare phase (input
+    /// GETs, row merges, index rebuilds, output PUTs) and re-take it only
+    /// for the brief [`Self::install_prepared_compaction`] CAS. Cheap: two
+    /// `Arc`-backed clones plus a manifest clone.
+    pub fn compaction_basis(&self) -> CompactionBasis {
+        CompactionBasis {
+            manifest_store: self.manifest_store.clone(),
+            fence: self.fence,
+            base: self.current.clone(),
+        }
+    }
+
+    /// Fold a compaction prepared off-lock into the CURRENT manifest —
+    /// which may have advanced past the prepare's basis via writes and
+    /// flushes; the newer SSTs survive and merge on a later sweep — and
+    /// commit it. If another compaction already removed one of the merged
+    /// inputs, the install aborts with [`Error::Precondition`], `self` is
+    /// untouched, and the prepared bodies are left for the janitor's orphan
+    /// sweep. On success, performs the same post-commit bookkeeping as
+    /// [`Self::compact_l0`].
+    #[instrument(skip(self, prepared), fields(
+ manifest_version = self.current.manifest.version,
+ prepared_base_version = prepared.base_version(),
+ ))]
+    pub async fn install_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+    ) -> Result<CompactionOutcome> {
         let outcome =
-            compact_l0_to_l1(&self.manifest_store, &self.fence, &self.current, schema).await?;
+            install_prepared(&self.manifest_store, &self.fence, &self.current, prepared).await?;
         self.current = outcome.committed.clone();
         // Reclaim cache side-map entries for SSTs this compaction merged away.
         self.prune_sst_cache();
@@ -2202,6 +2245,317 @@ mod tests {
         assert!(matches!(err, Error::Precondition(_)), "{err:?}");
     }
 
+    /// Multi-bucket fixture for the prepare/install tests: `Doc` nodes with
+    /// an embedding + a text body, `REFS` edges, a registered vector index
+    /// and a registered text index, spread over two flushes so every bucket
+    /// holds two L0 SSTs and the L0→L1 sweep is authoritative (rebuilding
+    /// both the `.vg` and the `.ft`).
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    async fn seeded_multi_bucket_session(ns: &str) -> (WriterSession, Schema) {
+        use crate::manifest::{VectorMetric, VectorQuantization};
+
+        fn doc_record(emb: Vec<f32>, body: &str) -> NodeWriteRecord {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("emb".into(), Value::Vec(emb));
+            props.insert("body".into(), Value::Str(body.into()));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        }
+
+        let mut session = WriterSession::open(make_store(), make_paths(ns))
+            .await
+            .unwrap();
+        let doc_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 4 }, true).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .edge_type(EdgeTypeDef {
+                name: "REFS".into(),
+                src_label: "Doc".into(),
+                dst_label: "Doc".into(),
+                properties: vec![],
+            })
+            .unwrap()
+            .build();
+        session
+            .register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "emb".into(),
+                    dim: 4,
+                    metric: VectorMetric::Cosine,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        session
+            .upsert_node(
+                "Doc",
+                sorted_node_id(1),
+                &doc_record(vec![1.0, 0.0, 0.0, 0.0], "fox the cat"),
+            )
+            .unwrap();
+        session
+            .upsert_node(
+                "Doc",
+                sorted_node_id(2),
+                &doc_record(vec![0.0, 1.0, 0.0, 0.0], "common the dog"),
+            )
+            .unwrap();
+        session
+            .upsert_edge("REFS", sorted_node_id(1), sorted_node_id(2), &edge_record())
+            .unwrap();
+        session.flush(doc_schema.clone()).await.unwrap();
+        session
+            .upsert_node(
+                "Doc",
+                sorted_node_id(3),
+                &doc_record(vec![0.0, 0.0, 1.0, 0.0], "common the bird"),
+            )
+            .unwrap();
+        session
+            .upsert_edge("REFS", sorted_node_id(2), sorted_node_id(3), &edge_record())
+            .unwrap();
+        session.flush(doc_schema.clone()).await.unwrap();
+        (session, doc_schema)
+    }
+
+    /// The prepare/install round-trip must be indistinguishable from the
+    /// single-call `compact_l0` on a multi-bucket fixture (nodes + fwd/inv
+    /// edges + authoritative `.vg`/`.ft` rebuilds): same outcome counters,
+    /// same manifest version, same structural SST contents, same reads.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn prepared_compaction_round_trip_matches_compact_l0() {
+        let (mut legacy, schema) = seeded_multi_bucket_session("ingest-prep-rt-legacy").await;
+        let (mut split, _) = seeded_multi_bucket_session("ingest-prep-rt-split").await;
+
+        let legacy_out = legacy.compact_l0(&schema).await.unwrap();
+
+        let basis = split.compaction_basis();
+        assert!(
+            basis.needs_compaction(),
+            "two L0s per bucket must plan a merge"
+        );
+        let prepared = basis.prepare(&schema).await.unwrap();
+        assert!(!prepared.is_noop());
+        let split_out = split.install_prepared_compaction(prepared).await.unwrap();
+
+        // Same outcome counters and manifest version…
+        assert_eq!(
+            split_out.source_ssts_removed,
+            legacy_out.source_ssts_removed
+        );
+        assert_eq!(split_out.new_ssts_written, legacy_out.new_ssts_written);
+        assert_eq!(
+            split_out.bloom_sidecars_written,
+            legacy_out.bloom_sidecars_written
+        );
+        assert_eq!(
+            split_out.committed.manifest.version,
+            legacy_out.committed.manifest.version
+        );
+
+        // …and the same manifest shape. Ids and timestamps are freshly
+        // minted per run, so compare the structural content per SST.
+        fn shape(m: &Manifest) -> Vec<(&'static str, String, u32, u64, u64)> {
+            let mut v: Vec<_> = m
+                .ssts
+                .iter()
+                .map(|d| {
+                    (
+                        d.kind.path_tag(),
+                        d.scope.clone(),
+                        d.level.as_u32(),
+                        d.row_count,
+                        d.max_lsn,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        }
+        assert_eq!(
+            shape(&split_out.committed.manifest),
+            shape(&legacy_out.committed.manifest)
+        );
+        for kind in [SstKind::VectorGraph, SstKind::TextIndex] {
+            assert!(
+                split_out
+                    .committed
+                    .manifest
+                    .ssts
+                    .iter()
+                    .any(|d| d.kind == kind),
+                "the authoritative rebuild must produce a {kind:?} SST"
+            );
+        }
+
+        // Reads through the split-committed manifest: point lookup, KNN via
+        // the fresh `.vg`, BM25 via the fresh `.ft`.
+        let snap = split.snapshot();
+        assert!(!snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        let v = snap
+            .lookup_node("Doc", sorted_node_id(3))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v.properties.get("body"),
+            Some(&Value::Str("common the bird".into()))
+        );
+        let hits = snap
+            .vector_search("doc_emb", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].0, sorted_node_id(1));
+        let ft = snap
+            .text_search(
+                "doc_ft",
+                "Doc",
+                &crate::text::TextQuery::from_terms(&["fox".to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the rebuilt .ft must serve");
+        assert_eq!(ft[0].0, sorted_node_id(1));
+        let outs = snap.out_edges("REFS", sorted_node_id(2)).await.unwrap();
+        assert_eq!(outs.edges.len(), 1);
+        assert_eq!(outs.edges[0].dst, sorted_node_id(3));
+    }
+
+    /// Interleaved write: a prepare taken at version N must install cleanly
+    /// after a committed write batch (N+1) and a flush (N+2) advanced the
+    /// manifest — the flushed L0 survives alongside the compaction outputs,
+    /// the merged inputs are gone, reads stay correct, and the freshness
+    /// gate routes index reads to the flat scan because the newer L0 outran
+    /// the just-installed `.ft`.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn install_after_interleaved_write_and_flush_keeps_l0_and_outputs() {
+        fn body_record(body: &str) -> NodeWriteRecord {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            props.insert("body".into(), Value::Str(body.into()));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        }
+
+        let (mut session, schema) = seeded_multi_bucket_session("ingest-prep-interleave").await;
+        let base_version = session.manifest_version();
+        let inputs: Vec<Uuid> = session.current.manifest.ssts.iter().map(|d| d.id).collect();
+
+        // Prepare from the basis at version N, then let the writer advance…
+        let basis = session.compaction_basis();
+        let prepared = basis.prepare(&schema).await.unwrap();
+        assert!(!prepared.is_noop());
+        assert_eq!(prepared.base_version(), base_version);
+
+        // …a committed write batch (N+1)…
+        session
+            .upsert_node("Doc", sorted_node_id(8), &body_record("common the lizard"))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        assert_eq!(session.manifest_version(), base_version + 1);
+
+        // …and a flush (N+2) that drains it into a NEW L0 in the same
+        // node bucket.
+        session.flush(schema.clone()).await.unwrap();
+        assert_eq!(session.manifest_version(), base_version + 2);
+        let interleaved_l0: Vec<Uuid> = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.level == SstLevel::L0 && !inputs.contains(&d.id))
+            .map(|d| d.id)
+            .collect();
+        assert!(
+            !interleaved_l0.is_empty(),
+            "the interleaved flush must add an L0"
+        );
+
+        // Install folds into the CURRENT manifest (N+2), not the basis.
+        let outcome = session.install_prepared_compaction(prepared).await.unwrap();
+        assert_eq!(outcome.committed.manifest.version, base_version + 3);
+        let m = &outcome.committed.manifest;
+        for id in &inputs {
+            assert!(
+                !m.ssts.iter().any(|d| d.id == *id),
+                "merged input {id} must be removed"
+            );
+        }
+        for id in &interleaved_l0 {
+            assert!(
+                m.ssts.iter().any(|d| d.id == *id),
+                "the interleaved L0 {id} must survive the install"
+            );
+        }
+        assert!(
+            m.ssts
+                .iter()
+                .any(|d| d.kind == SstKind::Nodes && d.level == SstLevel(1)),
+            "the merged L1 nodes SST must be installed"
+        );
+        assert!(
+            m.ssts
+                .iter()
+                .any(|d| d.kind == SstKind::TextIndex && d.scope == "doc_ft"),
+            "the prepared .ft output must be installed"
+        );
+
+        // Reads stay correct across compacted rows AND the interleaved L0…
+        let snap = session.snapshot();
+        for (id, body) in [(1u8, "fox the cat"), (8u8, "common the lizard")] {
+            let v = snap
+                .lookup_node("Doc", sorted_node_id(id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(v.properties.get("body"), Some(&Value::Str(body.into())));
+        }
+        // …and the freshness gate sees the newer L0 outrunning the
+        // just-installed indexes, so BM25 falls back to the exact flat scan
+        // instead of serving a corpus that misses node 8.
+        assert!(snap.index_outrun_by_nodes("doc_ft", SstKind::TextIndex));
+        assert!(snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        let got = snap
+            .text_search(
+                "doc_ft",
+                "Doc",
+                &crate::text::TextQuery::from_terms(&["fox".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none(), "an outrun index must fall back, not serve");
+    }
+
     #[tokio::test]
     async fn upsert_then_commit_makes_data_visible_via_snapshot() {
         let store = make_store();
@@ -3140,6 +3494,103 @@ mod tests {
             v_bob.properties.get("name"),
             Some(&Value::Str("Bob".into()))
         );
+    }
+
+    /// The `needs_compaction` predicate must mirror the planner over the
+    /// descriptor metadata, not the naive `max_l0_bucket_len() >= 2`
+    /// heuristic: a single L0 above an existing L1 still plans a merge.
+    #[tokio::test]
+    async fn needs_compaction_tracks_bucket_shape_not_just_l0_count() {
+        let store = make_store();
+        let paths = make_paths("ingest-needs-compaction");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        assert!(
+            !session.compaction_basis().needs_compaction(),
+            "an empty namespace has nothing to compact"
+        );
+
+        // Two flushed L0s → a merge is planned.
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        assert!(session.compaction_basis().needs_compaction());
+
+        // A lone L1 → nothing worth rewriting.
+        session.compact_l0(&schema()).await.unwrap();
+        assert!(
+            !session.compaction_basis().needs_compaction(),
+            "a single L1 per bucket has nothing to merge"
+        );
+
+        // ONE new L0 above the L1: the naive L0-count heuristic says no,
+        // but the planner drains it into L1 (two inputs).
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("Carol", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        assert_eq!(session.max_l0_bucket_len(), 1);
+        assert!(
+            session.compaction_basis().needs_compaction(),
+            "one L0 above an L1 still plans a merge"
+        );
+    }
+
+    /// Input-vanished abort: installing the SAME prepared compaction twice
+    /// must fail cleanly the second time (the first install removed its
+    /// inputs), leaving both the session's view and the durable manifest
+    /// exactly where the first install put them.
+    #[tokio::test]
+    async fn double_install_of_the_same_prepared_compaction_aborts_cleanly() {
+        let store = make_store();
+        let paths = make_paths("ingest-double-install");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+
+        let prepared = session
+            .compaction_basis()
+            .prepare(&schema())
+            .await
+            .unwrap();
+        let first = session
+            .install_prepared_compaction(prepared.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.source_ssts_removed, 2);
+        let installed_version = session.manifest_version();
+
+        // Same prepared again: its inputs are gone, so the install must
+        // abort instead of resurrecting merged-away descriptors.
+        let err = session
+            .install_prepared_compaction(prepared)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        assert_eq!(
+            session.manifest_version(),
+            installed_version,
+            "an aborted install must not commit a manifest version"
+        );
+        let reloaded = session.manifest_store.load_current().await.unwrap();
+        assert_eq!(reloaded.manifest.version, installed_version);
+
+        // Reads keep serving from the intact manifest.
+        let snap = session.snapshot();
+        for id in [sorted_node_id(1), sorted_node_id(2)] {
+            assert!(snap.lookup_node("Person", id).await.unwrap().is_some());
+        }
     }
 
     #[tokio::test]

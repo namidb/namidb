@@ -252,32 +252,56 @@ impl NamespaceRegistry {
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
                     }
-                    let mut w = s.writer.lock().await;
-                    let schema = w.snapshot().manifest().manifest.schema.clone();
-                    match w.flush(schema.clone()).await {
-                        Ok(_) => {
-                            s.snapshot.store(w.owned_snapshot());
-                            if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
-                                if let Err(e) = w.compact_l0(&schema).await {
-                                    error!(namespace = %ns, error = %e, "reactive compaction failed");
+                    // Flush under the writer lock; when the L0 high-water
+                    // mark trips, snapshot a compaction basis and RELEASE
+                    // the lock before the expensive prepare, so this
+                    // namespace's writes are not stalled behind the merge.
+                    let basis = {
+                        let mut w = s.writer.lock().await;
+                        let schema = w.snapshot().manifest().manifest.schema.clone();
+                        match w.flush(schema.clone()).await {
+                            Ok(_) => {
+                                s.snapshot.store(w.owned_snapshot());
+                                if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
+                                    Some((w.compaction_basis(), schema))
                                 } else {
-                                    s.snapshot.store(w.owned_snapshot());
+                                    None
                                 }
+                            }
+                            Err(e) => {
+                                error!(namespace = %ns, error = %e, "periodic flush failed");
+                                // A fenced/poisoned writer would fail every later
+                                // flush AND every write on this namespace; reopen
+                                // it under the lock we already hold.
+                                recovery::recover_writer_if_needed(
+                                    &mut w,
+                                    &s.snapshot,
+                                    &s.writer_health,
+                                    &ns,
+                                    &e,
+                                )
+                                .await;
+                                None
+                            }
+                        }
+                    };
+                    // Reactive compaction: prepare off-lock, re-lock only
+                    // for the brief manifest CAS.
+                    let Some((basis, schema)) = basis else { continue };
+                    if !basis.needs_compaction() {
+                        continue;
+                    }
+                    match basis.prepare(&schema).await {
+                        Ok(prepared) => {
+                            let mut w = s.writer.lock().await;
+                            if let Err(e) = w.install_prepared_compaction(prepared).await {
+                                error!(namespace = %ns, error = %e, "reactive compaction failed");
+                            } else {
+                                s.snapshot.store(w.owned_snapshot());
                             }
                         }
                         Err(e) => {
-                            error!(namespace = %ns, error = %e, "periodic flush failed");
-                            // A fenced/poisoned writer would fail every later
-                            // flush AND every write on this namespace; reopen
-                            // it under the lock we already hold.
-                            recovery::recover_writer_if_needed(
-                                &mut w,
-                                &s.snapshot,
-                                &s.writer_health,
-                                &ns,
-                                &e,
-                            )
-                            .await;
+                            error!(namespace = %ns, error = %e, "reactive compaction failed")
                         }
                     }
                 }
@@ -307,22 +331,38 @@ impl NamespaceRegistry {
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                     }
+                    // Compaction: snapshot the basis under a brief writer
+                    // lock, prepare (downloads, merge, index rebuilds,
+                    // uploads) OFF the lock so this namespace's writes
+                    // proceed, then re-lock only for the manifest CAS. An
+                    // idle tick skips the prepare via the metadata-only
+                    // `needs_compaction` predicate.
                     {
-                        let mut w = s.writer.lock().await;
-                        let schema = w.snapshot().manifest().manifest.schema.clone();
-                        match w.compact_l0(&schema).await {
-                            Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                                s.snapshot.store(w.owned_snapshot());
-                                info!(
-                                    namespace = %ns,
-                                    removed = outcome.source_ssts_removed,
-                                    written = outcome.new_ssts_written,
-                                    "compacted L0 into L1"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!(namespace = %ns, error = %e, "periodic compaction failed")
+                        let basis = s.writer.lock().await.compaction_basis();
+                        if basis.needs_compaction() {
+                            let schema = basis.schema().clone();
+                            match basis.prepare(&schema).await {
+                                Ok(prepared) => {
+                                    let mut w = s.writer.lock().await;
+                                    match w.install_prepared_compaction(prepared).await {
+                                        Ok(outcome) if outcome.source_ssts_removed > 0 => {
+                                            s.snapshot.store(w.owned_snapshot());
+                                            info!(
+                                                namespace = %ns,
+                                                removed = outcome.source_ssts_removed,
+                                                written = outcome.new_ssts_written,
+                                                "compacted L0 into L1"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            error!(namespace = %ns, error = %e, "periodic compaction failed")
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(namespace = %ns, error = %e, "periodic compaction failed")
+                                }
                             }
                         }
                     }

@@ -48,7 +48,10 @@ pub use cache::{
     sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
     DEFAULT_SST_CACHE_BUDGET_MIB,
 };
-pub use compact::{compact_l0_to_l1, CompactionOutcome};
+pub use compact::{
+    compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
+    PreparedCompaction,
+};
 pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};

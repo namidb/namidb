@@ -43,6 +43,16 @@
 //! end-to-end: the compactor reads each declared stream from every
 //! source SST, joins it with the per-edge enumeration, and re-emits
 //! the merged stream into the new SST body alongside `__overflow_json`.
+//!
+//! ## Prepare / commit split
+//!
+//! A sweep is two phases so a host can keep its writer lock out of the
+//! expensive part: [`prepare_compaction`] does the planning, every input
+//! GET, the CPU merges and index rebuilds, and every output PUT (all at
+//! immutable UUID paths no manifest references yet); [`install_prepared`]
+//! folds the result into the manifest **current at commit time** and runs
+//! the fence-checked CAS. [`crate::ingest::WriterSession::compaction_basis`]
+//! snapshots the inputs under the lock so the prepare can run off it.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -85,6 +95,121 @@ pub struct CompactionOutcome {
     pub source_ssts_removed: usize,
     pub new_ssts_written: usize,
     pub bloom_sidecars_written: usize,
+}
+
+/// The expensive half of a compaction sweep, produced by
+/// [`prepare_compaction`] (off the writer lock via
+/// [`CompactionBasis::prepare`]). Planning, every input GET, the row
+/// merges, the vector/text index rebuilds, and every output PUT have
+/// already happened: the merged bodies, blooms, and sidecars sit at
+/// immutable UUID-derived paths that no manifest version references yet.
+/// Only the manifest CAS ([`install_prepared`]) remains. An abandoned
+/// prepare therefore leaks nothing durable — its objects are unreferenced
+/// garbage the janitor's [`crate::janitor::sweep_orphans`] reclaims once
+/// past `min_age`.
+#[derive(Debug, Clone)]
+pub struct PreparedCompaction {
+    /// Descriptors of the merged SSTs whose bodies are already durable.
+    new_descs: Vec<SstDescriptor>,
+    /// Ids of the merged source descriptors to drop from the manifest.
+    removed_ids: Vec<Uuid>,
+    /// Bloom sidecars written alongside the new bodies.
+    bloom_count: usize,
+    /// Manifest version the plan was computed against. The commit CAS runs
+    /// against the manifest current at install time, which may be newer.
+    base_version: u64,
+}
+
+impl PreparedCompaction {
+    /// `true` when the sweep found nothing to merge; installing is a no-op.
+    pub fn is_noop(&self) -> bool {
+        self.removed_ids.is_empty()
+    }
+
+    /// Manifest version the prepare ran against.
+    pub fn base_version(&self) -> u64 {
+        self.base_version
+    }
+}
+
+/// Snapshot of everything the expensive compaction prepare phase needs,
+/// cloned out of a [`crate::ingest::WriterSession`] under the writer lock
+/// (see [`crate::ingest::WriterSession::compaction_basis`]) so
+/// [`Self::prepare`] can then run WITHOUT the lock while writes proceed.
+#[derive(Debug, Clone)]
+pub struct CompactionBasis {
+    pub(crate) manifest_store: ManifestStore,
+    pub(crate) fence: WriterFence,
+    pub(crate) base: LoadedManifest,
+}
+
+impl CompactionBasis {
+    /// Manifest version this basis was captured at.
+    pub fn manifest_version(&self) -> u64 {
+        self.base.manifest.version
+    }
+
+    /// Schema committed in the basis manifest — what the maintenance loops
+    /// hand to [`Self::prepare`].
+    pub fn schema(&self) -> &Schema {
+        &self.base.manifest.schema
+    }
+
+    /// Cheap, metadata-only "would a sweep merge anything?" predicate, so a
+    /// maintenance tick can skip [`Self::prepare`] entirely on an idle
+    /// namespace. NOTE: this is not `max_l0_bucket_len() >= 2` — a single
+    /// L0 above an existing L1 (or a leveled-only over-budget cascade)
+    /// still plans a merge.
+    pub fn needs_compaction(&self) -> bool {
+        any_bucket_plans(
+            &self.base.manifest.ssts,
+            compaction_base_bytes(),
+            compaction_level_ratio(),
+        )
+    }
+
+    /// Run the expensive prepare phase (input GETs, merges, index rebuilds,
+    /// output PUTs) against this basis. Holds no lock; see
+    /// [`prepare_compaction`].
+    pub async fn prepare(&self, schema: &Schema) -> Result<PreparedCompaction> {
+        prepare_compaction(&self.manifest_store, &self.fence, &self.base, schema).await
+    }
+}
+
+/// `true` when any `(kind, scope)` bucket of `ssts` would plan a merge under
+/// the given budgets — a metadata-only mirror of the per-bucket
+/// [`plan_bucket_merge`] calls the prepare phase makes, with no object-store
+/// I/O. Vector/text index SSTs are rebuilt from node buckets rather than
+/// planned directly, so only node and edge buckets participate.
+fn any_bucket_plans(ssts: &[SstDescriptor], base_bytes: u64, ratio: u64) -> bool {
+    let mut buckets: std::collections::HashMap<(SstKind, &str), Vec<&SstDescriptor>> =
+        std::collections::HashMap::new();
+    for d in ssts {
+        if matches!(d.kind, SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv) {
+            buckets
+                .entry((d.kind, d.scope.as_str()))
+                .or_default()
+                .push(d);
+        }
+    }
+    buckets
+        .values()
+        .any(|sources| plan_bucket_merge(sources, base_bytes, ratio).is_some())
+}
+
+/// Run a pure-CPU compaction section (row merges, index construction) on the
+/// blocking pool so it does not stall the async runtime — under the off-lock
+/// prepare the surrounding task shares its runtime with live queries and
+/// writes. The closure owns its inputs; a panic surfaces as an invariant
+/// error instead of unwinding the caller.
+async fn run_cpu<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::invariant(format!("compaction CPU task panicked: {e}")))
 }
 
 // ── Leveled-lite level budgets ──────────────────────────────────────────
@@ -222,17 +347,34 @@ pub async fn compact_l0_to_l1(
     .await
 }
 
-/// Run one leveled-lite compaction sweep with explicit level budgets. The
-/// public [`compact_l0_to_l1`] wraps this with the environment-configured
-/// budgets; tests call it directly with small budgets to exercise the
-/// cascade deterministically without touching process-wide env.
-#[instrument(
- skip(manifest_store, fence, base, schema),
- fields(
- namespace = %manifest_store.paths().namespace(),
- base_version = base.manifest.version,
- )
-)]
+/// Prepare one leveled-lite compaction sweep with the environment-configured
+/// budgets: plan every bucket, GET the inputs, merge, rebuild the SST-backed
+/// indexes, and PUT every output — WITHOUT committing a manifest. Pair with
+/// [`install_prepared`]. Callers that hold no writer lock reach this through
+/// [`CompactionBasis::prepare`].
+pub async fn prepare_compaction(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    schema: &Schema,
+) -> Result<PreparedCompaction> {
+    prepare_leveled(
+        manifest_store,
+        fence,
+        base,
+        schema,
+        compaction_base_bytes(),
+        compaction_level_ratio(),
+    )
+    .await
+}
+
+/// Run one leveled-lite compaction sweep with explicit level budgets —
+/// [`prepare_leveled`] and [`install_prepared`] back-to-back against the
+/// same base. The public [`compact_l0_to_l1`] wraps this with the
+/// environment-configured budgets; tests call it directly with small
+/// budgets to exercise the cascade deterministically without touching
+/// process-wide env.
 async fn compact_leveled(
     manifest_store: &ManifestStore,
     fence: &WriterFence,
@@ -241,6 +383,30 @@ async fn compact_leveled(
     base_bytes: u64,
     ratio: u64,
 ) -> Result<CompactionOutcome> {
+    let prepared = prepare_leveled(manifest_store, fence, base, schema, base_bytes, ratio).await?;
+    install_prepared(manifest_store, fence, base, prepared).await
+}
+
+/// Prepare phase of [`compact_leveled`]: everything expensive — planning,
+/// input GETs, the CPU merges and index rebuilds, and every output PUT.
+/// The new bodies land at immutable UUID paths no manifest references, so
+/// a prepare that is never installed strands only unreferenced garbage the
+/// janitor's orphan sweep reclaims.
+#[instrument(
+ skip(manifest_store, fence, base, schema),
+ fields(
+ namespace = %manifest_store.paths().namespace(),
+ base_version = base.manifest.version,
+ )
+)]
+async fn prepare_leveled(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    schema: &Schema,
+    base_bytes: u64,
+    ratio: u64,
+) -> Result<PreparedCompaction> {
     fence.assert_alive(base.manifest.epoch)?;
 
     // Group every SST by (kind, scope), every level together, so
@@ -346,7 +512,12 @@ async fn compact_leveled(
         // scope (no other scope can hold the key) AND the output is the
         // bucket's deepest level (no older un-merged level below it).
         let gc = node_gc_safe && plan.is_deepest;
-        let (finish, merged_rows) = compact_node_rows(&label_def, input_rows, gc)?;
+        // The sort + dedup + Arrow re-encode is pure CPU over the collected
+        // rows; run it on the blocking pool so a large bucket does not stall
+        // the async runtime for its duration.
+        let merge_def = label_def.clone();
+        let (finish, merged_rows) =
+            run_cpu(move || compact_node_rows(&merge_def, input_rows, gc)).await??;
         // The highest LSN in the merged corpus — stamped onto any SST-backed
         // index (vector / text) rebuilt from these rows so a later freshness
         // check can tell whether a newer Nodes SST has outrun the index.
@@ -498,29 +669,79 @@ async fn compact_leveled(
     #[cfg(not(feature = "vector-index"))]
     let _ = &vector_buckets;
 
-    if removed_ids.is_empty() {
-        debug!("compactor found no L0 bucket with >1 SSTs; nothing to do");
+    Ok(PreparedCompaction {
+        new_descs,
+        removed_ids,
+        bloom_count,
+        base_version: base.manifest.version,
+    })
+}
+
+/// Commit phase of the prepare/commit split: fold a [`PreparedCompaction`]
+/// into `current` — the manifest at commit time, which may have advanced
+/// past the prepare's basis via writes and flushes — and run the
+/// fence-checked manifest CAS.
+///
+/// A flush that landed during the prepare simply contributed new L0 SSTs:
+/// they survive into `next` untouched and merge on a later sweep, and an
+/// SST-backed index (`.vg` / `.ft`) rebuilt by this prepare is older than
+/// such an L0, so the LSN freshness gate
+/// ([`crate::read::Snapshot::index_outrun_by_nodes`]) already routes those
+/// reads to the exact flat scan.
+///
+/// Every merged input must still be referenced by `current`: writes and
+/// flushes only ADD SSTs, so only another compaction (or a DROP INDEX)
+/// removes them, and folding this plan in anyway would resurrect
+/// merged-away descriptors. A missing input aborts the install with
+/// [`Error::Precondition`], leaving the manifest untouched; the prepared
+/// bodies stay unreferenced for the janitor's orphan sweep.
+#[instrument(
+ skip(manifest_store, fence, current, prepared),
+ fields(
+ namespace = %manifest_store.paths().namespace(),
+ base_version = prepared.base_version,
+ current_version = current.manifest.version,
+ )
+)]
+pub async fn install_prepared(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    current: &LoadedManifest,
+    prepared: PreparedCompaction,
+) -> Result<CompactionOutcome> {
+    if prepared.removed_ids.is_empty() {
+        debug!("compactor found no bucket worth merging; nothing to install");
         return Ok(CompactionOutcome {
-            committed: base.clone(),
+            committed: current.clone(),
             source_ssts_removed: 0,
             new_ssts_written: 0,
             bloom_sidecars_written: 0,
         });
     }
+    fence.assert_alive(current.manifest.epoch)?;
 
-    let source_count = removed_ids.len();
-    let new_count = new_descs.len();
-    let mut next = base.manifest.next_version(fence.writer_id);
-    let removed_set: HashSet<Uuid> = removed_ids.into_iter().collect();
+    let live: HashSet<Uuid> = current.manifest.ssts.iter().map(|d| d.id).collect();
+    if let Some(missing) = prepared.removed_ids.iter().find(|id| !live.contains(id)) {
+        return Err(Error::precondition(format!(
+            "abandoning prepared compaction (basis v{}): input SST {missing} is no longer \
+ referenced by manifest v{}; the prepared bodies are left for the orphan sweep",
+            prepared.base_version, current.manifest.version
+        )));
+    }
+
+    let source_count = prepared.removed_ids.len();
+    let new_count = prepared.new_descs.len();
+    let mut next = current.manifest.next_version(fence.writer_id);
+    let removed_set: HashSet<Uuid> = prepared.removed_ids.into_iter().collect();
     next.ssts.retain(|d| !removed_set.contains(&d.id));
-    next.ssts.extend(new_descs);
-    let committed = manifest_store.commit(fence, base, next).await?;
+    next.ssts.extend(prepared.new_descs);
+    let committed = manifest_store.commit(fence, current, next).await?;
 
     Ok(CompactionOutcome {
         committed,
         source_ssts_removed: source_count,
         new_ssts_written: new_count,
-        bloom_sidecars_written: bloom_count,
+        bloom_sidecars_written: prepared.bloom_count,
     })
 }
 
@@ -549,7 +770,14 @@ async fn compact_and_write_edges(
         let reader = EdgeSstReader::open(body)?;
         extract_edge_rows_from_reader(&reader, &declared_property_names, &mut rows)?;
     }
-    let finish = compact_edge_rows(edge_type, edge_def.as_ref(), rows, direction, gc_tombstones)?;
+    // Pure-CPU merge (sort + dedup + CSR re-encode) on the blocking pool,
+    // same reasoning as the node path.
+    let merge_type = edge_type.to_string();
+    let merge_def = edge_def.clone();
+    let finish = run_cpu(move || {
+        compact_edge_rows(&merge_type, merge_def.as_ref(), rows, direction, gc_tombstones)
+    })
+    .await??;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
     if finish.stats.edge_count == 0 {
         return Ok((None, false, removed));
@@ -964,8 +1192,11 @@ async fn build_vector_indexes_for_nodes(
 
         // Skip-and-warn on a per-index build error (e.g. a malformed descriptor)
         // rather than `?`-aborting the whole compaction — one bad index must
-        // never wedge the namespace's compaction permanently.
-        let built = match build_body(desc, members) {
+        // never wedge the namespace's compaction permanently. The Vamana
+        // construction is O(n·R·L·dim) pure CPU, so it runs on the blocking
+        // pool instead of stalling the async runtime for its duration.
+        let build_desc = desc.clone();
+        let built = match run_cpu(move || build_body(&build_desc, members)).await? {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(index = %desc.name, error = %e, "skipping vector index build");
@@ -1101,7 +1332,9 @@ async fn build_text_indexes_for_nodes(
             members.push((row.id, parts.join(" ")));
         }
 
-        let Some((body, stats)) = build_body(members)? else {
+        // BM25 postings construction is pure CPU over the collected corpus;
+        // run it on the blocking pool like the Vamana build above.
+        let Some((body, stats)) = run_cpu(move || build_body(members)).await?? else {
             continue;
         };
 
@@ -2148,6 +2381,73 @@ mod tests {
             assert!(
                 snap.lookup_node("Person", id).await.unwrap().is_some(),
                 "survivor {id} must remain after GC"
+            );
+        }
+    }
+
+    /// A prepare that is never installed strands only unreferenced objects:
+    /// the min_age guard keeps a fresh prepare (possibly about to be
+    /// installed) alive, and once past it the janitor's orphan sweep
+    /// reclaims the prepared bodies while the still-referenced inputs keep
+    /// serving reads.
+    #[tokio::test]
+    async fn abandoned_prepare_is_reclaimed_by_the_orphan_sweep() {
+        use std::time::Duration;
+
+        use crate::janitor::sweep_orphans;
+
+        let (s, p, ms, fence, base) = build_two_l0_node_ssts().await;
+        let prepared = prepare_compaction(&ms, &fence, &base, &schema())
+            .await
+            .unwrap();
+        assert!(!prepared.is_noop());
+
+        // The prepared bodies are durable at their UUID paths but referenced
+        // by no manifest version.
+        let object_path = |rel: &str| {
+            Path::from(format!("{}/{}", p.namespace_prefix().as_ref(), rel))
+        };
+        let prepared_paths: Vec<String> =
+            prepared.new_descs.iter().map(|d| d.path.clone()).collect();
+        assert!(!prepared_paths.is_empty());
+        for rel in &prepared_paths {
+            assert!(
+                s.head(&object_path(rel)).await.is_ok(),
+                "prepared body must be durable before the sweep: {rel}"
+            );
+        }
+
+        // Never installed. A young prepare survives the min_age guard…
+        let young = sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        assert_eq!(young.orphans_deleted, 0, "a young prepare must survive");
+
+        // …but once past min_age the unreferenced bodies are reclaimed.
+        let swept = sweep_orphans(&ms, u64::MAX, Duration::ZERO, 4, true)
+            .await
+            .unwrap();
+        assert!(
+            swept.orphans_deleted >= prepared_paths.len(),
+            "expected >= {} orphans deleted, got {}",
+            prepared_paths.len(),
+            swept.orphans_deleted
+        );
+        for rel in &prepared_paths {
+            assert!(
+                s.head(&object_path(rel)).await.is_err(),
+                "abandoned prepared body must be reclaimed: {rel}"
+            );
+        }
+
+        // The manifest-referenced L0 inputs are untouched: reads still serve.
+        let mt = Memtable::new();
+        let mt_view = mt.snapshot_view();
+        let snap = Snapshot::new(base.clone(), &mt_view, s, p);
+        for id in [sorted_node_id(1), sorted_node_id(2)] {
+            assert!(
+                snap.lookup_node("Person", id).await.unwrap().is_some(),
+                "input SSTs must keep serving after the sweep"
             );
         }
     }
