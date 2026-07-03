@@ -130,10 +130,13 @@ pub struct Config {
     /// Memtable byte size above which writes are softly stalled
     /// (backpressure) until the flush catches up. `0` disables the stall.
     pub memtable_stall_bytes: usize,
-    /// Bound on how long a foreground request (write, DDL, admin flush,
-    /// Bolt BEGIN) may wait to acquire the writer mutex before failing
-    /// fast with 503 — so request queues stay bounded behind a stuck or
-    /// long-held writer instead of piling up. `Duration::ZERO` disables it.
+    /// Bound on how long a foreground auto-commit write (HTTP `/v0/cypher`,
+    /// Bolt auto-commit) or a Bolt `BEGIN` may wait to acquire the writer
+    /// mutex before failing fast with 503 / a transient Bolt error — so
+    /// request queues stay bounded behind a stuck or long-held writer.
+    /// Infrequent DDL and admin flush keep the unbounded wait; background
+    /// flush/compaction/recovery always wait as long as it takes.
+    /// `Duration::ZERO` disables the bound.
     pub writer_lock_timeout: Duration,
     /// PEM certificate-chain file enabling TLS on the HTTP and Bolt
     /// listeners. Must be set together with `tls_key`; when both are `None`

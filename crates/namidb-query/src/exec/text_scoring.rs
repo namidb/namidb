@@ -27,8 +27,10 @@
 //! more than half the corpus never goes negative). The scalar builtin uses the
 //! same expression with `idf = 1` and a fixed reference `avgdl`.
 //!
-//! Tokenization is ASCII-lowercase, split on non-alphanumeric runs (no
-//! stemming, no stopwords in v0).
+//! Tokenization (re-exported from `namidb_storage::text::tokenize`) is
+//! Unicode case-folding (`char::to_lowercase`, not ASCII), split on
+//! non-alphanumeric runs, with CJK/Hangul runs segmented into overlapping
+//! bigrams; no stemming, no stopwords in v0.
 //!
 //! The shared, corpus-aware primitives ([`tokenize_counts`], [`bm25_idf`],
 //! [`bm25_term_score`]) live in [`namidb_storage::text`] so the persistent
