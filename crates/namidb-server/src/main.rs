@@ -228,6 +228,18 @@ struct Cli {
     )]
     memtable_stall_bytes: usize,
 
+    /// Bound on how long a foreground request (write, DDL, admin flush, Bolt
+    /// BEGIN) may wait for the writer lock before failing fast with 503, so
+    /// request queues stay bounded behind a stuck or long-held writer.
+    /// `0s` disables the bound.
+    #[arg(
+        long,
+        env = "NAMIDB_WRITER_LOCK_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    writer_lock_timeout: Duration,
+
     /// PEM certificate-chain file. Set together with `--tls-key` to serve the
     /// HTTP and Bolt listeners over TLS; omit both to serve plaintext.
     #[arg(long, env = "NAMIDB_TLS_CERT")]
@@ -322,6 +334,7 @@ fn main() -> anyhow::Result<()> {
         write_stall_delay: cli.write_stall_delay,
         memtable_flush_bytes: cli.memtable_flush_bytes,
         memtable_stall_bytes: cli.memtable_stall_bytes,
+        writer_lock_timeout: cli.writer_lock_timeout,
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,
         slow_query_threshold: cli.slow_query_threshold,

@@ -42,6 +42,9 @@ pub struct SharedAppState {
     pub memtable_flush_bytes: usize,
     /// Memtable bytes above which writes are softly stalled (backpressure).
     pub memtable_stall_bytes: usize,
+    /// Foreground writer-lock acquisition bound (`ZERO` disables); see the
+    /// single-tenant twin on `AppState`.
+    pub writer_lock_timeout: Duration,
     /// Default namespace for unprefixed requests (`/v0/...` without a
     /// `/:namespace/` segment) and for requests that omit the
     /// `X-NamiDB-Namespace` header.
@@ -65,6 +68,7 @@ impl SharedAppState {
         write_stall_delay: Duration,
         memtable_flush_bytes: usize,
         memtable_stall_bytes: usize,
+        writer_lock_timeout: Duration,
         default_namespace: String,
     ) -> Self {
         Self {
@@ -78,6 +82,7 @@ impl SharedAppState {
             write_stall_delay,
             memtable_flush_bytes,
             memtable_stall_bytes,
+            writer_lock_timeout,
             default_namespace,
             authz: Arc::new(NoOpAuthz),
         }

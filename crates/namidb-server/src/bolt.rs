@@ -34,6 +34,14 @@ use crate::AppState;
 /// it failed before planning), the wall-clock it took (up to the end of
 /// execution, excluding any write-stall sleep), and the outcome the protocol
 /// returns to the driver.
+/// The uniform transient failure for a foreground writer-lock timeout.
+fn writer_busy_error() -> BackendError {
+    BackendError::Storage(
+        "writer is busy: could not acquire the write lock within the configured bound; retry"
+            .into(),
+    )
+}
+
 struct RunObservation {
     kind: Option<QueryKind>,
     elapsed: std::time::Duration,
@@ -134,7 +142,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let mut writer = self.state.writer.lock().await;
+        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(writer_busy_error()),
+            };
+        };
         let result = crate::apply_create_vector_index(&mut writer, &self.state.snapshot, cvi).await;
         drop(writer);
         let elapsed = started.elapsed();
@@ -197,7 +211,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let mut writer = self.state.writer.lock().await;
+        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(writer_busy_error()),
+            };
+        };
         let result =
             crate::apply_create_fulltext_index(&mut writer, &self.state.snapshot, cfi).await;
         drop(writer);
@@ -257,7 +277,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let mut writer = self.state.writer.lock().await;
+        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(writer_busy_error()),
+            };
+        };
         let result = crate::apply_drop_vector_index(&mut writer, &self.state.snapshot, dvi).await;
         drop(writer);
         let elapsed = started.elapsed();
@@ -318,7 +344,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let mut writer = self.state.writer.lock().await;
+        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(writer_busy_error()),
+            };
+        };
         let result = crate::apply_drop_fulltext_index(&mut writer, &self.state.snapshot, dfi).await;
         drop(writer);
         let elapsed = started.elapsed();
@@ -384,7 +416,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let mut writer = self.state.writer.lock().await;
+        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(writer_busy_error()),
+            };
+        };
         let result = if unique {
             crate::apply_create_constraint(
                 &mut writer,
@@ -563,10 +601,17 @@ impl ServerBackend {
                     result: Err(err),
                 };
             }
-            // Writes still take the writer lock (single-writer invariant).
+            // Writes still take the writer lock (single-writer invariant),
+            // bounded so queued writes fail fast behind a stuck writer.
             // On success we refresh the snapshot cell so subsequent reads
             // see the just-committed records (RFC-021).
-            let mut writer = self.state.writer.lock().await;
+            let Some(mut writer) = self.state.lock_writer_bounded().await else {
+                return RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed: started.elapsed(),
+                    result: Err(writer_busy_error()),
+                };
+            };
             match execute_write_with_deadline(
                 &plan,
                 &mut writer,
@@ -861,9 +906,20 @@ impl Backend for ServerBackend {
         if slot.is_some() {
             return Err(BackendError::Other("a transaction is already open".into()));
         }
-        // Take the global writer lock for the whole transaction. Held across
-        // RUNs (and client think-time) until COMMIT/ROLLBACK — see TxState.
-        let writer = self.state.writer.clone().lock_owned().await;
+        // Take the global writer lock for the whole transaction, bounded so
+        // a BEGIN queued behind a stuck/long transaction fails fast instead
+        // of pinning the connection. Held across RUNs (and client
+        // think-time) until COMMIT/ROLLBACK — see TxState.
+        let timeout = self.state.writer_lock_timeout();
+        let lock = self.state.writer.clone().lock_owned();
+        let writer = if timeout.is_zero() {
+            lock.await
+        } else {
+            match tokio::time::timeout(timeout, lock).await {
+                Ok(guard) => guard,
+                Err(_) => return Err(writer_busy_error()),
+            }
+        };
         *slot = Some(TxState {
             writer,
             staged: false,

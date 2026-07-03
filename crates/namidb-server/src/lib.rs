@@ -130,6 +130,11 @@ pub struct Config {
     /// Memtable byte size above which writes are softly stalled
     /// (backpressure) until the flush catches up. `0` disables the stall.
     pub memtable_stall_bytes: usize,
+    /// Bound on how long a foreground request (write, DDL, admin flush,
+    /// Bolt BEGIN) may wait to acquire the writer mutex before failing
+    /// fast with 503 — so request queues stay bounded behind a stuck or
+    /// long-held writer instead of piling up. `Duration::ZERO` disables it.
+    pub writer_lock_timeout: Duration,
     /// PEM certificate-chain file enabling TLS on the HTTP and Bolt
     /// listeners. Must be set together with `tls_key`; when both are `None`
     /// the server serves plaintext.
@@ -207,6 +212,9 @@ pub struct AppState {
     /// disables each. The server sets them from [`Config`] at boot.
     memtable_flush_bytes: usize,
     memtable_stall_bytes: usize,
+    /// Foreground writer-lock acquisition bound (see `Config`). `ZERO`
+    /// disables it.
+    writer_lock_timeout: Duration,
     /// Wakes the periodic flush task early when the byte threshold is
     /// crossed by a committed write.
     pub flush_notify: Arc<tokio::sync::Notify>,
@@ -253,6 +261,7 @@ impl AppState {
             write_stall_delay: Duration::ZERO,
             memtable_flush_bytes: 0,
             memtable_stall_bytes: 0,
+            writer_lock_timeout: Duration::ZERO,
             flush_notify: Arc::new(tokio::sync::Notify::new()),
             memtable_bytes_gauge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
@@ -293,6 +302,18 @@ impl AppState {
         self
     }
 
+    /// Set the foreground writer-lock acquisition bound (builder style).
+    /// `Duration::ZERO` disables it.
+    pub fn with_writer_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.writer_lock_timeout = timeout;
+        self
+    }
+
+    /// The configured foreground writer-lock bound (`ZERO` = disabled).
+    pub(crate) fn writer_lock_timeout(&self) -> Duration {
+        self.writer_lock_timeout
+    }
+
     /// If a write should be stalled given the worst bucket's current L0
     /// count and the live memtable size, the delay to apply; otherwise
     /// `None`. The caller samples both while holding the writer lock, then
@@ -328,6 +349,16 @@ impl AppState {
             self.flush_notify.notify_one();
         }
         self.write_stall_for(writer.max_l0_bucket_len(), bytes)
+    }
+
+    /// Acquire the writer mutex within the configured foreground bound.
+    /// `None` = timed out; the caller answers 503 (HTTP) or a transient
+    /// Bolt failure. Background tasks (flush/compaction/recovery) do NOT
+    /// use this — they may wait as long as it takes.
+    pub(crate) async fn lock_writer_bounded(
+        &self,
+    ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
+        lock_writer_bounded(&self.writer, self.writer_lock_timeout).await
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -636,6 +667,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.write_stall_delay,
             config.memtable_flush_bytes,
             config.memtable_stall_bytes,
+            config.writer_lock_timeout,
             config.default_namespace.clone(),
         )
         .with_authz(authz.clone());
@@ -682,6 +714,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_query_row_cap(config.query_row_cap)
         .with_write_stall(config.write_stall_l0, config.write_stall_delay)
         .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
+        .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_slow_query_threshold(config.slow_query_threshold);
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
@@ -1112,6 +1145,31 @@ fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Res
         None => Json(serde_json::json!({ "error": error })),
     };
     (status, body).into_response()
+}
+
+/// Bounded writer-mutex acquisition for foreground request paths. A zero
+/// `timeout` disables the bound. `None` = timed out.
+pub(crate) async fn lock_writer_bounded(
+    writer: &tokio::sync::Mutex<WriterSession>,
+    timeout: Duration,
+) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
+    if timeout.is_zero() {
+        return Some(writer.lock().await);
+    }
+    tokio::time::timeout(timeout, writer.lock()).await.ok()
+}
+
+/// The uniform 503 body for a foreground writer-lock timeout.
+fn writer_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "writer is busy: could not acquire the write lock within the \
+                    configured bound; retry"
+                .into(),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -2079,7 +2137,14 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     .into_response(),
             };
         }
-        let mut writer = state.writer.lock().await;
+        let Some(mut writer) = state.lock_writer_bounded().await else {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: writer_busy_response(),
+            };
+        };
         let result =
             execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
         // Sample the soft write-stall decision while still holding the lock
@@ -2546,7 +2611,16 @@ async fn run_cypher_multi(
                     .into_response(),
             };
         }
-        let mut writer = ns_state.writer.lock().await;
+        let Some(mut writer) =
+            lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await
+        else {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: writer_busy_response(),
+            };
+        };
         let result =
             execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
         let stall = match &result {
@@ -3624,6 +3698,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_writer_lock_returns_503_when_held() {
+        // A write queued behind a held writer lock must fail fast with 503
+        // once the configured bound elapses — request queues stay bounded
+        // behind a stuck or long-held writer.
+        let (store, paths) = namidb_storage::parse_uri("memory://test-lock-timeout").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into())
+            .with_writer_lock_timeout(Duration::from_millis(50));
+        let app = build_router(state.clone());
+
+        // Hold the lock as a stand-in for a stuck/long transaction.
+        let guard = state.writer.lock().await;
+        let resp = post_cypher(&app, None, "CREATE (:P {n: 1}) RETURN 1").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(guard);
+
+        // Released: the same write succeeds.
+        let resp = post_cypher(&app, None, "CREATE (:P {n: 1}) RETURN 1").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn health_returns_ok() {
         let app = fixture(None).await;
         let resp = app
@@ -4149,6 +4245,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Duration::ZERO,
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)
@@ -4239,6 +4336,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Duration::ZERO,
             "default".to_string(),
         );
         let app = build_multi_tenant_router(shared);
@@ -4307,6 +4405,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Duration::ZERO,
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)
