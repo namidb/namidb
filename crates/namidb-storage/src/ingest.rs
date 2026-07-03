@@ -2136,7 +2136,12 @@ mod tests {
         // The index path actually serves (`Some`, not the flat fallback).
         let snap = session.snapshot();
         let hits = snap
-            .text_search("note_ft", "Note", &["fox".to_string()], None)
+            .text_search(
+                "note_ft",
+                "Note",
+                &crate::text::TextQuery::from_terms(&["fox".to_string()]),
+                None,
+            )
             .await
             .unwrap()
             .expect("the .ft must serve before the drop");
@@ -2166,7 +2171,12 @@ mod tests {
         // the flat scan still sees the full corpus — the fallback stays correct.
         let snap = session.snapshot();
         assert!(
-            snap.text_search("note_ft", "Note", &["fox".to_string()], None)
+            snap.text_search(
+                "note_ft",
+                "Note",
+                &crate::text::TextQuery::from_terms(&["fox".to_string()]),
+                None,
+            )
                 .await
                 .unwrap()
                 .is_none(),
