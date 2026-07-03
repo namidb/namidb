@@ -137,6 +137,11 @@ pub struct Snapshot<'mt> {
     memtable: &'mt MemtableSnapshot,
     store: Arc<dyn ObjectStore>,
     paths: NamespacePaths,
+    /// `paths.namespace_prefix()` rendered once — the namespace component
+    /// stamped into every [`NodeCacheKey`] / [`AdjacencyKey`] this snapshot
+    /// builds, so entries in the process-wide shared caches never collide
+    /// across namespaces. `Arc<str>` so per-key clones are pointer-cheap.
+    cache_namespace: Arc<str>,
     cache: Option<SstCache>,
     /// Per-snapshot NodeView cache. Many queries access the same node
     /// from multiple sides (e.g., Join probe + reverse Expand, or the
@@ -260,11 +265,13 @@ impl<'mt> Snapshot<'mt> {
         store: Arc<dyn ObjectStore>,
         paths: NamespacePaths,
     ) -> Self {
+        let cache_namespace: Arc<str> = Arc::from(paths.namespace_prefix().as_ref());
         Self {
             manifest,
             memtable,
             store,
             paths,
+            cache_namespace,
             cache: None,
             node_cache: Mutex::new(HashMap::new()),
             ranged_mode: RangedMode::Auto,
@@ -1033,6 +1040,7 @@ impl<'mt> Snapshot<'mt> {
         // serve stale data after the writer commits.
         if let Some(shared) = &self.shared_node_cache {
             let shared_key = NodeCacheKey {
+                namespace: self.cache_namespace.clone(),
                 manifest_version: self.manifest.manifest.version,
                 label: label.to_string(),
                 node_id: id,
@@ -1062,6 +1070,7 @@ impl<'mt> Snapshot<'mt> {
         // Insert into L2 if attached.
         if let Some(shared) = &self.shared_node_cache {
             let shared_key = NodeCacheKey {
+                namespace: self.cache_namespace.clone(),
                 manifest_version: self.manifest.manifest.version,
                 label: label.to_string(),
                 node_id: id,
@@ -1142,6 +1151,7 @@ impl<'mt> Snapshot<'mt> {
             for id_bytes in &pending {
                 let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
                 let shared_key = NodeCacheKey {
+                    namespace: self.cache_namespace.clone(),
                     manifest_version,
                     label: label.to_string(),
                     node_id: id,
@@ -1302,6 +1312,7 @@ impl<'mt> Snapshot<'mt> {
             cache_l1.insert((label.to_string(), id), view.clone());
             if let Some(ref shared) = shared {
                 let shared_key = NodeCacheKey {
+                    namespace: self.cache_namespace.clone(),
                     manifest_version,
                     label: label.to_string(),
                     node_id: id,
@@ -2140,7 +2151,12 @@ impl<'mt> Snapshot<'mt> {
         latest: &mut BTreeMap<[u8; 16], (u64, bool)>,
     ) -> Result<()> {
         let manifest_version = self.manifest.manifest.version;
-        let cache_key = AdjacencyKey::new(manifest_version, edge_type, direction);
+        let cache_key = AdjacencyKey::new(
+            self.cache_namespace.clone(),
+            manifest_version,
+            edge_type,
+            direction,
+        );
         let adj: Arc<EdgeAdjacency> = {
             let manifest = self.manifest.clone();
             let store = self.store.clone();
@@ -2386,7 +2402,12 @@ impl<'mt> Snapshot<'mt> {
         // 1. Resolve (build on miss) the CSR for this (manifest_version,
         // edge_type, direction).
         let manifest_version = self.manifest.manifest.version;
-        let cache_key = AdjacencyKey::new(manifest_version, edge_type, direction);
+        let cache_key = AdjacencyKey::new(
+            self.cache_namespace.clone(),
+            manifest_version,
+            edge_type,
+            direction,
+        );
         let adj: Arc<EdgeAdjacency> = {
             namidb_core::profile_scope!("AdjacencyCache::get_or_build");
             // Capture state needed by the build closure so the future

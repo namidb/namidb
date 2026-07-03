@@ -92,8 +92,14 @@ async fn parity_pure_sst_nodes() {
     let from_tiered = snap.lookup_node("Person", alice).await.unwrap();
     assert_eq!(from_uncached, from_tiered);
 
-    // After the tiered path ran, the cache must hold the entry.
-    let key = NodeCacheKey::new(outcome.committed.manifest.version, "Person", alice);
+    // After the tiered path ran, the cache must hold the entry. The key is
+    // namespace-scoped (the cache is shared process-wide).
+    let key = NodeCacheKey::new(
+        paths.namespace_prefix().as_ref(),
+        outcome.committed.manifest.version,
+        "Person",
+        alice,
+    );
     let cached = cache.get(&key).expect("L2 hit after first lookup");
     assert_eq!(cached, from_tiered);
     assert!(cache.inserts() >= 1);
@@ -146,7 +152,12 @@ async fn parity_with_tombstone_caches_negative() {
     assert_eq!(uncached, tiered);
 
     // L2 must hold the negative cache entry.
-    let key = NodeCacheKey::new(outcome.committed.manifest.version, "Person", alice);
+    let key = NodeCacheKey::new(
+        paths.namespace_prefix().as_ref(),
+        outcome.committed.manifest.version,
+        "Person",
+        alice,
+    );
     let cached = cache.get(&key).expect("L2 hit");
     assert!(cached.is_none(), "negative cache");
 }

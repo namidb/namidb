@@ -168,6 +168,16 @@ impl NamespaceRegistry {
                     // writes are WAL-committed before the ack, and reopen
                     // replays the WAL.
                     evicted.cancel_maintenance();
+                    // The read caches are process-wide and shared across
+                    // namespaces (their budgets are global); dropping the
+                    // state does not release the evicted namespace's
+                    // entries, so reclaim them eagerly. The name came out
+                    // of the sessions map, so it always re-validates.
+                    if let Ok(ns_id) = NamespaceId::new(&to_evict) {
+                        namidb_storage::prune_shared_caches(&NamespacePaths::new(
+                            &self.root, ns_id,
+                        ));
+                    }
                 }
             } else {
                 return Err(RegistryError::AtCapacity);
@@ -711,5 +721,80 @@ mod tests {
             2,
             "the reopened namespace must see the pre-evict write and accept new ones"
         );
+    }
+
+    /// Evicting a namespace must eagerly reclaim its entries from the
+    /// process-wide shared caches: their budgets are global, so a dropped
+    /// tenant's CSRs / NodeViews / decoded SST side-state would otherwise
+    /// squat inside the shared budgets until eviction pressure. Sibling
+    /// namespaces' entries must survive untouched.
+    #[tokio::test]
+    async fn eviction_prunes_shared_caches() {
+        use namidb_core::NodeId;
+        use namidb_storage::{
+            shared_adjacency_cache, shared_node_cache, shared_sst_cache, AdjacencyKey,
+            EdgeAdjacency, EdgeDirection, EdgeStreamBundle, NodeCacheKey,
+        };
+
+        // Namespace names unique to this test — the caches are shared with
+        // every other test in this binary.
+        let evicted_ns = "cache-prune-acme";
+        let kept_ns = "cache-prune-keep";
+
+        let reg = evicting_registry("registry-evict-prune", MaintenanceConfig::default());
+        let acme = reg.get_or_open(evicted_ns).await.expect("open acme");
+        let handles = acme.take_maintenance_handles();
+        drop(acme);
+
+        // Tag entries for the soon-to-be-evicted namespace and a sibling.
+        // The registry root is "" here, so the prefix is the bare name.
+        let node_cache = shared_node_cache().expect("node cache on by default");
+        let adj_cache = shared_adjacency_cache().expect("adjacency cache on by default");
+        let sst_cache = shared_sst_cache().expect("sst cache on by default");
+        for ns in [evicted_ns, kept_ns] {
+            node_cache.insert(NodeCacheKey::new(ns, 1, "Person", NodeId::new()), None);
+            adj_cache
+                .get_or_build(
+                    AdjacencyKey::new(ns, 1, "KNOWS", EdgeDirection::Forward),
+                    || async {
+                        Ok(EdgeAdjacency::empty(
+                            "KNOWS".to_string(),
+                            EdgeDirection::Forward,
+                            1,
+                        ))
+                    },
+                )
+                .await
+                .expect("seed adjacency entry");
+            sst_cache.insert_edge_streams(
+                format!("{ns}/sst/level0/seed.csr"),
+                std::sync::Arc::new(EdgeStreamBundle {
+                    overflow: None,
+                    declared: Vec::new(),
+                }),
+            );
+        }
+        assert_eq!(node_cache.namespace_entries(evicted_ns), 1);
+        assert_eq!(adj_cache.namespace_entries(evicted_ns), 1);
+        assert_eq!(sst_cache.namespace_side_entries(evicted_ns), 1);
+
+        // Force the eviction (max_namespaces = 1).
+        let _beta = open_evicting(&reg, "cache-prune-beta").await;
+        join_with_timeout(handles).await;
+
+        for (what, count) in [
+            ("node", node_cache.namespace_entries(evicted_ns)),
+            ("adjacency", adj_cache.namespace_entries(evicted_ns)),
+            ("sst side-map", sst_cache.namespace_side_entries(evicted_ns)),
+        ] {
+            assert_eq!(count, 0, "{what} entries of the evicted namespace linger");
+        }
+        for (what, count) in [
+            ("node", node_cache.namespace_entries(kept_ns)),
+            ("adjacency", adj_cache.namespace_entries(kept_ns)),
+            ("sst side-map", sst_cache.namespace_side_entries(kept_ns)),
+        ] {
+            assert_eq!(count, 1, "{what} entries of a sibling namespace were evicted");
+        }
     }
 }

@@ -188,14 +188,15 @@ async fn sst_used_when_rel_property_returned() {
         .collect();
     assert_eq!(weights, vec![1.0, 2.5, 3.0]);
 
-    // CSR path NOT used for this Expand — `builds()` should stay at 0
-    // because nothing else exercised it.
+    // CSR path NOT used for this Expand — no CSR entry may exist for this
+    // namespace. (The cache is process-wide and shared across the tests in
+    // this binary, so the global `builds()` counter cannot prove absence;
+    // the namespace-scoped entry count can.)
     let cache = writer.adjacency_cache().expect("adjacency cache on");
     assert_eq!(
-        cache.builds(),
+        cache.namespace_entries("tenants/plan-route-rel-prop"),
         0,
-        "rel.weight read — expected zero CSR builds, got {}",
-        cache.builds()
+        "rel.weight read — expected zero CSR entries for this namespace"
     );
 }
 
@@ -224,12 +225,12 @@ async fn sst_used_when_rel_returned_whole() {
         }
     }
 
+    // Namespace-scoped probe: see `sst_used_when_rel_property_read`.
     let cache = writer.adjacency_cache().expect("adjacency cache on");
     assert_eq!(
-        cache.builds(),
+        cache.namespace_entries("tenants/plan-route-rel-whole"),
         0,
-        "rel whole-return — expected zero CSR builds, got {}",
-        cache.builds()
+        "rel whole-return — expected zero CSR entries for this namespace"
     );
 }
 

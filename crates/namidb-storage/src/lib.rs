@@ -40,12 +40,12 @@ pub mod uri;
 pub mod wal;
 
 pub use adjacency::{
-    adjacency_budget_bytes, adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey,
-    EdgeAdjacency, EdgeSlice, DEFAULT_ADJACENCY_BUDGET_MIB,
+    adjacency_budget_bytes, adjacency_enabled, build_adjacency, shared_adjacency_cache,
+    AdjacencyCache, AdjacencyKey, EdgeAdjacency, EdgeSlice, DEFAULT_ADJACENCY_BUDGET_MIB,
 };
 pub use backup::{copy_namespace_snapshot, SnapshotCopyReport};
 pub use cache::{
-    sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
+    shared_sst_cache, sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
     DEFAULT_SST_CACHE_BUDGET_MIB,
 };
 pub use compact::{
@@ -55,7 +55,7 @@ pub use compact::{
 pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
-pub use ingest::{CommitOutcome, WriterSession};
+pub use ingest::{prune_shared_caches, CommitOutcome, SessionCaches, WriterSession};
 pub use janitor::{sweep_orphans, JanitorReport};
 pub use local::LocalFileObjectStore;
 pub use manifest::{
@@ -64,8 +64,8 @@ pub use manifest::{
 };
 pub use memtable::{FrozenMemtable, MemEntry, MemKey, MemOp, Memtable, MemtableSnapshot};
 pub use node_cache::{
-    node_cache_budget_bytes, node_cache_enabled, CachedNodeView, NodeCacheKey, NodeViewCache,
-    DEFAULT_NODE_CACHE_BUDGET_MIB,
+    node_cache_budget_bytes, node_cache_enabled, shared_node_cache, CachedNodeView, NodeCacheKey,
+    NodeViewCache, DEFAULT_NODE_CACHE_BUDGET_MIB,
 };
 pub use parquet_loader::{
     load_edges as load_edges_from_parquet, load_nodes as load_nodes_from_parquet, LoadOutcome,

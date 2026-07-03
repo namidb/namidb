@@ -6,9 +6,11 @@
 //! while the existing per-snapshot cache only hit 9% of calls — the
 //! intra-snapshot scope drops the answers after every query and the
 //! bench (and any interactive workload) builds a fresh `Snapshot` per
-//! query. Cross-snapshot sharing, keyed by `(manifest_version, label,
-//! node_id)`, lets a warmup pay the SST walk once and amortise it
-//! across every subsequent query against the same manifest version.
+//! query. Cross-snapshot sharing, keyed by `(namespace, manifest_version,
+//! label, node_id)`, lets a warmup pay the SST walk once and amortise it
+//! across every subsequent query against the same manifest version. The
+//! namespace component makes the process-wide shared instance
+//! ([`shared_node_cache`]) safe across tenants.
 //!
 //! ## Negative caching
 //!
@@ -32,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use namidb_core::NodeId;
 
@@ -61,19 +63,56 @@ pub fn node_cache_budget_bytes() -> usize {
     mib.saturating_mul(1024 * 1024)
 }
 
-/// Compound cache key. Hash by all three fields so two snapshots that
-/// share `manifest_version` see the same slot for the same `(label,
-/// node_id)`.
+/// Process-wide shared [`NodeViewCache`]: one instance for every
+/// [`crate::WriterSession`] the process opens, so
+/// `NAMIDB_NODE_CACHE_BUDGET_MIB` bounds the PROCESS, not each session.
+/// Unlike the [`crate::cache::SstCache`] (whose keys are absolute paths and
+/// therefore namespace-safe by construction), sharing this cache is only
+/// sound because [`NodeCacheKey`] embeds the namespace prefix — the bare
+/// `(manifest_version, label, node_id)` triple collides across tenants.
+///
+/// The enable flag and budget are read once, on first use. Returns `None`
+/// when `NAMIDB_NODE_CACHE=0` at first use. Callers needing a private
+/// instance inject one via
+/// [`crate::ingest::WriterSession::open_with_caches`].
+pub fn shared_node_cache() -> Option<Arc<NodeViewCache>> {
+    static SHARED: OnceLock<Option<Arc<NodeViewCache>>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            node_cache_enabled().then(|| Arc::new(NodeViewCache::new(node_cache_budget_bytes())))
+        })
+        .clone()
+}
+
+/// Compound cache key. Hash by all four fields so two snapshots that share
+/// `namespace` + `manifest_version` see the same slot for the same
+/// `(label, node_id)`.
+///
+/// `namespace` is the object-store namespace prefix (`<root>/<ns>`, no
+/// trailing slash — [`crate::paths::NamespacePaths::namespace_prefix`]).
+/// It is part of the key because the cache is shared process-wide: two
+/// tenants can hold the same `(manifest_version, label, node_id)` triple
+/// with different data (manifest versions count per namespace and node
+/// ids are caller-supplied), so omitting it would serve one tenant's rows
+/// to another. `Arc<str>` keeps per-entry clones at pointer cost — every
+/// key of one snapshot shares the same allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeCacheKey {
+    pub namespace: Arc<str>,
     pub manifest_version: u64,
     pub label: String,
     pub node_id: NodeId,
 }
 
 impl NodeCacheKey {
-    pub fn new(manifest_version: u64, label: impl Into<String>, node_id: NodeId) -> Self {
+    pub fn new(
+        namespace: impl Into<Arc<str>>,
+        manifest_version: u64,
+        label: impl Into<String>,
+        node_id: NodeId,
+    ) -> Self {
         Self {
+            namespace: namespace.into(),
             manifest_version,
             label: label.into(),
             node_id,
@@ -189,14 +228,14 @@ impl NodeViewCache {
     /// Insert (or overwrite) the entry for `key`. Evicts oldest
     /// `manifest_version` entries to fit `capacity_bytes` if necessary.
     pub fn insert(&self, key: NodeCacheKey, view: CachedNodeView) {
-        let weight = approx_size(&view) + key.label.capacity() + 32;
+        let weight = entry_weight(&key, &view);
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
         let inner = &mut *self.inner.lock().unwrap();
 
         // If we're overwriting an existing entry, reclaim its weight and drop
         // its stale eviction-order entry (keyed by its old seq) first.
         if let Some((prev, prev_seq)) = inner.map.get(&key) {
-            let prev_weight = approx_size(prev) + key.label.capacity() + 32;
+            let prev_weight = entry_weight(&key, prev);
             let prev_order_key = (key.manifest_version, *prev_seq);
             inner.used_bytes = inner.used_bytes.saturating_sub(prev_weight);
             inner.order.remove(&prev_order_key);
@@ -211,7 +250,7 @@ impl NodeViewCache {
             };
             let victim_key = inner.order.remove(&victim_ord).unwrap();
             if let Some((victim, _)) = inner.map.remove(&victim_key) {
-                let victim_weight = approx_size(&victim) + victim_key.label.capacity() + 32;
+                let victim_weight = entry_weight(&victim_key, &victim);
                 inner.used_bytes = inner.used_bytes.saturating_sub(victim_weight);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
@@ -223,6 +262,49 @@ impl NodeViewCache {
         inner.map.insert(key, (view, seq));
         inner.used_bytes = inner.used_bytes.saturating_add(weight);
     }
+
+    /// Eagerly drop every entry belonging to `namespace` (the namespace
+    /// prefix embedded in [`NodeCacheKey::namespace`]). Called when a
+    /// multi-tenant host evicts a namespace — its entries in the shared
+    /// cache are dead weight (a later reopen continues the same manifest
+    /// lineage, so leftover entries would still be CORRECT; this is a
+    /// memory-reclaim, not a correctness, operation).
+    pub fn prune_namespace(&self, namespace: &str) {
+        let inner = &mut *self.inner.lock().unwrap();
+        let victims: Vec<(NodeCacheKey, u64)> = inner
+            .map
+            .iter()
+            .filter(|(k, _)| k.namespace.as_ref() == namespace)
+            .map(|(k, (_, seq))| (k.clone(), *seq))
+            .collect();
+        for (key, seq) in victims {
+            inner.order.remove(&(key.manifest_version, seq));
+            if let Some((view, _)) = inner.map.remove(&key) {
+                inner.used_bytes = inner
+                    .used_bytes
+                    .saturating_sub(entry_weight(&key, &view));
+            }
+        }
+    }
+
+    /// Count of entries whose key belongs to `namespace`. Observability +
+    /// test probe for namespace isolation and [`Self::prune_namespace`].
+    pub fn namespace_entries(&self, namespace: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .keys()
+            .filter(|k| k.namespace.as_ref() == namespace)
+            .count()
+    }
+}
+
+/// Budget weight of one cache entry: the view estimate plus the key's own
+/// heap footprint. The `namespace` component counts pointer-size only —
+/// the `Arc<str>` buffer is shared by every key of a snapshot.
+fn entry_weight(key: &NodeCacheKey, view: &CachedNodeView) -> usize {
+    approx_size(view) + key.label.capacity() + std::mem::size_of::<Arc<str>>() + 32
 }
 
 /// Conservative size estimate for a [`CachedNodeView`]. Counts labels +
@@ -270,10 +352,12 @@ mod tests {
         }
     }
 
+    const NS: &str = "tenants/acme";
+
     #[test]
     fn miss_returns_none_increments_misses() {
         let c = NodeViewCache::new(1024 * 1024);
-        let k = NodeCacheKey::new(1, "Person", nid(1));
+        let k = NodeCacheKey::new(NS, 1, "Person", nid(1));
         assert!(c.get(&k).is_none());
         assert_eq!(c.misses(), 1);
         assert_eq!(c.hits(), 0);
@@ -282,7 +366,7 @@ mod tests {
     #[test]
     fn insert_then_get_returns_view() {
         let c = NodeViewCache::new(1024 * 1024);
-        let k = NodeCacheKey::new(1, "Person", nid(1));
+        let k = NodeCacheKey::new(NS, 1, "Person", nid(1));
         c.insert(k.clone(), Some(make_view("Alice")));
         let got = c.get(&k).expect("hit");
         assert_eq!(got.as_ref().map(|v| v.properties.len()), Some(1));
@@ -295,7 +379,7 @@ mod tests {
         // Cache a negative (key resolved to "absent"). The L2 hit must
         // surface `Some(None)`, not be confused with a cache miss.
         let c = NodeViewCache::new(1024 * 1024);
-        let k = NodeCacheKey::new(1, "Person", nid(7));
+        let k = NodeCacheKey::new(NS, 1, "Person", nid(7));
         c.insert(k.clone(), None);
         let got = c.get(&k).expect("hit on negative cache");
         assert!(got.is_none(), "cached negative should still hit");
@@ -309,7 +393,7 @@ mod tests {
         // distinct (version, label) tuple is its own entry.
         let c = NodeViewCache::new(2048);
         for v in 1..=20u64 {
-            let k = NodeCacheKey::new(v, "Person", nid(1));
+            let k = NodeCacheKey::new(NS, v, "Person", nid(1));
             let mut view = make_view("padding-padding-padding-padding-padding");
             // Inflate the view so each entry is meaningful in bytes.
             for i in 0..8 {
@@ -324,8 +408,56 @@ mod tests {
             c.evictions()
         );
         // Most-recently-inserted version must survive.
-        let k_recent = NodeCacheKey::new(20, "Person", nid(1));
+        let k_recent = NodeCacheKey::new(NS, 20, "Person", nid(1));
         assert!(c.get(&k_recent).is_some(), "newest version must survive");
+    }
+
+    #[test]
+    fn same_triple_different_namespace_is_a_distinct_slot() {
+        // Two tenants at the same manifest version with the same
+        // (label, node_id) must never see each other's rows.
+        let c = NodeViewCache::new(1024 * 1024);
+        let ka = NodeCacheKey::new("tenants/a", 2, "Person", nid(1));
+        let kb = NodeCacheKey::new("tenants/b", 2, "Person", nid(1));
+        c.insert(ka.clone(), Some(make_view("from-a")));
+        c.insert(kb.clone(), Some(make_view("from-b")));
+
+        let name = |v: CachedNodeView| match v.unwrap().properties.get("name") {
+            Some(Value::Str(s)) => s.clone(),
+            other => panic!("unexpected name: {other:?}"),
+        };
+        assert_eq!(name(c.get(&ka).expect("a hit")), "from-a");
+        assert_eq!(name(c.get(&kb).expect("b hit")), "from-b");
+    }
+
+    #[test]
+    fn prune_namespace_removes_only_that_namespace() {
+        let c = NodeViewCache::new(1024 * 1024);
+        c.insert(NodeCacheKey::new("tenants/a", 2, "Person", nid(1)), Some(make_view("a1")));
+        c.insert(NodeCacheKey::new("tenants/a", 3, "Person", nid(2)), Some(make_view("a2")));
+        c.insert(NodeCacheKey::new("tenants/b", 2, "Person", nid(1)), Some(make_view("b1")));
+        assert_eq!(c.namespace_entries("tenants/a"), 2);
+        assert_eq!(c.namespace_entries("tenants/b"), 1);
+        let used_before = c.used_bytes();
+
+        c.prune_namespace("tenants/a");
+        assert_eq!(c.namespace_entries("tenants/a"), 0);
+        assert_eq!(c.namespace_entries("tenants/b"), 1);
+        assert!(
+            c.used_bytes() < used_before,
+            "pruning must release budget bytes"
+        );
+        assert!(
+            c.get(&NodeCacheKey::new("tenants/b", 2, "Person", nid(1)))
+                .is_some(),
+            "sibling namespace survives the prune"
+        );
+        // The pruned entries' order slots are gone too: filling the cache
+        // again must not underflow or double-free the byte accounting.
+        for v in 1..=5u64 {
+            c.insert(NodeCacheKey::new("tenants/a", v, "Person", nid(3)), Some(make_view("x")));
+        }
+        assert_eq!(c.namespace_entries("tenants/a"), 5);
     }
 
     #[test]

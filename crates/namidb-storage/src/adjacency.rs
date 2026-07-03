@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use uuid::Uuid;
 
@@ -70,6 +70,27 @@ pub fn adjacency_budget_bytes() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_ADJACENCY_BUDGET_MIB);
     mib.saturating_mul(1024 * 1024)
+}
+
+/// Process-wide shared [`AdjacencyCache`]: one instance for every
+/// [`crate::WriterSession`] the process opens, so
+/// `NAMIDB_ADJACENCY_BUDGET_MIB` bounds the PROCESS, not each session.
+/// Sharing is only sound because [`AdjacencyKey`] embeds the namespace
+/// prefix — the bare `(manifest_version, edge_type, direction)` triple
+/// collides across tenants (per-namespace manifest versions both start
+/// at 1) and would serve one tenant's CSR to another.
+///
+/// The enable flag and budget are read once, on first use. Returns `None`
+/// when `NAMIDB_ADJACENCY=0` at first use. Callers needing a private
+/// instance inject one via
+/// [`crate::ingest::WriterSession::open_with_caches`].
+pub fn shared_adjacency_cache() -> Option<Arc<AdjacencyCache>> {
+    static SHARED: OnceLock<Option<Arc<AdjacencyCache>>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            adjacency_enabled().then(|| Arc::new(AdjacencyCache::new(adjacency_budget_bytes())))
+        })
+        .clone()
 }
 
 /// Per-key projection of an [`EdgeAdjacency`]. Lifetime-bound to the
@@ -158,11 +179,17 @@ impl EdgeAdjacency {
     }
 }
 
-/// Hash key for the adjacency cache. Must mirror exactly the triple that
+/// Hash key for the adjacency cache. Must mirror exactly the tuple that
 /// uniquely identifies one CSR — collisions across different
-/// `manifest_version`s would surface stale data.
+/// `manifest_version`s (or, now that the cache is shared process-wide,
+/// across namespaces) would surface stale or foreign data.
+///
+/// `namespace` is the object-store namespace prefix (`<root>/<ns>`, no
+/// trailing slash — [`crate::paths::NamespacePaths::namespace_prefix`]);
+/// see [`crate::node_cache::NodeCacheKey`] for the rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdjacencyKey {
+    pub namespace: Arc<str>,
     pub manifest_version: u64,
     pub edge_type: String,
     pub direction: EdgeDirection,
@@ -170,11 +197,13 @@ pub struct AdjacencyKey {
 
 impl AdjacencyKey {
     pub fn new(
+        namespace: impl Into<Arc<str>>,
         manifest_version: u64,
         edge_type: impl Into<String>,
         direction: EdgeDirection,
     ) -> Self {
         Self {
+            namespace: namespace.into(),
             manifest_version,
             edge_type: edge_type.into(),
             direction,
@@ -192,9 +221,10 @@ struct CacheStats {
     evictions: AtomicU64,
 }
 
-/// Process-wide CSR cache shared across `Snapshot`s emitted by the same
-/// `WriterSession` (and,.x, across writers reading the same
-/// namespace via a server-mode shared cache).
+/// Process-wide CSR cache shared across `Snapshot`s — by default across
+/// every `WriterSession` in the process ([`shared_adjacency_cache`]), so
+/// the budget is global; keys embed the namespace so tenants never
+/// collide.
 ///
 /// v0 implementation: a `HashMap` guarded by a `Mutex` plus a manual
 /// budget check on insert. When the inserted entry would push
@@ -328,6 +358,38 @@ impl AdjacencyCache {
         map.insert(key, arc.clone());
         *used = used.saturating_add(weight);
         Ok(arc)
+    }
+
+    /// Eagerly drop every CSR belonging to `namespace` (the namespace
+    /// prefix embedded in [`AdjacencyKey::namespace`]). Called when a
+    /// multi-tenant host evicts a namespace — CSRs are the largest cache
+    /// entries per byte, so reclaiming them eagerly matters most here.
+    pub fn prune_namespace(&self, namespace: &str) {
+        let mut map = self.inner.lock().unwrap();
+        let mut used = self.used_bytes.lock().unwrap();
+        let victims: Vec<AdjacencyKey> = map
+            .keys()
+            .filter(|k| k.namespace.as_ref() == namespace)
+            .cloned()
+            .collect();
+        for key in victims {
+            if let Some(victim) = map.remove(&key) {
+                *used = used.saturating_sub(victim.approx_bytes());
+            }
+        }
+    }
+
+    /// Count of CSR entries whose key belongs to `namespace`. Observability
+    /// + test probe: with the process-wide shared cache, the global
+    /// [`Self::builds`] counter can no longer prove "this namespace built
+    /// no CSR", but an entry count scoped to the namespace can.
+    pub fn namespace_entries(&self, namespace: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.namespace.as_ref() == namespace)
+            .count()
     }
 }
 
@@ -575,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn cache_returns_same_arc_on_hit() {
         let cache = AdjacencyCache::new(1024 * 1024);
-        let key = AdjacencyKey::new(1, "KNOWS", EdgeDirection::Forward);
+        let key = AdjacencyKey::new("tenants/acme", 1, "KNOWS", EdgeDirection::Forward);
         let key2 = key.clone();
         let built = cache
             .get_or_build(key, || async {
@@ -613,7 +675,7 @@ mod tests {
         for v in 1..=10u64 {
             cache
                 .get_or_build(
-                    AdjacencyKey::new(v, "KNOWS", EdgeDirection::Forward),
+                    AdjacencyKey::new("tenants/acme", v, "KNOWS", EdgeDirection::Forward),
                     || async move {
                         let mut adj =
                             EdgeAdjacency::empty("KNOWS".to_string(), EdgeDirection::Forward, v);
@@ -631,8 +693,71 @@ mod tests {
             cache.evictions()
         );
         // Highest manifest_version still present (FIFO-by-version).
-        let hit = cache.get(&AdjacencyKey::new(10, "KNOWS", EdgeDirection::Forward));
+        let hit = cache.get(&AdjacencyKey::new(
+            "tenants/acme",
+            10,
+            "KNOWS",
+            EdgeDirection::Forward,
+        ));
         assert!(hit.is_some(), "newest entry must survive");
+    }
+
+    #[tokio::test]
+    async fn same_triple_different_namespace_is_a_distinct_slot() {
+        // Two tenants at the same manifest version with the same
+        // (edge_type, direction) must resolve to their OWN CSR — the
+        // shared cache must never hand tenant A's topology to tenant B.
+        let cache = AdjacencyCache::new(1024 * 1024);
+        let build = |ns: &'static str, partner: u8| {
+            let key = AdjacencyKey::new(ns, 2, "KNOWS", EdgeDirection::Forward);
+            let adj = build_adj_manual(
+                "KNOWS",
+                EdgeDirection::Forward,
+                2,
+                &[(nid(1), nid(partner), 10, false)],
+            );
+            (key, adj)
+        };
+        let (ka, adj_a) = build("tenants/a", 2);
+        let (kb, adj_b) = build("tenants/b", 3);
+        cache.get_or_build(ka.clone(), || async { Ok(adj_a) }).await.unwrap();
+        cache.get_or_build(kb.clone(), || async { Ok(adj_b) }).await.unwrap();
+
+        let got_a = cache.get(&ka).expect("a hit");
+        let got_b = cache.get(&kb).expect("b hit");
+        assert_eq!(got_a.lookup(nid(1)).unwrap().partners, &[nid(2)]);
+        assert_eq!(got_b.lookup(nid(1)).unwrap().partners, &[nid(3)]);
+    }
+
+    #[tokio::test]
+    async fn prune_namespace_removes_only_that_namespace() {
+        let cache = AdjacencyCache::new(1024 * 1024);
+        for (ns, v) in [("tenants/a", 1u64), ("tenants/a", 2), ("tenants/b", 1)] {
+            cache
+                .get_or_build(
+                    AdjacencyKey::new(ns, v, "KNOWS", EdgeDirection::Forward),
+                    || async move {
+                        Ok(EdgeAdjacency::empty(
+                            "KNOWS".to_string(),
+                            EdgeDirection::Forward,
+                            v,
+                        ))
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.namespace_entries("tenants/a"), 2);
+        assert_eq!(cache.namespace_entries("tenants/b"), 1);
+        let used_before = cache.used_bytes();
+
+        cache.prune_namespace("tenants/a");
+        assert_eq!(cache.namespace_entries("tenants/a"), 0);
+        assert_eq!(cache.namespace_entries("tenants/b"), 1);
+        assert!(
+            cache.used_bytes() < used_before,
+            "pruning must release budget bytes"
+        );
     }
 
     #[test]

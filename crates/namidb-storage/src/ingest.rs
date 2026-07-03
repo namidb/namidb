@@ -57,8 +57,8 @@ use namidb_core::{
     Value,
 };
 
-use crate::adjacency::{adjacency_budget_bytes, adjacency_enabled, AdjacencyCache};
-use crate::cache::{sst_cache_budget_bytes, sst_cache_enabled, SstCache};
+use crate::adjacency::{shared_adjacency_cache, AdjacencyCache};
+use crate::cache::{shared_sst_cache, SstCache};
 use crate::compact::{
     install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome, PreparedCompaction,
 };
@@ -70,7 +70,7 @@ use crate::manifest::{
     VectorIndexDescriptor, WalSegmentDescriptor,
 };
 use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
-use crate::node_cache::{node_cache_budget_bytes, node_cache_enabled, NodeViewCache};
+use crate::node_cache::{shared_node_cache, NodeViewCache};
 use crate::paths::NamespacePaths;
 use crate::read::Snapshot;
 use crate::recovery::{
@@ -91,6 +91,51 @@ fn auto_snapshot_every() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_AUTO_SNAPSHOT_EVERY)
+}
+
+/// The read-side caches one [`WriterSession`] attaches to every snapshot
+/// it emits. [`WriterSession::open`] defaults to [`SessionCaches::shared`]
+/// — the lazily-initialised PROCESS-WIDE instances — so N concurrent
+/// namespaces hold one set of budgets instead of N (multi-tenant memory
+/// safety). Per cache:
+///
+/// - [`SstCache`]: shared singleton. Keys are absolute object-store paths
+///   (namespace-prefixed) and `(absolute path, row-group index)` tuples,
+///   so tenants can never collide.
+/// - [`NodeViewCache`] / [`AdjacencyCache`]: shared singletons. Their keys
+///   embed the namespace prefix (see [`crate::node_cache::NodeCacheKey`] /
+///   [`crate::adjacency::AdjacencyKey`]) because the bare
+///   `(manifest_version, …)` tuples collide across tenants.
+///
+/// Hosts that need private instances — tests with tight budgets, or an
+/// embedded process opening the SAME namespace prefix on two DIFFERENT
+/// object stores (the one identity the namespace-prefixed keys cannot
+/// distinguish) — construct their own and pass them to
+/// [`WriterSession::open_with_caches`].
+#[derive(Clone, Debug, Default)]
+pub struct SessionCaches {
+    pub sst_cache: Option<SstCache>,
+    pub node_cache: Option<Arc<NodeViewCache>>,
+    pub adjacency_cache: Option<Arc<AdjacencyCache>>,
+}
+
+impl SessionCaches {
+    /// The process-wide shared instances (the [`WriterSession::open`]
+    /// default). Each is `None` when its `NAMIDB_*` env knob disabled it
+    /// at first use; budgets are read once and bound the whole process.
+    pub fn shared() -> Self {
+        Self {
+            sst_cache: shared_sst_cache(),
+            node_cache: shared_node_cache(),
+            adjacency_cache: shared_adjacency_cache(),
+        }
+    }
+
+    /// No caches at all. Every read pays the cold path; useful for benches
+    /// and tests that must observe uncached behaviour deterministically.
+    pub fn none() -> Self {
+        Self::default()
+    }
 }
 
 /// Outcome of [`WriterSession::commit_batch`].
@@ -124,17 +169,22 @@ pub struct WriterSession {
     pending: WalSegment,
     pending_payloads: Vec<(MemKey, u64, MemOp)>,
     /// CSR adjacency cache shared across every `Snapshot` this writer
-    /// emits (RFC-018). `Some` when `NAMIDB_ADJACENCY=1` at
-    /// `open` time; otherwise `None` and edge lookups walk the legacy
-    /// SST path. The cache is `Arc`-shared so query bursts amortise
-    /// the per-`(manifest_version, edge_type, direction)` build cost.
+    /// emits (RFC-018). By default the PROCESS-WIDE shared instance
+    /// ([`crate::adjacency::shared_adjacency_cache`], keys embed the
+    /// namespace); `None` when `NAMIDB_ADJACENCY=0` disabled it, in which
+    /// case edge lookups walk the legacy SST path. The cache is
+    /// `Arc`-shared so query bursts amortise the
+    /// per-`(namespace, manifest_version, edge_type, direction)` build cost.
     adjacency_cache: Option<Arc<AdjacencyCache>>,
-    /// Cross-snapshot NodeView cache (RFC-019). `Some` when
-    /// `NAMIDB_NODE_CACHE=1` at `open` time. Attached to every
-    /// `Snapshot` this writer emits; the 3-tier `lookup_node` consults
-    /// it between the per-snapshot L1 and the L3 SST walk.
+    /// Cross-snapshot NodeView cache (RFC-019). By default the
+    /// PROCESS-WIDE shared instance
+    /// ([`crate::node_cache::shared_node_cache`], keys embed the
+    /// namespace); `None` when `NAMIDB_NODE_CACHE=0` disabled it. Attached
+    /// to every `Snapshot` this writer emits; the 3-tier `lookup_node`
+    /// consults it between the per-snapshot L1 and the L3 SST walk.
     node_cache: Option<Arc<NodeViewCache>>,
-    /// Process-wide [`SstCache`]. Default ON since the cache
+    /// Process-wide [`SstCache`] (namespace-safe by construction: keys are
+    /// absolute object-store paths). Default ON since the cache
     /// now also stores decoded edge property streams, which IC07 at SF1
     /// surfaced as the dominant per-call cost of `edge_lookup_via_sst`.
     /// Set `NAMIDB_SST_CACHE=0` to disable.
@@ -196,8 +246,25 @@ impl WriterSession {
     /// `claim_writer` to fence any prior writer. After either path,
     /// replay the WAL segments the manifest references and seed
     /// counters so the next allocated LSN follows the last durable one.
-    #[instrument(skip(store, paths), fields(namespace = %paths.namespace()))]
+    ///
+    /// Read-side caches default to the PROCESS-WIDE shared instances
+    /// ([`SessionCaches::shared`]): the `NAMIDB_*_BUDGET_MIB` knobs bound
+    /// the process, not each session, so a multi-tenant host serving N
+    /// namespaces cannot multiply the budgets by N. Use
+    /// [`Self::open_with_caches`] to inject private instances.
     pub async fn open(store: Arc<dyn ObjectStore>, paths: NamespacePaths) -> Result<Self> {
+        Self::open_with_caches(store, paths, SessionCaches::shared()).await
+    }
+
+    /// [`Self::open`] with caller-supplied caches instead of the shared
+    /// process-wide instances. `None` slots disable that cache for every
+    /// snapshot this session emits.
+    #[instrument(skip(store, paths, caches), fields(namespace = %paths.namespace()))]
+    pub async fn open_with_caches(
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+        caches: SessionCaches,
+    ) -> Result<Self> {
         let manifest_store = ManifestStore::new(store.clone(), paths.clone());
         let wal_store = WalStore::new(store.clone(), paths);
 
@@ -242,17 +309,11 @@ impl WriterSession {
         let listed = wal_store.list_segments().await?;
         let next_wal_seq = listed.last().map(|r| r.seq.saturating_add(1)).unwrap_or(1);
 
-        let adjacency_cache = if adjacency_enabled() {
-            Some(Arc::new(AdjacencyCache::new(adjacency_budget_bytes())))
-        } else {
-            None
-        };
-        let node_cache = if node_cache_enabled() {
-            Some(Arc::new(NodeViewCache::new(node_cache_budget_bytes())))
-        } else {
-            None
-        };
-        let sst_cache = sst_cache_enabled().then(|| SstCache::new(sst_cache_budget_bytes()));
+        let SessionCaches {
+            sst_cache,
+            node_cache,
+            adjacency_cache,
+        } = caches;
 
         let published_memtable = Arc::new(recovered.memtable.snapshot_view());
         Ok(Self {
@@ -343,24 +404,27 @@ impl WriterSession {
         &self.unique_index
     }
 
-    /// Adjacency cache attached to this writer (RFC-018). `None`
-    /// when `NAMIDB_ADJACENCY` was not set at `open` time. Exposed so
-    /// tests can probe hit/miss/build counters and assert that the CSR
-    /// path actually ran.
+    /// Adjacency cache attached to this writer (RFC-018) — the shared
+    /// process-wide instance unless one was injected via
+    /// [`Self::open_with_caches`]; `None` when disabled. Exposed so tests
+    /// can probe the cache. The hit/miss/build counters are GLOBAL, so
+    /// absence proofs should use `namespace_entries`, not `builds`.
     pub fn adjacency_cache(&self) -> Option<&Arc<AdjacencyCache>> {
         self.adjacency_cache.as_ref()
     }
 
-    /// Cross-snapshot NodeView cache attached to this writer (RFC-019).
-    /// `None` when `NAMIDB_NODE_CACHE` was not set at `open` time.
-    /// Exposed for tests/observability — hit/miss/insert stats.
+    /// Cross-snapshot NodeView cache attached to this writer (RFC-019) —
+    /// the shared process-wide instance unless one was injected via
+    /// [`Self::open_with_caches`]; `None` when disabled. Exposed for
+    /// tests/observability — hit/miss/insert stats.
     pub fn node_cache(&self) -> Option<&Arc<NodeViewCache>> {
         self.node_cache.as_ref()
     }
 
     /// Process-wide SST body / metadata / edge-stream cache attached to
-    /// this writer. `None` when `NAMIDB_SST_CACHE=0` at `open` time.
-    /// Exposed for tests/observability.
+    /// this writer — shared unless injected via
+    /// [`Self::open_with_caches`]; `None` when disabled. Exposed for
+    /// tests/observability.
     pub fn sst_cache(&self) -> Option<&SstCache> {
         self.sst_cache.as_ref()
     }
@@ -427,7 +491,15 @@ impl WriterSession {
     pub async fn reopen(&mut self) -> Result<()> {
         let store = Arc::clone(&self.store);
         let paths = self.manifest_store.paths().clone();
-        *self = Self::open(store, paths).await?;
+        // Keep whatever caches this session was opened with — a session
+        // opened via `open_with_caches` must not silently swap its private
+        // instances for the shared ones on recovery.
+        let caches = SessionCaches {
+            sst_cache: self.sst_cache.clone(),
+            node_cache: self.node_cache.clone(),
+            adjacency_cache: self.adjacency_cache.clone(),
+        };
+        *self = Self::open_with_caches(store, paths, caches).await?;
         Ok(())
     }
 
@@ -1034,6 +1106,11 @@ impl WriterSession {
     /// edge readers) for SSTs the current manifest no longer references. Those
     /// maps are insert-only and keyed by absolute SST path, so without this they
     /// grow without bound as flush/compaction churns SSTs.
+    ///
+    /// Scoped to this session's namespace prefix: the cache is shared
+    /// process-wide, and this writer's live set says nothing about sibling
+    /// namespaces' entries — pruning them here would evict other tenants'
+    /// warm state on every flush/compaction.
     fn prune_sst_cache(&self) {
         let Some(cache) = &self.sst_cache else {
             return;
@@ -1047,7 +1124,7 @@ impl WriterSession {
             .iter()
             .map(|d| format!("{prefix}/{}", d.path))
             .collect();
-        cache.retain_paths(&live);
+        cache.retain_paths(prefix, &live);
     }
 
     /// Flush the live memtable iff the current manifest already references
@@ -1766,6 +1843,31 @@ fn value_datatype(v: &Value) -> Option<DataType> {
         Value::Date(_) => Some(DataType::Date32),
         Value::DateTime(_) => Some(DataType::TimestampMicrosUtc),
         Value::Null | Value::Vec(_) | Value::VecI8 { .. } | Value::List(_) | Value::Map(_) => None,
+    }
+}
+
+/// Eagerly reclaim every entry the process-wide shared caches hold for
+/// `paths`' namespace. For a multi-tenant host, call this when evicting a
+/// namespace: its `WriterSession` is being dropped anyway, so its CSRs,
+/// NodeViews, and decoded SST side-state are dead weight inside the shared
+/// budgets. Purely a memory-reclaim operation — leftover entries would
+/// still be served correctly (keys embed the namespace and the manifest
+/// version), just uselessly.
+///
+/// The `SstCache`'s byte-budgeted foyer tiers (SST bodies, decoded node
+/// row groups) expose no iteration API and are reclaimed lazily by their
+/// own budget eviction; everything map-backed is dropped eagerly here.
+pub fn prune_shared_caches(paths: &NamespacePaths) {
+    let prefix = paths.namespace_prefix();
+    let prefix = prefix.as_ref();
+    if let Some(cache) = shared_sst_cache() {
+        cache.prune_namespace(prefix);
+    }
+    if let Some(cache) = shared_node_cache() {
+        cache.prune_namespace(prefix);
+    }
+    if let Some(cache) = shared_adjacency_cache() {
+        cache.prune_namespace(prefix);
     }
 }
 

@@ -22,7 +22,7 @@
 //! budget rather than an entry count.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::RecordBatch;
 use bytes::Bytes;
@@ -89,6 +89,28 @@ pub fn sst_cache_budget_bytes() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SST_CACHE_BUDGET_MIB);
     mib.saturating_mul(1024 * 1024)
+}
+
+/// Process-wide shared [`SstCache`]: one instance for every
+/// [`crate::WriterSession`] the process opens, so `NAMIDB_SST_CACHE_BUDGET_MIB`
+/// (and the decoded row-group budget) bound the PROCESS, not each session —
+/// a multi-tenant host serving N namespaces holds one budget, not N.
+///
+/// Sharing across namespaces is sound because every key in every tier is
+/// an absolute object-store path (namespace-prefixed) or `(absolute path,
+/// row-group index)`: two namespaces can never collide on a key.
+///
+/// The enable flag and budgets are read once, on first use; later env
+/// mutations don't resize the shared instance. Returns `None` when
+/// `NAMIDB_SST_CACHE=0` at first use. Callers needing private budgets
+/// (tests, embedded hosts with several object stores) construct their own
+/// [`SstCache`] and inject it via
+/// [`crate::ingest::WriterSession::open_with_caches`].
+pub fn shared_sst_cache() -> Option<SstCache> {
+    static SHARED: OnceLock<Option<SstCache>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| sst_cache_enabled().then(|| SstCache::new(sst_cache_budget_bytes())))
+        .clone()
 }
 
 /// Decoded edge SST property streams — the overflow JSON column plus
@@ -435,32 +457,68 @@ impl SstCache {
     }
 
     /// Drop side-map entries (Parquet metadata, decoded edge streams, edge
-    /// readers) whose SST path is no longer `live`. The three maps are keyed by
-    /// absolute SST path and were insert-only, so under normal flush/compaction
-    /// churn they grew without bound (a 10M-edge SST's decoded streams are
-    /// ~1 GB per entry). Called after a manifest commit with the paths the new
-    /// manifest still references; the byte-bounded body cache (`inner`) is
-    /// unaffected. Over-eviction is safe (entries re-decode on demand).
-    pub fn retain_paths(&self, live: &std::collections::HashSet<String>) {
-        self.metadata.lock().unwrap().retain(|k, _| live.contains(k));
-        self.edge_streams
-            .lock()
-            .unwrap()
-            .retain(|k, _| live.contains(k));
-        self.edge_readers
-            .lock()
-            .unwrap()
-            .retain(|k, _| live.contains(k));
+    /// readers) under `namespace_prefix` whose SST path is no longer `live`.
+    /// The maps are keyed by absolute SST path and were insert-only, so under
+    /// normal flush/compaction churn they grew without bound (a 10M-edge SST's
+    /// decoded streams are ~1 GB per entry). Called after a manifest commit
+    /// with the paths the new manifest still references; the byte-bounded body
+    /// cache (`inner`) is unaffected. Over-eviction is safe (entries re-decode
+    /// on demand).
+    ///
+    /// The prune is scoped to `namespace_prefix` (`<root>/<ns>`, with or
+    /// without a trailing slash) because the cache is shared process-wide:
+    /// one namespace's flush knows only its OWN live set, so it must never
+    /// touch sibling namespaces' entries — a global retain here would evict
+    /// every other tenant's warm state on each flush.
+    pub fn retain_paths(&self, namespace_prefix: &str, live: &std::collections::HashSet<String>) {
+        // Normalise to a path-segment boundary so "tenants/acme" cannot
+        // match "tenants/acme2/...".
+        let mut prefix = namespace_prefix.to_string();
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let keep = |k: &String| !k.starts_with(&prefix) || live.contains(k);
+        self.metadata.lock().unwrap().retain(|k, _| keep(k));
+        self.edge_streams.lock().unwrap().retain(|k, _| keep(k));
+        self.edge_readers.lock().unwrap().retain(|k, _| keep(k));
         #[cfg(feature = "text-index")]
-        self.text_indexes
-            .lock()
-            .unwrap()
-            .retain(|k, _| live.contains(k));
+        self.text_indexes.lock().unwrap().retain(|k, _| keep(k));
         #[cfg(feature = "vector-index")]
-        self.vector_indexes
-            .lock()
-            .unwrap()
-            .retain(|k, _| live.contains(k));
+        self.vector_indexes.lock().unwrap().retain(|k, _| keep(k));
+    }
+
+    /// Eagerly drop every side-map entry under `namespace_prefix`. Called
+    /// when a multi-tenant host evicts a namespace — its state is being
+    /// dropped anyway, so its decoded metadata/streams/readers/indexes are
+    /// dead weight in the shared cache. The byte-budgeted foyer tiers (SST
+    /// bodies, decoded node row groups) expose no iteration API; their
+    /// entries are reclaimed lazily by budget eviction, which is safe
+    /// because both tiers are strictly byte-bounded.
+    pub fn prune_namespace(&self, namespace_prefix: &str) {
+        self.retain_paths(namespace_prefix, &std::collections::HashSet::new());
+    }
+
+    /// Count of side-map entries (across the path-keyed maps) whose SST path
+    /// sits under `namespace_prefix`. Observability + test probe for the
+    /// namespace-scoped [`Self::retain_paths`] / [`Self::prune_namespace`].
+    pub fn namespace_side_entries(&self, namespace_prefix: &str) -> usize {
+        let mut prefix = namespace_prefix.to_string();
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let count = |keys: Vec<String>| keys.iter().filter(|k| k.starts_with(&prefix)).count();
+        let mut n = count(self.metadata.lock().unwrap().keys().cloned().collect());
+        n += count(self.edge_streams.lock().unwrap().keys().cloned().collect());
+        n += count(self.edge_readers.lock().unwrap().keys().cloned().collect());
+        #[cfg(feature = "text-index")]
+        {
+            n += count(self.text_indexes.lock().unwrap().keys().cloned().collect());
+        }
+        #[cfg(feature = "vector-index")]
+        {
+            n += count(self.vector_indexes.lock().unwrap().keys().cloned().collect());
+        }
+        n
     }
 
     pub fn metadata_hits(&self) -> u64 {
@@ -536,6 +594,67 @@ mod tests {
         assert!(cache.get("nope").is_none());
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn retain_paths_only_prunes_the_given_namespace() {
+        let cache = SstCache::new(1 << 20);
+        let bundle = || Arc::new(EdgeStreamBundle {
+            overflow: None,
+            declared: Vec::new(),
+        });
+        let a_live = "tenants/a/sst/level0/live.csr".to_string();
+        let a_dead = "tenants/a/sst/level0/dead.csr".to_string();
+        let b_entry = "tenants/b/sst/level0/other.csr".to_string();
+        for k in [&a_live, &a_dead, &b_entry] {
+            cache.insert_edge_streams(k.clone(), bundle());
+        }
+
+        // Namespace `a` flushes: only its own dead path may go. A naive
+        // global retain would also evict `b`'s entry here.
+        let live: std::collections::HashSet<String> = [a_live.clone()].into();
+        cache.retain_paths("tenants/a", &live);
+
+        assert!(cache.get_edge_streams(&a_live).is_some(), "a's live entry kept");
+        assert!(cache.get_edge_streams(&a_dead).is_none(), "a's dead entry pruned");
+        assert!(
+            cache.get_edge_streams(&b_entry).is_some(),
+            "sibling namespace's entry must survive a's retain"
+        );
+    }
+
+    #[test]
+    fn retain_paths_prefix_respects_path_boundary() {
+        // "tenants/a" must not claim "tenants/a2/..." entries.
+        let cache = SstCache::new(1 << 20);
+        let bundle = Arc::new(EdgeStreamBundle {
+            overflow: None,
+            declared: Vec::new(),
+        });
+        let a2 = "tenants/a2/sst/level0/x.csr".to_string();
+        cache.insert_edge_streams(a2.clone(), bundle);
+        cache.retain_paths("tenants/a", &std::collections::HashSet::new());
+        assert!(
+            cache.get_edge_streams(&a2).is_some(),
+            "tenants/a2 is not under tenants/a"
+        );
+    }
+
+    #[test]
+    fn prune_namespace_drops_all_side_entries_for_that_namespace() {
+        let cache = SstCache::new(1 << 20);
+        let bundle = || Arc::new(EdgeStreamBundle {
+            overflow: None,
+            declared: Vec::new(),
+        });
+        cache.insert_edge_streams("tenants/gone/sst/level0/a.csr".into(), bundle());
+        cache.insert_edge_streams("tenants/gone/sst/level0/b.csr".into(), bundle());
+        cache.insert_edge_streams("tenants/kept/sst/level0/c.csr".into(), bundle());
+        assert_eq!(cache.namespace_side_entries("tenants/gone"), 2);
+
+        cache.prune_namespace("tenants/gone");
+        assert_eq!(cache.namespace_side_entries("tenants/gone"), 0);
+        assert_eq!(cache.namespace_side_entries("tenants/kept"), 1);
     }
 
     #[test]
