@@ -30,8 +30,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use namidb_graph::algo::{
-    degrees, label_propagation, pagerank, shortest_paths, strongly_connected_components,
-    triangle_count, weakly_connected_components, Graph, PageRankOptions,
+    betweenness, degrees, label_propagation, louvain, pagerank, shortest_paths,
+    strongly_connected_components, triangle_count, weakly_connected_components, Graph,
+    LouvainOptions, PageRankOptions,
     LABEL_PROPAGATION_DEFAULT_ITERS,
 };
 use namidb_markdown::Embedder;
@@ -1063,10 +1064,58 @@ impl Server {
                     "paths": paths,
                 })
             }
+            "louvain" => {
+                let mut opts = LouvainOptions::default();
+                if let Some(m) = args.get("max_iterations").and_then(Value::as_u64) {
+                    opts.max_iterations = m as usize;
+                }
+                let res = louvain(&graph, &opts);
+                let communities = group_top_k(&res.assignment, &id_meta, top_k);
+                json!({
+                    "algorithm": "louvain",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "community_count": res.count,
+                    "modularity": res.modularity,
+                    "communities": communities,
+                })
+            }
+            "betweenness" | "betweenness_centrality" => {
+                let bc = betweenness(&graph);
+                let mut ranked: Vec<(String, f64)> = id_meta
+                    .keys()
+                    .filter_map(|id| {
+                        namidb_core::NodeId::from_str(id).ok().map(|nid| {
+                            (id.clone(), bc.scores.get(&nid).copied().unwrap_or(0.0))
+                        })
+                    })
+                    .collect();
+                // Score desc, node id asc for a deterministic tie-break.
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let scores: Vec<Value> = ranked
+                    .into_iter()
+                    .take(top_k)
+                    .filter_map(|(id, score)| {
+                        id_meta.get(&id).map(|(title, path)| {
+                            json!({ "id": id, "title": title, "path": path, "score": score })
+                        })
+                    })
+                    .collect();
+                json!({
+                    "algorithm": "betweenness",
+                    "node_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "scores": scores,
+                })
+            }
             other => {
                 return Err(format!(
                     "unknown algorithm `{other}`; supported: wcc, scc, pagerank, degree, \
-                     triangle_count, label_propagation, shortest_path"
+                     triangle_count, label_propagation, louvain, betweenness, shortest_path"
                 ));
             }
         };
@@ -1458,14 +1507,14 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "graph_algorithm",
-            "description": "Run a native graph algorithm over the subgraph induced by a node label. Algorithms: `wcc` (Weakly Connected Components — undirected reachability clusters), `scc` (Strongly Connected Components — directed cycles), `pagerank` (structural importance via power iteration), `degree` (in/out/total degree centrality), `triangle_count` (triangles + local clustering coefficient), `label_propagation` (community detection), and `shortest_path` (BFS hop distances from a `source` node id). Returns algorithm-specific results joined to readable titles/paths. Read-only. The same algorithms are available in Cypher via `CALL algo.<name>()`.",
+            "description": "Run a native graph algorithm over the subgraph induced by a node label. Algorithms: `wcc` (Weakly Connected Components — undirected reachability clusters), `scc` (Strongly Connected Components — directed cycles), `pagerank` (structural importance via power iteration), `degree` (in/out/total degree centrality), `triangle_count` (triangles + local clustering coefficient), `label_propagation` (community detection), `louvain` (modularity community detection, also reports modularity), `betweenness` (Brandes betweenness centrality — bridge nodes), and `shortest_path` (BFS hop distances from a `source` node id). Returns algorithm-specific results joined to readable titles/paths. Read-only. The same algorithms are available in Cypher via `CALL algo.<name>()`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "algorithm": { "type": "string", "enum": ["wcc", "scc", "pagerank", "degree", "triangle_count", "label_propagation", "shortest_path"], "description": "Algorithm to run" },
+                    "algorithm": { "type": "string", "enum": ["wcc", "scc", "pagerank", "degree", "triangle_count", "label_propagation", "louvain", "betweenness", "shortest_path"], "description": "Algorithm to run" },
                     "label": { "type": "string", "description": "Node label to build the subgraph from (default \"Note\")" },
                     "edge_types": { "type": "array", "items": { "type": "string" }, "description": "Optional allowlist of edge types to traverse (default: all edge types between label nodes)" },
-                    "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For partitioning algos (wcc/scc/label_propagation): number of largest groups to return. For ranking algos (pagerank/degree/triangle_count/shortest_path): number of top results to return. Default 10." },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For partitioning algos (wcc/scc/label_propagation/louvain): number of largest groups to return. For ranking algos (pagerank/degree/triangle_count/betweenness/shortest_path): number of top results to return. Default 10." },
                     "damping": { "type": "number", "description": "PageRank damping factor (default 0.85)." },
                     "max_iterations": { "type": "integer", "description": "Iteration cap for pagerank (default 100) and label_propagation (default 10)." },
                     "source": { "type": "string", "description": "Required for shortest_path: the source node id to compute hop distances from." }
@@ -1725,6 +1774,40 @@ mod tests {
         // The largest component has size 3 (A, B, C).
         assert_eq!(res["components"][0]["size"], 3);
         assert_eq!(res["components"][1]["size"], 1);
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_louvain_and_betweenness() {
+        // A -> B -> C chain plus an isolate: betweenness must put B (the only
+        // pass-through) on top; louvain groups the chain into communities and
+        // reports a modularity value.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        write(dir.path(), "D.md", "isolated\n");
+        let server = Server::open("memory://mcp-louvain").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "betweenness", "label": "Note", "k": 4 }),
+        )
+        .await;
+        assert_eq!(res["algorithm"], "betweenness");
+        assert_eq!(res["scores"][0]["title"], "B", "the bridge ranks first");
+        assert_eq!(res["scores"][0]["score"], 1.0, "one A->C dependency");
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "louvain", "label": "Note" }),
+        )
+        .await;
+        assert_eq!(res["algorithm"], "louvain");
+        assert!(res["modularity"].is_number());
+        assert!(res["community_count"].as_u64().unwrap() >= 2);
     }
 
     #[tokio::test]
