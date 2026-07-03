@@ -296,6 +296,16 @@ impl NamespaceRegistry {
                             let mut w = s.writer.lock().await;
                             if let Err(e) = w.install_prepared_compaction(prepared).await {
                                 error!(namespace = %ns, error = %e, "reactive compaction failed");
+                                // Reopen a fenced/poisoned session in place
+                                // (no-op for a lost-input precondition abort).
+                                recovery::recover_writer_if_needed(
+                                    &mut w,
+                                    &s.snapshot,
+                                    &s.writer_health,
+                                    &ns,
+                                    &e,
+                                )
+                                .await;
                             } else {
                                 s.snapshot.store(w.owned_snapshot());
                             }
@@ -356,7 +366,15 @@ impl NamespaceRegistry {
                                         }
                                         Ok(_) => {}
                                         Err(e) => {
-                                            error!(namespace = %ns, error = %e, "periodic compaction failed")
+                                            error!(namespace = %ns, error = %e, "periodic compaction failed");
+                                            recovery::recover_writer_if_needed(
+                                                &mut w,
+                                                &s.snapshot,
+                                                &s.writer_health,
+                                                &ns,
+                                                &e,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }

@@ -793,7 +793,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => error!(error = %e, "reactive compaction failed"),
+                            Err(e) => {
+                                error!(error = %e, "reactive compaction failed");
+                                recovery::recover_writer_if_needed(
+                                    &mut w,
+                                    &state_for_flush.snapshot,
+                                    &state_for_flush.writer_health,
+                                    &state_for_flush.namespace,
+                                    &e,
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(e) => error!(error = %e, "reactive compaction failed"),
@@ -847,7 +857,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                                         );
                                     }
                                     Ok(_) => {}
-                                    Err(e) => error!(error = %e, "periodic compaction failed"),
+                                    Err(e) => {
+                                        error!(error = %e, "periodic compaction failed");
+                                        // A fenced/poisoned session would fail
+                                        // every later write too; reopen under
+                                        // the lock we already hold (no-op for
+                                        // a lost-input precondition abort).
+                                        recovery::recover_writer_if_needed(
+                                            &mut w,
+                                            &state_for_maint.snapshot,
+                                            &state_for_maint.writer_health,
+                                            &state_for_maint.namespace,
+                                            &e,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             Err(e) => error!(error = %e, "periodic compaction failed"),
@@ -1389,9 +1413,14 @@ async fn apply_create_vector_index(
 /// run the DDL, return an empty `CypherResponse` on success. Shared by the
 /// single- and multi-tenant paths, which pass their own writer/snapshot.
 #[cfg(feature = "vector-index")]
+// The DDL params are all distinct (session, publish cell, health, authz,
+// clause, principal, clock); bundling them would not aid readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_create_vector_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
     authz: &Arc<dyn authz::AuthzHook>,
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
     principal: &Principal,
@@ -1435,6 +1464,12 @@ async fn run_create_vector_index(
     }
     let mut w = writer.lock().await;
     let result = apply_create_vector_index(&mut w, snapshot, cvi).await;
+    if let Err(e) = &result {
+        // A fenced/poisoned session would fail every later write; reopen it
+        // in place under the lock we already hold (no-op for user errors
+        // like a duplicate index name).
+        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    }
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1503,9 +1538,14 @@ async fn apply_create_fulltext_index(
 /// HTTP shape for a `CREATE FULLTEXT INDEX`: gate on role + authz, run the DDL,
 /// return an empty `CypherResponse` on success. Mirrors `run_create_vector_index`.
 #[cfg(feature = "text-index")]
+// The DDL params are all distinct (session, publish cell, health, authz,
+// clause, principal, clock); bundling them would not aid readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_create_fulltext_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
     authz: &Arc<dyn authz::AuthzHook>,
     cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
     principal: &Principal,
@@ -1547,6 +1587,12 @@ async fn run_create_fulltext_index(
     }
     let mut w = writer.lock().await;
     let result = apply_create_fulltext_index(&mut w, snapshot, cfi).await;
+    if let Err(e) = &result {
+        // A fenced/poisoned session would fail every later write; reopen it
+        // in place under the lock we already hold (no-op for user errors
+        // like a duplicate index name).
+        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    }
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1603,9 +1649,14 @@ async fn apply_drop_vector_index(
 /// return an empty `CypherResponse` on success. Mirrors
 /// `run_create_vector_index` (same authz treatment as CREATE).
 #[cfg(feature = "vector-index")]
+// The DDL params are all distinct (session, publish cell, health, authz,
+// clause, principal, clock); bundling them would not aid readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_drop_vector_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
     authz: &Arc<dyn authz::AuthzHook>,
     dvi: &namidb_query::parser::ast::DropVectorIndexClause,
     principal: &Principal,
@@ -1644,6 +1695,12 @@ async fn run_drop_vector_index(
     }
     let mut w = writer.lock().await;
     let result = apply_drop_vector_index(&mut w, snapshot, dvi).await;
+    if let Err(e) = &result {
+        // A fenced/poisoned session would fail every later write; reopen it
+        // in place under the lock we already hold (no-op for user errors
+        // like a duplicate index name).
+        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    }
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1700,9 +1757,14 @@ async fn apply_drop_fulltext_index(
 /// authz, run the DDL, return an empty `CypherResponse` on success. Mirrors
 /// `run_drop_vector_index`.
 #[cfg(feature = "text-index")]
+// The DDL params are all distinct (session, publish cell, health, authz,
+// clause, principal, clock); bundling them would not aid readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_drop_fulltext_index(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
     authz: &Arc<dyn authz::AuthzHook>,
     dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
     principal: &Principal,
@@ -1741,6 +1803,12 @@ async fn run_drop_fulltext_index(
     }
     let mut w = writer.lock().await;
     let result = apply_drop_fulltext_index(&mut w, snapshot, dfi).await;
+    if let Err(e) = &result {
+        // A fenced/poisoned session would fail every later write; reopen it
+        // in place under the lock we already hold (no-op for user errors
+        // like a duplicate index name).
+        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    }
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1819,6 +1887,8 @@ async fn apply_create_index(
 async fn run_create_property_ddl(
     writer: &Arc<tokio::sync::Mutex<WriterSession>>,
     snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
     authz: &Arc<dyn authz::AuthzHook>,
     name: Option<&str>,
     label: &str,
@@ -1870,6 +1940,11 @@ async fn run_create_property_ddl(
     } else {
         apply_create_index(&mut w, snapshot, name, label, &properties[0], if_not_exists).await
     };
+    if let Err(e) = &result {
+        // Same reopen-in-place as the other DDL handlers (no-op for user
+        // errors like a duplicate name).
+        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    }
     drop(w);
     let elapsed = started.elapsed();
     match result {
@@ -1967,6 +2042,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_create_vector_index(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             cvi,
             principal,
@@ -1981,6 +2058,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_create_fulltext_index(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             cfi,
             principal,
@@ -1995,6 +2074,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_drop_vector_index(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             dvi,
             principal,
@@ -2009,6 +2090,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_drop_fulltext_index(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             dfi,
             principal,
@@ -2023,6 +2106,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_create_property_ddl(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2039,6 +2124,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         return run_create_property_ddl(
             &state.writer,
             &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
             &state.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2443,6 +2530,8 @@ async fn run_cypher_multi(
         return run_create_vector_index(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             cvi,
             principal,
@@ -2457,6 +2546,8 @@ async fn run_cypher_multi(
         return run_create_fulltext_index(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             cfi,
             principal,
@@ -2471,6 +2562,8 @@ async fn run_cypher_multi(
         return run_drop_vector_index(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             dvi,
             principal,
@@ -2485,6 +2578,8 @@ async fn run_cypher_multi(
         return run_drop_fulltext_index(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             dfi,
             principal,
@@ -2499,6 +2594,8 @@ async fn run_cypher_multi(
         return run_create_property_ddl(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2515,6 +2612,8 @@ async fn run_cypher_multi(
         return run_create_property_ddl(
             &ns_state.writer,
             &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
             &shared.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,

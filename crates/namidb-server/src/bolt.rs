@@ -150,6 +150,18 @@ impl ServerBackend {
             };
         };
         let result = crate::apply_create_vector_index(&mut writer, &self.state.snapshot, cvi).await;
+        if let Err(e) = &result {
+            // Reopen a fenced/poisoned session in place under the held lock
+            // (no-op for user errors like a duplicate index name).
+            crate::recovery::recover_writer_if_needed(
+                &mut writer,
+                &self.state.snapshot,
+                &self.state.writer_health,
+                &self.state.namespace,
+                e,
+            )
+            .await;
+        }
         drop(writer);
         let elapsed = started.elapsed();
         match result {
@@ -285,6 +297,18 @@ impl ServerBackend {
             };
         };
         let result = crate::apply_drop_vector_index(&mut writer, &self.state.snapshot, dvi).await;
+        if let Err(e) = &result {
+            // Reopen a fenced/poisoned session in place under the held lock
+            // (no-op for user errors like a duplicate index name).
+            crate::recovery::recover_writer_if_needed(
+                &mut writer,
+                &self.state.snapshot,
+                &self.state.writer_health,
+                &self.state.namespace,
+                e,
+            )
+            .await;
+        }
         drop(writer);
         let elapsed = started.elapsed();
         match result {
@@ -352,6 +376,18 @@ impl ServerBackend {
             };
         };
         let result = crate::apply_drop_fulltext_index(&mut writer, &self.state.snapshot, dfi).await;
+        if let Err(e) = &result {
+            // Reopen a fenced/poisoned session in place under the held lock
+            // (no-op for user errors like a duplicate index name).
+            crate::recovery::recover_writer_if_needed(
+                &mut writer,
+                &self.state.snapshot,
+                &self.state.writer_health,
+                &self.state.namespace,
+                e,
+            )
+            .await;
+        }
         drop(writer);
         let elapsed = started.elapsed();
         match result {
@@ -444,6 +480,16 @@ impl ServerBackend {
             )
             .await
         };
+        if let Err(e) = &result {
+            crate::recovery::recover_writer_if_needed(
+                &mut writer,
+                &self.state.snapshot,
+                &self.state.writer_health,
+                &self.state.namespace,
+                e,
+            )
+            .await;
+        }
         drop(writer);
         let elapsed = started.elapsed();
         match result {
