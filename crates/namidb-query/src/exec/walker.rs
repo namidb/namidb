@@ -2991,9 +2991,18 @@ async fn snapshot_to_algo_graph(
     snapshot: &Snapshot<'_>,
     projection: &AlgoProjection,
 ) -> Result<namidb_graph::algo::Graph, ExecError> {
-    // Requested labels/edge types are validated against the observed sets so a
-    // typo errors instead of silently projecting an empty graph (GDS parity).
-    let labels = match &projection.labels {
+    let mut g = namidb_graph::algo::Graph::new();
+    match &projection.labels {
+        // No label filter: ONE label-agnostic id pass over the whole store.
+        // The per-label loop repeated the same full memtable+SST merge once
+        // per observed label — O(labels × nodes) for every CALL algo.*.
+        None => {
+            for id in snapshot.scan_all_node_ids().await? {
+                g.add_node(id);
+            }
+        }
+        // Requested labels are validated against the observed set so a typo
+        // errors instead of silently projecting an empty graph (GDS parity).
         Some(ls) => {
             let known = snapshot.observed_labels();
             for l in ls {
@@ -3004,21 +3013,17 @@ async fn snapshot_to_algo_graph(
                     )));
                 }
             }
-            ls.clone()
-        }
-        None => snapshot.observed_labels(),
-    };
-    let mut g = namidb_graph::algo::Graph::new();
-    for label in &labels {
-        // We only need the node ids, so scan with an EMPTY property projection:
-        // this skips decoding every declared property column AND serde-parsing
-        // __overflow_json per row — the dominant cost of building the algo graph
-        // (millions of JSON parses on a large namespace, per CALL algo.*).
-        for n in snapshot
-            .scan_label_with_predicates_and_projection(label, &[], Some(&[]))
-            .await?
-        {
-            g.add_node(n.id);
+            for label in ls {
+                // Only the node ids are needed: an EMPTY property projection
+                // skips decoding every declared property column and the
+                // per-row __overflow_json parse.
+                for n in snapshot
+                    .scan_label_with_predicates_and_projection(label, &[], Some(&[]))
+                    .await?
+                {
+                    g.add_node(n.id);
+                }
+            }
         }
     }
     // A label filter projects the *induced* subgraph: an edge survives only

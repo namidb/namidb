@@ -1813,6 +1813,60 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn scan_all_node_ids_single_pass_matches_per_label_union() {
+        // Multi-label store with flushed + memtable data, a tombstone, and a
+        // memtable rewrite of a flushed id: the one-pass id scan must equal
+        // the union of per-label scans (all nodes carry labels here) with
+        // last-LSN-wins and tombstones dropped.
+        let store = make_store();
+        let paths = make_paths("scan-all-ids");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        for i in 1..=4u8 {
+            session
+                .upsert_node("Person", sorted_node_id(i), &node_record("p", None))
+                .unwrap();
+        }
+        for i in 5..=6u8 {
+            session
+                .upsert_node("Post", sorted_node_id(i), &node_record("q", None))
+                .unwrap();
+        }
+        session.commit_batch().await.unwrap();
+        let schema = session.snapshot().manifest().manifest.schema.clone();
+        session.flush(schema).await.unwrap();
+
+        // Post-flush deltas: delete one flushed node, rewrite another,
+        // add a fresh one.
+        session.tombstone_node("Person", sorted_node_id(2)).unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("p3", None))
+            .unwrap();
+        session
+            .upsert_node("Post", sorted_node_id(7), &node_record("q7", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        let snap = session.snapshot();
+        let mut fast = snap.scan_all_node_ids().await.unwrap();
+        fast.sort();
+
+        let mut expected: Vec<NodeId> = Vec::new();
+        for label in ["Person", "Post"] {
+            for v in snap.scan_label(label).await.unwrap() {
+                expected.push(v.id);
+            }
+        }
+        expected.sort();
+        expected.dedup();
+
+        assert_eq!(fast, expected, "one-pass ids must equal the per-label union");
+        assert!(!fast.contains(&sorted_node_id(2)), "tombstone dropped");
+        assert!(fast.contains(&sorted_node_id(7)), "memtable-only id present");
+        assert_eq!(fast.len(), 6);
+    }
+
     fn make_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
     }

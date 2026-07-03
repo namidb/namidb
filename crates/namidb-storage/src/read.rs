@@ -1741,7 +1741,13 @@ impl<'mt> Snapshot<'mt> {
                             properties.insert(p.name.clone(), v);
                         }
                     }
-                    if !ovf_col.is_null(row) {
+                    // Skip the per-row overflow JSON parse entirely when the
+                    // projection keeps nothing — an id-only scan was still
+                    // paying a serde_json parse per row for values it threw
+                    // away immediately.
+                    if !ovf_col.is_null(row)
+                        && projection_set.as_ref().is_none_or(|keep| !keep.is_empty())
+                    {
                         let json_str = ovf_col.value(row);
                         let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
                         if let Some(keep) = &projection_set {
@@ -1782,6 +1788,73 @@ impl<'mt> Snapshot<'mt> {
             .into_values()
             .filter_map(|(_, v)| v)
             .filter(|v| v.labels.contains(label))
+            .collect())
+    }
+
+    /// Every live node id visible at this snapshot, in ONE label-agnostic
+    /// pass over the memtable + every node SST, decoding only the
+    /// id/tombstone/lsn columns (no property decode, no overflow JSON
+    /// parse). This is the whole-graph node set for `CALL algo.*`: the
+    /// per-label scan repeats the same full-store merge once per observed
+    /// label, making an unfiltered algo-graph build `O(labels × nodes)`
+    /// instead of `O(nodes)`. Includes nodes with an empty label set (the
+    /// whole graph, GDS-style), which the per-label union would miss.
+    pub async fn scan_all_node_ids(&self) -> Result<Vec<NodeId>> {
+        // (node_id) → (winning lsn, live?). Highest LSN wins per id.
+        let mut latest: BTreeMap<NodeId, (u64, bool)> = BTreeMap::new();
+        let update = |latest: &mut BTreeMap<NodeId, (u64, bool)>,
+                          id: NodeId,
+                          lsn: u64,
+                          live: bool| {
+            match latest.get(&id) {
+                Some((existing, _)) if *existing >= lsn => {}
+                _ => {
+                    latest.insert(id, (lsn, live));
+                }
+            }
+        };
+
+        for (mk, entry) in self.node_entries() {
+            let MemKey::Node { id } = mk else {
+                continue;
+            };
+            let live = !matches!(entry.op, MemOp::Tombstone);
+            update(&mut latest, *id, entry.lsn, live);
+        }
+
+        for idx in self.manifest.index.node_descriptors() {
+            let desc = &self.manifest.manifest.ssts[idx];
+            let sst_label_def = self.label_def_for_node_sst(desc);
+            let body = self.get_sst_body(desc).await?;
+            let reader = NodeSstReader::open(sst_label_def, body)?;
+            for batch in reader.scan_with_predicates_and_projection(&[], Some(&[]))? {
+                crate::cancel::check()?;
+                let id_col = batch
+                    .column_by_name(COL_NODE_ID)
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                    .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                let tomb_col = batch
+                    .column_by_name(COL_TOMBSTONE)
+                    .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+                    .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+                let lsn_col = batch
+                    .column_by_name(COL_LSN)
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| Error::invariant("lsn column missing"))?;
+                for row in 0..batch.num_rows() {
+                    let id_bytes: [u8; 16] = id_col
+                        .value(row)
+                        .try_into()
+                        .map_err(|_| Error::invariant("node_id row length != 16"))?;
+                    let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                    update(&mut latest, id, lsn_col.value(row), !tomb_col.value(row));
+                }
+            }
+        }
+
+        Ok(latest
+            .into_iter()
+            .filter_map(|(id, (_, live))| live.then_some(id))
             .collect())
     }
 
