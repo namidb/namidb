@@ -1367,9 +1367,10 @@ async fn apply_set(
                     let mut core_props = {
                         let snap = writer.overlay_snapshot();
                         let current = match n.labels.iter().next() {
-                            Some(label) => {
-                                snap.lookup_node(label, n.id).await.map_err(ExecError::Storage)?
-                            }
+                            Some(label) => snap
+                                .lookup_node(label, n.id)
+                                .await
+                                .map_err(ExecError::Storage)?,
                             None => None,
                         };
                         match current {

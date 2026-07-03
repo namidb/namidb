@@ -133,11 +133,7 @@ pub fn parse_query(query: &str) -> TextQuery {
 }
 
 /// Split one unquoted span into plain terms and trailing-`*` prefixes.
-fn parse_unquoted_span(
-    span: &str,
-    terms: &mut BTreeSet<String>,
-    prefixes: &mut BTreeSet<String>,
-) {
+fn parse_unquoted_span(span: &str, terms: &mut BTreeSet<String>, prefixes: &mut BTreeSet<String>) {
     let mut flush = |run: &mut String, starred: bool| {
         if run.is_empty() {
             return;

@@ -1384,12 +1384,8 @@ impl<'mt> Snapshot<'mt> {
             let body = self.get_sst_body(desc).await?;
             parse_node_sst_metadata(&body)?
         } else {
-            load_node_sst_metadata_async(
-                self.store.clone(),
-                Path::from(absolute),
-                desc.size_bytes,
-            )
-            .await?
+            load_node_sst_metadata_async(self.store.clone(), Path::from(absolute), desc.size_bytes)
+                .await?
         };
         if let Some(cache) = &self.cache {
             cache.insert_metadata(absolute.to_string(), md.clone());
@@ -1813,17 +1809,15 @@ impl<'mt> Snapshot<'mt> {
     pub async fn scan_all_node_ids(&self) -> Result<Vec<NodeId>> {
         // (node_id) → (winning lsn, live?). Highest LSN wins per id.
         let mut latest: BTreeMap<NodeId, (u64, bool)> = BTreeMap::new();
-        let update = |latest: &mut BTreeMap<NodeId, (u64, bool)>,
-                          id: NodeId,
-                          lsn: u64,
-                          live: bool| {
-            match latest.get(&id) {
-                Some((existing, _)) if *existing >= lsn => {}
-                _ => {
-                    latest.insert(id, (lsn, live));
+        let update =
+            |latest: &mut BTreeMap<NodeId, (u64, bool)>, id: NodeId, lsn: u64, live: bool| {
+                match latest.get(&id) {
+                    Some((existing, _)) if *existing >= lsn => {}
+                    _ => {
+                        latest.insert(id, (lsn, live));
+                    }
                 }
-            }
-        };
+            };
 
         for (mk, entry) in self.node_entries() {
             let MemKey::Node { id } = mk else {
@@ -2746,7 +2740,6 @@ impl<'mt> Snapshot<'mt> {
         query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
-
         // Authoritative only if a TextIndex SST exists for this index...
         let has_index_sst = self
             .manifest
@@ -6004,8 +5997,7 @@ mod tests {
         let mut max_weight = 0usize;
         for rg in 0..md.num_row_groups() {
             let batches = Arc::new(reader.scan_row_groups(vec![rg]).unwrap());
-            let w =
-                crate::cache::decoded_node_row_group_weight(&(absolute.clone(), rg), &batches);
+            let w = crate::cache::decoded_node_row_group_weight(&(absolute.clone(), rg), &batches);
             total_weight += w;
             max_weight = max_weight.max(w);
         }
@@ -6201,17 +6193,20 @@ mod tests {
         let relative = "sst/L0/fabricated.idx_code.bin".to_string();
         let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), relative);
         store
-            .put(&object_store::path::Path::from(absolute), body.clone().into())
+            .put(
+                &object_store::path::Path::from(absolute),
+                body.clone().into(),
+            )
             .await
             .unwrap();
-        committed.manifest.ssts[account_sst].unique_property_indices.push(
-            crate::manifest::UniquePropertyIndexDescriptor {
+        committed.manifest.ssts[account_sst]
+            .unique_property_indices
+            .push(crate::manifest::UniquePropertyIndexDescriptor {
                 property: "code".into(),
                 path: relative,
                 size_bytes: body.len() as u64,
                 entry_count: 2,
-            },
-        );
+            });
 
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
@@ -6369,14 +6364,14 @@ mod tests {
                     })
             })
             .expect("Widget SST present");
-        committed.manifest.ssts[widget_sst].equality_property_indices.push(
-            crate::manifest::EqualityIndexDescriptor {
+        committed.manifest.ssts[widget_sst]
+            .equality_property_indices
+            .push(crate::manifest::EqualityIndexDescriptor {
                 property: "city".into(),
                 path: "sst/L0/does-not-exist.eqidx_city.bin".into(),
                 size_bytes: 1,
                 distinct_values: 1,
-            },
-        );
+            });
 
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();

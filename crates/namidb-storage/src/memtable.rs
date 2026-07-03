@@ -324,7 +324,10 @@ mod tests {
         }
         let a = mt.snapshot_view();
         let b = mt.snapshot_view();
-        assert!(a.inner.ptr_eq(&b.inner), "no-write views must share the root");
+        assert!(
+            a.inner.ptr_eq(&b.inner),
+            "no-write views must share the root"
+        );
 
         mt.apply(MemKey::Node { id: nid(255) }, 1000, MemOp::Tombstone);
         assert_eq!(a.len(), 500, "published view unaffected by later writes");
@@ -447,7 +450,11 @@ mod tests {
         assert_eq!(mt.len(), 0, "freeze drains the live memtable");
         mt.restore(frozen);
         assert_eq!(mt.len(), 4, "restore reinstates every frozen row");
-        assert_eq!(mt.bytes_estimate(), bytes_before, "byte accounting restored");
+        assert_eq!(
+            mt.bytes_estimate(),
+            bytes_before,
+            "byte accounting restored"
+        );
         for i in 0..4 {
             assert!(mt.get(&MemKey::Node { id: nid(i) }).is_some());
         }
@@ -464,7 +471,11 @@ mod tests {
         mt.apply(key.clone(), 5, MemOp::Upsert(Bytes::from_static(b"frozen")));
         let frozen = mt.freeze();
         // Live memtable advanced this key to a newer LSN post-freeze.
-        mt.apply(key.clone(), 9, MemOp::Upsert(Bytes::from_static(b"live-newer")));
+        mt.apply(
+            key.clone(),
+            9,
+            MemOp::Upsert(Bytes::from_static(b"live-newer")),
+        );
         mt.restore(frozen);
         let e = mt.get(&key).unwrap();
         assert_eq!(e.lsn, 9, "live newer LSN wins");
@@ -473,9 +484,17 @@ mod tests {
         // Reverse: frozen entry is newer than the live one → frozen wins.
         let key2 = MemKey::Node { id: nid(2) };
         let mut mt2 = Memtable::new();
-        mt2.apply(key2.clone(), 20, MemOp::Upsert(Bytes::from_static(b"frozen-new")));
+        mt2.apply(
+            key2.clone(),
+            20,
+            MemOp::Upsert(Bytes::from_static(b"frozen-new")),
+        );
         let frozen2 = mt2.freeze();
-        mt2.apply(key2.clone(), 3, MemOp::Upsert(Bytes::from_static(b"live-old")));
+        mt2.apply(
+            key2.clone(),
+            3,
+            MemOp::Upsert(Bytes::from_static(b"live-old")),
+        );
         mt2.restore(frozen2);
         assert_eq!(mt2.get(&key2).unwrap().lsn, 20, "frozen newer LSN wins");
     }

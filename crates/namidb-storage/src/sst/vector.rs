@@ -665,7 +665,9 @@ mod tests {
         // (plain-cosine navigation) rather than being rejected, so existing
         // indexes keep serving until compaction rebuilds them.
         let d = desc("legacy", VectorMetric::Dot, 8);
-        let (bytes, _) = build_body(&d, clustered_members(40, 8, 3)).unwrap().unwrap();
+        let (bytes, _) = build_body(&d, clustered_members(40, 8, 3))
+            .unwrap()
+            .unwrap();
         // Rewrite the body's metric tag to the legacy name.
         let mut body: VectorGraphBody = bincode::deserialize(&bytes[MAGIC.len()..]).unwrap();
         body.metric = "dot".to_string();
@@ -673,7 +675,9 @@ mod tests {
         legacy.extend_from_slice(&bincode::serialize(&body).unwrap());
         let idx = VectorGraphIndex::decode(&legacy).unwrap();
         assert_eq!(idx.metric(), "dot");
-        assert!(!idx.search(&clustered_members(1, 8, 3)[0].1, 3, 16).is_empty());
+        assert!(!idx
+            .search(&clustered_members(1, 8, 3)[0].1, 3, 16)
+            .is_empty());
     }
 
     #[test]

@@ -387,7 +387,12 @@ fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) ->
     Ok(Value::Map(out))
 }
 
-fn decode_struct_body(buf: &mut &[u8], fields: usize, max_len: usize, depth: usize) -> Result<Value> {
+fn decode_struct_body(
+    buf: &mut &[u8],
+    fields: usize,
+    max_len: usize,
+    depth: usize,
+) -> Result<Value> {
     let tag = read_u8(buf, "Struct tag")?;
     bound_check("Struct", fields, max_len)?;
     let mut out = Vec::with_capacity(fields);

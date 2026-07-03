@@ -523,8 +523,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     // Bounded top-k when a finite LIMIT keeps fewer rows than the
                     // input has: O(n log k) heap instead of a full O(n log n)
                     // sort of every row (identical result — same stable order).
-                    let bound = (skip as usize)
-                        .saturating_add(if limit == u64::MAX { usize::MAX } else { limit as usize });
+                    let bound = (skip as usize).saturating_add(if limit == u64::MAX {
+                        usize::MAX
+                    } else {
+                        limit as usize
+                    });
                     if bound != usize::MAX && bound < rows.len() {
                         rows = bounded_topk(rows, keys, params, bound)?;
                     } else {
@@ -1120,9 +1123,7 @@ pub(crate) async fn execute_expand(
             // (the label check for hops ≥1 lives in the traversal, which hop 0
             // skips).
             let source_has_target_labels = match row.get(source) {
-                Some(RuntimeValue::Node(n)) => {
-                    target_labels.iter().all(|l| n.labels.contains(l))
-                }
+                Some(RuntimeValue::Node(n)) => target_labels.iter().all(|l| n.labels.contains(l)),
                 _ => target_labels.is_empty(),
             };
             let zero_keeps = source_has_target_labels
@@ -1871,8 +1872,7 @@ async fn bm25_ranked(
     k: Option<usize>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
     use crate::exec::text_scoring::{
-        bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize,
-        PREFIX_EXPANSION_LIMIT,
+        bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize, PREFIX_EXPANSION_LIMIT,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::ops::Bound;
@@ -3630,9 +3630,9 @@ async fn try_index_search(
     const OVERFETCH_BASE: usize = 8;
     const WIDEN_GROWTH: usize = 4;
     const MAX_WIDEN_ROUNDS: usize = 4; // mult = 8, 32, 128, 512
-    // int8 hits are rescored with the exact f32 metric before truncation, so
-    // fetch a wider pool than k even without a filter: membership then depends
-    // on true scores, confining the quantization error to beam recall.
+                                       // int8 hits are rescored with the exact f32 metric before truncation, so
+                                       // fetch a wider pool than k even without a filter: membership then depends
+                                       // on true scores, confining the quantization error to beam recall.
     const INT8_RESCORE_POOL: usize = 4;
     let widen = post_filter.is_some();
     let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
@@ -3693,10 +3693,7 @@ async fn try_index_search(
             }
             exact
         } else {
-            raw_hits
-                .into_iter()
-                .map(|(id, s)| (id, s as f64))
-                .collect()
+            raw_hits.into_iter().map(|(id, s)| (id, s as f64)).collect()
         };
 
         // Merge: deduped index hits not superseded by the delta, plus the
@@ -4246,7 +4243,14 @@ fn fingerprint_into(out: &mut String, v: &RuntimeValue) {
             let _ = write!(out, "N{};", n.id);
         }
         RuntimeValue::Rel(r) => {
-            let _ = write!(out, "R{}:{}{}>{};", r.edge_type.len(), r.edge_type, r.src, r.dst);
+            let _ = write!(
+                out,
+                "R{}:{}{}>{};",
+                r.edge_type.len(),
+                r.edge_type,
+                r.src,
+                r.dst
+            );
         }
         RuntimeValue::Date(d) => {
             let _ = write!(out, "D{d};");
@@ -5231,8 +5235,9 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 for et in edge_types {
                     total += snapshot.count_edge_type(et).await? as i64;
                 }
-                Ok(FactorRowSet::from_flat(vec![Row::new()
-                    .with(output.clone(), RuntimeValue::Integer(total))]))
+                Ok(FactorRowSet::from_flat(vec![
+                    Row::new().with(output.clone(), RuntimeValue::Integer(total))
+                ]))
             }
 
             LogicalPlan::MultiwayJoin {
@@ -5360,13 +5365,10 @@ async fn execute_expand_factor(
             }
             // Hop 0 binds the source as the far end, so it must carry every
             // target label (mirrors the flat-path zero-hop fix).
-            let source_has_target_labels =
-                match arena.lookup_binding(parent_leaf, source) {
-                    Some(RuntimeValue::Node(n)) => {
-                        target_labels.iter().all(|l| n.labels.contains(l))
-                    }
-                    _ => target_labels.is_empty(),
-                };
+            let source_has_target_labels = match arena.lookup_binding(parent_leaf, source) {
+                Some(RuntimeValue::Node(n)) => target_labels.iter().all(|l| n.labels.contains(l)),
+                _ => target_labels.is_empty(),
+            };
             if !back_reference {
                 if let Some(RuntimeValue::Node(n)) = arena.lookup_binding(parent_leaf, source) {
                     slots.push(Slot {
@@ -5396,8 +5398,7 @@ async fn execute_expand_factor(
         // edge identities `(edge_type, src, dst)`, for Cypher relationship
         // uniqueness (trail semantics). Only populated for multi-hop
         // expansions; empty on the single-hop path where reuse is impossible.
-        let mut frontier: Vec<FactorFrontierEntry> =
-            vec![(parent_leaf, starting, Vec::new())];
+        let mut frontier: Vec<FactorFrontierEntry> = vec![(parent_leaf, starting, Vec::new())];
 
         for hop in 1..=max {
             let mut next_frontier: Vec<FactorFrontierEntry> = Vec::new();
@@ -6481,7 +6482,10 @@ mod tests {
         let v1 = RuntimeValue::Vector(vec![1.0, 2.0]);
         let v2 = RuntimeValue::Vector(vec![3.0, 4.0]);
         assert_ne!(fingerprint_value(&v1), fingerprint_value(&v2));
-        assert_eq!(fingerprint_value(&v1), fingerprint_value(&RuntimeValue::Vector(vec![1.0, 2.0])));
+        assert_eq!(
+            fingerprint_value(&v1),
+            fingerprint_value(&RuntimeValue::Vector(vec![1.0, 2.0]))
+        );
 
         // Distinct same-length byte strings (e.g. two 2-byte hashes).
         let b1 = RuntimeValue::Bytes(vec![0x01, 0x02]);

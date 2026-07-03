@@ -220,7 +220,10 @@ fn any_bucket_plans(ssts: &[SstDescriptor], base_bytes: u64, ratio: u64) -> bool
     let mut buckets: std::collections::HashMap<(SstKind, &str), Vec<&SstDescriptor>> =
         std::collections::HashMap::new();
     for d in ssts {
-        if matches!(d.kind, SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv) {
+        if matches!(
+            d.kind,
+            SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv
+        ) {
             buckets
                 .entry((d.kind, d.scope.as_str()))
                 .or_default()
@@ -3144,9 +3147,8 @@ mod tests {
 
         // The prepared bodies are durable at their UUID paths but referenced
         // by no manifest version.
-        let object_path = |rel: &str| {
-            Path::from(format!("{}/{}", p.namespace_prefix().as_ref(), rel))
-        };
+        let object_path =
+            |rel: &str| Path::from(format!("{}/{}", p.namespace_prefix().as_ref(), rel));
         let prepared_paths: Vec<String> =
             prepared.new_descs.iter().map(|d| d.path.clone()).collect();
         assert!(!prepared_paths.is_empty());

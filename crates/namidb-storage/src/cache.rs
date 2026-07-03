@@ -219,10 +219,7 @@ impl std::fmt::Debug for SstCache {
                 "meta_inserts",
                 &self.stats.meta_inserts.load(Ordering::Relaxed),
             )
-            .field(
-                "node_rg_usage_bytes",
-                &self.decoded_node_row_groups.usage(),
-            )
+            .field("node_rg_usage_bytes", &self.decoded_node_row_groups.usage())
             .field(
                 "node_rg_hits",
                 &self.stats.node_rg_hits.load(Ordering::Relaxed),
@@ -374,7 +371,8 @@ impl SstCache {
         batches: Arc<Vec<RecordBatch>>,
     ) {
         self.stats.node_rg_inserts.fetch_add(1, Ordering::Relaxed);
-        self.decoded_node_row_groups.insert((key, row_group), batches);
+        self.decoded_node_row_groups
+            .insert((key, row_group), batches);
     }
 
     /// Bytes held by the decoded node row-group tier (sum of entry weights).
@@ -516,7 +514,14 @@ impl SstCache {
         }
         #[cfg(feature = "vector-index")]
         {
-            n += count(self.vector_indexes.lock().unwrap().keys().cloned().collect());
+            n += count(
+                self.vector_indexes
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect(),
+            );
         }
         n
     }
@@ -599,10 +604,12 @@ mod tests {
     #[test]
     fn retain_paths_only_prunes_the_given_namespace() {
         let cache = SstCache::new(1 << 20);
-        let bundle = || Arc::new(EdgeStreamBundle {
-            overflow: None,
-            declared: Vec::new(),
-        });
+        let bundle = || {
+            Arc::new(EdgeStreamBundle {
+                overflow: None,
+                declared: Vec::new(),
+            })
+        };
         let a_live = "tenants/a/sst/level0/live.csr".to_string();
         let a_dead = "tenants/a/sst/level0/dead.csr".to_string();
         let b_entry = "tenants/b/sst/level0/other.csr".to_string();
@@ -615,8 +622,14 @@ mod tests {
         let live: std::collections::HashSet<String> = [a_live.clone()].into();
         cache.retain_paths("tenants/a", &live);
 
-        assert!(cache.get_edge_streams(&a_live).is_some(), "a's live entry kept");
-        assert!(cache.get_edge_streams(&a_dead).is_none(), "a's dead entry pruned");
+        assert!(
+            cache.get_edge_streams(&a_live).is_some(),
+            "a's live entry kept"
+        );
+        assert!(
+            cache.get_edge_streams(&a_dead).is_none(),
+            "a's dead entry pruned"
+        );
         assert!(
             cache.get_edge_streams(&b_entry).is_some(),
             "sibling namespace's entry must survive a's retain"
@@ -643,10 +656,12 @@ mod tests {
     #[test]
     fn prune_namespace_drops_all_side_entries_for_that_namespace() {
         let cache = SstCache::new(1 << 20);
-        let bundle = || Arc::new(EdgeStreamBundle {
-            overflow: None,
-            declared: Vec::new(),
-        });
+        let bundle = || {
+            Arc::new(EdgeStreamBundle {
+                overflow: None,
+                declared: Vec::new(),
+            })
+        };
         cache.insert_edge_streams("tenants/gone/sst/level0/a.csr".into(), bundle());
         cache.insert_edge_streams("tenants/gone/sst/level0/b.csr".into(), bundle());
         cache.insert_edge_streams("tenants/kept/sst/level0/c.csr".into(), bundle());

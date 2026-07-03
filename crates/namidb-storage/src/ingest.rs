@@ -374,7 +374,10 @@ impl WriterSession {
         exclude: Option<NodeId>,
     ) -> Result<crate::unique_index::UniqueProbe> {
         use crate::unique_index::{encode_probe_key, UniqueProbe};
-        debug_assert!(!props.is_empty(), "unique_probe needs at least one property");
+        debug_assert!(
+            !props.is_empty(),
+            "unique_probe needs at least one property"
+        );
         // Canonical constraint identity: property names sorted, values aligned.
         let mut sorted: Vec<(&str, &Value)> = props.to_vec();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -726,7 +729,8 @@ impl WriterSession {
             .iter()
             .filter_map(|&lid| self.label_dict.name(namidb_core::LabelId::new(lid)))
             .collect();
-        self.unique_index.apply_upsert(id, &names, &record.properties);
+        self.unique_index
+            .apply_upsert(id, &names, &record.properties);
         Ok(lsn)
     }
 
@@ -1963,9 +1967,15 @@ mod tests {
         expected.sort();
         expected.dedup();
 
-        assert_eq!(fast, expected, "one-pass ids must equal the per-label union");
+        assert_eq!(
+            fast, expected,
+            "one-pass ids must equal the per-label union"
+        );
         assert!(!fast.contains(&sorted_node_id(2)), "tombstone dropped");
-        assert!(fast.contains(&sorted_node_id(7)), "memtable-only id present");
+        assert!(
+            fast.contains(&sorted_node_id(7)),
+            "memtable-only id present"
+        );
         assert_eq!(fast.len(), 6);
     }
 
@@ -2198,14 +2208,26 @@ mod tests {
         // Two flushes → two L0 Nodes SSTs; the authoritative L0→L1 compaction
         // then materializes the `.vg` body for the registered descriptor.
         session
-            .upsert_node("Doc", sorted_node_id(1), &emb_record(vec![1.0, 0.0, 0.0, 0.0]))
+            .upsert_node(
+                "Doc",
+                sorted_node_id(1),
+                &emb_record(vec![1.0, 0.0, 0.0, 0.0]),
+            )
             .unwrap();
         session
-            .upsert_node("Doc", sorted_node_id(2), &emb_record(vec![0.0, 1.0, 0.0, 0.0]))
+            .upsert_node(
+                "Doc",
+                sorted_node_id(2),
+                &emb_record(vec![0.0, 1.0, 0.0, 0.0]),
+            )
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session
-            .upsert_node("Doc", sorted_node_id(3), &emb_record(vec![0.0, 0.0, 1.0, 0.0]))
+            .upsert_node(
+                "Doc",
+                sorted_node_id(3),
+                &emb_record(vec![0.0, 0.0, 1.0, 0.0]),
+            )
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session.compact_l0(&doc_schema).await.unwrap();
@@ -2273,7 +2295,10 @@ mod tests {
             .await
             .unwrap();
         // Dropping it again after a drop errors without IF EXISTS.
-        session.drop_vector_index("doc_emb_v2", false).await.unwrap();
+        session
+            .drop_vector_index("doc_emb_v2", false)
+            .await
+            .unwrap();
         let err = session
             .drop_vector_index("doc_emb_v2", false)
             .await
@@ -2376,9 +2401,9 @@ mod tests {
                 &crate::text::TextQuery::from_terms(&["fox".to_string()]),
                 None,
             )
-                .await
-                .unwrap()
-                .is_none(),
+            .await
+            .unwrap()
+            .is_none(),
             "a dropped index must not serve"
         );
         assert_eq!(snap.scan_label("Note").await.unwrap().len(), 2);
@@ -3715,11 +3740,7 @@ mod tests {
             .unwrap();
         session.flush(schema()).await.unwrap();
 
-        let prepared = session
-            .compaction_basis()
-            .prepare(&schema())
-            .await
-            .unwrap();
+        let prepared = session.compaction_basis().prepare(&schema()).await.unwrap();
         let first = session
             .install_prepared_compaction(prepared.clone())
             .await
@@ -4355,40 +4376,61 @@ mod tests {
 
         let seven = Value::I64(7);
         assert_eq!(
-            s.unique_probe("Account", &[("code", &seven)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
             UniqueProbe::Conflict(x)
         );
-        assert_eq!(s.unique_index().populate_scans(), 1, "first probe scans once");
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            1,
+            "first probe scans once"
+        );
         // A node may keep / rewrite its own value.
         assert_eq!(
-            s.unique_probe("Account", &[("code", &seven)], Some(x)).await.unwrap(),
+            s.unique_probe("Account", &[("code", &seven)], Some(x))
+                .await
+                .unwrap(),
             UniqueProbe::NoConflict
         );
-        assert_eq!(s.unique_index().populate_scans(), 1, "warm probes do not rescan");
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            1,
+            "warm probes do not rescan"
+        );
 
         // Read-your-own-writes: a STAGED (uncommitted) node claims code=9…
         let y = sorted_node_id(2);
         let nine = Value::I64(9);
         s.upsert_node("Account", y, &int_record("code", 9)).unwrap();
         assert_eq!(
-            s.unique_probe("Account", &[("code", &nine)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &nine)], None)
+                .await
+                .unwrap(),
             UniqueProbe::Conflict(y)
         );
         // …a staged rewrite frees 9 and claims 10 in the same batch…
         let ten = Value::I64(10);
-        s.upsert_node("Account", y, &int_record("code", 10)).unwrap();
+        s.upsert_node("Account", y, &int_record("code", 10))
+            .unwrap();
         assert_eq!(
-            s.unique_probe("Account", &[("code", &nine)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &nine)], None)
+                .await
+                .unwrap(),
             UniqueProbe::NoConflict
         );
         assert_eq!(
-            s.unique_probe("Account", &[("code", &ten)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &ten)], None)
+                .await
+                .unwrap(),
             UniqueProbe::Conflict(y)
         );
         // …and a staged tombstone frees 10 too.
         s.tombstone_node("Account", y).unwrap();
         assert_eq!(
-            s.unique_probe("Account", &[("code", &ten)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &ten)], None)
+                .await
+                .unwrap(),
             UniqueProbe::NoConflict
         );
         assert_eq!(
@@ -4399,15 +4441,20 @@ mod tests {
 
         // Stage a claim on 11, then discard the batch: the index must forget
         // the staged state and answer from committed state after a rescan.
-        s.upsert_node("Account", y, &int_record("code", 11)).unwrap();
+        s.upsert_node("Account", y, &int_record("code", 11))
+            .unwrap();
         s.discard_batch();
         let eleven = Value::I64(11);
         assert_eq!(
-            s.unique_probe("Account", &[("code", &eleven)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &eleven)], None)
+                .await
+                .unwrap(),
             UniqueProbe::NoConflict
         );
         assert_eq!(
-            s.unique_probe("Account", &[("code", &seven)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
             UniqueProbe::Conflict(x)
         );
         assert_eq!(
@@ -4419,7 +4466,9 @@ mod tests {
         // Values without a canonical scalar encoding are not indexed.
         let list = Value::List(vec![Value::I64(1)]);
         assert_eq!(
-            s.unique_probe("Account", &[("code", &list)], None).await.unwrap(),
+            s.unique_probe("Account", &[("code", &list)], None)
+                .await
+                .unwrap(),
             UniqueProbe::Unindexable
         );
     }

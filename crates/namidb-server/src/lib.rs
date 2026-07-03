@@ -776,7 +776,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 // Reactive compaction (RFC-027 P5): prepare off-lock (input
                 // GETs, merge, index rebuilds, output PUTs), then re-lock
                 // only for the brief manifest CAS.
-                let Some((basis, schema)) = basis else { continue };
+                let Some((basis, schema)) = basis else {
+                    continue;
+                };
                 if !basis.needs_compaction() {
                     continue;
                 }
@@ -1748,7 +1750,9 @@ async fn apply_drop_fulltext_index(
     snapshot: &SnapshotCell,
     dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
 ) -> Result<u64, namidb_storage::Error> {
-    let version = writer.drop_text_index(&dfi.name.name, dfi.if_exists).await?;
+    let version = writer
+        .drop_text_index(&dfi.name.name, dfi.if_exists)
+        .await?;
     snapshot.store(writer.owned_snapshot());
     Ok(version)
 }
@@ -3249,7 +3253,10 @@ mod tests {
         let app = fixture(None).await;
 
         let create = "CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16";
-        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+        assert_eq!(
+            post_cypher(&app, None, create).await.status(),
+            StatusCode::OK
+        );
 
         // Drop succeeds with an empty response…
         let r = post_cypher(&app, None, "DROP VECTOR INDEX doc_emb").await;
@@ -3288,7 +3295,10 @@ mod tests {
         let app = fixture(None).await;
 
         let create = "CREATE FULLTEXT INDEX note_ft ON :Note(body, title)";
-        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+        assert_eq!(
+            post_cypher(&app, None, create).await.status(),
+            StatusCode::OK
+        );
 
         // Drop, then re-create over the freed (label, properties) slot.
         let r = post_cypher(&app, None, "DROP INDEX note_ft").await;
@@ -3325,7 +3335,10 @@ mod tests {
         let app = fixture(None).await;
 
         let create = "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) METRIC cosine DIMENSION 1536";
-        assert_eq!(post_cypher(&app, None, create).await.status(), StatusCode::OK);
+        assert_eq!(
+            post_cypher(&app, None, create).await.status(),
+            StatusCode::OK
+        );
 
         // A 768-dim embedding violates the (misconfigured) declared dimension.
         let vec768 = format!(
@@ -4447,10 +4460,8 @@ mod tests {
         );
 
         // Fence the registry-held writer for `acme` (flat layout: root "").
-        let paths = namidb_storage::NamespacePaths::new(
-            "",
-            namidb_core::NamespaceId::new("acme").unwrap(),
-        );
+        let paths =
+            namidb_storage::NamespacePaths::new("", namidb_core::NamespaceId::new("acme").unwrap());
         let interloper = WriterSession::open(store, paths).await.unwrap();
         drop(interloper);
 

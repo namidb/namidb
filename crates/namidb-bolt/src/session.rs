@@ -343,7 +343,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             // that stays just under the idle timeout could otherwise hold the
             // writer forever. Roll back and fail once the cap is exceeded.
             if in_tx {
-                let started = *self.tx_started.get_or_insert_with(tokio::time::Instant::now);
+                let started = *self
+                    .tx_started
+                    .get_or_insert_with(tokio::time::Instant::now);
                 if let Some(max) = self.max_tx_lifetime {
                     if started.elapsed() >= max {
                         let _ = self.backend.rollback_tx().await;

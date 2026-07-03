@@ -364,7 +364,10 @@ pub async fn sweep_orphans(
     // holder's own post-acquire root verification covers the (now much
     // smaller) residual window between this check and the deletes below.
     if delete && current_pin_floor(store.as_ref(), paths, now_unix).await? < horizon {
-        warn!(horizon, "retention pin arrived mid-sweep; skipping deletions this pass");
+        warn!(
+            horizon,
+            "retention pin arrived mid-sweep; skipping deletions this pass"
+        );
         report.aborted_by_pin = true;
         return Ok(report);
     }

@@ -32,8 +32,7 @@ use tokio::sync::Mutex;
 use namidb_graph::algo::{
     betweenness, degrees, label_propagation, louvain, pagerank, shortest_paths,
     strongly_connected_components, triangle_count, weakly_connected_components, Graph,
-    LouvainOptions, PageRankOptions,
-    LABEL_PROPAGATION_DEFAULT_ITERS,
+    LouvainOptions, PageRankOptions, LABEL_PROPAGATION_DEFAULT_ITERS,
 };
 use namidb_markdown::Embedder;
 use namidb_query::exec::{NodeValue, RelValue};
@@ -1085,9 +1084,9 @@ impl Server {
                 let mut ranked: Vec<(String, f64)> = id_meta
                     .keys()
                     .filter_map(|id| {
-                        namidb_core::NodeId::from_str(id).ok().map(|nid| {
-                            (id.clone(), bc.scores.get(&nid).copied().unwrap_or(0.0))
-                        })
+                        namidb_core::NodeId::from_str(id)
+                            .ok()
+                            .map(|nid| (id.clone(), bc.scores.get(&nid).copied().unwrap_or(0.0)))
                     })
                     .collect();
                 // Score desc, node id asc for a deterministic tie-break.

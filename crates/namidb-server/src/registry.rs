@@ -297,7 +297,9 @@ impl NamespaceRegistry {
                     };
                     // Reactive compaction: prepare off-lock, re-lock only
                     // for the brief manifest CAS.
-                    let Some((basis, schema)) = basis else { continue };
+                    let Some((basis, schema)) = basis else {
+                        continue;
+                    };
                     if !basis.needs_compaction() {
                         continue;
                     }
@@ -794,7 +796,10 @@ mod tests {
             ("adjacency", adj_cache.namespace_entries(kept_ns)),
             ("sst side-map", sst_cache.namespace_side_entries(kept_ns)),
         ] {
-            assert_eq!(count, 1, "{what} entries of a sibling namespace were evicted");
+            assert_eq!(
+                count, 1,
+                "{what} entries of a sibling namespace were evicted"
+            );
         }
     }
 }

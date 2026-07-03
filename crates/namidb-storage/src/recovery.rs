@@ -730,7 +730,9 @@ mod tests {
                 MemOp::Upsert(Bytes::from_static(b"resurrected")),
             )],
         );
-        write_memtable_snapshot(&store, &paths, &snap).await.unwrap();
+        write_memtable_snapshot(&store, &paths, &snap)
+            .await
+            .unwrap();
 
         // Manifest with a flushed Nodes SST at max_lsn=20 (> snapshot's 10) and
         // no WAL segments (the flush cleared them).

@@ -2224,7 +2224,9 @@ mod tests {
         }
         let mut state = 0x2545F4914F6CDD1Du64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
         for _ in 0..400 {
@@ -2256,7 +2258,11 @@ mod tests {
             );
             expected_total += t;
         }
-        assert_eq!(fast.total, expected_total / 3, "total triangle count diverges");
+        assert_eq!(
+            fast.total,
+            expected_total / 3,
+            "total triangle count diverges"
+        );
         assert!(fast.total > 0, "fixture should actually contain triangles");
     }
 
@@ -2282,8 +2288,14 @@ mod tests {
         let comm1 = res.assignment[&c1[0]];
         let comm2 = res.assignment[&c2[0]];
         assert_ne!(comm1, comm2);
-        assert!(c1.iter().all(|n| res.assignment[n] == comm1), "clique 1 intact");
-        assert!(c2.iter().all(|n| res.assignment[n] == comm2), "clique 2 intact");
+        assert!(
+            c1.iter().all(|n| res.assignment[n] == comm1),
+            "clique 1 intact"
+        );
+        assert!(
+            c2.iter().all(|n| res.assignment[n] == comm2),
+            "clique 2 intact"
+        );
         assert!(
             res.modularity > 0.3,
             "bridged cliques have high modularity, got {}",

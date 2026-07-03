@@ -1380,8 +1380,8 @@ impl ManifestStore {
             // descriptor without a hash (pre-hash manifest) is unverifiable —
             // refuse, so the repair deletes the orphan instead (discarding
             // only a never-acked commit).
-            let content_verified = declared_xxh3
-                .is_some_and(|h| xxhash_rust::xxh3::xxh3_64(&bytes) == h);
+            let content_verified =
+                declared_xxh3.is_some_and(|h| xxhash_rust::xxh3::xxh3_64(&bytes) == h);
             return Ok(match WalSegment::decode(seq, bytes) {
                 Ok(segment) => {
                     !segment.is_empty()

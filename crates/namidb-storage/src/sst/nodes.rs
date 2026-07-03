@@ -972,11 +972,15 @@ pub async fn scan_row_groups_async(
     row_groups: Vec<usize>,
     cached_metadata: Option<Arc<ParquetMetaData>>,
 ) -> Result<Vec<RecordBatch>> {
-    let (batches, _md) =
-        ranged_scan_selected_row_groups(store, path, file_size, label, cached_metadata, move |_| {
-            Ok(row_groups)
-        })
-        .await?;
+    let (batches, _md) = ranged_scan_selected_row_groups(
+        store,
+        path,
+        file_size,
+        label,
+        cached_metadata,
+        move |_| Ok(row_groups),
+    )
+    .await?;
     Ok(batches)
 }
 

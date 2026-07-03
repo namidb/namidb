@@ -583,22 +583,33 @@ async fn two_sets_to_same_node_via_different_aliases_both_persist() {
     let mut params = Params::new();
     params.insert("nid".into(), RuntimeValue::String(nid.to_string()));
     let q0 = parse("CREATE (n:P {_id: $nid, k: 1}) RETURN n").unwrap();
-    execute_write(&lower(&q0).unwrap(), &mut writer, &params).await.unwrap();
+    execute_write(&lower(&q0).unwrap(), &mut writer, &params)
+        .await
+        .unwrap();
     writer.commit_batch().await.unwrap();
 
-    let q = parse(
-        "MATCH (a:P {k:1}) MATCH (b:P {k:1}) SET a.c = 1 SET b.d = 2 RETURN a",
-    )
-    .unwrap();
+    let q = parse("MATCH (a:P {k:1}) MATCH (b:P {k:1}) SET a.c = 1 SET b.d = 2 RETURN a").unwrap();
     execute_write(&lower(&q).unwrap(), &mut writer, &Params::new())
         .await
         .unwrap();
     writer.commit_batch().await.unwrap();
 
     let snap = writer.snapshot();
-    let stored = snap.lookup_node("P", nid).await.unwrap().expect("P present");
-    assert_eq!(stored.properties.get("c"), Some(&CoreValue::I64(1)), "c must survive");
-    assert_eq!(stored.properties.get("d"), Some(&CoreValue::I64(2)), "d must survive");
+    let stored = snap
+        .lookup_node("P", nid)
+        .await
+        .unwrap()
+        .expect("P present");
+    assert_eq!(
+        stored.properties.get("c"),
+        Some(&CoreValue::I64(1)),
+        "c must survive"
+    );
+    assert_eq!(
+        stored.properties.get("d"),
+        Some(&CoreValue::I64(2)),
+        "d must survive"
+    );
 }
 
 #[tokio::test]
@@ -622,7 +633,9 @@ async fn create_with_colliding_explicit_id_errors() {
     // Second CREATE with the same _id must be rejected as a constraint error.
     let q2 = parse("CREATE (n:Foo {_id: $nid, name: 'second'}) RETURN n").unwrap();
     let plan2 = lower(&q2).unwrap();
-    let err = execute_write(&plan2, &mut writer, &params).await.unwrap_err();
+    let err = execute_write(&plan2, &mut writer, &params)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, namidb_query::ExecError::Constraint(_)),
         "expected a constraint error on id collision, got: {err:?}"
@@ -631,7 +644,11 @@ async fn create_with_colliding_explicit_id_errors() {
     // The original node must be untouched (name still 'first').
     writer.discard_batch();
     let snap = writer.snapshot();
-    let stored = snap.lookup_node("Foo", nid).await.unwrap().expect("Foo present");
+    let stored = snap
+        .lookup_node("Foo", nid)
+        .await
+        .unwrap()
+        .expect("Foo present");
     assert_eq!(
         stored.properties.get("name"),
         Some(&CoreValue::Str("first".into())),
@@ -1893,15 +1910,15 @@ async fn set_can_reuse_unique_value_freed_earlier_in_same_batch() {
     writer.flush(int_unique_schema()).await.unwrap();
 
     // Statement 1 (staged, uncommitted): account 1 → 3, freeing value 1.
-    let plan = lower(&parse("MATCH (a:Account {account_no: 1}) SET a.account_no = 3").unwrap())
-        .unwrap();
+    let plan =
+        lower(&parse("MATCH (a:Account {account_no: 1}) SET a.account_no = 3").unwrap()).unwrap();
     execute_write_staged(&plan, &mut writer, &Params::new())
         .await
         .unwrap();
     // Statement 2 (same batch): account 2 → 1 must be allowed, because the
     // staged statement above freed the value.
-    let plan = lower(&parse("MATCH (a:Account {account_no: 2}) SET a.account_no = 1").unwrap())
-        .unwrap();
+    let plan =
+        lower(&parse("MATCH (a:Account {account_no: 2}) SET a.account_no = 1").unwrap()).unwrap();
     execute_write_staged(&plan, &mut writer, &Params::new())
         .await
         .expect("value freed earlier in the batch must be reusable");
@@ -1922,8 +1939,8 @@ async fn set_can_reuse_unique_value_freed_earlier_in_same_batch() {
     assert_eq!(values, vec![1, 3]);
 
     // Negative control: moving onto a value that is STILL held is rejected.
-    let plan = lower(&parse("MATCH (a:Account {account_no: 3}) SET a.account_no = 1").unwrap())
-        .unwrap();
+    let plan =
+        lower(&parse("MATCH (a:Account {account_no: 3}) SET a.account_no = 1").unwrap()).unwrap();
     let err = execute_write(&plan, &mut writer, &Params::new())
         .await
         .expect_err("value still held by another node must be rejected");

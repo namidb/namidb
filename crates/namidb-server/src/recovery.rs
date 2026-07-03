@@ -44,7 +44,10 @@ impl WriterHealth {
 
     /// The failure keeping the writer degraded, or `None` when healthy.
     pub fn degraded_reason(&self) -> Option<String> {
-        self.degraded.lock().expect("writer health poisoned").clone()
+        self.degraded
+            .lock()
+            .expect("writer health poisoned")
+            .clone()
     }
 
     /// `"ok"` / `"degraded"` — the `writer` field of the health payload.

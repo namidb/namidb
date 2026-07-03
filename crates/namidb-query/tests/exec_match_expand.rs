@@ -283,16 +283,19 @@ async fn zero_hop_expand_enforces_target_labels() {
         .unwrap();
     let alice = NodeId::new();
     let rome = NodeId::new();
-    writer.upsert_node("Person", alice, &named("Alice")).unwrap();
+    writer
+        .upsert_node("Person", alice, &named("Alice"))
+        .unwrap();
     writer.upsert_node("City", rome, &named("Rome")).unwrap();
-    writer.upsert_edge("LIVES_IN", alice, rome, &edge()).unwrap();
+    writer
+        .upsert_edge("LIVES_IN", alice, rome, &edge())
+        .unwrap();
     writer.commit_batch().await.unwrap();
     let snapshot = writer.snapshot();
 
-    let q = parse(
-        "MATCH (a:Person)-[:LIVES_IN*0..1]->(x:City) RETURN x.name AS name ORDER BY name",
-    )
-    .unwrap();
+    let q =
+        parse("MATCH (a:Person)-[:LIVES_IN*0..1]->(x:City) RETURN x.name AS name ORDER BY name")
+            .unwrap();
     let plan = lower(&q).unwrap();
     let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
     let names: Vec<&str> = rows
@@ -303,7 +306,11 @@ async fn zero_hop_expand_enforces_target_labels() {
         })
         .collect();
     // Only Rome — Alice (Person, not City) must NOT be bound as the :City far end.
-    assert_eq!(names, vec!["Rome"], "zero-hop must honor the :City target label");
+    assert_eq!(
+        names,
+        vec!["Rome"],
+        "zero-hop must honor the :City target label"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +332,11 @@ async fn undirected_self_loop_is_returned_once() {
     let q = parse("MATCH (a:Person)-[r:KNOWS]-(b) RETURN b.name AS name").unwrap();
     let plan = lower(&q).unwrap();
     let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
-    assert_eq!(rows.len(), 1, "self-loop must yield exactly one undirected row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "self-loop must yield exactly one undirected row"
+    );
 
     // count(*) over the undirected pattern must be 1, not 2.
     let qc = parse("MATCH (a:Person)-[r:KNOWS]-(b) RETURN count(*) AS c").unwrap();
@@ -350,7 +361,9 @@ async fn var_length_expand_does_not_reuse_a_relationship() {
     writer
         .upsert_node("Person", alice, &person("Alice", 30))
         .unwrap();
-    writer.upsert_node("Person", bob, &person("Bob", 25)).unwrap();
+    writer
+        .upsert_node("Person", bob, &person("Bob", 25))
+        .unwrap();
     writer.upsert_edge("KNOWS", alice, bob, &edge()).unwrap();
     writer.commit_batch().await.unwrap();
     let snapshot = writer.snapshot();
@@ -366,7 +379,8 @@ async fn var_length_expand_does_not_reuse_a_relationship() {
 
     // Sanity: single-hop expansion is unaffected — Alice and Bob are mutual
     // undirected neighbours at hop 1.
-    let q1 = parse("MATCH (a:Person)-[:KNOWS*1..1]-(x) RETURN x.name AS name ORDER BY name").unwrap();
+    let q1 =
+        parse("MATCH (a:Person)-[:KNOWS*1..1]-(x) RETURN x.name AS name ORDER BY name").unwrap();
     let plan1 = lower(&q1).unwrap();
     let rows1 = execute(&plan1, &snapshot, &Params::new()).await.unwrap();
     let names1: Vec<&str> = rows1
@@ -376,7 +390,11 @@ async fn var_length_expand_does_not_reuse_a_relationship() {
             other => panic!("unexpected: {other:?}"),
         })
         .collect();
-    assert_eq!(names1, vec!["Alice", "Bob"], "single-hop expand still works");
+    assert_eq!(
+        names1,
+        vec!["Alice", "Bob"],
+        "single-hop expand still works"
+    );
 }
 
 #[tokio::test]

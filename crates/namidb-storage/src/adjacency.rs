@@ -720,8 +720,14 @@ mod tests {
         };
         let (ka, adj_a) = build("tenants/a", 2);
         let (kb, adj_b) = build("tenants/b", 3);
-        cache.get_or_build(ka.clone(), || async { Ok(adj_a) }).await.unwrap();
-        cache.get_or_build(kb.clone(), || async { Ok(adj_b) }).await.unwrap();
+        cache
+            .get_or_build(ka.clone(), || async { Ok(adj_a) })
+            .await
+            .unwrap();
+        cache
+            .get_or_build(kb.clone(), || async { Ok(adj_b) })
+            .await
+            .unwrap();
 
         let got_a = cache.get(&ka).expect("a hit");
         let got_b = cache.get(&kb).expect("b hit");

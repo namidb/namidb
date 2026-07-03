@@ -89,7 +89,10 @@ pub(crate) fn encode_probe_key(values: &[&Value]) -> Option<UniqueKey> {
 /// property map. `None` when any property is absent or unindexable — such a
 /// node cannot equal an indexable probe tuple, so it is simply not filed.
 fn encode_node_key(names: &[String], props: &BTreeMap<String, Value>) -> Option<UniqueKey> {
-    names.iter().map(|n| props.get(n).and_then(key_part)).collect()
+    names
+        .iter()
+        .map(|n| props.get(n).and_then(key_part))
+        .collect()
 }
 
 /// One populated `(label, property-set)` constraint map.

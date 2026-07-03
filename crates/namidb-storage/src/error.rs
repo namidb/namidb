@@ -109,9 +109,6 @@ impl Error {
     /// cannot be classified from the error alone. Callers must consult
     /// `WriterSession::is_poisoned()` alongside this method.
     pub fn requires_writer_reopen(&self) -> bool {
-        matches!(
-            self,
-            Error::Fenced { .. } | Error::ManifestCommitCas { .. }
-        )
+        matches!(self, Error::Fenced { .. } | Error::ManifestCommitCas { .. })
     }
 }

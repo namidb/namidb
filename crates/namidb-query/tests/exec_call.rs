@@ -968,7 +968,12 @@ async fn call_degree_projection_direction_reverse_and_undirected() {
     .await;
     let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
         .iter()
-        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .map(|r| {
+            (
+                node_of(r),
+                (int_col(r, "in_degree"), int_col(r, "out_degree")),
+            )
+        })
         .collect();
     assert_eq!(by_node[people[0].as_bytes()], (0, 1));
     assert_eq!(by_node[people[2].as_bytes()], (1, 0));
@@ -984,7 +989,12 @@ async fn call_degree_projection_direction_reverse_and_undirected() {
     .await;
     let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
         .iter()
-        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .map(|r| {
+            (
+                node_of(r),
+                (int_col(r, "in_degree"), int_col(r, "out_degree")),
+            )
+        })
         .collect();
     assert_eq!(by_node[people[0].as_bytes()], (1, 0));
     assert_eq!(by_node[people[2].as_bytes()], (0, 1));
@@ -1000,7 +1010,12 @@ async fn call_degree_projection_direction_reverse_and_undirected() {
     .await;
     let by_node: BTreeMap<[u8; 16], (i64, i64)> = rows
         .iter()
-        .map(|r| (node_of(r), (int_col(r, "in_degree"), int_col(r, "out_degree"))))
+        .map(|r| {
+            (
+                node_of(r),
+                (int_col(r, "in_degree"), int_col(r, "out_degree")),
+            )
+        })
         .collect();
     assert_eq!(by_node[people[1].as_bytes()], (2, 2));
 }
@@ -1185,7 +1200,11 @@ async fn text_index_gate_is_label_scoped() {
                 labels: vec![note_id.0],
             };
             lsn += 1;
-            mt.apply(MemKey::Node { id }, lsn, MemOp::Upsert(rec.encode().unwrap()));
+            mt.apply(
+                MemKey::Node { id },
+                lsn,
+                MemOp::Upsert(rec.encode().unwrap()),
+            );
         }
         cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
             .await
@@ -1257,5 +1276,8 @@ async fn text_index_gate_is_label_scoped() {
          YIELD node, score RETURN node",
     )
     .await;
-    assert!(rows.is_empty(), "relabeled doc must not be served: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "relabeled doc must not be served: {rows:?}"
+    );
 }

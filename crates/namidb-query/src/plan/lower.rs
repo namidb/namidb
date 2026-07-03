@@ -1529,8 +1529,7 @@ fn lower_projection(
         })
         .collect();
 
-    let has_limit_or_skip =
-        skip_rc != RowCount::Const(0) || limit_rc != RowCount::Const(u64::MAX);
+    let has_limit_or_skip = skip_rc != RowCount::Const(0) || limit_rc != RowCount::Const(u64::MAX);
     let has_topn = !order_keys.is_empty() || has_limit_or_skip;
 
     if distinct && !has_aggs && has_limit_or_skip {

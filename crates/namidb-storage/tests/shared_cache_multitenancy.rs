@@ -172,8 +172,14 @@ async fn flush_retain_does_not_evict_sibling_namespace_entries() {
 async fn sst_cache_budget_is_global_across_namespaces() {
     // Roomy budget: both namespaces' entries coexist side by side.
     let roomy = SstCache::new(1 << 20);
-    roomy.insert("tenants/ns-a/sst/level0/a.parquet".into(), Bytes::from(vec![1u8; 1024]));
-    roomy.insert("tenants/ns-b/sst/level0/b.parquet".into(), Bytes::from(vec![2u8; 1024]));
+    roomy.insert(
+        "tenants/ns-a/sst/level0/a.parquet".into(),
+        Bytes::from(vec![1u8; 1024]),
+    );
+    roomy.insert(
+        "tenants/ns-b/sst/level0/b.parquet".into(),
+        Bytes::from(vec![2u8; 1024]),
+    );
     assert!(roomy.get("tenants/ns-a/sst/level0/a.parquet").is_some());
     assert!(roomy.get("tenants/ns-b/sst/level0/b.parquet").is_some());
 

@@ -25,7 +25,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::text::{avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT};
+use crate::text::{
+    avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT,
+};
 
 /// On-disk magic + format major version (`NAMI` `FT` `02`). Bumped on any
 /// incompatible layout change so a reader never silently misparses a file —
@@ -439,8 +441,7 @@ mod tests {
         let hits = idx.search_query(&parse_query("t*"), None);
         assert_eq!(hits.len(), PREFIX_EXPANSION_LIMIT);
         let got: HashSet<[u8; 16]> = hits.iter().map(|(i, _)| *i).collect();
-        let want: HashSet<[u8; 16]> =
-            (0..PREFIX_EXPANSION_LIMIT as u8).map(id).collect();
+        let want: HashSet<[u8; 16]> = (0..PREFIX_EXPANSION_LIMIT as u8).map(id).collect();
         assert_eq!(got, want, "expansion must pick the lexicographic head");
     }
 

@@ -280,9 +280,7 @@ impl NodeViewCache {
         for (key, seq) in victims {
             inner.order.remove(&(key.manifest_version, seq));
             if let Some((view, _)) = inner.map.remove(&key) {
-                inner.used_bytes = inner
-                    .used_bytes
-                    .saturating_sub(entry_weight(&key, &view));
+                inner.used_bytes = inner.used_bytes.saturating_sub(entry_weight(&key, &view));
             }
         }
     }
@@ -433,9 +431,18 @@ mod tests {
     #[test]
     fn prune_namespace_removes_only_that_namespace() {
         let c = NodeViewCache::new(1024 * 1024);
-        c.insert(NodeCacheKey::new("tenants/a", 2, "Person", nid(1)), Some(make_view("a1")));
-        c.insert(NodeCacheKey::new("tenants/a", 3, "Person", nid(2)), Some(make_view("a2")));
-        c.insert(NodeCacheKey::new("tenants/b", 2, "Person", nid(1)), Some(make_view("b1")));
+        c.insert(
+            NodeCacheKey::new("tenants/a", 2, "Person", nid(1)),
+            Some(make_view("a1")),
+        );
+        c.insert(
+            NodeCacheKey::new("tenants/a", 3, "Person", nid(2)),
+            Some(make_view("a2")),
+        );
+        c.insert(
+            NodeCacheKey::new("tenants/b", 2, "Person", nid(1)),
+            Some(make_view("b1")),
+        );
         assert_eq!(c.namespace_entries("tenants/a"), 2);
         assert_eq!(c.namespace_entries("tenants/b"), 1);
         let used_before = c.used_bytes();
@@ -455,7 +462,10 @@ mod tests {
         // The pruned entries' order slots are gone too: filling the cache
         // again must not underflow or double-free the byte accounting.
         for v in 1..=5u64 {
-            c.insert(NodeCacheKey::new("tenants/a", v, "Person", nid(3)), Some(make_view("x")));
+            c.insert(
+                NodeCacheKey::new("tenants/a", v, "Person", nid(3)),
+                Some(make_view("x")),
+            );
         }
         assert_eq!(c.namespace_entries("tenants/a"), 5);
     }

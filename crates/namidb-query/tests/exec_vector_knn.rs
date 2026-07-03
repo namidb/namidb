@@ -113,7 +113,11 @@ async fn cosine_knn_honors_parameterized_limit() {
     .unwrap();
 
     let rows = execute(&plan, &snap, &params).await.unwrap();
-    assert_eq!(titles(&rows), vec!["x-ish".to_string()], "LIMIT $k=1 → 1 row");
+    assert_eq!(
+        titles(&rows),
+        vec!["x-ish".to_string()],
+        "LIMIT $k=1 → 1 row"
+    );
 }
 
 #[tokio::test]
@@ -473,7 +477,9 @@ mod indexed {
         ] {
             let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
             assert!(
-                serde_json::to_string(&plan).unwrap().contains("VectorSearch"),
+                serde_json::to_string(&plan)
+                    .unwrap()
+                    .contains("VectorSearch"),
                 "WITH-based KNN must reach the index, plan: {cypher}"
             );
         }
