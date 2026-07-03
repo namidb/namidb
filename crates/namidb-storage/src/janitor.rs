@@ -72,7 +72,7 @@ use std::collections::HashSet;
 use chrono::Utc;
 use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::error::{Error, Result};
 use crate::manifest::ManifestStore;
@@ -146,6 +146,36 @@ pub struct JanitorReport {
     /// (when `delete = true`) removed, so a crashed holder cannot pin the
     /// namespace forever. Populated in dry-run too.
     pub expired_pins_reclaimed: usize,
+    /// `true` when the pre-delete pin re-check found a lease that landed
+    /// while the live set was being built, pinning a version below this
+    /// sweep's horizon: nothing was deleted this pass; the next tick
+    /// recomputes with the lease in view.
+    pub aborted_by_pin: bool,
+}
+
+/// Read-only floor over the unexpired pin leases right now (no reclaim, no
+/// report side effects) — the pre-delete re-check in [`sweep_orphans`].
+async fn current_pin_floor(
+    store: &dyn object_store::ObjectStore,
+    paths: &crate::paths::NamespacePaths,
+    now_unix: i64,
+) -> Result<u64> {
+    let mut floor = u64::MAX;
+    let mut pins = store.list(Some(&paths.pins_dir()));
+    while let Some(meta) = pins.try_next().await.map_err(Error::ObjectStore)? {
+        let body = match store.get(&meta.location).await {
+            Ok(res) => res.bytes().await.map_err(Error::ObjectStore)?,
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(other) => return Err(Error::ObjectStore(other)),
+        };
+        let Ok(lease) = serde_json::from_slice::<crate::pin::PinLease>(&body) else {
+            continue;
+        };
+        if lease.expires_at_unix >= now_unix {
+            floor = floor.min(lease.version);
+        }
+    }
+    Ok(floor)
 }
 
 /// Scan `sst/level{0..max_level}/` for objects not referenced by the
@@ -327,6 +357,18 @@ pub async fn sweep_orphans(
     let ns_prefix_str = ns_prefix.as_ref();
 
     let scan_max_level = max_level.max(max_seen_level);
+    // Pre-delete pin re-check (defense in depth): a lease that landed while
+    // the live set was being built pins a version this sweep's horizon does
+    // not honour — deleting now would race the new holder's copy. Abort the
+    // pass instead; the next tick recomputes with the lease in view. The
+    // holder's own post-acquire root verification covers the (now much
+    // smaller) residual window between this check and the deletes below.
+    if delete && current_pin_floor(store.as_ref(), paths, now_unix).await? < horizon {
+        warn!(horizon, "retention pin arrived mid-sweep; skipping deletions this pass");
+        report.aborted_by_pin = true;
+        return Ok(report);
+    }
+
     for level in 0..=scan_max_level {
         let level_dir = paths.sst_dir(level);
         let mut stream = store.list(Some(&level_dir));
