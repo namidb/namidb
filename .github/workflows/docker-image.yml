@@ -1,18 +1,23 @@
 # Build and publish the official `namidb-server` container image.
 #
 # Triggers:
-#   * `v*` tag push          → build linux/amd64 + linux/arm64 and push to GHCR
+#   * `v*` tag push          → build linux/amd64 + linux/arm64 (each on its
+#                              native runner — no QEMU) and push to GHCR
 #                              (and Docker Hub, if the secrets are configured)
 #                              tagged `X.Y.Z`, `X.Y`, `X` and `latest`.
 #   * workflow_dispatch      → with a `version` input (e.g. `2.0.0`): checks out
 #                              tag `v<version>` and publishes it — for releases
 #                              that predate this workflow. Without the input:
 #                              build-check only.
-#   * pull_request           → build-check only (amd64, no push), so a broken
+#   * pull_request           → build-check on both arches, no push, so a broken
 #                              Dockerfile is caught before the release tag.
 #
 # The image is the same config as the prebuilt `namidb-server` release
 # archive: `--features vector-index,text-index` (see the Dockerfile).
+#
+# Shape: one `build` job per arch pushes the image *by digest*, then `publish`
+# stitches the digests into one multi-arch manifest per tag. A fat-LTO Rust
+# build under QEMU takes hours; native `ubuntu-24.04-arm` runners take minutes.
 #
 # Registries:
 #   ghcr.io/namidb/namidb-server     — always (GITHUB_TOKEN, zero config)
@@ -46,25 +51,28 @@ env:
   HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
 
 jobs:
-  build:
+  # Decide once: are we publishing, which version, to which repositories.
+  meta:
     runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.compute.outputs.publish }}
+      version: ${{ steps.compute.outputs.version }}
+      ref: ${{ steps.compute.outputs.ref }}
+      images: ${{ steps.compute.outputs.images }}      # space-separated repos
+      tags: ${{ steps.compute.outputs.tags }}          # space-separated tag suffixes
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.version != '' && format('refs/tags/v{0}', inputs.version) || github.ref }}
-
-      - name: Compute version and image tags
-        id: meta
+      - name: Compute version, repositories and tags
+        id: compute
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          PUBLISH=false VERSION=""
+          PUBLISH=false VERSION="" REF="$GITHUB_REF"
           case "$GITHUB_REF" in
             refs/tags/v*) VERSION="${GITHUB_REF#refs/tags/v}"; PUBLISH=true ;;
           esac
           if [[ -n "$INPUT_VERSION" ]]; then
-            VERSION="${INPUT_VERSION#v}"; PUBLISH=true
+            VERSION="${INPUT_VERSION#v}"; PUBLISH=true; REF="refs/tags/v$VERSION"
           fi
 
           IMAGES="ghcr.io/namidb/namidb-server"
@@ -73,31 +81,47 @@ jobs:
           fi
 
           TAGS=""
-          for IMG in $IMAGES; do
-            if [[ "$PUBLISH" == "true" ]]; then
-              TAGS="$TAGS,$IMG:$VERSION"
-              # Rolling tags only for stable X.Y.Z releases, not prereleases.
-              if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-                TAGS="$TAGS,$IMG:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-                TAGS="$TAGS,$IMG:${BASH_REMATCH[1]}"
-                TAGS="$TAGS,$IMG:latest"
-              fi
-            else
-              TAGS="$TAGS,$IMG:build-check"
+          if [[ "$PUBLISH" == "true" ]]; then
+            TAGS="$VERSION"
+            # Rolling tags only for stable X.Y.Z releases, not prereleases.
+            if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+              TAGS="$TAGS ${BASH_REMATCH[1]}.${BASH_REMATCH[2]} ${BASH_REMATCH[1]} latest"
             fi
-          done
+          fi
 
-          echo "publish=$PUBLISH"      >> "$GITHUB_OUTPUT"
-          echo "tags=${TAGS#,}"        >> "$GITHUB_OUTPUT"
-          echo "Publishing=$PUBLISH version=$VERSION tags=${TAGS#,}"
+          {
+            echo "publish=$PUBLISH"
+            echo "version=$VERSION"
+            echo "ref=$REF"
+            echo "images=$IMAGES"
+            echo "tags=$TAGS"
+          } >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH version=$VERSION images=[$IMAGES] tags=[$TAGS]"
 
-      - uses: docker/setup-qemu-action@v3
-        if: steps.meta.outputs.publish == 'true'
+  # One native build per architecture. When publishing, the image is pushed
+  # *by digest* to every target repository; tags are attached in `publish`.
+  build:
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
 
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: steps.meta.outputs.publish == 'true'
+        if: needs.meta.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -105,19 +129,91 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: steps.meta.outputs.publish == 'true' && env.HAS_DOCKERHUB == 'true'
+        if: needs.meta.outputs.publish == 'true' && env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build (and push when publishing)
+      - name: Compose by-digest output spec
+        id: out
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.meta.outputs.publish }}" == "true" ]]; then
+            NAMES=$(echo '${{ needs.meta.outputs.images }}' | tr ' ' ',')
+            echo "outputs=type=image,\"name=$NAMES\",push-by-digest=true,name-canonical=true,push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "outputs=type=cacheonly" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build ${{ matrix.platform }}
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: crates/namidb-server/Dockerfile
-          platforms: ${{ steps.meta.outputs.publish == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ steps.meta.outputs.publish == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: ${{ steps.out.outputs.outputs }}
+          cache-from: type=gha,scope=docker-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.arch }}
+
+      - name: Export digest
+        if: needs.meta.outputs.publish == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch the per-arch digests into one multi-arch manifest per tag, in each
+  # target repository.
+  publish:
+    needs: [meta, build]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          set -euo pipefail
+          DIGESTS=$(ls /tmp/digests)
+          for IMG in ${{ needs.meta.outputs.images }}; do
+            TAG_ARGS=""
+            for TAG in ${{ needs.meta.outputs.tags }}; do
+              TAG_ARGS="$TAG_ARGS -t $IMG:$TAG"
+            done
+            SRCS=""
+            for D in $DIGESTS; do
+              SRCS="$SRCS $IMG@sha256:$D"
+            done
+            docker buildx imagetools create $TAG_ARGS $SRCS
+            docker buildx imagetools inspect "$IMG:${{ needs.meta.outputs.version }}"
+          done
