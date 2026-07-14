@@ -13,7 +13,7 @@ Point it at a bucket (or a local folder, or nothing at all), write Cypher, and y
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-1f6feb.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![PyPI](https://img.shields.io/badge/PyPI-namidb-3776ab.svg?logo=pypi&logoColor=white)](https://pypi.org/project/namidb/)
-[![Docker](https://img.shields.io/badge/Docker-namidb--server-2496ed.svg?logo=docker&logoColor=white)](crates/namidb-server/Dockerfile)
+[![Docker Hub](https://img.shields.io/docker/v/namidb/namidb-server?sort=semver&label=Docker&logo=docker&logoColor=white&color=2496ed)](https://hub.docker.com/r/namidb/namidb-server)
 [![Website](https://img.shields.io/badge/Website-namidb.com-0a7ea4.svg)](https://namidb.com)
 [![Docs](https://img.shields.io/badge/Docs-docs.namidb.com-0a7ea4.svg)](https://docs.namidb.com)
 
@@ -348,6 +348,17 @@ The tools it exposes:
 
 ## Run it as a server (HTTP + Bolt)
 
+The official image is on [Docker Hub](https://hub.docker.com/r/namidb/namidb-server) (multi-arch: `linux/amd64` + `linux/arm64`), built with vector + full-text search on:
+
+```bash
+# Official image, plain HTTP on :8080.
+docker run --rm -p 8080:8080 \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  namidb/namidb-server:2 --store "s3://my-bucket?ns=prod&region=us-west-2"
+```
+
+For a full self-hosted stack (server + MinIO as the bucket) see [`docker-compose.yml`](docker-compose.yml). Or run it from source:
+
 ```bash
 # Plain HTTP on :8080.
 cargo run --release -p namidb-server -- --store "s3://my-bucket?ns=prod&region=us-west-2"
@@ -386,7 +397,7 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 
 > Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`), `text-index` (`CREATE FULLTEXT INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
 >
-> **Prebuilt server binary.** Each GitHub Release ships a `namidb-server-<tag>-<target>` archive built with `--features vector-index,text-index`, so `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX` work out of the box. The `namidb` and `namidb-mcp` archives are feature-light — no optional features — so build the server from source with your own `--features` set when you also want `jwt`/`pdp` or a slimmer binary.
+> **Prebuilt server binary.** Each GitHub Release ships a `namidb-server-<tag>-<target>` archive built with `--features vector-index,text-index`, so `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX` work out of the box — the [official Docker image](https://hub.docker.com/r/namidb/namidb-server) is the same configuration. The `namidb` and `namidb-mcp` archives are feature-light — no optional features — so build the server from source with your own `--features` set when you also want `jwt`/`pdp` or a slimmer binary.
 
 <br />
 
