@@ -12,10 +12,16 @@ From source (workspace root):
 cargo install --path crates/namidb-server
 ```
 
-Container image (build from the repo root):
+Container image (official, multi-arch amd64/arm64):
 
 ```bash
-docker build -t namidb-server:0.1 -f crates/namidb-server/Dockerfile .
+docker pull ghcr.io/namidb/namidb-server:2
+```
+
+Or build it yourself from the repo root:
+
+```bash
+docker build -t ghcr.io/namidb/namidb-server:2 -f crates/namidb-server/Dockerfile .
 ```
 
 ## Run
