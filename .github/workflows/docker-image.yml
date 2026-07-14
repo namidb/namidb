@@ -47,21 +47,26 @@ permissions:
   packages: write
 
 env:
-  # Secrets are not readable in step-level `if:`, so surface the check here.
-  HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+  # The Docker Hub username is a repo *variable*, not a secret: as a secret
+  # its value ("namidb") gets masked across every log line and GitHub drops
+  # job outputs containing it. Only DOCKERHUB_TOKEN is a secret.
+  HAS_DOCKERHUB: ${{ vars.DOCKERHUB_USERNAME != '' }}
 
 jobs:
-  # Decide once: are we publishing, which version, to which repositories.
+  # Decide once: are we publishing and which version. Image repository names
+  # are deliberately NOT job outputs: GitHub silently drops any job output
+  # containing a secret value ("skip output since it may contain secret"),
+  # which bit us when DOCKERHUB_USERNAME ("namidb") was stored as a secret —
+  # every job composes the repo list locally from HAS_DOCKERHUB instead.
   meta:
     runs-on: ubuntu-24.04
     outputs:
       publish: ${{ steps.compute.outputs.publish }}
       version: ${{ steps.compute.outputs.version }}
       ref: ${{ steps.compute.outputs.ref }}
-      images: ${{ steps.compute.outputs.images }}      # space-separated repos
       tags: ${{ steps.compute.outputs.tags }}          # space-separated tag suffixes
     steps:
-      - name: Compute version, repositories and tags
+      - name: Compute version and tags
         id: compute
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -73,11 +78,6 @@ jobs:
           esac
           if [[ -n "$INPUT_VERSION" ]]; then
             VERSION="${INPUT_VERSION#v}"; PUBLISH=true; REF="refs/tags/v$VERSION"
-          fi
-
-          IMAGES="ghcr.io/namidb/namidb-server"
-          if [[ "$HAS_DOCKERHUB" == "true" ]]; then
-            IMAGES="$IMAGES docker.io/namidb/namidb-server"
           fi
 
           TAGS=""
@@ -93,10 +93,9 @@ jobs:
             echo "publish=$PUBLISH"
             echo "version=$VERSION"
             echo "ref=$REF"
-            echo "images=$IMAGES"
             echo "tags=$TAGS"
           } >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH version=$VERSION images=[$IMAGES] tags=[$TAGS]"
+          echo "publish=$PUBLISH version=$VERSION tags=[$TAGS]"
 
   # One native build per architecture. When publishing, the image is pushed
   # *by digest* to every target repository; tags are attached in `publish`.
@@ -132,7 +131,7 @@ jobs:
         if: needs.meta.outputs.publish == 'true' && env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Compose by-digest output spec
@@ -140,7 +139,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ needs.meta.outputs.publish }}" == "true" ]]; then
-            NAMES=$(echo '${{ needs.meta.outputs.images }}' | tr ' ' ',')
+            NAMES="ghcr.io/namidb/namidb-server"
+            if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+              NAMES="$NAMES,docker.io/namidb/namidb-server"
+            fi
             echo "outputs=type=image,\"name=$NAMES\",push-by-digest=true,name-canonical=true,push=true" >> "$GITHUB_OUTPUT"
           else
             echo "outputs=type=cacheonly" >> "$GITHUB_OUTPUT"
@@ -198,14 +200,18 @@ jobs:
         if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create multi-arch manifests
         run: |
           set -euo pipefail
           DIGESTS=$(ls /tmp/digests)
-          for IMG in ${{ needs.meta.outputs.images }}; do
+          IMAGES="ghcr.io/namidb/namidb-server"
+          if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+            IMAGES="$IMAGES docker.io/namidb/namidb-server"
+          fi
+          for IMG in $IMAGES; do
             TAG_ARGS=""
             for TAG in ${{ needs.meta.outputs.tags }}; do
               TAG_ARGS="$TAG_ARGS -t $IMG:$TAG"
