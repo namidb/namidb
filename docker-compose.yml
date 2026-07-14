@@ -1,10 +1,12 @@
 # Self-hosted NamiDB on MinIO.
 #
-# Usage:
-#   docker build -t namidb-server:0.1 -f crates/namidb-server/Dockerfile .
+# Usage (pulls the official image from GHCR, nothing to build):
 #   export NAMIDB_AUTH_TOKEN=$(openssl rand -hex 32)
 #   docker compose up -d
 #   curl -s http://localhost:8080/v0/health | jq .
+#
+# To run a locally built image instead:
+#   docker build -t ghcr.io/namidb/namidb-server:2 -f crates/namidb-server/Dockerfile .
 #
 # After it boots, the graph database is reachable on :8080 with bearer
 # token = $NAMIDB_AUTH_TOKEN. The MinIO console is on :9001
@@ -39,7 +41,7 @@ services:
       "
 
   namidb-server:
-    image: namidb-server:0.1
+    image: ghcr.io/namidb/namidb-server:2
     depends_on:
       bucket-init:
         condition: service_completed_successfully
