@@ -174,10 +174,15 @@ macro_rules! profile_scope {
 mod tests {
     use super::*;
 
+    /// Both tests mutate process-global state (the stats map and
+    /// `ENABLED_CACHE`) and the test harness runs them on parallel
+    /// threads, so a `reset()` from one can wipe rows the other just
+    /// recorded. Serialize them.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn dump_is_empty_initially() {
-        // Note: tests run in the same process; if another test already
-        // recorded something we'll see it. Reset first.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let _ = enabled(); // populate cache
         let rows = dump();
@@ -186,6 +191,7 @@ mod tests {
 
     #[test]
     fn record_accumulates_per_stage() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         // Force-enable: bypass env var for this unit test.
         ENABLED_CACHE.store(2, Ordering::Relaxed);
