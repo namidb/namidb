@@ -160,7 +160,6 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             input,
             target_alias,
             target_labels,
-            rel_alias: _,
             ..
         } => {
             collect_outer_labels(input, out);
