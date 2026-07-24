@@ -373,20 +373,29 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 predicates,
                 projection,
             } => {
-                let labels = resolve_node_labels(snapshot, label.as_deref());
                 let mut rows: Vec<Row> = Vec::new();
-                for label_name in &labels {
-                    let nodes = snapshot
-                        .scan_label_with_predicates_and_projection(
-                            label_name,
-                            predicates,
-                            projection.as_deref(),
-                        )
-                        .await?;
-                    for n in nodes {
-                        let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                        rows.push(Row::new().with(alias.clone(), value));
+                let nodes = match label.as_deref() {
+                    Some(label_name) => {
+                        snapshot
+                            .scan_label_with_predicates_and_projection(
+                                label_name,
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
                     }
+                    None => {
+                        snapshot
+                            .scan_all_nodes_with_predicates_and_projection(
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
+                    }
+                };
+                for n in nodes {
+                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
+                    rows.push(Row::new().with(alias.clone(), value));
                 }
                 Ok(rows)
             }
@@ -946,23 +955,29 @@ fn execute_capped<'a>(
                 predicates,
                 projection,
             } => {
-                let labels = resolve_node_labels(snapshot, label.as_deref());
                 let mut rows: Vec<Row> = Vec::new();
-                'scan: for label_name in &labels {
-                    let nodes = snapshot
-                        .scan_label_with_predicates_and_projection(
-                            label_name,
-                            predicates,
-                            projection.as_deref(),
-                        )
-                        .await?;
-                    for n in nodes {
-                        if rows.len() >= cap {
-                            break 'scan;
-                        }
-                        let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                        rows.push(Row::new().with(alias.clone(), value));
+                let nodes = match label.as_deref() {
+                    Some(label_name) => {
+                        snapshot
+                            .scan_label_with_predicates_and_projection(
+                                label_name,
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
                     }
+                    None => {
+                        snapshot
+                            .scan_all_nodes_with_predicates_and_projection(
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
+                    }
+                };
+                for n in nodes.into_iter().take(cap) {
+                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
+                    rows.push(Row::new().with(alias.clone(), value));
                 }
                 Ok(rows)
             }
@@ -1450,20 +1465,6 @@ struct Step {
     rels: Vec<(String, NodeId, NodeId)>,
 }
 
-/// Resolve the set of labels a `NodeScan` operator must visit.
-///
-/// `Some(l)` → scan only label `l`. `None` (pattern wrote `MATCH (n)`
-/// without a label predicate) → enumerate every label observable through
-/// the snapshot (`Snapshot::observed_labels`). Cost grows linearly with
-/// the observed label count; the existing label-by-label `scan_label`
-/// path is reused so per-label predicates and projections still apply.
-fn resolve_node_labels(snapshot: &Snapshot<'_>, label: Option<&str>) -> Vec<String> {
-    match label {
-        Some(l) => vec![l.to_string()],
-        None => snapshot.observed_labels(),
-    }
-}
-
 /// Flat (no-index) top-k vector search over `label`'s `property` embeddings
 /// (RFC-030). Scans every node of `label` (or all labels when `None`), scoring
 /// each against `query`, and emits the `k` best as rows binding `alias` to the
@@ -1877,6 +1878,17 @@ async fn bm25_ranked(
     use std::collections::{BTreeMap, HashMap};
     use std::ops::Bound;
 
+    // TextIndexDescriptor canonicalises its property set (sorted + deduped)
+    // before compaction concatenates the document fields. Apply the identical
+    // canonical order to the request before both index matching and the flat
+    // fallback. Otherwise a request such as ['title', 'body'] could use the
+    // index's "body title" token order while the first fresh write switches it
+    // to a flat "title body" corpus, changing cross-field phrase matches and
+    // duplicate-field BM25 scores solely because index freshness changed.
+    let mut props = props.to_vec();
+    props.sort();
+    props.dedup();
+
     let parsed = parse_query(query);
     if parsed.is_empty() {
         return Ok(Vec::new());
@@ -1892,7 +1904,7 @@ async fn bm25_ranked(
             .manifest
             .text_indexes
             .iter()
-            .find(|d| d.matches(label, props))
+            .find(|d| d.matches(label, &props))
             .map(|d| d.name.clone());
         if let Some(index_name) = index_name {
             if let Some(hits) = snapshot.text_search(&index_name, label, &parsed, k).await? {
@@ -1920,7 +1932,7 @@ async fn bm25_ranked(
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut since_check = 0usize;
     for (vi, view) in views.iter().enumerate() {
-        let Some(text) = doc_text(view, props) else {
+        let Some(text) = doc_text(view, &props) else {
             continue; // not part of the searchable corpus
         };
         let tokens = tokenize(&text);
@@ -3455,7 +3467,6 @@ async fn vector_search_rows(
     #[cfg(not(feature = "vector-index"))]
     let _ = ef_search;
 
-    let labels = resolve_node_labels(snapshot, label);
     // Materialise the WHOLE node: the result binds it to `alias`, and a
     // downstream projection (`RETURN d.title`) or a procedure's `YIELD node` may
     // read any property — not just the embedding — and a `post_filter` may too.
@@ -3466,22 +3477,29 @@ async fn vector_search_rows(
     // (sort_key, score_value, node) — sort_key is "lower is better" (higher-is-
     // better metrics are negated), so an ascending sort yields the top-k.
     let mut scored: Vec<(f64, f64, NodeValue)> = Vec::new();
-    for label_name in &labels {
-        let nodes = snapshot
-            .scan_label_with_predicates_and_projection(label_name, &[], projection.as_deref())
-            .await?;
-        for n in nodes {
-            crate::exec::limits::check_deadline()?;
-            let node = NodeValue::from(n);
-            let Some(emb) = node.properties.get(property) else {
-                continue;
-            };
-            let Some((score, higher_is_better)) = vector_score(distance, emb, q, span)? else {
-                continue;
-            };
-            let sort_key = if higher_is_better { -score } else { score };
-            scored.push((sort_key, score, node));
+    let nodes = match label {
+        Some(label_name) => {
+            snapshot
+                .scan_label_with_predicates_and_projection(label_name, &[], projection.as_deref())
+                .await?
         }
+        None => {
+            snapshot
+                .scan_all_nodes_with_predicates_and_projection(&[], projection.as_deref())
+                .await?
+        }
+    };
+    for n in nodes {
+        crate::exec::limits::check_deadline()?;
+        let node = NodeValue::from(n);
+        let Some(emb) = node.properties.get(property) else {
+            continue;
+        };
+        let Some((score, higher_is_better)) = vector_score(distance, emb, q, span)? else {
+            continue;
+        };
+        let sort_key = if higher_is_better { -score } else { score };
+        scored.push((sort_key, score, node));
     }
 
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -3659,7 +3677,15 @@ async fn try_index_search(
             Some(e) => e.max(kprime),
             None => kprime.max(64),
         };
-        let raw_hits = snapshot.vector_search(&index_name, &qv, kprime, ef).await?;
+        let Some(raw_hits) = snapshot
+            .try_vector_search(&index_name, &qv, kprime, ef)
+            .await?
+        else {
+            // A missing, legacy, or corrupt `.vg` is not an empty persisted
+            // corpus. Preserve that distinction even when the fresh delta alone
+            // could fill `k`, otherwise persisted neighbours can be omitted.
+            return Ok(None);
+        };
         // Fewer hits than asked ⇒ `kprime ≥` the corpus the index can see, so a
         // wider fetch cannot surface more (checked after using this round's hits).
         let index_exhausted = raw_hits.len() < kprime;
@@ -3941,25 +3967,21 @@ fn should_skip_target_materialize(
     })
 }
 
-/// Walk every label in the manifest looking for a node with `id`.
-/// Cypher's `Expand` doesn't carry the target label in v1 (only the
-/// edge type), so we trial-search until storage provides a
-/// label-index for ids.
+/// Resolve a node when the logical operator carries no label constraint.
+///
+/// Nodes are physically id-primary and the stored row carries its complete
+/// label set, so this is one point read. The previous implementation
+/// trial-probed `lookup_node(label, id)` for every observed label, repeating
+/// the same SST lookup O(label_count) times (including labels only retained in
+/// the historical dictionary) on typeless expands and NodeById lookups.
 pub(crate) async fn scan_node_for_id(
     snapshot: &Snapshot<'_>,
     id: NodeId,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
-    // `observed_labels` covers the declared schema *and* labels that
-    // were ever written into the memtable or any SST. Without it the
-    // typeless Expand path falls back to declared-only and silently
-    // drops every neighbour for namespaces that skipped `SchemaBuilder`
-    // (the root cause of B1 / B7 — `MATCH ()-[r:T]->()` returning 0).
-    for label in snapshot.observed_labels() {
-        if let Some(view) = snapshot.lookup_node(&label, id).await? {
-            return Ok(Some(view));
-        }
-    }
-    Ok(None)
+    snapshot
+        .lookup_node_by_id(id)
+        .await
+        .map_err(ExecError::from)
 }
 
 // ───────────────────────── Project ───────────────────────────────────
@@ -4630,28 +4652,37 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
             } => {
                 // NodeScan produces N independent rows — emit each as a
                 // direct child of root. No clone path; one FactorNode per
-                // result. For typeless scans we fan out across every
-                // observed label and concatenate the result.
-                let labels = resolve_node_labels(snapshot, label.as_deref());
+                // result. Typeless scans use the label-agnostic storage pass so
+                // multi-label nodes are emitted once.
                 let mut set = FactorRowSet::singleton_root();
                 let root = set.arena.root();
                 let alias_arc: Arc<str> = Arc::from(alias.as_str());
                 let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
-                for label_name in &labels {
-                    let nodes = snapshot
-                        .scan_label_with_predicates_and_projection(
-                            label_name,
-                            predicates,
-                            projection.as_deref(),
-                        )
-                        .await?;
-                    for n in nodes {
-                        let slot = Slot {
-                            name: alias_arc.clone(),
-                            value: RuntimeValue::Node(Box::new(NodeValue::from(n))),
-                        };
-                        leaves.push(set.arena.push(root, vec![slot]));
+                let nodes = match label.as_deref() {
+                    Some(label_name) => {
+                        snapshot
+                            .scan_label_with_predicates_and_projection(
+                                label_name,
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
                     }
+                    None => {
+                        snapshot
+                            .scan_all_nodes_with_predicates_and_projection(
+                                predicates,
+                                projection.as_deref(),
+                            )
+                            .await?
+                    }
+                };
+                for n in nodes {
+                    let slot = Slot {
+                        name: alias_arc.clone(),
+                        value: RuntimeValue::Node(Box::new(NodeValue::from(n))),
+                    };
+                    leaves.push(set.arena.push(root, vec![slot]));
                 }
                 set.leaves = leaves;
                 Ok(set)

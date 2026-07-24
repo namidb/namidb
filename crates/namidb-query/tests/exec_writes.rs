@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use namidb_core::id::{NamespaceId, NodeId};
-use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+use namidb_core::schema::{
+    Constraint, ConstraintKind, DataType, LabelDef, PropertyDef, SchemaBuilder,
+};
 use namidb_core::value::Value as CoreValue;
 use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
@@ -86,10 +88,32 @@ async fn create_and_match_multi_label_node() {
     // Visible under each of its labels individually...
     assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
     assert_eq!(count(&writer, "MATCH (n:Admin) RETURN n").await, 1);
+    // A typeless NodeScan is a scan of physical nodes, not a concatenation of
+    // label postings: this :Person:Admin node must appear exactly once.
+    assert_eq!(count(&writer, "MATCH (n) RETURN n").await, 1);
+    // LIMIT takes the executor's capped NodeScan route; it must share the same
+    // one-row semantics.
+    assert_eq!(count(&writer, "MATCH (n) RETURN n LIMIT 10").await, 1);
     // ...and under the conjunction of both (it carries both).
     assert_eq!(count(&writer, "MATCH (n:Person:Admin) RETURN n").await, 1);
     // But NOT under a conjunction that includes a label it lacks.
     assert_eq!(count(&writer, "MATCH (n:Person:Manager) RETURN n").await, 0);
+
+    // Storage permits an unlabeled node. A typeless MATCH includes it while
+    // the labelled scans above remain unchanged.
+    writer
+        .upsert_node_with_labels(
+            Vec::<String>::new(),
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("name".into(), CoreValue::Str("Bare".into()))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    assert_eq!(count(&writer, "MATCH (n) RETURN n").await, 2);
 
     // The optimized plan (label_eq cleanup + pushdown) must agree.
     let snap = writer.snapshot();
@@ -1984,4 +2008,350 @@ async fn bulk_create_under_unique_constraint_pays_one_scan_not_one_per_row() {
         .await
         .expect_err("duplicate after bulk load must be rejected");
     assert!(format!("{err:?}").contains("unique"), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn merge_unique_unwind_500_uses_one_index_population_across_commit_and_flush() {
+    // Regression for the legal-graph loader shape. MERGE's implicit match
+    // used to call scan_label once per UNWIND row (O(store_size * rows)).
+    // The path counters are the assertion: equal final rows alone would also
+    // pass with the slow scan implementation.
+    let mut writer = WriterSession::open(store(), paths("w-merge-unique-unwind-500"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 0})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    let query = lower(
+        &parse(
+            "UNWIND range(1, 500) AS i \
+             MERGE (a:Account {account_no: i}) \
+             SET a.payload = i",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let first = execute_write(&query, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(first.nodes_created, 500);
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "the 500-row MERGE must populate its unique index once"
+    );
+    assert!(
+        writer.unique_index().probes() >= probes_before + 500,
+        "every implicit MERGE match must probe the unique index"
+    );
+
+    // Both auto-commit and a physical memtable→SST flush preserve the
+    // transactional index: neither changes logical node content.
+    writer.flush(int_unique_schema()).await.unwrap();
+    let replay_probes = writer.unique_index().probes();
+    let replay = execute_write(&query, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(replay.nodes_created, 0, "replay must be idempotent");
+    assert!(
+        writer.unique_index().probes() >= replay_probes + 500,
+        "existing-key MERGE rows must take the probe path too"
+    );
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "successful commit + flush must not trigger another population scan"
+    );
+}
+
+#[tokio::test]
+async fn merge_numeric_unique_key_preserves_cross_type_cypher_equality() {
+    // Runtime equality treats integer 1 and float 1.0 as equal, whereas the
+    // storage uniqueness key intentionally keeps their encodings distinct.
+    // A negative numeric unique probe must not make MERGE create a duplicate.
+    let mut writer = WriterSession::open(store(), paths("w-merge-unique-numeric-equality"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {account_no: 1})").await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    let probes_before = writer.unique_index().probes();
+    let matched = write_q(
+        &mut writer,
+        "MERGE (a:Account {account_no: 1.0}) \
+         ON MATCH SET a.seen = true RETURN a",
+    )
+    .await;
+    assert_eq!(matched.nodes_created, 0);
+    assert_eq!(matched.rows.len(), 1);
+    assert!(
+        writer.unique_index().probes() >= probes_before + 2,
+        "numeric tuples must probe both strict I64/F64 encodings"
+    );
+    let accounts = writer.snapshot().scan_label("Account").await.unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(
+        accounts[0].properties.get("seen"),
+        Some(&CoreValue::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn relationship_create_rejects_reserved_id_inline_and_in_spread() {
+    for (name, query, params) in [
+        (
+            "inline",
+            "CREATE (:A)-[:R {_id: 'edge-id'}]->(:B)",
+            Params::new(),
+        ),
+        (
+            "spread",
+            "CREATE (:A)-[:R $props]->(:B)",
+            Params::from([(
+                "props".into(),
+                RuntimeValue::Map(BTreeMap::from([(
+                    "_id".into(),
+                    RuntimeValue::String("edge-id".into()),
+                )])),
+            )]),
+        ),
+    ] {
+        let mut writer = WriterSession::open(store(), paths(&format!("w-rel-create-id-{name}")))
+            .await
+            .unwrap();
+        let plan = lower(&parse(query).unwrap()).unwrap();
+        let err = execute_write(&plan, &mut writer, &params)
+            .await
+            .expect_err("relationships have no user-visible _id slot");
+        assert!(
+            format!("{err:?}").contains("_id is not valid on a relationship CREATE"),
+            "unexpected error for {name}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_uses_fully_covered_composite_key_on_secondary_label() {
+    // The constraint belongs to the SECOND label in the pattern. Candidate
+    // selection must use Account(tenant,key), then apply LegalEntity as a
+    // residual label check.
+    let mut writer = WriterSession::open(store(), paths("w-merge-composite-multilabel"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:LegalEntity:Account {tenant: 't1', key: 'k1', marker: 'old'})",
+    )
+    .await;
+    let mut schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "LegalEntity".into(),
+            properties: vec![],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![
+                PropertyDef::new("tenant", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("key", DataType::Utf8, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    schema.constraints.push(Constraint {
+        name: "uniq_account_tenant_key".into(),
+        label: "Account".into(),
+        properties: vec!["tenant".into(), "key".into()],
+        kind: ConstraintKind::Unique,
+    });
+    writer.flush(schema).await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    let matched = write_q(
+        &mut writer,
+        "MERGE (n:LegalEntity:Account {tenant: 't1', key: 'k1'}) \
+         ON MATCH SET n.marker = 'seen' RETURN n",
+    )
+    .await;
+    assert_eq!(matched.nodes_created, 0);
+    assert_eq!(matched.rows.len(), 1);
+    assert_eq!(writer.unique_index().populate_scans() - scans_before, 1);
+    assert!(
+        writer.unique_index().probes() > probes_before,
+        "composite MERGE lookup must probe the transactional index"
+    );
+}
+
+#[tokio::test]
+async fn merge_node_parameter_map_participates_in_match_and_unique_lookup() {
+    // `properties_spread` used to be discarded by find_merge_matches, so this
+    // query matched both Account nodes instead of only key='b'.
+    let mut writer = WriterSession::open(store(), paths("w-merge-node-spread"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Account {key: 'a', payload: 1}), \
+         (:Account {key: 'b', payload: 2})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![
+                PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true),
+                PropertyDef::new("payload", DataType::Int64, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let plan =
+        lower(&parse("MERGE (n:Account $props) ON MATCH SET n.hit = true RETURN n").unwrap())
+            .unwrap();
+    let mut params = Params::new();
+    params.insert(
+        "props".into(),
+        RuntimeValue::Map(BTreeMap::from([
+            ("key".into(), RuntimeValue::String("b".into())),
+            ("payload".into(), RuntimeValue::Integer(2)),
+        ])),
+    );
+    let probes_before = writer.unique_index().probes();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(
+        outcome.rows.len(),
+        1,
+        "spread residuals must select one node"
+    );
+    assert!(
+        writer.unique_index().probes() > probes_before,
+        "a unique key supplied through $props must use the probe path"
+    );
+    let snap = writer.snapshot();
+    let nodes = snap.scan_label("Account").await.unwrap();
+    let hit_keys: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.properties.get("hit") == Some(&CoreValue::Bool(true)))
+        .map(|node| node.properties.get("key").cloned())
+        .collect();
+    assert_eq!(hit_keys, vec![Some(CoreValue::Str("b".into()))]);
+}
+
+#[tokio::test]
+async fn merge_non_unique_index_uses_posting_list_then_residual_filter() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-equality-index"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Doc {group: 'legal', key: 'a'}), \
+         (:Doc {group: 'legal', key: 'b'}), \
+         (:Doc {group: 'other', key: 'c'})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Doc".into(),
+            properties: vec![
+                PropertyDef::new("group", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true),
+                PropertyDef::new("key", DataType::Utf8, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let lookups_before = writer.property_index_cache().equality_lookup_calls();
+    let outcome = write_q(
+        &mut writer,
+        "MERGE (d:Doc {group: 'legal', key: 'b'}) \
+         ON MATCH SET d.hit = true RETURN d",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(
+        outcome.rows.len(),
+        1,
+        "residual key must reduce two postings"
+    );
+    assert!(
+        writer.property_index_cache().equality_lookup_calls() > lookups_before,
+        "MERGE must call lookup_nodes_by_property, not scan_label"
+    );
+}
+
+#[tokio::test]
+async fn merge_node_by_explicit_id_uses_direct_lookup_and_is_idempotent() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-explicit-id"))
+        .await
+        .unwrap();
+    let created = write_q(
+        &mut writer,
+        "CREATE (n:Account {key: 'a', payload: 1}) RETURN n",
+    )
+    .await;
+    let id = match created.rows[0].get("n") {
+        Some(RuntimeValue::Node(node)) => node.id,
+        other => panic!("expected created node, got {other:?}"),
+    };
+    let plan = lower(&parse("MERGE (n:Account {_id: $id, key: 'a'}) RETURN n").unwrap()).unwrap();
+    let mut params = Params::new();
+    params.insert("id".into(), RuntimeValue::String(id.to_string()));
+    let scans_before = writer.unique_index().populate_scans();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(outcome.rows.len(), 1);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "_id must bypass label/unique-index population and point-read the node"
+    );
+}
+
+#[tokio::test]
+async fn merge_relationship_parameter_map_participates_in_match() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-rel-spread"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:A {name: 'a'})-[:R {kind: 'old'}]->(b:B {name: 'b'})",
+    )
+    .await;
+    let plan = lower(
+        &parse(
+            "MATCH (a:A {name: 'a'}), (b:B {name: 'b'}) \
+             MERGE (a)-[r:R $relprops]->(b) RETURN r",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut params = Params::new();
+    params.insert(
+        "relprops".into(),
+        RuntimeValue::Map(BTreeMap::from([(
+            "kind".into(),
+            RuntimeValue::String("new".into()),
+        )])),
+    );
+    let replaced = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(
+        replaced.edges_created, 1,
+        "different spread properties must take MERGE's create branch"
+    );
+    let replay = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(
+        replay.edges_created, 0,
+        "same spread properties must match on replay"
+    );
 }

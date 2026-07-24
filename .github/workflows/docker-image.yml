@@ -33,6 +33,13 @@ on:
   pull_request:
     paths:
       - "crates/namidb-server/Dockerfile"
+      - "crates/namidb-py/LICENSE"
+      - "crates/namidb-py/pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "scripts/check-release-metadata.py"
       - ".dockerignore"
       - ".github/workflows/docker-image.yml"
   workflow_dispatch:
@@ -96,6 +103,48 @@ jobs:
             echo "tags=$TAGS"
           } >> "$GITHUB_OUTPUT"
           echo "publish=$PUBLISH version=$VERSION tags=[$TAGS]"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.compute.outputs.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        env:
+          PUBLISH: ${{ steps.compute.outputs.publish }}
+          VERSION: ${{ steps.compute.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -f scripts/check-release-metadata.py ]]; then
+            python scripts/check-release-metadata.py
+            if [[ "$PUBLISH" == "true" ]]; then
+              python scripts/check-release-metadata.py \
+                --tag "v$VERSION" --tag-kind engine
+            fi
+          elif [[ "$PUBLISH" == "true" ]]; then
+            # Compatibility path for manually publishing a historical tag
+            # created before the shared validator existed.
+            python - "$VERSION" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          expected = sys.argv[1]
+          with pathlib.Path("Cargo.toml").open("rb") as handle:
+              cargo = str(tomllib.load(handle)["workspace"]["package"]["version"])
+          with pathlib.Path("crates/namidb-py/pyproject.toml").open("rb") as handle:
+              python = str(tomllib.load(handle)["project"]["version"])
+          if cargo != expected or python != expected:
+              raise SystemExit(
+                  f"release metadata mismatch: tag={expected}, "
+                  f"Cargo={cargo}, Python={python}"
+              )
+          print(f"historical release metadata ok: version={expected}")
+          PY
+          fi
 
   # One native build per architecture. When publishing, the image is pushed
   # *by digest* to every target repository; tags are attached in `publish`.
@@ -222,4 +271,25 @@ jobs:
             done
             docker buildx imagetools create $TAG_ARGS $SRCS
             docker buildx imagetools inspect "$IMG:${{ needs.meta.outputs.version }}"
+
+            VERSION="${{ needs.meta.outputs.version }}"
+            PLATFORMS=$(
+              docker buildx imagetools inspect --raw "$IMG:$VERSION" |
+                jq -c '[.manifests[].platform |
+                  select(.os == "linux") |
+                  "\(.os)/\(.architecture)"] | sort'
+            )
+            test "$PLATFORMS" = '["linux/amd64","linux/arm64"]'
+
+            VERSION_DIGESTS=$(
+              docker buildx imagetools inspect --raw "$IMG:$VERSION" |
+                jq -cS '[.manifests[].digest] | sort'
+            )
+            for TAG in ${{ needs.meta.outputs.tags }}; do
+              TAG_DIGESTS=$(
+                docker buildx imagetools inspect --raw "$IMG:$TAG" |
+                  jq -cS '[.manifests[].digest] | sort'
+              )
+              test "$TAG_DIGESTS" = "$VERSION_DIGESTS"
+            done
           done

@@ -103,6 +103,11 @@ pub struct VectorGraphBuildStats {
     pub dim: u32,
     pub metric: String,
     pub point_count: u64,
+    /// Exact NodeId bounds of the vectors retained in this graph. Persisted in
+    /// the generic SST key range so freshness checks can prove that a newer
+    /// node SST for another label cannot contain a relabel/delete of a member.
+    pub min_node_id: [u8; 16],
+    pub max_node_id: [u8; 16],
     pub r: usize,
     pub l_build: usize,
     pub alpha: f32,
@@ -297,10 +302,15 @@ pub fn build_body(
         }
     };
 
+    let (Some(&min_node_id), Some(&max_node_id)) = (ids.iter().min(), ids.iter().max()) else {
+        return Ok(None);
+    };
     let stats = VectorGraphBuildStats {
         dim: desc.dim,
         metric: metric_name(desc.metric).to_string(),
         point_count: ids.len() as u64,
+        min_node_id,
+        max_node_id,
         r: desc.r,
         l_build: desc.l_build,
         alpha: desc.alpha,

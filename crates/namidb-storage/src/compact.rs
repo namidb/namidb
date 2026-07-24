@@ -87,7 +87,7 @@ use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::file::metadata::ParquetMetaData;
 use tracing::{debug, instrument};
 use uuid::Uuid;
@@ -608,7 +608,7 @@ async fn prepare_leveled(
             continue;
         }
         let (descriptor, wrote_bloom) = put_node_sst_leveled(
-            store.as_ref(),
+            store.clone(),
             paths,
             plan.target_level,
             &label,
@@ -631,7 +631,7 @@ async fn prepare_leveled(
         #[cfg(feature = "vector-index")]
         {
             let (new_vg, old_vg_ids) = build_vector_indexes_from_members(
-                store.as_ref(),
+                store.clone(),
                 paths,
                 plan.target_level,
                 finish_max_lsn,
@@ -648,7 +648,7 @@ async fn prepare_leveled(
         #[cfg(feature = "text-index")]
         {
             let (new_ft, old_ft_ids) = build_text_indexes_from_members(
-                store.as_ref(),
+                store.clone(),
                 paths,
                 plan.target_level,
                 finish_max_lsn,
@@ -667,7 +667,7 @@ async fn prepare_leveled(
             continue;
         };
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
-            store.as_ref(),
+            store.clone(),
             paths,
             schema,
             &edge_type,
@@ -694,7 +694,7 @@ async fn prepare_leveled(
             continue;
         };
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
-            store.as_ref(),
+            store.clone(),
             paths,
             schema,
             &edge_type,
@@ -804,7 +804,7 @@ pub async fn install_prepared(
 
 #[allow(clippy::too_many_arguments)]
 async fn compact_and_write_edges(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     schema: &Schema,
     edge_type: &str,
@@ -824,7 +824,7 @@ async fn compact_and_write_edges(
     // beyond the per-source cursor positions.
     let mut bodies: Vec<Bytes> = Vec::with_capacity(sources.len());
     for desc in sources {
-        bodies.push(get_sst_body(store, paths, desc).await?);
+        bodies.push(get_sst_body(store.as_ref(), paths, desc).await?);
     }
     let merge_type = edge_type.to_string();
     let merge_def = edge_def.clone();
@@ -1749,7 +1749,7 @@ fn merge_edge_sources(
 // ── PUT helpers (L1 variants) ───────────────────────────────────────────
 
 async fn put_node_sst_leveled(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     out_level: u32,
     label: &str,
@@ -1774,10 +1774,10 @@ async fn put_node_sst_leveled(
 
     let body = finish.body;
     let body_len = body.len() as u64;
-    put_create(store, &object_path, body).await?;
+    crate::flush::put_object(store.clone(), &object_path, body).await?;
 
     let (bloom_descriptor, wrote_bloom) = put_bloom_sidecar(
-        store,
+        store.clone(),
         paths,
         level.as_u32(),
         &id,
@@ -1814,7 +1814,7 @@ async fn put_node_sst_leveled(
         index_sidecars.push(sidecar);
     }
     for (path, body) in &index_sidecars {
-        put_create(store, path, body.clone()).await?;
+        crate::flush::put_object(store.clone(), path, body.clone()).await?;
     }
 
     let stats = finish.stats;
@@ -1962,7 +1962,7 @@ impl TextMemberCollector {
 /// rebuilds the index.
 #[cfg(feature = "vector-index")]
 async fn build_vector_indexes_from_members(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     out_level: u32,
     corpus_max_lsn: u64,
@@ -2003,7 +2003,7 @@ async fn build_vector_indexes_from_members(
         let object_path = paths.sst_object(level.as_u32(), &file_name);
         let relative_path = relative_sst_path(level.as_u32(), &file_name);
         let body_len = body.len() as u64;
-        put_create(store, &object_path, body).await?;
+        crate::flush::put_object(store.clone(), &object_path, body).await?;
 
         let descriptor = SstDescriptor {
             id,
@@ -2014,8 +2014,12 @@ async fn build_vector_indexes_from_members(
             size_bytes: body_len,
             row_count: stats.point_count,
             created_at: Utc::now(),
-            min_key: [0u8; 16],
-            max_key: [0xFFu8; 16],
+            // For index SSTs the generic key range is the exact NodeId member
+            // range (rather than the old 00..FF sentinel). The freshness gate
+            // uses it to prove that a newer, unrelated-label Nodes SST cannot
+            // contain a relabel/delete of an indexed member.
+            min_key: stats.min_node_id,
+            max_key: stats.max_node_id,
             min_lsn: 0,
             // Stamp the indexed corpus's high-water LSN so a later read can tell
             // whether a newer Nodes SST has outrun this `.vg` (freshness gate).
@@ -2062,7 +2066,7 @@ async fn build_vector_indexes_from_members(
 /// rather than truncating the index to the shallow subset.
 #[cfg(feature = "text-index")]
 async fn build_text_indexes_from_members(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     out_level: u32,
     corpus_max_lsn: u64,
@@ -2092,7 +2096,7 @@ async fn build_text_indexes_from_members(
         let object_path = paths.sst_object(level.as_u32(), &file_name);
         let relative_path = relative_sst_path(level.as_u32(), &file_name);
         let body_len = body.len() as u64;
-        put_create(store, &object_path, body).await?;
+        crate::flush::put_object(store.clone(), &object_path, body).await?;
 
         let descriptor = SstDescriptor {
             id,
@@ -2103,8 +2107,11 @@ async fn build_text_indexes_from_members(
             size_bytes: body_len,
             row_count: stats.doc_count,
             created_at: Utc::now(),
-            min_key: [0u8; 16],
-            max_key: [0xFFu8; 16],
+            // TextIndex uses the same NodeId-member range contract as
+            // VectorGraph; legacy descriptors retain 00..FF and therefore
+            // conservatively overlap every newer Nodes SST until rebuilt.
+            min_key: stats.min_node_id,
+            max_key: stats.max_node_id,
             min_lsn: 0,
             // High-water LSN of the indexed corpus — lets a later read detect a
             // newer Nodes SST and fall back to the flat scan (freshness gate).
@@ -2135,7 +2142,7 @@ async fn build_text_indexes_from_members(
 }
 
 async fn put_edge_sst_leveled(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     out_level: u32,
     edge_type: &str,
@@ -2159,7 +2166,7 @@ async fn put_edge_sst_leveled(
 
     let body = finish.body;
     let body_len = body.len() as u64;
-    put_create(store, &object_path, body).await?;
+    crate::flush::put_object(store.clone(), &object_path, body).await?;
 
     let (bloom_descriptor, wrote_bloom) = put_bloom_sidecar(
         store,
@@ -2204,7 +2211,7 @@ async fn put_edge_sst_leveled(
 }
 
 async fn put_bloom_sidecar(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     level: u32,
     sst_id: &Uuid,
@@ -2221,17 +2228,8 @@ async fn put_bloom_sidecar(
 
     let body = bloom.to_bytes();
     let descriptor = BloomDescriptor::from_body(relative, &body)?;
-    put_create(store, &object_path, body).await?;
+    crate::flush::put_object(store, &object_path, body).await?;
     Ok((Some(descriptor), true))
-}
-
-async fn put_create(store: &dyn ObjectStore, path: &Path, body: Bytes) -> Result<()> {
-    let opts = PutOptions::from(PutMode::Create);
-    store
-        .put_opts(path, PutPayload::from(body), opts)
-        .await
-        .map_err(Error::ObjectStore)?;
-    Ok(())
 }
 
 async fn get_sst_body(
@@ -2263,6 +2261,8 @@ mod tests {
         DataType, EdgeTypeDef, LabelDef, NamespaceId, NodeId, PropertyDef, SchemaBuilder, Value,
     };
     use object_store::memory::InMemory;
+    #[cfg(feature = "text-index")]
+    use object_store::PutPayload;
 
     use super::*;
     use crate::flush::{flush, EdgeWriteRecord, NodeWriteRecord};
@@ -4497,6 +4497,13 @@ mod tests {
         // high-water LSN, so the gate lets them serve.
         assert_eq!(vg.max_lsn, node_desc.max_lsn);
         assert_eq!(ft.max_lsn, node_desc.max_lsn);
+        // Index descriptor key bounds are member NodeId bounds, not the legacy
+        // 00..FF sentinel. Both corpora contain reconciled ids 1..=12 (id 5 is
+        // deleted, but the extrema remain 1 and 12).
+        assert_eq!(vg.min_key, *idx_id(1).as_bytes());
+        assert_eq!(vg.max_key, *idx_id(12).as_bytes());
+        assert_eq!(ft.min_key, *idx_id(1).as_bytes());
+        assert_eq!(ft.max_key, *idx_id(12).as_bytes());
 
         let mt = Memtable::new();
         let mt_view = mt.snapshot_view();

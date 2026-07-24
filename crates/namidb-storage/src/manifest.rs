@@ -257,6 +257,13 @@ pub struct SstDescriptor {
     pub created_at: DateTime<Utc>,
 
     // ── key range (raw 16-byte bounds; JSON-encoded as base64) ──
+    //
+    // Nodes/edges store their physical row-key bounds. VectorGraph/TextIndex
+    // store the exact NodeId bounds of their member corpus; the read-side
+    // freshness gate pairs this range with the descriptor's max_lsn to prove
+    // that a newer SST for another label cannot relabel/delete an indexed id.
+    // Index descriptors written before this contract used 00..FF, which remains
+    // a safe (fully overlapping) conservative range after upgrade.
     #[serde(with = "serde_key16")]
     pub min_key: [u8; 16],
     #[serde(with = "serde_key16")]

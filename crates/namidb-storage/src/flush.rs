@@ -30,17 +30,20 @@
 //! 3. For every edge bucket, build [`EdgeStreamRow`]s for the forward
 //! partner SST and transpose them for the inverse partner SST. Each
 //! feeds its own [`EdgeSstWriter`].
-//! 4. PUT every SST body + every non-omitted bloom side-car with
-//! `PutMode::Create` so an in-flight conflicting writer cannot stomp.
+//! 4. PUT every SST body + every non-omitted bloom side-car to its immutable
+//! UUIDv7 path. Small objects retain `PutMode::Create`; large bodies use
+//! multipart upload, whose APIs do not support create-only semantics.
 //! 5. Build a fresh manifest carrying every new [`SstDescriptor`] and clear
 //! `wal_segments` (every record they reference is now durable inside an
 //! SST).
 //! 6. Commit through [`ManifestStore::commit`] (CAS).
 //!
-//! On any error before the manifest commit we return immediately. Orphan
-//! SST/bloom objects survive in object storage; they cost space but cannot
-//! affect correctness because no manifest version references them. A future
-//! janitor will sweep them.
+//! On any error before the manifest commit, every started upload is allowed to
+//! finish its cleanup before the error is returned. Complete orphan SST/bloom
+//! objects can survive in object storage; they cost space but cannot affect
+//! correctness because no manifest version references them, and the janitor
+//! sweeps them. Multipart errors are explicitly aborted; operators should also
+//! configure an incomplete-multipart lifecycle rule for process crashes.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,11 +56,11 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 use namidb_core::{
@@ -243,13 +246,13 @@ pub async fn flush(
         ));
     }
 
-    // 2. I/O phase — issue every body + bloom PUT concurrently. The PUTs
-    // are independent (each targets a fresh UUIDv7 path created above),
-    // so the only ordering constraint is that they all complete before
-    // the manifest CAS. `try_join_all` keeps the failure semantics:
-    // the first error short-circuits the rest, mirroring the old
-    // sequential behaviour. Orphan objects from in-flight PUTs that
-    // succeeded before the failure are reclaimed by the janitor.
+    // 2. I/O phase — issue body + bloom PUTs with bounded object-level
+    // concurrency. The PUTs are independent (each targets a fresh UUIDv7
+    // path created above), so the only ordering constraint is that they all
+    // complete before the manifest CAS. We deliberately collect every result
+    // instead of short-circuiting: dropping a multipart future on the first
+    // sibling failure would bypass its explicit abort cleanup. Complete
+    // orphan objects are harmless and reclaimed by the janitor.
     let mut put_futures: Vec<_> = Vec::with_capacity(pendings.len() * 2);
     for p in &pendings {
         let body = p.body.clone();
@@ -281,7 +284,13 @@ pub async fn flush(
             ));
         }
     }
-    futures::future::try_join_all(put_futures).await?;
+    let put_results: Vec<Result<()>> = futures::stream::iter(put_futures)
+        .buffer_unordered(OBJECT_UPLOAD_MAX_CONCURRENCY)
+        .collect()
+        .await;
+    if let Some(error) = put_results.into_iter().find_map(|result| result.err()) {
+        return Err(error);
+    }
 
     let bloom_count = pendings.iter().filter(|p| p.bloom_body.is_some()).count();
     let new_ssts: Vec<SstDescriptor> = pendings.into_iter().map(|p| p.descriptor).collect();
@@ -1317,30 +1326,35 @@ async fn put_create(store: &dyn ObjectStore, path: &Path, body: Bytes) -> Result
     Ok(())
 }
 
-/// Threshold above which an SST body is uploaded via multipart instead of a
-/// single PUT. Sits just below the S3 5 MiB per-part minimum so any body
-/// that produces at least one full part (~SF1 edge SSTs at 2–5 MiB and
-/// every L1 compacted SST) crosses the multipart path; bodies smaller than
-/// this still go single-PUT (no multipart overhead and `PutMode::Create`
-/// stays available for collision protection).
-const MULTIPART_THRESHOLD: usize = 4 * 1024 * 1024;
-
 /// Per-part chunk size for multipart uploads. S3's hard floor is 5 MiB on
 /// every part except the trailing one; we match that floor so each part
 /// is valid in isolation. R2 inherits the same floor.
 const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 
+/// Threshold at which an SST body is uploaded via multipart instead of a
+/// single PUT. It must not be lower than [`MULTIPART_PART_SIZE`]: buffering
+/// writers commonly fall back to an ordinary overwrite PUT below their
+/// capacity, which would silently defeat both multipart and `PutMode::Create`.
+const MULTIPART_THRESHOLD: usize = MULTIPART_PART_SIZE;
+
 /// Default in-flight concurrency for multipart upload parts. The
-/// `object_store::buffered::BufWriter` default is also 8; we mirror it
-/// explicitly so the call site documents the chosen rate.
+/// bounded queue prevents compaction from serialising every network RTT while
+/// avoiding an unbounded number of resident request bodies.
 const MULTIPART_MAX_CONCURRENCY: usize = 8;
+
+/// Maximum number of independent SST/sidecar objects uploaded concurrently by
+/// one flush. Combined with [`MULTIPART_MAX_CONCURRENCY`], this caps a flush at
+/// 32 in-flight part requests instead of multiplying by every label/sidecar.
+const OBJECT_UPLOAD_MAX_CONCURRENCY: usize = 4;
 
 /// Upload `body` to `path`. For small bodies, falls back to the single-PUT
 /// `PutMode::Create` path so the CAS-style "no overwrite" semantics still
 /// protect against a competing writer stomping on a UUIDv7 path. For
-/// bodies past [`MULTIPART_THRESHOLD`] (SST bodies in the LDBC SNB SF1
-/// range — 10–50 MiB), uses `BufWriter` with `MULTIPART_PART_SIZE` chunks
-/// and `MULTIPART_MAX_CONCURRENCY` in-flight uploads.
+/// bodies at or past [`MULTIPART_THRESHOLD`] (SST bodies in the LDBC SNB SF1
+/// range — 10–50 MiB), uploads fixed-size `MULTIPART_PART_SIZE` chunks with
+/// at most `MULTIPART_MAX_CONCURRENCY` requests in flight. Any part or
+/// completion error explicitly aborts the upload so S3/R2 do not retain
+/// orphan parts after a recoverable failure.
 ///
 /// Why the split: S3 / R2 multipart uploads do NOT honour the `If-None-Match`
 /// header that backs `PutMode::Create`. SST paths embed a UUIDv7 per writer
@@ -1355,16 +1369,54 @@ pub(crate) async fn put_object(
     if body.len() < MULTIPART_THRESHOLD {
         return put_create(store.as_ref(), path, body).await;
     }
-    let mut writer =
-        object_store::buffered::BufWriter::with_capacity(store, path.clone(), MULTIPART_PART_SIZE)
-            .with_max_concurrency(MULTIPART_MAX_CONCURRENCY);
-    writer.put(body).await.map_err(Error::ObjectStore)?;
-    writer.shutdown().await.map_err(|e| {
-        Error::ObjectStore(object_store::Error::Generic {
-            store: "BufWriter",
-            source: Box::new(e),
-        })
-    })?;
+
+    let mut upload = store
+        .put_multipart(path)
+        .await
+        .map_err(Error::ObjectStore)?;
+    let mut pending = FuturesUnordered::new();
+    let mut part_error = None;
+
+    for offset in (0..body.len()).step_by(MULTIPART_PART_SIZE) {
+        let end = (offset + MULTIPART_PART_SIZE).min(body.len());
+        pending.push(upload.put_part(PutPayload::from(body.slice(offset..end))));
+        if pending.len() < MULTIPART_MAX_CONCURRENCY {
+            continue;
+        }
+        if let Some(Err(source)) = pending.next().await {
+            part_error = Some(source);
+            break;
+        }
+    }
+
+    while let Some(result) = pending.next().await {
+        if part_error.is_none() {
+            if let Err(source) = result {
+                part_error = Some(source);
+            }
+        }
+    }
+    if let Some(source) = part_error {
+        if let Err(abort_error) = upload.abort().await {
+            warn!(
+                path = %path,
+                error = %abort_error,
+                "failed to abort multipart upload after part failure"
+            );
+        }
+        return Err(Error::ObjectStore(source));
+    }
+
+    if let Err(source) = upload.complete().await {
+        if let Err(abort_error) = upload.abort().await {
+            warn!(
+                path = %path,
+                error = %abort_error,
+                "failed to abort multipart upload after completion failure"
+            );
+        }
+        return Err(Error::ObjectStore(source));
+    }
     Ok(())
 }
 
@@ -1986,6 +2038,25 @@ mod tests {
                 PropertyDef::new("name", DataType::Utf8, false).unwrap(),
                 PropertyDef::new("age", DataType::Int32, true).unwrap(),
             ],
+        }
+    }
+
+    #[tokio::test]
+    async fn put_object_round_trips_single_and_multipart_bodies() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (name, body) in [
+            ("single.bin", Bytes::from_static(b"small immutable body")),
+            (
+                "multipart.bin",
+                Bytes::from(vec![0x5a; MULTIPART_THRESHOLD + 17]),
+            ),
+        ] {
+            let path = Path::from(name);
+            put_object(store.clone(), &path, body.clone())
+                .await
+                .unwrap();
+            let stored = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(stored, body, "{name} must survive its upload path");
         }
     }
 

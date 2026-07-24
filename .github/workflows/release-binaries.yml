@@ -23,14 +23,36 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "scripts/check-release-metadata.py"
       - ".github/workflows/release-binaries.yml"
   workflow_dispatch: {}
 
 jobs:
+  validate-release:
+    name: validate release metadata
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate Cargo, lockfile, changelog, Python metadata, and license
+        run: python scripts/check-release-metadata.py
+      - name: Validate v* tag against the declared version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python scripts/check-release-metadata.py \
+            --tag "$RELEASE_TAG" --tag-kind engine
+
   # Fast debug build to catch binary regressions on PRs without paying for the
   # release LTO build or touching the release.
   build-check:
     name: build-check
+    needs: validate-release
     if: github.event_name != 'push'
     runs-on: ubuntu-22.04
     steps:
@@ -47,6 +69,7 @@ jobs:
   # release, and a lightweight tag has none, so without this the upload jobs
   # fail with "release not found".
   create-release:
+    needs: validate-release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:

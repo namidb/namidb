@@ -640,17 +640,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "chacha20"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -755,9 +744,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "comfy-table"
-version = "7.2.2"
+version = "7.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958c5d6ecf1f214b4c2bbbbf6ab9523a864bd136dcf71a7e8904799acfe1ad47"
+checksum = "b03b7db8e0b4b2fdad6c551e634134e99ec000e5c8c3b6856c65e8bbaded7a3b"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
@@ -1425,7 +1414,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
- "rand_core 0.10.1",
  "wasip2",
  "wasip3",
 ]
@@ -1647,13 +1635,12 @@ dependencies = [
 
 [[package]]
 name = "icu_collections"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c"
+checksum = "4c6b649701667bbe825c3b7e6388cb521c23d88644678e83c0c4d0a621a34b43"
 dependencies = [
  "displaydoc",
  "potential_utf",
- "utf8_iter",
  "yoke",
  "zerofrom",
  "zerovec",
@@ -1661,9 +1648,9 @@ dependencies = [
 
 [[package]]
 name = "icu_locale_core"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92219b62b3e2b4d88ac5119f8904c10f8f61bf7e95b640d25ba3075e6cac2c29"
+checksum = "edba7861004dd3714265b4db54a3c390e880ab658fec5f7db895fae2046b5bb6"
 dependencies = [
  "displaydoc",
  "litemap",
@@ -1674,9 +1661,9 @@ dependencies = [
 
 [[package]]
 name = "icu_normalizer"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c56e5ee99d6e3d33bd91c5d85458b6005a22140021cc324cea84dd0e72cff3b4"
+checksum = "5f6c8828b67bf8908d82127b2054ea1b4427ff0230ee9141c54251934ab1b599"
 dependencies = [
  "icu_collections",
  "icu_normalizer_data",
@@ -1688,15 +1675,15 @@ dependencies = [
 
 [[package]]
 name = "icu_normalizer_data"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da3be0ae77ea334f4da67c12f149704f19f81d1adf7c51cf482943e84a2bad38"
+checksum = "7aedcccd01fc5fe81e6b489c15b247b8b0690feb23304303a9e560f37efc560a"
 
 [[package]]
 name = "icu_properties"
-version = "2.2.0"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee3b67d0ea5c2cca5003417989af8996f8604e34fb9ddf96208a033901e70de"
+checksum = "020bfc02fe870ec3a66d93e677ccca0562506e5872c650f893269e08615d74ec"
 dependencies = [
  "icu_collections",
  "icu_locale_core",
@@ -1708,15 +1695,15 @@ dependencies = [
 
 [[package]]
 name = "icu_properties_data"
-version = "2.2.0"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e2bbb201e0c04f7b4b3e14382af113e17ba4f63e2c9d2ee626b720cbce54a14"
+checksum = "616c294cf8d725c6afcd8f55abc17c56464ef6211f9ed59cccffe534129c77af"
 
 [[package]]
 name = "icu_provider"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
+checksum = "85962cf0ce02e1e0a629cc34e7ca3e373ce20dda4c4d7294bbd0bf1fdb59e614"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
@@ -1746,9 +1733,9 @@ dependencies = [
 
 [[package]]
 name = "idna_adapter"
-version = "1.2.2"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
+checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
@@ -2193,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "namidb"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "namidb-core",
  "namidb-graph",
@@ -2203,7 +2190,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-ann"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "namidb-core",
  "rand 0.8.6",
@@ -2216,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bench"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2224,7 +2211,7 @@ dependencies = [
  "namidb-core",
  "namidb-query",
  "namidb-storage",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "serde",
@@ -2235,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bolt"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2255,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2267,7 +2254,7 @@ dependencies = [
  "namidb-storage",
  "notify",
  "notify-debouncer-full",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2275,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2291,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-graph"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2313,14 +2300,14 @@ dependencies = [
 
 [[package]]
 name = "namidb-markdown"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
  "namidb-core",
  "namidb-storage",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "pulldown-cmark",
  "regex",
  "reqwest",
@@ -2336,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-mcp"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2356,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-py"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2364,7 +2351,7 @@ dependencies = [
  "namidb-markdown",
  "namidb-query",
  "namidb-storage",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "pyo3",
  "pyo3-async-runtimes",
  "serde_json",
@@ -2374,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-query"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2383,7 +2370,7 @@ dependencies = [
  "namidb-core",
  "namidb-graph",
  "namidb-storage",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "proptest",
  "regex",
  "serde",
@@ -2398,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2415,7 +2402,7 @@ dependencies = [
  "namidb-core",
  "namidb-query",
  "namidb-storage",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "rcgen",
  "reqwest",
  "rustls",
@@ -2436,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-storage"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2458,7 +2445,7 @@ dependencies = [
  "imbl",
  "namidb-ann",
  "namidb-core",
- "object_store 0.13.2",
+ "object_store 0.13.1",
  "parquet",
  "proptest",
  "rand 0.8.6",
@@ -2641,18 +2628,16 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.13.2"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
+checksum = "c2858065e55c148d294a9f3aae3b0fa9458edadb41a108397094566f4e3c0dfb"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
  "chrono",
  "form_urlencoded",
- "futures-channel",
- "futures-core",
- "futures-util",
+ "futures",
  "http",
  "http-body-util",
  "httparse",
@@ -2663,7 +2648,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quick-xml",
- "rand 0.10.1",
+ "rand 0.9.4",
  "reqwest",
  "ring",
  "rustls-pki-types",
@@ -3017,9 +3002,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
 dependencies = [
  "memchr",
  "serde",
@@ -3123,17 +3108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
-dependencies = [
- "chacha20",
- "getrandom 0.4.2",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3170,12 +3144,6 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
-
-[[package]]
-name = "rand_core"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_xorshift"

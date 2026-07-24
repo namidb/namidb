@@ -338,19 +338,37 @@ export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
 
 ## Releasing to PyPI
 
-1. Bump `version` in `crates/namidb-py/pyproject.toml` and
-   `crates/namidb-py/Cargo.toml` (they have to match).
-2. Update `CHANGELOG.md` (or this README's release notes section).
-3. Commit, then tag and push:
+Run every command below from the repository root.
+
+1. Set the same `X.Y.Z` in the root `Cargo.toml`
+   (`workspace.package.version` and every internal workspace dependency pin)
+   and in `crates/namidb-py/pyproject.toml`. Every crate, including
+   `namidb-py`, inherits its Rust version from the root workspace manifest.
+2. Refresh `Cargo.lock` and update `CHANGELOG.md`.
+3. Validate the complete release metadata before creating an immutable tag:
    ```bash
-   git tag py-v0.2.0
-   git push origin py-v0.2.0
+   VERSION=X.Y.Z
+   python scripts/check-release-metadata.py \
+     --tag "v$VERSION" --tag-kind engine
+   python scripts/check-release-metadata.py \
+     --tag "py-v$VERSION" --tag-kind python
    ```
-4. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
+4. Commit and push the release commit, wait for `ci` and `python-wheels` to
+   pass on `main`, then create both annotated tags on that exact commit:
+   ```bash
+   git tag -a "v$VERSION" -m "NamiDB $VERSION"
+   git tag -a "py-v$VERSION" -m "namidb Python $VERSION"
+   test "$(git rev-parse "v$VERSION^{commit}")" = \
+        "$(git rev-parse "py-v$VERSION^{commit}")"
+   git push --atomic origin "v$VERSION" "py-v$VERSION"
+   ```
+5. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
    arm64, Windows x86_64) plus the sdist, smoke-tests one wheel on
    Python 3.9 and 3.13, then publishes to PyPI via OIDC trusted
    publishing (set up once per account at
    https://pypi.org/manage/account/publishing/).
 
-The `py-v*` tag prefix keeps Python releases separate from any future
-`v*` tags that mark engine or crate releases.
+The `v*` tag creates the GitHub Release, prebuilt binaries, and container
+images. The `py-v*` tag publishes the Python distribution to PyPI. The
+release workflows reject either tag unless it exactly matches the Cargo,
+lockfile, Python version, dated changelog entry, and bundled license.

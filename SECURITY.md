@@ -42,9 +42,9 @@ reporters in the advisory and in the release notes if they wish.
 
 ## Supported versions
 
-NamiDB is in active development before its first stable release.
-Security fixes target `main` and the most recent published version.
-Older versions are not supported.
+NamiDB's public API has been stable since 1.0. Security fixes target
+`main` and the most recent published version. Older versions are not
+supported.
 
 | Version                                                       | Supported          |
 |---------------------------------------------------------------|--------------------|

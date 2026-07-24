@@ -11,6 +11,69 @@ the release notes.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-23: Indexed MERGE and search correctness
+
+This patch removes the last quadratic path from idempotent bulk graph loads,
+hardens index fallbacks, and improves large-object uploads without changing
+the public API or on-disk format.
+
+### Changed — performance
+
+- **`MERGE` node existence checks use indexed candidates.** `_id`, declared
+  single/composite unique keys (including keys on a secondary label), and
+  non-unique string equality indexes now select candidates through point or
+  transactional index probes before applying the complete pattern as a
+  residual. A 500-row `UNWIND … MERGE` populates a unique-key map once per
+  writer and then stays O(1) per row across commits and memtable flushes,
+  instead of scanning the growing label for every row.
+- **Label-agnostic node resolution is one id-primary point read.** Typeless
+  graph expansion and node-by-id operations no longer repeat the same storage
+  lookup once for every observed label.
+- **Typeless node scans reconcile the physical node stream once.** `MATCH (n)`
+  and label-free vector fallbacks no longer fan out across labels, so
+  multi-label nodes appear exactly once and unlabeled nodes remain visible.
+- **Persisted vector/FTS freshness is label-scoped without serving stale
+  results.** New index descriptors retain the exact member NodeId range, so a
+  newer SST proven to contain only another label can stay on the indexed path
+  when its IDs are disjoint. Relabels, deletes, same-label writes, legacy
+  descriptors, and ambiguous metadata still force the exact fallback.
+- **Large compaction outputs use concurrent multipart upload.** Node/edge SSTs,
+  vector and full-text indexes, bloom filters, and property sidecars at least
+  5 MiB use the multipart protocol with 5 MiB chunks, bounded concurrency, and
+  explicit abort on part/completion failure. Small immutable objects retain
+  `PutMode::Create`; manifest CAS and commit durability are unchanged.
+
+### Fixed
+
+- **Unique-key `MERGE` is no longer O(N²).** Both existing and new keys take
+  the same warm transactional index path, and node/relationship parameter-map
+  properties now participate in the implicit match instead of being ignored.
+  Numeric keys probe both integer and float encodings to retain Cypher's
+  cross-type equality without giving up the indexed path; only ambiguous
+  integral floats beyond the exact 53-bit range use the safe scan fallback.
+- **Relationship `_id` handling is consistent.** Both inline and parameter-map
+  relationship properties reject the node-only reserved `_id` slot in
+  `CREATE` and `MERGE`.
+- **Unique property sidecars resolve value reassignment correctly.** Reads
+  confirm every historical claimant against its current node view instead of
+  treating an SST's unrelated `max_lsn` as the posting's LSN and potentially
+  hiding the live owner.
+- **Vector search never drops persisted neighbours after index corruption.**
+  Missing, legacy, or undecodable `.vg` data now explicitly selects the exact
+  flat fallback even when fresh delta rows alone could fill `k`.
+- **BM25 field semantics are stable across index freshness.** Requested
+  property names are sorted and deduplicated for both indexed and flat paths,
+  preventing fallback-only phrase/order changes or duplicate-field score
+  inflation.
+- **Release artifacts are version- and license-checked before publication.**
+  GitHub binaries, four Python wheels plus the sdist, and multi-architecture
+  Docker manifests now share a release metadata gate. Python distributions
+  carry PEP 639 license metadata and the complete repository license.
+- **The declared Rust 1.85 MSRV is reproducible again.** The object-store,
+  Arrow table-rendering, and URL/IDNA ICU dependency lines are pinned to their
+  final Rust-1.85-compatible releases, so local builds and the `rust:1.85`
+  official image do not resolve crates that require newer language syntax.
+
 ## [2.0.0] - 2026-07-03: Enterprise-grade hardening — durability, resilience, and search completeness
 
 A deep audit of the vector / text / graph search stack and the enterprise
@@ -1858,7 +1921,9 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/namidb/namidb/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/namidb/namidb/releases/tag/v2.0.0
 [0.13.0]: https://github.com/namidb/namidb/releases/tag/v0.13.0
 [0.4.1]: https://github.com/namidb/namidb/releases/tag/v0.4.1
 [0.4.0]: https://github.com/namidb/namidb/releases/tag/v0.4.0

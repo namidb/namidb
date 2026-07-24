@@ -87,6 +87,11 @@ db = namidb.Client(
 
 Credentials come from the standard env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, …); IAM roles on EC2/EKS/Lambda just work. Kill the process, start it on another machine pointed at the same URI — the graph is still there, because the bucket *is* the database.
 
+For production object-store deployments, configure a bucket lifecycle rule
+that aborts incomplete multipart uploads after a short retention window.
+NamiDB aborts recoverable upload failures itself; the lifecycle rule covers
+process or host termination while S3/R2 still owns uploaded parts.
+
 | Scheme | Backend |
 |---|---|
 | `s3://<bucket>[/<prefix>]?ns=<ns>` | AWS S3, Cloudflare R2, MinIO, Tigris, LocalStack — anything S3-compatible |

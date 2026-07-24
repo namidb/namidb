@@ -31,6 +31,7 @@
 //!   the concern entirely.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use namidb_core::id::NodeId;
@@ -48,6 +49,10 @@ pub struct PropertyIndexCache {
     /// `Arc` on the inner so readers can release the outer lock as
     /// soon as they have the per-(label, prop) handle.
     indices: RwLock<PropertyIndices>,
+    /// Calls routed through the unique point-lookup storage API.
+    unique_lookup_calls: AtomicU64,
+    /// Calls routed through the non-unique equality posting-list API.
+    equality_lookup_calls: AtomicU64,
 }
 
 impl PropertyIndexCache {
@@ -73,6 +78,26 @@ impl PropertyIndexCache {
         if let Ok(mut w) = self.indices.write() {
             w.insert((label, property), index);
         }
+    }
+
+    /// Record one storage-level unique property lookup. Kept on the shared
+    /// writer cache so regression tests can assert the chosen read path rather
+    /// than merely observing an equal result from a label-scan fallback.
+    pub(crate) fn record_unique_lookup(&self) {
+        self.unique_lookup_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one storage-level non-unique equality lookup.
+    pub(crate) fn record_equality_lookup(&self) {
+        self.equality_lookup_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn unique_lookup_calls(&self) -> u64 {
+        self.unique_lookup_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn equality_lookup_calls(&self) -> u64 {
+        self.equality_lookup_calls.load(Ordering::Relaxed)
     }
 
     /// Drop every cached index. Called after a flush that changes the

@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -38,7 +38,9 @@ notify = "6"
 notify-debouncer-full = "0.3"
 
 # Object storage (S3 / GCS / Azure / Local / Memory)
-object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+# 0.13.2 uses Rust syntax newer than its declared 1.85 MSRV. Keep the final
+# 0.13 release that actually compiles with this workspace's supported toolchain.
+object_store = { version = "=0.13.1", features = ["aws", "gcp", "azure"] }
 
 # Columnar in-memory
 arrow = { version = "55", features = ["prettyprint"] }
@@ -118,13 +120,13 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 
 # Local workspace crates
-namidb-core = { path = "crates/namidb-core", version = "2.0.0" }
-namidb-storage = { path = "crates/namidb-storage", version = "2.0.0" }
-namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.0" }
-namidb-graph = { path = "crates/namidb-graph", version = "2.0.0" }
-namidb-ann = { path = "crates/namidb-ann", version = "2.0.0" }
-namidb-query = { path = "crates/namidb-query", version = "2.0.0" }
-namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.0" }
+namidb-core = { path = "crates/namidb-core", version = "2.0.1" }
+namidb-storage = { path = "crates/namidb-storage", version = "2.0.1" }
+namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.1" }
+namidb-graph = { path = "crates/namidb-graph", version = "2.0.1" }
+namidb-ann = { path = "crates/namidb-ann", version = "2.0.1" }
+namidb-query = { path = "crates/namidb-query", version = "2.0.1" }
+namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.1" }
 
 [profile.release]
 opt-level = 3

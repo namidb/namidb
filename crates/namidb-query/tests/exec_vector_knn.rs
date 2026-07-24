@@ -12,7 +12,10 @@ use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute, lower, parse, Params, RuntimeValue};
+use namidb_query::parser::{Expression, ExpressionKind, SourceSpan};
+use namidb_query::plan::logical::VectorDistance;
+use namidb_query::plan::RowCount;
+use namidb_query::{execute, lower, parse, LogicalPlan, Params, RuntimeValue};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -147,6 +150,70 @@ async fn knn_prefilter_excludes_nodes_without_embedding() {
     assert!(!got.iter().any(|t| t == "no-embedding"));
 }
 
+#[tokio::test]
+async fn typeless_knn_returns_multilabel_once_and_includes_unlabelled() {
+    let mut writer = WriterSession::open(store(), paths("knn-typeless"))
+        .await
+        .unwrap();
+    let rec = |title: &str, embedding: Vec<f32>| NodeWriteRecord {
+        properties: BTreeMap::from([
+            ("title".into(), CoreValue::Str(title.into())),
+            ("embedding".into(), CoreValue::Vec(embedding)),
+        ]),
+        schema_version: 1,
+        ..Default::default()
+    };
+    writer
+        .upsert_node_with_labels(
+            ["A".to_string(), "B".to_string()],
+            NodeId::new(),
+            &rec("multi", vec![1.0, 0.0, 0.0]),
+        )
+        .unwrap();
+    writer
+        .upsert_node_with_labels(
+            Vec::<String>::new(),
+            NodeId::new(),
+            &rec("bare", vec![0.8, 0.2, 0.0]),
+        )
+        .unwrap();
+    writer
+        .upsert_node("C", NodeId::new(), &rec("other", vec![0.0, 1.0, 0.0]))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    // Exercise VectorSearch's exact label-less fallback directly. No index can
+    // serve a cross-label KNN, so it must scan physical nodes once.
+    let plan = LogicalPlan::VectorSearch {
+        label: None,
+        alias: "d".into(),
+        property: "embedding".into(),
+        query: Expression {
+            kind: ExpressionKind::Parameter("q".into()),
+            span: SourceSpan::point(0),
+        },
+        k: RowCount::Const(10),
+        distance: VectorDistance::Cosine,
+        score_alias: "score".into(),
+        post_filter: None,
+    };
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let rows = execute(&plan, &writer.snapshot(), &params).await.unwrap();
+    let got: Vec<String> = rows
+        .iter()
+        .map(|row| match row.get("d") {
+            Some(RuntimeValue::Node(node)) => match node.properties.get("title") {
+                Some(RuntimeValue::String(title)) => title.clone(),
+                other => panic!("expected title string, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(got, vec!["multi", "bare", "other"]);
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.
@@ -156,6 +223,7 @@ mod indexed {
     use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
     use namidb_query::{optimize, StatsCatalog};
     use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+    use object_store::ObjectStoreExt;
 
     const DIM: u32 = 4;
     const KNN3: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL \
@@ -315,6 +383,85 @@ mod indexed {
             "fresh memtable node visible"
         );
         assert!(!got.contains(&"a".to_string()), "deleted node excluded");
+    }
+
+    #[tokio::test]
+    async fn undecodable_vector_index_with_full_delta_falls_back_to_flat() {
+        // Regression: storage used to collapse "the .vg failed to decode" into
+        // an empty hit list. If the fresh memtable delta alone could fill k, the
+        // executor then returned that delta without flat-scanning the persisted
+        // corpus, potentially omitting a much better neighbour.
+        let backing = store();
+        let p = paths("idx-corrupt-with-delta");
+        let mut w = WriterSession::open(backing.clone(), p.clone())
+            .await
+            .unwrap();
+        w.register_vector_index(
+            VectorIndexDescriptor {
+                name: "doc_emb".into(),
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: DIM,
+                metric: VectorMetric::Cosine,
+                r: 32,
+                l_build: 64,
+                alpha: 1.2,
+                quantization: VectorQuantization::None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("persisted-best", "X", vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("persisted-far", "X", vec![0.0, 0.0, 1.0, 0.0]),
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+        w.compact_l0(&schema()).await.unwrap();
+
+        let vg_path = {
+            let snap = w.snapshot();
+            snap.manifest()
+                .manifest
+                .ssts
+                .iter()
+                .find(|d| d.kind == namidb_storage::manifest::SstKind::VectorGraph)
+                .expect("compaction builds .vg")
+                .path
+                .clone()
+        };
+        let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), vg_path);
+        backing
+            .put(
+                &object_store::path::Path::from(absolute),
+                object_store::PutPayload::from_static(b"NAMIVG00corrupt"),
+            )
+            .await
+            .unwrap();
+
+        // One inferior fresh candidate is enough to fill LIMIT 1. It must not
+        // mask the persisted exact best merely because the graph is unreadable.
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("fresh-inferior", "X", vec![0.0, 1.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        w.commit_batch().await.unwrap();
+
+        let cypher = "MATCH (d:Doc) RETURN d.title AS title, \
+             cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 1";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        assert_eq!(got, vec!["persisted-best".to_string()]);
     }
 
     #[tokio::test]

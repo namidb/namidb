@@ -22,7 +22,7 @@
 //! - Property values must be representable as `core::Value` scalars
 //! (List/Map/Node/Rel are rejected with an explicit error).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
@@ -712,6 +712,7 @@ fn apply_spread_properties(
     core_props: &mut BTreeMap<String, CoreValue>,
     runtime_props: &mut BTreeMap<String, RuntimeValue>,
     explicit_id: &mut Option<NodeId>,
+    reserved_id_error: Option<&'static str>,
 ) -> Result<(), ExecError> {
     let value = evaluate(spread_expr, row, params)?;
     let map = match value {
@@ -725,6 +726,9 @@ fn apply_spread_properties(
     };
     for (k, v) in map {
         if k == "_id" {
+            if let Some(message) = reserved_id_error {
+                return Err(ExecError::Runtime(message.into()));
+            }
             *explicit_id = Some(crate::exec::walker::node_id_from_value(
                 &v,
                 spread_expr.span,
@@ -1178,6 +1182,7 @@ async fn apply_create(
                         &mut core_props,
                         &mut runtime_props,
                         &mut explicit_id,
+                        None,
                     )?;
                 }
                 for (k, expr) in properties {
@@ -1276,14 +1281,15 @@ async fn apply_create(
                         &mut core_props,
                         &mut runtime_props,
                         &mut ignored_id,
+                        Some("_id is not valid on a relationship CREATE"),
                     )?;
-                    if ignored_id.is_some() {
+                }
+                for (k, expr) in properties {
+                    if k == "_id" {
                         return Err(ExecError::Runtime(
                             "_id is not valid on a relationship CREATE".into(),
                         ));
                     }
-                }
-                for (k, expr) in properties {
                     let v = evaluate(expr, &row, params)?;
                     let core = runtime_to_core(&v, expr).map_err(ExecError::Runtime)?;
                     core_props.insert(k.clone(), core);
@@ -1862,11 +1868,18 @@ async fn find_merge_matches(
                 alias,
                 labels,
                 properties,
-                properties_spread: _,
+                properties_spread,
             } => {
                 // Carry the full label set: `MERGE (n:A:B)` matches a node that
                 // carries BOTH labels, and creates one with both on miss.
-                nodes.insert(alias.as_str(), (labels.as_slice(), properties.as_slice()));
+                nodes.insert(
+                    alias.as_str(),
+                    MergeNodePattern {
+                        labels: labels.as_slice(),
+                        properties: properties.as_slice(),
+                        properties_spread: properties_spread.as_ref(),
+                    },
+                );
             }
             CreateElement::Rel { .. } => rels.push(el),
         }
@@ -1879,21 +1892,9 @@ async fn find_merge_matches(
                 "MERGE pattern must contain at least one node".into(),
             ));
         }
-        let (head_alias, (head_labels, head_props)) = nodes.into_iter().next().expect("len == 1");
-        let snap = writer.overlay_snapshot();
-        let candidates = snap
-            .scan_label(merge_scan_label(head_labels))
-            .await
-            .map_err(ExecError::Storage)?;
+        let (head_alias, head) = nodes.into_iter().next().expect("len == 1");
         let mut matched_rows: Vec<Row> = Vec::new();
-        for view in candidates {
-            let node_val = NodeValue::from(view);
-            if !node_has_all_labels(&node_val, head_labels) {
-                continue;
-            }
-            if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
-                continue;
-            }
+        for node_val in merge_node_candidates(head, outer_row, writer, params).await? {
             let mut new_row = outer_row.clone();
             new_row.set(
                 head_alias.to_string(),
@@ -1914,41 +1915,63 @@ async fn find_merge_matches(
     //   * a back-reference to an alias already bound on the outer row
     //     (e.g. `MATCH (a), (b) MERGE (a)-[:R]->(b)`) — no scan, just
     //     keep the carried-in NodeValue.
-    let snap = writer.overlay_snapshot();
     let first_head_alias = match rels[0] {
         CreateElement::Rel { source_alias, .. } => source_alias.as_str(),
         _ => unreachable!("rels only contains Rel variants"),
     };
     let mut matched_rows: Vec<Row> =
-        seed_merge_head(first_head_alias, &nodes, outer_row, &snap, params).await?;
+        seed_merge_head(first_head_alias, &nodes, outer_row, writer, params).await?;
+    let snap = writer.overlay_snapshot();
 
     for rel in &rels {
-        let (rel_alias, rel_edge_type, rel_direction, rel_props, source_alias, target_alias) =
-            match rel {
-                CreateElement::Rel {
-                    alias,
-                    edge_type,
-                    direction,
-                    properties,
-                    source_alias,
-                    target_alias,
-                    ..
-                } => (
-                    alias.as_deref(),
-                    edge_type.as_str(),
-                    *direction,
-                    properties.as_slice(),
-                    source_alias.as_str(),
-                    target_alias.as_str(),
-                ),
-                _ => unreachable!("rels only contains Rel variants"),
-            };
+        let (
+            rel_alias,
+            rel_edge_type,
+            rel_direction,
+            rel_props,
+            rel_properties_spread,
+            source_alias,
+            target_alias,
+        ) = match rel {
+            CreateElement::Rel {
+                alias,
+                edge_type,
+                direction,
+                properties,
+                properties_spread,
+                source_alias,
+                target_alias,
+            } => (
+                alias.as_deref(),
+                edge_type.as_str(),
+                *direction,
+                properties.as_slice(),
+                properties_spread.as_ref(),
+                source_alias.as_str(),
+                target_alias.as_str(),
+            ),
+            _ => unreachable!("rels only contains Rel variants"),
+        };
         // Resolve the tail: either a fresh pattern Node or a
         // back-reference to a binding on the outer row.
         let tail = MergeTail::resolve(target_alias, &nodes, outer_row)?;
 
         let mut next: Vec<Row> = Vec::new();
         for source_row in matched_rows {
+            let expected_rel_props = materialize_merge_rel_properties(
+                rel_props,
+                rel_properties_spread,
+                &source_row,
+                params,
+            )?;
+            let expected_tail = match &tail {
+                MergeTail::Fresh(pattern) => Some(materialize_merge_node_pattern(
+                    *pattern,
+                    &source_row,
+                    params,
+                )?),
+                MergeTail::BackReference { .. } => None,
+            };
             let source_node_id = match source_row.get(source_alias) {
                 Some(RuntimeValue::Node(n)) => n.id,
                 _ => continue,
@@ -1971,9 +1994,9 @@ async fn find_merge_matches(
                     _ => unreachable!(),
                 };
                 let partner_node = match &tail {
-                    MergeTail::Fresh { labels, props } => {
+                    MergeTail::Fresh(pattern) => {
                         let view = match snap
-                            .lookup_node(merge_scan_label(labels), partner_id)
+                            .lookup_node(merge_scan_label(pattern.labels), partner_id)
                             .await
                             .map_err(ExecError::Storage)?
                         {
@@ -1981,10 +2004,11 @@ async fn find_merge_matches(
                             None => continue,
                         };
                         let partner = NodeValue::from(view);
-                        if !node_has_all_labels(&partner, labels) {
-                            continue;
-                        }
-                        if !merge_props_match(props, &partner.properties, &source_row, params)? {
+                        if !materialized_node_matches(
+                            &partner,
+                            pattern.labels,
+                            expected_tail.as_ref().expect("fresh tail was materialized"),
+                        ) {
                             continue;
                         }
                         partner
@@ -1997,7 +2021,7 @@ async fn find_merge_matches(
                     }
                 };
                 let rel_value = RelValue::from(e);
-                if !merge_props_match(rel_props, &rel_value.properties, &source_row, params)? {
+                if !materialized_props_match(&expected_rel_props, &rel_value.properties) {
                     continue;
                 }
                 let mut new_row = source_row.clone();
@@ -2016,10 +2040,30 @@ async fn find_merge_matches(
     Ok(matched_rows)
 }
 
-/// `alias -> (label, declared property entries)` map built once per
-/// MERGE call from the lowered `CreateElement::Node`s. Lives only as
-/// long as `find_merge_matches` borrows the lowered pattern.
-type MergeNodeMap<'a> = BTreeMap<&'a str, (&'a [String], &'a [(String, Expression)])>;
+/// Borrowed node-pattern metadata retained while matching a MERGE. Unlike the
+/// old `(labels, properties)` tuple, this deliberately carries the optional
+/// `$props` spread: ignoring it made `MERGE (n:L $props)` match every `:L`
+/// node regardless of the supplied key.
+#[derive(Clone, Copy)]
+struct MergeNodePattern<'a> {
+    labels: &'a [String],
+    properties: &'a [(String, Expression)],
+    properties_spread: Option<&'a Expression>,
+}
+
+/// `alias -> node pattern` map built once per MERGE call. Lives only as long
+/// as `find_merge_matches` borrows the lowered pattern.
+type MergeNodeMap<'a> = BTreeMap<&'a str, MergeNodePattern<'a>>;
+
+/// One node MERGE pattern evaluated against its current outer row. Both
+/// runtime and storage values are kept: runtime values preserve Cypher's
+/// comparison semantics for residual predicates, while storage values are
+/// the canonical keys consumed by `WriterSession::unique_probe`.
+struct MaterializedMergeNode {
+    properties: BTreeMap<String, RuntimeValue>,
+    core_properties: BTreeMap<String, CoreValue>,
+    explicit_id: Option<NodeId>,
+}
 
 /// The label a MERGE node scans on (its primary/first); the remaining labels
 /// are confirmed per-candidate by [`node_has_all_labels`]. Empty string when
@@ -2034,31 +2078,377 @@ fn node_has_all_labels(n: &NodeValue, required: &[String]) -> bool {
     required.iter().all(|l| n.labels.contains(l))
 }
 
+/// Evaluate a node pattern's spread and explicit map exactly once for the
+/// current outer row. Explicit entries override spread entries, matching the
+/// create branch. `_id` is an engine NodeId selector rather than a stored
+/// property and is therefore split out for the direct lookup path.
+fn materialize_merge_node_pattern(
+    pattern: MergeNodePattern<'_>,
+    row: &Row,
+    params: &Params,
+) -> Result<MaterializedMergeNode, ExecError> {
+    let mut core_properties = BTreeMap::new();
+    let mut properties = BTreeMap::new();
+    let mut explicit_id = None;
+    if let Some(spread_expr) = pattern.properties_spread {
+        apply_spread_properties(
+            spread_expr,
+            row,
+            params,
+            &mut core_properties,
+            &mut properties,
+            &mut explicit_id,
+            None,
+        )?;
+    }
+    for (key, expr) in pattern.properties {
+        let value = evaluate(expr, row, params)?;
+        if key == "_id" {
+            explicit_id = Some(crate::exec::walker::node_id_from_value(&value, expr.span)?);
+            continue;
+        }
+        let core = runtime_to_core(&value, expr).map_err(ExecError::Runtime)?;
+        core_properties.insert(key.clone(), core);
+        properties.insert(key.clone(), value);
+    }
+    Ok(MaterializedMergeNode {
+        properties,
+        core_properties,
+        explicit_id,
+    })
+}
+
+/// Evaluate a relationship MERGE property map, including `$props`. `_id`
+/// remains invalid for relationships, exactly as on the create branch.
+fn materialize_merge_rel_properties(
+    properties: &[(String, Expression)],
+    properties_spread: Option<&Expression>,
+    row: &Row,
+    params: &Params,
+) -> Result<BTreeMap<String, RuntimeValue>, ExecError> {
+    let mut core_properties = BTreeMap::new();
+    let mut runtime_properties = BTreeMap::new();
+    if let Some(spread_expr) = properties_spread {
+        let mut invalid_id = None;
+        apply_spread_properties(
+            spread_expr,
+            row,
+            params,
+            &mut core_properties,
+            &mut runtime_properties,
+            &mut invalid_id,
+            Some("_id is not valid on a relationship MERGE"),
+        )?;
+    }
+    for (key, expr) in properties {
+        if key == "_id" {
+            return Err(ExecError::Runtime(
+                "_id is not valid on a relationship MERGE".into(),
+            ));
+        }
+        let value = evaluate(expr, row, params)?;
+        // Run the same storability validation as the create branch even
+        // though only runtime values are needed for the residual comparison.
+        let core = runtime_to_core(&value, expr).map_err(ExecError::Runtime)?;
+        core_properties.insert(key.clone(), core);
+        runtime_properties.insert(key.clone(), value);
+    }
+    Ok(runtime_properties)
+}
+
+fn materialized_props_match(
+    expected: &BTreeMap<String, RuntimeValue>,
+    actual: &BTreeMap<String, RuntimeValue>,
+) -> bool {
+    expected.iter().all(|(key, value)| {
+        actual
+            .get(key)
+            .is_some_and(|v| runtime_values_equal(v, value))
+    })
+}
+
+fn materialized_node_matches(
+    node: &NodeValue,
+    required_labels: &[String],
+    expected: &MaterializedMergeNode,
+) -> bool {
+    node_has_all_labels(node, required_labels)
+        && expected.explicit_id.is_none_or(|id| node.id == id)
+        && materialized_props_match(&expected.properties, &node.properties)
+}
+
+/// Unique keys declared by the schema and fully covered by this MERGE node
+/// pattern. Composite constraints are included (longest first); legacy
+/// single-property `PropertyDef::unique` flags are included even when the
+/// named-constraint list predates them. Labels may be secondary in
+/// `MERGE (n:A:B)`: the lookup is scoped to the label that owns the
+/// constraint, then all required labels are checked as residuals.
+fn covered_merge_unique_keys(
+    writer: &WriterSession,
+    labels: &[String],
+    expected: &MaterializedMergeNode,
+) -> Vec<(String, Vec<(String, CoreValue)>)> {
+    let schema = writer.schema();
+    let mut specs: BTreeSet<(String, Vec<String>)> = BTreeSet::new();
+    for constraint in schema.constraints() {
+        if constraint.kind != namidb_core::ConstraintKind::Unique
+            || !labels.iter().any(|l| l == &constraint.label)
+        {
+            continue;
+        }
+        let mut names = constraint.properties.clone();
+        names.sort();
+        if names
+            .iter()
+            .all(|name| expected.core_properties.contains_key(name))
+        {
+            specs.insert((constraint.label.clone(), names));
+        }
+    }
+    for label in labels {
+        let Some(def) = schema.label(label) else {
+            continue;
+        };
+        for property in &def.properties {
+            if property.unique && expected.core_properties.contains_key(&property.name) {
+                specs.insert((label.clone(), vec![property.name.clone()]));
+            }
+        }
+    }
+    let mut out: Vec<_> = specs
+        .into_iter()
+        .map(|(label, names)| {
+            let values: Vec<(String, CoreValue)> = names
+                .into_iter()
+                .map(|name| {
+                    let value = expected
+                        .core_properties
+                        .get(&name)
+                        .expect("covered key")
+                        .clone();
+                    (name, value)
+                })
+                .collect();
+            (label, values)
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// First declared non-unique equality index covered by the pattern. String
+/// values use the equality posting-list sidecar; other values deliberately
+/// fall through to the typed/full scan path because storage's equality
+/// sidecar is currently string-only.
+fn covered_merge_equality_key(
+    writer: &WriterSession,
+    labels: &[String],
+    expected: &MaterializedMergeNode,
+) -> Option<(String, String, String)> {
+    for label in labels {
+        let Some(def) = writer.schema().label(label) else {
+            continue;
+        };
+        for property in &def.properties {
+            if property.indexed && !property.unique {
+                if let Some(RuntimeValue::String(value)) = expected.properties.get(&property.name) {
+                    return Some((label.clone(), property.name.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Candidate selection for a fresh node in a MERGE pattern:
+///
+/// 1. `_id` → direct NodeId lookup.
+/// 2. Fully-covered unique (including composite) key → transactional O(1)
+///    probe plus direct NodeId lookup. The index sees committed + staged rows.
+/// 3. Declared non-unique equality index → posting-list lookup.
+/// 4. No usable index → legacy label scan.
+///
+/// Every fast path applies the full label/property residual afterwards, so
+/// the optimization cannot weaken MERGE's whole-pattern semantics.
+async fn merge_node_candidates(
+    pattern: MergeNodePattern<'_>,
+    row: &Row,
+    writer: &WriterSession,
+    params: &Params,
+) -> Result<Vec<NodeValue>, ExecError> {
+    let expected = materialize_merge_node_pattern(pattern, row, params)?;
+
+    if let Some(id) = expected.explicit_id {
+        let snap = writer.overlay_snapshot();
+        let found = if pattern.labels.is_empty() {
+            crate::exec::walker::scan_node_for_id(&snap, id).await?
+        } else {
+            snap.lookup_node(merge_scan_label(pattern.labels), id)
+                .await
+                .map_err(ExecError::Storage)?
+        };
+        return Ok(found
+            .map(NodeValue::from)
+            .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
+            .into_iter()
+            .collect());
+    }
+
+    for (label, tuple) in covered_merge_unique_keys(writer, pattern.labels, &expected) {
+        let Some(variants) = merge_unique_probe_variants(&tuple) else {
+            continue;
+        };
+        let mut candidate_ids = BTreeSet::new();
+        let mut fully_indexable = true;
+        for variant in variants {
+            let refs: Vec<(&str, &CoreValue)> = variant
+                .iter()
+                .map(|(name, value)| (name.as_str(), value))
+                .collect();
+            match writer
+                .unique_probe(&label, &refs, None)
+                .await
+                .map_err(ExecError::Storage)?
+            {
+                UniqueProbe::Conflict(id) => {
+                    candidate_ids.insert(id);
+                }
+                UniqueProbe::NoConflict => {}
+                // NULL / list / map / vector / ambiguous large-float keys
+                // cannot prove absence through this index. Try another
+                // covered key, then fall through to equality/label scan.
+                UniqueProbe::Unindexable => {
+                    fully_indexable = false;
+                    break;
+                }
+            }
+        }
+        if !fully_indexable {
+            continue;
+        }
+
+        // Absence across every Cypher-equal encoding proves that the full
+        // pattern cannot match. For numeric keys this includes both strict
+        // I64/F64 storage domains.
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snap = writer.overlay_snapshot();
+        let mut found = Vec::with_capacity(candidate_ids.len());
+        for id in candidate_ids {
+            let Some(node) = snap
+                .lookup_node(&label, id)
+                .await
+                .map_err(ExecError::Storage)?
+                .map(NodeValue::from)
+            else {
+                continue;
+            };
+            if materialized_node_matches(&node, pattern.labels, &expected) {
+                found.push(node);
+            }
+        }
+        return Ok(found);
+    }
+
+    if let Some((label, property, value)) =
+        covered_merge_equality_key(writer, pattern.labels, &expected)
+    {
+        let snap = writer.overlay_snapshot();
+        let lookup_value = RuntimeValue::String(value);
+        let candidates = crate::exec::walker::lookup_nodes_by_property_via_scan(
+            &snap,
+            &label,
+            &property,
+            &lookup_value,
+        )
+        .await?;
+        return Ok(candidates
+            .into_iter()
+            .map(NodeValue::from)
+            .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
+            .collect());
+    }
+
+    let snap = writer.overlay_snapshot();
+    let candidates = snap
+        .scan_label(merge_scan_label(pattern.labels))
+        .await
+        .map_err(ExecError::Storage)?;
+    Ok(candidates
+        .into_iter()
+        .map(NodeValue::from)
+        .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
+        .collect())
+}
+
+/// Strict storage uniqueness distinguishes integers from floats, while Cypher
+/// equality considers `1` and `1.0` equal. Produce the small Cartesian set of
+/// strict tuples that can satisfy the runtime predicate so a negative result
+/// remains proof of absence without giving numeric bulk loads an O(N) scan.
+///
+/// Integer→float has exactly one counterpart (`n as f64`). A finite integral
+/// float below 2^53 has exactly one integer counterpart. Above that boundary
+/// several adjacent i64 values may round to the same f64, so the safe answer
+/// is `None` (fall back to a scan). The variant cap prevents pathological
+/// user-defined composite constraints from creating exponential work.
+fn merge_unique_probe_variants(
+    tuple: &[(String, CoreValue)],
+) -> Option<Vec<Vec<(String, CoreValue)>>> {
+    const MAX_VARIANTS: usize = 256;
+    const MAX_EXACT_INTEGER_F64: f64 = 9_007_199_254_740_992.0; // 2^53
+
+    let mut variants: Vec<Vec<(String, CoreValue)>> = vec![Vec::with_capacity(tuple.len())];
+    for (name, value) in tuple {
+        let options = match value {
+            CoreValue::I64(n) => vec![CoreValue::I64(*n), CoreValue::F64(*n as f64)],
+            CoreValue::F64(f) if f.is_nan() => return None,
+            CoreValue::F64(f)
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < MAX_EXACT_INTEGER_F64 =>
+            {
+                let n = *f as i64;
+                debug_assert_eq!(n as f64, *f);
+                vec![CoreValue::F64(*f), CoreValue::I64(n)]
+            }
+            CoreValue::F64(f)
+                if f.is_finite() && f.fract() == 0.0 && f.abs() >= MAX_EXACT_INTEGER_F64 =>
+            {
+                return None;
+            }
+            _ => vec![value.clone()],
+        };
+        if variants.len().checked_mul(options.len())? > MAX_VARIANTS {
+            return None;
+        }
+        let mut expanded = Vec::with_capacity(variants.len() * options.len());
+        for prefix in variants {
+            for option in &options {
+                let mut next = prefix.clone();
+                next.push((name.clone(), option.clone()));
+                expanded.push(next);
+            }
+        }
+        variants = expanded;
+    }
+    Some(variants)
+}
+
 /// Seed `find_merge_matches` for an N-hop chain. The "head" alias is
 /// the source of the first rel. If the pattern declares it as a fresh
-/// Node we scan its label; if the caller already bound it on the outer
-/// row (back-reference) we lift that NodeValue verbatim.
+/// Node we use the same indexed candidate selection as single-node MERGE; if
+/// the caller already bound it on the outer row (back-reference) we lift that
+/// NodeValue verbatim.
 async fn seed_merge_head(
     head_alias: &str,
     nodes: &MergeNodeMap<'_>,
     outer_row: &Row,
-    snap: &namidb_storage::Snapshot<'_>,
+    writer: &WriterSession,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    if let Some((head_labels, head_props)) = nodes.get(head_alias).copied() {
-        let candidates = snap
-            .scan_label(merge_scan_label(head_labels))
-            .await
-            .map_err(ExecError::Storage)?;
+    if let Some(pattern) = nodes.get(head_alias).copied() {
         let mut out = Vec::new();
-        for view in candidates {
-            let node_val = NodeValue::from(view);
-            if !node_has_all_labels(&node_val, head_labels) {
-                continue;
-            }
-            if !merge_props_match(head_props, &node_val.properties, outer_row, params)? {
-                continue;
-            }
+        for node_val in merge_node_candidates(pattern, outer_row, writer, params).await? {
             let mut new_row = outer_row.clone();
             new_row.set(
                 head_alias.to_string(),
@@ -2084,10 +2474,7 @@ async fn seed_merge_head(
 /// back-reference to a NodeValue already bound on the outer row (the
 /// rel must point at exactly that id).
 enum MergeTail<'a> {
-    Fresh {
-        labels: &'a [String],
-        props: &'a [(String, Expression)],
-    },
+    Fresh(MergeNodePattern<'a>),
     BackReference {
         node_id: NodeId,
         value: Box<NodeValue>,
@@ -2096,8 +2483,8 @@ enum MergeTail<'a> {
 
 impl<'a> MergeTail<'a> {
     fn resolve(alias: &str, nodes: &MergeNodeMap<'a>, outer_row: &Row) -> Result<Self, ExecError> {
-        if let Some((labels, props)) = nodes.get(alias).copied() {
-            return Ok(MergeTail::Fresh { labels, props });
+        if let Some(pattern) = nodes.get(alias).copied() {
+            return Ok(MergeTail::Fresh(pattern));
         }
         if let Some(RuntimeValue::Node(n)) = outer_row.get(alias) {
             return Ok(MergeTail::BackReference {
@@ -2110,22 +2497,6 @@ impl<'a> MergeTail<'a> {
             alias
         )))
     }
-}
-
-fn merge_props_match(
-    declared: &[(String, Expression)],
-    actual: &BTreeMap<String, RuntimeValue>,
-    row: &Row,
-    params: &Params,
-) -> Result<bool, ExecError> {
-    for (key, expr) in declared {
-        let expected = evaluate(expr, row, params)?;
-        match actual.get(key) {
-            Some(v) if runtime_values_equal(v, &expected) => continue,
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
 }
 
 fn runtime_values_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {

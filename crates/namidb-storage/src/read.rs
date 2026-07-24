@@ -432,6 +432,9 @@ impl<'mt> Snapshot<'mt> {
         value: &str,
     ) -> Result<Option<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_node_by_property");
+        if let Some(cache) = &self.property_index_cache {
+            cache.record_unique_lookup();
+        }
         // 1. Try the cross-snapshot in-memory index — `O(1)` warm path.
         if let Some(cache) = &self.property_index_cache {
             if let Some(idx) = cache.get(label, property) {
@@ -472,55 +475,38 @@ impl<'mt> Snapshot<'mt> {
             });
         if all_have_sidecar {
             namidb_core::profile_scope!("Snapshot::lookup_node_by_property.sidecar");
-            // Memtable wins on conflicts: scan memtable first for any
-            // upsert / tombstone of the same `value` so cross-store
-            // last-write-wins logic stays correct. Memtable rows
-            // without an LSN newer than the SST sidecar's authoritative
-            // entry won't override it, but a memtable upsert with the
-            // same `value` does: the user might have re-inserted a row
-            // under the same property between the SST's flush and
-            // ours. Materialise as a full label scan over the memtable
-            // — bounded by memtable size, not the SST.
-            let mut winner: Option<(u64, namidb_core::id::NodeId, bool)> = None;
+            // Gather every id that has ever claimed `value` in an in-scope
+            // sidecar, plus current memtable claimants, then confirm each
+            // candidate against the snapshot's last-write-wins node view.
+            //
+            // A unique sidecar stores `value → NodeId`, not the posting row's
+            // LSN. Using the enclosing SST's `max_lsn` as that row LSN is
+            // incorrect: an unrelated high-LSN row can make a stale claimant
+            // appear newer than the value's real reassignment in another SST.
+            // If that stale id was subsequently renamed, re-verifying only the
+            // false "winner" returns None and hides the real live owner.
+            //
+            // Candidate cardinality is bounded by the number of in-scope SSTs
+            // plus matching memtable rows (normally one under the uniqueness
+            // invariant), and BTreeSet gives deterministic probe order.
+            let mut candidates: BTreeSet<namidb_core::id::NodeId> = BTreeSet::new();
             for (mk, e) in self.node_entries() {
                 if let MemKey::Node { id } = mk {
-                    match &e.op {
-                        MemOp::Upsert(payload) => {
-                            let rec = NodeWriteRecord::decode(payload)?;
-                            if record_carries_label(&rec, label, &self.manifest.manifest.label_dict)
-                            {
-                                if let Some(namidb_core::Value::Str(s)) =
-                                    rec.properties.get(property)
-                                {
-                                    if s == value {
-                                        let bump = winner
-                                            .as_ref()
-                                            .map(|(lsn, _, _)| e.lsn > *lsn)
-                                            .unwrap_or(true);
-                                        if bump {
-                                            winner = Some((e.lsn, *id, false));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        MemOp::Tombstone => {
-                            // A node tombstone on a winning id removes it; a
-                            // tombstone on a non-winning id is irrelevant.
-                            if let Some((lsn, win_id, _)) = winner {
-                                if win_id == *id && e.lsn > lsn {
-                                    winner = Some((e.lsn, *id, true));
-                                }
-                            }
+                    if let MemOp::Upsert(payload) = &e.op {
+                        let rec = NodeWriteRecord::decode(payload)?;
+                        if record_carries_label(&rec, label, &self.manifest.manifest.label_dict)
+                            && matches!(rec.properties.get(property),
+                            Some(namidb_core::Value::Str(s)) if s == value)
+                        {
+                            candidates.insert(*id);
                         }
                     }
                 }
             }
 
-            // SST sidecar pass: bincode-decode each candidate's
-            // `(value → NodeId)` map and probe `value`. Last LSN wins
-            // when multiple SSTs carry an entry for the same value;
-            // SST LSN is `max_lsn` of the SST.
+            // SST sidecar pass: bincode-decode each `(value → NodeId)` map and
+            // retain every claimant. Confirmation below resolves tombstones,
+            // renames, relabels, and cross-SST last-write-wins by id.
             for idx in &sst_idxs {
                 let desc = &self.manifest.manifest.ssts[*idx];
                 let sidecar_desc = desc
@@ -557,36 +543,32 @@ impl<'mt> Snapshot<'mt> {
                     .map_err(|e| Error::invariant(format!("unique-index bincode decode: {e}")))?;
                 if let Some(id_bytes) = map.get(value) {
                     let id = namidb_core::id::NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-                    let bump = winner
-                        .as_ref()
-                        .map(|(lsn, _, _)| desc.max_lsn > *lsn)
-                        .unwrap_or(true);
-                    if bump {
-                        winner = Some((desc.max_lsn, id, false));
-                    }
+                    candidates.insert(id);
                 }
             }
 
-            return match winner {
-                Some((_, _, true)) => Ok(None), // tombstone-on-winner
-                Some((_, id, false)) => match self.lookup_node(label, id).await? {
-                    // Re-verify the current value: the SST sidecar maps
-                    // `value → id` as of flush time, but a later SET may have
-                    // renamed the property. If the live node no longer carries
-                    // `value`, the sidecar entry is stale — return no match so a
-                    // rename can't trigger a false unique-constraint violation
-                    // or a wrong MATCH hit. A memtable winner already matched at
-                    // its current value, so this never rejects a live match.
-                    Some(view)
-                        if matches!(view.properties.get(property),
-                            Some(namidb_core::Value::Str(s)) if s == value) =>
-                    {
-                        Ok(Some(view))
-                    }
-                    _ => Ok(None),
-                },
-                None => Ok(None), // not in any sidecar
-            };
+            // Under a valid unique constraint there is at most one confirmed
+            // live owner. If legacy/corrupt data contains more, select
+            // deterministically by newest row LSN, then lowest NodeId, rather
+            // than depending on manifest/SST iteration order.
+            let mut confirmed: Option<NodeView> = None;
+            for id in candidates {
+                let Some(view) = self.lookup_node(label, id).await? else {
+                    continue;
+                };
+                if !matches!(view.properties.get(property),
+                    Some(namidb_core::Value::Str(s)) if s == value)
+                {
+                    continue;
+                }
+                let replace = confirmed.as_ref().is_none_or(|current| {
+                    view.lsn > current.lsn || (view.lsn == current.lsn && view.id < current.id)
+                });
+                if replace {
+                    confirmed = Some(view);
+                }
+            }
+            return Ok(confirmed);
         }
 
         // 3. Legacy cold path: full label scan to build the index, then look up.
@@ -638,6 +620,9 @@ impl<'mt> Snapshot<'mt> {
         value: &str,
     ) -> Result<Vec<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property");
+        if let Some(cache) = &self.property_index_cache {
+            cache.record_equality_lookup();
+        }
 
         // Same label scoping as `lookup_node_by_property`: only SSTs that
         // can contain a live row of `label` need the sidecar; the rest can
@@ -1434,10 +1419,15 @@ impl<'mt> Snapshot<'mt> {
         split_batches_by_row_group(md, row_groups, batches)
     }
 
-    /// Id-primary cold lookup: resolve the last-LSN-wins record for `id` across
-    /// the memtable and every node SST (decoding each row's label set), with no
-    /// label scoping. `lookup_node` filters the result by label.
-    async fn lookup_node_by_id(&self, id: NodeId) -> Result<Option<NodeView>> {
+    /// Id-primary lookup: resolve the last-LSN-wins record for `id` across the
+    /// memtable and every node SST, decoding and returning its complete label
+    /// set. Label-agnostic query operators should use this directly instead of
+    /// trial-probing every observed label; the physical node key is already the
+    /// id, so that loop repeats the same point read `O(label_count)` times.
+    ///
+    /// [`Self::lookup_node`] layers its per-label caches and membership filter
+    /// over this primitive.
+    pub async fn lookup_node_by_id(&self, id: NodeId) -> Result<Option<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_node_by_id");
         let id_bytes = *id.as_bytes();
         let dict = &self.manifest.manifest.label_dict;
@@ -1642,6 +1632,39 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
+        self.scan_nodes_with_optional_label(Some(label), predicates, projection)
+            .await
+    }
+
+    /// Materialise every live node in one label-agnostic pass, with the same
+    /// predicate pushdown and property projection as
+    /// [`Self::scan_label_with_predicates_and_projection`].
+    ///
+    /// Each physical node id is reconciled once across the memtable and all
+    /// node SSTs, so multi-label nodes appear once and nodes with no labels are
+    /// included. This is the storage primitive for Cypher `MATCH (n)` and
+    /// typeless vector-search fallback; callers must not emulate it by
+    /// concatenating one `scan_label` per observed label.
+    #[instrument(skip(self, predicates, projection), fields(predicates = predicates.len(), projection = projection.as_ref().map(|p| p.len()).unwrap_or(0)))]
+    pub async fn scan_all_nodes_with_predicates_and_projection(
+        &self,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+    ) -> Result<Vec<NodeView>> {
+        self.scan_nodes_with_optional_label(None, predicates, projection)
+            .await
+    }
+
+    /// Shared implementation for typed and typeless scans. Keeping the label
+    /// filter optional here ensures both routes perform exactly one
+    /// memtable+SST reconciliation and cannot drift in predicate/projection
+    /// semantics.
+    async fn scan_nodes_with_optional_label(
+        &self,
+        label: Option<&str>,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+    ) -> Result<Vec<NodeView>> {
         let dict = &self.manifest.manifest.label_dict;
 
         // (node_id) → (winning lsn, materialised view or tombstone marker).
@@ -1789,12 +1812,13 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // 3. Drop tombstones and rows that don't carry `label`; return in
-        // ascending-id order (BTreeMap iter).
+        // 3. Drop tombstones and, for a typed scan, rows that don't carry the
+        // requested label. A typeless scan keeps all live rows, including an
+        // empty label set. Return in ascending-id order (BTreeMap iteration).
         Ok(latest
             .into_values()
             .filter_map(|(_, v)| v)
-            .filter(|v| v.labels.contains(label))
+            .filter(|v| label.is_none_or(|label| v.labels.contains(label)))
             .collect())
     }
 
@@ -2580,15 +2604,24 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(idx))
     }
 
+    /// Search the persisted vector-graph SSTs for `index_name`, preserving the
+    /// distinction between an empty result and an unusable index.
+    ///
+    /// `Ok(None)` means no matching `.vg` exists or at least one matching body
+    /// could not be decoded. Callers that merge fresh memtable deltas with the
+    /// persisted result must retain this signal and fall back to the flat scan:
+    /// treating an undecodable graph as an empty graph is only safe while the
+    /// fresh delta itself cannot fill `k`.
     #[cfg(feature = "vector-index")]
-    pub async fn vector_search(
+    pub async fn try_vector_search(
         &self,
         index_name: &str,
         query: &[f32],
         k: usize,
         ef: usize,
-    ) -> Result<Vec<(NodeId, f32)>> {
+    ) -> Result<Option<Vec<(NodeId, f32)>>> {
         let mut all: Vec<(NodeId, f32)> = Vec::new();
+        let mut found = false;
         // Score orientation is metric-dependent: cosine/dot are higher-is-closer,
         // euclidean is lower-is-closer. All `.vg` SSTs for one index share a
         // metric, so the last decoded one's orientation is authoritative.
@@ -2597,10 +2630,13 @@ impl<'mt> Snapshot<'mt> {
             if desc.kind != SstKind::VectorGraph || desc.scope != index_name {
                 continue;
             }
-            // A legacy (v1) or corrupt body fails to decode; skip it so the read
-            // falls back to the flat scan rather than erroring the whole query.
+            found = true;
+            // A legacy (v1) or corrupt body makes the persisted answer
+            // incomplete. Preserve "index unavailable" so the query layer can
+            // fall back to the exact flat scan rather than accidentally serving
+            // only a sufficiently-large fresh delta.
             let Some(idx) = self.fetch_vector_index(desc).await? else {
-                continue;
+                return Ok(None);
             };
             higher_is_better = idx.higher_is_better();
             all.extend(
@@ -2616,36 +2652,55 @@ impl<'mt> Snapshot<'mt> {
             all.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         }
         all.truncate(k);
-        Ok(all)
+        Ok(found.then_some(all))
     }
 
-    /// `true` if any persisted `Nodes` SST carries writes **newer** than the
-    /// `index_name` index's SST(s) — the index has been outrun by node data it
-    /// has not absorbed, so the caller must fall back to the exact flat scan.
+    /// Low-level vector-index probe retained for storage callers and benchmark
+    /// harnesses that only need the decoded hits. An absent/undecodable index is
+    /// represented as an empty result; query execution must use
+    /// [`Self::try_vector_search`] so it can trigger the exact fallback.
+    #[cfg(feature = "vector-index")]
+    pub async fn vector_search(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        Ok(self
+            .try_vector_search(index_name, query, k, ef)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// `true` if persisted `Nodes` SSTs carry writes that the `index_name`
+    /// index SST(s) may not have absorbed.
     ///
     /// An SST-backed index (`.vg` / `.ft`) is rebuilt only on an **authoritative**
-    /// (deepest-level) compaction whose merged rows span the full label corpus;
-    /// the rebuild stamps the index descriptor's `max_lsn` with that corpus's
-    /// high-water LSN. A later flush (→ L0) or partial merge (→ L1+) produces a
-    /// `Nodes` SST with a higher `max_lsn`. Comparing LSNs — not levels — is what
-    /// makes this correct regardless of which level the newer data landed at,
-    /// closing the partial-compaction truncation window: a shallow merge that
-    /// rewrites a subset to L1 no longer hides those rows from the freshness
-    /// check just because L0 is now empty. The lockstep `Nodes` SST written by
-    /// the same authoritative merge shares the index's `max_lsn` exactly, so it is
-    /// never (`>`) flagged. `kind` is the index SST kind
-    /// (`VectorGraph` / `TextIndex`).
+    /// compaction spanning the full label corpus. Its descriptor's `max_lsn`
+    /// stores that corpus high-water mark; later flushes/partial merges carry a
+    /// higher LSN. Comparing LSNs rather than levels catches both.
+    ///
+    /// The persisted gate is label-scoped without trusting live-label metadata
+    /// alone: an SST with no current row of the indexed label may still contain
+    /// a tombstone/relabel of an id that the old index serves. Every current
+    /// index descriptor stores its exact member-NodeId range. A newer node SST
+    /// can be ignored only when its label index proves it has no live row of the
+    /// target label **and** its key range is disjoint from each index SST it
+    /// outruns. Range and `max_lsn` stay paired per index SST, so a newer index
+    /// cannot lend its high-water mark to an older range. Legacy index
+    /// descriptors use 00..FF and remain conservatively global until rebuilt.
+    ///
+    /// `kind` is `VectorGraph` or `TextIndex`.
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
     pub fn index_outrun_by_nodes(&self, index_name: &str, kind: SstKind) -> bool {
-        let idx_lsn = self
-            .manifest
-            .manifest
+        let manifest = &self.manifest.manifest;
+        let index_ssts: Vec<&SstDescriptor> = manifest
             .ssts
             .iter()
             .filter(|d| d.kind == kind && d.scope == index_name)
-            .map(|d| d.max_lsn)
-            .max();
-        let Some(idx_lsn) = idx_lsn else {
+            .collect();
+        if index_ssts.is_empty() {
             // No index SST for this name yet. If any persisted `Nodes` SST
             // exists, its flushed rows are unabsorbed by the (nonexistent)
             // index AND are not in the memtable fresh-delta the caller merges,
@@ -2656,18 +2711,50 @@ impl<'mt> Snapshot<'mt> {
             // there is no Nodes SST either, the whole corpus is still in the
             // memtable, which the caller's fresh-delta merge fully covers, so
             // the index path stays correct.
-            return self
-                .manifest
-                .manifest
+            return manifest.ssts.iter().any(|d| d.kind == SstKind::Nodes);
+        }
+
+        let index_label = match kind {
+            SstKind::VectorGraph => manifest
+                .vector_indexes
+                .iter()
+                .find(|d| d.name == index_name)
+                .map(|d| d.label.as_str()),
+            SstKind::TextIndex => manifest
+                .text_indexes
+                .iter()
+                .find(|d| d.name == index_name)
+                .map(|d| d.label.as_str()),
+            _ => None,
+        };
+        let oldest_index_lsn = index_ssts.iter().map(|d| d.max_lsn).min().unwrap_or(0);
+        // A missing/malformed registration gives us no safe label scope.
+        let Some(index_label) = index_label else {
+            return manifest
                 .ssts
                 .iter()
-                .any(|d| d.kind == SstKind::Nodes);
+                .any(|d| d.kind == SstKind::Nodes && d.max_lsn > oldest_index_lsn);
         };
-        self.manifest
-            .manifest
-            .ssts
-            .iter()
-            .any(|d| d.kind == SstKind::Nodes && d.max_lsn > idx_lsn)
+
+        for (node_idx, node_sst) in manifest.ssts.iter().enumerate() {
+            if node_sst.kind != SstKind::Nodes || node_sst.max_lsn <= oldest_index_lsn {
+                continue;
+            }
+            // Missing/legacy label-index metadata deliberately returns true:
+            // without a proof of absence this SST may add/update a document.
+            if node_sst_can_contain_label(manifest, node_idx, index_label) {
+                return true;
+            }
+            // There is no live target-label row, but this SST may tombstone or
+            // relabel a member. Compare each index SST against its own LSN and
+            // range rather than combining an old range with a new high-water.
+            if index_ssts.iter().any(|index_sst| {
+                node_sst.max_lsn > index_sst.max_lsn && key_ranges_may_overlap(node_sst, index_sst)
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// (`vector-index`) Fresh node deltas (committed memtable + staged overlay)
@@ -3073,6 +3160,16 @@ fn record_carries_label(rec: &NodeWriteRecord, label: &str, dict: &LabelDictiona
     dict.id(label)
         .map(|lid| rec.labels.contains(&lid.get()))
         .unwrap_or(false)
+}
+
+/// Conservative overlap test for descriptor key ranges. Invalid/reversed
+/// metadata cannot prove disjointness and therefore overlaps by definition.
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+fn key_ranges_may_overlap(a: &SstDescriptor, b: &SstDescriptor) -> bool {
+    if a.min_key > a.max_key || b.min_key > b.max_key {
+        return true;
+    }
+    a.min_key <= b.max_key && b.min_key <= a.max_key
 }
 
 /// Whether the node SST at `idx` can contain a LIVE row carrying `label`.
@@ -6236,6 +6333,362 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(cache.get("Account", "code").is_none());
+    }
+
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn persisted_index_freshness_pairs_label_member_range_and_lsn() {
+        use crate::manifest::{
+            KindSpecificStats, LabelIndexDescriptor, SstKind, SstLevel, TextIndexDescriptor,
+            VectorIndexDescriptor, VectorMetric, VectorQuantization,
+        };
+        use chrono::Utc;
+
+        fn index_sst(
+            kind: SstKind,
+            scope: &str,
+            min_key: [u8; 16],
+            max_key: [u8; 16],
+            max_lsn: u64,
+        ) -> SstDescriptor {
+            let kind_specific = match kind {
+                SstKind::VectorGraph => KindSpecificStats::VectorGraph {
+                    dim: 4,
+                    metric: "cosine".into(),
+                    point_count: 2,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    entry_medoid: 0,
+                },
+                SstKind::TextIndex => KindSpecificStats::TextIndex {
+                    doc_count: 2,
+                    term_count: 2,
+                    total_len: 2,
+                },
+                _ => unreachable!("index_sst only builds vector/text descriptors"),
+            };
+            SstDescriptor {
+                id: Uuid::now_v7(),
+                kind,
+                scope: scope.into(),
+                level: SstLevel(1),
+                path: format!("{scope}.idx"),
+                size_bytes: 1,
+                row_count: 2,
+                created_at: Utc::now(),
+                min_key,
+                max_key,
+                min_lsn: 0,
+                max_lsn,
+                schema_version_min: 0,
+                schema_version_max: 0,
+                property_stats: vec![],
+                kind_specific,
+                bloom: None,
+                unique_property_indices: vec![],
+                equality_property_indices: vec![],
+                label_index: None,
+                per_label_property_stats: vec![],
+            }
+        }
+
+        fn node_sst(
+            min_key: [u8; 16],
+            max_key: [u8; 16],
+            max_lsn: u64,
+            label_counts: Option<Vec<(u32, u64)>>,
+        ) -> SstDescriptor {
+            SstDescriptor {
+                id: Uuid::now_v7(),
+                kind: SstKind::Nodes,
+                scope: String::new(),
+                level: SstLevel::L0,
+                path: format!("nodes-{max_lsn}.parquet"),
+                size_bytes: 1,
+                row_count: 1,
+                created_at: Utc::now(),
+                min_key,
+                max_key,
+                min_lsn: max_lsn,
+                max_lsn,
+                schema_version_min: 1,
+                schema_version_max: 1,
+                property_stats: vec![],
+                kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
+                bloom: None,
+                unique_property_indices: vec![],
+                equality_property_indices: vec![],
+                label_index: label_counts.map(|per_label_counts| LabelIndexDescriptor {
+                    path: "labels.bin".into(),
+                    size_bytes: 1,
+                    label_count: per_label_counts.len() as u64,
+                    posting_count: per_label_counts.iter().map(|(_, n)| *n).sum(),
+                    per_label_counts,
+                }),
+                per_label_property_stats: vec![],
+            }
+        }
+
+        let store = make_store();
+        let paths = make_paths("index-freshness-label-range");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_label = base.manifest.label_dict.intern("Note").get();
+        let other_label = base.manifest.label_dict.intern("Other").get();
+        base.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "note_vec".into(),
+            label: "Note".into(),
+            property: "embedding".into(),
+            dim: 4,
+            metric: VectorMetric::Cosine,
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let member_min = *sorted_node_id(10).as_bytes();
+        let member_max = *sorted_node_id(20).as_bytes();
+        base.manifest.ssts.extend([
+            index_sst(SstKind::VectorGraph, "note_vec", member_min, member_max, 10),
+            index_sst(SstKind::TextIndex, "note_ft", member_min, member_max, 10),
+        ]);
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let is_fresh = |loaded: LoadedManifest, name: &str, kind: SstKind| {
+            let snap = Snapshot::new(loaded, &empty_view, store.clone(), paths.clone());
+            !snap.index_outrun_by_nodes(name, kind)
+        };
+        let assert_both = |loaded: LoadedManifest, expected_fresh: bool| {
+            assert_eq!(
+                is_fresh(loaded.clone(), "note_vec", SstKind::VectorGraph),
+                expected_fresh
+            );
+            assert_eq!(
+                is_fresh(loaded, "note_ft", SstKind::TextIndex),
+                expected_fresh
+            );
+        };
+
+        // A new, unrelated-label UUIDv7 range is disjoint from every index
+        // member range: it cannot add a Note or remove/relabel an indexed id.
+        let mut unrelated = base.clone();
+        unrelated.manifest.ssts.push(node_sst(
+            *sorted_node_id(30).as_bytes(),
+            *sorted_node_id(30).as_bytes(),
+            20,
+            Some(vec![(other_label, 1)]),
+        ));
+        assert_both(unrelated, true);
+
+        // A live write carrying the indexed label is always dirty, even when
+        // its id range is disjoint (new Note document).
+        let mut same_label = base.clone();
+        same_label.manifest.ssts.push(node_sst(
+            *sorted_node_id(30).as_bytes(),
+            *sorted_node_id(30).as_bytes(),
+            20,
+            Some(vec![(note_label, 1)]),
+        ));
+        assert_both(same_label, false);
+
+        // Relabel/update of an existing member carries only Other now. Its id
+        // still overlaps the member range, so the index cannot serve stale.
+        let mut relabel = base.clone();
+        relabel.manifest.ssts.push(node_sst(
+            *sorted_node_id(15).as_bytes(),
+            *sorted_node_id(15).as_bytes(),
+            20,
+            Some(vec![(other_label, 1)]),
+        ));
+        assert_both(relabel, false);
+
+        // Even a disjoint range cannot be label-scoped when the Nodes SST has
+        // no label-index metadata: it might carry a new Note row.
+        let mut unknown_labels = base.clone();
+        unknown_labels.manifest.ssts.push(node_sst(
+            *sorted_node_id(30).as_bytes(),
+            *sorted_node_id(30).as_bytes(),
+            20,
+            None,
+        ));
+        assert_both(unknown_labels, false);
+
+        // Tombstone-only SSTs have no live label-index sidecar. Absence of that
+        // proof remains conservative and forces fallback.
+        let mut tombstone = base.clone();
+        tombstone.manifest.ssts.push(node_sst(
+            *sorted_node_id(15).as_bytes(),
+            *sorted_node_id(15).as_bytes(),
+            20,
+            None,
+        ));
+        assert_both(tombstone, false);
+
+        // Legacy index descriptors used 00..FF, so an unrelated SST can never
+        // prove range disjointness until authoritative recompaction rebuilds it.
+        let mut legacy = base.clone();
+        for desc in &mut legacy.manifest.ssts {
+            desc.min_key = [0u8; 16];
+            desc.max_key = [0xFFu8; 16];
+        }
+        legacy.manifest.ssts.push(node_sst(
+            *sorted_node_id(30).as_bytes(),
+            *sorted_node_id(30).as_bytes(),
+            20,
+            Some(vec![(other_label, 1)]),
+        ));
+        assert_both(legacy, false);
+
+        // Multiple index SSTs: a fresh descriptor's LSN must not mask a change
+        // that is newer than and overlaps the older descriptor.
+        let mut multiple = base.clone();
+        multiple.manifest.ssts.push(index_sst(
+            SstKind::VectorGraph,
+            "note_vec",
+            *sorted_node_id(40).as_bytes(),
+            *sorted_node_id(50).as_bytes(),
+            30,
+        ));
+        multiple.manifest.ssts.push(index_sst(
+            SstKind::TextIndex,
+            "note_ft",
+            *sorted_node_id(40).as_bytes(),
+            *sorted_node_id(50).as_bytes(),
+            30,
+        ));
+        multiple.manifest.ssts.push(node_sst(
+            *sorted_node_id(15).as_bytes(),
+            *sorted_node_id(15).as_bytes(),
+            20,
+            Some(vec![(other_label, 1)]),
+        ));
+        assert_both(multiple, false);
+    }
+
+    #[tokio::test]
+    async fn unique_sidecar_confirms_all_claimants_instead_of_using_sst_max_lsn() {
+        // Regression: the sidecar stores value→NodeId but no per-posting LSN.
+        // Treating desc.max_lsn as the posting's LSN lets an unrelated new row
+        // in SST #1 make its OLD "shared" claimant beat the true reassignment
+        // in SST #2. Reverification then rejects only that stale id and used to
+        // return None without ever checking the live new owner.
+        let store = make_store();
+        let paths = make_paths("unique-sidecar-posting-lsn");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let account_lid = base.manifest.label_dict.intern("Account").get();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().build();
+
+        let old_owner = sorted_node_id(1);
+        let unrelated = sorted_node_id(2);
+        let new_owner = sorted_node_id(3);
+
+        // SST #1: the interesting posting is old (LSN 10), but an unrelated
+        // row raises the descriptor max_lsn to 100.
+        let mut first = Memtable::new();
+        first.apply(
+            MemKey::Node { id: old_owner },
+            10,
+            MemOp::Upsert(coded_node_payload("code", "shared", account_lid)),
+        );
+        first.apply(
+            MemKey::Node { id: unrelated },
+            100,
+            MemOp::Upsert(coded_node_payload("code", "other", account_lid)),
+        );
+        let out1 = flush(&ms, &fence, &base, &first.freeze(), schema.clone())
+            .await
+            .unwrap();
+
+        // SST #2: release "shared" from the old id, then assign it to the new
+        // id. Both row LSNs are newer than the old posting, but the descriptor's
+        // max (90) is lower than SST #1's unrelated max (100).
+        let mut second = Memtable::new();
+        second.apply(
+            MemKey::Node { id: old_owner },
+            80,
+            MemOp::Upsert(coded_node_payload("code", "renamed", account_lid)),
+        );
+        second.apply(
+            MemKey::Node { id: new_owner },
+            90,
+            MemOp::Upsert(coded_node_payload("code", "shared", account_lid)),
+        );
+        let out2 = flush(&ms, &fence, &out1.committed, &second.freeze(), schema)
+            .await
+            .unwrap();
+        let mut committed = out2.committed;
+
+        let first_sst = committed
+            .manifest
+            .ssts
+            .iter()
+            .position(|d| d.kind == SstKind::Nodes && d.max_lsn == 100)
+            .expect("first node SST");
+        let second_sst = committed
+            .manifest
+            .ssts
+            .iter()
+            .position(|d| d.kind == SstKind::Nodes && d.max_lsn == 90)
+            .expect("second node SST");
+
+        for (ordinal, sst_idx, entries) in [
+            (
+                1u8,
+                first_sst,
+                vec![
+                    ("shared".to_string(), *old_owner.as_bytes()),
+                    ("other".to_string(), *unrelated.as_bytes()),
+                ],
+            ),
+            (
+                2u8,
+                second_sst,
+                vec![
+                    ("renamed".to_string(), *old_owner.as_bytes()),
+                    ("shared".to_string(), *new_owner.as_bytes()),
+                ],
+            ),
+        ] {
+            let map: BTreeMap<String, [u8; 16]> = entries.into_iter().collect();
+            let body = Bytes::from(bincode::serialize(&map).unwrap());
+            let relative = format!("sst/L0/fabricated-{ordinal}.idx_code.bin");
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), relative);
+            store
+                .put(
+                    &object_store::path::Path::from(absolute),
+                    body.clone().into(),
+                )
+                .await
+                .unwrap();
+            committed.manifest.ssts[sst_idx]
+                .unique_property_indices
+                .push(crate::manifest::UniquePropertyIndexDescriptor {
+                    property: "code".into(),
+                    path: relative,
+                    size_bytes: body.len() as u64,
+                    entry_count: map.len() as u64,
+                });
+        }
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+        let hit = snap
+            .lookup_node_by_property("Account", "code", "shared")
+            .await
+            .unwrap()
+            .expect("the reassigned value must resolve");
+        assert_eq!(hit.id, new_owner);
+        assert_eq!(hit.lsn, 90);
     }
 
     #[tokio::test]

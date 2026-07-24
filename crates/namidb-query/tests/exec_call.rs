@@ -830,6 +830,99 @@ async fn bm25_phrase_and_prefix_parity_between_index_and_flat() {
     }
 }
 
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn bm25_property_order_is_stable_across_index_fallback() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::TextIndexDescriptor;
+
+    fn note(title: &str, body: &str) -> NodeWriteRecord {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "title".to_string(),
+            namidb_core::Value::Str(title.to_string()),
+        );
+        props.insert(
+            "body".to_string(),
+            namidb_core::Value::Str(body.to_string()),
+        );
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    // TextIndexDescriptor canonicalises property sets to lexical order:
+    // ['body', 'title']. A reversed request must use that same order even when
+    // a fresh write makes search.bm25 switch from the index to the flat scan;
+    // otherwise the cross-field phrase "alpha beta" changes semantics.
+    let mut writer = WriterSession::open(store(), paths("bm25-prop-order"))
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new(
+                "note_ft".into(),
+                "Note".into(),
+                vec!["title".into(), "body".into()],
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![
+                PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    let target = NodeId::new();
+    writer
+        .upsert_node("Note", target, &note("beta", "alpha"))
+        .unwrap();
+    writer.flush(schema.clone()).await.unwrap();
+    writer
+        .upsert_node("Note", NodeId::new(), &note("words", "noise"))
+        .unwrap();
+    writer.flush(schema.clone()).await.unwrap();
+    writer.compact_l0(&schema).await.unwrap();
+
+    let cypher = "CALL search.bm25({label: 'Note', text_properties: ['title', 'body'], \
+         query: '\"alpha beta\"'}) YIELD node, score RETURN node";
+    let indexed = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        indexed.len(),
+        1,
+        "authoritative index must match the phrase"
+    );
+    assert!(matches!(
+        indexed[0].get("node"),
+        Some(RuntimeValue::Node(n)) if n.id == target
+    ));
+
+    // This same-label delta deliberately disables the exact BM25 index path.
+    // Results must not change solely because execution falls back to scanning.
+    writer
+        .upsert_node("Note", NodeId::new(), &note("fresh", "unrelated"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let fallback = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        fallback.len(),
+        1,
+        "flat fallback must preserve canonical field order"
+    );
+    assert!(matches!(
+        fallback[0].get("node"),
+        Some(RuntimeValue::Node(n)) if n.id == target
+    ));
+}
+
 #[tokio::test]
 async fn call_search_bm25_requires_text_property() {
     let mut writer = WriterSession::open(store(), paths("call-bm25-noprop"))

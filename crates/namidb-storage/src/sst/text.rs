@@ -62,6 +62,10 @@ pub struct TextIndexBuildStats {
     pub doc_count: u64,
     pub term_count: u64,
     pub total_len: u64,
+    /// Exact NodeId bounds of the indexed document corpus. These become the
+    /// TextIndex SST key range used by the persisted freshness gate.
+    pub min_node_id: [u8; 16],
+    pub max_node_id: [u8; 16],
 }
 
 /// Build a text-index body from `(NodeId, document text)` pairs. The text is the
@@ -98,10 +102,17 @@ pub fn build_body(
     }
     // We pushed postings in ascending document order, so each list is already
     // sorted by document index — deterministic and ready for scoring.
+    let (Some(&min_node_id), Some(&max_node_id)) =
+        (body.doc_ids.iter().min(), body.doc_ids.iter().max())
+    else {
+        return Ok(None);
+    };
     let stats = TextIndexBuildStats {
         doc_count: body.n_docs as u64,
         term_count: body.postings.len() as u64,
         total_len: body.total_len,
+        min_node_id,
+        max_node_id,
     };
     let payload = bincode::serialize(&body)
         .map_err(|e| Error::invariant(format!("text index encode failed: {e}")))?;

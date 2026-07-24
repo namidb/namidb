@@ -13,10 +13,12 @@
 //! next check.
 //!
 //! Consistency contract: a populated `(label, property-set)` map must agree
-//! with a fresh `scan_label` over the overlay snapshot at all times. Any
-//! event that can change node content outside the staged-write chokepoints
-//! (commit, flush, SST attach, DDL, batch discard) resets the index; the
-//! next probe repopulates from a fresh scan.
+//! with a fresh `scan_label` over the overlay snapshot at all times. Node
+//! mutations are applied at the staging chokepoints, so a successful commit
+//! or flush preserves the maps (those operations change durability or physical
+//! representation, not logical content). Events that bypass or undo those
+//! chokepoints — external SST attachment, batch discard, session reopen, and
+//! relevant DDL — reset the index; the next probe repopulates from a scan.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};

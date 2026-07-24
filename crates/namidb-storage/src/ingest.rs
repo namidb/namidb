@@ -200,9 +200,10 @@ pub struct WriterSession {
     /// (committed + staged), consulted by [`Self::unique_probe`] so a
     /// constraint-bearing bulk write pays one label scan instead of one per
     /// row. Maintained by the node staging chokepoints
-    /// (`upsert_node_with_labels` / `tombstone_node`) and reset wherever
-    /// `property_index_cache` is, plus on `discard_batch` (staged entries
-    /// are baked into its populated maps).
+    /// (`upsert_node_with_labels` / `tombstone_node`). Successful commits and
+    /// flushes preserve it: they change durability/representation but the
+    /// staged chokepoints have already applied the exact logical mutations.
+    /// Discard/reopen and external content attachment reset it.
     unique_index: crate::unique_index::UniqueConstraintIndex,
     /// Object store handle kept around so [`Self::commit_batch`] can
     /// fire the auto-snapshot path without re-deriving it from the
@@ -955,7 +956,10 @@ impl WriterSession {
         // (read-after-write bug). Subsequent snapshots rebuild on their
         // first miss. Mirrors the reset in `flush`/`attach_ssts`.
         self.property_index_cache.reset();
-        self.unique_index.reset();
+        // Do NOT reset `unique_index`: every committed node mutation already
+        // passed through apply_upsert/apply_tombstone while staged, so its maps
+        // now describe the committed state exactly. Keeping them warm is what
+        // makes auto-commit MERGE-by-key O(1) after the first population.
 
         // Auto-snapshot tick. Best effort: a snapshot is a cache, the
         // WAL is the source of truth. Log the failure and keep going
@@ -1208,7 +1212,9 @@ impl WriterSession {
         // new manifest version. Subsequent snapshots will rebuild on
         // their first miss.
         self.property_index_cache.reset();
-        self.unique_index.reset();
+        // A flush only moves the same logical rows from memtable/WAL into
+        // immutable SSTs. The transactional unique index remains exact and
+        // must stay warm across periodic loader flushes.
         Ok(outcome)
     }
 
