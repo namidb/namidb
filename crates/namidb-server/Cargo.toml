@@ -79,7 +79,7 @@ tokio-test = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
-rcgen = "0.13"
+rcgen = "0.14"
 # Also dev-deps so the TLS integration test (a separate crate) can drive a
 # verifying rustls client; they unify with the versions above.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
