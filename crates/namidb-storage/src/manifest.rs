@@ -25,6 +25,8 @@
 //! manifests below the pointer.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(debug_assertions)]
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -613,6 +615,9 @@ pub struct LoadedManifest {
     pub pointer_etag: Option<String>,
     /// E-tag-style version (some backends use this instead of e-tag).
     pub pointer_version: Option<String>,
+    /// Immutable manifest payload paired with [`Self::index`]. Code that
+    /// deliberately mutates a fixture or derived copy must construct a fresh
+    /// `LoadedManifest` through [`Self::new`] before handing it to a reader.
     pub manifest: Manifest,
     /// Pre-computed sorted-by-min-key index over `manifest.ssts`, bucketed
     /// by `(kind, scope)`. The read path uses this to skip the linear scan
@@ -1450,8 +1455,7 @@ fn parse_pointer_version(location: &Path) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
-/// Sorted-by-min-key index over [`Manifest::ssts`], bucketed by
-/// `(SstKind, scope)`.
+/// Key-range index over [`Manifest::ssts`], bucketed by `(SstKind, scope)`.
 ///
 /// Built once when a `LoadedManifest` is constructed; reused across
 /// every `Snapshot` lookup on that manifest. Lets the read path skip
@@ -1463,82 +1467,373 @@ fn parse_pointer_version(location: &Path) -> Option<u64> {
 ///
 /// ## Layout
 ///
-/// One bucket per `(kind, scope)` pair (e.g. `(Nodes, "Person")`).
-/// Each bucket stores indices into the parent `Manifest::ssts` vec,
-/// sorted ascending by `min_key`. Two consequences:
+/// One bucket per `(kind, scope)` pair (e.g. `(Nodes, "Person")`). L0 is
+/// indexed by a centred interval tree because flush ranges may overlap
+/// arbitrarily. Every level >= 1 is indexed independently: non-overlapping
+/// ranges use binary search, while a malformed/legacy level containing
+/// overlaps falls back to the same interval tree. Separating levels is
+/// correctness-critical because ranges from different levels overlap by
+/// design even when each individual level is disjoint.
 ///
-/// 1. **Disjoint ranges** (post-compaction L1+, where the writer
-/// guarantees ranges don't overlap) → binary-search to exactly one
-/// candidate.
-/// 2. **Overlapping ranges** (L0, where writers may flush SSTs whose
-/// `(min_key, max_key)` straddle each other) → binary-search to the
-/// first descriptor whose `min_key > target`, then walk backwards
-/// collecting every earlier descriptor whose `max_key >= target`.
-/// In practice L0 has a small bounded count, so the walk is short.
-#[derive(Debug, Default)]
+/// A point lookup is therefore `O(levels * log S + overlaps)` instead of
+/// walking every descriptor whose `min_key` precedes the target. The latter
+/// made a lookup near the end of a compacted bucket silently remain `O(S)`.
+#[derive(Debug)]
 pub struct DescriptorIndex {
-    buckets: HashMap<(SstKind, String), Vec<usize>>,
+    // Nested maps let the hot lookup borrow `scope` as `&str`; the previous
+    // `(SstKind, String)` key allocated a fresh `String` on every point probe.
+    buckets: HashMap<SstKind, HashMap<String, DescriptorBucket>>,
+    /// Debug-only guard against mutating the public `LoadedManifest.manifest`
+    /// without rebuilding this derived index.
+    #[cfg(debug_assertions)]
+    fingerprint: u64,
+}
+
+#[derive(Debug, Default)]
+struct DescriptorBucket {
+    /// Every descriptor in this `(kind, scope)` bucket, preserving the
+    /// `scope_descriptors` contract (ascending `min_key`).
+    all_by_min: Vec<usize>,
+    l0: OverlapRangeIndex,
+    /// One independently searchable index per level >= 1.
+    levels: Vec<(u32, LevelRangeIndex)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedRange {
+    descriptor: usize,
+    min: [u8; 16],
+    max: [u8; 16],
+}
+
+impl IndexedRange {
+    fn new(descriptor: usize, ssts: &[SstDescriptor]) -> Self {
+        let desc = &ssts[descriptor];
+        Self {
+            descriptor,
+            min: desc.min_key,
+            max: desc.max_key,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LevelRangeIndex {
+    Disjoint(Vec<IndexedRange>),
+    Overlapping(OverlapRangeIndex),
+}
+
+impl LevelRangeIndex {
+    fn build(mut ranges: Vec<IndexedRange>) -> Self {
+        ranges.sort_by_key(|range| (range.min, range.max, range.descriptor));
+        let disjoint = ranges.windows(2).all(|pair| pair[0].max < pair[1].min);
+        if disjoint {
+            Self::Disjoint(ranges)
+        } else {
+            Self::Overlapping(OverlapRangeIndex::build(ranges))
+        }
+    }
+
+    fn query(&self, target: &[u8; 16], out: &mut Vec<usize>, stats: &mut CandidateLookupStats) {
+        match self {
+            Self::Disjoint(ranges) => {
+                let after = upper_bound_min(ranges, target, stats);
+                if let Some(range) = after.checked_sub(1).and_then(|idx| ranges.get(idx)) {
+                    stats.record(1);
+                    if range.max >= *target {
+                        out.push(range.descriptor);
+                    }
+                }
+            }
+            Self::Overlapping(index) => index.query(target, out, stats),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct OverlapRangeIndex {
+    root: Option<Box<IntervalNode>>,
+}
+
+impl OverlapRangeIndex {
+    fn build(ranges: Vec<IndexedRange>) -> Self {
+        Self {
+            root: IntervalNode::build(ranges),
+        }
+    }
+
+    fn query(&self, target: &[u8; 16], out: &mut Vec<usize>, stats: &mut CandidateLookupStats) {
+        if let Some(root) = &self.root {
+            root.query(target, out, stats);
+        }
+    }
+}
+
+/// Centred interval tree for arbitrary inclusive descriptor ranges.
+///
+/// Intervals crossing `center` are held twice: ascending by `min` for a query
+/// left of the centre, and descending by `max` for a query right of it. In
+/// either direction one binary search identifies exactly the intervals that
+/// contain the target; the other intervals live in one recursively searched
+/// half. Choosing the median `min` as the centre bounds both children by half.
+#[derive(Debug)]
+struct IntervalNode {
+    center: [u8; 16],
+    by_min: Vec<IndexedRange>,
+    by_max_desc: Vec<IndexedRange>,
+    left: Option<Box<IntervalNode>>,
+    right: Option<Box<IntervalNode>>,
+}
+
+impl IntervalNode {
+    fn build(mut ranges: Vec<IndexedRange>) -> Option<Box<Self>> {
+        // Reversed/invalid metadata never matched the old
+        // `min <= target && max >= target` predicate. Drop it here too.
+        ranges.retain(|range| range.min <= range.max);
+        if ranges.is_empty() {
+            return None;
+        }
+        ranges.sort_by_key(|range| (range.min, range.max, range.descriptor));
+        let center = ranges[ranges.len() / 2].min;
+
+        let mut left = Vec::new();
+        let mut crossing = Vec::new();
+        let mut right = Vec::new();
+        for range in ranges {
+            if range.max < center {
+                left.push(range);
+            } else if range.min > center {
+                right.push(range);
+            } else {
+                crossing.push(range);
+            }
+        }
+
+        let mut by_min = crossing;
+        by_min.sort_by_key(|range| (range.min, range.max, range.descriptor));
+        let mut by_max_desc = by_min.clone();
+        by_max_desc.sort_by(|a, b| {
+            b.max
+                .cmp(&a.max)
+                .then_with(|| a.min.cmp(&b.min))
+                .then_with(|| a.descriptor.cmp(&b.descriptor))
+        });
+
+        Some(Box::new(Self {
+            center,
+            by_min,
+            by_max_desc,
+            left: Self::build(left),
+            right: Self::build(right),
+        }))
+    }
+
+    fn query(&self, target: &[u8; 16], out: &mut Vec<usize>, stats: &mut CandidateLookupStats) {
+        stats.record(1);
+        match target.cmp(&self.center) {
+            std::cmp::Ordering::Less => {
+                let after = upper_bound_min(&self.by_min, target, stats);
+                stats.record(after);
+                out.extend(self.by_min[..after].iter().map(|range| range.descriptor));
+                if let Some(left) = &self.left {
+                    left.query(target, out, stats);
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                let after = lower_bound_max_desc(&self.by_max_desc, target, stats);
+                stats.record(after);
+                out.extend(
+                    self.by_max_desc[..after]
+                        .iter()
+                        .map(|range| range.descriptor),
+                );
+                if let Some(right) = &self.right {
+                    right.query(target, out, stats);
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                stats.record(self.by_min.len());
+                out.extend(self.by_min.iter().map(|range| range.descriptor));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CandidateLookupStats {
+    #[cfg(test)]
+    range_checks: usize,
+}
+
+impl CandidateLookupStats {
+    #[inline(always)]
+    fn record(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.range_checks += count;
+        }
+        #[cfg(not(test))]
+        let _ = count;
+    }
+}
+
+fn upper_bound_min(
+    ranges: &[IndexedRange],
+    target: &[u8; 16],
+    stats: &mut CandidateLookupStats,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        stats.record(1);
+        if ranges[mid].min <= *target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn lower_bound_max_desc(
+    ranges: &[IndexedRange],
+    target: &[u8; 16],
+    stats: &mut CandidateLookupStats,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        stats.record(1);
+        if ranges[mid].max >= *target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+impl DescriptorBucket {
+    fn build(mut descriptors: Vec<usize>, ssts: &[SstDescriptor]) -> Self {
+        descriptors
+            .sort_by_key(|&idx| (ssts[idx].min_key, ssts[idx].max_key, ssts[idx].level, idx));
+
+        let mut l0 = Vec::new();
+        let mut by_level: HashMap<u32, Vec<IndexedRange>> = HashMap::new();
+        for &idx in &descriptors {
+            let range = IndexedRange::new(idx, ssts);
+            let level = ssts[idx].level.as_u32();
+            if level == 0 {
+                l0.push(range);
+            } else {
+                by_level.entry(level).or_default().push(range);
+            }
+        }
+        let mut levels: Vec<(u32, LevelRangeIndex)> = by_level
+            .into_iter()
+            .map(|(level, ranges)| (level, LevelRangeIndex::build(ranges)))
+            .collect();
+        levels.sort_by_key(|(level, _)| *level);
+
+        Self {
+            all_by_min: descriptors,
+            l0: OverlapRangeIndex::build(l0),
+            levels,
+        }
+    }
+
+    fn query(&self, target: &[u8; 16], stats: &mut CandidateLookupStats) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.l0.query(target, &mut out, stats);
+        for (_, level) in &self.levels {
+            level.query(target, &mut out, stats);
+        }
+        out
+    }
 }
 
 impl DescriptorIndex {
-    /// Bucket `ssts` by `(kind, scope)` and sort each bucket by `min_key`.
+    /// Bucket `ssts` by `(kind, scope)` and build the per-level range indexes.
     pub fn build(ssts: &[SstDescriptor]) -> Self {
-        let mut buckets: HashMap<(SstKind, String), Vec<usize>> = HashMap::new();
-        for (i, d) in ssts.iter().enumerate() {
-            buckets
-                .entry((d.kind, d.scope.clone()))
+        let mut grouped: HashMap<SstKind, HashMap<String, Vec<usize>>> = HashMap::new();
+        for (idx, desc) in ssts.iter().enumerate() {
+            grouped
+                .entry(desc.kind)
                 .or_default()
-                .push(i);
+                .entry(desc.scope.clone())
+                .or_default()
+                .push(idx);
         }
-        for v in buckets.values_mut() {
-            v.sort_by_key(|&i| ssts[i].min_key);
+        let buckets = grouped
+            .into_iter()
+            .map(|(kind, scopes)| {
+                let scopes = scopes
+                    .into_iter()
+                    .map(|(scope, descriptors)| (scope, DescriptorBucket::build(descriptors, ssts)))
+                    .collect();
+                (kind, scopes)
+            })
+            .collect();
+        Self {
+            buckets,
+            #[cfg(debug_assertions)]
+            fingerprint: descriptor_index_fingerprint(ssts),
         }
-        Self { buckets }
+    }
+
+    /// Catch stale derived-index fixtures (or accidental internal mutation)
+    /// at the snapshot boundary. Compiled out of release builds.
+    #[cfg(debug_assertions)]
+    pub fn debug_assert_consistent(&self, ssts: &[SstDescriptor]) {
+        debug_assert_eq!(
+            self.fingerprint,
+            descriptor_index_fingerprint(ssts),
+            "LoadedManifest.manifest.ssts changed without rebuilding DescriptorIndex"
+        );
+    }
+
+    fn bucket(&self, kind: SstKind, scope: &str) -> Option<&DescriptorBucket> {
+        self.buckets.get(&kind)?.get(scope)
+    }
+
+    #[cfg(test)]
+    fn lookup_candidates_with_stats(
+        &self,
+        kind: SstKind,
+        scope: &str,
+        target: &[u8; 16],
+    ) -> (Vec<usize>, CandidateLookupStats) {
+        let mut stats = CandidateLookupStats::default();
+        let candidates = self
+            .bucket(kind, scope)
+            .map(|bucket| bucket.query(target, &mut stats))
+            .unwrap_or_default();
+        (candidates, stats)
     }
 
     /// Return descriptor indices (into `ssts`) whose `(min_key, max_key)`
-    /// range straddles `target` for the given `(kind, scope)`. The
-    /// caller still has to bloom-probe + body-fetch to confirm — this
-    /// only prunes obvious non-candidates.
+    /// range straddles `target` for the given `(kind, scope)`. The caller
+    /// still has to bloom-probe + body-fetch to confirm.
     pub fn lookup_candidates(
         &self,
-        ssts: &[SstDescriptor],
+        _ssts: &[SstDescriptor],
         kind: SstKind,
         scope: &str,
         target: &[u8; 16],
     ) -> Vec<usize> {
-        // Borrowed key for the HashMap lookup — cheap because the
-        // String inside the key is owned.
-        let bucket = match self.buckets.get(&(kind, scope.to_string())) {
-            Some(b) => b,
-            None => return Vec::new(),
-        };
-        // `partition_point` returns the first i where the predicate is
-        // false, i.e. the first descriptor with `min_key > target`.
-        // Everything to the left has `min_key <= target` and is a
-        // potential candidate (still has to clear the `max_key >= target`
-        // check, because L0 ranges can be wider on one side).
-        let after = bucket.partition_point(|&idx| ssts[idx].min_key <= *target);
-        let mut out = Vec::new();
-        for j in (0..after).rev() {
-            let idx = bucket[j];
-            if ssts[idx].max_key >= *target {
-                out.push(idx);
-            }
-            // We deliberately do NOT break: ranges sorted by `min_key`
-            // are not necessarily sorted by `max_key` under L0 overlap.
-            // In the disjoint case (L1+) `after - 1` is the only hit
-            // anyway, so the loop body runs once.
-        }
-        out
+        let mut stats = CandidateLookupStats::default();
+        self.bucket(kind, scope)
+            .map(|bucket| bucket.query(target, &mut stats))
+            .unwrap_or_default()
     }
 
     /// All descriptor indices for `(kind, scope)` in ascending `min_key`
     /// order. Used by full-label scans like `Snapshot::scan_label`.
     pub fn scope_descriptors(&self, kind: SstKind, scope: &str) -> &[usize] {
-        self.buckets
-            .get(&(kind, scope.to_string()))
-            .map(|v| v.as_slice())
+        self.bucket(kind, scope)
+            .map(|bucket| bucket.all_by_min.as_slice())
             .unwrap_or(&[])
     }
 
@@ -1549,9 +1844,10 @@ impl DescriptorIndex {
     pub fn node_descriptors(&self) -> Vec<usize> {
         let mut out: Vec<usize> = self
             .buckets
-            .iter()
-            .filter(|((kind, _), _)| *kind == SstKind::Nodes)
-            .flat_map(|(_, v)| v.iter().copied())
+            .get(&SstKind::Nodes)
+            .into_iter()
+            .flat_map(|scopes| scopes.values())
+            .flat_map(|bucket| bucket.all_by_min.iter().copied())
             .collect();
         out.sort_unstable();
         out
@@ -1562,14 +1858,28 @@ impl DescriptorIndex {
     /// [`lookup_candidates`] for id-primary point lookups.
     pub fn node_candidates(&self, ssts: &[SstDescriptor], target: &[u8; 16]) -> Vec<usize> {
         let mut out = Vec::new();
-        for (kind, scope) in self.buckets.keys() {
-            if *kind != SstKind::Nodes {
-                continue;
+        if let Some(scopes) = self.buckets.get(&SstKind::Nodes) {
+            for scope in scopes.keys() {
+                out.extend(self.lookup_candidates(ssts, SstKind::Nodes, scope, target));
             }
-            out.extend(self.lookup_candidates(ssts, SstKind::Nodes, scope, target));
         }
         out
     }
+}
+
+#[cfg(debug_assertions)]
+fn descriptor_index_fingerprint(ssts: &[SstDescriptor]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ssts.len().hash(&mut hasher);
+    for descriptor in ssts {
+        descriptor.id.hash(&mut hasher);
+        descriptor.kind.hash(&mut hasher);
+        descriptor.scope.hash(&mut hasher);
+        descriptor.level.hash(&mut hasher);
+        descriptor.min_key.hash(&mut hasher);
+        descriptor.max_key.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -2306,6 +2616,269 @@ mod tests {
             label_index: None,
             per_label_property_stats: Vec::new(),
         }
+    }
+
+    fn ranged_edge_descriptor(level: u32, min: u128, max: u128) -> SstDescriptor {
+        let mut desc = sample_edge_descriptor();
+        desc.level = SstLevel(level);
+        desc.min_key = min.to_be_bytes();
+        desc.max_key = max.to_be_bytes();
+        desc.path = format!("sst/level{level}/{min:032x}-{max:032x}.csr");
+        desc
+    }
+
+    fn matrix_descriptor(
+        kind: SstKind,
+        scope: &str,
+        level: u32,
+        min: u128,
+        max: u128,
+        ordinal: usize,
+    ) -> SstDescriptor {
+        // DescriptorIndex only routes on these fields. Reusing the edge fixture
+        // keeps the differential test focused on point-candidate selection.
+        let mut desc = ranged_edge_descriptor(level, min, max);
+        desc.id = Uuid::from_bytes(((ordinal as u128) + 1).to_be_bytes());
+        desc.kind = kind;
+        desc.scope = scope.to_owned();
+        desc.path = format!("sst/level{level}/matrix-{ordinal:04}-{min:032x}-{max:032x}");
+        desc
+    }
+
+    #[test]
+    fn descriptor_index_binary_searches_disjoint_l1_ranges() {
+        const RANGE_COUNT: usize = 256;
+        let ssts: Vec<SstDescriptor> = (0..RANGE_COUNT)
+            .map(|i| {
+                let min = (i as u128) * 10;
+                ranged_edge_descriptor(1, min, min + 4)
+            })
+            .collect();
+        let index = DescriptorIndex::build(&ssts);
+
+        // A target in the final range used to execute the reverse loop over
+        // all 256 preceding descriptors after `partition_point`. The explicit
+        // comparison counter proves this remains logarithmic, rather than
+        // merely asserting the (already-correct) candidate set.
+        let target = (((RANGE_COUNT - 1) as u128) * 10 + 2).to_be_bytes();
+        let (candidates, stats) =
+            index.lookup_candidates_with_stats(SstKind::EdgesFwd, "KNOWS", &target);
+        assert_eq!(candidates, vec![RANGE_COUNT - 1]);
+        assert!(
+            stats.range_checks <= 12,
+            "final-range lookup examined {} ranges for {RANGE_COUNT} disjoint descriptors",
+            stats.range_checks
+        );
+
+        // A gap at the end is also a logarithmic negative lookup.
+        let gap = (((RANGE_COUNT - 2) as u128) * 10 + 8).to_be_bytes();
+        let (candidates, stats) =
+            index.lookup_candidates_with_stats(SstKind::EdgesFwd, "KNOWS", &gap);
+        assert!(candidates.is_empty());
+        assert!(
+            stats.range_checks <= 12,
+            "negative lookup examined {} ranges for {RANGE_COUNT} disjoint descriptors",
+            stats.range_checks
+        );
+    }
+
+    #[test]
+    fn descriptor_index_reports_overlapping_l0_and_each_leveled_candidate() {
+        let ssts = vec![
+            ranged_edge_descriptor(0, 0, 100),
+            ranged_edge_descriptor(0, 25, 75),
+            ranged_edge_descriptor(0, 200, 300),
+            // Deliberately overlapping ranges inside L1 exercise the safe
+            // interval-tree fallback for a legacy/malformed manifest.
+            ranged_edge_descriptor(1, 40, 60),
+            ranged_edge_descriptor(1, 45, 55),
+            // A different level may overlap by design and must contribute its
+            // own candidate even when each level is internally disjoint.
+            ranged_edge_descriptor(2, 50, 90),
+        ];
+        let index = DescriptorIndex::build(&ssts);
+        let target = 50u128.to_be_bytes();
+        let mut candidates = index.lookup_candidates(&ssts, SstKind::EdgesFwd, "KNOWS", &target);
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![0, 1, 3, 4, 5]);
+
+        assert_eq!(
+            index.scope_descriptors(SstKind::EdgesFwd, "KNOWS").len(),
+            ssts.len(),
+            "the point index must not change full-scope descriptor enumeration"
+        );
+    }
+
+    #[test]
+    fn descriptor_index_matches_linear_scan_across_deterministic_range_matrix() {
+        const BUCKETS: &[(SstKind, &str)] = &[
+            (SstKind::Nodes, ""),
+            (SstKind::Nodes, "Person"),
+            (SstKind::EdgesFwd, "KNOWS"),
+            (SstKind::EdgesFwd, "LIKES"),
+            (SstKind::EdgesInv, "KNOWS"),
+            (SstKind::EdgesInv, "LIKES"),
+            (SstKind::VectorGraph, "embedding-a"),
+            (SstKind::VectorGraph, "embedding-b"),
+            (SstKind::TextIndex, "body-a"),
+            (SstKind::TextIndex, "body-b"),
+        ];
+        const SHAPES: &[(u32, u128, u128)] = &[
+            // L0 is intentionally overlapping, nested, and partially
+            // overlapping. Its final singleton is separated by a gap.
+            (0, 0, 30),
+            (0, 10, 20),
+            (0, 25, 55),
+            (0, 60, 60),
+            // Ordinary leveled data: disjoint ranges with visible gaps.
+            (1, 0, 4),
+            (1, 8, 12),
+            (1, 16, 20),
+            (1, 24, 28),
+            // Legacy/malformed leveled data: nested and boundary-touching
+            // overlaps must use the safe overlap index.
+            (2, 2, 18),
+            (2, 5, 9),
+            (2, 9, 24),
+            (2, 30, 35),
+            // A second disjoint level verifies per-level candidate union.
+            (3, 40, 44),
+            (3, 48, 52),
+        ];
+
+        let mut ssts = Vec::new();
+        for (bucket_no, &(kind, scope)) in BUCKETS.iter().enumerate() {
+            // Different key regions per scope make accidental cross-scope
+            // routing visible instead of producing coincidentally equal sets.
+            let base = (bucket_no as u128) * 1_000 + 100;
+            for &(level, start, end) in SHAPES {
+                let ordinal = ssts.len();
+                ssts.push(matrix_descriptor(
+                    kind,
+                    scope,
+                    level,
+                    base + start,
+                    base + end,
+                    ordinal,
+                ));
+            }
+        }
+
+        // Also exercise the numeric ends of the encoded key space. They are
+        // disjoint from the structured ranges in their respective levels.
+        let ordinal = ssts.len();
+        ssts.push(matrix_descriptor(
+            SstKind::Nodes,
+            "",
+            0,
+            u128::MIN,
+            u128::MIN,
+            ordinal,
+        ));
+        let ordinal = ssts.len();
+        ssts.push(matrix_descriptor(
+            SstKind::Nodes,
+            "",
+            1,
+            u128::MAX,
+            u128::MAX,
+            ordinal,
+        ));
+
+        let index = DescriptorIndex::build(&ssts);
+        for (bucket_no, &(kind, scope)) in BUCKETS.iter().enumerate() {
+            let base = (bucket_no as u128) * 1_000 + 100;
+            let mut probes = std::collections::BTreeSet::new();
+
+            // Dense probes guarantee that every overlap and every gap is
+            // checked, while explicit neighbours pin inclusive boundaries.
+            probes.extend((0..=70).map(|offset| base + offset));
+            for desc in ssts
+                .iter()
+                .filter(|desc| desc.kind == kind && desc.scope == scope)
+            {
+                let min = u128::from_be_bytes(desc.min_key);
+                let max = u128::from_be_bytes(desc.max_key);
+                probes.insert(min);
+                probes.insert(max);
+                if let Some(before) = min.checked_sub(1) {
+                    probes.insert(before);
+                }
+                if let Some(after) = max.checked_add(1) {
+                    probes.insert(after);
+                }
+            }
+
+            for target in probes {
+                let target_key = target.to_be_bytes();
+                let mut expected: Vec<usize> = ssts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, desc)| {
+                        desc.kind == kind
+                            && desc.scope == scope
+                            && desc.min_key <= target_key
+                            && target_key <= desc.max_key
+                    })
+                    .map(|(position, _)| position)
+                    .collect();
+                let mut actual = index.lookup_candidates(&ssts, kind, scope, &target_key);
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(
+                    actual, expected,
+                    "candidate mismatch for kind={kind:?}, scope={scope:?}, target={target}"
+                );
+            }
+        }
+
+        // Missing buckets are part of the routing contract as well.
+        for &(kind, _) in BUCKETS {
+            assert!(
+                index
+                    .lookup_candidates(&ssts, kind, "missing-scope", &100u128.to_be_bytes())
+                    .is_empty(),
+                "unexpected candidates for missing scope of kind={kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_index_node_candidates_union_scopes_only() {
+        let mut person = sample_node_descriptor();
+        person.scope = "Person".into();
+        person.level = SstLevel(1);
+        person.min_key = 0u128.to_be_bytes();
+        person.max_key = 100u128.to_be_bytes();
+
+        let mut company = sample_node_descriptor();
+        company.scope = "Company".into();
+        company.level = SstLevel(2);
+        company.min_key = 25u128.to_be_bytes();
+        company.max_key = 75u128.to_be_bytes();
+
+        let edge = ranged_edge_descriptor(1, 0, 100);
+        let ssts = vec![person, company, edge];
+        let index = DescriptorIndex::build(&ssts);
+        let target = 50u128.to_be_bytes();
+        let mut candidates = index.node_candidates(&ssts, &target);
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![0, 1]);
+        assert_eq!(index.scope_descriptors(SstKind::Nodes, "Person"), &[0],);
+        assert_eq!(index.scope_descriptors(SstKind::Nodes, "Company"), &[1],);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "LoadedManifest.manifest.ssts changed without rebuilding DescriptorIndex"
+    )]
+    fn descriptor_index_debug_guard_rejects_stale_metadata() {
+        let mut ssts = vec![ranged_edge_descriptor(1, 0, 100)];
+        let index = DescriptorIndex::build(&ssts);
+        // `scope` participates in bucket routing; mutating it behind a loaded
+        // index would otherwise turn a point lookup into a silent false miss.
+        ssts[0].scope = "CHANGED".into();
+        index.debug_assert_consistent(&ssts);
     }
 
     #[test]

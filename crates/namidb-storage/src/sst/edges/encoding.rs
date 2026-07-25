@@ -164,6 +164,28 @@ pub fn read_offset(buf: &[u8], cursor: usize, width: OffsetWidth) -> Result<u64>
 pub const TAG_SPLIT: u8 = 0x01;
 pub const TAG_DENSE: u8 = 0x10;
 
+/// Binary-search a sorted sequence of contiguous 16-byte identifiers.
+pub fn binary_search_fixed_16(buf: &[u8], target: &[u8; 16]) -> Result<Option<usize>> {
+    if buf.len() % 16 != 0 {
+        return Err(Error::invariant(format!(
+            "fixed-16 sequence length {} is not divisible by 16",
+            buf.len()
+        )));
+    }
+    let mut lo = 0usize;
+    let mut hi = buf.len() / 16;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let probe = &buf[mid * 16..(mid + 1) * 16];
+        match probe.cmp(target.as_slice()) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(Some(mid)),
+        }
+    }
+    Ok(None)
+}
+
 /// Compute the byte cost of the split-encoded block for the given partner
 /// list, **assuming the list is sorted ascending by the full 128-bit id**.
 pub fn split_block_cost(partners: &[[u8; 16]]) -> usize {
@@ -276,6 +298,82 @@ pub fn read_partner_block(buf: &[u8], cursor: usize) -> Result<(Vec<[u8; 16]>, u
         }
     };
     Ok((partners, c - start))
+}
+
+/// Find one partner inside an encoded block without materialising the whole
+/// adjacency list.
+///
+/// Dense (skew/high-degree) blocks are searched directly in their sorted
+/// fixed-width payload, so the endpoint probe is `O(log degree)` with no
+/// allocation. Split blocks retain their delta encoding and are decoded only
+/// until the sorted stream reaches or passes `target`; those blocks are kept
+/// for lower-degree buckets where their space saving outweighs the bounded
+/// sequential decode.
+pub fn find_partner_in_block(
+    buf: &[u8],
+    cursor: usize,
+    target: &[u8; 16],
+) -> Result<Option<usize>> {
+    let (deg, n) = read_varint(buf, cursor)?;
+    let mut c = cursor + n;
+    if c >= buf.len() {
+        return Err(Error::invariant("partner block truncated: missing tag"));
+    }
+    let tag = buf[c];
+    c += 1;
+    let deg = usize::try_from(deg)
+        .map_err(|_| Error::invariant("partner block degree does not fit usize"))?;
+
+    match tag {
+        TAG_DENSE => {
+            let need = deg
+                .checked_mul(16)
+                .ok_or_else(|| Error::invariant("dense partner block size overflows usize"))?;
+            let end = c
+                .checked_add(need)
+                .ok_or_else(|| Error::invariant("dense partner block end overflows usize"))?;
+            if end > buf.len() {
+                return Err(Error::invariant(format!(
+                    "dense block truncated: need {need} bytes, have {}",
+                    buf.len().saturating_sub(c)
+                )));
+            }
+            let rows = &buf[c..end];
+            binary_search_fixed_16(rows, target)
+        }
+        TAG_SPLIT => {
+            let mut previous_top = 0u64;
+            for index in 0..deg {
+                let (encoded_top, consumed) = read_varint(buf, c)?;
+                c += consumed;
+                if c + 8 > buf.len() {
+                    return Err(Error::invariant(format!(
+                        "split block truncated: bot64[{index}]"
+                    )));
+                }
+                let bot = u64::from_le_bytes(buf[c..c + 8].try_into().unwrap());
+                c += 8;
+                let top = if index == 0 {
+                    encoded_top
+                } else {
+                    previous_top.wrapping_add(encoded_top)
+                };
+                let current = combine_top_bot(top, bot);
+                match current.cmp(target) {
+                    std::cmp::Ordering::Less => {
+                        previous_top = top;
+                    }
+                    std::cmp::Ordering::Equal => return Ok(Some(index)),
+                    std::cmp::Ordering::Greater => return Ok(None),
+                }
+            }
+            Ok(None)
+        }
+        other => Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!("unknown partner block tag 0x{other:02x}"),
+        }),
+    }
 }
 
 fn read_split_payload(buf: &[u8], cursor: usize, deg: usize) -> Result<(Vec<[u8; 16]>, usize)> {
@@ -494,5 +592,62 @@ mod tests {
         buf.extend_from_slice(&[0u8; 16]);
         let err = read_partner_block(&buf, 0).unwrap_err();
         assert!(matches!(err, Error::Corrupted { .. }));
+    }
+
+    #[test]
+    fn point_lookup_searches_dense_block_without_decoding_the_degree() {
+        // The writer sorts by raw NodeId bytes. Big-endian counters preserve
+        // that byte order across the 0xff -> 0x0100 boundary.
+        let partners: Vec<_> = (0..4096u128).map(|i| (i * 2).to_be_bytes()).collect();
+        let mut buf = Vec::new();
+        assert_eq!(
+            write_partner_block(&partners, /* force dense */ 1, &mut buf),
+            TAG_DENSE
+        );
+
+        for index in [0usize, 1, 2048, 4095] {
+            assert_eq!(
+                find_partner_in_block(&buf, 0, &partners[index]).unwrap(),
+                Some(index)
+            );
+        }
+        assert_eq!(
+            find_partner_in_block(&buf, 0, &4096u128.to_be_bytes()).unwrap(),
+            Some(2048)
+        );
+        assert_eq!(
+            find_partner_in_block(&buf, 0, &4097u128.to_be_bytes()).unwrap(),
+            None
+        );
+        assert_eq!(find_partner_in_block(&buf, 0, &[0xff; 16]).unwrap(), None);
+    }
+
+    #[test]
+    fn point_lookup_stops_on_split_block_and_handles_absence() {
+        let partners: Vec<_> = (0..128u64).map(|i| partner(7, i)).collect();
+        let mut buf = Vec::new();
+        assert_eq!(
+            write_partner_block(&partners, /* keep split */ 10_000, &mut buf),
+            TAG_SPLIT
+        );
+
+        for index in [0usize, 1, 64, 127] {
+            assert_eq!(
+                find_partner_in_block(&buf, 0, &partners[index]).unwrap(),
+                Some(index)
+            );
+        }
+        assert_eq!(
+            find_partner_in_block(&buf, 0, &partner(6, u64::MAX)).unwrap(),
+            None
+        );
+        assert_eq!(
+            find_partner_in_block(&buf, 0, &partner(7, 63)).unwrap(),
+            Some(63)
+        );
+        assert_eq!(
+            find_partner_in_block(&buf, 0, &partner(8, 0)).unwrap(),
+            None
+        );
     }
 }

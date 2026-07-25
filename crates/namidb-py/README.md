@@ -82,6 +82,34 @@ then to push the memtable into L0 SSTs. That's different from the
 `upsert_node` / `upsert_edge` / `tombstone_*` API, which stages mutations
 and waits for an explicit `client.commit()`.
 
+## Vector and full-text indexes
+
+Published wheels include the same persistent Vamana ANN and BM25 index
+features as the server image. Their DDL works directly through the embedded
+client:
+
+```python
+client.cypher(
+    "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) "
+    "METRIC cosine DIMENSION 384"
+)
+client.cypher("CREATE FULLTEXT INDEX doc_text ON :Doc(title, body)")
+```
+
+Index bodies are built by an authoritative compaction. `compact()` prepares
+the merge and the `.vg` / `.ft` bodies without holding the foreground writer
+mutex, then briefly re-acquires it to install the new manifest:
+
+```python
+client.flush()
+report = client.compact()
+print(report["applied"], report["l0_before"], report["l0_after"])
+```
+
+`await client.acompact()` is the coroutine equivalent. Until a body is
+materialized, and whenever freshness cannot be proven, vector and BM25
+queries automatically use their exact flat fallback.
+
 ## Async API
 
 The same surface is available as a coroutine through `Client.acypher`,
@@ -309,9 +337,12 @@ default.
   protocol (`If-Match` on object stores, `flock` plus atomic rename on
   the filesystem) and the same single-writer-per-namespace epoch
   fencing.
-- A synchronous Python API plus an async coroutine API (`acypher`).
+- A synchronous Python API plus async coroutine APIs (`acypher`,
+  `acompact`).
   Under the hood every call drives a tokio runtime owned by the
   `Client`; the first call per process pays the bootstrap cost.
+- Persistent Vamana vector and BM25 full-text indexes, including their
+  Cypher DDL and off-writer-lock compaction lifecycle.
 - The same SST plus bloom cache the Rust read path uses
   ([`SstCache`](../namidb-storage/src/cache.rs)) is exposed through
   `client.cache_stats()`, so application dashboards can graph the hit

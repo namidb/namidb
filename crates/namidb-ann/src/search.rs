@@ -6,7 +6,7 @@
 //! [`search`] wraps it for the query case and returns the top-`k` neighbours.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::graph::VamanaGraph;
 use crate::space::VectorSpace;
@@ -43,6 +43,108 @@ impl PartialOrd for DistNode {
     }
 }
 
+/// Reusable visited-state for [`beam_search_with_scratch`].
+///
+/// The build invokes beam search once per indexed point. Clearing a dense
+/// `Vec<bool>` of length `n` before every invocation turns that loop into
+/// `O(n²)` memory writes even when `l_build` is small. Dense epoch marks pay
+/// one `O(n)` allocation for the whole build and then reset in `O(1)`.
+///
+/// One-off public queries use the sparse variant: its memory and clearing work
+/// scale with the nodes actually reached by the beam, not with the full corpus.
+pub(crate) struct BeamScratch {
+    marks: VisitMarks,
+}
+
+enum VisitMarks {
+    /// Fast repeated probes over one fixed corpus (the Vamana build).
+    Dense {
+        epochs: Vec<u32>,
+        current_epoch: u32,
+    },
+    /// One-off probes where allocating `O(n)` state would dominate a small beam.
+    Sparse(HashSet<u32>),
+}
+
+impl BeamScratch {
+    /// Dense epoch marks for a sequence of searches over `n` graph nodes.
+    pub(crate) fn dense(n: usize) -> Self {
+        Self {
+            marks: VisitMarks::Dense {
+                epochs: vec![0; n],
+                current_epoch: 0,
+            },
+        }
+    }
+
+    /// Sparse marks for a one-off search. `expected` is only an allocation hint;
+    /// the set grows if the beam reaches more nodes.
+    fn sparse(expected: usize) -> Self {
+        Self {
+            marks: VisitMarks::Sparse(HashSet::with_capacity(expected)),
+        }
+    }
+
+    /// Start a logically empty visited set for a graph of `n` nodes.
+    fn begin(&mut self, n: usize) {
+        match &mut self.marks {
+            VisitMarks::Dense {
+                epochs,
+                current_epoch,
+            } => {
+                // Build currently fixes `n`, but resize keeps this scratch safe
+                // for future callers that reuse it with a larger graph.
+                if epochs.len() < n {
+                    epochs.resize(n, 0);
+                }
+                *current_epoch = current_epoch.wrapping_add(1);
+                if *current_epoch == 0 {
+                    // One full clear per 2^32 searches, rather than per search.
+                    epochs.fill(0);
+                    *current_epoch = 1;
+                }
+            }
+            VisitMarks::Sparse(visited) => visited.clear(),
+        }
+    }
+
+    /// Mark `id`, returning `true` only on its first visit in this search.
+    #[inline]
+    fn mark_if_new(&mut self, id: u32) -> bool {
+        match &mut self.marks {
+            VisitMarks::Dense {
+                epochs,
+                current_epoch,
+            } => {
+                let mark = &mut epochs[id as usize];
+                if *mark == *current_epoch {
+                    false
+                } else {
+                    *mark = *current_epoch;
+                    true
+                }
+            }
+            VisitMarks::Sparse(visited) => visited.insert(id),
+        }
+    }
+
+    #[cfg(test)]
+    fn resident_marks(&self) -> usize {
+        match &self.marks {
+            VisitMarks::Dense { epochs, .. } => epochs.len(),
+            VisitMarks::Sparse(visited) => visited.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn dense_allocation_ptr(&self) -> Option<*const u32> {
+        match &self.marks {
+            VisitMarks::Dense { epochs, .. } => Some(epochs.as_ptr()),
+            VisitMarks::Sparse(_) => None,
+        }
+    }
+}
+
 /// Beam search core, parameterized by the adjacency slice. Shared by the query
 /// path ([`search`], over a finished [`VamanaGraph`]) and the build (over the
 /// in-progress adjacency `&adj`), so the build never clones the graph-so-far.
@@ -59,6 +161,27 @@ pub(crate) fn beam_search(
     ef: usize,
     dist: impl Fn(u32) -> f32,
 ) -> Vec<Neighbor> {
+    // Public searches are normally tiny relative to the corpus (`ef=64` by
+    // default). A sparse scratch avoids allocating/zeroing `n` slots per query.
+    // Cap the eager reservation: `ef` is caller-controlled, and an extreme
+    // value must not turn into a giant hash-table allocation before traversal.
+    const MAX_EAGER_SPARSE_MARKS: usize = 4_096;
+    let expected_visits = ef.max(k).min(n).min(MAX_EAGER_SPARSE_MARKS);
+    let mut scratch = BeamScratch::sparse(expected_visits);
+    beam_search_with_scratch(adjacency, n, entry, k, ef, dist, &mut scratch)
+}
+
+/// Beam search using caller-owned visited state. The Vamana builder reuses one
+/// dense epoch scratch across all `n` refinement searches.
+pub(crate) fn beam_search_with_scratch(
+    adjacency: &[Vec<u32>],
+    n: usize,
+    entry: u32,
+    k: usize,
+    ef: usize,
+    dist: impl Fn(u32) -> f32,
+    scratch: &mut BeamScratch,
+) -> Vec<Neighbor> {
     if n == 0 || k == 0 {
         return Vec::new();
     }
@@ -73,14 +196,14 @@ pub(crate) fn beam_search(
     let k = k.min(n);
     let ef = ef.max(k).min(n);
 
-    let mut visited = vec![false; n];
+    scratch.begin(n);
 
     // `candidates`: min-heap (closest-first) of things to expand.
     let mut candidates: BinaryHeap<std::cmp::Reverse<DistNode>> = BinaryHeap::with_capacity(ef + 1);
     // `results`: max-heap of the ef closest seen; peek() = the current farthest.
     let mut results: BinaryHeap<DistNode> = BinaryHeap::with_capacity(ef + 1);
 
-    visited[entry as usize] = true;
+    scratch.mark_if_new(entry);
     let d0 = dist(entry);
     candidates.push(std::cmp::Reverse(DistNode {
         dist: d0,
@@ -100,10 +223,9 @@ pub(crate) fn beam_search(
         }
         for &nb in adjacency[c as usize].as_slice() {
             let nbi = nb as usize;
-            if nbi >= n || visited[nbi] {
+            if nbi >= n || !scratch.mark_if_new(nb) {
                 continue;
             }
-            visited[nbi] = true;
             let d_n = dist(nb);
             // Admit if the beam isn't full, or this beats the current farthest.
             if results.len() < ef || d_n < worst {
@@ -226,5 +348,36 @@ mod tests {
         for w in out.windows(2) {
             assert!(w[0].dist <= w[1].dist + 1e-6, "not sorted: {:?}", out);
         }
+    }
+
+    #[test]
+    fn sparse_scratch_tracks_visits_not_corpus_size() {
+        // This models a tiny beam over a very large corpus without allocating
+        // that corpus. The old `vec![false; n]` path reserved ten million
+        // entries before touching its first node.
+        let mut scratch = BeamScratch::sparse(4);
+        scratch.begin(10_000_000);
+        assert!(scratch.mark_if_new(9_999_999));
+        assert!(!scratch.mark_if_new(9_999_999));
+        assert_eq!(scratch.resident_marks(), 1);
+    }
+
+    #[test]
+    fn dense_epoch_scratch_resets_without_reallocating() {
+        let full = vec![vec![1, 2, 3], vec![0, 2, 3], vec![0, 1, 3], vec![0, 1, 2]];
+        let mut scratch = BeamScratch::dense(full.len());
+        let allocation = scratch.dense_allocation_ptr();
+
+        // First search visits the whole connected graph.
+        let first =
+            beam_search_with_scratch(&full, full.len(), 0, 1, 4, |id| id as f32, &mut scratch);
+        assert_eq!(first[0].id, 0);
+
+        // A fresh epoch must make nodes visited above eligible again. Starting
+        // from 3 still reaches 0, the best node; stale marks would leave 3.
+        let second =
+            beam_search_with_scratch(&full, full.len(), 3, 1, 4, |id| id as f32, &mut scratch);
+        assert_eq!(second[0].id, 0);
+        assert_eq!(scratch.dense_allocation_ptr(), allocation);
     }
 }

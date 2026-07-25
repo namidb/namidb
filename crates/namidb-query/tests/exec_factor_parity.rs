@@ -32,7 +32,8 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::value::Value as CoreValue;
 use namidb_query::{
-    execute_factor_path, execute_flat_path, lower, parse, plan, Params, Row, StatsCatalog,
+    execute_factor_path, execute_flat_path, lower, parse, plan, Params, Row, RuntimeValue,
+    StatsCatalog,
 };
 use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
@@ -169,7 +170,7 @@ fn sorted_fingerprints(rows: &[Row]) -> Vec<String> {
 
 async fn assert_parity(cypher: &str, params: &Params, snapshot_label: &str) {
     let writer = setup_fixture().await;
-    let snap = writer.snapshot();
+    let snap = writer.overlay_snapshot();
     let query = parse(cypher).expect("parse");
     let lp = lower(&query).expect("lower");
 
@@ -204,7 +205,7 @@ async fn assert_parity(cypher: &str, params: &Params, snapshot_label: &str) {
 /// CLI sees in production.
 async fn assert_parity_optimized(cypher: &str, params: &Params, snapshot_label: &str) {
     let writer = setup_fixture().await;
-    let snap = writer.snapshot();
+    let snap = writer.overlay_snapshot();
     let query = parse(cypher).expect("parse");
     let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
     let lp = plan(&query, &catalog).expect("plan");
@@ -240,6 +241,76 @@ async fn parity_simple_node_scan() {
         "MATCH (p:Person)",
     )
     .await;
+}
+
+#[tokio::test]
+async fn bound_expand_into_validates_target_labels_flat_and_factor() {
+    let writer = setup_fixture().await;
+    let snapshot = writer.overlay_snapshot();
+    let outer = lower(
+        &parse(
+            "MATCH (a:Person {firstName: 'Alice'}), (b:Person {firstName: 'Bob'}) \
+             RETURN b.firstName AS name",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let outer_rows = execute_flat_path(&outer, &snapshot, &Params::default())
+        .await
+        .unwrap();
+    assert_eq!(outer_rows.len(), 1, "fixture must bind Alice and Bob");
+
+    // Alice -> Bob exists, but the already-bound Bob is a Person, not a Post.
+    // Expand-Into must apply the target label even though it does not
+    // materialize the target again.
+    let required = parse(
+        "MATCH (a:Person {firstName: 'Alice'}), (b:Person {firstName: 'Bob'}) \
+         MATCH (a)-[:KNOWS]->(b:Post) \
+         RETURN b.firstName AS name",
+    )
+    .unwrap();
+    let required_plan = lower(&required).unwrap();
+    let flat_required = execute_flat_path(&required_plan, &snapshot, &Params::default())
+        .await
+        .unwrap();
+    let factor_required = execute_factor_path(&required_plan, &snapshot, &Params::default())
+        .await
+        .unwrap();
+    assert!(flat_required.is_empty());
+    assert!(factor_required.is_empty());
+
+    // OPTIONAL preserves the outer bindings but exposes a NULL relationship,
+    // proving that the physical Alice -> Bob edge did not satisfy `b:Post`.
+    let optional = parse(
+        "MATCH (a:Person {firstName: 'Alice'}), (b:Person {firstName: 'Bob'}) \
+         OPTIONAL MATCH (a)-[r:KNOWS]->(b:Post) \
+         RETURN b.firstName AS name, r AS rel",
+    )
+    .unwrap();
+    let optional_plan = lower(&optional).unwrap();
+    let flat_optional = execute_flat_path(&optional_plan, &snapshot, &Params::default())
+        .await
+        .unwrap();
+    let factor_optional = execute_factor_path(&optional_plan, &snapshot, &Params::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        flat_optional.len(),
+        1,
+        "flat OPTIONAL must preserve the row"
+    );
+    assert_eq!(
+        factor_optional.len(),
+        1,
+        "factor OPTIONAL must preserve the row"
+    );
+    for rows in [&flat_optional, &factor_optional] {
+        assert!(matches!(rows[0].get("rel"), Some(RuntimeValue::Null)));
+        assert!(matches!(
+            rows[0].get("name"),
+            Some(RuntimeValue::String(name)) if name == "Bob"
+        ));
+    }
 }
 
 #[tokio::test]

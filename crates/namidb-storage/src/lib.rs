@@ -80,9 +80,9 @@ pub use recovery::{
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
 };
 pub use sst::{
-    BloomDescriptor, BloomFilter, DegreeHistogram, EdgeDirection, EdgeRecord, EdgeSstFinish,
-    EdgeSstReader, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions, NodeSstReader, NodeSstWriter,
-    NodeSstWriterOptions, PropertyColumnStats, StatScalar,
+    BloomDescriptor, BloomFilter, DegreeHistogram, EdgeDirection, EdgePointLookup, EdgeRecord,
+    EdgeSstFinish, EdgeSstReader, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions, NodeSstReader,
+    NodeSstWriter, NodeSstWriterOptions, PropertyColumnStats, StatScalar,
 };
 pub use unique_index::UniqueProbe;
 pub use uri::{parse_uri, UriError};

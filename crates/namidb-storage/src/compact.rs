@@ -1752,7 +1752,8 @@ fn merge_edge_sources(
     };
     let mut options = EdgeSstWriterOptions::new(direction, edge_type, src_label, dst_label);
     // Pre-dedup upper bound (see the node merge for why); sizes the bloom
-    // and the skew threshold slightly conservatively.
+    // slightly conservatively. The partner skew threshold is fixed so exact
+    // probes retain a corpus-size-independent bound.
     options.expected_keys = total_keys.max(1);
     if let Some(def) = edge_def {
         options.declared_properties = def.properties.iter().map(|p| p.name.clone()).collect();

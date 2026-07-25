@@ -31,6 +31,11 @@ use crate::sst::edges::format::{
 use crate::sst::edges::EdgeDirection;
 use crate::sst::stats::{DegreeHistogram, PropertyColumnStats};
 
+/// Maximum degree kept in the sequentially-decodable split representation by
+/// default. Above this bound the dense block supports allocation-free binary
+/// search for exact endpoint probes.
+pub const DEFAULT_SKEW_THRESHOLD: usize = 1024;
+
 /// One row in the edge SST input. `key_id` and `partner_id` carry the
 /// **direction-specific** mapping: for a forward partner SST `key_id` is
 /// `src_id` and `partner_id` is `dst_id`; for an inverse partner SST the
@@ -60,8 +65,7 @@ pub struct EdgeSstWriterOptions {
     pub src_label: String,
     pub dst_label: String,
     pub schema_version: u64,
-    /// Force a specific skew threshold. `None` → bench-driven default:
-    /// `max(1024, 4 * sqrt(key_count))`.
+    /// Force a specific skew threshold. `None` → [`DEFAULT_SKEW_THRESHOLD`].
     pub skew_threshold: Option<usize>,
     pub fence_stride: u32,
     pub fence_threshold: u64,
@@ -304,15 +308,11 @@ impl EdgeSstWriter {
     pub fn new(options: EdgeSstWriterOptions) -> Self {
         let bloom =
             BloomFilter::with_capacity(options.expected_keys.max(1), options.bits_per_key.max(1));
-        // Pick the skew threshold up-front from `expected_keys`. Used to
-        // mean it was deferred to finish() and recomputed from the actual
-        // key_count, but streaming needs deterministic partner-block
-        // encoding at `append` time. Callers that know the exact
-        // distribution can still pin `skew_threshold` via the options.
-        let skew_threshold = options.skew_threshold.unwrap_or_else(|| {
-            let sqrt = (options.expected_keys as f64).sqrt() as usize;
-            (4 * sqrt).max(1024)
-        });
+        // Keep split-block point scans bounded independently of corpus size.
+        // The former `4 * sqrt(key_count)` default reached 4k at one million
+        // keys, making exact relationship MERGE linear in a hub's degree after
+        // compaction. Callers can still pin a different threshold explicitly.
+        let skew_threshold = options.skew_threshold.unwrap_or(DEFAULT_SKEW_THRESHOLD);
         let declared_streams: Vec<PropertyStream> = options
             .declared_properties
             .iter()

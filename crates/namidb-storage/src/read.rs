@@ -117,6 +117,16 @@ pub struct EdgeListView {
     pub edges: Vec<EdgeView>,
 }
 
+enum EdgePointWinner {
+    Tombstone,
+    Materialized(BTreeMap<String, Value>),
+    Persisted {
+        absolute: String,
+        reader: Arc<EdgeSstReader>,
+        edge_offset: usize,
+    },
+}
+
 /// Endpoint labels for an edge type, surfaced by
 /// [`Snapshot::observed_edge_endpoints`]. For edge types that were
 /// declared through `SchemaBuilder` the labels come straight from the
@@ -280,6 +290,10 @@ impl<'mt> Snapshot<'mt> {
         store: Arc<dyn ObjectStore>,
         paths: NamespacePaths,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        manifest
+            .index
+            .debug_assert_consistent(&manifest.manifest.ssts);
         let cache_namespace: Arc<str> = Arc::from(paths.namespace_prefix().as_ref());
         Self {
             manifest,
@@ -449,6 +463,35 @@ impl<'mt> Snapshot<'mt> {
                 self.edge_mem_entries_for_type(edge_type)
                     .filter(move |(mk, _)| matches!(mk, MemKey::Edge { dst, .. } if *dst == key)),
             ),
+        }
+    }
+
+    /// Point-read one physical relationship identity from the committed
+    /// memtable plus the staged RYOW overlay.
+    fn edge_mem_entry(&self, edge_type: &str, src: NodeId, dst: NodeId) -> Option<&MemEntry> {
+        let key = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst,
+        };
+        let committed = self.memtable.get(&key);
+        let staged = self.overlay.as_ref().and_then(|o| o.get(&key));
+        match (staged, committed) {
+            (Some(s), Some(c)) => {
+                debug_assert!(
+                    s.lsn > c.lsn,
+                    "overlay edge LSN {} must exceed committed LSN {}",
+                    s.lsn,
+                    c.lsn
+                );
+                if s.lsn >= c.lsn {
+                    Some(s)
+                } else {
+                    Some(c)
+                }
+            }
+            (Some(s), None) => Some(s),
+            (None, c) => c,
         }
     }
 
@@ -1391,7 +1434,9 @@ impl<'mt> Snapshot<'mt> {
     ///
     /// Returns a `Vec<Option<NodeView>>` aligned 1:1 with `ids`. `None`
     /// means absent or tombstoned at this snapshot. Duplicates in `ids`
-    /// resolve to the same `NodeView` value (cheap clone — same Arc).
+    /// resolve to equivalent `NodeView` values. `NodeView` owns its maps, so
+    /// callers should consume this returned vector directly instead of doing
+    /// a second point lookup and clone.
     ///
     /// Why this exists: in cold IC09-shaped workloads
     /// (`(a)-[:KNOWS]->(b)-[:KNOWS]->(c)`) the per-edge `lookup_node`
@@ -1897,6 +1942,151 @@ impl<'mt> Snapshot<'mt> {
     pub async fn out_edges_via_sst(&self, edge_type: &str, src: NodeId) -> Result<EdgeListView> {
         self.edge_lookup_via_sst(edge_type, src, EdgeDirection::Forward)
             .await
+    }
+
+    /// Exact `(edge_type, src, dst)` relationship lookup.
+    ///
+    /// This is the storage primitive behind bound-endpoint `MERGE` and
+    /// Expand-Into. It probes the ordered memtable key and then only the
+    /// forward SST ranges whose source key can contain `src`; within a
+    /// high-degree partner block the destination is binary-searched in place.
+    /// Overlapping L0/L1 versions are reconciled by LSN, and property streams
+    /// are decoded only for the final live winner.
+    #[instrument(skip(self), fields(edge_type = edge_type, src = %src, dst = %dst))]
+    pub async fn lookup_edge_via_sst(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        dst: NodeId,
+    ) -> Result<Option<EdgeView>> {
+        self.edge_point_lookup_via_sst(edge_type, src, dst, true)
+            .await
+    }
+
+    /// Exact relationship existence probe without decoding property streams.
+    pub async fn contains_edge_via_sst(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        dst: NodeId,
+    ) -> Result<bool> {
+        Ok(self
+            .edge_point_lookup_via_sst(edge_type, src, dst, false)
+            .await?
+            .is_some())
+    }
+
+    async fn edge_point_lookup_via_sst(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        dst: NodeId,
+        materialize_properties: bool,
+    ) -> Result<Option<EdgeView>> {
+        namidb_core::profile_scope!("Snapshot::edge_point_lookup_via_sst");
+        let src_bytes = *src.as_bytes();
+        let dst_bytes = *dst.as_bytes();
+        let mut winner: Option<(u64, EdgePointWinner)> = None;
+
+        // The physical memtable identity already is `(type, src, dst)`, so
+        // both committed and staged writes are direct ordered-map probes.
+        if let Some(entry) = self.edge_mem_entry(edge_type, src, dst) {
+            let source = match &entry.op {
+                MemOp::Tombstone => EdgePointWinner::Tombstone,
+                MemOp::Upsert(payload) => {
+                    let properties = if materialize_properties {
+                        EdgeWriteRecord::decode(payload)?.properties
+                    } else {
+                        BTreeMap::new()
+                    };
+                    EdgePointWinner::Materialized(properties)
+                }
+            };
+            winner = Some((entry.lsn, source));
+        }
+
+        let mut candidates = self.manifest.index.lookup_candidates(
+            &self.manifest.manifest.ssts,
+            SstKind::EdgesFwd,
+            edge_type,
+            &src_bytes,
+        );
+        // Probe newest candidate ranges first. Once a point version wins,
+        // `max_lsn` lets us skip every older SST body without opening it.
+        // This keeps point probes bounded while an L0 backlog is draining.
+        candidates.sort_unstable_by(|left, right| {
+            self.manifest.manifest.ssts[*right]
+                .max_lsn
+                .cmp(&self.manifest.manifest.ssts[*left].max_lsn)
+                .then_with(|| right.cmp(left))
+        });
+        for idx in candidates {
+            let desc = &self.manifest.manifest.ssts[idx];
+            // A whole SST whose newest row cannot outrun the winner contributes
+            // nothing. This is especially valuable while L0 is draining.
+            if winner
+                .as_ref()
+                .is_some_and(|(winner_lsn, _)| desc.max_lsn <= *winner_lsn)
+            {
+                continue;
+            }
+            if !self.bloom_admits(desc, &src_bytes).await? {
+                continue;
+            }
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            let reader = self.fetch_edge_reader(&absolute).await?;
+            let Some(point) = reader.lookup_partner(&src_bytes, &dst_bytes)? else {
+                continue;
+            };
+            if winner
+                .as_ref()
+                .is_some_and(|(winner_lsn, _)| point.lsn <= *winner_lsn)
+            {
+                continue;
+            }
+            let source = if point.tombstone {
+                EdgePointWinner::Tombstone
+            } else {
+                EdgePointWinner::Persisted {
+                    absolute,
+                    reader,
+                    edge_offset: point.edge_offset,
+                }
+            };
+            winner = Some((point.lsn, source));
+        }
+
+        let Some((lsn, winner)) = winner else {
+            return Ok(None);
+        };
+        let properties = match winner {
+            EdgePointWinner::Tombstone => return Ok(None),
+            EdgePointWinner::Materialized(properties) => properties,
+            EdgePointWinner::Persisted {
+                absolute,
+                reader,
+                edge_offset,
+            } => {
+                if materialize_properties {
+                    let streams = self.fetch_edge_streams(&absolute, edge_type, &reader)?;
+                    decode_edge_properties(
+                        streams.overflow.as_ref().and_then(|v| v.get(edge_offset)),
+                        &streams.declared,
+                        edge_offset,
+                    )?
+                } else {
+                    BTreeMap::new()
+                }
+            }
+        };
+
+        Ok(Some(EdgeView {
+            edge_type: edge_type.to_string(),
+            src,
+            dst,
+            properties,
+            lsn,
+        }))
     }
 
     /// Force the CSR path for `out_edges`. Requires an `AdjacencyCache`
@@ -2890,12 +3080,12 @@ impl<'mt> Snapshot<'mt> {
         self.fetch_bytes(&absolute).await
     }
 
-    /// RFC-030 (`vector-index`): approximate top-k over the `VectorGraph`
-    /// SST(s) registered for `index_name`. Returns `(NodeId, similarity)`
-    /// best-first (higher similarity = closer). Unions across every in-scope
-    /// VectorGraph SST and re-ranks — there is normally exactly one per index
-    /// for an id-primary namespace, but a partial rebuild can briefly leave
-    /// two. `ef` is the search beam width (≥ `k`).
+    /// RFC-030 (`vector-index`): approximate top-k over the single authoritative
+    /// `VectorGraph` SST registered for `index_name`. Returns
+    /// `(NodeId, similarity)` best-first (higher similarity = closer). A
+    /// rebuild atomically replaces the previous body; zero or multiple bodies
+    /// are treated as an unusable generation and the query layer flat-scans.
+    /// `ef` is the search beam width (≥ `k`).
     /// Decoded `.vg` index for `desc`, via the process-wide [`SstCache`]:
     /// decoding deserialises every stored vector plus the whole adjacency and
     /// clones the vectors into the navigation space, so paying it once per SST
@@ -2970,17 +3160,23 @@ impl<'mt> Snapshot<'mt> {
         k: usize,
         ef: usize,
     ) -> Result<Option<Vec<(NodeId, f32)>>> {
-        let mut all: Vec<(NodeId, f32)> = Vec::new();
-        let mut found = false;
+        let mut best_by_id: HashMap<NodeId, f32> = HashMap::new();
+        let descriptor_ids = self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::VectorGraph, index_name);
+        // Vector indexes are full-corpus, replace-at-commit artifacts. Serving
+        // multiple generations could resurrect a stale vector/document, so an
+        // anomalous or legacy manifest must use the exact fallback.
+        if descriptor_ids.len() != 1 {
+            return Ok(None);
+        }
         // Score orientation is metric-dependent: cosine/dot are higher-is-closer,
         // euclidean is lower-is-closer. All `.vg` SSTs for one index share a
         // metric, so the last decoded one's orientation is authoritative.
         let mut higher_is_better = true;
-        for desc in &self.manifest.manifest.ssts {
-            if desc.kind != SstKind::VectorGraph || desc.scope != index_name {
-                continue;
-            }
-            found = true;
+        for &desc_idx in descriptor_ids {
+            let desc = &self.manifest.manifest.ssts[desc_idx];
             // A legacy (v1) or corrupt body makes the persisted answer
             // incomplete. Preserve "index unavailable" so the query layer can
             // fall back to the exact flat scan rather than accidentally serving
@@ -2989,20 +3185,32 @@ impl<'mt> Snapshot<'mt> {
                 return Ok(None);
             };
             higher_is_better = idx.higher_is_better();
-            all.extend(
-                idx.search(query, k, ef)
-                    .into_iter()
-                    .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
-            );
+            for (id, score) in idx.search(query, k, ef) {
+                let id = NodeId(Uuid::from_bytes(id));
+                best_by_id
+                    .entry(id)
+                    .and_modify(|best| {
+                        let replace = if higher_is_better {
+                            score > *best
+                        } else {
+                            score < *best
+                        };
+                        if replace {
+                            *best = score;
+                        }
+                    })
+                    .or_insert(score);
+            }
         }
+        let mut all: Vec<(NodeId, f32)> = best_by_id.into_iter().collect();
         // Best-first by the metric's orientation.
         if higher_is_better {
-            all.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            all.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         } else {
-            all.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            all.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         }
         all.truncate(k);
-        Ok(found.then_some(all))
+        Ok(Some(all))
     }
 
     /// Low-level vector-index probe retained for storage callers and benchmark
@@ -3045,10 +3253,12 @@ impl<'mt> Snapshot<'mt> {
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
     pub fn index_outrun_by_nodes(&self, index_name: &str, kind: SstKind) -> bool {
         let manifest = &self.manifest.manifest;
-        let index_ssts: Vec<&SstDescriptor> = manifest
-            .ssts
+        let index_ssts: Vec<&SstDescriptor> = self
+            .manifest
+            .index
+            .scope_descriptors(kind, index_name)
             .iter()
-            .filter(|d| d.kind == kind && d.scope == index_name)
+            .map(|idx| &manifest.ssts[*idx])
             .collect();
         if index_ssts.is_empty() {
             // No index SST for this name yet. If any persisted `Nodes` SST
@@ -3163,12 +3373,13 @@ impl<'mt> Snapshot<'mt> {
     /// to `search.bm25` immediately, regardless of whether an index exists. The
     /// index only serves once compaction has caught the corpus up.
     ///
-    /// `Ok(Some(hits))` is the BM25 result: `(NodeId, score)` best-first with a
-    /// node-id tie-break, unioned across every in-scope TextIndex SST (normally
-    /// one per index; a partial rebuild can briefly leave two). `k = None`
-    /// returns every match. `query` is the parsed query — phrases, prefixes
-    /// and plain terms — whose semantics `TextIndex::search_query` shares
-    /// verbatim with the executor's flat scan.
+    /// `Ok(Some(hits))` is the BM25 result from the single authoritative index:
+    /// `(NodeId, score)` best-first with a node-id tie-break. Multiple bodies
+    /// indicate stale/anomalous generations and force the exact fallback
+    /// because their per-corpus BM25 statistics are not comparable. `k = None`
+    /// returns every match. `query` is the parsed query — phrases, prefixes and
+    /// plain terms — whose semantics `TextIndex::search_query` shares verbatim
+    /// with the executor's flat scan.
     #[cfg(feature = "text-index")]
     pub async fn text_search(
         &self,
@@ -3178,13 +3389,11 @@ impl<'mt> Snapshot<'mt> {
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
         // Authoritative only if a TextIndex SST exists for this index...
-        let has_index_sst = self
+        let index_descriptor_ids = self
             .manifest
-            .manifest
-            .ssts
-            .iter()
-            .any(|d| d.kind == SstKind::TextIndex && d.scope == index_name);
-        if !has_index_sst {
+            .index
+            .scope_descriptors(SstKind::TextIndex, index_name);
+        if index_descriptor_ids.len() != 1 {
             return Ok(None);
         }
         // ...and there is no un-compacted node delta the index has not absorbed:
@@ -3222,11 +3431,9 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        let mut all: Vec<(NodeId, f64)> = Vec::new();
-        for desc in &self.manifest.manifest.ssts {
-            if desc.kind != SstKind::TextIndex || desc.scope != index_name {
-                continue;
-            }
+        let mut best_by_id: HashMap<NodeId, f64> = HashMap::new();
+        for &desc_idx in index_descriptor_ids {
+            let desc = &self.manifest.manifest.ssts[desc_idx];
             // An undecodable body (legacy magic after a format bump, or
             // corruption): BM25 depends on whole-corpus stats, so a partial
             // serve would skew them — treat the index as absent and flat-scan.
@@ -3239,12 +3446,19 @@ impl<'mt> Snapshot<'mt> {
             if dirty.iter().any(|id| idx.contains_doc(id)) {
                 return Ok(None);
             }
-            all.extend(
-                idx.search_query(query, k)
-                    .into_iter()
-                    .map(|(id, s)| (NodeId(Uuid::from_bytes(id)), s)),
-            );
+            for (id, score) in idx.search_query(query, k) {
+                let id = NodeId(Uuid::from_bytes(id));
+                best_by_id
+                    .entry(id)
+                    .and_modify(|best| {
+                        if score > *best {
+                            *best = score;
+                        }
+                    })
+                    .or_insert(score);
+            }
         }
+        let mut all: Vec<(NodeId, f64)> = best_by_id.into_iter().collect();
         all.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -4850,6 +5064,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_edge_lookup_reconciles_dense_sst_memtable_and_overlay() {
+        let store = make_store();
+        let paths = make_paths("read-edge-point");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+
+        let src = NodeId::from_uuid(Uuid::from_bytes([0x80; 16]));
+        let partners: Vec<NodeId> = (0..2048u128)
+            .map(|i| NodeId::from_uuid(Uuid::from_bytes((i * 2).to_be_bytes())))
+            .collect();
+        let target = partners[1536];
+        let mut flushed = Memtable::new();
+        for (i, dst) in partners.iter().enumerate() {
+            let properties = if *dst == target {
+                BTreeMap::from([("code".into(), Value::Str("persisted".into()))])
+            } else {
+                BTreeMap::new()
+            };
+            flushed.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src,
+                    dst: *dst,
+                },
+                i as u64 + 10,
+                MemOp::Upsert(
+                    EdgeWriteRecord {
+                        properties,
+                        schema_version: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            );
+        }
+        let outcome = flush(&ms, &fence, &base, &flushed.freeze(), schema)
+            .await
+            .unwrap();
+
+        let live = Memtable::new();
+        let live_view = live.snapshot_view();
+        let persisted = Snapshot::new(
+            outcome.committed.clone(),
+            &live_view,
+            store.clone(),
+            paths.clone(),
+        );
+        let edge = persisted
+            .lookup_edge_via_sst("KNOWS", src, target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edge.properties.get("code"),
+            Some(&Value::Str("persisted".into()))
+        );
+        assert!(persisted
+            .contains_edge_via_sst("KNOWS", src, target)
+            .await
+            .unwrap());
+        let absent = NodeId::from_uuid(Uuid::from_bytes((u128::MAX - 1).to_be_bytes()));
+        assert!(!persisted
+            .contains_edge_via_sst("KNOWS", src, absent)
+            .await
+            .unwrap());
+
+        // A staged tombstone must hide both the persisted row and any
+        // committed-memtable version of the same physical relationship.
+        let mut committed = Memtable::new();
+        committed.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src,
+                dst: target,
+            },
+            10_000,
+            MemOp::Upsert(
+                EdgeWriteRecord {
+                    properties: BTreeMap::from([("code".into(), Value::Str("committed".into()))]),
+                    schema_version: 1,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        );
+        let committed_view = committed.snapshot_view();
+        let mut staged = Memtable::new();
+        staged.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src,
+                dst: target,
+            },
+            10_001,
+            MemOp::Tombstone,
+        );
+        let hidden = Snapshot::new(outcome.committed, &committed_view, store, paths)
+            .with_overlay(staged.snapshot_view());
+        assert!(hidden
+            .lookup_edge_via_sst("KNOWS", src, target)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_edge_lookup_reconciles_overlapping_ssts_before_decoding_properties() {
+        let store = make_store();
+        let paths = make_paths("read-edge-point-lww");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+        let src = sorted_node_id(1);
+        let dst = sorted_node_id(2);
+        let key = || MemKey::Edge {
+            edge_type: "KNOWS".into(),
+            src,
+            dst,
+        };
+        let payload = |code: &str| {
+            EdgeWriteRecord {
+                properties: BTreeMap::from([("code".into(), Value::Str(code.into()))]),
+                schema_version: 1,
+            }
+            .encode()
+            .unwrap()
+        };
+
+        let mut old = Memtable::new();
+        old.apply(key(), 10, MemOp::Upsert(payload("old-loser")));
+        let old_frozen = old.freeze();
+        let v1 = flush(&ms, &fence, &base, &old_frozen, schema.clone())
+            .await
+            .unwrap();
+
+        let mut deleted = Memtable::new();
+        deleted.apply(key(), 20, MemOp::Tombstone);
+        let deleted_frozen = deleted.freeze();
+        let v2 = flush(&ms, &fence, &v1.committed, &deleted_frozen, schema.clone())
+            .await
+            .unwrap();
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let deleted_snap = Snapshot::new(
+            v2.committed.clone(),
+            &empty_view,
+            store.clone(),
+            paths.clone(),
+        );
+        assert!(deleted_snap
+            .lookup_edge_via_sst("KNOWS", src, dst)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut resurrected = Memtable::new();
+        resurrected.apply(key(), 30, MemOp::Upsert(payload("new-winner")));
+        let resurrected_frozen = resurrected.freeze();
+        let v3 = flush(&ms, &fence, &v2.committed, &resurrected_frozen, schema)
+            .await
+            .unwrap();
+
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = Snapshot::new(v3.committed, &empty_view, store, paths).with_cache(cache.clone());
+        let edge = snap
+            .lookup_edge_via_sst("KNOWS", src, dst)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge.lsn, 30);
+        assert_eq!(
+            edge.properties.get("code"),
+            Some(&Value::Str("new-winner".into()))
+        );
+        assert_eq!(
+            cache.edge_readers_inserts(),
+            1,
+            "newest-first probing should not open older overlapping edge SSTs"
+        );
+        assert_eq!(
+            cache.edge_streams_inserts(),
+            1,
+            "only the final live winner's SST property bundle should decode"
+        );
+        assert!(snap.contains_edge_via_sst("KNOWS", src, dst).await.unwrap());
+        assert_eq!(
+            cache.edge_streams_inserts(),
+            1,
+            "an existence probe must not touch property streams"
+        );
+    }
+
+    #[tokio::test]
     async fn out_edges_merges_memtable_and_sst() {
         let store = make_store();
         let paths = make_paths("read-edges-merge");
@@ -6213,6 +6633,12 @@ mod tests {
             label_index: None,
             per_label_property_stats: Vec::new(),
         });
+        base = LoadedManifest::new(
+            base.pointer,
+            base.pointer_etag,
+            base.pointer_version,
+            base.manifest,
+        );
         let mt = Memtable::new();
         let view = mt.snapshot_view();
         let snap = Snapshot::new(base, &view, store, paths);
@@ -7013,6 +7439,16 @@ mod tests {
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
         let is_fresh = |loaded: LoadedManifest, name: &str, kind: SstKind| {
+            // This test intentionally mutates cloned manifest fixtures. A
+            // production LoadedManifest is immutable and every commit/load
+            // rebuilds its derived descriptor index; mirror that boundary
+            // before constructing the snapshot.
+            let loaded = LoadedManifest::new(
+                loaded.pointer,
+                loaded.pointer_etag,
+                loaded.pointer_version,
+                loaded.manifest,
+            );
             let snap = Snapshot::new(loaded, &empty_view, store.clone(), paths.clone());
             !snap.index_outrun_by_nodes(name, kind)
         };
@@ -7120,6 +7556,34 @@ mod tests {
             20,
             Some(vec![(other_label, 1)]),
         ));
+        let anomalous = LoadedManifest::new(
+            multiple.pointer.clone(),
+            multiple.pointer_etag.clone(),
+            multiple.pointer_version.clone(),
+            multiple.manifest.clone(),
+        );
+        let anomaly_snap = Snapshot::new(anomalous, &empty_view, store.clone(), paths.clone());
+        assert!(
+            anomaly_snap
+                .try_vector_search("note_vec", &[0.0; 4], 1, 8)
+                .await
+                .unwrap()
+                .is_none(),
+            "multiple vector generations must force the exact fallback"
+        );
+        assert!(
+            anomaly_snap
+                .text_search(
+                    "note_ft",
+                    "Note",
+                    &crate::text::parse_query("hello"),
+                    Some(1),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "multiple BM25 generations must not mix corpus-local scores"
+        );
         assert_both(multiple, false);
     }
 

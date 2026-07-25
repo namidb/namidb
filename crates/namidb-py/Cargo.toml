@@ -15,6 +15,14 @@ description = "Python bindings for the NamiDB storage engine (pyo3 + maturin)"
 name = "_lib"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Keep the published Python distribution aligned with the server: these
+# forwarders compile both the query dispatch and the storage build/read paths.
+# `pyproject.toml` explicitly enables both for wheels and source distributions.
+vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+text-index = ["namidb-query/text-index", "namidb-storage/text-index"]
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }

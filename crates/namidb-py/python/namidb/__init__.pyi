@@ -7,7 +7,7 @@ surface so IDEs / Pylance / mypy can type-check user code.
 
 from __future__ import annotations
 
-from typing import Any, Coroutine, Optional
+from typing import Any, Coroutine, Optional, TypedDict
 
 __version__: str
 
@@ -17,6 +17,18 @@ __version__: str
 # their side.
 _Table = Any
 _DataFrame = Any
+
+
+class _CompactionReport(TypedDict):
+    applied: bool
+    manifest_version_before: int
+    manifest_version_after: int
+    l0_before: int
+    l0_after: int
+    source_ssts_removed: int
+    new_ssts_written: int
+    bloom_sidecars_written: int
+
 
 class QueryResult:
     """Result of a Cypher query.
@@ -118,6 +130,14 @@ class Client:
 
     def flush(self) -> None:
         """Flush the memtable to L0 SSTs."""
+
+    def compact(self) -> _CompactionReport:
+        """Run one leveled compaction pass. Expensive preparation runs
+        without the writer mutex; the returned report describes whether
+        the pass applied and which immutable SSTs it replaced."""
+
+    def acompact(self) -> Coroutine[Any, Any, _CompactionReport]:
+        """Async sibling of [`Client.compact`], returning the same report."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 

@@ -36,6 +36,7 @@ on:
       - "crates/namidb-py/**"
       - "crates/namidb-core/**"
       - "crates/namidb-storage/**"
+      - "crates/namidb-ann/**"
       - "crates/namidb-graph/**"
       - "crates/namidb-query/**"
       - "Cargo.toml"
@@ -50,6 +51,7 @@ on:
       - "crates/namidb-py/**"
       - "crates/namidb-core/**"
       - "crates/namidb-storage/**"
+      - "crates/namidb-ann/**"
       - "crates/namidb-graph/**"
       - "crates/namidb-query/**"
       - "Cargo.toml"
@@ -244,6 +246,14 @@ jobs:
           c.cypher("CREATE (a:Person {name: 'CI'})")
           r = c.cypher("MATCH (p:Person) RETURN p.name AS name")
           assert r.first() == {"name": "CI"}, r.first()
+          c.cypher(
+              "CREATE VECTOR INDEX ci_vec ON :Doc(embedding) "
+              "METRIC cosine DIMENSION 3"
+          )
+          c.cypher("CREATE FULLTEXT INDEX ci_text ON :Doc(body)")
+          indexes = {row["name"]: row for row in c.cypher("SHOW INDEXES").rows()}
+          assert indexes["ci_vec"]["type"] == "VECTOR", indexes
+          assert indexes["ci_text"]["type"] == "FULLTEXT", indexes
           print("ok:", tg.__version__)
           PY
       - name: Pytest the package against the installed wheel

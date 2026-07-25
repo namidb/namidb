@@ -40,6 +40,10 @@ use namidb_storage::{
 pub struct Client {
     runtime: Runtime,
     session: Arc<Mutex<WriterSession>>,
+    /// Serialises compaction passes without sharing the writer mutex. Two
+    /// concurrent `acompact()` calls must not prepare from the same basis and
+    /// race to remove the same immutable inputs.
+    compaction_lock: Arc<Mutex<()>>,
     store: Arc<dyn ObjectStore>,
     paths: namidb_storage::NamespacePaths,
     cache: SstCache,
@@ -79,6 +83,7 @@ impl Client {
         Ok(Self {
             runtime,
             session: Arc::new(Mutex::new(session)),
+            compaction_lock: Arc::new(Mutex::new(())),
             store,
             paths,
             cache,
@@ -243,6 +248,30 @@ impl Client {
             session.flush(schema).await.map_err(map_storage_err)
         })?;
         Ok(())
+    }
+
+    /// Run one leveled compaction pass.
+    ///
+    /// The expensive prepare phase (object reads, row merging, vector/full-text
+    /// index builds, and object writes) runs without the writer mutex. The
+    /// mutex is held only while capturing a basis and while installing the
+    /// prepared manifest update. Returns a dict describing the pass.
+    fn compact(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let report = self.runtime.block_on(run_compaction_inner(
+            self.session.clone(),
+            self.compaction_lock.clone(),
+        ))?;
+        compaction_report_to_py(py, &report)
+    }
+
+    /// Async sibling of [`Client::compact`]. Returns the same report dict.
+    fn acompact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.session.clone();
+        let compaction_lock = self.compaction_lock.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = run_compaction_inner(session, compaction_lock).await?;
+            Python::with_gil(|py| compaction_report_to_py(py, &report))
+        })
     }
 
     /// Look up a single node by `(label, id)`.
@@ -627,7 +656,131 @@ impl Client {
     }
 }
 
+// ── Embedded maintenance ──────────────────────────────────────────────
+
+#[derive(Debug)]
+struct CompactionReport {
+    applied: bool,
+    manifest_version_before: u64,
+    manifest_version_after: u64,
+    l0_before: usize,
+    l0_after: usize,
+    source_ssts_removed: usize,
+    new_ssts_written: usize,
+    bloom_sidecars_written: usize,
+}
+
+/// Compact one immutable basis without retaining the foreground writer lock.
+///
+/// A separate mutex serialises compaction passes, while ordinary writes remain
+/// free to acquire `session` throughout the expensive prepare phase. Storage's
+/// install step folds those newer writes/flushes into the current manifest.
+async fn run_compaction_inner(
+    session: Arc<Mutex<WriterSession>>,
+    compaction_lock: Arc<Mutex<()>>,
+) -> PyResult<CompactionReport> {
+    let _compaction_guard = compaction_lock.lock().await;
+    let basis = {
+        let guard = session.lock().await;
+        guard.compaction_basis()
+    };
+    let manifest_version_before = basis.manifest_version();
+    let l0_before = basis.max_l0_bucket_len();
+
+    if !basis.needs_compaction() {
+        // Re-sample after re-acquiring the writer: a concurrent foreground
+        // flush may have advanced the manifest while this no-op pass ran.
+        let guard = session.lock().await;
+        return Ok(CompactionReport {
+            applied: false,
+            manifest_version_before,
+            manifest_version_after: guard.snapshot().manifest().manifest.version,
+            l0_before,
+            l0_after: guard.max_l0_bucket_len(),
+            source_ssts_removed: 0,
+            new_ssts_written: 0,
+            bloom_sidecars_written: 0,
+        });
+    }
+
+    let schema = basis.schema().clone();
+    // No WriterSession guard is alive across this await: all expensive object
+    // I/O, CPU merging, and vector/text index construction happen off-lock.
+    let prepared = basis.prepare(&schema).await.map_err(map_storage_err)?;
+
+    // Let already-ready foreground work join the FIFO writer queue before the
+    // brief install section, mirroring the server maintenance loop.
+    tokio::task::yield_now().await;
+    let mut guard = session.lock().await;
+    let outcome = guard
+        .install_prepared_compaction(prepared)
+        .await
+        .map_err(map_storage_err)?;
+    let l0_after = guard.max_l0_bucket_len();
+
+    Ok(CompactionReport {
+        applied: outcome.source_ssts_removed > 0,
+        manifest_version_before,
+        manifest_version_after: outcome.committed.manifest.version,
+        l0_before,
+        l0_after,
+        source_ssts_removed: outcome.source_ssts_removed,
+        new_ssts_written: outcome.new_ssts_written,
+        bloom_sidecars_written: outcome.bloom_sidecars_written,
+    })
+}
+
+fn compaction_report_to_py(py: Python<'_>, report: &CompactionReport) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("applied", report.applied)?;
+    d.set_item("manifest_version_before", report.manifest_version_before)?;
+    d.set_item("manifest_version_after", report.manifest_version_after)?;
+    d.set_item("l0_before", report.l0_before)?;
+    d.set_item("l0_after", report.l0_after)?;
+    d.set_item("source_ssts_removed", report.source_ssts_removed)?;
+    d.set_item("new_ssts_written", report.new_ssts_written)?;
+    d.set_item("bloom_sidecars_written", report.bloom_sidecars_written)?;
+    Ok(d.into())
+}
+
 // ── Cypher execution path (shared between sync + async) ───────────────
+
+#[cfg(feature = "vector-index")]
+fn vector_index_descriptor_from(
+    cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
+) -> namidb_storage::manifest::VectorIndexDescriptor {
+    use namidb_query::parser::ast::{VectorMetric as M, VectorQuantization as Q};
+
+    let metric = match cvi.metric {
+        M::Cosine => namidb_storage::manifest::VectorMetric::Cosine,
+        M::Dot => namidb_storage::manifest::VectorMetric::Dot,
+        M::Euclidean => namidb_storage::manifest::VectorMetric::Euclidean,
+    };
+    let quantization = match cvi.quantization {
+        Q::None => namidb_storage::manifest::VectorQuantization::None,
+        Q::Int8 => namidb_storage::manifest::VectorQuantization::Int8,
+    };
+    // Keep these defaults byte-for-byte aligned with the server and
+    // `namidb_ann::BuildParams::default()`.
+    namidb_storage::manifest::VectorIndexDescriptor {
+        name: cvi.name.name.clone(),
+        label: cvi.label.name.clone(),
+        property: cvi.property.name.clone(),
+        dim: cvi.dim,
+        metric,
+        r: cvi.r.unwrap_or(64),
+        l_build: cvi.l_build.unwrap_or(128),
+        alpha: cvi.alpha.unwrap_or(1.2),
+        quantization,
+    }
+}
+
+fn empty_query_result() -> QueryResult {
+    QueryResult {
+        columns: vec![],
+        rows: vec![],
+    }
+}
 
 /// Drive a Cypher query under a held `WriterSession` guard. Caller is
 /// responsible for acquiring the `tokio::sync::Mutex` lock; this
@@ -644,6 +797,44 @@ async fn run_cypher_inner(
     // Schema DDL / introspection is intercepted before planning — these clauses
     // never lower to a `LogicalPlan`. Running them as the sole statement here
     // lets the embedded client issue them directly (no Bolt/HTTP round-trip).
+    #[cfg(feature = "vector-index")]
+    if let Some(cvi) = parsed.as_create_vector_index() {
+        let desc = vector_index_descriptor_from(cvi);
+        guard
+            .register_vector_index(desc, cvi.if_not_exists)
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(empty_query_result());
+    }
+    #[cfg(feature = "text-index")]
+    if let Some(cfi) = parsed.as_create_fulltext_index() {
+        let desc = namidb_storage::manifest::TextIndexDescriptor::new(
+            cfi.name.name.clone(),
+            cfi.label.name.clone(),
+            cfi.properties.iter().map(|p| p.name.clone()).collect(),
+        );
+        guard
+            .register_text_index(desc, cfi.if_not_exists)
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(empty_query_result());
+    }
+    #[cfg(feature = "vector-index")]
+    if let Some(dvi) = parsed.as_drop_vector_index() {
+        guard
+            .drop_vector_index(&dvi.name.name, dvi.if_exists)
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(empty_query_result());
+    }
+    #[cfg(feature = "text-index")]
+    if let Some(dfi) = parsed.as_drop_fulltext_index() {
+        guard
+            .drop_text_index(&dfi.name.name, dfi.if_exists)
+            .await
+            .map_err(map_storage_err)?;
+        return Ok(empty_query_result());
+    }
     if let Some(c) = parsed.as_create_constraint() {
         let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
         guard
@@ -655,10 +846,7 @@ async fn run_cypher_inner(
             )
             .await
             .map_err(map_storage_err)?;
-        return Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        });
+        return Ok(empty_query_result());
     }
     if let Some(c) = parsed.as_create_index() {
         guard
@@ -670,10 +858,7 @@ async fn run_cypher_inner(
             )
             .await
             .map_err(map_storage_err)?;
-        return Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        });
+        return Ok(empty_query_result());
     }
     if let Some(c) = parsed.as_show_schema() {
         use namidb_query::parser::ast::ShowKind;

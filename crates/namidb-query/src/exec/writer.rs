@@ -2130,6 +2130,66 @@ async fn find_merge_matches(
                 Some(RuntimeValue::Node(n)) => n.id,
                 _ => continue,
             };
+
+            // Expand-Into for MERGE: when the tail is already bound, the
+            // relationship's physical identity is fully known. Probe the
+            // exact `(type, src, dst)` key instead of materialising every
+            // relationship incident to the source and filtering by partner.
+            // The storage point path reconciles memtable/SST versions and
+            // tombstones, then decodes properties only for the winning row.
+            if let MergeTail::BackReference { node_id, value } = &tail {
+                let (physical_src, physical_dst) = match rel_direction {
+                    RelationshipDirection::Right => (source_node_id, *node_id),
+                    RelationshipDirection::Left => (*node_id, source_node_id),
+                    RelationshipDirection::Both => {
+                        return Err(ExecError::Runtime(
+                            "MERGE relationship must be directed".into(),
+                        ));
+                    }
+                };
+                // The common loader shape `MERGE (a)-[:R]->(b)` needs only an
+                // existence answer when the relationship is anonymous and no
+                // relationship properties participate in the pattern. Avoid
+                // decoding the winning SST's property streams altogether.
+                if expected_rel_props.is_empty() && rel_alias.is_none() {
+                    if !snap
+                        .contains_edge_via_sst(rel_edge_type, physical_src, physical_dst)
+                        .await
+                        .map_err(ExecError::Storage)?
+                    {
+                        continue;
+                    }
+                    let mut new_row = source_row;
+                    new_row.set(
+                        target_alias.to_string(),
+                        RuntimeValue::Node(Box::new((**value).clone())),
+                    );
+                    next.push(new_row);
+                    continue;
+                }
+                let Some(edge) = snap
+                    .lookup_edge_via_sst(rel_edge_type, physical_src, physical_dst)
+                    .await
+                    .map_err(ExecError::Storage)?
+                else {
+                    continue;
+                };
+                let rel_value = RelValue::from(edge);
+                if !materialized_props_match(&expected_rel_props, &rel_value.properties) {
+                    continue;
+                }
+                let mut new_row = source_row;
+                new_row.set(
+                    target_alias.to_string(),
+                    RuntimeValue::Node(Box::new((**value).clone())),
+                );
+                if let Some(name) = rel_alias {
+                    new_row.set(name.to_string(), RuntimeValue::Rel(Box::new(rel_value)));
+                }
+                next.push(new_row);
+                continue;
+            }
+
             // MERGE is a correlated relationship existence probe. Keep it on
             // the source-keyed SST path instead of the manifest-versioned CSR:
             // bulk loaders commit many small batches, so rebuilding the whole
@@ -2179,11 +2239,8 @@ async fn find_merge_matches(
                         }
                         partner
                     }
-                    MergeTail::BackReference { node_id, value } => {
-                        if partner_id != *node_id {
-                            continue;
-                        }
-                        (**value).clone()
+                    MergeTail::BackReference { .. } => {
+                        unreachable!("bound tails use the exact endpoint probe above")
                     }
                 };
                 let rel_value = RelValue::from(e);
@@ -2671,6 +2728,11 @@ impl<'a> MergeTail<'a> {
 
 fn runtime_values_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
     match (a, b) {
+        // This is persisted-pattern equivalence, not the three-valued Cypher
+        // `=` operator: `materialized_props_match` has already established
+        // that the property key exists on both sides. Since NAMIDB currently
+        // permits an explicit null to round-trip through CREATE/MERGE, it must
+        // match itself or every replay would take the create branch.
         (RuntimeValue::Null, RuntimeValue::Null) => true,
         (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => x == y,
         (RuntimeValue::Float(x), RuntimeValue::Float(y)) => x == y,
@@ -2678,6 +2740,33 @@ fn runtime_values_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
         | (RuntimeValue::Float(y), RuntimeValue::Integer(x)) => (*x as f64) == *y,
         (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => x == y,
         (RuntimeValue::String(x), RuntimeValue::String(y)) => x == y,
+        (RuntimeValue::Bytes(x), RuntimeValue::Bytes(y)) => x == y,
+        (RuntimeValue::Vector(x), RuntimeValue::Vector(y)) => x == y,
+        (
+            RuntimeValue::Vector8 {
+                codes: x_codes,
+                scale: x_scale,
+            },
+            RuntimeValue::Vector8 {
+                codes: y_codes,
+                scale: y_scale,
+            },
+        ) => x_codes == y_codes && x_scale == y_scale,
+        (RuntimeValue::Date(x), RuntimeValue::Date(y)) => x == y,
+        (RuntimeValue::DateTime(x), RuntimeValue::DateTime(y)) => x == y,
+        (RuntimeValue::List(x), RuntimeValue::List(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(left, right)| runtime_values_equal(left, right))
+        }
+        (RuntimeValue::Map(x), RuntimeValue::Map(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(key, left)| {
+                    y.get(key)
+                        .is_some_and(|right| runtime_values_equal(left, right))
+                })
+        }
         (RuntimeValue::Node(x), RuntimeValue::Node(y)) => x.id == y.id,
         (RuntimeValue::Rel(x), RuntimeValue::Rel(y)) => {
             x.edge_type == y.edge_type && x.src == y.src && x.dst == y.dst
@@ -2712,6 +2801,10 @@ fn runtime_to_core(v: &RuntimeValue, expr: &Expression) -> Result<CoreValue, Str
         RuntimeValue::String(s) => Ok(CoreValue::Str(s.clone())),
         RuntimeValue::Bytes(b) => Ok(CoreValue::Bytes(b.clone())),
         RuntimeValue::Vector(v) => Ok(CoreValue::Vec(v.clone())),
+        RuntimeValue::Vector8 { codes, scale } => Ok(CoreValue::VecI8 {
+            codes: codes.clone(),
+            scale: *scale,
+        }),
         RuntimeValue::Date(d) => Ok(CoreValue::Date(*d)),
         RuntimeValue::DateTime(m) => Ok(CoreValue::DateTime(*m)),
         RuntimeValue::List(items) => {
@@ -2765,6 +2858,10 @@ fn runtime_value_to_core(v: &RuntimeValue) -> Result<CoreValue, String> {
         RuntimeValue::String(s) => Ok(CoreValue::Str(s.clone())),
         RuntimeValue::Bytes(b) => Ok(CoreValue::Bytes(b.clone())),
         RuntimeValue::Vector(v) => Ok(CoreValue::Vec(v.clone())),
+        RuntimeValue::Vector8 { codes, scale } => Ok(CoreValue::VecI8 {
+            codes: codes.clone(),
+            scale: *scale,
+        }),
         RuntimeValue::Date(d) => Ok(CoreValue::Date(*d)),
         RuntimeValue::DateTime(m) => Ok(CoreValue::DateTime(*m)),
         RuntimeValue::List(items) => {
@@ -2801,6 +2898,58 @@ mod tests {
 
     fn paths(name: &str) -> NamespacePaths {
         NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+    }
+
+    #[test]
+    fn merge_property_equivalence_covers_nested_and_typed_storage_values() {
+        let left = RuntimeValue::Map(BTreeMap::from([
+            (
+                "nested".into(),
+                RuntimeValue::List(vec![
+                    RuntimeValue::Integer(7),
+                    RuntimeValue::Map(BTreeMap::from([
+                        ("nullable".into(), RuntimeValue::Null),
+                        ("ratio".into(), RuntimeValue::Float(3.0)),
+                    ])),
+                ]),
+            ),
+            ("bytes".into(), RuntimeValue::Bytes(vec![0, 1, 255])),
+            ("vector".into(), RuntimeValue::Vector(vec![0.25, -1.5])),
+            ("date".into(), RuntimeValue::Date(20_000)),
+            (
+                "datetime".into(),
+                RuntimeValue::DateTime(1_700_000_000_123_456),
+            ),
+        ]));
+        let right = RuntimeValue::Map(BTreeMap::from([
+            (
+                "nested".into(),
+                RuntimeValue::List(vec![
+                    // Numeric coercion must apply recursively too.
+                    RuntimeValue::Float(7.0),
+                    RuntimeValue::Map(BTreeMap::from([
+                        ("nullable".into(), RuntimeValue::Null),
+                        ("ratio".into(), RuntimeValue::Integer(3)),
+                    ])),
+                ]),
+            ),
+            ("bytes".into(), RuntimeValue::Bytes(vec![0, 1, 255])),
+            ("vector".into(), RuntimeValue::Vector(vec![0.25, -1.5])),
+            ("date".into(), RuntimeValue::Date(20_000)),
+            (
+                "datetime".into(),
+                RuntimeValue::DateTime(1_700_000_000_123_456),
+            ),
+        ]));
+
+        assert!(runtime_values_equal(&left, &right));
+
+        let mut changed = match right {
+            RuntimeValue::Map(values) => values,
+            _ => unreachable!(),
+        };
+        changed.insert("date".into(), RuntimeValue::Date(20_001));
+        assert!(!runtime_values_equal(&left, &RuntimeValue::Map(changed)));
     }
 
     #[tokio::test]

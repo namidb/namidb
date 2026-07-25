@@ -11,6 +11,74 @@ the release notes.
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-07-25: Exact relationship probes
+
+This patch removes degree-dependent work from bound relationship probes,
+reduces manifest and search-path overhead, and gives the published Python
+distribution the same persistent vector/full-text index lifecycle as the
+server. The on-disk formats and existing APIs remain compatible; the Python
+compaction methods are additive.
+
+### Changed — performance
+
+- **Bound relationship `MERGE` uses an exact endpoint-pair seek.** When both
+  endpoints are already bound, forward and inverse edge SSTs binary-search the
+  endpoint key and then the partner inside its CSR block instead of decoding
+  and filtering the endpoint's full degree. Anonymous propertyless `MERGE`
+  uses an existence-only probe; property-bearing matches decode only the live
+  winner's property bundle. Expand-Into and the final WCOJ edge-membership
+  check share the same path.
+- **Manifest candidate selection is indexed by kind, scope, level and key
+  range.** Disjoint leveled ranges use binary search and overlapping L0 or
+  legacy ranges use interval trees, reducing each point read from a manifest
+  scan to O(levels · log SSTs + overlaps). Exact edge candidates are visited
+  newest-LSN first so an authoritative winner can skip older bodies.
+- **High-degree edge blocks retain a corpus-independent point-probe bound.**
+  The dense/split skew threshold is fixed at 1,024 partners; dense UUID blocks
+  use fixed-width binary search and split blocks stop once their sorted range
+  passes the target.
+- **ANN visited state scales with the work performed.** One-off Vamana queries
+  use sparse visited marks rather than allocating and clearing a corpus-sized
+  bit vector. Index construction reuses one dense epoch array across all
+  refinement searches, removing an O(N²) stream of zero-fill writes.
+- **Vector and BM25 result hydration is batched.** ANN and int8 rescoring fetch
+  candidates in 64-node groups; BM25 uses 256-node groups and projects only
+  requested text properties on the flat path. Hydrated `NodeView`s are
+  consumed directly instead of being looked up and cloned a second time, with
+  deadline checks before every cold batch.
+- **PyPI wheels now include persistent Vamana and full-text indexes.** Embedded
+  Python supports `CREATE`/`DROP VECTOR INDEX`, `CREATE`/`DROP FULLTEXT INDEX`,
+  `compact()` and `acompact()`. Compaction prepares object reads, merges, index
+  builds and immutable uploads outside the writer mutex, then holds it only
+  for the validated manifest install.
+
+### Fixed
+
+- **Exact relationship reads preserve last-LSN-wins across every layer.**
+  Memtable, staged overlay, overlapping SST upserts and tombstones reconcile
+  before properties are decoded; a newer deletion cannot resurrect an older
+  edge and a later upsert can safely restore it.
+- **Search never combines incompatible index generations.** Vector and
+  full-text reads require one authoritative immutable body. Zero or multiple
+  generations select the flat fallback, avoiding stale vector membership and
+  BM25 scores computed from incompatible corpus statistics.
+- **Bound Expand-Into validates the live target label.** Flat and factorized
+  execution now reject a pre-bound endpoint with the wrong label, handle NULL
+  correctly, and preserve OPTIONAL MATCH null-padding.
+- **Relationship `MERGE` compares every persisted property type.** Bytes,
+  f32/int8 vectors, dates, datetimes, nested lists/maps and explicit NULLs
+  participate in the implicit match; int8 vectors round-trip back to storage
+  rather than being dropped during runtime-to-core conversion.
+- **Descriptor-index fixtures cannot silently drift in debug builds.** A
+  fingerprint covers every structural SST field and rejects snapshots whose
+  manifest was mutated without rebuilding the paired index. A deterministic
+  differential matrix checks indexed candidates against a linear reference
+  across kinds, scopes, levels, overlaps, gaps and inclusive key boundaries.
+- **Factorized execution parity tests now read their staged fixture.** The
+  suite uses the writer overlay snapshot, so label, NULL and OPTIONAL
+  assertions exercise real rows instead of an accidentally empty committed
+  snapshot.
+
 ## [2.0.2] - 2026-07-25: Sustained bulk graph loads
 
 This patch keeps idempotent multi-million-row graph loads on indexed paths,
@@ -1998,7 +2066,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/namidb/namidb/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/namidb/namidb/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/namidb/namidb/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/namidb/namidb/releases/tag/v2.0.0

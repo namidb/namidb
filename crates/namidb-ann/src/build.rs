@@ -17,7 +17,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::graph::VamanaGraph;
-use crate::search::beam_search;
+use crate::search::{beam_search_with_scratch, BeamScratch};
 use crate::space::VectorSpace;
 
 /// Build knobs. Defaults follow DiskANN's small/medium-set recommendations:
@@ -161,12 +161,22 @@ pub fn build<S: VectorSpace, R: Rng>(space: &S, params: BuildParams, rng: &mut R
     let l_build = params.l_build;
     let alpha = params.alpha;
     let r = params.r;
+    // One dense visited array for the whole refine pass. Epoch marks make each
+    // logical reset O(1), avoiding the old O(n)-zero-fill inside every one of
+    // the n beam searches.
+    let mut search_scratch = BeamScratch::dense(n);
 
     for &i in &order {
         // Find l_build nearest members to i over the graph-so-far.
-        let found = beam_search(&adj, n, entry, l_build, l_build, |id| {
-            space.pair_distance(i, id)
-        });
+        let found = beam_search_with_scratch(
+            &adj,
+            n,
+            entry,
+            l_build,
+            l_build,
+            |id| space.pair_distance(i, id),
+            &mut search_scratch,
+        );
         // Candidate set = found neighbours (dist to i), excluding i.
         let cands: Vec<Cand> = found
             .into_iter()

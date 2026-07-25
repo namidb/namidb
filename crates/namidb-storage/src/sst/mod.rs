@@ -21,8 +21,8 @@ pub mod vector;
 
 pub use bloom::{BloomDescriptor, BloomFilter, BLOOM_OMIT_THRESHOLD_BYTES, DEFAULT_BITS_PER_KEY};
 pub use edges::{
-    EdgeDirection, EdgeRecord, EdgeSstFinish, EdgeSstReader, EdgeSstStats, EdgeSstWriter,
-    EdgeSstWriterOptions,
+    EdgeDirection, EdgePointLookup, EdgeRecord, EdgeSstFinish, EdgeSstReader, EdgeSstStats,
+    EdgeSstWriter, EdgeSstWriterOptions,
 };
 pub use hll::{Hll, DEFAULT_PRECISION as HLL_DEFAULT_PRECISION};
 pub use nodes::{

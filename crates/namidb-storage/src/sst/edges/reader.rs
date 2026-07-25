@@ -13,7 +13,10 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result};
-use crate::sst::edges::encoding::{read_offset, read_partner_block, read_varint, OffsetWidth};
+use crate::sst::edges::encoding::{
+    binary_search_fixed_16, find_partner_in_block, read_offset, read_partner_block, read_varint,
+    OffsetWidth,
+};
 use crate::sst::edges::fence_index::FenceIndex;
 use crate::sst::edges::format::{
     EdgeFileFooter, EdgeFileHeader, SectionEntry, CODEC_NONE, CODEC_ZSTD, FOOTER_TRAILER_LEN,
@@ -52,6 +55,18 @@ pub struct EdgeLookup {
     pub edge_offset: usize,
 }
 
+/// Exact `(key, partner)` result from an edge SST.
+///
+/// `edge_offset` addresses the corresponding row in the property streams.
+/// Unlike [`EdgeLookup`], this projection never allocates or decodes the
+/// key's complete partner list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgePointLookup {
+    pub lsn: u64,
+    pub tombstone: bool,
+    pub edge_offset: usize,
+}
+
 /// One (key, partner) projection produced by [`EdgeSstReader::scan_all_edges`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeRowProjection {
@@ -69,6 +84,18 @@ impl EdgeSstReader {
         let header = EdgeFileHeader::decode(&body)?;
         let (footer, _footer_start) = EdgeFileFooter::decode(&body)?;
         let offset_width = OffsetWidth::from_bits(footer.offsets_bits)?;
+
+        // Verify topology/metadata sections exactly once when the reader
+        // enters the shared cache. Random lookups must not re-hash whole
+        // key/partner/LSN sections on every edge probe — that silently turns a
+        // point lookup back into O(SST bytes). Property streams stay lazy: a
+        // negative/existence-only probe must not hash megabytes of columns it
+        // will never decode; `section_with_name` verifies those on first use.
+        for entry in &footer.sections {
+            if entry.kind != SECTION_PROPERTY_STREAM {
+                let _ = verified_section(&body, entry)?;
+            }
+        }
 
         let fence_index = if let Some(entry) = footer.find_kind(SECTION_FENCE_INDEX) {
             let bytes = section_bytes(&body, entry)?;
@@ -143,11 +170,20 @@ impl EdgeSstReader {
             return Ok(None);
         }
 
-        let window = &key_ids[lo * 16..hi * 16];
-        match window.chunks_exact(16).position(|chunk| chunk == key) {
-            Some(offset) => Ok(Some((lo + offset) as u64)),
-            None => Ok(None),
-        }
+        let start = lo
+            .checked_mul(16)
+            .ok_or_else(|| Error::invariant("key-id window start overflows usize"))?;
+        let end = hi
+            .checked_mul(16)
+            .ok_or_else(|| Error::invariant("key-id window end overflows usize"))?;
+        let window = key_ids.get(start..end).ok_or_else(|| Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "key-id window [{start}, {end}) exceeds section length {}",
+                key_ids.len()
+            ),
+        })?;
+        Ok(binary_search_fixed_16(window, key)?.map(|offset| (lo + offset) as u64))
     }
 
     /// Look up the partner list for `key`. Returns `None` when absent.
@@ -167,6 +203,15 @@ impl EdgeSstReader {
 
         // partners block
         let partners_bytes = self.section(SECTION_PARTNERS, "")?;
+        if start > end || end > partners_bytes.len() {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "partner block bounds [{start}, {end}) exceed section length {}",
+                    partners_bytes.len()
+                ),
+            });
+        }
         let (partners, _consumed) = read_partner_block(partners_bytes, start)?;
         // Sanity-check: `_consumed == end - start`.
         if start + _consumed != end {
@@ -189,8 +234,19 @@ impl EdgeSstReader {
         let lsn_bytes = self.section(SECTION_PER_EDGE_LSN, "")?;
         let mut lsns = Vec::with_capacity(partners.len());
         for i in edge_offset..edge_end {
-            let off = i * 8;
-            let lsn = u64::from_le_bytes(lsn_bytes[off..off + 8].try_into().unwrap());
+            let off = i
+                .checked_mul(8)
+                .ok_or_else(|| Error::invariant("per-edge LSN offset overflows usize"))?;
+            let row = lsn_bytes
+                .get(off..off + 8)
+                .ok_or_else(|| Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!(
+                        "per-edge LSN row {i} exceeds section length {}",
+                        lsn_bytes.len()
+                    ),
+                })?;
+            let lsn = u64::from_le_bytes(row.try_into().unwrap());
             lsns.push(lsn);
         }
 
@@ -199,10 +255,18 @@ impl EdgeSstReader {
             let tomb_bytes = self.section(SECTION_PER_EDGE_TOMBSTONES, "")?;
             (edge_offset..edge_end)
                 .map(|i| {
-                    let byte = tomb_bytes[i / 8];
-                    (byte >> (i % 8)) & 1 == 1
+                    tomb_bytes
+                        .get(i / 8)
+                        .map(|byte| (byte >> (i % 8)) & 1 == 1)
+                        .ok_or_else(|| Error::Corrupted {
+                            path: "<edges>".into(),
+                            detail: format!(
+                                "per-edge tombstone row {i} exceeds section length {}",
+                                tomb_bytes.len()
+                            ),
+                        })
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()?
         } else {
             vec![false; partners.len()]
         };
@@ -211,6 +275,95 @@ impl EdgeSstReader {
             partners,
             lsns,
             tombstones,
+            edge_offset,
+        }))
+    }
+
+    /// Point-probe one exact `(key, partner)` edge.
+    ///
+    /// High-degree buckets use the dense partner representation and are
+    /// binary-searched in place (`O(log degree)`, zero allocation). The
+    /// returned absolute `edge_offset` lets the snapshot decode properties
+    /// only for the winning LSN after it has reconciled all overlapping SSTs.
+    pub fn lookup_partner(
+        &self,
+        key: &[u8; 16],
+        partner: &[u8; 16],
+    ) -> Result<Option<EdgePointLookup>> {
+        let Some(idx) = self.position_of(key)? else {
+            return Ok(None);
+        };
+        let idx = idx as usize;
+
+        let offsets_bytes = self.section(SECTION_OFFSETS, "")?;
+        let stride = self.offset_width.bytes();
+        let start = read_offset(offsets_bytes, idx * stride, self.offset_width)? as usize;
+        let end = read_offset(offsets_bytes, (idx + 1) * stride, self.offset_width)? as usize;
+        let partners_bytes = self.section(SECTION_PARTNERS, "")?;
+        if start > end || end > partners_bytes.len() {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "partner block bounds [{start}, {end}) exceed section length {}",
+                    partners_bytes.len()
+                ),
+            });
+        }
+        let Some(relative_idx) = find_partner_in_block(&partners_bytes[start..end], 0, partner)?
+        else {
+            return Ok(None);
+        };
+
+        let edge_offset = (self.cumulative_edges[idx] as usize)
+            .checked_add(relative_idx)
+            .ok_or_else(|| Error::invariant("edge point offset overflows usize"))?;
+        if edge_offset >= self.footer.edge_count as usize {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "edge point offset {edge_offset} exceeds edge_count {}",
+                    self.footer.edge_count
+                ),
+            });
+        }
+
+        let lsn_bytes = self.section(SECTION_PER_EDGE_LSN, "")?;
+        let lsn_start = edge_offset
+            .checked_mul(8)
+            .ok_or_else(|| Error::invariant("edge LSN offset overflows usize"))?;
+        let lsn_end = lsn_start
+            .checked_add(8)
+            .ok_or_else(|| Error::invariant("edge LSN end overflows usize"))?;
+        let lsn_slice = lsn_bytes
+            .get(lsn_start..lsn_end)
+            .ok_or_else(|| Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "per-edge LSN row {edge_offset} exceeds section length {}",
+                    lsn_bytes.len()
+                ),
+            })?;
+        let lsn = u64::from_le_bytes(lsn_slice.try_into().unwrap());
+
+        let tombstone = if self.footer.find_kind(SECTION_PER_EDGE_TOMBSTONES).is_some() {
+            let tomb_bytes = self.section(SECTION_PER_EDGE_TOMBSTONES, "")?;
+            let byte = *tomb_bytes
+                .get(edge_offset / 8)
+                .ok_or_else(|| Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!(
+                        "per-edge tombstone row {edge_offset} exceeds section length {}",
+                        tomb_bytes.len()
+                    ),
+                })?;
+            (byte >> (edge_offset % 8)) & 1 == 1
+        } else {
+            false
+        };
+
+        Ok(Some(EdgePointLookup {
+            lsn,
+            tombstone,
             edge_offset,
         }))
     }
@@ -361,8 +514,9 @@ impl EdgeSstReader {
         &self.cumulative_edges
     }
 
-    /// Fetch the raw bytes of one section, verifying its `xxhash3_64`. The
-    /// returned slice borrows from `self.body`.
+    /// Fetch a named property stream, verifying its checksum lazily. Snapshot
+    /// stream bundles cache the decoded result, so this cost is paid at most
+    /// once per SST in the normal shared-cache path.
     fn section_with_name(&self, kind: u16, name: &str) -> Result<&[u8]> {
         let entry = self
             .footer
@@ -371,22 +525,11 @@ impl EdgeSstReader {
                 path: "<edges>".into(),
                 detail: format!("edge SST missing section kind=0x{kind:04x} name='{name}'"),
             })?;
-        let bytes = section_bytes(&self.body, entry)?;
-        let hash = xxh3_64(bytes);
-        if hash != entry.xxhash3_64 {
-            return Err(Error::Corrupted {
-                path: "<edges>".into(),
-                detail: format!(
-                    "section '{}' (kind 0x{:04x}) xxhash mismatch",
-                    entry.name, entry.kind
-                ),
-            });
-        }
-        Ok(bytes)
+        verified_section(&self.body, entry)
     }
 
-    /// Fetch the raw bytes of one section, verifying its `xxhash3_64`. The
-    /// returned slice borrows from `self.body`.
+    /// Fetch the raw bytes of one section. Topology/metadata checksums are
+    /// verified once at [`Self::open`]; property streams are verified lazily.
     pub fn section(&self, kind: u16, name: &str) -> Result<&[u8]> {
         let entry = if name.is_empty() {
             self.footer.find_kind(kind)
@@ -397,18 +540,11 @@ impl EdgeSstReader {
             path: "<edges>".into(),
             detail: format!("edge SST missing section kind=0x{kind:04x} name='{name}'"),
         })?;
-        let bytes = section_bytes(&self.body, entry)?;
-        let hash = xxh3_64(bytes);
-        if hash != entry.xxhash3_64 {
-            return Err(Error::Corrupted {
-                path: "<edges>".into(),
-                detail: format!(
-                    "section '{}' (kind 0x{:04x}) xxhash mismatch",
-                    entry.name, entry.kind
-                ),
-            });
+        if kind == SECTION_PROPERTY_STREAM {
+            verified_section(&self.body, entry)
+        } else {
+            section_bytes(&self.body, entry)
         }
-        Ok(bytes)
     }
 }
 
@@ -461,15 +597,16 @@ fn build_cumulative_edges(
         return Ok(cumulative);
     }
 
-    // Resolve the two sections we need, with their xxhash already verified.
+    // `EdgeSstReader::open` verified every section before calling us, so these
+    // are trusted bounded slices. Re-hashing here would double the open cost.
     let offsets_entry = footer
         .find_kind(SECTION_OFFSETS)
         .ok_or_else(|| Error::invariant("offsets section missing despite earlier check"))?;
     let partners_entry = footer
         .find_kind(SECTION_PARTNERS)
         .ok_or_else(|| Error::invariant("partners section missing despite earlier check"))?;
-    let offsets_bytes = verified_section(body, offsets_entry)?;
-    let partners_bytes = verified_section(body, partners_entry)?;
+    let offsets_bytes = section_bytes(body, offsets_entry)?;
+    let partners_bytes = section_bytes(body, partners_entry)?;
 
     let stride = offset_width.bytes();
     let mut running: u64 = 0;
@@ -560,6 +697,23 @@ mod tests {
         assert_eq!(look.lsns, vec![20, 21, 22]);
         // The tombstoned edge was (k_idx=2, p_idx=1) → partners[1].
         assert_eq!(look.tombstones, vec![false, true, false]);
+
+        let exact = reader
+            .lookup_partner(&target, &key(2, 201))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact,
+            EdgePointLookup {
+                lsn: 21,
+                tombstone: true,
+                edge_offset: 7,
+            }
+        );
+        assert!(reader
+            .lookup_partner(&target, &key(2, 999))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -668,5 +822,41 @@ mod tests {
             sum += deg as u64;
         }
         assert_eq!(sum, expected_total);
+    }
+
+    #[test]
+    fn exact_lookup_handles_dense_high_degree_bucket() {
+        let mut opts = EdgeSstWriterOptions::new(EdgeDirection::Forward, "KNOWS", "P", "P");
+        opts.skew_threshold = Some(8);
+        let mut writer = EdgeSstWriter::new(opts);
+        let source = [0x11; 16];
+        let partners: Vec<[u8; 16]> = (0..4096u128).map(u128::to_be_bytes).collect();
+        for (i, partner) in partners.iter().enumerate() {
+            writer
+                .append(EdgeRecord {
+                    key_id: source,
+                    partner_id: *partner,
+                    lsn: i as u64 + 10,
+                    tombstone: i == 2048,
+                    declared_properties: vec![],
+                    overflow_json: None,
+                })
+                .unwrap();
+        }
+        let reader = EdgeSstReader::open(writer.finish().unwrap().body).unwrap();
+
+        for index in [0usize, 1, 2048, 4095] {
+            let exact = reader
+                .lookup_partner(&source, &partners[index])
+                .unwrap()
+                .unwrap();
+            assert_eq!(exact.lsn, index as u64 + 10);
+            assert_eq!(exact.tombstone, index == 2048);
+            assert_eq!(exact.edge_offset, index);
+        }
+        assert!(reader
+            .lookup_partner(&source, &[0xff; 16])
+            .unwrap()
+            .is_none());
     }
 }

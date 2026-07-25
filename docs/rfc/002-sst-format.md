@@ -521,8 +521,9 @@ if d > skew_threshold || split_cost >= dense_cost {
 }
 ```
 
-`skew_threshold` is bench-driven; the v1 default is `max(1024, 4 *
-sqrt(key_count))`. The `split_cost >= dense_cost` clause is the
+`skew_threshold` is bench-driven; the production default is `1024`, which
+bounds the sequential work of an exact partner probe independently of corpus
+size. The `split_cost >= dense_cost` clause is the
 "always-correct fallback": for pathological partner distributions
 (spanning the full `u64` range with near-uniform deltas) the split
 encoding can balloon to 18 B per partner, so the dense block bounds

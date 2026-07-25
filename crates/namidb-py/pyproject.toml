@@ -7,7 +7,7 @@ name = "namidb"
 # Keep in sync with the workspace `version` in /Cargo.toml.
 # `python-wheels.yml` publishes a wheel whose filename uses THIS
 # version; the release tag `py-vX.Y.Z` must match X.Y.Z exactly.
-version = "2.0.2"
+version = "2.0.3"
 description = "Cloud-native graph database on object storage (Python bindings)"
 readme = "README.md"
 license = "BUSL-1.1"
@@ -44,7 +44,7 @@ Repository = "https://github.com/namidb/namidb"
 # `namidb._lib` and re-exported from `python/namidb/__init__.py`.
 module-name = "namidb._lib"
 python-source = "python"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "vector-index", "text-index"]
 manifest-path = "Cargo.toml"
 strip = true
 

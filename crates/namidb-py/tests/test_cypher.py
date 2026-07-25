@@ -233,3 +233,178 @@ def test_embedded_ddl_constraint_index_and_show(client: tg.Client) -> None:
 
     idx_labels = [row["labelsOrTypes"][0] for row in client.cypher("SHOW INDEXES").rows()]
     assert "Doc" in idx_labels
+
+
+def test_embedded_vector_and_fulltext_ddl_lifecycle(client: tg.Client) -> None:
+    vector_ddl = (
+        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) "
+        "METRIC cosine DIMENSION 3"
+    )
+    fulltext_ddl = "CREATE FULLTEXT INDEX doc_text ON :Doc(body, title)"
+
+    assert client.cypher(vector_ddl).rows() == []
+    assert client.cypher(fulltext_ddl).rows() == []
+
+    indexes = {row["name"]: row for row in client.cypher("SHOW INDEXES").rows()}
+    assert indexes["doc_emb"]["type"] == "VECTOR"
+    assert indexes["doc_emb"]["labelsOrTypes"] == ["Doc"]
+    assert indexes["doc_emb"]["properties"] == ["embedding"]
+    assert indexes["doc_text"]["type"] == "FULLTEXT"
+    assert indexes["doc_text"]["labelsOrTypes"] == ["Doc"]
+    assert indexes["doc_text"]["properties"] == ["body", "title"]
+
+    # Duplicate name/target is an error unless explicitly idempotent.
+    with pytest.raises(RuntimeError, match="already exists"):
+        client.cypher(vector_ddl)
+    with pytest.raises(RuntimeError, match="already exists"):
+        client.cypher(fulltext_ddl)
+    client.cypher(
+        "CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(embedding) "
+        "METRIC cosine DIMENSION 3"
+    )
+    client.cypher(
+        "CREATE FULLTEXT INDEX doc_text IF NOT EXISTS ON :Doc(body, title)"
+    )
+
+    client.cypher("DROP VECTOR INDEX doc_emb")
+    client.cypher("DROP FULLTEXT INDEX doc_text")
+    assert {
+        row["name"] for row in client.cypher("SHOW INDEXES").rows()
+    }.isdisjoint({"doc_emb", "doc_text"})
+
+    with pytest.raises(RuntimeError, match="no vector index"):
+        client.cypher("DROP VECTOR INDEX doc_emb")
+    with pytest.raises(RuntimeError, match="no text index"):
+        client.cypher("DROP INDEX doc_text")
+    client.cypher("DROP VECTOR INDEX doc_emb IF EXISTS")
+    client.cypher("DROP INDEX doc_text IF EXISTS")
+
+    # Both full-text DROP spellings free the descriptor slot.
+    client.cypher(fulltext_ddl)
+    client.cypher("DROP INDEX doc_text")
+    client.cypher(fulltext_ddl)
+    client.cypher("DROP FULLTEXT INDEX doc_text")
+
+
+def test_vector_ddl_rejects_invalid_metric_and_dimension(client: tg.Client) -> None:
+    # Parser-level validation: int8 navigation is cosine-only.
+    with pytest.raises(ValueError, match="int8 quantization requires METRIC cosine"):
+        client.cypher(
+            "CREATE VECTOR INDEX bad_int8 ON :Doc(embedding) "
+            "METRIC dot DIMENSION 3 WITH {quantization: int8}"
+        )
+
+    client.cypher(
+        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) "
+        "METRIC cosine DIMENSION 3"
+    )
+    # A Python numeric list is accepted as a vector parameter and coerced by
+    # the indexed write path, but the declared dimension remains mandatory.
+    with pytest.raises(RuntimeError, match=r"dim 2.*declares 3"):
+        client.cypher(
+            "CREATE (:Doc {title: 'bad', embedding: $embedding})",
+            params={"embedding": [1.0, 0.0]},
+        )
+    client.cypher(
+        "CREATE (:Doc {title: 'ok', embedding: $embedding})",
+        params={"embedding": [1.0, 0.0, 0.0]},
+    )
+    result = client.cypher(
+        "CALL search.vector({label: 'Doc', property: 'embedding', "
+        "query: $query, k: 1}) "
+        "YIELD node, score RETURN node.title AS title, score",
+        params={"query": [1.0, 0.0, 0.0]},
+    )
+    assert result.first()["title"] == "ok"
+
+
+def test_compaction_materializes_vector_and_text_indexes(client: tg.Client) -> None:
+    client.cypher(
+        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) "
+        "METRIC cosine DIMENSION 3"
+    )
+    client.cypher("CREATE FULLTEXT INDEX doc_text ON :Doc(body)")
+
+    # Two flushes create two node L0 inputs, which makes the next authoritative
+    # compaction build one Nodes L1 plus the `.vg` and `.ft` bodies.
+    client.cypher(
+        "CREATE (:Doc {title: 'alpha', body: 'fox jumps quickly', "
+        "embedding: vector([1.0, 0.0, 0.0])}), "
+        "(:Doc {title: 'beta', body: 'database storage engine', "
+        "embedding: vector([0.0, 1.0, 0.0])})"
+    )
+    client.flush()
+    client.cypher(
+        "CREATE (:Doc {title: 'gamma', body: 'fox graph database', "
+        "embedding: vector([0.8, 0.2, 0.0])})"
+    )
+    client.flush()
+
+    vector_query = (
+        "CALL search.vector({label: 'Doc', property: 'embedding', "
+        "query: $query, k: 2}) "
+        "YIELD node, score RETURN node.title AS title, score"
+    )
+    bm25_query = (
+        "CALL search.bm25({label: 'Doc', text_property: 'body', "
+        "query: 'fox', k: 10}) "
+        "YIELD node, score RETURN node.title AS title, score"
+    )
+
+    # With descriptors but no immutable index body yet, both procedures use
+    # their exact flat fallback.
+    vector_before = [
+        row["title"]
+        for row in client.cypher(
+            vector_query, params={"query": [1.0, 0.0, 0.0]}
+        ).rows()
+    ]
+    bm25_before = {
+        row["title"] for row in client.cypher(bm25_query).rows()
+    }
+
+    report = client.compact()
+    assert report["applied"] is True
+    assert report["manifest_version_after"] > report["manifest_version_before"]
+    assert report["l0_before"] >= 2
+    assert report["l0_after"] < report["l0_before"]
+    assert report["source_ssts_removed"] >= 2
+    # Nodes L1 + one VectorGraph + one TextIndex.
+    assert report["new_ssts_written"] >= 3
+
+    # The now-authoritative bodies are consumed by the feature-backed paths and
+    # remain result-equivalent to the flat baseline.
+    vector_after = [
+        row["title"]
+        for row in client.cypher(
+            vector_query, params={"query": [1.0, 0.0, 0.0]}
+        ).rows()
+    ]
+    bm25_after = {
+        row["title"] for row in client.cypher(bm25_query).rows()
+    }
+    assert vector_before == vector_after == ["alpha", "gamma"]
+    assert bm25_before == bm25_after == {"alpha", "gamma"}
+
+    # A second pass over an already-compacted namespace is a structured no-op.
+    noop = client.compact()
+    assert noop["applied"] is False
+    assert noop["source_ssts_removed"] == 0
+    assert noop["new_ssts_written"] == 0
+
+
+def test_acompact_returns_the_same_report_shape(client: tg.Client) -> None:
+    async def run() -> dict:
+        return await client.acompact()
+
+    report = asyncio.run(run())
+    assert report == {
+        "applied": False,
+        "manifest_version_before": report["manifest_version_before"],
+        "manifest_version_after": report["manifest_version_after"],
+        "l0_before": 0,
+        "l0_after": 0,
+        "source_ssts_removed": 0,
+        "new_ssts_written": 0,
+        "bloom_sidecars_written": 0,
+    }

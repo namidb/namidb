@@ -1079,20 +1079,26 @@ pub(crate) async fn execute_expand(
         // Back-reference: read the existing binding once. The
         // traversal explores the frontier freely; only paths whose
         // tail matches `existing_target_id` are kept as results.
-        let existing_target_id: Option<NodeId> = if back_reference {
-            match row.get(target_alias) {
-                Some(RuntimeValue::Node(n)) => Some(n.id),
-                Some(RuntimeValue::Null) => None,
-                other => {
-                    return Err(ExecError::Runtime(format!(
-                        "Expand back-reference target `{}` is not a Node (got {:?})",
-                        target_alias, other
-                    )))
+        let (existing_target_id, bound_target_matches_labels): (Option<NodeId>, bool) =
+            if back_reference {
+                match row.get(target_alias) {
+                    Some(RuntimeValue::Node(n)) => (
+                        Some(n.id),
+                        target_labels.iter().all(|label| n.labels.contains(label)),
+                    ),
+                    // A NULL back-reference cannot satisfy a relationship pattern,
+                    // including a zero-hop variable-length pattern.
+                    Some(RuntimeValue::Null) => (None, false),
+                    other => {
+                        return Err(ExecError::Runtime(format!(
+                            "Expand back-reference target `{}` is not a Node (got {:?})",
+                            target_alias, other
+                        )))
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                (None, true)
+            };
 
         // Zero-length patterns (`*0..n`): the source node itself
         // counts as a valid match at hop 0. Emit it before stepping
@@ -1123,7 +1129,8 @@ pub(crate) async fn execute_expand(
                 Some(RuntimeValue::Node(n)) => target_labels.iter().all(|l| n.labels.contains(l)),
                 _ => target_labels.is_empty(),
             };
-            let zero_keeps = source_has_target_labels
+            let zero_keeps = bound_target_matches_labels
+                && source_has_target_labels
                 && match existing_target_id {
                     Some(existing) => starting == existing,
                     None => true,
@@ -1149,12 +1156,16 @@ pub(crate) async fn execute_expand(
         } else {
             Vec::new()
         };
-        let mut frontier: Vec<Step> = vec![Step {
-            tail: starting,
-            row: row.clone(),
-            trail: initial_trail,
-            rels: Vec::new(),
-        }];
+        let mut frontier: Vec<Step> = if bound_target_matches_labels {
+            vec![Step {
+                tail: starting,
+                row: row.clone(),
+                trail: initial_trail,
+                rels: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        };
         // Shortest-mode BFS pruning (RFC-023): a node reached at an earlier
         // hop cannot lie on a shortest path discovered later, and every prefix
         // of an unweighted shortest path is itself a shortest path — so
@@ -1189,9 +1200,25 @@ pub(crate) async fn execute_expand(
             let mut seen_targets: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
             for step in frontier.drain(..) {
-                let neighbours =
+                let neighbours = if back_reference && max == 1 {
+                    match existing_target_id {
+                        Some(target) => {
+                            exact_edges_between_any(
+                                snapshot,
+                                &edge_types,
+                                direction,
+                                step.tail,
+                                target,
+                                edge_read_mode,
+                            )
+                            .await?
+                        }
+                        None => Vec::new(),
+                    }
+                } else {
                     neighbours_of_any(snapshot, &edge_types, direction, step.tail, edge_read_mode)
-                        .await?;
+                        .await?
+                };
                 if !back_reference && !skip_target_materialize {
                     for edge in &neighbours {
                         let tid = partner_id(edge, direction, step.tail);
@@ -1366,7 +1393,8 @@ pub(crate) async fn execute_expand(
                         rels: new_rels,
                     });
                     if hop >= min.max(1) {
-                        let keeps = target_is_result
+                        let keeps = bound_target_matches_labels
+                            && target_is_result
                             && match existing_target_id {
                                 Some(existing) => target_id == existing,
                                 None => true,
@@ -1821,12 +1849,20 @@ async fn bm25_search(
     let ranked = bm25_ranked(snapshot, &label, &props, &query, k).await?;
 
     // Hydrate each ranked id to its full node so `YIELD node` carries the
-    // document's properties. A doc ranked but since deleted resolves to None.
+    // document's properties. Hydrate bounded chunks directly so cold
+    // object-store results share row-group reads without a second lookup and
+    // deep NodeView clone per hit. A deleted document resolves to None.
     let mut raw = Vec::with_capacity(ranked.len());
-    for (id, score) in ranked {
-        if let Some(view) = snapshot.lookup_node(&label, id).await? {
-            let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
-            raw.push(vec![node, RuntimeValue::Float(score)]);
+    const HYDRATE_BATCH: usize = 256;
+    for chunk in ranked.chunks(HYDRATE_BATCH) {
+        crate::exec::limits::check_deadline()?;
+        let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+        let hydrated = snapshot.batch_lookup_nodes(&label, &ids).await?;
+        for ((_, score), view) in chunk.iter().zip(hydrated) {
+            if let Some(view) = view {
+                let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
+                raw.push(vec![node, RuntimeValue::Float(*score)]);
+            }
         }
     }
     project_proc_rows("search.bm25", &["node", "score"], raw, yield_items)
@@ -1894,7 +1930,12 @@ async fn bm25_ranked(
         }
     }
 
-    let views = snapshot.scan_label(label).await?;
+    // Ranking needs only the configured text columns. Winner hydration happens
+    // in `bm25_search`, so avoid decoding every unrelated property in the flat
+    // fallback (the common path while a fresh delta makes the FTS SST stale).
+    let views = snapshot
+        .scan_label_with_predicates_and_projection(label, &[], Some(&props))
+        .await?;
 
     // Fixed scored terms (plain + phrase tokens), distinct and sorted; prefix
     // expansions join after the pass discovers the corpus vocabulary.
@@ -3680,22 +3721,25 @@ async fn try_index_search(
         let mut rescored_views: std::collections::HashMap<NodeId, NodeValue> =
             std::collections::HashMap::new();
         let hits: Vec<(NodeId, f64)> = if index_int8 {
-            let ids: Vec<NodeId> = raw_hits.iter().map(|(id, _)| *id).collect();
-            // Batch prewarm so the per-id lookups below hit the cache.
-            let _ = snapshot.batch_lookup_nodes(label, &ids).await?;
             let mut exact = Vec::with_capacity(raw_hits.len());
-            for (id, _quantized) in raw_hits {
+            const RESCORE_BATCH: usize = 64;
+            for raw_chunk in raw_hits.chunks(RESCORE_BATCH) {
                 crate::exec::limits::check_deadline()?;
-                let Some(view) = snapshot.lookup_node(label, id).await? else {
-                    continue;
-                };
-                let node = NodeValue::from(view);
-                let Some(emb) = node.properties.get(property) else {
-                    continue;
-                };
-                if let Some((s, _higher)) = vector_score(distance, emb, &q_rv, span)? {
-                    exact.push((id, s));
-                    rescored_views.insert(id, node);
+                let ids: Vec<NodeId> = raw_chunk.iter().map(|(id, _)| *id).collect();
+                let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
+                for ((id, _quantized), view) in raw_chunk.iter().zip(hydrated) {
+                    crate::exec::limits::check_deadline()?;
+                    let Some(view) = view else {
+                        continue;
+                    };
+                    let node = NodeValue::from(view);
+                    let Some(emb) = node.properties.get(property) else {
+                        continue;
+                    };
+                    if let Some((s, _higher)) = vector_score(distance, emb, &q_rv, span)? {
+                        exact.push((*id, s));
+                        rescored_views.insert(*id, node);
+                    }
                 }
             }
             exact
@@ -3705,9 +3749,9 @@ async fn try_index_search(
 
         // Merge: deduped index hits not superseded by the delta, plus the
         // pre-scored delta. `seen` starts from the delta ids each round so a
-        // superseded hit is dropped, and also dedups index hits a partial rebuild
-        // returned twice (storage `vector_search` unions `.vg` SSTs without
-        // deduping, and the wider `kprime` fetch widens that window).
+        // superseded hit is dropped. The set also remains a defensive dedup
+        // boundary for malformed index bodies; storage rejects manifests with
+        // multiple full-corpus vector generations.
         let mut seen: BTreeSet<NodeId> = delta_ids.clone();
         let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta_scored.len());
         for (id, score) in hits {
@@ -3726,27 +3770,42 @@ async fn try_index_search(
         // Per-candidate deadline probe: a widened filtered ANN can do many cold
         // node lookups and must stay interruptible the way the flat scan is.
         let mut out = Vec::with_capacity(k);
-        for (score, id) in scored {
-            if out.len() >= k {
-                break;
-            }
+        const HYDRATE_BATCH: usize = 64;
+        'batches: for batch in scored.chunks(HYDRATE_BATCH) {
             crate::exec::limits::check_deadline()?;
-            let node_value = match rescored_views.remove(&id) {
-                Some(nv) => nv,
-                None => match snapshot.lookup_node(label, id).await? {
-                    Some(view) => NodeValue::from(view),
-                    None => continue,
-                },
-            };
-            let mut row = Row::new();
-            row.set(alias.to_string(), RuntimeValue::Node(Box::new(node_value)));
-            row.set(score_alias.to_string(), RuntimeValue::Float(score));
-            if let Some(pf) = post_filter {
-                if evaluate(pf, &row, params)?.as_bool() != Some(true) {
-                    continue;
+            let ids: Vec<NodeId> = batch
+                .iter()
+                .map(|(_, id)| *id)
+                .filter(|id| !rescored_views.contains_key(id))
+                .collect();
+            let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
+            let mut hydrated_by_id: std::collections::HashMap<NodeId, NodeValue> = ids
+                .into_iter()
+                .zip(hydrated)
+                .filter_map(|(id, view)| view.map(|view| (id, NodeValue::from(view))))
+                .collect();
+            for &(score, id) in batch {
+                if out.len() >= k {
+                    break 'batches;
                 }
+                crate::exec::limits::check_deadline()?;
+                let node_value = match rescored_views.remove(&id) {
+                    Some(nv) => nv,
+                    None => match hydrated_by_id.remove(&id) {
+                        Some(view) => view,
+                        None => continue,
+                    },
+                };
+                let mut row = Row::new();
+                row.set(alias.to_string(), RuntimeValue::Node(Box::new(node_value)));
+                row.set(score_alias.to_string(), RuntimeValue::Float(score));
+                if let Some(pf) = post_filter {
+                    if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                        continue;
+                    }
+                }
+                out.push(row);
             }
-            out.push(row);
         }
 
         if out.len() >= k {
@@ -3807,6 +3866,73 @@ async fn neighbours_of_any(
         all.extend(edges);
     }
     Ok(all)
+}
+
+/// Exact Expand-Into probe for a pattern whose two endpoint aliases are
+/// already bound. Physical edge identity is `(type, src, dst)`, so a
+/// single-hop MATCH must not enumerate either endpoint's full adjacency just
+/// to discard every partner except `to`.
+async fn exact_edges_between_any(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    from: NodeId,
+    to: NodeId,
+    mode: EdgeReadMode,
+) -> Result<Vec<EdgeView>, ExecError> {
+    let mut out = Vec::with_capacity(edge_types.len());
+    for edge_type in edge_types {
+        match direction {
+            RelationshipDirection::Right => {
+                if let Some(edge) = exact_edge(snapshot, edge_type, from, to, mode).await? {
+                    out.push(edge);
+                }
+            }
+            RelationshipDirection::Left => {
+                if let Some(edge) = exact_edge(snapshot, edge_type, to, from, mode).await? {
+                    out.push(edge);
+                }
+            }
+            RelationshipDirection::Both => {
+                if let Some(edge) = exact_edge(snapshot, edge_type, from, to, mode).await? {
+                    out.push(edge);
+                }
+                // `neighbours_of(Both)` yields a self-loop only from its
+                // forward half; keep the same multiplicity/order here.
+                if from != to {
+                    if let Some(edge) = exact_edge(snapshot, edge_type, to, from, mode).await? {
+                        out.push(edge);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn exact_edge(
+    snapshot: &Snapshot<'_>,
+    edge_type: &str,
+    src: NodeId,
+    dst: NodeId,
+    mode: EdgeReadMode,
+) -> Result<Option<EdgeView>, ExecError> {
+    if mode == EdgeReadMode::Properties {
+        return snapshot
+            .lookup_edge_via_sst(edge_type, src, dst)
+            .await
+            .map_err(ExecError::from);
+    }
+    if !snapshot.contains_edge_via_sst(edge_type, src, dst).await? {
+        return Ok(None);
+    }
+    Ok(Some(EdgeView {
+        edge_type: edge_type.to_string(),
+        src,
+        dst,
+        properties: Default::default(),
+        lsn: 0,
+    }))
 }
 
 async fn neighbours_of(
@@ -5383,20 +5509,24 @@ async fn execute_expand_factor(
 
         // Back-reference: pull the existing target id once. Only paths
         // ending at this id survive emission.
-        let existing_target_id: Option<NodeId> = if back_reference {
-            match arena.lookup_binding(parent_leaf, target_alias) {
-                Some(RuntimeValue::Node(n)) => Some(n.id),
-                Some(RuntimeValue::Null) => None,
-                other => {
-                    return Err(ExecError::Runtime(format!(
-                        "Expand back-reference target `{}` is not a Node (got {:?})",
-                        target_alias, other
-                    )))
+        let (existing_target_id, bound_target_matches_labels): (Option<NodeId>, bool) =
+            if back_reference {
+                match arena.lookup_binding(parent_leaf, target_alias) {
+                    Some(RuntimeValue::Node(n)) => (
+                        Some(n.id),
+                        target_labels.iter().all(|label| n.labels.contains(label)),
+                    ),
+                    Some(RuntimeValue::Null) => (None, false),
+                    other => {
+                        return Err(ExecError::Runtime(format!(
+                            "Expand back-reference target `{}` is not a Node (got {:?})",
+                            target_alias, other
+                        )))
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                (None, true)
+            };
 
         let mut hop_outputs_for_this_input: Vec<crate::exec::FactorIdx> = Vec::new();
         let mut matched_any = false;
@@ -5425,7 +5555,8 @@ async fn execute_expand_factor(
                     });
                 }
             }
-            let zero_keeps = source_has_target_labels
+            let zero_keeps = bound_target_matches_labels
+                && source_has_target_labels
                 && match existing_target_id {
                     Some(existing) => starting == existing,
                     None => true,
@@ -5446,7 +5577,11 @@ async fn execute_expand_factor(
         // edge identities `(edge_type, src, dst)`, for Cypher relationship
         // uniqueness (trail semantics). Only populated for multi-hop
         // expansions; empty on the single-hop path where reuse is impossible.
-        let mut frontier: Vec<FactorFrontierEntry> = vec![(parent_leaf, starting, Vec::new())];
+        let mut frontier: Vec<FactorFrontierEntry> = if bound_target_matches_labels {
+            vec![(parent_leaf, starting, Vec::new())]
+        } else {
+            Vec::new()
+        };
 
         for hop in 1..=max {
             let mut next_frontier: Vec<FactorFrontierEntry> = Vec::new();
@@ -5459,9 +5594,25 @@ async fn execute_expand_factor(
             let mut seen_targets: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
             for (cur_parent, tail, rels) in frontier.drain(..) {
-                let neighbours =
+                let neighbours = if back_reference && max == 1 {
+                    match existing_target_id {
+                        Some(target) => {
+                            exact_edges_between_any(
+                                snapshot,
+                                &edge_types,
+                                direction,
+                                tail,
+                                target,
+                                edge_read_mode,
+                            )
+                            .await?
+                        }
+                        None => Vec::new(),
+                    }
+                } else {
                     neighbours_of_any(snapshot, &edge_types, direction, tail, edge_read_mode)
-                        .await?;
+                        .await?
+                };
                 if !back_reference && !skip_target_materialize {
                     for edge in &neighbours {
                         let tid = partner_id(edge, direction, tail);
@@ -5562,7 +5713,8 @@ async fn execute_expand_factor(
                     }
                     next_frontier.push((new_idx, target_id, new_rels));
                     if hop >= min.max(1) {
-                        let keeps = target_is_result
+                        let keeps = bound_target_matches_labels
+                            && target_is_result
                             && match existing_target_id {
                                 Some(existing) => target_id == existing,
                                 None => true,
@@ -5859,15 +6011,9 @@ fn descend_multiway<'a>(
 /// emission to scale per-tuple set semantics back up to per-path
 /// multiset semantics (the binary executor's native shape).
 ///
-/// `sorted_partners` only tells us whether at least one edge of a
-/// given type connects the two nodes; here we go through
-/// `out_edges` / `in_edges`, which return `Vec<EdgeView>`, so
-/// parallel edges of the same type contribute one count each. The
-/// cost is `O(types * deg)` per call, paid only once per output
-/// tuple — concretely, leaves are already the pruned cyclic
-/// matches the leapfrog produced, so this dominates only in the
-/// pathological case where the multiplicity per constraint is
-/// huge anyway.
+/// The storage identity is `(edge_type, src, dst)`, hence each type contributes
+/// at most one relationship for the endpoint pair. Use exact existence probes
+/// rather than rescanning a full degree at every WCOJ leaf.
 async fn count_edge_multiplicity(
     snapshot: &Snapshot<'_>,
     from: NodeId,
@@ -5877,24 +6023,17 @@ async fn count_edge_multiplicity(
 ) -> Result<usize, ExecError> {
     let mut total: usize = 0;
     for et in edge_types {
-        let edges = match direction {
-            RelationshipDirection::Right => snapshot.out_edges(et, from).await?.edges,
-            RelationshipDirection::Left => snapshot.in_edges(et, from).await?.edges,
+        let (src, dst) = match direction {
+            RelationshipDirection::Right => (from, to),
+            RelationshipDirection::Left => (to, from),
             RelationshipDirection::Both => {
                 return Err(ExecError::Runtime(
                     "MultiwayJoin v0: undirected edges not supported".into(),
                 ));
             }
         };
-        for e in edges {
-            let partner = match direction {
-                RelationshipDirection::Right => e.dst,
-                RelationshipDirection::Left => e.src,
-                RelationshipDirection::Both => unreachable!(),
-            };
-            if partner == to {
-                total += 1;
-            }
+        if snapshot.contains_edge_via_sst(et, src, dst).await? {
+            total += 1;
         }
     }
     Ok(total)

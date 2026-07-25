@@ -13,7 +13,8 @@ use namidb_core::schema::{
 };
 use namidb_core::value::Value as CoreValue;
 use namidb_storage::{
-    AdjacencyCache, EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, WriterSession,
+    AdjacencyCache, EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache,
+    WriterSession,
 };
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -794,7 +795,9 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
     // properties, which makes a persisted `{weight: 1}` edge look absent and
     // makes `ON MATCH SET` overwrite rather than extend its property map.
     let adjacency = Arc::new(AdjacencyCache::new(64 * 1024 * 1024));
-    let mut caches = SessionCaches::shared();
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
     caches.adjacency_cache = Some(Arc::clone(&adjacency));
     let mut writer = WriterSession::open_with_caches(store(), paths("w-merge-rel-sst"), caches)
         .await
@@ -823,7 +826,8 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
 
     let alice = NodeId::new();
     let bob = NodeId::new();
-    for (id, key) in [(alice, "alice"), (bob, "bob")] {
+    let carol = NodeId::new();
+    for (id, key) in [(alice, "alice"), (bob, "bob"), (carol, "carol")] {
         writer
             .upsert_node(
                 "Person",
@@ -850,6 +854,26 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
             },
         )
         .unwrap();
+    // Persist a skew/high-degree source bucket. The bound-endpoint MERGE below
+    // must point-probe `alice -> bob`; enumerating this whole bucket recreates
+    // the loader's degree-dependent latency.
+    for _ in 0..2048 {
+        let mut dst = NodeId::new();
+        while dst == alice || dst == bob {
+            dst = NodeId::new();
+        }
+        writer
+            .upsert_edge(
+                "KNOWS",
+                alice,
+                dst,
+                &EdgeWriteRecord {
+                    properties: BTreeMap::new(),
+                    schema_version: 1,
+                },
+            )
+            .unwrap();
+    }
     writer.commit_batch().await.unwrap();
     writer.flush(schema).await.unwrap();
     assert!(
@@ -861,6 +885,46 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
             .iter()
             .any(|sst| sst.kind == namidb_storage::SstKind::EdgesFwd),
         "the relationship must be persisted so MERGE exercises the SST/CSR choice"
+    );
+
+    // A miss with both endpoints bound must not decode the source's property
+    // streams. The old degree scan did so even though no alice→carol edge
+    // existed; the exact point probe proves absence from the partner block.
+    let miss_plan = lower(
+        &parse(
+            "MATCH (a:Person {key: 'alice'}), (c:Person {key: 'carol'}) \
+             MERGE (a)-[:KNOWS {weight: 99, retained: 'new'}]->(c)",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let stream_inserts_before_miss = sst_cache.edge_streams_inserts();
+    let miss = execute_write(&miss_plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(miss.edges_created, 1);
+    assert_eq!(
+        sst_cache.edge_streams_inserts(),
+        stream_inserts_before_miss,
+        "an exact endpoint miss must not decode any persisted edge properties"
+    );
+
+    let propertyless_plan = lower(
+        &parse(
+            "MATCH (a:Person {key: 'alice'}), (b:Person {key: 'bob'}) \
+             MERGE (a)-[:KNOWS]->(b)",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let propertyless = execute_write(&propertyless_plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(propertyless.edges_created, 0);
+    assert_eq!(
+        sst_cache.edge_streams_inserts(),
+        stream_inserts_before_miss,
+        "anonymous propertyless MERGE should use an existence-only point probe"
     );
 
     let query = parse(
@@ -889,24 +953,28 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
         csr_builds_before,
         "relationship MERGE must use one source-keyed SST range, not build a whole-type CSR"
     );
+    assert_eq!(
+        sst_cache.edge_streams_inserts(),
+        stream_inserts_before_miss + 1,
+        "the matching exact edge decodes only its winning SST's property bundle"
+    );
 
-    let edges = writer
+    let edge = writer
         .snapshot()
         .out_edges_via_sst("KNOWS", alice)
         .await
         .unwrap()
-        .edges;
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].properties.get("weight"), Some(&CoreValue::I64(1)));
+        .edges
+        .into_iter()
+        .find(|edge| edge.dst == bob)
+        .expect("the MERGE target edge remains present among distractors");
+    assert_eq!(edge.properties.get("weight"), Some(&CoreValue::I64(1)));
     assert_eq!(
-        edges[0].properties.get("retained"),
+        edge.properties.get("retained"),
         Some(&CoreValue::Str("keep".into())),
         "ON MATCH SET must extend the persisted relationship property map"
     );
-    assert_eq!(
-        edges[0].properties.get("touched"),
-        Some(&CoreValue::Bool(true))
-    );
+    assert_eq!(edge.properties.get("touched"), Some(&CoreValue::Bool(true)));
 }
 
 #[tokio::test]
@@ -3113,5 +3181,201 @@ async fn merge_relationship_parameter_map_participates_in_match() {
     assert_eq!(
         replay.edges_created, 0,
         "same spread properties must match on replay"
+    );
+}
+
+#[tokio::test]
+async fn merge_relationship_matches_compound_temporal_bytes_and_vector_properties() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-rel-complex-props"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "A".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "B".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "R".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            properties: vec![
+                PropertyDef::new("nullable", DataType::Json, true).unwrap(),
+                PropertyDef::new("enabled", DataType::Bool, false).unwrap(),
+                PropertyDef::new("count", DataType::Int64, false).unwrap(),
+                PropertyDef::new("ratio", DataType::Float64, false).unwrap(),
+                PropertyDef::new("name", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("bytes", DataType::Binary, false).unwrap(),
+                PropertyDef::new("vector", DataType::FloatVector { dim: 3 }, false).unwrap(),
+                PropertyDef::new("vector8", DataType::Int8Vector { dim: 3 }, false).unwrap(),
+                PropertyDef::new("date", DataType::Date32, false).unwrap(),
+                PropertyDef::new("datetime", DataType::TimestampMicrosUtc, false).unwrap(),
+                PropertyDef::new("list", DataType::Json, false).unwrap(),
+                PropertyDef::new("map", DataType::Json, false).unwrap(),
+                PropertyDef::new("matched_in", DataType::Utf8, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    let complex_properties = RuntimeValue::Map(BTreeMap::from([
+        ("nullable".into(), RuntimeValue::Null),
+        ("enabled".into(), RuntimeValue::Bool(true)),
+        ("count".into(), RuntimeValue::Integer(7)),
+        ("ratio".into(), RuntimeValue::Float(1.5)),
+        ("name".into(), RuntimeValue::String("typed".into())),
+        ("bytes".into(), RuntimeValue::Bytes(vec![0, 1, 255])),
+        ("vector".into(), RuntimeValue::Vector(vec![0.25, -1.5, 3.0])),
+        (
+            "vector8".into(),
+            RuntimeValue::Vector8 {
+                codes: vec![4, -7, 12],
+                scale: 0.125,
+            },
+        ),
+        ("date".into(), RuntimeValue::Date(20_000)),
+        (
+            "datetime".into(),
+            RuntimeValue::DateTime(1_700_000_000_123_456),
+        ),
+        (
+            "list".into(),
+            RuntimeValue::List(vec![
+                RuntimeValue::Integer(1),
+                RuntimeValue::String("two".into()),
+                RuntimeValue::Map(BTreeMap::from([("nested_null".into(), RuntimeValue::Null)])),
+            ]),
+        ),
+        (
+            "map".into(),
+            RuntimeValue::Map(BTreeMap::from([
+                ("nested_date".into(), RuntimeValue::Date(20_001)),
+                (
+                    "nested_list".into(),
+                    RuntimeValue::List(vec![
+                        RuntimeValue::Float(3.0),
+                        RuntimeValue::Bytes(vec![4, 5]),
+                    ]),
+                ),
+            ])),
+        ),
+    ]));
+    let mut params = Params::new();
+    params.insert("relprops".into(), complex_properties.clone());
+
+    let create = lower(
+        &parse(
+            "CREATE (a:A {name: 'a'})-[r:R $relprops]->(b:B {name: 'b'}) \
+             RETURN r",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let created = execute_write(&create, &mut writer, &params).await.unwrap();
+    assert_eq!(created.edges_created, 1);
+    let (src, dst) = match created.rows[0].get("r") {
+        Some(RuntimeValue::Rel(relation)) => (relation.src, relation.dst),
+        other => panic!("expected created relationship binding, got {other:?}"),
+    };
+
+    let merge = lower(
+        &parse(
+            "MATCH (a:A {name: 'a'}), (b:B {name: 'b'}) \
+             MERGE (a)-[r:R $relprops]->(b) \
+             ON MATCH SET r.matched_in = $phase \
+             RETURN r",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let expected_properties = match &complex_properties {
+        RuntimeValue::Map(properties) => properties.clone(),
+        _ => unreachable!(),
+    };
+    let assert_matched = |outcome: &namidb_query::WriteOutcome, phase: &str| {
+        assert_eq!(
+            outcome.nodes_created, 0,
+            "bound-endpoint relationship MERGE must not create nodes in {phase}"
+        );
+        assert_eq!(
+            outcome.edges_created, 0,
+            "every storable property shape must match without replacing the edge in {phase}"
+        );
+        assert_eq!(
+            outcome.properties_set, 1,
+            "the existing relationship must take the ON MATCH branch in {phase}"
+        );
+        let relation = match outcome.rows[0].get("r") {
+            Some(RuntimeValue::Rel(relation)) => relation,
+            other => panic!("expected relationship binding in {phase}, got {other:?}"),
+        };
+        assert_eq!(
+            (relation.src, relation.dst),
+            (src, dst),
+            "MERGE must retain the relationship endpoints in {phase}"
+        );
+        let mut expected = expected_properties.clone();
+        expected.insert("matched_in".into(), RuntimeValue::String(phase.to_string()));
+        assert_eq!(
+            relation.properties, expected,
+            "ON MATCH must preserve every original property in {phase}"
+        );
+    };
+
+    params.insert("phase".into(), RuntimeValue::String("memtable".into()));
+    let memtable_match = execute_write(&merge, &mut writer, &params).await.unwrap();
+    assert_matched(&memtable_match, "memtable");
+    assert_eq!(writer.pending_len(), 0, "auto-commit must seal the match");
+
+    writer.flush(schema.clone()).await.unwrap();
+    params.insert("phase".into(), RuntimeValue::String("sst".into()));
+    let sst_match = execute_write(&merge, &mut writer, &params).await.unwrap();
+    assert_matched(&sst_match, "sst");
+
+    // The ON MATCH update creates a second immutable version of the same edge.
+    // Flush it, then compact both forward and inverse R buckets so the final
+    // replay resolves the relationship and all of its properties from L1.
+    writer.flush(schema.clone()).await.unwrap();
+    let compacted = writer.compact_l0(&schema).await.unwrap();
+    assert_eq!(
+        compacted.source_ssts_removed, 4,
+        "two L0 versions in each R direction should be compacted"
+    );
+    assert_eq!(
+        compacted.new_ssts_written, 2,
+        "compaction should write one forward and one inverse R SST"
+    );
+
+    params.insert("phase".into(), RuntimeValue::String("l1".into()));
+    let compacted_match = execute_write(&merge, &mut writer, &params).await.unwrap();
+    assert_matched(&compacted_match, "l1");
+    writer.flush(schema).await.unwrap();
+
+    let edges = writer
+        .snapshot()
+        .out_edges_via_sst("R", src)
+        .await
+        .unwrap()
+        .edges;
+    assert_eq!(
+        edges.len(),
+        1,
+        "MERGE replays across memtable, SST, and L1 must not duplicate the edge"
+    );
+    assert_eq!(edges[0].dst, dst);
+    let mut expected = expected_properties;
+    expected.insert("matched_in".into(), RuntimeValue::String("l1".into()));
+    let persisted = edges[0]
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), RuntimeValue::from(value.clone())))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        persisted, expected,
+        "the final ON MATCH property map must survive commit and flush"
     );
 }

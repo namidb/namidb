@@ -19,7 +19,7 @@ pub use format::{
     EdgeFileFooter, EdgeFileHeader, SectionEntry, FLAG_HAS_PROPERTIES, FLAG_HAS_TOMBSTONES,
     FLAG_INVERSE_PARTNER, FLAG_SKEW_BUCKETS,
 };
-pub use reader::{EdgeLookup, EdgeRowProjection, EdgeSstReader};
+pub use reader::{EdgeLookup, EdgePointLookup, EdgeRowProjection, EdgeSstReader};
 pub use writer::{EdgeRecord, EdgeSstFinish, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions};
 
 /// Direction of an edge SST.
