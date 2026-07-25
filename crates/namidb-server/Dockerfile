@@ -35,8 +35,14 @@ COPY --from=builder /build/target/release/namidb-server /usr/local/bin/namidb-se
 USER namidb:namidb
 EXPOSE 8080
 
+# Bound glibc's per-thread allocation arenas. Large FTS/vector decodes and
+# compactions otherwise leave many 64/128 MiB arenas resident after their
+# temporary working set is dropped, obscuring the engine cache budget and
+# increasing OOM risk during long-running bulk loads.
 ENV NAMIDB_LISTEN=0.0.0.0:8080 \
-    RUST_LOG=info
+    RUST_LOG=info \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072
 
 # Liveness: /v0/livez takes no lock and reads no namespace state, so a busy
 # engine (a long write or compaction holding the writer lock) still answers.

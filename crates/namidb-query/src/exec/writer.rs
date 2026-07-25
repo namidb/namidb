@@ -456,6 +456,76 @@ fn execute_write_inner<'a>(
                 let use_transactional =
                     routing.transactional_property_reads() || writer.has_staged_node_mutations();
                 let snap = snapshot_for_write_read(writer, routing);
+
+                // A correlated unique String lookup over committed state can
+                // resolve the whole input in one storage call. Evaluate every
+                // RHS first so expression errors retain eager-operator
+                // semantics and no partial batch lookup has happened when one
+                // row fails. RYOW, multi-value and non-String probes keep the
+                // exact per-row paths below.
+                if !*multi && !use_transactional {
+                    let evaluated_rows = input_rows
+                        .into_iter()
+                        .map(|row| {
+                            let lookup_value = evaluate(value, &row, params)?;
+                            Ok::<_, ExecError>((row, lookup_value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let string_values = evaluated_rows
+                        .iter()
+                        .filter_map(|(_, lookup_value)| match lookup_value {
+                            RuntimeValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let batch_results = if string_values.is_empty() {
+                        Vec::new()
+                    } else {
+                        snap.batch_lookup_nodes_by_property(label, property, &string_values)
+                            .await
+                            .map_err(ExecError::Storage)?
+                    };
+                    if batch_results.len() != string_values.len() {
+                        return Err(ExecError::Runtime(format!(
+                            "batch property lookup returned {} results for {} values",
+                            batch_results.len(),
+                            string_values.len()
+                        )));
+                    }
+
+                    let mut batch_results = batch_results.into_iter();
+                    let mut out = Vec::with_capacity(evaluated_rows.len());
+                    for (row, lookup_value) in evaluated_rows {
+                        let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
+                            batch_results.next().ok_or_else(|| {
+                                ExecError::Runtime(
+                                    "batch property lookup result alignment was lost".into(),
+                                )
+                            })?
+                        } else {
+                            lookup_unique_node_for_write(
+                                writer,
+                                &snap,
+                                label,
+                                property,
+                                &lookup_value,
+                                value,
+                                false,
+                            )
+                            .await?
+                        };
+                        if let Some(view) = found {
+                            let mut new_row = row;
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    }
+                    return Ok(out);
+                }
+
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;

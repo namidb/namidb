@@ -483,14 +483,20 @@ The defaults are fine for almost everything; reach for these when chasing a perf
 
 | Env var | Default | What it does |
 |---|---|---|
+| `NAMIDB_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Exact-byte process-wide ceiling shared by SST, decoded, node-view, and adjacency caches. `0` disables all shared caches. |
 | `NAMIDB_ADJACENCY` | ON | CSR adjacency in RAM, shared across snapshots. |
 | `NAMIDB_NODE_CACHE` | ON | Cross-snapshot `NodeView` lookup cache. |
-| `NAMIDB_SST_CACHE` | ON | Raw SST body cache; decoded tiers have independent budgets. |
+| `NAMIDB_SST_CACHE` | ON | Raw SST body and decoded SST cache tiers. |
 | `NAMIDB_FACTORIZE` | OFF | Factorized intermediate results in the executor. |
 | `NAMIDB_EMBED_PROVIDER` | unset | Remote embedder for `load-vault --embed` (`openai`/`voyage`/`cohere`/`gemini`/`jina`; needs `--features remote-embedder`). |
 
-The cache budgets are **process-wide** — one shared pool across every namespace,
-so a busy tenant cannot multiply the memory limit. The main knobs are
+The caches are **process-wide** — one shared set across every namespace, so a
+busy tenant cannot multiply the memory limit. `NAMIDB_CACHE_MAX_BYTES` is the
+aggregate hard-admission ceiling in exact bytes. The legacy per-tier knobs
+remain compatible ceilings; when their sum is larger than the aggregate
+maximum, NamiDB scales every active ceiling proportionally and deterministically.
+No single cache entry is admitted when its deep estimated weight exceeds its
+assigned tier. The legacy knobs are
 `NAMIDB_SST_CACHE_BUDGET_MIB` (256), `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`
 (256), `NAMIDB_SST_METADATA_CACHE_BUDGET_MIB` (64),
 `NAMIDB_EDGE_STREAM_CACHE_BUDGET_MIB` (256),
@@ -499,7 +505,13 @@ so a busy tenant cannot multiply the memory limit. The main knobs are
 `NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB` (64),
 `NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB` (512), and
 `NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB` (512), plus the existing
-`NAMIDB_NODE_CACHE_*` and `NAMIDB_ADJACENCY_*` pools. Values are MiB.
+`NAMIDB_NODE_CACHE_*` and `NAMIDB_ADJACENCY_*` pools. Legacy values are MiB;
+only `NAMIDB_CACHE_MAX_BYTES` is expressed as exact bytes.
+This ceiling covers retained cache entries; memtables, active query rows, the
+writer's mandatory uniqueness index, and transient flush/compaction work are
+separate. The official image also bounds glibc allocation arenas so dropped
+large-index working sets are returned instead of accumulating per-thread
+arenas.
 The server also takes durability/backpressure knobs for critical workloads:
 
 | Flag (env var) | Default | What it does |

@@ -490,6 +490,37 @@ impl Metrics {
 
         let _ = writeln!(
             out,
+            "# HELP namidb_cache_max_bytes Configured aggregate byte ceiling for process-wide storage caches."
+        );
+        let _ = writeln!(out, "# TYPE namidb_cache_max_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_cache_max_bytes {}",
+            namidb_storage::cache_max_bytes()
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_cache_capacity_bytes Aggregate capacity assigned to enabled storage-cache tiers."
+        );
+        let _ = writeln!(out, "# TYPE namidb_cache_capacity_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_cache_capacity_bytes {}",
+            namidb_storage::shared_cache_capacity_bytes()
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_cache_resident_bytes Cache-accounted bytes currently resident across storage tiers."
+        );
+        let _ = writeln!(out, "# TYPE namidb_cache_resident_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_cache_resident_bytes {}",
+            namidb_storage::shared_cache_usage_bytes()
+        );
+
+        let _ = writeln!(
+            out,
             "# HELP namidb_queries_total Cypher queries executed, by protocol and status."
         );
         let _ = writeln!(out, "# TYPE namidb_queries_total counter");
@@ -739,6 +770,9 @@ mod tests {
         // Slow log disabled (threshold ZERO): never counts a slow query.
         assert!(text.contains("namidb_slow_queries_total 0"));
         assert!(text.contains("namidb_build_info{version=\"0.0.0-test\"} 1"));
+        assert!(text.contains("namidb_cache_max_bytes "));
+        assert!(text.contains("namidb_cache_capacity_bytes "));
+        assert!(text.contains("namidb_cache_resident_bytes "));
     }
 
     #[test]

@@ -191,6 +191,9 @@ curl -s http://127.0.0.1:8080/v0/metrics
 | `namidb_queries_total`          | counter   | `protocol`, `status` | Queries executed, by `http`/`bolt` and `ok`/`error` |
 | `namidb_query_duration_seconds` | histogram | `protocol`, `kind`   | Execution wall-clock, by `http`/`bolt` and `read`/`write` |
 | `namidb_queries_in_flight`      | gauge     |                      | Queries currently executing |
+| `namidb_cache_max_bytes`        | gauge     |                      | Configured aggregate cache ceiling |
+| `namidb_cache_capacity_bytes`   | gauge     |                      | Capacity assigned to enabled cache tiers |
+| `namidb_cache_resident_bytes`   | gauge     |                      | Cache-accounted bytes currently resident |
 | `namidb_slow_queries_total`     | counter   |                      | Queries that crossed the slow-query threshold |
 | `namidb_build_info`             | gauge     | `version`            | Always `1`; carries the build version |
 | `namidb_uptime_seconds`         | gauge     |                      | Seconds since the server started |

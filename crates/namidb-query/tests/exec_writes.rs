@@ -2604,7 +2604,7 @@ async fn unique_indexed_match_unwind_uses_numeric_transactional_probes() {
 }
 
 #[tokio::test]
-async fn unique_string_match_before_edge_only_write_keeps_committed_point_index() {
+async fn unique_endpoint_matches_batch_for_relationship_merge_loader() {
     let mut writer = WriterSession::open(store(), paths("w-match-unique-string-sidecar"))
         .await
         .unwrap();
@@ -2625,21 +2625,78 @@ async fn unique_string_match_before_edge_only_write_keeps_committed_point_index(
     writer.flush(schema).await.unwrap();
 
     let query = parse(
-        "UNWIND range(1, 500) AS i \
-         MATCH (a:Account {key: toString(i)}) \
-         CREATE (a)-[:SEEN]->(a)",
+        "UNWIND $rows AS row \
+         MATCH (a:Account {key: row.source}) \
+         MATCH (b:Account {key: row.target}) \
+         MERGE (a)-[r:SEEN {codigo: row.codigo}]->(b) \
+         SET r.relacion = row.codigo \
+         RETURN a.key AS source_key, b.key AS target_key, row.codigo AS codigo",
     )
     .unwrap();
     let snapshot = writer.snapshot();
     let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
     drop(snapshot);
     let plan = optimize(lower(&query).unwrap(), &catalog);
+
+    fn count_unique_lookups(plan: &namidb_query::LogicalPlan) -> usize {
+        usize::from(matches!(
+            plan,
+            namidb_query::LogicalPlan::NodeByPropertyValue {
+                label,
+                property,
+                multi: false,
+                ..
+            } if label == "Account" && property == "key"
+        )) + plan
+            .children()
+            .iter()
+            .map(|child| count_unique_lookups(child))
+            .sum::<usize>()
+    }
+    assert_eq!(
+        count_unique_lookups(&plan),
+        2,
+        "optimized loader plan must retain one unique point lookup per endpoint: {plan:?}"
+    );
+
+    let rel_row = |source: &str, target: &str, codigo: &str| {
+        RuntimeValue::Map(BTreeMap::from([
+            ("source".into(), RuntimeValue::String(source.into())),
+            ("target".into(), RuntimeValue::String(target.into())),
+            ("codigo".into(), RuntimeValue::String(codigo.into())),
+        ]))
+    };
+    let mut params = Params::new();
+    params.insert(
+        "rows".into(),
+        RuntimeValue::List(vec![
+            rel_row("3", "4", "r1"),
+            rel_row("missing", "5", "missing-source"),
+            rel_row("1", "missing", "missing-target"),
+            rel_row("3", "4", "r1"),
+            rel_row("2", "3", "r2"),
+        ]),
+    );
     let scans_before = writer.unique_index().populate_scans();
     let point_reads_before = writer.property_index_cache().unique_lookup_calls();
-    let outcome = execute_write(&plan, &mut writer, &Params::new())
-        .await
-        .unwrap();
-    assert_eq!(outcome.rows.len(), 500);
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    let matched_codes = outcome
+        .rows
+        .iter()
+        .map(|row| match row.get("codigo") {
+            Some(RuntimeValue::String(code)) => code.as_str(),
+            other => panic!("expected relationship code, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matched_codes,
+        vec!["r1", "r1", "r2"],
+        "endpoint batches must preserve input order, duplicate hits and misses"
+    );
+    assert_eq!(
+        outcome.edges_created, 2,
+        "duplicate MERGE rows must share one relationship"
+    );
     assert_eq!(
         writer.unique_index().populate_scans(),
         scans_before,
@@ -2647,8 +2704,59 @@ async fn unique_string_match_before_edge_only_write_keeps_committed_point_index(
     );
     assert_eq!(
         writer.property_index_cache().unique_lookup_calls() - point_reads_before,
-        500,
-        "every correlated key must route through the committed point-index API"
+        2,
+        "all correlated String keys must use one storage batch per endpoint"
+    );
+
+    let repeat_point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let repeated = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(repeated.rows.len(), 3);
+    assert_eq!(
+        repeated.edges_created, 0,
+        "the second loader pass must hit both existing relationships"
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - repeat_point_reads_before,
+        2,
+        "existing-edge MERGE must still use one node batch per endpoint"
+    );
+
+    let read_query =
+        parse("UNWIND $keys AS key MATCH (a:Account {key: key}) RETURN a.key AS matched_key")
+            .unwrap();
+    let read_plan = optimize(lower(&read_query).unwrap(), &catalog);
+    assert_eq!(
+        count_unique_lookups(&read_plan),
+        1,
+        "optimized correlated read must retain its unique point lookup: {read_plan:?}"
+    );
+    let mut read_params = Params::new();
+    read_params.insert(
+        "keys".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::String("3".into()),
+            RuntimeValue::String("missing".into()),
+            RuntimeValue::Null,
+            RuntimeValue::String("1".into()),
+            RuntimeValue::String("3".into()),
+        ]),
+    );
+    let read_point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let snapshot = writer.snapshot();
+    let rows = execute(&read_plan, &snapshot, &read_params).await.unwrap();
+    drop(snapshot);
+    let matched_keys = rows
+        .iter()
+        .map(|row| match row.get("matched_key") {
+            Some(RuntimeValue::String(key)) => key.as_str(),
+            other => panic!("expected matched key, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matched_keys, vec!["3", "1", "3"]);
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - read_point_reads_before,
+        1,
+        "read-only correlated MATCH must use one storage batch"
     );
 }
 

@@ -50,6 +50,7 @@ services:
       NAMIDB_LISTEN: "0.0.0.0:8080"
       NAMIDB_AUTH_TOKEN: "${NAMIDB_AUTH_TOKEN:?set NAMIDB_AUTH_TOKEN in your env (e.g. openssl rand -hex 32)}"
       NAMIDB_FLUSH_INTERVAL: "30s"
+      NAMIDB_CACHE_MAX_BYTES: "${NAMIDB_CACHE_MAX_BYTES:-1073741824}"
       AWS_ACCESS_KEY_ID: "minioadmin"
       AWS_SECRET_ACCESS_KEY: "minioadmin"
       RUST_LOG: "info"

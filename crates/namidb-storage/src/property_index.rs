@@ -24,11 +24,9 @@
 //! - Build time: one full label scan on the first miss. Warm queries
 //!   amortise it; cold-from-zero callers pay it on the first request,
 //!   which is the right place to pay it.
-//! - Invalidation: the cache is tied to a `WriterSession`. The session
-//!   itself bumps its manifest version on every flush, so any caller
-//!   that reuses the cache across flushes must `reset()` it; the
-//!   bench harness opens a fresh writer per benchmark, which sidesteps
-//!   the concern entirely.
+//! - Invalidation: the cache is tied to a `WriterSession` and advances a
+//!   logical generation only when node data changes. Edge-only commits and
+//!   representation-only flushes preserve the generation and remain hot.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +78,19 @@ pub struct PropertyIndexCache {
 impl PropertyIndexCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Start a writer-local cache at a namespace-safe generation floor.
+    ///
+    /// Writer sessions use the current manifest version so a process-wide
+    /// NodeView cache cannot confuse generation zero from a reopened session
+    /// with an older session's generation zero. Subsequent node mutations
+    /// advance from this floor; edge-only commits and physical flushes do not.
+    pub(crate) fn new_at_generation(generation: u64) -> Self {
+        Self {
+            generation: AtomicU64::new(generation),
+            ..Self::default()
+        }
     }
 
     /// Probe-only: returns `Some(handle)` when the (label, property)
@@ -218,10 +229,9 @@ impl PropertyIndexCache {
         self.memtable_population_scans.load(Ordering::Relaxed)
     }
 
-    /// Drop every cached index. Called after a flush that changes the
-    /// manifest version (any cached `Arc<HashMap>` still points at
-    /// post-flush data only as long as nothing changed; on flush we
-    /// invalidate to be safe).
+    /// Advance the logical node generation and drop every cached index.
+    /// Called after committed node mutations and schema/index changes that
+    /// can alter property lookup semantics, not representation-only flushes.
     pub fn reset(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut w) = self.indices.write() {

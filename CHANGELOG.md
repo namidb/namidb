@@ -11,6 +11,70 @@ the release notes.
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-07-25: Batched relationship loading and bounded caches
+
+This patch removes the remaining per-row endpoint work from idempotent
+relationship loads and places every shared retained-cache tier under one
+process-wide admission budget. The public API and on-disk formats remain
+compatible.
+
+### Changed — performance
+
+- **Correlated relationship endpoints resolve once per batch.** Each unique
+  `NodeByPropertyValue` operator now collects all String keys from an `UNWIND`,
+  reads the unique/equality sidecars and committed memtable once, and confirms
+  the deduplicated node ids with one row-group-vectorized lookup. Input order,
+  duplicate keys and missing endpoints are preserved. The same path serves
+  read-only queries and relationship writes.
+- **Relationship-only writes keep the committed node index path enabled.**
+  Plan routing distinguishes proven relationship aliases in `MERGE`, `SET`
+  and `REMOVE` from node mutations. Consequently the common
+  `MATCH a` + `MATCH b` + `MERGE (a)-[r:T {key: ...}]->(b) SET r...` loader
+  performs exactly two endpoint batches instead of thousands of sequential
+  awaits or a transactional node-index population.
+- **Node views stay warm throughout edge loads.** A logical node generation
+  now advances on committed node mutations, but survives edge-only commits
+  and representation-only flushes. Reopened writers seed it from the durable
+  manifest version, retaining cache isolation without throwing away endpoint
+  locality after every edge batch.
+- **The exact relationship seek remains the physical existence index.**
+  Bound `(type, source, target)` probes continue to select source ranges
+  through the descriptor index, binary-search the partner CSR block and
+  decode only the winning property stream. A 20k-node/10k-edge debug fixture
+  measured property-bearing idempotent `MERGE` at about 0.135 ms per edge,
+  versus the reported 15 ms per edge before endpoint batching.
+
+### Changed — memory and operations
+
+- **`NAMIDB_CACHE_MAX_BYTES` caps shared retained caches.** The exact-byte
+  setting defaults to 1 GiB; `0` disables all shared caches. Existing per-tier
+  MiB knobs remain compatible ceilings and are scaled proportionally and
+  deterministically when their sum exceeds the aggregate maximum.
+- **Oversized entries are rejected before retention.** SST bodies, Arrow row
+  groups, property sidecars, metadata, edge readers/streams, blooms, decoded
+  vector/full-text indexes, deep `NodeView` values and CSR adjacency all use
+  weighted admission. Foyer tiers use one shard, eliminating the previous
+  per-shard oversized-entry multiplication.
+- **Large search indexes fail safe before allocation.** Vector and full-text
+  bodies that cannot fit their assigned decoded tier are not downloaded and
+  decoded merely to be discarded; the query selects its existing exact flat
+  fallback instead.
+- **Cache pressure is observable.** Prometheus now exports
+  `namidb_cache_max_bytes`, `namidb_cache_capacity_bytes` and
+  `namidb_cache_resident_bytes`. The official container sets bounded glibc
+  arena/trim defaults so temporary vector, BM25 and compaction working sets do
+  not remain resident across many worker threads.
+
+### Fixed
+
+- Legacy node SSTs without property sidecars pay at most one label scan for a
+  complete batch map, rather than one scan per requested key.
+- Stale sidecar claimants are batch-confirmed against the current node view,
+  preserving tombstone, rename, relabel and last-LSN-wins semantics.
+- A single cache value larger than its tier can no longer remain resident
+  above the configured budget; oversized adjacency remains queryable but is
+  returned uncached.
+
 ## [2.0.3] - 2026-07-25: Exact relationship probes
 
 This patch removes degree-dependent work from bound relationship probes,
@@ -2066,7 +2130,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.4...HEAD
+[2.0.4]: https://github.com/namidb/namidb/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/namidb/namidb/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/namidb/namidb/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/namidb/namidb/compare/v2.0.0...v2.0.1

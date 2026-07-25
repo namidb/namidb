@@ -420,6 +420,71 @@ pub(crate) fn execute_inner_with_routing<'a>(
             } => {
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+
+                if !*multi {
+                    // Correlated unique String probes share one storage pass.
+                    // Evaluate every RHS before I/O so an expression error
+                    // cannot leave a partially-consumed lookup batch.
+                    let evaluated_rows = input_rows
+                        .into_iter()
+                        .map(|row| {
+                            let lookup_value = evaluate(value, &row, params)?;
+                            Ok::<_, ExecError>((row, lookup_value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let string_values = evaluated_rows
+                        .iter()
+                        .filter_map(|(_, lookup_value)| match lookup_value {
+                            RuntimeValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let batch_results = if string_values.is_empty() {
+                        Vec::new()
+                    } else {
+                        snapshot
+                            .batch_lookup_nodes_by_property(label, property, &string_values)
+                            .await
+                            .map_err(ExecError::Storage)?
+                    };
+                    if batch_results.len() != string_values.len() {
+                        return Err(ExecError::Runtime(format!(
+                            "batch property lookup returned {} results for {} values",
+                            batch_results.len(),
+                            string_values.len()
+                        )));
+                    }
+
+                    let mut batch_results = batch_results.into_iter();
+                    let mut out = Vec::with_capacity(evaluated_rows.len());
+                    for (row, lookup_value) in evaluated_rows {
+                        let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
+                            batch_results.next().ok_or_else(|| {
+                                ExecError::Runtime(
+                                    "batch property lookup result alignment was lost".into(),
+                                )
+                            })?
+                        } else {
+                            lookup_node_by_property_via_scan(
+                                snapshot,
+                                label,
+                                property,
+                                &lookup_value,
+                            )
+                            .await?
+                        };
+                        if let Some(view) = found {
+                            let mut new_row = row;
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    }
+                    return Ok(out);
+                }
+
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
@@ -6494,11 +6559,49 @@ fn plan_requires_transactional_property_reads(plan: &LogicalPlan) -> bool {
     use crate::plan::logical::CreateElement;
 
     let mutating_here = match plan {
-        // SET/REMOVE can target either a node or a relationship. Treat them
-        // conservatively as node-mutating; the only cost of a relationship
-        // target is one writer-private population, while treating a node SET
-        // as edge-only reintroduces O(N²) across auto-commits.
-        LogicalPlan::Set { .. } | LogicalPlan::Remove { .. } | LogicalPlan::Merge { .. } => true,
+        LogicalPlan::Set { input, items } => {
+            let (relationship_aliases, node_aliases) = plan_value_alias_kinds(input);
+            set_ops_may_mutate_node(items, &relationship_aliases, &node_aliases)
+        }
+        LogicalPlan::Remove { input, items } => {
+            let (relationship_aliases, node_aliases) = plan_value_alias_kinds(input);
+            remove_ops_may_mutate_node(items, &relationship_aliases, &node_aliases)
+        }
+        LogicalPlan::Merge {
+            input,
+            pattern,
+            on_match_sets,
+            on_create_sets,
+        } => {
+            let (mut relationship_aliases, mut node_aliases) = plan_value_alias_kinds(input);
+            let mut creates_node = false;
+            for element in pattern {
+                match element {
+                    CreateElement::Node { alias, .. } => {
+                        creates_node = true;
+                        node_aliases.insert(alias.clone());
+                    }
+                    CreateElement::Rel {
+                        alias,
+                        source_alias,
+                        target_alias,
+                        ..
+                    } => {
+                        if let Some(alias) = alias {
+                            relationship_aliases.insert(alias.clone());
+                        }
+                        // Relationship endpoints are proven node bindings even
+                        // when the input shape did not materialise them through
+                        // a NodeScan/NodeByPropertyValue operator.
+                        node_aliases.insert(source_alias.clone());
+                        node_aliases.insert(target_alias.clone());
+                    }
+                }
+            }
+            creates_node
+                || set_ops_may_mutate_node(on_match_sets, &relationship_aliases, &node_aliases)
+                || set_ops_may_mutate_node(on_create_sets, &relationship_aliases, &node_aliases)
+        }
         LogicalPlan::Create { elements, .. } => elements
             .iter()
             .any(|element| matches!(element, CreateElement::Node { .. })),
@@ -6530,6 +6633,54 @@ fn plan_requires_transactional_property_reads(plan: &LogicalPlan) -> bool {
             .children()
             .iter()
             .any(|child| plan_requires_transactional_property_reads(child))
+}
+
+fn plan_value_alias_kinds(plan: &LogicalPlan) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut relationship_aliases = BTreeSet::new();
+    let mut node_aliases = BTreeSet::new();
+    collect_plan_relationship_aliases(plan, &mut relationship_aliases);
+    collect_plan_node_aliases(plan, &mut node_aliases);
+    (relationship_aliases, node_aliases)
+}
+
+fn alias_is_proven_relationship(
+    alias: &str,
+    relationship_aliases: &BTreeSet<String>,
+    node_aliases: &BTreeSet<String>,
+) -> bool {
+    relationship_aliases.contains(alias) && !node_aliases.contains(alias)
+}
+
+fn set_ops_may_mutate_node(
+    items: &[crate::plan::logical::SetOp],
+    relationship_aliases: &BTreeSet<String>,
+    node_aliases: &BTreeSet<String>,
+) -> bool {
+    use crate::plan::logical::SetOp;
+
+    items.iter().any(|item| match item {
+        SetOp::Labels { .. } => true,
+        SetOp::Property { target_alias, .. }
+        | SetOp::Replace { target_alias, .. }
+        | SetOp::Merge { target_alias, .. } => {
+            !alias_is_proven_relationship(target_alias, relationship_aliases, node_aliases)
+        }
+    })
+}
+
+fn remove_ops_may_mutate_node(
+    items: &[crate::plan::logical::RemoveOp],
+    relationship_aliases: &BTreeSet<String>,
+    node_aliases: &BTreeSet<String>,
+) -> bool {
+    use crate::plan::logical::RemoveOp;
+
+    items.iter().any(|item| match item {
+        RemoveOp::Labels { .. } => true,
+        RemoveOp::Property { target_alias, .. } => {
+            !alias_is_proven_relationship(target_alias, relationship_aliases, node_aliases)
+        }
+    })
 }
 
 fn collect_plan_relationship_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
@@ -6587,15 +6738,35 @@ fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         }
         LogicalPlan::Create { elements, .. } => {
             for element in elements {
-                if let CreateElement::Node { alias, .. } = element {
-                    out.insert(alias.clone());
+                match element {
+                    CreateElement::Node { alias, .. } => {
+                        out.insert(alias.clone());
+                    }
+                    CreateElement::Rel {
+                        source_alias,
+                        target_alias,
+                        ..
+                    } => {
+                        out.insert(source_alias.clone());
+                        out.insert(target_alias.clone());
+                    }
                 }
             }
         }
         LogicalPlan::Merge { pattern, .. } => {
             for element in pattern {
-                if let CreateElement::Node { alias, .. } = element {
-                    out.insert(alias.clone());
+                match element {
+                    CreateElement::Node { alias, .. } => {
+                        out.insert(alias.clone());
+                    }
+                    CreateElement::Rel {
+                        source_alias,
+                        target_alias,
+                        ..
+                    } => {
+                        out.insert(source_alias.clone());
+                        out.insert(target_alias.clone());
+                    }
                 }
             }
         }
@@ -6958,6 +7129,65 @@ mod tests {
             routing.edge_read_mode(Some("r"), None),
             EdgeReadMode::SparseIdentity,
             "DELETE r must use a source-keyed identity lookup, never a whole-type CSR rebuild"
+        );
+    }
+
+    fn routing_for(query: &str) -> PlanRouting {
+        let query = crate::parser::parse(query).unwrap();
+        let plan = crate::plan::lower(&query).unwrap();
+        PlanRouting::analyze(&plan)
+    }
+
+    #[test]
+    fn routing_node_merge_requires_transactional_property_reads() {
+        let routing = routing_for("MERGE (n:Account {key: 'a'}) RETURN n");
+        assert!(
+            routing.transactional_property_reads(),
+            "a node MERGE can create or mutate a node and must retain RYOW lookups"
+        );
+    }
+
+    #[test]
+    fn routing_relationship_merge_with_relationship_sets_is_edge_only() {
+        let routing = routing_for(
+            "MATCH (a:Account), (b:Account) \
+             MERGE (a)-[r:LINKS]->(b) \
+             ON MATCH SET r.seen = true \
+             ON CREATE SET r.created = true",
+        );
+        assert!(
+            !routing.transactional_property_reads(),
+            "a relationship-only MERGE and relationship SETs do not invalidate node indices"
+        );
+    }
+
+    #[test]
+    fn routing_relationship_set_and_remove_are_edge_only() {
+        let set_routing = routing_for("MATCH (a:Account)-[r:LINKS]->(b:Account) SET r.seen = true");
+        assert!(
+            !set_routing.transactional_property_reads(),
+            "SET on a proven relationship alias must retain committed node-index reads"
+        );
+
+        let remove_routing = routing_for("MATCH (a:Account)-[r:LINKS]->(b:Account) REMOVE r.seen");
+        assert!(
+            !remove_routing.transactional_property_reads(),
+            "REMOVE on a proven relationship alias must retain committed node-index reads"
+        );
+    }
+
+    #[test]
+    fn routing_node_set_and_remove_require_transactional_property_reads() {
+        let set_routing = routing_for("MATCH (n:Account) SET n.seen = true");
+        assert!(
+            set_routing.transactional_property_reads(),
+            "SET on a node alias must use RYOW property lookups"
+        );
+
+        let remove_routing = routing_for("MATCH (n:Account) REMOVE n.seen");
+        assert!(
+            remove_routing.transactional_property_reads(),
+            "REMOVE on a node alias must use RYOW property lookups"
         );
     }
 

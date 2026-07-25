@@ -198,11 +198,11 @@ pub struct Snapshot<'mt> {
     /// Process-wide cross-snapshot NodeView cache (RFC-019).
     /// Populated via [`Self::with_shared_node_cache`]. Promotion path:
     /// L1 (per-snap `node_cache`) → L2 (this Arc) → L3 (SST walk).
-    /// Slot key is `(manifest_version, label, NodeId)`; same invariants
-    /// as the adjacency cache. Caches both positive (`Some(view)`) and
-    /// negative (`None`) outcomes — a tombstoned key resolved once
-    /// stays resolved for every subsequent snapshot at that manifest
-    /// version.
+    /// Slot key is `(logical_node_generation, label, NodeId)`. The generation
+    /// comes from the writer's property-index cache and therefore advances on
+    /// node mutations while remaining stable across edge-only commits and
+    /// physical flushes. Caches both positive (`Some(view)`) and negative
+    /// (`None`) outcomes.
     shared_node_cache: Option<Arc<NodeViewCache>>,
     /// Cross-snapshot lazy index over `(label, property) → value → NodeId`
     /// (RFC-pending). Attached via [`Self::with_property_index_cache`].
@@ -385,6 +385,14 @@ impl<'mt> Snapshot<'mt> {
         self.property_index_generation = Some(generation);
         self.property_index_cache = Some(cache);
         self
+    }
+
+    /// Generation used by the semantic NodeView cache. Writer snapshots carry
+    /// the logical property-index generation; standalone snapshots fall back
+    /// to the manifest version, preserving the conservative legacy behaviour.
+    fn node_cache_generation(&self) -> u64 {
+        self.property_index_generation
+            .unwrap_or(self.manifest.manifest.version)
     }
 
     /// Attach the writer-private committed+staged postings index.
@@ -846,6 +854,264 @@ impl<'mt> Snapshot<'mt> {
             );
         }
         Ok(found)
+    }
+
+    /// Batched unique String-property lookup.
+    ///
+    /// Returns one entry per input value, preserving order, duplicates and
+    /// misses. For a complete sidecar generation it gathers every claimant
+    /// from the committed memtable and all in-scope sidecars once, then
+    /// confirms the deduplicated NodeIds with exactly one
+    /// [`Self::batch_lookup_nodes`] call. Confirmation is mandatory: an older
+    /// sidecar can still name a node whose current value was changed or
+    /// tombstoned by a newer memtable/SST record.
+    ///
+    /// The caller is responsible for the uniqueness invariant, matching
+    /// [`Self::lookup_node_by_property`]. Legacy/incomplete sidecar stores fall
+    /// back to one label scan, never one scan per requested value.
+    #[instrument(skip(self, values), fields(
+        label = label,
+        property = property,
+        values_len = values.len()
+    ))]
+    pub async fn batch_lookup_nodes_by_property(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Option<NodeView>>> {
+        namidb_core::profile_scope!("Snapshot::batch_lookup_nodes_by_property");
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(cache) = &self.property_index_cache {
+            // One storage operation, regardless of batch cardinality.
+            cache.record_unique_lookup();
+        }
+
+        // `batch_lookup_nodes` is label-scoped. Preserve the existing
+        // label-agnostic sentinel exactly through one all-node scan.
+        if label.is_empty() {
+            let views = self
+                .scan_all_nodes_with_predicates_and_projection(&[], None)
+                .await?;
+            return self.batch_unique_from_scan(label, property, values, views);
+        }
+
+        let mut candidates: BTreeMap<String, BTreeSet<NodeId>> = values
+            .iter()
+            .cloned()
+            .map(|value| (value, BTreeSet::new()))
+            .collect();
+
+        // RYOW snapshots use the writer-private postings map. Populating the
+        // first distinct value scans the overlay once; every later value is an
+        // O(1) probe. Candidate confirmation is still batched below.
+        if self.transactional_property_index.is_some() {
+            for (value, ids_out) in &mut candidates {
+                if let Some(ids) = self
+                    .transactional_string_candidates(label, property, value)
+                    .await?
+                {
+                    ids_out.extend(ids);
+                }
+            }
+            return self
+                .batch_confirm_unique_candidates(label, property, values, candidates)
+                .await;
+        }
+
+        // A fully materialised legacy index is already a complete claimant
+        // source for this logical generation. Batch-confirm its hits so node
+        // materialisation is still row-group vectorised.
+        if let Some(cache) = &self.property_index_cache {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            if let Some(index) = cache.get_at(label, property, generation) {
+                for (value, ids_out) in &mut candidates {
+                    if let Some(id) = index.get(value) {
+                        ids_out.insert(*id);
+                    }
+                }
+                return self
+                    .batch_confirm_unique_candidates(label, property, values, candidates)
+                    .await;
+            }
+        }
+
+        let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        let have_node_ssts = !node_sst_idxs.is_empty();
+        let sst_idxs: Vec<usize> = node_sst_idxs
+            .into_iter()
+            .filter(|idx| node_sst_can_contain_label(&self.manifest.manifest, *idx, label))
+            .collect();
+        let all_have_unique_sidecar = have_node_ssts
+            && sst_idxs.iter().all(|idx| {
+                self.manifest.manifest.ssts[*idx]
+                    .unique_property_indices
+                    .iter()
+                    .any(|sidecar| sidecar.property == property)
+            });
+        let all_have_equality_sidecar = have_node_ssts
+            && sst_idxs.iter().all(|idx| {
+                self.manifest.manifest.ssts[*idx]
+                    .equality_property_indices
+                    .iter()
+                    .any(|sidecar| sidecar.property == property)
+            });
+
+        // A memtable-only namespace has a complete claimant map. With SSTs,
+        // every relevant SST must carry one of the two supported sidecars;
+        // otherwise a scan is the only proof of absence.
+        if have_node_ssts && !all_have_unique_sidecar && !all_have_equality_sidecar {
+            let views = self.scan_label(label).await?;
+            return self.batch_unique_from_scan(label, property, values, views);
+        }
+
+        let memtable_claimants = self.memtable_property_claimants(label, property)?;
+        for (value, ids_out) in &mut candidates {
+            if let Some(ids) = memtable_claimants.get(value) {
+                ids_out.extend(ids.iter().copied());
+            }
+        }
+
+        if all_have_unique_sidecar {
+            for idx in &sst_idxs {
+                let desc = &self.manifest.manifest.ssts[*idx];
+                let sidecar = desc
+                    .unique_property_indices
+                    .iter()
+                    .find(|sidecar| sidecar.property == property)
+                    .expect("all_have_unique_sidecar guard");
+                let absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    sidecar.path
+                );
+                let index = self.fetch_unique_property_sidecar(&absolute).await?;
+                for (value, ids_out) in &mut candidates {
+                    if let Some(id) = index.get(value) {
+                        ids_out.insert(NodeId::from_uuid(Uuid::from_bytes(*id)));
+                    }
+                }
+            }
+        } else if all_have_equality_sidecar {
+            for idx in &sst_idxs {
+                let desc = &self.manifest.manifest.ssts[*idx];
+                let sidecar = desc
+                    .equality_property_indices
+                    .iter()
+                    .find(|sidecar| sidecar.property == property)
+                    .expect("all_have_equality_sidecar guard");
+                let absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    sidecar.path
+                );
+                let index = self.fetch_equality_property_sidecar(&absolute).await?;
+                for (value, ids_out) in &mut candidates {
+                    if let Some(ids) = index.get(value) {
+                        ids_out.extend(
+                            ids.iter()
+                                .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id))),
+                        );
+                    }
+                }
+            }
+        }
+
+        self.batch_confirm_unique_candidates(label, property, values, candidates)
+            .await
+    }
+
+    async fn batch_confirm_unique_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+        candidates: BTreeMap<String, BTreeSet<NodeId>>,
+    ) -> Result<Vec<Option<NodeView>>> {
+        let ids: Vec<NodeId> = candidates
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let resolved = self.batch_lookup_nodes(label, &ids).await?;
+        let by_id: HashMap<NodeId, NodeView> = ids
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(id, view)| view.map(|view| (id, view)))
+            .collect();
+
+        let mut confirmed: HashMap<String, Option<NodeView>> =
+            HashMap::with_capacity(candidates.len());
+        for (value, ids) in candidates {
+            let mut winner: Option<NodeView> = None;
+            for id in ids {
+                let Some(view) = by_id.get(&id) else {
+                    continue;
+                };
+                if !matches!(view.properties.get(property), Some(Value::Str(current)) if current == &value)
+                {
+                    continue;
+                }
+                let replace = winner.as_ref().is_none_or(|old| {
+                    view.lsn > old.lsn || (view.lsn == old.lsn && view.id < old.id)
+                });
+                if replace {
+                    winner = Some(view.clone());
+                }
+            }
+            confirmed.insert(value, winner);
+        }
+        Ok(values
+            .iter()
+            .map(|value| confirmed.get(value).cloned().flatten())
+            .collect())
+    }
+
+    fn batch_unique_from_scan(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+        views: Vec<NodeView>,
+    ) -> Result<Vec<Option<NodeView>>> {
+        let mut by_value: HashMap<String, NodeView> = HashMap::new();
+        for view in views {
+            let Some(Value::Str(value)) = view.properties.get(property) else {
+                continue;
+            };
+            let replace = by_value
+                .get(value)
+                .is_none_or(|old| view.lsn > old.lsn || (view.lsn == old.lsn && view.id < old.id));
+            if replace {
+                by_value.insert(value.clone(), view);
+            }
+        }
+
+        if let Some(cache) = &self.property_index_cache {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            let index = by_value
+                .iter()
+                .map(|(value, view)| (value.clone(), view.id))
+                .collect();
+            cache.insert_at(
+                label.to_string(),
+                property.to_string(),
+                Arc::new(index),
+                generation,
+            );
+        }
+
+        Ok(values
+            .iter()
+            .map(|value| by_value.get(value).cloned())
+            .collect())
     }
 
     /// Resolve `MATCH (a:label {property: value})` for a NON-unique
@@ -1385,12 +1651,12 @@ impl<'mt> Snapshot<'mt> {
         }
 
         // L2: cross-snapshot NodeViewCache (RFC-019). Optional.
-        // Slot key includes manifest_version so promoted entries cannot
-        // serve stale data after the writer commits.
+        // Slot key uses the logical node generation: an edge-only commit can
+        // reuse the view, while a node mutation advances the generation.
         if let Some(shared) = &self.shared_node_cache {
             let shared_key = NodeCacheKey {
                 namespace: self.cache_namespace.clone(),
-                manifest_version: self.manifest.manifest.version,
+                manifest_version: self.node_cache_generation(),
                 label: label.to_string(),
                 node_id: id,
             };
@@ -1420,7 +1686,7 @@ impl<'mt> Snapshot<'mt> {
         if let Some(shared) = &self.shared_node_cache {
             let shared_key = NodeCacheKey {
                 namespace: self.cache_namespace.clone(),
-                manifest_version: self.manifest.manifest.version,
+                manifest_version: self.node_cache_generation(),
                 label: label.to_string(),
                 node_id: id,
             };
@@ -1497,13 +1763,13 @@ impl<'mt> Snapshot<'mt> {
 
         // L2 cache pass: same logic against the cross-snapshot cache.
         if let Some(shared) = &self.shared_node_cache {
-            let manifest_version = self.manifest.manifest.version;
+            let node_generation = self.node_cache_generation();
             let mut promote: Vec<(NodeCacheKey, Option<NodeView>)> = Vec::new();
             for id_bytes in &pending {
                 let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
                 let shared_key = NodeCacheKey {
                     namespace: self.cache_namespace.clone(),
-                    manifest_version,
+                    manifest_version: node_generation,
                     label: label.to_string(),
                     node_id: id,
                 };
@@ -1648,7 +1914,7 @@ impl<'mt> Snapshot<'mt> {
         // 3. Push every (resolved or negative) outcome into the output
         // vector and populate the cache tiers.
         let shared = self.shared_node_cache.clone();
-        let manifest_version = self.manifest.manifest.version;
+        let node_generation = self.node_cache_generation();
         let mut cache_l1 = self.node_cache.lock().unwrap();
         for id_bytes in &pending {
             let view = winners
@@ -1664,7 +1930,7 @@ impl<'mt> Snapshot<'mt> {
             if let Some(ref shared) = shared {
                 let shared_key = NodeCacheKey {
                     namespace: self.cache_namespace.clone(),
-                    manifest_version,
+                    manifest_version: node_generation,
                     label: label.to_string(),
                     node_id: id,
                 };
@@ -3103,6 +3369,13 @@ impl<'mt> Snapshot<'mt> {
             if let Some(idx) = cache.get_vector_index(&absolute) {
                 return Ok(Some(idx));
             }
+            let wire_bytes = usize::try_from(desc.size_bytes).unwrap_or(usize::MAX);
+            if !cache.can_admit_vector_index_wire_bytes(&absolute, wire_bytes) {
+                // The exact flat-search fallback remains available. Refuse the
+                // monolithic decode before GET so a configured hard cache cap
+                // cannot still suffer a multi-gigabyte transient allocation.
+                return Ok(None);
+            }
         }
         let body = self.get_sst_body(desc).await?;
         let Ok(idx) = VectorGraphIndex::decode(&body) else {
@@ -3110,7 +3383,7 @@ impl<'mt> Snapshot<'mt> {
         };
         let idx = Arc::new(idx);
         if let Some(cache) = self.cache.as_ref() {
-            cache.insert_vector_index(absolute, idx.clone());
+            cache.insert_vector_index_with_wire_bytes(absolute, idx.clone(), body.len());
         }
         Ok(Some(idx))
     }
@@ -3132,6 +3405,13 @@ impl<'mt> Snapshot<'mt> {
             if let Some(idx) = cache.get_text_index(&absolute) {
                 return Ok(Some(idx));
             }
+            let wire_bytes = usize::try_from(desc.size_bytes).unwrap_or(usize::MAX);
+            if !cache.can_admit_text_index_wire_bytes(&absolute, wire_bytes) {
+                // Preserve correctness through the exact flat BM25 fallback,
+                // while keeping an oversized monolithic index out of both the
+                // retained cache and the pre-admission decode working set.
+                return Ok(None);
+            }
         }
         let body = self.get_sst_body(desc).await?;
         let Ok(idx) = TextIndex::decode(&body) else {
@@ -3139,7 +3419,7 @@ impl<'mt> Snapshot<'mt> {
         };
         let idx = Arc::new(idx);
         if let Some(cache) = self.cache.as_ref() {
-            cache.insert_text_index(absolute, idx.clone());
+            cache.insert_text_index_with_wire_bytes(absolute, idx.clone(), body.len());
         }
         Ok(Some(idx))
     }

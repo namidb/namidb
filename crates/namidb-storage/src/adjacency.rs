@@ -41,6 +41,7 @@ use uuid::Uuid;
 use namidb_core::NodeId;
 
 use crate::cache::SstCache;
+use crate::cache_budget::{legacy_budget_bytes, shared_cache_capacities};
 use crate::error::{Error, Result};
 use crate::manifest::{LoadedManifest, SstKind};
 use crate::paths::NamespacePaths;
@@ -65,30 +66,29 @@ pub fn adjacency_enabled() -> bool {
 
 /// Read `NAMIDB_ADJACENCY_BUDGET_MIB` or fall back to [`DEFAULT_ADJACENCY_BUDGET_MIB`].
 pub fn adjacency_budget_bytes() -> usize {
-    let mib = std::env::var("NAMIDB_ADJACENCY_BUDGET_MIB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_ADJACENCY_BUDGET_MIB);
-    mib.saturating_mul(1024 * 1024)
+    legacy_budget_bytes("NAMIDB_ADJACENCY_BUDGET_MIB", DEFAULT_ADJACENCY_BUDGET_MIB)
 }
 
 /// Process-wide shared [`AdjacencyCache`]: one instance for every
-/// [`crate::WriterSession`] the process opens, so
-/// `NAMIDB_ADJACENCY_BUDGET_MIB` bounds the PROCESS, not each session.
+/// [`crate::WriterSession`] the process opens. Its legacy
+/// `NAMIDB_ADJACENCY_BUDGET_MIB` ceiling is scaled under the process-wide
+/// `NAMIDB_CACHE_MAX_BYTES` maximum.
 /// Sharing is only sound because [`AdjacencyKey`] embeds the namespace
 /// prefix — the bare `(manifest_version, edge_type, direction)` triple
 /// collides across tenants (per-namespace manifest versions both start
 /// at 1) and would serve one tenant's CSR to another.
 ///
 /// The enable flag and budget are read once, on first use. Returns `None`
-/// when `NAMIDB_ADJACENCY=0` at first use. Callers needing a private
+/// when `NAMIDB_ADJACENCY=0` or `NAMIDB_CACHE_MAX_BYTES=0` at first use.
+/// Callers needing a private
 /// instance inject one via
 /// [`crate::ingest::WriterSession::open_with_caches`].
 pub fn shared_adjacency_cache() -> Option<Arc<AdjacencyCache>> {
     static SHARED: OnceLock<Option<Arc<AdjacencyCache>>> = OnceLock::new();
     SHARED
         .get_or_init(|| {
-            adjacency_enabled().then(|| Arc::new(AdjacencyCache::new(adjacency_budget_bytes())))
+            let capacity = shared_cache_capacities().adjacency_capacity_bytes();
+            (capacity > 0).then(|| Arc::new(AdjacencyCache::new(capacity)))
         })
         .clone()
 }
@@ -211,6 +211,14 @@ impl AdjacencyKey {
     }
 }
 
+fn adjacency_entry_weight(key: &AdjacencyKey, adjacency: &EdgeAdjacency) -> usize {
+    adjacency
+        .approx_bytes()
+        .saturating_add(std::mem::size_of::<AdjacencyKey>())
+        .saturating_add(key.edge_type.capacity())
+        .saturating_add(64)
+}
+
 /// Counters surfaced for diagnostics + tests. The cache itself relies only
 /// on `used_bytes` for budget gating.
 #[derive(Debug, Default)]
@@ -259,7 +267,7 @@ impl AdjacencyCache {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            capacity_bytes: capacity_bytes.max(1),
+            capacity_bytes,
             used_bytes: Mutex::new(0),
             stats: Arc::new(CacheStats::default()),
         }
@@ -326,17 +334,22 @@ impl AdjacencyCache {
         let built = build().await?;
         self.stats.builds.fetch_add(1, Ordering::Relaxed);
         let arc = Arc::new(built);
-        let weight = arc.approx_bytes();
+        let weight = adjacency_entry_weight(&key, &arc);
 
         let mut map = self.inner.lock().unwrap();
         if let Some(existing) = map.get(&key) {
             // Another caller won the race; discard our build.
             return Ok(existing.clone());
         }
+        if self.capacity_bytes == 0 || weight > self.capacity_bytes {
+            // Correctness never depends on retention: serve this build to the
+            // caller without letting one CSR exceed the cache ceiling.
+            return Ok(arc);
+        }
         // Evict to budget if necessary. Drop oldest (lowest
         // manifest_version) first.
         let mut used = self.used_bytes.lock().unwrap();
-        while *used + weight > self.capacity_bytes && !map.is_empty() {
+        while used.saturating_add(weight) > self.capacity_bytes && !map.is_empty() {
             // Pop the oldest manifest_version first; among ties, any entry
             // is acceptable. We pick by manifest_version + edge_type only
             // (no Ord on EdgeDirection) so two directions of the same
@@ -347,14 +360,10 @@ impl AdjacencyCache {
                 .cloned();
             let Some(vk) = victim_key else { break };
             if let Some(victim) = map.remove(&vk) {
-                *used = used.saturating_sub(victim.approx_bytes());
+                *used = used.saturating_sub(adjacency_entry_weight(&vk, &victim));
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // If after fully evicting the entry STILL doesn't fit, we still
-        // insert (a single CSR larger than the budget is acceptable as
-        // the only resident entry — alternative is failing the lookup
-        // which is worse for correctness).
         map.insert(key, arc.clone());
         *used = used.saturating_add(weight);
         Ok(arc)
@@ -374,7 +383,7 @@ impl AdjacencyCache {
             .collect();
         for key in victims {
             if let Some(victim) = map.remove(&key) {
-                *used = used.saturating_sub(victim.approx_bytes());
+                *used = used.saturating_sub(adjacency_entry_weight(&key, &victim));
             }
         }
     }
@@ -667,11 +676,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_adjacency_is_served_but_never_retained() {
+        let cache = AdjacencyCache::new(4 * 1024);
+        let key = AdjacencyKey::new("tenants/acme", 1, "KNOWS", EdgeDirection::Forward);
+        let built = cache
+            .get_or_build(key.clone(), || async {
+                let mut adjacency = EdgeAdjacency::empty("KNOWS".into(), EdgeDirection::Forward, 1);
+                adjacency.partners = vec![nid(2); 1024];
+                adjacency.lsns = vec![1; 1024];
+                adjacency.tombstones = vec![false; 1024];
+                Ok(adjacency)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(built.edge_count(), 1024);
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.used_bytes(), 0);
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_disables_adjacency_retention() {
+        let cache = AdjacencyCache::new(0);
+        let key = AdjacencyKey::new("tenants/acme", 1, "KNOWS", EdgeDirection::Forward);
+        cache
+            .get_or_build(key.clone(), || async {
+                Ok(EdgeAdjacency::empty(
+                    "KNOWS".into(),
+                    EdgeDirection::Forward,
+                    1,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cache.capacity_bytes(), 0);
+        assert_eq!(cache.entries(), 0);
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[tokio::test]
     async fn cache_evicts_oldest_when_over_budget() {
-        // Tiny cache: 256 B. Every empty EdgeAdjacency carries ~64 B of
-        // overhead allowance + a few bytes for the edge_type label and
-        // offsets sentinel, so a handful of inserts must overflow.
-        let cache = AdjacencyCache::new(256);
+        // Tiny cache: 512 B. Each entry includes the CSR, HashMap key and
+        // allocation overhead, so a handful of inserts must overflow while
+        // every individual entry still fits.
+        let cache = AdjacencyCache::new(512);
         for v in 1..=10u64 {
             cache
                 .get_or_build(

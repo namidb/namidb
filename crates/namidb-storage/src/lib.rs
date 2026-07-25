@@ -16,6 +16,7 @@
 pub mod adjacency;
 pub mod backup;
 pub mod cache;
+pub mod cache_budget;
 pub mod cancel;
 pub mod compact;
 pub mod error;
@@ -47,6 +48,10 @@ pub use backup::{copy_namespace_snapshot, SnapshotCopyReport};
 pub use cache::{
     shared_sst_cache, sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
     DEFAULT_SST_CACHE_BUDGET_MIB,
+};
+pub use cache_budget::{
+    cache_max_bytes, shared_cache_capacities, shared_cache_capacity_bytes,
+    shared_cache_usage_bytes, CacheCapacities, DEFAULT_CACHE_MAX_BYTES,
 };
 pub use compact::{
     compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,

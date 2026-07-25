@@ -20,6 +20,8 @@
 //! - Eviction policy is `S3FifoConfig` (the foyer default).
 //! - Weight is `key.len() + value.len()` so the cache obeys a real-byte
 //! budget rather than an entry count.
+//! - Legacy per-tier budgets are scaled under the process-wide
+//! `NAMIDB_CACHE_MAX_BYTES` ceiling before the shared cache is constructed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +32,7 @@ use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
 use parquet::file::metadata::ParquetMetaData;
 
+use crate::cache_budget::{legacy_budget_bytes, shared_cache_capacities, CacheCapacities};
 use crate::sst::bloom::BloomFilter;
 
 /// Default budget for an [`SstCache`]: 256 MiB. Override via
@@ -74,25 +77,17 @@ pub const DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB: usize = 512;
 /// vectors and a navigation-space copy, so it receives a larger default.
 pub const DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB: usize = 512;
 
-fn env_budget_bytes(name: &str, default_mib: usize) -> usize {
-    let mib = std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default_mib);
-    mib.saturating_mul(1024 * 1024)
-}
-
 /// Read `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB` or fall back to
 /// [`DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB`].
 pub fn decoded_node_rg_cache_budget_bytes() -> usize {
-    env_budget_bytes(
+    legacy_budget_bytes(
         "NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB",
         DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB,
     )
 }
 
 pub fn property_sidecar_cache_budget_bytes() -> usize {
-    env_budget_bytes(
+    legacy_budget_bytes(
         "NAMIDB_PROPERTY_SIDECAR_CACHE_BUDGET_MIB",
         DEFAULT_PROPERTY_SIDECAR_CACHE_BUDGET_MIB,
     )
@@ -233,35 +228,74 @@ struct DecodedCacheBudgets {
     vector_index_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SstCacheBudgets {
+    body_bytes: usize,
+    node_row_group_bytes: usize,
+    property_sidecar_bytes: usize,
+    decoded: DecodedCacheBudgets,
+}
+
+impl SstCacheBudgets {
+    fn aggregate_capacity_bytes(self) -> usize {
+        let base = self
+            .body_bytes
+            .saturating_add(self.node_row_group_bytes)
+            .saturating_add(self.property_sidecar_bytes)
+            .saturating_add(self.decoded.metadata_bytes)
+            .saturating_add(self.decoded.edge_stream_bytes)
+            .saturating_add(self.decoded.edge_reader_bytes)
+            .saturating_add(self.decoded.bloom_bytes);
+        #[cfg(feature = "text-index")]
+        let base = base.saturating_add(self.decoded.text_index_bytes);
+        #[cfg(feature = "vector-index")]
+        let base = base.saturating_add(self.decoded.vector_index_bytes);
+        base
+    }
+}
+
 impl DecodedCacheBudgets {
     fn from_env() -> Self {
         Self {
-            metadata_bytes: env_budget_bytes(
+            metadata_bytes: legacy_budget_bytes(
                 "NAMIDB_SST_METADATA_CACHE_BUDGET_MIB",
                 DEFAULT_SST_METADATA_CACHE_BUDGET_MIB,
             ),
-            edge_stream_bytes: env_budget_bytes(
+            edge_stream_bytes: legacy_budget_bytes(
                 "NAMIDB_EDGE_STREAM_CACHE_BUDGET_MIB",
                 DEFAULT_EDGE_STREAM_CACHE_BUDGET_MIB,
             ),
-            edge_reader_bytes: env_budget_bytes(
+            edge_reader_bytes: legacy_budget_bytes(
                 "NAMIDB_EDGE_READER_CACHE_BUDGET_MIB",
                 DEFAULT_EDGE_READER_CACHE_BUDGET_MIB,
             ),
-            bloom_bytes: env_budget_bytes(
+            bloom_bytes: legacy_budget_bytes(
                 "NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB",
                 DEFAULT_BLOOM_FILTER_CACHE_BUDGET_MIB,
             ),
             #[cfg(feature = "text-index")]
-            text_index_bytes: env_budget_bytes(
+            text_index_bytes: legacy_budget_bytes(
                 "NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB",
                 DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB,
             ),
             #[cfg(feature = "vector-index")]
-            vector_index_bytes: env_budget_bytes(
+            vector_index_bytes: legacy_budget_bytes(
                 "NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB",
                 DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
             ),
+        }
+    }
+
+    fn from_capacities(capacities: CacheCapacities) -> Self {
+        Self {
+            metadata_bytes: capacities.sst_metadata_bytes,
+            edge_stream_bytes: capacities.edge_stream_bytes,
+            edge_reader_bytes: capacities.edge_reader_bytes,
+            bloom_bytes: capacities.bloom_filter_bytes,
+            #[cfg(feature = "text-index")]
+            text_index_bytes: capacities.text_index_bytes,
+            #[cfg(feature = "vector-index")]
+            vector_index_bytes: capacities.vector_index_bytes,
         }
     }
 
@@ -287,12 +321,24 @@ pub(crate) fn decoded_node_row_group_weight(
     key: &NodeRowGroupKey,
     value: &DecodedNodeRowGroup,
 ) -> usize {
-    key.0.len()
-        + std::mem::size_of::<usize>()
-        + value
-            .iter()
-            .map(|b| b.get_array_memory_size())
-            .sum::<usize>()
+    key.0
+        .len()
+        .saturating_add(std::mem::size_of::<usize>())
+        .saturating_add(value.iter().fold(0usize, |sum, batch| {
+            sum.saturating_add(batch.get_array_memory_size())
+        }))
+}
+
+fn raw_body_weight(key: &str, value: &Bytes) -> usize {
+    key.len().saturating_add(value.len())
+}
+
+fn metadata_weight(key: &str, value: &Arc<ParquetMetaData>) -> usize {
+    key.len().saturating_add(value.memory_size())
+}
+
+fn fits_capacity(capacity_bytes: usize, weight: usize) -> bool {
+    capacity_bytes > 0 && weight <= capacity_bytes
 }
 
 /// Read `NAMIDB_SST_CACHE` and return `false` only for `"0"`. Default
@@ -308,17 +354,13 @@ pub fn sst_cache_enabled() -> bool {
 /// Read `NAMIDB_SST_CACHE_BUDGET_MIB` or fall back to
 /// [`DEFAULT_SST_CACHE_BUDGET_MIB`].
 pub fn sst_cache_budget_bytes() -> usize {
-    let mib = std::env::var("NAMIDB_SST_CACHE_BUDGET_MIB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SST_CACHE_BUDGET_MIB);
-    mib.saturating_mul(1024 * 1024)
+    legacy_budget_bytes("NAMIDB_SST_CACHE_BUDGET_MIB", DEFAULT_SST_CACHE_BUDGET_MIB)
 }
 
 /// Process-wide shared [`SstCache`]: one instance for every
-/// [`crate::WriterSession`] the process opens, so `NAMIDB_SST_CACHE_BUDGET_MIB`
-/// (and the decoded row-group budget) bound the PROCESS, not each session —
-/// a multi-tenant host serving N namespaces holds one budget, not N.
+/// [`crate::WriterSession`] the process opens. Legacy per-tier ceilings are
+/// proportionally scaled under `NAMIDB_CACHE_MAX_BYTES`, so a multi-tenant
+/// host serving N namespaces holds one aggregate budget, not N.
 ///
 /// Sharing across namespaces is sound because every key in every tier is
 /// an absolute object-store path (namespace-prefixed) or `(absolute path,
@@ -326,14 +368,19 @@ pub fn sst_cache_budget_bytes() -> usize {
 ///
 /// The enable flag and budgets are read once, on first use; later env
 /// mutations don't resize the shared instance. Returns `None` when
-/// `NAMIDB_SST_CACHE=0` at first use. Callers needing private budgets
+/// `NAMIDB_SST_CACHE=0` or `NAMIDB_CACHE_MAX_BYTES=0` at first use. Callers
+/// needing private budgets
 /// (tests, embedded hosts with several object stores) construct their own
 /// [`SstCache`] and inject it via
 /// [`crate::ingest::WriterSession::open_with_caches`].
 pub fn shared_sst_cache() -> Option<SstCache> {
     static SHARED: OnceLock<Option<SstCache>> = OnceLock::new();
     SHARED
-        .get_or_init(|| sst_cache_enabled().then(|| SstCache::new(sst_cache_budget_bytes())))
+        .get_or_init(|| {
+            let capacities = shared_cache_capacities();
+            (capacities.sst_capacity_bytes() > 0)
+                .then(|| SstCache::with_shared_capacities(capacities))
+        })
         .clone()
 }
 
@@ -461,6 +508,9 @@ struct CacheStats {
 /// Process-wide cache shared between [`crate::Snapshot`] instances.
 #[derive(Clone)]
 pub struct SstCache {
+    /// Logical hard ceilings. Foyer instances use an internal one-byte dummy
+    /// capacity for zero-share tiers, while admission consults these values.
+    budgets: SstCacheBudgets,
     inner: Arc<Cache<String, Bytes>>,
     /// Decoded node-SST row groups keyed by `(absolute SST path, row-group
     /// index)`. Populated by `Snapshot::batch_lookup_nodes` and consulted by
@@ -513,7 +563,7 @@ impl std::fmt::Debug for SstCache {
         // foyer's `Cache` doesn't impl Debug and only exposes
         // `capacity`/`usage`; surface those alongside our own counters.
         let mut out = f.debug_struct("SstCache");
-        out.field("capacity_bytes", &self.inner.capacity())
+        out.field("capacity_bytes", &self.budgets.body_bytes)
             .field("usage_bytes", &self.inner.usage())
             .field("hits", &self.stats.hits.load(Ordering::Relaxed))
             .field("misses", &self.stats.misses.load(Ordering::Relaxed))
@@ -527,11 +577,25 @@ impl std::fmt::Debug for SstCache {
                 "meta_inserts",
                 &self.stats.meta_inserts.load(Ordering::Relaxed),
             )
-            .field("metadata_capacity_bytes", &self.metadata.capacity())
+            .field(
+                "aggregate_capacity_bytes",
+                &self.budgets.aggregate_capacity_bytes(),
+            )
+            .field("aggregate_usage_bytes", &self.aggregate_usage_bytes())
+            .field(
+                "metadata_capacity_bytes",
+                &self.budgets.decoded.metadata_bytes,
+            )
             .field("metadata_usage_bytes", &self.metadata.usage())
-            .field("edge_stream_capacity_bytes", &self.edge_streams.capacity())
+            .field(
+                "edge_stream_capacity_bytes",
+                &self.budgets.decoded.edge_stream_bytes,
+            )
             .field("edge_stream_usage_bytes", &self.edge_streams.usage())
-            .field("edge_reader_capacity_bytes", &self.edge_readers.capacity())
+            .field(
+                "edge_reader_capacity_bytes",
+                &self.budgets.decoded.edge_reader_bytes,
+            )
             .field("edge_reader_usage_bytes", &self.edge_readers.usage())
             .field("node_rg_usage_bytes", &self.decoded_node_row_groups.usage())
             .field(
@@ -548,7 +612,7 @@ impl std::fmt::Debug for SstCache {
             )
             .field(
                 "property_sidecar_capacity_bytes",
-                &self.property_sidecars.capacity(),
+                &self.budgets.property_sidecar_bytes,
             )
             .field(
                 "property_sidecar_usage_bytes",
@@ -566,7 +630,7 @@ impl std::fmt::Debug for SstCache {
                 "property_sidecar_inserts",
                 &self.stats.property_sidecar_inserts.load(Ordering::Relaxed),
             )
-            .field("bloom_capacity_bytes", &self.bloom_filters.capacity())
+            .field("bloom_capacity_bytes", &self.budgets.decoded.bloom_bytes)
             .field("bloom_usage_bytes", &self.bloom_filters.usage())
             .field("bloom_hits", &self.stats.bloom_hits.load(Ordering::Relaxed))
             .field(
@@ -578,12 +642,15 @@ impl std::fmt::Debug for SstCache {
                 &self.stats.bloom_inserts.load(Ordering::Relaxed),
             );
         #[cfg(feature = "text-index")]
-        out.field("text_index_capacity_bytes", &self.text_indexes.capacity())
-            .field("text_index_usage_bytes", &self.text_indexes.usage());
+        out.field(
+            "text_index_capacity_bytes",
+            &self.budgets.decoded.text_index_bytes,
+        )
+        .field("text_index_usage_bytes", &self.text_indexes.usage());
         #[cfg(feature = "vector-index")]
         out.field(
             "vector_index_capacity_bytes",
-            &self.vector_indexes.capacity(),
+            &self.budgets.decoded.vector_index_bytes,
         )
         .field("vector_index_usage_bytes", &self.vector_indexes.usage());
         out.finish()
@@ -611,60 +678,130 @@ impl SstCache {
         )
     }
 
+    fn with_shared_capacities(capacities: CacheCapacities) -> Self {
+        Self::with_all_budgets(
+            capacities.sst_body_bytes,
+            capacities.decoded_node_row_group_bytes,
+            capacities.property_sidecar_bytes,
+            DecodedCacheBudgets::from_capacities(capacities),
+        )
+    }
+
     fn with_all_budgets(
         capacity_bytes: usize,
         decoded_node_rg_bytes: usize,
         property_sidecar_bytes: usize,
         decoded: DecodedCacheBudgets,
     ) -> Self {
-        let inner = CacheBuilder::new(capacity_bytes.max(1))
-            .with_weighter(|key: &String, value: &Bytes| key.len() + value.len())
+        let budgets = SstCacheBudgets {
+            body_bytes: capacity_bytes,
+            node_row_group_bytes: decoded_node_rg_bytes,
+            property_sidecar_bytes,
+            decoded,
+        };
+        let inner_capacity = capacity_bytes;
+        let inner = CacheBuilder::new(inner_capacity.max(1))
+            .with_shards(1)
+            .with_weighter(|key: &String, value: &Bytes| raw_body_weight(key, value))
+            .with_filter(move |key: &String, value: &Bytes| {
+                fits_capacity(inner_capacity, raw_body_weight(key, value))
+            })
             .build();
-        let decoded_node_row_groups = CacheBuilder::new(decoded_node_rg_bytes.max(1))
+        let node_rg_capacity = decoded_node_rg_bytes;
+        let decoded_node_row_groups = CacheBuilder::new(node_rg_capacity.max(1))
+            .with_shards(1)
             .with_weighter(decoded_node_row_group_weight)
+            .with_filter(move |key: &NodeRowGroupKey, value: &DecodedNodeRowGroup| {
+                fits_capacity(node_rg_capacity, decoded_node_row_group_weight(key, value))
+            })
             .build();
-        let property_sidecars = CacheBuilder::new(property_sidecar_bytes.max(1))
+        let property_sidecar_capacity = property_sidecar_bytes;
+        let property_sidecars = CacheBuilder::new(property_sidecar_capacity.max(1))
+            .with_shards(1)
             .with_weighter(|key: &String, value: &DecodedPropertySidecar| {
                 decoded_property_sidecar_weight(key, value)
             })
-            .build();
-        let metadata = CacheBuilder::new(decoded.metadata_bytes.max(1))
-            .with_weighter(|key: &String, value: &Arc<ParquetMetaData>| {
-                key.len().saturating_add(value.memory_size())
+            .with_filter(move |key: &String, value: &DecodedPropertySidecar| {
+                fits_capacity(
+                    property_sidecar_capacity,
+                    decoded_property_sidecar_weight(key, value),
+                )
             })
             .build();
-        let edge_streams = CacheBuilder::new(decoded.edge_stream_bytes.max(1))
+        let metadata_capacity = decoded.metadata_bytes;
+        let metadata = CacheBuilder::new(metadata_capacity.max(1))
+            .with_shards(1)
+            .with_weighter(|key: &String, value: &Arc<ParquetMetaData>| metadata_weight(key, value))
+            .with_filter(move |key: &String, value: &Arc<ParquetMetaData>| {
+                fits_capacity(metadata_capacity, metadata_weight(key, value))
+            })
+            .build();
+        let edge_stream_capacity = decoded.edge_stream_bytes;
+        let edge_streams = CacheBuilder::new(edge_stream_capacity.max(1))
+            .with_shards(1)
             .with_weighter(|key: &String, value: &Arc<EdgeStreamBundle>| {
                 edge_stream_bundle_weight(key, value)
             })
+            .with_filter(move |key: &String, value: &Arc<EdgeStreamBundle>| {
+                fits_capacity(edge_stream_capacity, edge_stream_bundle_weight(key, value))
+            })
             .build();
-        let edge_readers = CacheBuilder::new(decoded.edge_reader_bytes.max(1))
+        let edge_reader_capacity = decoded.edge_reader_bytes;
+        let edge_readers = CacheBuilder::new(edge_reader_capacity.max(1))
+            .with_shards(1)
             .with_weighter(
                 |key: &String, value: &Arc<crate::sst::edges::EdgeSstReader>| {
                     edge_reader_weight(key, value)
                 },
             )
+            .with_filter(
+                move |key: &String, value: &Arc<crate::sst::edges::EdgeSstReader>| {
+                    fits_capacity(edge_reader_capacity, edge_reader_weight(key, value))
+                },
+            )
             .build();
-        let bloom_filters = CacheBuilder::new(decoded.bloom_bytes.max(1))
+        let bloom_capacity = decoded.bloom_bytes;
+        let bloom_filters = CacheBuilder::new(bloom_capacity.max(1))
+            .with_shards(1)
             .with_weighter(|key: &String, value: &Arc<BloomFilter>| bloom_filter_weight(key, value))
+            .with_filter(move |key: &String, value: &Arc<BloomFilter>| {
+                fits_capacity(bloom_capacity, bloom_filter_weight(key, value))
+            })
             .build();
         #[cfg(feature = "text-index")]
-        let text_indexes = CacheBuilder::new(decoded.text_index_bytes.max(1))
+        let text_index_capacity = decoded.text_index_bytes;
+        #[cfg(feature = "text-index")]
+        let text_indexes = CacheBuilder::new(text_index_capacity.max(1))
+            .with_shards(1)
             .with_weighter(
                 |key: &String, value: &WeightedArc<crate::sst::text::TextIndex>| {
                     weighted_arc_weight(key, value)
                 },
             )
+            .with_filter(
+                move |key: &String, value: &WeightedArc<crate::sst::text::TextIndex>| {
+                    fits_capacity(text_index_capacity, weighted_arc_weight(key, value))
+                },
+            )
             .build();
         #[cfg(feature = "vector-index")]
-        let vector_indexes = CacheBuilder::new(decoded.vector_index_bytes.max(1))
+        let vector_index_capacity = decoded.vector_index_bytes;
+        #[cfg(feature = "vector-index")]
+        let vector_indexes = CacheBuilder::new(vector_index_capacity.max(1))
+            .with_shards(1)
             .with_weighter(
                 |key: &String, value: &WeightedArc<crate::sst::vector::VectorGraphIndex>| {
                     weighted_arc_weight(key, value)
                 },
             )
+            .with_filter(
+                move |key: &String, value: &WeightedArc<crate::sst::vector::VectorGraphIndex>| {
+                    fits_capacity(vector_index_capacity, weighted_arc_weight(key, value))
+                },
+            )
             .build();
         Self {
+            budgets,
             inner: Arc::new(inner),
             decoded_node_row_groups: Arc::new(decoded_node_row_groups),
             metadata: Arc::new(metadata),
@@ -703,18 +840,47 @@ impl SstCache {
             .map(|entry| entry.value().value.clone())
     }
 
+    /// Cheap preflight for a serialized text-index body.
+    ///
+    /// Call this with the manifest/object length before downloading or
+    /// decoding a monolithic index. `false` means the decoded representation's
+    /// six-wire-copy lower estimate cannot fit and the exact flat fallback
+    /// should be used instead.
+    #[cfg(feature = "text-index")]
+    pub fn can_admit_text_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
+        fits_capacity(
+            self.budgets.decoded.text_index_bytes,
+            key.len().saturating_add(wire_bytes.saturating_mul(6)),
+        )
+    }
+
     /// Store a decoded text index for an SST path.
     #[cfg(feature = "text-index")]
     pub fn insert_text_index(&self, key: String, idx: Arc<crate::sst::text::TextIndex>) {
-        // Bincode's wire body is a stable lower bound. A 6x multiplier
-        // conservatively covers BTree/posting Vec allocator overhead and the
-        // separately sorted id copy. An uncached body falls back to a
-        // per-document estimate; either way the tier has a hard byte budget.
         let wire_bytes = self
             .inner
             .get(&key)
             .map(|entry| entry.value().len())
             .unwrap_or_default();
+        self.insert_text_index_with_wire_bytes(key, idx, wire_bytes);
+    }
+
+    /// Store a decoded text index, using the serialized body length supplied
+    /// by the caller for conservative deep-memory admission.
+    ///
+    /// The explicit length is required when the raw body itself exceeded its
+    /// tier and was deliberately not cached.
+    #[cfg(feature = "text-index")]
+    pub fn insert_text_index_with_wire_bytes(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::text::TextIndex>,
+        wire_bytes: usize,
+    ) {
+        // Bincode's wire body is a stable lower bound. A 6x multiplier
+        // conservatively covers BTree/posting Vec allocator overhead and the
+        // separately sorted id copy. An uncached body falls back to a
+        // per-document estimate; either way the tier has a hard byte budget.
         let doc_count = usize::try_from(idx.doc_count()).unwrap_or(usize::MAX);
         let estimated_bytes = wire_bytes
             .saturating_mul(6)
@@ -724,6 +890,12 @@ impl SstCache {
             value: idx,
             estimated_bytes,
         };
+        if !fits_capacity(
+            self.budgets.decoded.text_index_bytes,
+            weighted_arc_weight(&key, &value),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::TextIndex(key.clone());
         self.insert_tracked(tracked, || {
             self.text_indexes.insert(key, value);
@@ -739,18 +911,41 @@ impl SstCache {
             .map(|entry| entry.value().value.clone())
     }
 
+    /// Preflight a serialized vector-index body before GET/decode.
+    #[cfg(feature = "vector-index")]
+    pub fn can_admit_vector_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
+        fits_capacity(
+            self.budgets.decoded.vector_index_bytes,
+            key.len().saturating_add(wire_bytes.saturating_mul(6)),
+        )
+    }
+
     /// Store a decoded vector index for an SST path.
     #[cfg(feature = "vector-index")]
     pub fn insert_vector_index(&self, key: String, idx: Arc<crate::sst::vector::VectorGraphIndex>) {
-        // Decode retains the serialized graph's vectors/adjacency and builds a
-        // second navigation-space vector set. Six wire copies is conservative
-        // for normal Vamana degrees; the independent point/dimension estimate
-        // protects the no-body-cache path.
         let wire_bytes = self
             .inner
             .get(&key)
             .map(|entry| entry.value().len())
             .unwrap_or_default();
+        self.insert_vector_index_with_wire_bytes(key, idx, wire_bytes);
+    }
+
+    /// Store a decoded vector index with an explicit serialized-body length.
+    ///
+    /// This remains safe when the raw body was too large for its own tier and
+    /// therefore never became observable through [`Self::get`].
+    #[cfg(feature = "vector-index")]
+    pub fn insert_vector_index_with_wire_bytes(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::vector::VectorGraphIndex>,
+        wire_bytes: usize,
+    ) {
+        // Decode retains the serialized graph's vectors/adjacency and builds a
+        // second navigation-space vector set. Six wire copies is conservative
+        // for normal Vamana degrees; the independent point/dimension estimate
+        // protects the no-body-cache path.
         let per_point = (idx.dim() as usize).saturating_mul(8).saturating_add(512);
         let point_count = usize::try_from(idx.point_count()).unwrap_or(usize::MAX);
         let estimated_bytes = wire_bytes
@@ -761,6 +956,12 @@ impl SstCache {
             value: idx,
             estimated_bytes,
         };
+        if !fits_capacity(
+            self.budgets.decoded.vector_index_bytes,
+            weighted_arc_weight(&key, &value),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::VectorIndex(key.clone());
         self.insert_tracked(tracked, || {
             self.vector_indexes.insert(key, value);
@@ -793,6 +994,12 @@ impl SstCache {
         self.stats
             .edge_readers_inserts
             .fetch_add(1, Ordering::Relaxed);
+        if !fits_capacity(
+            self.budgets.decoded.edge_reader_bytes,
+            edge_reader_weight(&key, &reader),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::EdgeReader(key.clone());
         self.insert_tracked(tracked, || {
             self.edge_readers.insert(key, reader);
@@ -838,10 +1045,16 @@ impl SstCache {
         self.stats
             .property_sidecar_inserts
             .fetch_add(1, Ordering::Relaxed);
+        let value = DecodedPropertySidecar::Unique(index);
+        if !fits_capacity(
+            self.budgets.property_sidecar_bytes,
+            decoded_property_sidecar_weight(&key, &value),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::PropertySidecar(key.clone());
         self.insert_tracked(tracked, || {
-            self.property_sidecars
-                .insert(key, DecodedPropertySidecar::Unique(index));
+            self.property_sidecars.insert(key, value);
         });
     }
 
@@ -878,10 +1091,16 @@ impl SstCache {
         self.stats
             .property_sidecar_inserts
             .fetch_add(1, Ordering::Relaxed);
+        let value = DecodedPropertySidecar::Equality(index);
+        if !fits_capacity(
+            self.budgets.property_sidecar_bytes,
+            decoded_property_sidecar_weight(&key, &value),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::PropertySidecar(key.clone());
         self.insert_tracked(tracked, || {
-            self.property_sidecars
-                .insert(key, DecodedPropertySidecar::Equality(index));
+            self.property_sidecars.insert(key, value);
         });
     }
 
@@ -902,7 +1121,7 @@ impl SstCache {
     }
 
     pub fn property_sidecar_capacity_bytes(&self) -> usize {
-        self.property_sidecars.capacity()
+        self.budgets.property_sidecar_bytes
     }
 
     /// Look up a parsed bloom filter by immutable sidecar path.
@@ -922,6 +1141,12 @@ impl SstCache {
     /// Store a parsed bloom filter.
     pub fn insert_bloom_filter(&self, key: String, filter: Arc<BloomFilter>) {
         self.stats.bloom_inserts.fetch_add(1, Ordering::Relaxed);
+        if !fits_capacity(
+            self.budgets.decoded.bloom_bytes,
+            bloom_filter_weight(&key, &filter),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::Bloom(key.clone());
         self.insert_tracked(tracked, || {
             self.bloom_filters.insert(key, filter);
@@ -945,7 +1170,7 @@ impl SstCache {
     }
 
     pub fn bloom_capacity_bytes(&self) -> usize {
-        self.bloom_filters.capacity()
+        self.budgets.decoded.bloom_bytes
     }
 
     /// Look up the decoded batches for one node-SST row group. Returns
@@ -981,16 +1206,26 @@ impl SstCache {
         batches: Arc<Vec<RecordBatch>>,
     ) {
         self.stats.node_rg_inserts.fetch_add(1, Ordering::Relaxed);
+        let cache_key = (key.clone(), row_group);
+        if !fits_capacity(
+            self.budgets.node_row_group_bytes,
+            decoded_node_row_group_weight(&cache_key, &batches),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::NodeRowGroup(key.clone(), row_group);
         self.insert_tracked(tracked, || {
-            self.decoded_node_row_groups
-                .insert((key, row_group), batches);
+            self.decoded_node_row_groups.insert(cache_key, batches);
         });
     }
 
     /// Bytes held by the decoded node row-group tier (sum of entry weights).
     pub fn decoded_node_row_groups_usage(&self) -> usize {
         self.decoded_node_row_groups.usage()
+    }
+
+    pub fn decoded_node_row_groups_capacity_bytes(&self) -> usize {
+        self.budgets.node_row_group_bytes
     }
 
     pub fn decoded_node_row_group_hits(&self) -> u64 {
@@ -1027,6 +1262,12 @@ impl SstCache {
         self.stats
             .edge_streams_inserts
             .fetch_add(1, Ordering::Relaxed);
+        if !fits_capacity(
+            self.budgets.decoded.edge_stream_bytes,
+            edge_stream_bundle_weight(&key, &bundle),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::EdgeStreams(key.clone());
         self.insert_tracked(tracked, || {
             self.edge_streams.insert(key, bundle);
@@ -1048,7 +1289,7 @@ impl SstCache {
     }
 
     pub fn edge_streams_capacity_bytes(&self) -> usize {
-        self.edge_streams.capacity()
+        self.budgets.decoded.edge_stream_bytes
     }
 
     /// Look up Parquet metadata for an SST path (RFC-003). Returns
@@ -1071,6 +1312,12 @@ impl SstCache {
     /// per UUIDv7-keyed path, so cached metadata never goes stale.
     pub fn insert_metadata(&self, key: String, meta: Arc<ParquetMetaData>) {
         self.stats.meta_inserts.fetch_add(1, Ordering::Relaxed);
+        if !fits_capacity(
+            self.budgets.decoded.metadata_bytes,
+            metadata_weight(&key, &meta),
+        ) {
+            return;
+        }
         let tracked = TrackedCacheEntry::Metadata(key.clone());
         self.insert_tracked(tracked, || {
             self.metadata.insert(key, meta);
@@ -1224,7 +1471,7 @@ impl SstCache {
     }
 
     pub fn metadata_capacity_bytes(&self) -> usize {
-        self.metadata.capacity()
+        self.budgets.decoded.metadata_bytes
     }
 
     #[cfg(feature = "text-index")]
@@ -1232,9 +1479,19 @@ impl SstCache {
         self.text_indexes.usage()
     }
 
+    #[cfg(feature = "text-index")]
+    pub fn text_index_capacity_bytes(&self) -> usize {
+        self.budgets.decoded.text_index_bytes
+    }
+
     #[cfg(feature = "vector-index")]
     pub fn vector_index_usage_bytes(&self) -> usize {
         self.vector_indexes.usage()
+    }
+
+    #[cfg(feature = "vector-index")]
+    pub fn vector_index_capacity_bytes(&self) -> usize {
+        self.budgets.decoded.vector_index_bytes
     }
 
     /// Look up a body. Returns `None` on miss; the caller must perform
@@ -1255,6 +1512,9 @@ impl SstCache {
     /// Insert (or replace) the entry for `key`.
     pub fn insert(&self, key: String, value: Bytes) {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
+        if !fits_capacity(self.budgets.body_bytes, raw_body_weight(&key, &value)) {
+            return;
+        }
         let tracked = TrackedCacheEntry::Body(key.clone());
         self.insert_tracked(tracked, || {
             self.inner.insert(key, value);
@@ -1264,6 +1524,35 @@ impl SstCache {
     /// Current cache usage in bytes (sum of weights of live entries).
     pub fn usage(&self) -> usize {
         self.inner.usage()
+    }
+
+    /// Raw SST body tier capacity.
+    pub fn capacity_bytes(&self) -> usize {
+        self.budgets.body_bytes
+    }
+
+    /// Sum of all compiled SST cache tier capacities (seven base tiers plus
+    /// optional text and vector tiers).
+    pub fn aggregate_capacity_bytes(&self) -> usize {
+        self.budgets.aggregate_capacity_bytes()
+    }
+
+    /// Sum of cache-accounted resident bytes in every compiled SST tier.
+    pub fn aggregate_usage_bytes(&self) -> usize {
+        let base = self
+            .inner
+            .usage()
+            .saturating_add(self.decoded_node_row_groups.usage())
+            .saturating_add(self.property_sidecars.usage())
+            .saturating_add(self.metadata.usage())
+            .saturating_add(self.edge_streams.usage())
+            .saturating_add(self.edge_readers.usage())
+            .saturating_add(self.bloom_filters.usage());
+        #[cfg(feature = "text-index")]
+        let base = base.saturating_add(self.text_indexes.usage());
+        #[cfg(feature = "vector-index")]
+        let base = base.saturating_add(self.vector_indexes.usage());
+        base
     }
 
     /// Cache hit count since construction.
@@ -1313,6 +1602,7 @@ mod tests {
     fn every_decoded_tier_has_an_explicit_capacity() {
         let budget = 32 * 1024;
         let cache = tight_cache(budget);
+        assert_eq!(cache.capacity_bytes(), budget);
         assert_eq!(cache.decoded_node_row_groups.capacity(), budget);
         assert_eq!(cache.metadata.capacity(), budget);
         assert_eq!(cache.edge_streams.capacity(), budget);
@@ -1323,6 +1613,77 @@ mod tests {
         assert_eq!(cache.text_indexes.capacity(), budget);
         #[cfg(feature = "vector-index")]
         assert_eq!(cache.vector_indexes.capacity(), budget);
+        let compiled_tiers = 7
+            + usize::from(cfg!(feature = "text-index"))
+            + usize::from(cfg!(feature = "vector-index"));
+        assert_eq!(cache.aggregate_capacity_bytes(), compiled_tiers * budget);
+    }
+
+    #[test]
+    fn foyer_never_admits_an_entry_larger_than_its_capacity() {
+        let cache = tight_cache(4 * 1024);
+        cache.insert("k".into(), Bytes::from(vec![0; 6 * 1024]));
+
+        assert!(cache.get("k").is_none());
+        assert_eq!(cache.usage(), 0);
+        assert_eq!(cache.aggregate_usage_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_capacity_uses_a_non_admitting_dummy_cache() {
+        let cache = tight_cache(0);
+        assert_eq!(cache.aggregate_capacity_bytes(), 0);
+        cache.insert(String::new(), Bytes::new());
+        assert!(cache.get("").is_none());
+        assert_eq!(cache.aggregate_usage_bytes(), 0);
+    }
+
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn oversized_text_index_is_rejected_with_explicit_wire_size() {
+        let cache = tight_cache(4 * 1024);
+        let key = "tenants/a/sst/level1/search.ft".to_string();
+        let (body, _) = crate::sst::text::build_body(vec![([1; 16], "legal text".into())])
+            .unwrap()
+            .unwrap();
+        let index = Arc::new(crate::sst::text::TextIndex::decode(&body).unwrap());
+
+        assert!(!cache.can_admit_text_index_wire_bytes(&key, 1024));
+        cache.insert_text_index_with_wire_bytes(key.clone(), index, 1024);
+        assert!(cache.get_text_index(&key).is_none());
+        assert_eq!(cache.text_index_usage_bytes(), 0);
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn oversized_vector_index_is_rejected_with_explicit_wire_size() {
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        let cache = tight_cache(4 * 1024);
+        let key = "tenants/a/sst/level1/search.vg".to_string();
+        let descriptor = VectorIndexDescriptor {
+            name: "emb_idx".into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 2,
+            l_build: 4,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        };
+        let (body, _) = crate::sst::vector::build_body(
+            &descriptor,
+            vec![([1; 16], vec![1.0, 0.0]), ([2; 16], vec![0.0, 1.0])],
+        )
+        .unwrap()
+        .unwrap();
+        let index = Arc::new(crate::sst::vector::VectorGraphIndex::decode(&body).unwrap());
+
+        assert!(!cache.can_admit_vector_index_wire_bytes(&key, 1024));
+        cache.insert_vector_index_with_wire_bytes(key.clone(), index, 1024);
+        assert!(cache.get_vector_index(&key).is_none());
+        assert_eq!(cache.vector_index_usage_bytes(), 0);
     }
 
     #[test]

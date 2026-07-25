@@ -201,8 +201,8 @@ pub struct WriterSession {
     /// (RFC-pending). Always constructed (cheap empty map); the
     /// per-snapshot `Snapshot::lookup_node_by_property` populates it on
     /// the first miss and reuses it from every subsequent snapshot.
-    /// Reset on `flush` because a flush bumps the manifest version and
-    /// can introduce new nodes.
+    /// Its logical generation advances only on node mutations or relevant
+    /// schema/index changes. Edge-only commits and physical flushes preserve it.
     property_index_cache: Arc<crate::property_index::PropertyIndexCache>,
     /// Per-writer transactional index over declared-unique property values
     /// (committed + staged), consulted by [`Self::unique_probe`] so a
@@ -324,6 +324,10 @@ impl WriterSession {
             adjacency_cache,
         } = caches;
 
+        // Seed the writer-local logical node generation from durable state.
+        // A reopen therefore cannot collide in the process-wide NodeView cache
+        // with an older session that started its counter at zero.
+        let property_index_generation = current.manifest.version;
         let published_memtable = Arc::new(recovered.memtable.snapshot_view());
         let session = Self {
             manifest_store,
@@ -342,7 +346,11 @@ impl WriterSession {
             adjacency_cache,
             node_cache,
             sst_cache,
-            property_index_cache: Arc::new(crate::property_index::PropertyIndexCache::new()),
+            property_index_cache: Arc::new(
+                crate::property_index::PropertyIndexCache::new_at_generation(
+                    property_index_generation,
+                ),
+            ),
             unique_index: crate::unique_index::UniqueConstraintIndex::new(),
             store,
             auto_snapshot_every: auto_snapshot_every(),
@@ -684,9 +692,9 @@ impl WriterSession {
     /// it reflects exactly what [`commit_batch`](Self::commit_batch) would make
     /// durable without replaying the growing pending WAL on every lookup. The
     /// cross-snapshot NodeView and property-index caches are deliberately
-    /// NOT attached: they are keyed by manifest version and shared across
-    /// sessions, so caching a staged (uncommitted) row in them would leak
-    /// it to a concurrent reader pinned at the same version. The immutable
+    /// NOT attached when staged node mutations exist: caching an uncommitted
+    /// row under the published logical generation would leak it to a concurrent
+    /// reader. The immutable
     /// SST/adjacency body caches are safe to keep. Instead, the overlay attaches
     /// the writer-private transactional property index, whose rollback journal
     /// makes committed+staged equality lookups reusable without cross-reader
@@ -1299,15 +1307,9 @@ impl WriterSession {
         // The flush emptied the live memtable (memtable.freeze() drained
         // it), so the published snapshot must reset to empty too.
         self.refresh_published();
-        // Invalidate the cross-snapshot property index — a flush can
-        // promote new nodes from the memtable into SSTs, and the cached
-        // value→NodeId map is built off a snapshot that pre-dates the
-        // new manifest version. Subsequent snapshots will rebuild on
-        // their first miss.
-        self.property_index_cache.reset();
         // A flush only moves the same logical rows from memtable/WAL into
-        // immutable SSTs. The transactional unique index remains exact and
-        // must stay warm across periodic loader flushes.
+        // immutable SSTs. Both logical property caches remain exact and must
+        // stay warm across periodic loader flushes.
         Ok(outcome)
     }
 
@@ -2148,6 +2150,23 @@ mod tests {
     fn schema() -> Schema {
         SchemaBuilder::new()
             .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build()
+    }
+
+    fn unique_name_schema() -> Schema {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![
+                    PropertyDef::new("name", DataType::Utf8, false)
+                        .unwrap()
+                        .with_unique(true),
+                    PropertyDef::new("age", DataType::Int32, true).unwrap(),
+                ],
+            })
             .unwrap()
             .edge_type(knows_edge())
             .unwrap()
@@ -3332,6 +3351,308 @@ mod tests {
         assert!(
             Arc::ptr_eq(&before, &after),
             "edge-only commit should preserve the exact cached map"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_unique_lookup_preserves_order_duplicates_misses_and_confirms_stale_claimants() {
+        let store = make_store();
+        let paths = make_paths("ingest-batch-unique-sidecar");
+        let mut session = WriterSession::open_with_caches(
+            store,
+            paths,
+            SessionCaches {
+                sst_cache: Some(SstCache::new(8 * 1024 * 1024)),
+                ..SessionCaches::none()
+            },
+        )
+        .await
+        .unwrap();
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let charlie = sorted_node_id(3);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session
+            .upsert_node("Person", bob, &node_record("Bob", Some(40)))
+            .unwrap();
+        session.flush(unique_name_schema()).await.unwrap();
+
+        assert!(session
+            .snapshot()
+            .manifest()
+            .manifest
+            .ssts
+            .iter()
+            .any(|sst| {
+                sst.unique_property_indices
+                    .iter()
+                    .any(|sidecar| sidecar.property == "name")
+                    || sst
+                        .equality_property_indices
+                        .iter()
+                        .any(|sidecar| sidecar.property == "name")
+            }));
+
+        // The immutable sidecar still claims Bob. The newer memtable renames
+        // that same node and adds Charlie, so the batch path must collect both
+        // tiers once and confirm current node views in one vectorised read.
+        session
+            .upsert_node("Person", bob, &node_record("Robert", Some(41)))
+            .unwrap();
+        session
+            .upsert_node("Person", charlie, &node_record("Charlie", Some(25)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        let values = vec![
+            "Robert".to_string(),
+            "missing".to_string(),
+            "Alice".to_string(),
+            "Robert".to_string(),
+            "Bob".to_string(),
+            "Charlie".to_string(),
+        ];
+        let lookup_calls = session.property_index_cache().unique_lookup_calls();
+        let claimant_scans = session.property_index_cache().memtable_population_scans();
+        let found = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Person", "name", &values)
+            .await
+            .unwrap();
+        let ids: Vec<Option<NodeId>> = found
+            .iter()
+            .map(|view| view.as_ref().map(|view| view.id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(bob), None, Some(alice), Some(bob), None, Some(charlie),]
+        );
+        assert_eq!(
+            session.property_index_cache().unique_lookup_calls() - lookup_calls,
+            1,
+            "one batch must be one storage-level unique lookup"
+        );
+        assert_eq!(
+            session.property_index_cache().memtable_population_scans() - claimant_scans,
+            1,
+            "the committed memtable claimant map must be built once per generation"
+        );
+
+        let scans_after_first = session.property_index_cache().memtable_population_scans();
+        let again = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Person", "name", &values)
+            .await
+            .unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .map(|view| view.as_ref().map(|view| view.id))
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            session.property_index_cache().memtable_population_scans(),
+            scans_after_first,
+            "a second batch must reuse the claimant map"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_unique_lookup_legacy_store_scans_once_then_reuses_complete_map() {
+        let store = make_store();
+        let paths = make_paths("ingest-batch-unique-legacy");
+        let mut session = WriterSession::open_with_caches(store, paths, SessionCaches::none())
+            .await
+            .unwrap();
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", None))
+            .unwrap();
+        session
+            .upsert_node("Person", bob, &node_record("Bob", None))
+            .unwrap();
+        // `schema()` does not declare `name` unique/indexed, deliberately
+        // producing an old-style Nodes SST without a property sidecar.
+        session.flush(schema()).await.unwrap();
+
+        let values = vec![
+            "Bob".to_string(),
+            "missing".to_string(),
+            "Alice".to_string(),
+            "Bob".to_string(),
+        ];
+        let found = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Person", "name", &values)
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|view| view.as_ref().map(|view| view.id))
+                .collect::<Vec<_>>(),
+            vec![Some(bob), None, Some(alice), Some(bob)]
+        );
+        let complete = session
+            .property_index_cache()
+            .get("Person", "name")
+            .expect("legacy fallback should publish one complete value map");
+
+        let found_again = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Person", "name", &values)
+            .await
+            .unwrap();
+        assert_eq!(
+            found_again
+                .iter()
+                .map(|view| view.as_ref().map(|view| view.id))
+                .collect::<Vec<_>>(),
+            vec![Some(bob), None, Some(alice), Some(bob)]
+        );
+        assert!(Arc::ptr_eq(
+            &complete,
+            &session
+                .property_index_cache()
+                .get("Person", "name")
+                .unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_cache_generation_survives_edge_commit_and_flush_but_not_node_change_or_reopen() {
+        let store = make_store();
+        let paths = make_paths("ingest-logical-node-cache-generation");
+        let node_cache = Arc::new(NodeViewCache::new(8 * 1024 * 1024));
+        let caches = SessionCaches {
+            node_cache: Some(node_cache.clone()),
+            ..SessionCaches::none()
+        };
+        let mut session =
+            WriterSession::open_with_caches(store.clone(), paths.clone(), caches.clone())
+                .await
+                .unwrap();
+        assert_eq!(
+            session.property_index_cache().generation(),
+            session.manifest_version(),
+            "a fresh/reopened writer seeds its logical generation from the manifest"
+        );
+
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        let node_generation = session.property_index_cache().generation();
+        let warmed = session
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            warmed.properties.get("name"),
+            Some(&Value::Str("Alice".into()))
+        );
+
+        let hits_before_edge = node_cache.hits();
+        session
+            .upsert_edge("KNOWS", alice, sorted_node_id(2), &edge_record())
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        assert_eq!(
+            session.property_index_cache().generation(),
+            node_generation,
+            "an edge-only manifest commit must preserve node generation"
+        );
+        assert!(session
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            node_cache.hits(),
+            hits_before_edge + 1,
+            "the next snapshot should reuse the pre-edge-commit NodeView"
+        );
+
+        let hits_before_flush = node_cache.hits();
+        session.flush(schema()).await.unwrap();
+        assert_eq!(
+            session.property_index_cache().generation(),
+            node_generation,
+            "a representation-only flush must preserve node generation"
+        );
+        assert!(session
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            node_cache.hits(),
+            hits_before_flush + 1,
+            "the flushed representation must reuse the same logical NodeView"
+        );
+
+        let misses_before_mutation = node_cache.misses();
+        session
+            .upsert_node("Person", alice, &node_record("Alicia", Some(31)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        assert_eq!(
+            session.property_index_cache().generation(),
+            node_generation + 1,
+            "a committed node mutation must advance node generation"
+        );
+        let mutated = session
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mutated.properties.get("name"),
+            Some(&Value::Str("Alicia".into()))
+        );
+        assert_eq!(
+            node_cache.misses(),
+            misses_before_mutation + 1,
+            "the old NodeView slot must not serve a node mutation"
+        );
+
+        let old_generation = session.property_index_cache().generation();
+        drop(session);
+        let reopened = WriterSession::open_with_caches(store, paths, caches)
+            .await
+            .unwrap();
+        let reopened_generation = reopened.property_index_cache().generation();
+        assert_eq!(reopened_generation, reopened.manifest_version());
+        assert!(
+            reopened_generation > old_generation,
+            "reopen must begin above generations cached by the prior writer"
+        );
+        let misses_before_reopen = node_cache.misses();
+        let reopened_view = reopened
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened_view.properties.get("name"),
+            Some(&Value::Str("Alicia".into()))
+        );
+        assert_eq!(
+            node_cache.misses(),
+            misses_before_reopen + 1,
+            "reopen must not collide with a prior writer's logical key"
         );
     }
 

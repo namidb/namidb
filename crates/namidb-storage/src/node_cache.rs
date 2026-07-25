@@ -6,9 +6,9 @@
 //! while the existing per-snapshot cache only hit 9% of calls — the
 //! intra-snapshot scope drops the answers after every query and the
 //! bench (and any interactive workload) builds a fresh `Snapshot` per
-//! query. Cross-snapshot sharing, keyed by `(namespace, manifest_version,
-//! label, node_id)`, lets a warmup pay the SST walk once and amortise it
-//! across every subsequent query against the same manifest version. The
+//! query. Cross-snapshot sharing, keyed by `(namespace, logical node
+//! generation, label, node_id)`, lets a warmup pay the SST walk once and
+//! amortise it across every subsequent query while node data is unchanged. The
 //! namespace component makes the process-wide shared instance
 //! ([`shared_node_cache`]) safe across tenants.
 //!
@@ -17,8 +17,9 @@
 //! `CachedNodeView` is `Option<NodeView>`. We **also cache `None`** —
 //! a successful resolution to "absent / tombstoned" is still expensive
 //! (it pays the same bloom probe + body walk + LSN merge). Caching it
-//! is correct because the cache key includes `manifest_version`: once
-//! the writer commits, the cache slot for the next version is fresh.
+//! is correct because the cache key includes the logical node generation:
+//! node mutations advance it, while edge-only commits and physical flushes do
+//! not invalidate otherwise exact node views.
 //!
 //! ## L1 + L2
 //!
@@ -36,8 +37,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use namidb_core::NodeId;
+use namidb_core::{NodeId, Value};
 
+use crate::cache_budget::{legacy_budget_bytes, shared_cache_capacities};
 use crate::read::NodeView;
 
 /// Default budget for a [`NodeViewCache`]: 256 MiB. Override via
@@ -56,49 +58,54 @@ pub fn node_cache_enabled() -> bool {
 /// Read `NAMIDB_NODE_CACHE_BUDGET_MIB` or fall back to
 /// [`DEFAULT_NODE_CACHE_BUDGET_MIB`].
 pub fn node_cache_budget_bytes() -> usize {
-    let mib = std::env::var("NAMIDB_NODE_CACHE_BUDGET_MIB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_NODE_CACHE_BUDGET_MIB);
-    mib.saturating_mul(1024 * 1024)
+    legacy_budget_bytes(
+        "NAMIDB_NODE_CACHE_BUDGET_MIB",
+        DEFAULT_NODE_CACHE_BUDGET_MIB,
+    )
 }
 
 /// Process-wide shared [`NodeViewCache`]: one instance for every
-/// [`crate::WriterSession`] the process opens, so
-/// `NAMIDB_NODE_CACHE_BUDGET_MIB` bounds the PROCESS, not each session.
+/// [`crate::WriterSession`] the process opens. Its legacy
+/// `NAMIDB_NODE_CACHE_BUDGET_MIB` ceiling is scaled under the process-wide
+/// `NAMIDB_CACHE_MAX_BYTES` maximum.
 /// Unlike the [`crate::cache::SstCache`] (whose keys are absolute paths and
 /// therefore namespace-safe by construction), sharing this cache is only
 /// sound because [`NodeCacheKey`] embeds the namespace prefix — the bare
-/// `(manifest_version, label, node_id)` triple collides across tenants.
+/// `(logical_generation, label, node_id)` triple collides across tenants.
 ///
 /// The enable flag and budget are read once, on first use. Returns `None`
-/// when `NAMIDB_NODE_CACHE=0` at first use. Callers needing a private
+/// when `NAMIDB_NODE_CACHE=0` or `NAMIDB_CACHE_MAX_BYTES=0` at first use.
+/// Callers needing a private
 /// instance inject one via
 /// [`crate::ingest::WriterSession::open_with_caches`].
 pub fn shared_node_cache() -> Option<Arc<NodeViewCache>> {
     static SHARED: OnceLock<Option<Arc<NodeViewCache>>> = OnceLock::new();
     SHARED
         .get_or_init(|| {
-            node_cache_enabled().then(|| Arc::new(NodeViewCache::new(node_cache_budget_bytes())))
+            let capacity = shared_cache_capacities().node_view_capacity_bytes();
+            (capacity > 0).then(|| Arc::new(NodeViewCache::new(capacity)))
         })
         .clone()
 }
 
 /// Compound cache key. Hash by all four fields so two snapshots that share
-/// `namespace` + `manifest_version` see the same slot for the same
+/// `namespace` + logical node generation see the same slot for the same
 /// `(label, node_id)`.
 ///
 /// `namespace` is the object-store namespace prefix (`<root>/<ns>`, no
 /// trailing slash — [`crate::paths::NamespacePaths::namespace_prefix`]).
 /// It is part of the key because the cache is shared process-wide: two
-/// tenants can hold the same `(manifest_version, label, node_id)` triple
-/// with different data (manifest versions count per namespace and node
+/// tenants can hold the same `(logical_generation, label, node_id)` triple
+/// with different data (generations count per namespace and node
 /// ids are caller-supplied), so omitting it would serve one tenant's rows
 /// to another. `Arc<str>` keeps per-entry clones at pointer cost — every
 /// key of one snapshot shares the same allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeCacheKey {
     pub namespace: Arc<str>,
+    /// Logical node-data generation. Edge-only manifest commits and physical
+    /// flushes preserve it; a committed node mutation advances it. The public
+    /// field name is retained for source compatibility with 2.0.x callers.
     pub manifest_version: u64,
     pub label: String,
     pub node_id: NodeId,
@@ -138,8 +145,8 @@ struct Inner {
     /// key → (cached view, insertion sequence). The sequence disambiguates the
     /// eviction-order entry so an overwrite can remove the stale one in O(log n).
     map: HashMap<NodeCacheKey, (CachedNodeView, u64)>,
-    /// Eviction order: `(manifest_version, seq) → key`. `pop_first` yields the
-    /// victim (oldest manifest version, then oldest insertion) in O(log n) — no
+    /// Eviction order: `(node_generation, seq) → key`. `pop_first` yields the
+    /// victim (oldest generation, then oldest insertion) in O(log n) — no
     /// full-map scan or per-key String clone.
     order: BTreeMap<(u64, u64), NodeCacheKey>,
     next_seq: u64,
@@ -179,7 +186,7 @@ impl NodeViewCache {
                 next_seq: 0,
                 used_bytes: 0,
             }),
-            capacity_bytes: capacity_bytes.max(1),
+            capacity_bytes,
             stats: Arc::new(CacheStats::default()),
         }
     }
@@ -225,11 +232,14 @@ impl NodeViewCache {
         }
     }
 
-    /// Insert (or overwrite) the entry for `key`. Evicts oldest
-    /// `manifest_version` entries to fit `capacity_bytes` if necessary.
+    /// Insert (or overwrite) the entry for `key`. Evicts oldest logical
+    /// generations to fit `capacity_bytes` if necessary.
     pub fn insert(&self, key: NodeCacheKey, view: CachedNodeView) {
         let weight = entry_weight(&key, &view);
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
+        if self.capacity_bytes == 0 || weight > self.capacity_bytes {
+            return;
+        }
         let inner = &mut *self.inner.lock().unwrap();
 
         // If we're overwriting an existing entry, reclaim its weight and drop
@@ -241,10 +251,10 @@ impl NodeViewCache {
             inner.order.remove(&prev_order_key);
         }
 
-        // Evict oldest (manifest_version, seq) entries in O(log n) each until the
+        // Evict oldest (node_generation, seq) entries in O(log n) each until the
         // new entry fits. The new key is not yet in `order`, so it is never a
         // victim of its own insert.
-        while inner.used_bytes + weight > self.capacity_bytes {
+        while inner.used_bytes.saturating_add(weight) > self.capacity_bytes {
             let Some((&victim_ord, _)) = inner.order.iter().next() else {
                 break; // nothing left to evict
             };
@@ -302,25 +312,65 @@ impl NodeViewCache {
 /// heap footprint. The `namespace` component counts pointer-size only —
 /// the `Arc<str>` buffer is shared by every key of a snapshot.
 fn entry_weight(key: &NodeCacheKey, view: &CachedNodeView) -> usize {
-    approx_size(view) + key.label.capacity() + std::mem::size_of::<Arc<str>>() + 32
+    approx_size(view)
+        // The key is owned once by the HashMap and once by the BTreeMap order
+        // index. String::clone allocates a second label buffer; Arc<str>
+        // namespace clones share their backing allocation.
+        .saturating_add(key.label.capacity().saturating_mul(2))
+        .saturating_add(std::mem::size_of::<NodeCacheKey>().saturating_mul(2))
+        .saturating_add(128)
 }
 
 /// Conservative size estimate for a [`CachedNodeView`]. Counts labels +
-/// property name + per-value allowance + invariant overhead. Used for
-/// budget accounting — exact tracking would require deep `Value` walks
-/// which are not worth it.
+/// property names and recursively-owned property values.
 fn approx_size(view: &CachedNodeView) -> usize {
+    const BTREE_ENTRY_OVERHEAD: usize = 96;
     match view {
         None => 32, // overhead allowance for cached-miss
         Some(v) => {
-            let prop_bytes: usize = v
-                .properties
-                .keys()
-                .map(|k| k.capacity() + 64) // 64 = rough Value enum size
-                .sum();
-            v.labels.iter().map(|l| l.capacity()).sum::<usize>() + prop_bytes + 128
+            let labels = v.labels.iter().fold(0usize, |sum, label| {
+                sum.saturating_add(label.capacity())
+                    .saturating_add(BTREE_ENTRY_OVERHEAD)
+            });
+            let properties = v.properties.iter().fold(0usize, |sum, (key, value)| {
+                sum.saturating_add(key.capacity())
+                    .saturating_add(value_deep_size(value))
+                    .saturating_add(BTREE_ENTRY_OVERHEAD)
+            });
+            std::mem::size_of::<NodeView>()
+                .saturating_add(labels)
+                .saturating_add(properties)
+                .saturating_add(128)
         }
     }
+}
+
+fn value_deep_size(value: &Value) -> usize {
+    const BTREE_ENTRY_OVERHEAD: usize = 96;
+    let owned = match value {
+        Value::Null
+        | Value::Bool(_)
+        | Value::I64(_)
+        | Value::F64(_)
+        | Value::Date(_)
+        | Value::DateTime(_) => 0,
+        Value::Str(value) => value.capacity(),
+        Value::Bytes(value) => value.capacity(),
+        Value::Vec(value) => value.capacity().saturating_mul(std::mem::size_of::<f32>()),
+        Value::VecI8 { codes, .. } => codes.capacity().saturating_mul(std::mem::size_of::<i8>()),
+        Value::List(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(values.iter().fold(0usize, |sum, value| {
+                sum.saturating_add(value_deep_size(value))
+            })),
+        Value::Map(values) => values.iter().fold(0usize, |sum, (key, value)| {
+            sum.saturating_add(key.capacity())
+                .saturating_add(value_deep_size(value))
+                .saturating_add(BTREE_ENTRY_OVERHEAD)
+        }),
+    };
+    std::mem::size_of::<Value>().saturating_add(owned)
 }
 
 #[cfg(test)]
@@ -386,19 +436,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_deep_value_is_never_retained() {
+        let c = NodeViewCache::new(4 * 1024);
+        let k = NodeCacheKey::new(NS, 1, "Document", nid(1));
+        let mut view = make_view("large");
+        view.properties
+            .insert("embedding".into(), Value::Vec(vec![0.5; 2048]));
+
+        c.insert(k.clone(), Some(view));
+
+        assert_eq!(c.entries(), 0);
+        assert_eq!(c.used_bytes(), 0);
+        assert!(c.get(&k).is_none());
+    }
+
+    #[test]
+    fn zero_capacity_disables_admission() {
+        let c = NodeViewCache::new(0);
+        let k = NodeCacheKey::new(NS, 1, "Person", nid(1));
+        c.insert(k.clone(), None);
+        assert_eq!(c.capacity_bytes(), 0);
+        assert_eq!(c.entries(), 0);
+        assert!(c.get(&k).is_none());
+    }
+
+    #[test]
     fn evicts_oldest_manifest_version_when_over_budget() {
-        // Tight budget so a few inserts overflow. Each insert with a
-        // distinct (version, label) tuple is its own entry.
-        let c = NodeViewCache::new(2048);
-        for v in 1..=20u64 {
-            let k = NodeCacheKey::new(NS, v, "Person", nid(1));
+        let padded_view = || {
             let mut view = make_view("padding-padding-padding-padding-padding");
-            // Inflate the view so each entry is meaningful in bytes.
             for i in 0..8 {
                 view.properties
                     .insert(format!("k_{i}"), Value::Str("v".repeat(32)));
             }
-            c.insert(k, Some(view));
+            view
+        };
+        // Size the cache from the same deep-accounting function admission
+        // uses: two entries fit, so the third must evict rather than being
+        // rejected as individually oversized.
+        let sample_key = NodeCacheKey::new(NS, 1, "Person", nid(1));
+        let sample_view = Some(padded_view());
+        let c = NodeViewCache::new(entry_weight(&sample_key, &sample_view) * 2);
+        for v in 1..=20u64 {
+            let k = NodeCacheKey::new(NS, v, "Person", nid(1));
+            c.insert(k, Some(padded_view()));
         }
         assert!(
             c.evictions() > 0,

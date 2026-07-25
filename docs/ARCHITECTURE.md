@@ -4,13 +4,13 @@
 
 | | |
 |---|---|
-| **Version** | 2.0.3 |
+| **Version** | 2.0.4 |
 | **Scope** | The complete engine as implemented on the `main` branch: storage, durability, compaction, query execution, vector and full-text search, graph algorithms, and the service layer. |
 | **Audience** | Systems engineers, database researchers, and graduate students. This document is written to be cited and taught from; it explains mechanism, complexity, and correctness arguments rather than usage. |
 | **Companion material** | The design-proposal record lives in [`docs/rfc/`](./rfc/) (RFCs 001–036); operational guidance in [`docs/multi-tenancy.md`](./multi-tenancy.md); user-facing documentation in the top-level [`README.md`](../README.md). |
 | **How to read it** | Sections are self-contained and cross-reference each other. §1 states the thesis and the system model; §2–§4 are the storage substrate; §5 is the query engine; §6–§7 are the search and analytics layers; §8 is the service and concurrency layer; §9–§10 describe how the system was built and how it is evaluated. |
 
-> **On accuracy.** Every mechanism below is grounded in the source as it exists at 2.0.3, with inline file references (e.g. `crates/namidb-storage/src/manifest.rs`). Where a design RFC and the shipped code diverge, this report documents the **code**. Constants, budgets, and format magic numbers are read out of the source, not assumed.
+> **On accuracy.** Every mechanism below is grounded in the source as it exists at 2.0.4, with inline file references (e.g. `crates/namidb-storage/src/manifest.rs`). Where a design RFC and the shipped code diverge, this report documents the **code**. Constants, budgets, and format magic numbers are read out of the source, not assumed.
 
 ---
 
@@ -257,7 +257,19 @@ Point lookup `lookup_node_by_id` (`read.rs:1440`) probes the memtable, then the 
 
 A writer's staged-but-uncommitted batch lives in `pending_payloads: Vec<(MemKey, u64, MemOp)>`, absent from `published_memtable` by design, and simultaneously in an incrementally maintained `staged_memtable`. `WriterSession::overlay_snapshot()` freezes the latter through its persistent `OrdMap` in O(1) and attaches it as `Snapshot::overlay: Option<MemtableSnapshot>`; it never replays the growing pending WAL per correlated lookup. The read paths chain the two sources: `node_entries()` returns `memtable.iter_nodes().chain(overlay…)`, and `node_mem_entry(id)` compares the two LSNs directly. Correctness rests on one invariant: **staged LSNs are strictly greater than any committed LSN** (the writer seeds `next_lsn` past every committed LSN on open), so the existing last-LSN-wins merge resolves a staged upsert over the committed row and a staged tombstone hides it — no separate read engine. The code guards this with `debug_assert!(s.lsn > c.lsn)` yet still takes `s.lsn >= c.lsn`, degrading gracefully to last-LSN-wins if allocation ever regressed. The overlay covers nodes and edges (`edge_mem_entries` feeds the SST and CSR edge paths and `sorted_partners`).
 
-Shared NodeView/property caches remain detached from overlays because they are keyed by manifest version and would leak staged rows to concurrent readers. Instead, an overlay borrows the writer-private transactional property index. Its `(label, property tuple) → value → holders` maps are populated once, maintained by every staged upsert/tombstone, preserved across commit/flush, and journalled for exact rollback. The holder representation keeps a singleton inline and promotes only duplicate/non-unique postings to a set, so 1.5M distinct keys do not allocate 1.5M tiny hash tables. Consequently both unique and non-unique indexed `MERGE`/correlated `MATCH` remain O(1) or O(matches) after one population while retaining exact residual confirmation.
+Shared NodeView/property caches remain detached from staged overlays, which could
+otherwise leak uncommitted rows to concurrent readers. Committed snapshots stamp
+NodeView entries with a logical node generation: node mutations advance it,
+while edge-only commits and representation-only node flushes preserve it, so a
+long relationship load keeps its endpoint working set warm. Instead, an overlay
+borrows the writer-private transactional property index. Its `(label, property
+tuple) → value → holders` maps are populated once, maintained by every staged
+upsert/tombstone, preserved across commit/flush, and journalled for exact
+rollback. The holder representation keeps a singleton inline and promotes only
+duplicate/non-unique postings to a set, so 1.5M distinct keys do not allocate
+1.5M tiny hash tables. Consequently both unique and non-unique indexed
+`MERGE`/correlated `MATCH` remain O(1) or O(matches) after one population while
+retaining exact residual confirmation.
 
 ### Ranged reads and pushdown (RFC-003/011/013/015)
 
@@ -265,7 +277,14 @@ Shared NodeView/property caches remain detached from overlays because they are k
 
 ### The cache hierarchy and its memory model
 
-Four process-wide singletons, each byte-budgeted, keyed to be namespace-safe:
+Three process-wide shared cache families are keyed to be namespace-safe. Their
+listed legacy budgets are per-tier ceilings, not additive defaults:
+`NAMIDB_CACHE_MAX_BYTES`
+(default `1073741824`, exact bytes) scales all active ceilings proportionally
+when necessary, so their effective sum never exceeds 1 GiB by default. Setting
+the aggregate limit to `0` disables the shared caches. Foyer tiers use one shard
+and both pre-admission checks and a cache filter reject entries whose deep
+estimated weight exceeds their effective tier capacity.
 
 | Cache | Tier / structure | Default budget | Eviction |
 |---|---|---|---|
@@ -278,11 +297,11 @@ Four process-wide singletons, each byte-budgeted, keyed to be namespace-safe:
 | `NodeViewCache` (RFC-019) | `HashMap<NodeCacheKey,(CachedNodeView,seq)>` + `BTreeMap<(version,seq),key>` order index | 256 MiB (`NAMIDB_NODE_CACHE_..`) | oldest manifest version, O(log n) |
 | `AdjacencyCache` (RFC-018) | `Mutex<HashMap<AdjacencyKey,Arc<EdgeAdjacency>>>` | 512 MiB (`NAMIDB_ADJACENCY_..`) | lowest manifest version |
 
-`lookup_node` is a 3-tier lookup: **L1** per-snapshot `Mutex<HashMap<(String,NodeId),Option<NodeView>>>`; **L2** the shared `NodeViewCache` (promoted into L1 on hit); **L3** the SST walk (inserted into both). The `NodeViewCache` caches negatives (`None` = absent/tombstoned) because the key embeds `manifest_version` — a committed write mints a fresh slot at the next version. Its eviction is O(log n): `Inner.order` is a `BTreeMap` whose `pop_first` yields the (oldest version, oldest insertion) victim without a full-map scan, and an overwrite removes the stale order entry by its stored `seq`. The `AdjacencyCache` materialises, per `(edge_type, direction)`, a CSR of five parallel arrays — `keys: Vec<NodeId>`, `offsets: Vec<u32>`, `partners: Vec<NodeId>`, `lsns: Vec<u64>`, `tombstones: Vec<bool>` — where `partners[offsets[i]..offsets[i+1]]` are key i's edges; `lookup` is O(log K) binary search + O(deg). `build_adjacency` folds every scope SST through a `BTreeMap<([u8;16],[u8;16]),(u64,bool)>` (last-LSN-wins), costing O(E log E) once per version; `get_or_build` runs the build outside the lock and discards the loser of a build race.
+`lookup_node` is a 3-tier lookup: **L1** per-snapshot `Mutex<HashMap<(String,NodeId),Option<NodeView>>>`; **L2** the shared `NodeViewCache` (promoted into L1 on hit); **L3** the SST walk (inserted into both). The `NodeViewCache` caches negatives (`None` = absent/tombstoned) because the compatibility-named `manifest_version` field in its key carries the logical node generation. A node mutation mints a fresh generation; an edge-only commit or node flush does not. Its eviction is O(log n): `Inner.order` is a `BTreeMap` whose `pop_first` yields the (oldest generation, oldest insertion) victim without a full-map scan, and an overwrite removes the stale order entry by its stored `seq`. The `AdjacencyCache` materialises, per `(edge_type, direction)`, a CSR of five parallel arrays — `keys: Vec<NodeId>`, `offsets: Vec<u32>`, `partners: Vec<NodeId>`, `lsns: Vec<u64>`, `tombstones: Vec<bool>` — where `partners[offsets[i]..offsets[i+1]]` are key i's edges; `lookup` is O(log K) binary search + O(deg). `build_adjacency` folds every scope SST through a `BTreeMap<([u8;16],[u8;16]),(u64,bool)>` (last-LSN-wins), costing O(E log E) once per version; `get_or_build` runs the build outside the lock and discards the loser of a build race.
 
 Every loaded manifest also owns a `DescriptorIndex` paired with its SST list. Internal code treats that pair as immutable and reconstructs both through `LoadedManifest::new`; because the fields remain public for API compatibility, an external consumer that mutates `manifest.ssts` must rebuild the wrapper before constructing a snapshot. Descriptors are bucketed by `(kind, scope)` without allocating a scope string per lookup; L0 and any legacy overlapping leveled ranges use a centred interval tree, while disjoint L1+ ranges use binary search. A point read therefore selects candidates in O(levels · log SSTs + overlaps), instead of linearly rescanning the manifest before every node, relationship, vector, or text lookup. Candidates are reconciled newest-`max_lsn` first, so an exact edge winner can stop before opening older bodies; tombstones still participate in last-LSN-wins. Debug snapshots fingerprint all fields that determine the index and reject a fixture that mutates the paired manifest without rebuilding it.
 
-**Multi-tenant sharing (docs/multi-tenancy.md).** One host serves N namespaces under one set of budgets. The `SstCache` is namespace-safe *by construction* — every key is an absolute object-store path (namespace-prefixed) or `(path, row-group)`. The `NodeViewCache` and `AdjacencyCache` are **not**: the bare `(manifest_version, label/edge_type, …)` triple collides across tenants because per-namespace manifest versions both start at 1. `NodeCacheKey` and `AdjacencyKey` therefore embed `namespace: Arc<str>` (the `<root>/<ns>` prefix, rendered once per snapshot as `cache_namespace` so per-key clones are pointer-cheap); tests `same_triple_different_namespace_is_a_distinct_slot` pin this. `retain_paths(namespace_prefix, live)` prunes side-map entries **scoped to one namespace** (normalised to a `/` boundary so `tenants/a` never claims `tenants/a2`) on each manifest commit — a global retain would evict every other tenant's warm state per flush. `prune_namespace` eagerly drops a namespace's entries from all four caches on eviction; the byte-budgeted foyer tiers reclaim lazily since they are strictly bounded.
+**Multi-tenant sharing (docs/multi-tenancy.md).** One host serves N namespaces under one set of budgets. The `SstCache` is namespace-safe *by construction* — every key is an absolute object-store path (namespace-prefixed) or `(path, row-group)`. The `NodeViewCache` and `AdjacencyCache` are **not**: the bare `(generation, label/edge_type, …)` triple collides across tenants because per-namespace generations both start at 1. `NodeCacheKey` and `AdjacencyKey` therefore embed `namespace: Arc<str>` (the `<root>/<ns>` prefix, rendered once per snapshot as `cache_namespace` so per-key clones are pointer-cheap); tests `same_triple_different_namespace_is_a_distinct_slot` pin this. `retain_paths(namespace_prefix, live)` prunes side-map entries **scoped to one namespace** (normalised to a `/` boundary so `tenants/a` never claims `tenants/a2`) on each manifest commit — a global retain would evict every other tenant's warm state per flush. `prune_namespace` eagerly drops a namespace's entries from all three shared cache families on eviction; the byte-budgeted foyer tiers reclaim lazily since they are strictly bounded.
 
 ### Index freshness and flat fallback
 
@@ -715,7 +734,7 @@ The project's design record. Each is at `docs/rfc/<n>-*.md`.
 
 ## Appendix B: Selected Constants and Defaults
 
-Read from the source at 2.0.3. Runtime-tunable values give their environment variable.
+Read from the source at 2.0.4. Runtime-tunable values give their environment variable.
 
 | Subsystem | Constant | Value |
 |---|---|---|
@@ -739,4 +758,4 @@ Read from the source at 2.0.3. Runtime-tunable values give their environment var
 
 ---
 
-<sub>NamiDB is developed by NamiDB, Inc. (Delaware, USA) and licensed under the Business Source License 1.1. This report describes version 2.0.3. Corrections and questions: the source is the authority; every claim here is traceable to a file path cited inline.</sub>
+<sub>NamiDB is developed by NamiDB, Inc. (Delaware, USA) and licensed under the Business Source License 1.1. This report describes version 2.0.4. Corrections and questions: the source is the authority; every claim here is traceable to a file path cited inline.</sub>
