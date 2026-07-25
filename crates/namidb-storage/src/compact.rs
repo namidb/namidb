@@ -153,6 +153,15 @@ pub struct PreparedCompaction {
     /// Manifest version the plan was computed against. The commit CAS runs
     /// against the manifest current at install time, which may be newer.
     base_version: u64,
+    /// Schema from the manifest the prepare was planned against. Data commits
+    /// and flushes may advance the manifest while prepare runs, but a DDL
+    /// change can alter the columns/sidecars the prepared node SST must carry.
+    base_schema: Schema,
+    /// Search-index catalogs used to decide which immutable index bodies to
+    /// rebuild or retain. Installing across CREATE/DROP INDEX would otherwise
+    /// publish outputs computed for a different catalog.
+    base_vector_indexes: Vec<crate::manifest::VectorIndexDescriptor>,
+    base_text_indexes: Vec<crate::manifest::TextIndexDescriptor>,
 }
 
 impl PreparedCompaction {
@@ -188,6 +197,23 @@ impl CompactionBasis {
     /// hand to [`Self::prepare`].
     pub fn schema(&self) -> &Schema {
         &self.base.manifest.schema
+    }
+
+    /// Worst per-bucket L0 backlog captured by this basis.
+    ///
+    /// This is the read-amplification number the server publishes around a
+    /// background pass. It is sampled from the immutable basis rather than a
+    /// live writer so the "before" value describes exactly the inputs the
+    /// prepare phase planned against.
+    pub fn max_l0_bucket_len(&self) -> usize {
+        let mut counts: std::collections::HashMap<(SstKind, &str), usize> =
+            std::collections::HashMap::new();
+        for sst in &self.base.manifest.ssts {
+            if sst.level == SstLevel::L0 {
+                *counts.entry((sst.kind, sst.scope.as_str())).or_insert(0) += 1;
+            }
+        }
+        counts.values().copied().max().unwrap_or(0)
     }
 
     /// Cheap, metadata-only "would a sweep merge anything?" predicate, so a
@@ -731,6 +757,9 @@ async fn prepare_leveled(
         removed_ids,
         bloom_count,
         base_version: base.manifest.version,
+        base_schema: base.manifest.schema.clone(),
+        base_vector_indexes: base.manifest.vector_indexes.clone(),
+        base_text_indexes: base.manifest.text_indexes.clone(),
     })
 }
 
@@ -752,6 +781,11 @@ async fn prepare_leveled(
 /// merged-away descriptors. A missing input aborts the install with
 /// [`Error::Precondition`], leaving the manifest untouched; the prepared
 /// bodies stay unreferenced for the janitor's orphan sweep.
+///
+/// The schema and vector/text index catalogs must also still match the
+/// prepare basis. Normal data commits and flushes preserve those catalogs and
+/// remain safe to interleave; DDL does not, because it changes which columns,
+/// property sidecars, or search-index bodies the compacted outputs must carry.
 #[instrument(
  skip(manifest_store, fence, current, prepared),
  fields(
@@ -776,6 +810,26 @@ pub async fn install_prepared(
         });
     }
     fence.assert_alive(current.manifest.epoch)?;
+
+    let mut catalog_drift = Vec::new();
+    if current.manifest.schema != prepared.base_schema {
+        catalog_drift.push("schema");
+    }
+    if current.manifest.vector_indexes != prepared.base_vector_indexes {
+        catalog_drift.push("vector indexes");
+    }
+    if current.manifest.text_indexes != prepared.base_text_indexes {
+        catalog_drift.push("text indexes");
+    }
+    if !catalog_drift.is_empty() {
+        return Err(Error::precondition(format!(
+            "abandoning prepared compaction (basis v{}): {} changed in manifest v{}; \
+             the prepared bodies are left for the orphan sweep",
+            prepared.base_version,
+            catalog_drift.join(", "),
+            current.manifest.version
+        )));
+    }
 
     let live: HashSet<Uuid> = current.manifest.ssts.iter().map(|d| d.id).collect();
     if let Some(missing) = prepared.removed_ids.iter().find(|id| !live.contains(id)) {
@@ -2918,6 +2972,81 @@ mod tests {
 
         // 7. A lone over-budget L1 with no L0 → not worth a pure rewrite.
         assert_eq!(plan_levels(&[mk(1, 5000)], bb, r), None);
+    }
+
+    #[tokio::test]
+    async fn plan_bucket_merge_includes_the_entire_l0_backlog() {
+        let (.., base) = build_two_l0_node_ssts().await;
+        let mut template = base.manifest.ssts[0].clone();
+        template.level = SstLevel::L0;
+        template.size_bytes = 1;
+        let backlog: Vec<SstDescriptor> = (0..11)
+            .map(|_| SstDescriptor {
+                id: Uuid::now_v7(),
+                ..template.clone()
+            })
+            .collect();
+        let refs: Vec<&SstDescriptor> = backlog.iter().collect();
+        let plan = plan_bucket_merge(&refs, 1024, 10).expect("eleven L0s must compact");
+
+        assert_eq!(
+            plan.inputs.len(),
+            backlog.len(),
+            "one pass must scale with the captured backlog, not stop after three inputs"
+        );
+        assert!(
+            plan.inputs.iter().all(|sst| sst.level == SstLevel::L0),
+            "every captured L0 descriptor belongs to the plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_compaction_pass_drains_more_than_three_l0_files() {
+        let s = store();
+        let p = paths("compact-full-l0-backlog");
+        let ms = ManifestStore::new(s, p);
+        let mut current = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        current.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(current.manifest.epoch);
+
+        const BACKLOG: usize = 7;
+        for i in 0..BACKLOG {
+            current = flush_node_op(
+                &ms,
+                &fence,
+                &current,
+                sorted_node_id(i as u8 + 1),
+                i as u64 + 1,
+                MemOp::Upsert(node_payload(&format!("person-{i}"), None)),
+            )
+            .await;
+        }
+        let l0_before = current
+            .manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == SstKind::Nodes && sst.level == SstLevel::L0)
+            .count();
+        assert_eq!(l0_before, BACKLOG);
+
+        let outcome = compact_l0_to_l1(&ms, &fence, &current, &schema())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.source_ssts_removed, BACKLOG,
+            "the pass must consume every eligible L0 input captured in its basis"
+        );
+        assert_eq!(
+            outcome
+                .committed
+                .manifest
+                .ssts
+                .iter()
+                .filter(|sst| sst.kind == SstKind::Nodes && sst.level == SstLevel::L0)
+                .count(),
+            0,
+            "no captured L0 may be left for artificial three-file follow-up passes"
+        );
     }
 
     #[tokio::test]

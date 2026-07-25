@@ -25,9 +25,10 @@ use namidb_storage::{
 use object_store::ObjectStore;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::error;
 
-use crate::metrics::Metrics;
+use crate::maintenance::{request_compaction, CompactionScheduler};
+use crate::metrics::{CompactionTrigger, Metrics, WriterLockKind};
 use crate::recovery::{self, WriterHealth};
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -160,14 +161,35 @@ impl NamespaceRegistry {
         while self.at_capacity(sessions.len()) {
             if let Some(to_evict) = self.find_idle_oldest(&sessions) {
                 tracing::info!("evicting idle namespace: {}", to_evict);
-                if let Some(evicted) = sessions.remove(&to_evict) {
+                if let Some(evicted) = sessions.get(&to_evict).cloned() {
+                    // Close this incarnation to new foreground writes BEFORE
+                    // removing it from the map. Requests that already cloned
+                    // the Arc may still be queued on `writer`; every
+                    // multi-tenant write path re-validates this flag after it
+                    // acquires that mutex.
+                    evicted.mark_retired();
+                    sessions.remove(&to_evict);
                     // Stop the namespace's flush/compaction loops so the
                     // evicted state (writer, memtable, caches) is actually
                     // released instead of living on as a zombie second
                     // writer. Dropping the memtable loses nothing: acked
                     // writes are WAL-committed before the ack, and reopen
                     // replays the WAL.
-                    evicted.cancel_maintenance();
+                    // Stop and JOIN every task before a replacement writer can
+                    // claim this namespace. A stale compaction/flush task must
+                    // never recover itself after the new writer opens: doing
+                    // so would bump the epoch again and fence the replacement.
+                    evicted.cancel_and_abort_maintenance().await;
+                    // Quiesce the old writer before opening any replacement
+                    // WriterSession while the registry write lock still
+                    // excludes concurrent opens. A write that already held
+                    // the mutex is allowed to finish; queued stale requests
+                    // observe `retired` after acquiring it and leave without
+                    // touching storage. Once this guard has been acquired,
+                    // no operation through the old Arc can recover/reopen and
+                    // fence the next incarnation.
+                    let old_writer = evicted.writer.lock().await;
+                    drop(old_writer);
                     // The read caches are process-wide and shared across
                     // namespaces (their budgets are global); dropping the
                     // state does not release the evicted namespace's
@@ -209,10 +231,12 @@ impl NamespaceRegistry {
             namespace: namespace.to_string(),
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             snapshot,
+            compaction_scheduler: Arc::new(CompactionScheduler::new()),
             last_access: std::sync::atomic::AtomicU64::new(now),
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             cancel_tx: watch::channel(false).0,
             maintenance_tasks: std::sync::Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
             writer_health: WriterHealth::new(),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
         });
@@ -248,12 +272,14 @@ impl NamespaceRegistry {
         // Periodic flush (+ reactive compaction on L0 high-water).
         if maint.flush_interval > Duration::ZERO {
             let s = Arc::clone(&state);
+            let metrics = Arc::clone(&self.metrics);
             let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // first tick fires immediately; skip
                 loop {
                     tokio::select! {
@@ -262,68 +288,71 @@ impl NamespaceRegistry {
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
                     }
-                    // Flush under the writer lock; when the L0 high-water
-                    // mark trips, snapshot a compaction basis and RELEASE
-                    // the lock before the expensive prepare, so this
-                    // namespace's writes are not stalled behind the merge.
-                    let basis = {
+                    // Flush under the writer lock, then only enqueue a
+                    // trigger when the L0 high-water mark trips. The
+                    // scheduler captures a fresh basis inside its sole
+                    // worker, including for its one pending follow-up.
+                    let should_compact = {
+                        let lock_started = Instant::now();
                         let mut w = s.writer.lock().await;
+                        metrics.observe_writer_lock(
+                            WriterLockKind::Flush,
+                            lock_started.elapsed(),
+                            true,
+                        );
+                        // Eviction marks retirement before it cancels this
+                        // task. If the flush worker was already queued on the
+                        // writer, abort without touching the old incarnation
+                        // once the mutex becomes available.
+                        if s.is_retired() {
+                            drop(w);
+                            return;
+                        }
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         match w.flush(schema.clone()).await {
                             Ok(_) => {
                                 s.snapshot.store(w.owned_snapshot());
-                                if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
-                                    Some((w.compaction_basis(), schema))
-                                } else {
-                                    None
-                                }
+                                l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
                             }
                             Err(e) => {
                                 error!(namespace = %ns, error = %e, "periodic flush failed");
                                 // A fenced/poisoned writer would fail every later
                                 // flush AND every write on this namespace; reopen
                                 // it under the lock we already hold.
-                                recovery::recover_writer_if_needed(
-                                    &mut w,
-                                    &s.snapshot,
-                                    &s.writer_health,
-                                    &ns,
-                                    &e,
-                                )
-                                .await;
-                                None
+                                if !s.is_retired() {
+                                    recovery::recover_writer_if_needed(
+                                        &mut w,
+                                        &s.snapshot,
+                                        &s.writer_health,
+                                        &ns,
+                                        &e,
+                                    )
+                                    .await;
+                                }
+                                false
                             }
                         }
                     };
-                    // Reactive compaction: prepare off-lock, re-lock only
-                    // for the brief manifest CAS.
-                    let Some((basis, schema)) = basis else {
-                        continue;
-                    };
-                    if !basis.needs_compaction() {
+                    if !should_compact {
                         continue;
                     }
-                    match basis.prepare(&schema).await {
-                        Ok(prepared) => {
-                            let mut w = s.writer.lock().await;
-                            if let Err(e) = w.install_prepared_compaction(prepared).await {
-                                error!(namespace = %ns, error = %e, "reactive compaction failed");
-                                // Reopen a fenced/poisoned session in place
-                                // (no-op for a lost-input precondition abort).
-                                recovery::recover_writer_if_needed(
-                                    &mut w,
-                                    &s.snapshot,
-                                    &s.writer_health,
-                                    &ns,
-                                    &e,
-                                )
-                                .await;
-                            } else {
-                                s.snapshot.store(w.owned_snapshot());
-                            }
-                        }
-                        Err(e) => {
-                            error!(namespace = %ns, error = %e, "reactive compaction failed")
+                    // Only the trigger that starts the namespace's sole
+                    // worker returns a handle. Track precisely that handle so
+                    // eviction can abort+join it; queued/coalesced triggers
+                    // allocate no task.
+                    if let Some(handle) = request_compaction(
+                        &s.compaction_scheduler,
+                        CompactionTrigger::Reactive,
+                        &s.writer,
+                        &s.snapshot,
+                        &s.writer_health,
+                        &ns,
+                        &metrics,
+                        Some(s.cancel_tx.subscribe()),
+                    ) {
+                        if let Some(handle) = s.track_maintenance_task(handle) {
+                            handle.abort();
+                            let _ = handle.await;
                         }
                     }
                 }
@@ -338,6 +367,7 @@ impl NamespaceRegistry {
         // Periodic compaction (L0->L1) + orphan sweep.
         if maint.compaction_interval > Duration::ZERO {
             let s = Arc::clone(&state);
+            let metrics = Arc::clone(&self.metrics);
             let mut cancel = state.cancel_tx.subscribe();
             let ms = Arc::clone(&maint_store);
             let interval = maint.compaction_interval;
@@ -346,6 +376,7 @@ impl NamespaceRegistry {
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // first tick fires immediately; skip
                 loop {
                     tokio::select! {
@@ -353,49 +384,33 @@ impl NamespaceRegistry {
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                     }
-                    // Compaction: snapshot the basis under a brief writer
-                    // lock, prepare (downloads, merge, index rebuilds,
-                    // uploads) OFF the lock so this namespace's writes
-                    // proceed, then re-lock only for the manifest CAS. An
-                    // idle tick skips the prepare via the metadata-only
-                    // `needs_compaction` predicate.
-                    {
-                        let basis = s.writer.lock().await.compaction_basis();
-                        if basis.needs_compaction() {
-                            let schema = basis.schema().clone();
-                            match basis.prepare(&schema).await {
-                                Ok(prepared) => {
-                                    let mut w = s.writer.lock().await;
-                                    match w.install_prepared_compaction(prepared).await {
-                                        Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                                            s.snapshot.store(w.owned_snapshot());
-                                            info!(
-                                                namespace = %ns,
-                                                removed = outcome.source_ssts_removed,
-                                                written = outcome.new_ssts_written,
-                                                "compacted L0 into L1"
-                                            );
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            error!(namespace = %ns, error = %e, "periodic compaction failed");
-                                            recovery::recover_writer_if_needed(
-                                                &mut w,
-                                                &s.snapshot,
-                                                &s.writer_health,
-                                                &ns,
-                                                &e,
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(namespace = %ns, error = %e, "periodic compaction failed")
-                                }
-                            }
+                    // Enqueue into the same single-flight scheduler as
+                    // reactive flush triggers. A periodic request while a
+                    // worker runs reserves at most one fresh follow-up.
+                    if let Some(handle) = request_compaction(
+                        &s.compaction_scheduler,
+                        CompactionTrigger::Periodic,
+                        &s.writer,
+                        &s.snapshot,
+                        &s.writer_health,
+                        &ns,
+                        &metrics,
+                        Some(s.cancel_tx.subscribe()),
+                    ) {
+                        if let Some(handle) = s.track_maintenance_task(handle) {
+                            handle.abort();
+                            let _ = handle.await;
                         }
                     }
+                    // Do not sweep immutable compaction outputs while an
+                    // active or pending pass can still be between upload and
+                    // manifest install.
+                    s.compaction_scheduler.wait_idle().await;
+                    // A trigger can arrive immediately after `wait_idle`.
+                    // The fair write guard closes that race: compaction holds
+                    // a read guard across prepare+install, so no unreferenced
+                    // output can be uploaded while deletion is in progress.
+                    let _sweep_guard = s.compaction_scheduler.sweep_guard().await;
                     // Orphan sweep — no writer lock; the retention horizon
                     // (RFC-027) keeps it from deleting a body a live reader
                     // still references.
@@ -457,6 +472,10 @@ pub struct NamespaceState {
     pub writer: Arc<Mutex<WriterSession>>,
     /// Snapshot cache for read queries.
     pub snapshot: Arc<SnapshotCell>,
+    /// Single-flight background compaction scheduler. It admits at most one
+    /// worker plus one basis-fresh follow-up without creating a FIFO task per
+    /// flush trigger.
+    pub(crate) compaction_scheduler: Arc<CompactionScheduler>,
     /// Last access time (seconds since Unix epoch). Updated on every
     /// `get_or_open` hit by the registry.
     pub last_access: std::sync::atomic::AtomicU64,
@@ -473,6 +492,11 @@ pub struct NamespaceState {
     /// `spawn_maintenance`, so an eviction observer can await task exit
     /// (each task finishes any in-flight flush/compaction first).
     maintenance_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Permanently closes this in-memory incarnation to new writes. Eviction
+    /// sets it before removing the state from the registry and then waits for
+    /// the writer mutex, so a stale `Arc<NamespaceState>` cannot recover the
+    /// old WriterSession after a replacement has claimed the namespace epoch.
+    retired: std::sync::atomic::AtomicBool,
     /// Writer status for this namespace's readiness probe: degraded from a
     /// terminal commit/flush failure until the automatic reopen succeeds.
     pub writer_health: Arc<WriterHealth>,
@@ -482,17 +506,68 @@ pub struct NamespaceState {
 }
 
 impl NamespaceState {
+    /// Permanently retire this namespace incarnation.
+    ///
+    /// Release/Acquire pairs with [`Self::is_retired`], which foreground
+    /// write paths call only after acquiring `writer`. That post-lock check
+    /// closes the check-then-wait race for stale Arc clones.
+    pub(crate) fn mark_retired(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel_maintenance();
+    }
+
+    /// Whether this in-memory namespace incarnation has been evicted.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Signal the maintenance tasks to stop. An in-flight flush or
     /// compaction runs to completion; the loops observe the signal between
     /// operations (and while sleeping) and then exit, releasing their
     /// references to this state.
-    pub fn cancel_maintenance(&self) {
-        let _ = self.cancel_tx.send(true);
+    fn cancel_maintenance(&self) {
+        let _ = self.cancel_tx.send_replace(true);
+    }
+
+    /// Cancel and join every maintenance task owned by this state.
+    ///
+    /// Eviction calls this before opening a replacement writer for the same
+    /// namespace. `abort` is intentional: compaction outputs are immutable
+    /// and remain invisible until manifest install, while a flush's WAL stays
+    /// authoritative if its future is dropped before CAS.
+    pub async fn cancel_and_abort_maintenance(&self) {
+        self.cancel_maintenance();
+        let handles = self.take_maintenance_handles();
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Register a dynamically spawned reactive-compaction task. Completed
+    /// handles are discarded opportunistically; if eviction already fired,
+    /// abort the new task instead of letting it outlive the namespace.
+    fn track_maintenance_task(&self, handle: JoinHandle<()>) -> Option<JoinHandle<()>> {
+        let mut handle = Some(handle);
+        {
+            let mut handles = self
+                .maintenance_tasks
+                .lock()
+                .expect("maintenance handles poisoned");
+            if !*self.cancel_tx.borrow() {
+                handles.retain(|existing| !existing.is_finished());
+                handles.push(handle.take().expect("handle is present"));
+            }
+        }
+        handle
     }
 
     /// Take the maintenance task handles (empty after the first call).
     /// They complete shortly after [`Self::cancel_maintenance`].
-    pub fn take_maintenance_handles(&self) -> Vec<JoinHandle<()>> {
+    fn take_maintenance_handles(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(
             &mut self
                 .maintenance_tasks
@@ -723,6 +798,50 @@ mod tests {
             2,
             "the reopened namespace must see the pre-evict write and accept new ones"
         );
+    }
+
+    /// Eviction publishes retirement before waiting for the old writer and
+    /// cannot open the replacement until every already-active write has left
+    /// that mutex. This ordering makes post-lock retirement validation
+    /// sufficient for stale Arc clones.
+    #[tokio::test]
+    async fn eviction_retires_and_quiesces_writer_before_replacement() {
+        let reg = Arc::new(evicting_registry(
+            "registry-evict-quiesce",
+            MaintenanceConfig::default(),
+        ));
+        let acme = reg.get_or_open("acme").await.expect("open acme");
+
+        // `idle_timeout=0` still requires a positive whole-second idle age.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        // Model a foreground write that acquired the old incarnation before
+        // eviction. The replacement opener must stop after setting retired
+        // and wait for this guard.
+        let active_write = acme.writer.lock().await;
+        let opener_registry = Arc::clone(&reg);
+        let opener = tokio::spawn(async move { opener_registry.get_or_open("beta").await });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !acme.is_retired() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eviction never retired the old incarnation");
+        assert!(
+            !opener.is_finished(),
+            "replacement opened before the old writer was quiescent"
+        );
+
+        drop(active_write);
+        let beta = tokio::time::timeout(Duration::from_secs(5), opener)
+            .await
+            .expect("replacement opener stayed blocked")
+            .expect("replacement opener task panicked")
+            .expect("open beta");
+        assert_eq!(beta.namespace, "beta");
+        assert!(acme.is_retired());
     }
 
     /// Evicting a namespace must eagerly reclaim its entries from the

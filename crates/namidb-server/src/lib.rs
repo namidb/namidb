@@ -10,6 +10,7 @@ pub mod auth;
 pub mod authz;
 pub mod bolt;
 mod introspect;
+mod maintenance;
 pub mod metrics;
 pub mod recovery;
 pub mod registry;
@@ -45,7 +46,8 @@ use namidb_query::{
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
 use crate::auth::{AuthConfig, Principal};
-use crate::metrics::{Metrics, Protocol, QueryKind};
+use crate::maintenance::{request_compaction, CompactionScheduler};
+use crate::metrics::{CompactionTrigger, Metrics, Protocol, QueryKind, WriterLockKind};
 use crate::recovery::WriterHealth;
 use crate::registry::{NamespaceRegistry, NamespaceState};
 use crate::shared::SharedAppState;
@@ -180,6 +182,10 @@ type CatalogCache = Arc<std::sync::Mutex<Option<(u64, Arc<StatsCatalog>)>>>;
 pub struct AppState {
     pub writer: Arc<Mutex<WriterSession>>,
     pub snapshot: Arc<SnapshotCell>,
+    /// Single-flight background compaction scheduler. It admits at most one
+    /// worker plus one basis-fresh follow-up without creating a FIFO task per
+    /// flush trigger.
+    pub(crate) compaction_scheduler: Arc<CompactionScheduler>,
     /// Memoised optimizer stats, keyed by manifest version. Building the
     /// catalog is `O(ssts)`; without this every read query rebuilt it from
     /// scratch. Shared across cloned `AppState`s (the router clones it per
@@ -254,6 +260,7 @@ impl AppState {
         Self {
             writer: Arc::new(Mutex::new(writer)),
             snapshot,
+            compaction_scheduler: Arc::new(CompactionScheduler::new()),
             catalog_cache: Arc::new(std::sync::Mutex::new(None)),
             auth: Arc::new(auth),
             namespace,
@@ -360,8 +367,13 @@ impl AppState {
     /// use this — they may wait as long as it takes.
     pub(crate) async fn lock_writer_bounded(
         &self,
+        kind: WriterLockKind,
     ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
-        lock_writer_bounded(&self.writer, self.writer_lock_timeout).await
+        let started = std::time::Instant::now();
+        let guard = lock_writer_bounded(&self.writer, self.writer_lock_timeout).await;
+        self.metrics
+            .observe_writer_lock(kind, started.elapsed(), guard.is_some());
+        guard
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -725,12 +737,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let state_for_flush = state.clone();
         let interval = config.flush_interval;
         // Reactive compaction trigger (RFC-027 P5): when a flush leaves a
-        // bucket with >= this many L0 SSTs, compact immediately under the
-        // same writer lock rather than waiting for the periodic compaction
-        // tick, so read amplification does not spike between ticks.
+        // bucket with >= this many L0 SSTs, start an off-lock pass immediately
+        // rather than waiting for the periodic tick, so read amplification
+        // does not spike between ticks.
         let l0_trigger = config.compaction_l0_trigger;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // first tick fires immediately; skip.
             loop {
                 // Flush on the timer OR when a committed write crossed the
@@ -741,12 +754,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     _ = tick.tick() => {}
                     _ = state_for_flush.flush_notify.notified() => {}
                 }
-                // Flush under the writer lock; when the L0 high-water mark
-                // trips, snapshot a compaction basis and RELEASE the lock
-                // before the expensive prepare, so writes are not stalled
-                // behind the merge (finding 32).
-                let basis = {
+                // Flush under the writer lock, then only enqueue a trigger
+                // when the L0 high-water mark trips. The scheduler captures
+                // a fresh basis inside its sole worker, so a queued follow-up
+                // neither retains a stale manifest nor allocates another task.
+                let should_compact = {
+                    let lock_started = std::time::Instant::now();
                     let mut w = state_for_flush.writer.lock().await;
+                    state_for_flush.metrics.observe_writer_lock(
+                        WriterLockKind::Flush,
+                        lock_started.elapsed(),
+                        true,
+                    );
                     let schema = w.snapshot().manifest().manifest.schema.clone();
                     match w.flush(schema.clone()).await {
                         Ok(_) => {
@@ -754,11 +773,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                             state_for_flush
                                 .memtable_bytes_gauge
                                 .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
-                            if l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger {
-                                Some((w.compaction_basis(), schema))
-                            } else {
-                                None
-                            }
+                            l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
                         }
                         Err(e) => {
                             error!(error = %e, "periodic flush failed");
@@ -772,47 +787,26 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                                 &e,
                             )
                             .await;
-                            None
+                            false
                         }
                     }
                 };
-                // Reactive compaction (RFC-027 P5): prepare off-lock (input
-                // GETs, merge, index rebuilds, output PUTs), then re-lock
-                // only for the brief manifest CAS.
-                let Some((basis, schema)) = basis else {
-                    continue;
-                };
-                if !basis.needs_compaction() {
+                if !should_compact {
                     continue;
                 }
-                match basis.prepare(&schema).await {
-                    Ok(prepared) => {
-                        let mut w = state_for_flush.writer.lock().await;
-                        match w.install_prepared_compaction(prepared).await {
-                            Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                                state_for_flush.snapshot.store(w.owned_snapshot());
-                                info!(
-                                    removed = outcome.source_ssts_removed,
-                                    written = outcome.new_ssts_written,
-                                    "reactive compaction (L0 high-water)"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!(error = %e, "reactive compaction failed");
-                                recovery::recover_writer_if_needed(
-                                    &mut w,
-                                    &state_for_flush.snapshot,
-                                    &state_for_flush.writer_health,
-                                    &state_for_flush.namespace,
-                                    &e,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Err(e) => error!(error = %e, "reactive compaction failed"),
-                }
+                // Dropping the handle detaches the sole worker in
+                // single-tenant mode. The scheduler owns its admission state
+                // and bounds a trigger storm to one worker + one follow-up.
+                let _ = request_compaction(
+                    &state_for_flush.compaction_scheduler,
+                    CompactionTrigger::Reactive,
+                    &state_for_flush.writer,
+                    &state_for_flush.snapshot,
+                    &state_for_flush.writer_health,
+                    &state_for_flush.namespace,
+                    &state_for_flush.metrics,
+                    None,
+                );
             }
         });
     }
@@ -834,55 +828,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let sweep_delete = config.sweep_delete;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // first tick fires immediately; skip.
             loop {
                 tick.tick().await;
-                // Compaction: snapshot the basis under a brief writer lock,
-                // run the expensive prepare (input GETs, merge, index
-                // rebuilds, output PUTs) WITHOUT the lock so writes proceed
-                // concurrently, then re-lock only for the manifest CAS
-                // (finding 32). An idle tick is cheap: the metadata-only
-                // `needs_compaction` predicate skips the prepare entirely.
-                // Republish only when it actually merged, so reads pick up
-                // the new L1 SST and release the removed L0 descriptors.
-                {
-                    let basis = state_for_maint.writer.lock().await.compaction_basis();
-                    if basis.needs_compaction() {
-                        let schema = basis.schema().clone();
-                        match basis.prepare(&schema).await {
-                            Ok(prepared) => {
-                                let mut w = state_for_maint.writer.lock().await;
-                                match w.install_prepared_compaction(prepared).await {
-                                    Ok(outcome) if outcome.source_ssts_removed > 0 => {
-                                        state_for_maint.snapshot.store(w.owned_snapshot());
-                                        info!(
-                                            removed = outcome.source_ssts_removed,
-                                            written = outcome.new_ssts_written,
-                                            "compacted L0 into L1"
-                                        );
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        error!(error = %e, "periodic compaction failed");
-                                        // A fenced/poisoned session would fail
-                                        // every later write too; reopen under
-                                        // the lock we already hold (no-op for
-                                        // a lost-input precondition abort).
-                                        recovery::recover_writer_if_needed(
-                                            &mut w,
-                                            &state_for_maint.snapshot,
-                                            &state_for_maint.writer_health,
-                                            &state_for_maint.namespace,
-                                            &e,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Err(e) => error!(error = %e, "periodic compaction failed"),
-                        }
-                    }
-                }
+                // Enqueue into the same single-flight scheduler used by
+                // reactive flush triggers. It captures its basis only when
+                // each admitted pass actually begins.
+                let _ = request_compaction(
+                    &state_for_maint.compaction_scheduler,
+                    CompactionTrigger::Periodic,
+                    &state_for_maint.writer,
+                    &state_for_maint.snapshot,
+                    &state_for_maint.writer_health,
+                    &state_for_maint.namespace,
+                    &state_for_maint.metrics,
+                    None,
+                );
+                // Sweep only after the entire active+pending burst is idle;
+                // otherwise it can race immutable outputs uploaded by the
+                // off-lock prepare before their manifest install.
+                state_for_maint.compaction_scheduler.wait_idle().await;
+                // `wait_idle` is only a point-in-time observation. Take the
+                // scheduler's fair write guard as well so a reactive trigger
+                // racing this boundary either finishes before the sweep or
+                // waits until deletion has completed.
+                let _sweep_guard = state_for_maint.compaction_scheduler.sweep_guard().await;
                 // Orphan sweep — no writer lock. The `max_level` arg is only a
                 // floor now: sweep_orphans scans up to the deepest level any
                 // retained manifest occupies, so L2+ compaction outputs are
@@ -1201,6 +1172,19 @@ fn writer_busy_response() -> Response {
         .into_response()
 }
 
+/// The uniform 503 body returned when a multi-tenant request waited on a
+/// namespace incarnation that was retired by eviction. Clients may safely
+/// retry: the registry will route the next attempt to the live incarnation.
+fn namespace_retired_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "namespace was evicted while waiting for its writer; retry".into(),
+        }),
+    )
+        .into_response()
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -1356,6 +1340,15 @@ struct ObservedQuery {
     response: Response,
 }
 
+fn namespace_retired_observation(started: std::time::Instant) -> ObservedQuery {
+    ObservedQuery {
+        kind: Some(QueryKind::Write),
+        ok: false,
+        elapsed: started.elapsed(),
+        response: namespace_retired_response(),
+    }
+}
+
 // ───────────────────── CREATE VECTOR INDEX (DDL) ──────────────────────
 //
 // `CREATE VECTOR INDEX` is schema DDL — neither a read nor a row write — so
@@ -1426,6 +1419,7 @@ async fn run_create_vector_index(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
+    namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
     cvi: &namidb_query::parser::ast::CreateVectorIndexClause,
     principal: &Principal,
@@ -1468,12 +1462,18 @@ async fn run_create_vector_index(
         };
     }
     let mut w = writer.lock().await;
+    if namespace_state.is_some_and(NamespaceState::is_retired) {
+        drop(w);
+        return namespace_retired_observation(started);
+    }
     let result = apply_create_vector_index(&mut w, snapshot, cvi).await;
     if let Err(e) = &result {
         // A fenced/poisoned session would fail every later write; reopen it
         // in place under the lock we already hold (no-op for user errors
         // like a duplicate index name).
-        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        if !namespace_state.is_some_and(NamespaceState::is_retired) {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
     }
     drop(w);
     let elapsed = started.elapsed();
@@ -1551,6 +1551,7 @@ async fn run_create_fulltext_index(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
+    namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
     cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
     principal: &Principal,
@@ -1591,12 +1592,18 @@ async fn run_create_fulltext_index(
         };
     }
     let mut w = writer.lock().await;
+    if namespace_state.is_some_and(NamespaceState::is_retired) {
+        drop(w);
+        return namespace_retired_observation(started);
+    }
     let result = apply_create_fulltext_index(&mut w, snapshot, cfi).await;
     if let Err(e) = &result {
         // A fenced/poisoned session would fail every later write; reopen it
         // in place under the lock we already hold (no-op for user errors
         // like a duplicate index name).
-        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        if !namespace_state.is_some_and(NamespaceState::is_retired) {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
     }
     drop(w);
     let elapsed = started.elapsed();
@@ -1662,6 +1669,7 @@ async fn run_drop_vector_index(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
+    namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
     dvi: &namidb_query::parser::ast::DropVectorIndexClause,
     principal: &Principal,
@@ -1699,12 +1707,18 @@ async fn run_drop_vector_index(
         };
     }
     let mut w = writer.lock().await;
+    if namespace_state.is_some_and(NamespaceState::is_retired) {
+        drop(w);
+        return namespace_retired_observation(started);
+    }
     let result = apply_drop_vector_index(&mut w, snapshot, dvi).await;
     if let Err(e) = &result {
         // A fenced/poisoned session would fail every later write; reopen it
         // in place under the lock we already hold (no-op for user errors
         // like a duplicate index name).
-        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        if !namespace_state.is_some_and(NamespaceState::is_retired) {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
     }
     drop(w);
     let elapsed = started.elapsed();
@@ -1772,6 +1786,7 @@ async fn run_drop_fulltext_index(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
+    namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
     dfi: &namidb_query::parser::ast::DropFulltextIndexClause,
     principal: &Principal,
@@ -1809,12 +1824,18 @@ async fn run_drop_fulltext_index(
         };
     }
     let mut w = writer.lock().await;
+    if namespace_state.is_some_and(NamespaceState::is_retired) {
+        drop(w);
+        return namespace_retired_observation(started);
+    }
     let result = apply_drop_fulltext_index(&mut w, snapshot, dfi).await;
     if let Err(e) = &result {
         // A fenced/poisoned session would fail every later write; reopen it
         // in place under the lock we already hold (no-op for user errors
         // like a duplicate index name).
-        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        if !namespace_state.is_some_and(NamespaceState::is_retired) {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
     }
     drop(w);
     let elapsed = started.elapsed();
@@ -1896,6 +1917,7 @@ async fn run_create_property_ddl(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
+    namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
     name: Option<&str>,
     label: &str,
@@ -1942,6 +1964,10 @@ async fn run_create_property_ddl(
         };
     }
     let mut w = writer.lock().await;
+    if namespace_state.is_some_and(NamespaceState::is_retired) {
+        drop(w);
+        return namespace_retired_observation(started);
+    }
     let result = if unique {
         apply_create_constraint(&mut w, snapshot, name, label, properties, if_not_exists).await
     } else {
@@ -1950,7 +1976,9 @@ async fn run_create_property_ddl(
     if let Err(e) = &result {
         // Same reopen-in-place as the other DDL handlers (no-op for user
         // errors like a duplicate name).
-        recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        if !namespace_state.is_some_and(NamespaceState::is_retired) {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
     }
     drop(w);
     let elapsed = started.elapsed();
@@ -2051,6 +2079,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             cvi,
             principal,
@@ -2067,6 +2096,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             cfi,
             principal,
@@ -2083,6 +2113,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             dvi,
             principal,
@@ -2099,6 +2130,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             dfi,
             principal,
@@ -2115,6 +2147,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2133,6 +2166,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.snapshot,
             &state.writer_health,
             &state.namespace,
+            None,
             &state.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2231,7 +2265,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     .into_response(),
             };
         }
-        let Some(mut writer) = state.lock_writer_bounded().await else {
+        let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
             return ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
@@ -2539,6 +2573,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             cvi,
             principal,
@@ -2555,6 +2590,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             cfi,
             principal,
@@ -2571,6 +2607,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             dvi,
             principal,
@@ -2587,6 +2624,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             dfi,
             principal,
@@ -2603,6 +2641,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2621,6 +2660,7 @@ async fn run_cypher_multi(
             &ns_state.snapshot,
             &ns_state.writer_health,
             &ns_state.namespace,
+            Some(ns_state),
             &shared.authz,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
@@ -2717,9 +2757,14 @@ async fn run_cypher_multi(
                     .into_response(),
             };
         }
-        let Some(mut writer) =
-            lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await
-        else {
+        let lock_started = std::time::Instant::now();
+        let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
+        shared.metrics.observe_writer_lock(
+            WriterLockKind::Http,
+            lock_started.elapsed(),
+            writer.is_some(),
+        );
+        let Some(mut writer) = writer else {
             return ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
@@ -2727,6 +2772,13 @@ async fn run_cypher_multi(
                 response: writer_busy_response(),
             };
         };
+        // Eviction marks the incarnation retired before it waits for this
+        // mutex. Revalidate only after acquisition: an Arc cloned before
+        // eviction may have spent arbitrary time in the mutex's FIFO queue.
+        if ns_state.is_retired() {
+            drop(writer);
+            return namespace_retired_observation(started);
+        }
         let result =
             execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
         let stall = match &result {
@@ -2741,14 +2793,18 @@ async fn run_cypher_multi(
             Err(e) => {
                 // Reopen a fenced/poisoned namespace writer in place, under
                 // the lock we already hold (mirrors the single-tenant path).
-                recovery::recover_after_write_error(
-                    &mut writer,
-                    &ns_state.snapshot,
-                    &ns_state.writer_health,
-                    &ns_state.namespace,
-                    e,
-                )
-                .await;
+                // Never recover a retired incarnation: doing so after
+                // eviction could claim a newer epoch and fence its successor.
+                if !ns_state.is_retired() {
+                    recovery::recover_after_write_error(
+                        &mut writer,
+                        &ns_state.snapshot,
+                        &ns_state.writer_health,
+                        &ns_state.namespace,
+                        e,
+                    )
+                    .await;
+                }
                 None
             }
         };
@@ -2863,6 +2919,11 @@ async fn dispatch_admin_flush_multi(
         }
     };
     let mut w = ns_state.writer.lock().await;
+    // Same post-lock incarnation check as normal writes and schema DDL.
+    if ns_state.is_retired() {
+        drop(w);
+        return namespace_retired_response();
+    }
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
         Ok(outcome) => {
@@ -2875,14 +2936,16 @@ async fn dispatch_admin_flush_multi(
             .into_response()
         }
         Err(e) => {
-            recovery::recover_writer_if_needed(
-                &mut w,
-                &ns_state.snapshot,
-                &ns_state.writer_health,
-                &ns_state.namespace,
-                &e,
-            )
-            .await;
+            if !ns_state.is_retired() {
+                recovery::recover_writer_if_needed(
+                    &mut w,
+                    &ns_state.snapshot,
+                    &ns_state.writer_health,
+                    &ns_state.namespace,
+                    &e,
+                )
+                .await;
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorBody {
@@ -4422,6 +4485,68 @@ mod tests {
             read,
             StatusCode::OK,
             "default namespace is isolated from acme"
+        );
+    }
+
+    /// A request may clone a namespace state, finish planning, and queue on
+    /// its writer before eviction retires that incarnation. It must
+    /// revalidate only after the mutex becomes available and leave storage
+    /// untouched instead of reviving/fencing the old WriterSession.
+    #[tokio::test]
+    async fn multi_tenant_write_queued_on_retired_incarnation_is_rejected() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-retired-writer").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new(
+            Arc::clone(&registry),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            "default".to_string(),
+        );
+        let state = registry.get_or_open("acme").await.expect("open acme");
+        let before_version = state.snapshot.load().manifest().manifest.version;
+
+        let active_writer = state.writer.lock().await;
+        let request = CypherRequest {
+            query: "CREATE (:Person {name: 'must-not-commit'})".to_string(),
+            params: serde_json::Map::new(),
+        };
+        let principal = Principal::anonymous_rw();
+        let queued = run_cypher_multi(&state, &shared, &request, &principal);
+        tokio::pin!(queued);
+
+        // Poll through parsing/planning into the held writer mutex. Timing
+        // out a borrowed pinned future leaves it alive and queued.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err(),
+            "write unexpectedly completed while the writer mutex was held"
+        );
+        state.mark_retired();
+        drop(active_writer);
+
+        let observed = queued.await;
+        assert_eq!(observed.response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state.snapshot.load().manifest().manifest.version,
+            before_version,
+            "a request queued on a retired incarnation mutated storage"
         );
     }
 

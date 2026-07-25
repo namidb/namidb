@@ -64,7 +64,10 @@ use namidb_core::{DataType, LabelDef, LabelDictionary, LabelId, NodeId, Value};
 use crate::adjacency::{
     adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey, EdgeAdjacency,
 };
-use crate::cache::{DecodedNodeRowGroup, EdgeStreamBundle, NodeRowGroupKey, SstCache};
+use crate::cache::{
+    DecodedNodeRowGroup, EdgeStreamBundle, EqualityPropertySidecar, NodeRowGroupKey, SstCache,
+    UniquePropertySidecar,
+};
 use crate::error::{Error, Result};
 use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
 use crate::manifest::{LoadedManifest, Manifest, SstDescriptor, SstKind};
@@ -196,6 +199,18 @@ pub struct Snapshot<'mt> {
     /// `Snapshot::lookup_node_by_property` populates it on first miss
     /// and reuses it for the warm-path point lookups.
     property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
+    /// Cache generation captured with this immutable snapshot. Entries built
+    /// by an older pinned reader cannot become visible to a newer snapshot.
+    property_index_generation: Option<u64>,
+    /// Writer-private transactional property index. Attached only to
+    /// [`crate::ingest::WriterSession::overlay_snapshot`], never to published
+    /// reader snapshots, so committed + staged postings can be reused without
+    /// leaking an uncommitted value change to concurrent readers.
+    transactional_property_index: Option<&'mt crate::unique_index::UniqueConstraintIndex>,
+    /// Whether the overlay already contains staged node mutations. A map first
+    /// populated from such a view has no committed baseline and must be removed
+    /// (rather than incrementally restored) if the batch rolls back.
+    transactional_property_index_staged: bool,
     /// Per-snapshot fallback for decoded node-SST row groups, keyed by
     /// `(absolute SST path, row-group index)`. Used by
     /// [`Self::batch_lookup_nodes`] ONLY when no process-wide [`SstCache`]
@@ -217,7 +232,7 @@ pub struct Snapshot<'mt> {
     ///
     /// The node read paths merge it via [`node_entries`](Self::node_entries)
     /// and [`node_mem_entry`](Self::node_mem_entry); the edge read paths
-    /// merge it via [`edge_mem_entries`](Self::edge_mem_entries) (RFC-026
+    /// merge it via the range-pruned edge memtable iterators (RFC-026
     /// edge overlay), so a traversal over an edge staged earlier in the
     /// same statement or transaction sees it.
     overlay: Option<MemtableSnapshot>,
@@ -279,6 +294,9 @@ impl<'mt> Snapshot<'mt> {
             adjacency_cache: None,
             shared_node_cache: None,
             property_index_cache: None,
+            property_index_generation: None,
+            transactional_property_index: None,
+            transactional_property_index_staged: false,
             decoded_node_row_groups: Mutex::new(HashMap::new()),
             overlay: None,
         }
@@ -340,7 +358,33 @@ impl<'mt> Snapshot<'mt> {
         mut self,
         cache: Arc<crate::property_index::PropertyIndexCache>,
     ) -> Self {
+        self.property_index_generation = Some(cache.generation());
         self.property_index_cache = Some(cache);
+        self
+    }
+
+    pub(crate) fn with_property_index_cache_generation(
+        mut self,
+        cache: Arc<crate::property_index::PropertyIndexCache>,
+        generation: u64,
+    ) -> Self {
+        self.property_index_generation = Some(generation);
+        self.property_index_cache = Some(cache);
+        self
+    }
+
+    /// Attach the writer-private committed+staged postings index.
+    ///
+    /// This hook is intentionally crate-private: only a writer overlay may
+    /// expose the index. Published/read-only snapshots keep using the
+    /// generation-scoped committed cache and immutable SST sidecars.
+    pub(crate) fn with_transactional_property_index(
+        mut self,
+        index: &'mt crate::unique_index::UniqueConstraintIndex,
+        staged_node_mutations: bool,
+    ) -> Self {
+        self.transactional_property_index = Some(index);
+        self.transactional_property_index_staged = staged_node_mutations;
         self
     }
 
@@ -366,21 +410,46 @@ impl<'mt> Snapshot<'mt> {
             .chain(self.overlay.iter().flat_map(|o| o.iter_nodes()))
     }
 
-    /// Memtable entries to consult on the edge read paths (RFC-026 edge
-    /// overlay): the committed `memtable`, with the writer's staged batch
-    /// chained on when this is an overlay snapshot. Staged LSNs are
-    /// strictly greater than any committed LSN, so the per-partner /
-    /// per-edge last-LSN-wins merge in every edge read path picks a staged
-    /// upsert or tombstone over the committed edge. Unlike
-    /// [`node_entries`](Self::node_entries) this yields every entry; the
-    /// edge paths filter `MemKey::Edge` inline, exactly as they did over
-    /// the bare committed `memtable`, so node entries are skipped. When
-    /// nothing is staged (`overlay` is `None`) this is the committed
-    /// `memtable` alone.
-    fn edge_mem_entries(&self) -> impl Iterator<Item = (&MemKey, &MemEntry)> {
-        self.memtable
-            .iter()
-            .chain(self.overlay.iter().flat_map(|o| o.iter()))
+    /// Memtable entries for one edge type, merging the committed view with a
+    /// staged overlay. `MemKey` is ordered by `(kind, edge_type, src, dst)`,
+    /// so this is a tight range and never walks buffered node rows or other
+    /// edge types.
+    fn edge_mem_entries_for_type<'a>(
+        &'a self,
+        edge_type: &'a str,
+    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+        self.memtable.iter_edge_type(edge_type).chain(
+            self.overlay
+                .iter()
+                .flat_map(move |o| o.iter_edge_type(edge_type)),
+        )
+    }
+
+    /// Memtable entries that can affect one adjacency probe.
+    ///
+    /// Forward expansion is the bulk-loader hot path and maps exactly to the
+    /// ordered `(edge_type, src)` prefix. Inverse probes cannot use that
+    /// ordering directly, so they at least stay inside the edge-type range
+    /// before filtering by destination.
+    fn edge_mem_entries_for_key<'a>(
+        &'a self,
+        edge_type: &'a str,
+        key: NodeId,
+        direction: EdgeDirection,
+    ) -> Box<dyn Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a> {
+        match direction {
+            EdgeDirection::Forward => Box::new(
+                self.memtable.iter_out_edges(edge_type, key).chain(
+                    self.overlay
+                        .iter()
+                        .flat_map(move |o| o.iter_out_edges(edge_type, key)),
+                ),
+            ),
+            EdgeDirection::Inverse => Box::new(
+                self.edge_mem_entries_for_type(edge_type)
+                    .filter(move |(mk, _)| matches!(mk, MemKey::Edge { dst, .. } if *dst == key)),
+            ),
+        }
     }
 
     /// Point read of a single node's memtable entry with the staged
@@ -417,6 +486,111 @@ impl<'mt> Snapshot<'mt> {
         }
     }
 
+    /// Build (once per committed memtable generation) the string-property
+    /// claimants used to supplement immutable SST sidecars.
+    ///
+    /// A sidecar lookup must consider rows buffered since the last flush.
+    /// Scanning those rows for every key makes a batch lookup quadratic even
+    /// though the SST half is indexed. The writer-owned property cache is
+    /// invalidated on node commits, so this map is exact for snapshots that
+    /// attach it. RYOW overlay snapshots deliberately do not share that cache;
+    /// they rebuild from their small staged view to avoid leaking uncommitted
+    /// rows across readers.
+    fn memtable_property_claimants(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Arc<HashMap<String, Vec<NodeId>>>> {
+        if let Some(cache) = &self.property_index_cache {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            if let Some(index) = cache.get_memtable_claimants_at(label, property, generation) {
+                return Ok(index);
+            }
+        }
+
+        let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
+        for (mk, entry) in self.node_entries() {
+            let MemKey::Node { id } = mk else {
+                continue;
+            };
+            let MemOp::Upsert(payload) = &entry.op else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            if !label.is_empty()
+                && !record_carries_label(&record, label, &self.manifest.manifest.label_dict)
+            {
+                continue;
+            }
+            if let Some(Value::Str(value)) = record.properties.get(property) {
+                index.entry(value.clone()).or_default().push(*id);
+            }
+        }
+        let index = Arc::new(index);
+        if let Some(cache) = &self.property_index_cache {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            cache.insert_memtable_claimants_at(
+                label.to_string(),
+                property.to_string(),
+                index.clone(),
+                generation,
+            );
+        }
+        Ok(index)
+    }
+
+    /// Probe (and lazily populate) the writer-private committed+staged
+    /// postings map attached to a RYOW snapshot.
+    ///
+    /// `None` means this is an ordinary published/read-only snapshot and the
+    /// caller should use committed caches/SST sidecars. `Some(ids)` is
+    /// authoritative, including an empty vector. The first lookup for one
+    /// `(label, property)` scans the current overlay exactly once; subsequent
+    /// snapshots reuse the map, while staged upserts/tombstones maintain it at
+    /// the writer chokepoints.
+    async fn transactional_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        value: &str,
+    ) -> Result<Option<Vec<NodeId>>> {
+        let Some(index) = self.transactional_property_index else {
+            return Ok(None);
+        };
+        let names = vec![property.to_string()];
+        let probe_value = Value::Str(value.to_string());
+        let key = crate::unique_index::encode_probe_key(&[&probe_value])
+            .expect("String values always have a transactional index encoding");
+        if let Some(ids) = index.probe_all(label, &names, &key) {
+            return Ok(Some(ids));
+        }
+
+        // Populate from exactly the view this snapshot exposes. An empty label
+        // denotes the id-primary any-label scope; physical nodes are reconciled
+        // once even when they carry multiple labels.
+        let views = if label.is_empty() {
+            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+                .await?
+        } else {
+            self.scan_label(label).await?
+        };
+        let entries = views.iter().map(|view| (view.id, &view.properties));
+        if self.transactional_property_index_staged {
+            index.populate_staged(label, &names, entries);
+        } else {
+            index.populate(label, &names, entries);
+        }
+        Ok(Some(
+            index
+                .probe_all(label, &names, &key)
+                .expect("transactional property map was just populated"),
+        ))
+    }
+
     /// Point-lookup a node by a *unique* user property. The first call
     /// per (label, prop) pays a full label scan to populate the
     /// cross-snapshot cache; subsequent calls are `O(1)`. Caller is
@@ -435,9 +609,37 @@ impl<'mt> Snapshot<'mt> {
         if let Some(cache) = &self.property_index_cache {
             cache.record_unique_lookup();
         }
+        // Writer/RYOW path: the private transactional postings map sees both
+        // committed and staged rows and is incrementally maintained across
+        // overlay snapshots. Confirm against this snapshot so relabels,
+        // tombstones, and value changes retain last-write-wins semantics.
+        if let Some(ids) = self
+            .transactional_string_candidates(label, property, value)
+            .await?
+        {
+            let mut confirmed: Option<NodeView> = None;
+            for id in ids {
+                let Some(view) = self.lookup_node(label, id).await? else {
+                    continue;
+                };
+                if !matches!(view.properties.get(property), Some(Value::Str(s)) if s == value) {
+                    continue;
+                }
+                let replace = confirmed.as_ref().is_none_or(|current| {
+                    view.lsn > current.lsn || (view.lsn == current.lsn && view.id < current.id)
+                });
+                if replace {
+                    confirmed = Some(view);
+                }
+            }
+            return Ok(confirmed);
+        }
         // 1. Try the cross-snapshot in-memory index — `O(1)` warm path.
         if let Some(cache) = &self.property_index_cache {
-            if let Some(idx) = cache.get(label, property) {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            if let Some(idx) = cache.get_at(label, property, generation) {
                 if let Some(node_id) = idx.get(value).copied() {
                     return self.lookup_node(label, node_id).await;
                 } else {
@@ -490,17 +692,10 @@ impl<'mt> Snapshot<'mt> {
             // plus matching memtable rows (normally one under the uniqueness
             // invariant), and BTreeSet gives deterministic probe order.
             let mut candidates: BTreeSet<namidb_core::id::NodeId> = BTreeSet::new();
-            for (mk, e) in self.node_entries() {
-                if let MemKey::Node { id } = mk {
-                    if let MemOp::Upsert(payload) = &e.op {
-                        let rec = NodeWriteRecord::decode(payload)?;
-                        if record_carries_label(&rec, label, &self.manifest.manifest.label_dict)
-                            && matches!(rec.properties.get(property),
-                            Some(namidb_core::Value::Str(s)) if s == value)
-                        {
-                            candidates.insert(*id);
-                        }
-                    }
+            let memtable_claimants = self.memtable_property_claimants(label, property)?;
+            if let Some(ids) = memtable_claimants.get(value) {
+                for id in ids {
+                    candidates.insert(*id);
                 }
             }
 
@@ -519,28 +714,7 @@ impl<'mt> Snapshot<'mt> {
                     self.paths.namespace_prefix().as_ref(),
                     sidecar_desc.path
                 );
-                // Reuse the body cache for sidecar bodies too. They're
-                // immutable per UUIDv7 path so the standard cache key
-                // works without conflict.
-                let body = if let Some(b) = self.cache_get(&absolute) {
-                    b
-                } else {
-                    let object_path = object_store::path::Path::from(absolute.clone());
-                    let bytes = self
-                        .store
-                        .get(&object_path)
-                        .await
-                        .map_err(Error::ObjectStore)?
-                        .bytes()
-                        .await
-                        .map_err(Error::ObjectStore)?;
-                    if let Some(cache) = &self.cache {
-                        cache.insert(absolute.clone(), bytes.clone());
-                    }
-                    bytes
-                };
-                let map: std::collections::BTreeMap<String, [u8; 16]> = bincode::deserialize(&body)
-                    .map_err(|e| Error::invariant(format!("unique-index bincode decode: {e}")))?;
+                let map = self.fetch_unique_property_sidecar(&absolute).await?;
                 if let Some(id_bytes) = map.get(value) {
                     let id = namidb_core::id::NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
                     candidates.insert(id);
@@ -571,6 +745,34 @@ impl<'mt> Snapshot<'mt> {
             return Ok(confirmed);
         }
 
+        // Id-primary node SSTs cannot emit a label-scoped single-value
+        // sidecar, but they do emit a global equality posting sidecar for
+        // unique properties. Reuse it and confirm labels/current values; the
+        // declared uniqueness invariant means the result cardinality is at
+        // most one (legacy duplicate data is resolved deterministically).
+        let all_have_equality_sidecar = have_node_ssts
+            && sst_idxs.iter().all(|idx| {
+                self.manifest.manifest.ssts[*idx]
+                    .equality_property_indices
+                    .iter()
+                    .any(|d| d.property == property)
+            });
+        if all_have_equality_sidecar {
+            let matches = self
+                .lookup_nodes_by_property(label, property, value)
+                .await?;
+            let mut confirmed: Option<NodeView> = None;
+            for view in matches {
+                let replace = confirmed.as_ref().is_none_or(|current| {
+                    view.lsn > current.lsn || (view.lsn == current.lsn && view.id < current.id)
+                });
+                if replace {
+                    confirmed = Some(view);
+                }
+            }
+            return Ok(confirmed);
+        }
+
         // 3. Legacy cold path: full label scan to build the index, then look up.
         //
         // Reached when at least one SST in the scope was written by a
@@ -590,10 +792,14 @@ impl<'mt> Snapshot<'mt> {
             }
         }
         if let Some(cache) = &self.property_index_cache {
-            cache.insert(
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            cache.insert_at(
                 label.to_string(),
                 property.to_string(),
                 std::sync::Arc::new(idx),
+                generation,
             );
         }
         Ok(found)
@@ -623,6 +829,21 @@ impl<'mt> Snapshot<'mt> {
         if let Some(cache) = &self.property_index_cache {
             cache.record_equality_lookup();
         }
+        if let Some(ids) = self
+            .transactional_string_candidates(label, property, value)
+            .await?
+        {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(view) = self.lookup_node(label, id).await? {
+                    if matches!(view.properties.get(property), Some(Value::Str(s)) if s == value) {
+                        out.push(view);
+                    }
+                }
+            }
+            out.sort_by_key(|view| view.id);
+            return Ok(out);
+        }
 
         // Same label scoping as `lookup_node_by_property`: only SSTs that
         // can contain a live row of `label` need the sidecar; the rest can
@@ -642,8 +863,9 @@ impl<'mt> Snapshot<'mt> {
             });
 
         // Cold path: a pre-sidecar SST is in scope (or the property was not
-        // `indexed` at flush time). Scan + filter, returning every match.
-        if !all_have_sidecar {
+        // `indexed` at flush time). A memtable-only store is NOT cold: its
+        // claimant map is the complete index and is cached per generation.
+        if have_node_ssts && !all_have_sidecar {
             let all_nodes = self.scan_label(label).await?;
             return Ok(all_nodes
                 .into_iter()
@@ -659,18 +881,10 @@ impl<'mt> Snapshot<'mt> {
         // union of every SST posting list under `value`.
         let mut candidates: std::collections::BTreeSet<namidb_core::id::NodeId> =
             std::collections::BTreeSet::new();
-        for (mk, e) in self.node_entries() {
-            if let MemKey::Node { id } = mk {
-                if let MemOp::Upsert(payload) = &e.op {
-                    let rec = NodeWriteRecord::decode(payload)?;
-                    if record_carries_label(&rec, label, &self.manifest.manifest.label_dict) {
-                        if let Some(namidb_core::Value::Str(s)) = rec.properties.get(property) {
-                            if s == value {
-                                candidates.insert(*id);
-                            }
-                        }
-                    }
-                }
+        let memtable_claimants = self.memtable_property_claimants(label, property)?;
+        if let Some(ids) = memtable_claimants.get(value) {
+            for id in ids {
+                candidates.insert(*id);
             }
         }
         for idx in &sst_idxs {
@@ -685,26 +899,7 @@ impl<'mt> Snapshot<'mt> {
                 self.paths.namespace_prefix().as_ref(),
                 sidecar_desc.path
             );
-            let body = if let Some(b) = self.cache_get(&absolute) {
-                b
-            } else {
-                let object_path = object_store::path::Path::from(absolute.clone());
-                let bytes = self
-                    .store
-                    .get(&object_path)
-                    .await
-                    .map_err(Error::ObjectStore)?
-                    .bytes()
-                    .await
-                    .map_err(Error::ObjectStore)?;
-                if let Some(cache) = &self.cache {
-                    cache.insert(absolute.clone(), bytes.clone());
-                }
-                bytes
-            };
-            let map: std::collections::BTreeMap<String, Vec<[u8; 16]>> =
-                bincode::deserialize(&body)
-                    .map_err(|e| Error::invariant(format!("equality-index bincode decode: {e}")))?;
+            let map = self.fetch_equality_property_sidecar(&absolute).await?;
             if let Some(ids) = map.get(value) {
                 for id_bytes in ids {
                     candidates.insert(namidb_core::id::NodeId::from_uuid(Uuid::from_bytes(
@@ -726,6 +921,132 @@ impl<'mt> Snapshot<'mt> {
                     out.push(view);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a label-agnostic equality predicate, e.g.
+    /// `MATCH (n {key: $key})`, without guessing a label scope.
+    ///
+    /// Fresh id-primary SSTs carry a global equality sidecar for every
+    /// schema-declared indexed *or unique* property. We union those postings
+    /// with the committed memtable claimant map and confirm candidates by
+    /// physical node id, so multi-label nodes appear once and per-label
+    /// uniqueness does not incorrectly collapse equal keys from two labels.
+    /// Older/incomplete SST sets pay one all-node scan and retain a complete
+    /// cross-snapshot fallback index.
+    pub async fn lookup_nodes_by_property_any_label(
+        &self,
+        property: &str,
+        value: &str,
+    ) -> Result<Vec<NodeView>> {
+        namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property_any_label");
+        if let Some(cache) = &self.property_index_cache {
+            cache.record_equality_lookup();
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            if let Some(index) = cache.get_global_at(property, generation) {
+                let mut out = Vec::new();
+                for id in index.get(value).into_iter().flatten() {
+                    if let Some(view) = self.lookup_node_by_id(*id).await? {
+                        if matches!(view.properties.get(property), Some(Value::Str(s)) if s == value)
+                        {
+                            out.push(view);
+                        }
+                    }
+                }
+                return Ok(out);
+            }
+        }
+        if let Some(ids) = self
+            .transactional_string_candidates("", property, value)
+            .await?
+        {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(view) = self.lookup_node_by_id(id).await? {
+                    if matches!(view.properties.get(property), Some(Value::Str(s)) if s == value) {
+                        out.push(view);
+                    }
+                }
+            }
+            out.sort_by_key(|view| view.id);
+            return Ok(out);
+        }
+
+        let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        let have_node_ssts = !sst_idxs.is_empty();
+        let all_have_sidecar = have_node_ssts
+            && sst_idxs.iter().all(|idx| {
+                self.manifest.manifest.ssts[*idx]
+                    .equality_property_indices
+                    .iter()
+                    .any(|d| d.property == property)
+            });
+
+        // New stores use the sidecars. A memtable-only store has the same
+        // candidate shape without an SST half, so it also avoids a full scan.
+        if all_have_sidecar || !have_node_ssts {
+            let mut candidates: BTreeSet<NodeId> = BTreeSet::new();
+            let memtable_claimants = self.memtable_property_claimants("", property)?;
+            if let Some(ids) = memtable_claimants.get(value) {
+                candidates.extend(ids.iter().copied());
+            }
+            if all_have_sidecar {
+                for idx in &sst_idxs {
+                    let desc = &self.manifest.manifest.ssts[*idx];
+                    let sidecar_desc = desc
+                        .equality_property_indices
+                        .iter()
+                        .find(|d| d.property == property)
+                        .expect("all_have_sidecar guard");
+                    let absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        sidecar_desc.path
+                    );
+                    let map = self.fetch_equality_property_sidecar(&absolute).await?;
+                    if let Some(ids) = map.get(value) {
+                        candidates.extend(
+                            ids.iter()
+                                .map(|bytes| NodeId::from_uuid(Uuid::from_bytes(*bytes))),
+                        );
+                    }
+                }
+            }
+
+            let mut out = Vec::with_capacity(candidates.len());
+            for id in candidates {
+                if let Some(view) = self.lookup_node_by_id(id).await? {
+                    if matches!(view.properties.get(property), Some(Value::Str(s)) if s == value) {
+                        out.push(view);
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Legacy/incomplete sidecars: one label-agnostic reconciliation, then
+        // keep every posting so the remaining correlated keys are O(1).
+        let all_nodes = self
+            .scan_all_nodes_with_predicates_and_projection(&[], None)
+            .await?;
+        let mut index: HashMap<String, Vec<NodeId>> = HashMap::with_capacity(all_nodes.len());
+        let mut out = Vec::new();
+        for view in &all_nodes {
+            if let Some(Value::Str(current)) = view.properties.get(property) {
+                index.entry(current.clone()).or_default().push(view.id);
+                if current == value {
+                    out.push(view.clone());
+                }
+            }
+        }
+        if let Some(cache) = &self.property_index_cache {
+            let generation = self
+                .property_index_generation
+                .unwrap_or_else(|| cache.generation());
+            cache.insert_global_at(property.to_string(), Arc::new(index), generation);
         }
         Ok(out)
     }
@@ -1901,7 +2222,7 @@ impl<'mt> Snapshot<'mt> {
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, Option<EdgeView>)> = BTreeMap::new();
 
         // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
-        for (mk, entry) in self.edge_mem_entries() {
+        for (mk, entry) in self.edge_mem_entries_for_type(edge_type) {
             let MemKey::Edge {
                 edge_type: et,
                 src,
@@ -2002,7 +2323,7 @@ impl<'mt> Snapshot<'mt> {
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, bool)> = BTreeMap::new();
 
         // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
-        for (mk, entry) in self.edge_mem_entries() {
+        for (mk, entry) in self.edge_mem_entries_for_type(edge_type) {
             let MemKey::Edge {
                 edge_type: et,
                 src,
@@ -2094,6 +2415,35 @@ impl<'mt> Snapshot<'mt> {
         key: NodeId,
         direction: EdgeDirection,
     ) -> Result<Vec<NodeId>> {
+        self.sorted_partners_inner(edge_type, key, direction, false)
+            .await
+    }
+
+    /// Identity-only partner lookup that always uses the source-keyed SST
+    /// range/bloom path, even when the process-wide CSR cache is enabled.
+    ///
+    /// This is the sparse mutation primitive: a keyed `DELETE r` needs only
+    /// `(edge_type, src, dst)`. Rebuilding a whole-type CSR after every
+    /// manifest-changing delete batch would turn that operation into
+    /// O(total edges) per batch; the SST route stays proportional to the
+    /// candidate SSTs and the selected node's degree.
+    pub async fn sorted_partners_via_sst(
+        &self,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+    ) -> Result<Vec<NodeId>> {
+        self.sorted_partners_inner(edge_type, key, direction, true)
+            .await
+    }
+
+    async fn sorted_partners_inner(
+        &self,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+        force_sst: bool,
+    ) -> Result<Vec<NodeId>> {
         namidb_core::profile_scope!("Snapshot::sorted_partners");
         let key_bytes = *key.as_bytes();
         // Partner bytes -> (lsn, is_upsert).
@@ -2102,7 +2452,7 @@ impl<'mt> Snapshot<'mt> {
         // Committed memtable then the staged overlay (RFC-026 edge RYOW)
         // first; the SST/CSR path below shadows whatever they contributed
         // only when its LSN is strictly higher.
-        for (mk, entry) in self.edge_mem_entries() {
+        for (mk, entry) in self.edge_mem_entries_for_key(edge_type, key, direction) {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -2132,7 +2482,7 @@ impl<'mt> Snapshot<'mt> {
 
         // CSR if available + enabled, otherwise SST fallback. Both paths
         // emit (partner, lsn, is_upsert) triples into the same map.
-        if adjacency_enabled() {
+        if !force_sst && adjacency_enabled() {
             if let Some(cache) = self.adjacency_cache.clone() {
                 self.merge_sorted_partners_csr(cache, edge_type, key, direction, &mut latest)
                     .await?;
@@ -2298,7 +2648,7 @@ impl<'mt> Snapshot<'mt> {
         let mut latest: BTreeMap<[u8; 16], (u64, Option<EdgeView>)> = BTreeMap::new();
 
         // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
-        for (mk, entry) in self.edge_mem_entries() {
+        for (mk, entry) in self.edge_mem_entries_for_key(edge_type, key, direction) {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -2457,7 +2807,7 @@ impl<'mt> Snapshot<'mt> {
         // 2a. Memtable sweep, then the writer's staged overlay (RFC-026
         // edge RYOW): same shape as the SST path. A staged or committed
         // tombstone here shadows a CSR upsert of equal-or-lower LSN.
-        for (mk, entry) in self.edge_mem_entries() {
+        for (mk, entry) in self.edge_mem_entries_for_key(edge_type, key, direction) {
             let MemKey::Edge {
                 edge_type: et,
                 src: s,
@@ -2971,6 +3321,44 @@ impl<'mt> Snapshot<'mt> {
         Ok(bundle)
     }
 
+    async fn fetch_unique_property_sidecar(
+        &self,
+        absolute: &str,
+    ) -> Result<Arc<UniquePropertySidecar>> {
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(index) = cache.get_unique_property_sidecar(absolute) {
+                return Ok(index);
+            }
+        }
+        let body = self.fetch_bytes(absolute).await?;
+        let index: UniquePropertySidecar = bincode::deserialize(&body)
+            .map_err(|e| Error::invariant(format!("unique-index bincode decode: {e}")))?;
+        let index = Arc::new(index);
+        if let Some(cache) = self.cache.as_ref() {
+            cache.insert_unique_property_sidecar(absolute.to_string(), index.clone());
+        }
+        Ok(index)
+    }
+
+    async fn fetch_equality_property_sidecar(
+        &self,
+        absolute: &str,
+    ) -> Result<Arc<EqualityPropertySidecar>> {
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(index) = cache.get_equality_property_sidecar(absolute) {
+                return Ok(index);
+            }
+        }
+        let body = self.fetch_bytes(absolute).await?;
+        let index: EqualityPropertySidecar = bincode::deserialize(&body)
+            .map_err(|e| Error::invariant(format!("equality-index bincode decode: {e}")))?;
+        let index = Arc::new(index);
+        if let Some(cache) = self.cache.as_ref() {
+            cache.insert_equality_property_sidecar(absolute.to_string(), index.clone());
+        }
+        Ok(index)
+    }
+
     /// Returns `true` if the SST cannot be ruled out by its bloom side-car
     /// for `key`. SSTs without a side-car (small bodies under the omit
     /// threshold — see [`crate::sst::bloom::BLOOM_OMIT_THRESHOLD_BYTES`])
@@ -2984,8 +3372,16 @@ impl<'mt> Snapshot<'mt> {
             self.paths.namespace_prefix().as_ref(),
             bloom_desc.path
         );
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(filter) = cache.get_bloom_filter(&absolute) {
+                return Ok(filter.contains(key));
+            }
+        }
         let body = self.fetch_bytes(&absolute).await?;
-        let filter = BloomFilter::from_bytes(&bloom_desc.path, &body)?;
+        let filter = Arc::new(BloomFilter::from_bytes(&bloom_desc.path, &body)?);
+        if let Some(cache) = self.cache.as_ref() {
+            cache.insert_bloom_filter(absolute, filter.clone());
+        }
         Ok(filter.contains(key))
     }
 
@@ -3608,6 +4004,7 @@ pub struct OwnedSnapshot {
     pub(crate) adjacency_cache: Option<Arc<AdjacencyCache>>,
     pub(crate) shared_node_cache: Option<Arc<NodeViewCache>>,
     pub(crate) property_index_cache: Option<Arc<crate::property_index::PropertyIndexCache>>,
+    pub(crate) property_index_generation: Option<u64>,
 }
 
 impl std::fmt::Debug for OwnedSnapshot {
@@ -3654,7 +4051,12 @@ impl OwnedSnapshot {
             snap = snap.with_shared_node_cache(c.clone());
         }
         if let Some(c) = &self.property_index_cache {
-            snap = snap.with_property_index_cache(c.clone());
+            snap = match self.property_index_generation {
+                Some(generation) => {
+                    snap.with_property_index_cache_generation(c.clone(), generation)
+                }
+                None => snap.with_property_index_cache(c.clone()),
+            };
         }
         snap
     }
@@ -5455,7 +5857,8 @@ mod tests {
 
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
-        let snap = Snapshot::new(base, &empty_view, store.clone(), paths);
+        let cache = SstCache::new(1 << 20);
+        let snap = Snapshot::new(base, &empty_view, store.clone(), paths).with_cache(cache.clone());
         assert!(
             snap.bloom_admits(&descriptor, sorted_node_id(5).as_bytes())
                 .await
@@ -5469,6 +5872,9 @@ mod tests {
                 .unwrap(),
             "key never inserted should be rejected by the bloom"
         );
+        assert_eq!(cache.bloom_inserts(), 1, "bloom decoded only once");
+        assert_eq!(cache.bloom_misses(), 1);
+        assert_eq!(cache.bloom_hits(), 1);
 
         // Sanity: an SstDescriptor with `bloom = None` admits everything.
         let no_bloom = SstDescriptor {
@@ -6308,8 +6714,10 @@ mod tests {
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
         let cache = Arc::new(crate::property_index::PropertyIndexCache::new());
+        let sst_cache = SstCache::new(1 << 20);
         let snap = Snapshot::new(committed, &empty_view, store.clone(), paths.clone())
-            .with_property_index_cache(cache.clone());
+            .with_property_index_cache(cache.clone())
+            .with_cache(sst_cache.clone());
 
         // The lookup resolves through the sidecar even though the Widget SST
         // has none for `code`.
@@ -6333,6 +6741,149 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(cache.get("Account", "code").is_none());
+        assert_eq!(
+            cache.memtable_population_scans(),
+            1,
+            "the committed memtable claimant map is built once per property"
+        );
+        assert_eq!(
+            sst_cache.property_sidecar_inserts(),
+            1,
+            "the sidecar is decoded once, not once per lookup"
+        );
+        assert_eq!(sst_cache.property_sidecar_misses(), 1);
+        assert_eq!(sst_cache.property_sidecar_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_property_lookup_preserves_cross_label_duplicates() {
+        let store = make_store();
+        let paths = make_paths("global-property-postings");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let a_label = base.manifest.label_dict.intern("A").get();
+        let b_label = base.manifest.label_dict.intern("B").get();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let key_def = || {
+            PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)
+        };
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "A".into(),
+                properties: vec![key_def()],
+            })
+            .unwrap()
+            .label(LabelDef {
+                name: "B".into(),
+                properties: vec![key_def()],
+            })
+            .unwrap()
+            .build();
+
+        let a = sorted_node_id(1);
+        let b = sorted_node_id(2);
+        let both = sorted_node_id(3);
+        let mut mt = Memtable::new();
+        for (id, labels, key, lsn) in [
+            (a, vec![a_label], "shared", 1),
+            (b, vec![b_label], "shared", 2),
+            (both, vec![a_label, b_label], "both", 3),
+        ] {
+            mt.apply(
+                MemKey::Node { id },
+                lsn,
+                MemOp::Upsert(
+                    NodeWriteRecord {
+                        properties: BTreeMap::from([("key".into(), Value::Str(key.into()))]),
+                        schema_version: 1,
+                        labels,
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            );
+        }
+        let flushed = flush(&ms, &fence, &base, &mt.freeze(), schema.clone())
+            .await
+            .unwrap();
+        assert!(
+            flushed.committed.manifest.ssts.iter().any(|sst| sst
+                .equality_property_indices
+                .iter()
+                .any(|index| index.property == "key")),
+            "per-label unique keys need a global posting sidecar"
+        );
+
+        // A later tombstone-only SST contributes no key values, but must
+        // still advertise an empty sidecar as a coverage marker. Otherwise
+        // one harmless flush would demote every global lookup back to an
+        // all-node scan.
+        let mut tombstones = Memtable::new();
+        tombstones.apply(
+            MemKey::Node {
+                id: sorted_node_id(99),
+            },
+            4,
+            MemOp::Tombstone,
+        );
+        let flushed = flush(
+            &ms,
+            &fence,
+            &flushed.committed,
+            &tombstones.freeze(),
+            schema,
+        )
+        .await
+        .unwrap();
+        let node_ssts: Vec<&SstDescriptor> = flushed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == SstKind::Nodes)
+            .collect();
+        assert!(node_ssts.len() >= 2);
+        assert!(node_ssts.iter().all(|sst| sst
+            .equality_property_indices
+            .iter()
+            .any(|index| index.property == "key")));
+        assert!(node_ssts.iter().any(|sst| sst
+            .equality_property_indices
+            .iter()
+            .any(|index| index.property == "key" && index.distinct_values == 0)));
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let property_cache = Arc::new(crate::property_index::PropertyIndexCache::new());
+        let generation = property_cache.generation();
+        let snap = Snapshot::new(flushed.committed, &empty_view, store, paths)
+            .with_cache(SstCache::new(1 << 20))
+            .with_property_index_cache(property_cache.clone());
+        let mut shared: Vec<NodeId> = snap
+            .lookup_nodes_by_property_any_label("key", "shared")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        shared.sort();
+        assert_eq!(shared, vec![a, b], "uniqueness remains label-scoped");
+
+        let both_hits = snap
+            .lookup_nodes_by_property_any_label("key", "both")
+            .await
+            .unwrap();
+        assert_eq!(
+            both_hits.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![both],
+            "a multi-label physical node must not be duplicated"
+        );
+        assert!(
+            property_cache.get_global_at("key", generation).is_none(),
+            "complete sidecar coverage must not populate the all-node fallback cache"
+        );
     }
 
     #[cfg(all(feature = "vector-index", feature = "text-index"))]

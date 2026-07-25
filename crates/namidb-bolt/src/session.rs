@@ -7,13 +7,15 @@
 //! `namidb-server` and easy to test.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::chunk::{read_message, write_message};
+use crate::chunk::write_message;
 use crate::error::{BoltError, Result};
 use crate::handshake::{negotiate, read_offers, write_response, Version};
 use crate::mapping::{params_from_bolt_map, runtime_to_bolt, ElementIdMode};
@@ -22,6 +24,140 @@ use crate::state::State;
 use crate::value::Value;
 
 use namidb_query::{Params, Row, RuntimeValue};
+
+/// Cooperative cancellation signal for one in-flight `RUN`.
+///
+/// The Bolt session flips this when its transport reaches EOF while the
+/// backend is still executing. A backend may override
+/// [`Backend::run_with_cancellation`] / [`Backend::run_in_tx_with_cancellation`]
+/// to stop only at a cancellation-safe boundary, clean up staged mutations,
+/// and then return. The session deliberately awaits that cleanup before it
+/// tears the connection task down.
+#[derive(Clone, Debug, Default)]
+pub struct RunCancellation {
+    inner: Arc<RunCancellationInner>,
+}
+
+#[derive(Debug, Default)]
+struct RunCancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl RunCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish cancellation. Idempotent and safe to call before the backend
+    /// starts waiting.
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Wait until cancellation is published without a check/subscribe race.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Cancellation-safe Bolt chunk decoder.
+///
+/// `chunk::read_message` intentionally owns its header/body buffers inside one
+/// future, which is ideal for the ordinary sequential session loop but cannot
+/// be selected against backend execution: cancelling it after a partial
+/// socket read would discard bytes already removed from TCP. This decoder
+/// retains every partial header/chunk in the `Session`, and uses Tokio's
+/// cancellation-safe `read` operation for each increment. If RUN completes
+/// halfway through a pipelined PULL frame, the next loop iteration resumes at
+/// the exact byte offset.
+#[derive(Debug, Default)]
+struct StatefulMessageReader {
+    header: [u8; 2],
+    header_read: usize,
+    chunk: Vec<u8>,
+    chunk_read: usize,
+    message: Vec<u8>,
+}
+
+impl StatefulMessageReader {
+    async fn read_message<R: AsyncReadExt + Unpin>(
+        &mut self,
+        reader: &mut R,
+        max_message_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        loop {
+            // An in-progress chunk is the decoder's explicit "body" phase.
+            // Do not read a fresh header until its full body has arrived: the
+            // future may have been dropped by `select!` after consuming only
+            // part of that body while a concurrent RUN completed.
+            if self.chunk.is_empty() {
+                while self.header_read < self.header.len() {
+                    let read = reader.read(&mut self.header[self.header_read..]).await?;
+                    if read == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    self.header_read += read;
+                }
+
+                let chunk_len = u16::from_be_bytes(self.header) as usize;
+                self.header_read = 0;
+                if chunk_len == 0 {
+                    self.chunk_read = 0;
+                    return Ok(std::mem::take(&mut self.message));
+                }
+
+                let next_len =
+                    self.message
+                        .len()
+                        .checked_add(chunk_len)
+                        .ok_or(BoltError::TooLarge {
+                            what: "Bolt message",
+                            len: usize::MAX,
+                            max: max_message_bytes,
+                        })?;
+                if next_len > max_message_bytes {
+                    return Err(BoltError::TooLarge {
+                        what: "Bolt message",
+                        len: next_len,
+                        max: max_message_bytes,
+                    });
+                }
+
+                self.chunk.resize(chunk_len, 0);
+                self.chunk_read = 0;
+            }
+
+            while self.chunk_read < self.chunk.len() {
+                let read = reader.read(&mut self.chunk[self.chunk_read..]).await?;
+                if read == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+                self.chunk_read += read;
+            }
+            self.message.extend_from_slice(&self.chunk);
+            self.chunk.clear();
+            self.chunk_read = 0;
+        }
+    }
+}
 
 /// Server-side identity returned in `SUCCESS` after HELLO.
 #[derive(Debug, Clone)]
@@ -179,6 +315,21 @@ pub trait Backend: Send + Sync {
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError>;
 
+    /// Execute an auto-commit statement while observing transport
+    /// cancellation. The default preserves the legacy behaviour and lets the
+    /// statement finish: blindly dropping an arbitrary backend future could
+    /// interrupt a durability commit. Backends that can distinguish their
+    /// cancel-safe apply phase from their non-cancellable commit phase should
+    /// override this method.
+    async fn run_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        _cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run(cypher, params).await
+    }
+
     /// Begin an explicit transaction. Subsequent [`Backend::run_in_tx`]
     /// calls stage into it; [`Backend::commit_tx`] makes them durable and
     /// [`Backend::rollback_tx`] discards them. The default is a no-op so a
@@ -197,6 +348,20 @@ pub trait Backend: Send + Sync {
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
         self.run(cypher, params).await
+    }
+
+    /// Cancellation-aware explicit-transaction statement. As with
+    /// [`Backend::run_with_cancellation`], the conservative default finishes
+    /// the call. A supporting backend may abort the current apply safely; the
+    /// session will subsequently invoke `rollback_tx` when the disconnected
+    /// connection unwinds.
+    async fn run_in_tx_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        _cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run_in_tx(cypher, params).await
     }
 
     /// Commit the open explicit transaction, making its staged statements
@@ -228,10 +393,18 @@ pub trait Backend: Send + Sync {
     async fn logoff(&self) {}
 }
 
+/// Bound valid Bolt pipelining while a long RUN is in flight. A normal driver
+/// pipelines at most RUN + PULL/DISCARD; the higher ceiling leaves room for
+/// RESET/telemetry without allowing an executing query to become an
+/// unbounded per-connection message queue.
+const MAX_PREFETCHED_MESSAGES: usize = 16;
+const MAX_PREFETCHED_BYTES: usize = POST_AUTH_MESSAGE_BYTES;
+
 /// One Bolt connection. Created once per `accept()` and driven to
 /// completion in a single task.
 pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     socket: S,
+    message_reader: StatefulMessageReader,
     info: ServerInfo,
     auth: AuthPolicy,
     backend: Arc<dyn Backend>,
@@ -248,6 +421,12 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// Write counters of the in-flight stream, emitted as `stats` in the
     /// closing `SUCCESS` after PULL/DISCARD. Empty for reads.
     pending_counters: BTreeMap<String, i64>,
+    /// Messages pipelined by the client while a RUN is executing. Reading the
+    /// transport concurrently with the backend is what lets us notice EOF and
+    /// cancel a runaway statement; valid early PULL/DISCARD messages are kept
+    /// in order and consumed by the normal state machine afterwards.
+    prefetched_messages: std::collections::VecDeque<Vec<u8>>,
+    prefetched_bytes: usize,
     /// While an explicit transaction is open the backend holds the writer
     /// lock, so an idle client would pin it indefinitely. When set, a read
     /// that blocks longer than this with a transaction open rolls the
@@ -281,6 +460,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     pub fn new(socket: S, info: ServerInfo, auth: AuthPolicy, backend: Arc<dyn Backend>) -> Self {
         Self {
             socket,
+            message_reader: StatefulMessageReader::default(),
             info,
             auth,
             backend,
@@ -289,6 +469,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             pending_statement_type: None,
             pending_counters: BTreeMap::new(),
             pending_rows: std::collections::VecDeque::new(),
+            prefetched_messages: std::collections::VecDeque::new(),
+            prefetched_bytes: 0,
             tx_idle_timeout: None,
             handshake_timeout: None,
             max_tx_lifetime: None,
@@ -365,41 +547,46 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 self.tx_started = None;
             }
             let pre_auth = !self.authenticated;
-            let read = read_message(&mut self.socket, max);
-            let read_result = if in_tx {
-                match self.tx_idle_timeout {
-                    Some(t) => match tokio::time::timeout(t, read).await {
-                        Ok(r) => r,
-                        Err(_elapsed) => {
-                            let _ = self.backend.rollback_tx().await;
-                            self.state = State::Failed;
-                            self.write_failure(
-                                "Neo.TransientError.Transaction.LockClientStopped",
-                                "transaction idle timeout; rolled back to release the writer"
-                                    .to_string(),
-                            )
-                            .await?;
-                            continue;
-                        }
-                    },
-                    None => read.await,
-                }
-            } else if pre_auth {
-                // Drop a not-yet-authenticated client that stalls a read past
-                // the handshake timeout (slowloris): it never sends HELLO/LOGON
-                // and would otherwise pin this task + FD indefinitely.
-                match self.handshake_timeout {
-                    Some(t) => match tokio::time::timeout(t, read).await {
-                        Ok(r) => r,
-                        Err(_elapsed) => {
-                            debug!("bolt pre-auth read timed out; closing idle connection");
-                            return Ok(());
-                        }
-                    },
-                    None => read.await,
-                }
+            let read_result = if let Some(body) = self.prefetched_messages.pop_front() {
+                self.prefetched_bytes = self.prefetched_bytes.saturating_sub(body.len());
+                Ok(body)
             } else {
-                read.await
+                let read = self.message_reader.read_message(&mut self.socket, max);
+                if in_tx {
+                    match self.tx_idle_timeout {
+                        Some(t) => match tokio::time::timeout(t, read).await {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                let _ = self.backend.rollback_tx().await;
+                                self.state = State::Failed;
+                                self.write_failure(
+                                    "Neo.TransientError.Transaction.LockClientStopped",
+                                    "transaction idle timeout; rolled back to release the writer"
+                                        .to_string(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        },
+                        None => read.await,
+                    }
+                } else if pre_auth {
+                    // Drop a not-yet-authenticated client that stalls a read past
+                    // the handshake timeout (slowloris): it never sends HELLO/LOGON
+                    // and would otherwise pin this task + FD indefinitely.
+                    match self.handshake_timeout {
+                        Some(t) => match tokio::time::timeout(t, read).await {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                debug!("bolt pre-auth read timed out; closing idle connection");
+                                return Ok(());
+                            }
+                        },
+                        None => read.await,
+                    }
+                } else {
+                    read.await
+                }
             };
             let body = match read_result {
                 Ok(b) => b,
@@ -737,10 +924,63 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         // Inside an explicit transaction the statement stages into the open
         // tx (committed at COMMIT, discarded at ROLLBACK); a bare RUN
         // auto-commits.
-        let run_result = if inside_tx {
-            self.backend.run_in_tx(cypher, params).await
+        //
+        // While it executes, keep reading complete framed messages. This is
+        // necessary to observe TCP/TLS EOF: a single-task session otherwise
+        // cannot discover that the client disappeared until RUN returns.
+        // Legitimate pipelined PULL/DISCARD messages are replayed through the
+        // normal state machine afterwards.
+        let cancellation = RunCancellation::new();
+        let backend = Arc::clone(&self.backend);
+        let run = if inside_tx {
+            Box::pin(backend.run_in_tx_with_cancellation(cypher, params, cancellation.clone()))
         } else {
-            self.backend.run(cypher, params).await
+            Box::pin(backend.run_with_cancellation(cypher, params, cancellation.clone()))
+        };
+        tokio::pin!(run);
+        let run_result = loop {
+            tokio::select! {
+                // Prefer a ready EOF over a simultaneously-ready backend so a
+                // closed client never receives (or appears to receive) an ACK.
+                biased;
+                read = self
+                    .message_reader
+                    .read_message(&mut self.socket, POST_AUTH_MESSAGE_BYTES) => {
+                    match read {
+                        Ok(body) => {
+                            let next_bytes = self.prefetched_bytes.saturating_add(body.len());
+                            if self.prefetched_messages.len() >= MAX_PREFETCHED_MESSAGES
+                                || next_bytes > MAX_PREFETCHED_BYTES
+                            {
+                                cancellation.cancel();
+                                // The backend owns cleanup semantics. Await it
+                                // before unwinding so staged mutations and the
+                                // single-writer guard cannot escape this
+                                // connection task.
+                                let _ = run.as_mut().await;
+                                return Err(BoltError::TooLarge {
+                                    what: "pipelined messages during RUN",
+                                    len: next_bytes,
+                                    max: MAX_PREFETCHED_BYTES,
+                                });
+                            }
+                            self.prefetched_bytes = next_bytes;
+                            self.prefetched_messages.push_back(body);
+                        }
+                        Err(error) => {
+                            cancellation.cancel();
+                            // Never drop the backend future at an arbitrary
+                            // durability boundary. A cancellation-aware backend
+                            // stops its apply phase, rolls staged state back,
+                            // or completes an already-started commit, then
+                            // returns and releases the writer.
+                            let _ = run.as_mut().await;
+                            return Err(error);
+                        }
+                    }
+                }
+                result = run.as_mut() => break result,
+            }
         };
         let outcome = match run_result {
             Ok(o) => o,
@@ -923,11 +1163,69 @@ mod tests {
     use bytes::BytesMut;
     use namidb_query::exec::NodeValue;
     use namidb_query::Row;
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
-    use tokio::io::duplex;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
     struct StaticBackend {
         outcome: StdMutex<Option<RunOutcome>>,
+    }
+
+    /// Test transport that reports how many bytes the server consumed after
+    /// it is armed. This lets the partial-frame regression prove the decoder
+    /// reached the middle of a chunk body before RUN is allowed to finish.
+    struct ReadObservedStream {
+        inner: DuplexStream,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        bytes_read: Arc<std::sync::atomic::AtomicUsize>,
+        target: usize,
+        target_reached: Arc<Notify>,
+    }
+
+    impl AsyncRead for ReadObservedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(())))
+                && self.armed.load(std::sync::atomic::Ordering::Acquire)
+            {
+                let read = buf.filled().len().saturating_sub(before);
+                let total = self
+                    .bytes_read
+                    .fetch_add(read, std::sync::atomic::Ordering::AcqRel)
+                    .saturating_add(read);
+                if total >= self.target {
+                    self.target_reached.notify_one();
+                }
+            }
+            result
+        }
+    }
+
+    impl AsyncWrite for ReadObservedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
     }
 
     #[async_trait]
@@ -1062,6 +1360,264 @@ mod tests {
         let _ = task.await.unwrap();
     }
 
+    /// A session used to await `Backend::run` without touching the socket, so
+    /// dropping the client could leave an unbounded write holding the server's
+    /// single writer forever. The RUN reader now notices EOF, publishes the
+    /// cancellation token, and waits for backend cleanup before the session
+    /// exits.
+    #[tokio::test]
+    async fn disconnect_during_run_notifies_backend_and_finishes_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DisconnectAwareBackend {
+            started: Arc<Notify>,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Backend for DisconnectAwareBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                std::future::pending().await
+            }
+
+            async fn run_with_cancellation(
+                &self,
+                _cypher: &str,
+                _params: Params,
+                cancellation: RunCancellation,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                self.started.notify_one();
+                cancellation.cancelled().await;
+                self.cancelled.store(true, Ordering::SeqCst);
+                Err(BackendError::Other("client disconnected".into()))
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "disconnect-run".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(DisconnectAwareBackend {
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&cancelled),
+            }),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        for (tag, auth) in [
+            (crate::value::struct_tag::HELLO, BTreeMap::new()),
+            (crate::value::struct_tag::LOGON, {
+                let mut auth = BTreeMap::new();
+                auth.insert("scheme".into(), Value::String("none".into()));
+                auth
+            }),
+        ] {
+            write_msg(
+                &mut client,
+                &pack_request(&Value::Struct {
+                    tag,
+                    fields: vec![Value::Map(auth)],
+                }),
+            )
+            .await;
+            let _ = read_msg(&mut client).await;
+        }
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RUN,
+                fields: vec![
+                    Value::String("UNBOUNDED WRITE".into()),
+                    Value::Map(BTreeMap::new()),
+                    Value::Map(BTreeMap::new()),
+                ],
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("backend RUN did not start");
+
+        drop(client);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("session stayed pinned after client EOF")
+            .expect("session task panicked");
+        assert!(result.is_err(), "EOF must terminate the session");
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "backend never observed disconnect cancellation"
+        );
+    }
+
+    /// RUN and PULL are commonly pipelined. If RUN wins `select!` after the
+    /// session has consumed a chunk header plus part of the PULL body, the
+    /// next state-machine iteration must resume that same body. Treating its
+    /// next two bytes as a fresh header corrupts the Bolt stream.
+    #[tokio::test]
+    async fn run_completion_preserves_partially_read_pipelined_pull() {
+        struct ControlledBackend {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Backend for ControlledBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                self.started.notify_one();
+                self.release.notified().await;
+                let mut bindings = BTreeMap::new();
+                bindings.insert("n".into(), RuntimeValue::Integer(7));
+                Ok(RunOutcome {
+                    fields: vec!["n".into()],
+                    rows: vec![Row { bindings }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_reached = Arc::new(Notify::new());
+        let (mut client, server) = duplex(64 * 1024);
+        let observed_server = ReadObservedStream {
+            inner: server,
+            armed: Arc::clone(&armed),
+            bytes_read: Arc::clone(&bytes_read),
+            // Two chunk-header bytes plus exactly one body byte.
+            target: 3,
+            target_reached: Arc::clone(&target_reached),
+        };
+        let session = Session::new(
+            observed_server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "partial-pipeline".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(ControlledBackend {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        for (tag, auth) in [
+            (crate::value::struct_tag::HELLO, BTreeMap::new()),
+            (crate::value::struct_tag::LOGON, {
+                let mut auth = BTreeMap::new();
+                auth.insert("scheme".into(), Value::String("none".into()));
+                auth
+            }),
+        ] {
+            write_msg(
+                &mut client,
+                &pack_request(&Value::Struct {
+                    tag,
+                    fields: vec![Value::Map(auth)],
+                }),
+            )
+            .await;
+            assert!(matches!(
+                decode_response(&read_msg(&mut client).await),
+                Response::Success(_)
+            ));
+        }
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RUN,
+                fields: vec![
+                    Value::String("MATCH (n) RETURN n".into()),
+                    Value::Map(BTreeMap::new()),
+                    Value::Map(BTreeMap::new()),
+                ],
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("backend RUN did not start");
+
+        let pull_body = pack_request(&Value::Struct {
+            tag: crate::value::struct_tag::PULL,
+            fields: vec![Value::Map({
+                let mut extra = BTreeMap::new();
+                extra.insert("n".into(), Value::Int(-1));
+                extra
+            })],
+        });
+        let chunk_len = u16::try_from(pull_body.len()).expect("test PULL fits one chunk");
+        let mut framed_pull = Vec::with_capacity(pull_body.len() + 4);
+        framed_pull.extend_from_slice(&chunk_len.to_be_bytes());
+        framed_pull.extend_from_slice(&pull_body);
+        framed_pull.extend_from_slice(&[0, 0]);
+
+        // Arm only after RUN has been decoded, then stop exactly after the
+        // PULL header and first body byte have reached StatefulMessageReader.
+        armed.store(true, std::sync::atomic::Ordering::Release);
+        client.write_all(&framed_pull[..3]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), target_reached.notified())
+            .await
+            .expect("session did not consume the partial PULL body");
+        assert_eq!(bytes_read.load(std::sync::atomic::Ordering::Acquire), 3);
+
+        // Complete RUN while its concurrent frame read is suspended in the
+        // body phase. The RUN header SUCCESS arrives before the rest of PULL.
+        release.notify_one();
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        client.write_all(&framed_pull[3..]).await.unwrap();
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Record(values) => assert_eq!(values, vec![Value::Int(7)]),
+            other => panic!("expected intact pipelined PULL RECORD, got {other:?}"),
+        }
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("session did not finish")
+            .expect("session task panicked")
+            .expect("session failed after resumed partial PULL");
+    }
+
     async fn send_handshake<W: AsyncWriteExt + Unpin>(w: &mut W) {
         let mut bytes = Vec::with_capacity(20);
         bytes.extend_from_slice(&MAGIC);
@@ -1087,7 +1643,9 @@ mod tests {
     }
 
     async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> Vec<u8> {
-        read_message(r, POST_AUTH_MESSAGE_BYTES).await.unwrap()
+        crate::chunk::read_message(r, POST_AUTH_MESSAGE_BYTES)
+            .await
+            .unwrap()
     }
 
     fn decode_response(body: &[u8]) -> Response {

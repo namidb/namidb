@@ -171,16 +171,28 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             input,
             label,
             alias,
+            property,
+            multi,
             ..
         } => {
             let child = estimate_inner(input, catalog);
-            // Point lookup: each input row triggers at most one hit.
-            let rows = child.rows.min(child.rows.max(1.0));
+            // A unique lookup emits at most one row per input row. Equality
+            // posting lookups can fan out: use the observed NDV when
+            // available, and a conservative equality-selectivity fallback
+            // otherwise. The label-agnostic form sums the per-label
+            // estimates because uniqueness is label-scoped; the same value
+            // may legitimately be owned by one node in each label.
+            let fanout = if *multi {
+                property_lookup_fanout(catalog, label, property)
+            } else {
+                1.0
+            };
+            let rows = child.rows * fanout;
             let mut bindings = child.bindings.clone();
             bindings.insert(
                 alias.clone(),
                 BindingMeta {
-                    label: Some(label.clone()),
+                    label: (!label.is_empty()).then(|| label.clone()),
                     ..Default::default()
                 },
             );
@@ -657,6 +669,39 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
     }
 }
 
+/// Expected matches produced by one non-unique equality posting lookup.
+///
+/// Keep the estimate at least one: the optimizer selected this operator
+/// because an index exists, and underestimating a global lookup as a unique
+/// point probe is much more damaging to join ordering than a small
+/// overestimate for a missing runtime value.
+fn property_lookup_fanout(catalog: &StatsCatalog, label: &str, property: &str) -> f64 {
+    const FALLBACK_EQ_SELECTIVITY: f64 = 0.10;
+
+    let per_label = |label: &str| {
+        let Some(stats) = catalog.label(label) else {
+            return 0.0;
+        };
+        let Some(property_stats) = stats.properties.get(property) else {
+            return 0.0;
+        };
+        if property_stats.unique {
+            return f64::from(property_stats.non_null_count > 0 || stats.node_count > 0);
+        }
+        match property_stats.ndv {
+            Some(ndv) if ndv > 0 => property_stats.non_null_count as f64 / ndv as f64,
+            _ => property_stats.non_null_count as f64 * FALLBACK_EQ_SELECTIVITY,
+        }
+    };
+
+    let estimate = if label.is_empty() {
+        catalog.label_names().map(per_label).sum::<f64>()
+    } else {
+        per_label(label)
+    };
+    estimate.max(1.0)
+}
+
 /// AGM (Atserias-Grohe-Marx) upper bound on the output cardinality of
 /// the multiway join. The Atserias-Grohe-Marx theorem says the maximum
 /// number of output tuples for a join query is
@@ -1052,6 +1097,43 @@ mod tests {
         let c = estimate(&person_scan(), &cat);
         assert_eq!(c.rows, 1000.0);
         assert_eq!(c.bindings["p"].label.as_deref(), Some("Person"));
+    }
+
+    #[test]
+    fn global_multi_property_lookup_accounts_for_per_label_owners() {
+        let mut cat = StatsCatalog::empty();
+        for name in ["A", "B"] {
+            cat.__test_insert_label(LabelStats {
+                name: name.into(),
+                node_count: 100,
+                properties: BTreeMap::from([(
+                    "key".into(),
+                    PropStats {
+                        non_null_count: 100,
+                        unique: true,
+                        indexed: false,
+                        ..Default::default()
+                    },
+                )]),
+            });
+        }
+        let plan = LogicalPlan::NodeByPropertyValue {
+            input: Box::new(LogicalPlan::Empty),
+            label: String::new(),
+            alias: "n".into(),
+            property: "key".into(),
+            value: Expression {
+                kind: ExpressionKind::Literal(Literal::String("shared".into())),
+                span: span(),
+            },
+            multi: true,
+        };
+        let c = estimate(&plan, &cat);
+        assert_eq!(
+            c.rows, 2.0,
+            "label-scoped uniqueness permits one global hit per label"
+        );
+        assert_eq!(c.bindings["n"].label, None);
     }
 
     #[test]

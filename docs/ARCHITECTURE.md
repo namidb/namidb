@@ -4,13 +4,13 @@
 
 | | |
 |---|---|
-| **Version** | 2.0.0 |
+| **Version** | 2.0.2 |
 | **Scope** | The complete engine as implemented on the `main` branch: storage, durability, compaction, query execution, vector and full-text search, graph algorithms, and the service layer. |
 | **Audience** | Systems engineers, database researchers, and graduate students. This document is written to be cited and taught from; it explains mechanism, complexity, and correctness arguments rather than usage. |
 | **Companion material** | The design-proposal record lives in [`docs/rfc/`](./rfc/) (RFCs 001–036); operational guidance in [`docs/multi-tenancy.md`](./multi-tenancy.md); user-facing documentation in the top-level [`README.md`](../README.md). |
 | **How to read it** | Sections are self-contained and cross-reference each other. §1 states the thesis and the system model; §2–§4 are the storage substrate; §5 is the query engine; §6–§7 are the search and analytics layers; §8 is the service and concurrency layer; §9–§10 describe how the system was built and how it is evaluated. |
 
-> **On accuracy.** Every mechanism below is grounded in the source as it exists at 2.0.0, with inline file references (e.g. `crates/namidb-storage/src/manifest.rs`). Where a design RFC and the shipped code diverge, this report documents the **code**. Constants, budgets, and format magic numbers are read out of the source, not assumed.
+> **On accuracy.** Every mechanism below is grounded in the source as it exists at 2.0.2, with inline file references (e.g. `crates/namidb-storage/src/manifest.rs`). Where a design RFC and the shipped code diverge, this report documents the **code**. Constants, budgets, and format magic numbers are read out of the source, not assumed.
 
 ---
 
@@ -255,7 +255,9 @@ Point lookup `lookup_node_by_id` (`read.rs:1440`) probes the memtable, then the 
 
 ### Read-your-own-writes overlay (RFC-026)
 
-A writer's staged-but-uncommitted batch lives in `pending_payloads: Vec<(MemKey, u64, MemOp)>`, absent from `published_memtable` by design. `WriterSession::overlay_snapshot()` (`ingest.rs:631`) replays that batch (LSN-ascending) into a second `Memtable`, freezes it, and attaches it as `Snapshot::overlay: Option<MemtableSnapshot>`. The read paths chain the two sources: `node_entries()` returns `memtable.iter_nodes().chain(overlay…)`, and `node_mem_entry(id)` compares the two LSNs directly. Correctness rests on one invariant: **staged LSNs are strictly greater than any committed LSN** (the writer seeds `next_lsn` past every committed LSN on open), so the existing last-LSN-wins merge resolves a staged upsert over the committed row and a staged tombstone hides it — no separate read engine. The code guards this with `debug_assert!(s.lsn > c.lsn)` yet still takes `s.lsn >= c.lsn`, degrading gracefully to last-LSN-wins if allocation ever regressed. The overlay covers nodes and edges (`edge_mem_entries` feeds the SST and CSR edge paths and `sorted_partners`). Crucially, `overlay_snapshot()` attaches the immutable body/adjacency caches but **not** the cross-snapshot NodeView or property-index caches: those are keyed by manifest version and shared across sessions, so caching a staged row would leak uncommitted data to a concurrent reader pinned at the same version.
+A writer's staged-but-uncommitted batch lives in `pending_payloads: Vec<(MemKey, u64, MemOp)>`, absent from `published_memtable` by design, and simultaneously in an incrementally maintained `staged_memtable`. `WriterSession::overlay_snapshot()` freezes the latter through its persistent `OrdMap` in O(1) and attaches it as `Snapshot::overlay: Option<MemtableSnapshot>`; it never replays the growing pending WAL per correlated lookup. The read paths chain the two sources: `node_entries()` returns `memtable.iter_nodes().chain(overlay…)`, and `node_mem_entry(id)` compares the two LSNs directly. Correctness rests on one invariant: **staged LSNs are strictly greater than any committed LSN** (the writer seeds `next_lsn` past every committed LSN on open), so the existing last-LSN-wins merge resolves a staged upsert over the committed row and a staged tombstone hides it — no separate read engine. The code guards this with `debug_assert!(s.lsn > c.lsn)` yet still takes `s.lsn >= c.lsn`, degrading gracefully to last-LSN-wins if allocation ever regressed. The overlay covers nodes and edges (`edge_mem_entries` feeds the SST and CSR edge paths and `sorted_partners`).
+
+Shared NodeView/property caches remain detached from overlays because they are keyed by manifest version and would leak staged rows to concurrent readers. Instead, an overlay borrows the writer-private transactional property index. Its `(label, property tuple) → value → holders` maps are populated once, maintained by every staged upsert/tombstone, preserved across commit/flush, and journalled for exact rollback. The holder representation keeps a singleton inline and promotes only duplicate/non-unique postings to a set, so 1.5M distinct keys do not allocate 1.5M tiny hash tables. Consequently both unique and non-unique indexed `MERGE`/correlated `MATCH` remain O(1) or O(matches) after one population while retaining exact residual confirmation.
 
 ### Ranged reads and pushdown (RFC-003/011/013/015)
 
@@ -269,7 +271,10 @@ Four process-wide singletons, each byte-budgeted, keyed to be namespace-safe:
 |---|---|---|---|
 | `SstCache.inner` (`cache.rs`) | foyer `Cache<String,Bytes>` body cache, weight `key.len()+value.len()` | 256 MiB (`NAMIDB_SST_CACHE_BUDGET_MIB`) | S3-FIFO |
 | `SstCache.decoded_node_row_groups` | foyer `Cache<(String,usize),Arc<Vec<RecordBatch>>>`, weight = key + Arrow `get_array_memory_size` | 256 MiB (`NAMIDB_DECODED_NODE_RG_..`) | S3-FIFO |
-| `SstCache` side maps | `Arc<Mutex<HashMap<String,…>>>` for parsed `ParquetMetaData`, `EdgeStreamBundle`, `EdgeSstReader`, decoded `.ft`/`.vg` indexes | unbounded | pruned by `retain_paths` |
+| `SstCache.metadata` | weighted foyer cache for parsed `ParquetMetaData` | 64 MiB (`NAMIDB_SST_METADATA_CACHE_BUDGET_MIB`) | S3-FIFO + manifest pruning |
+| `SstCache.edge_streams` / `edge_readers` | weighted foyer caches for decoded property streams and CSR readers | 256 MiB each (`NAMIDB_EDGE_STREAM_CACHE_BUDGET_MIB`, `NAMIDB_EDGE_READER_CACHE_BUDGET_MIB`) | S3-FIFO + manifest pruning |
+| `SstCache.property_sidecars` / `bloom_filters` | weighted foyer caches for equality postings and parsed blooms | 512 / 64 MiB (`NAMIDB_PROPERTY_SIDECAR_CACHE_BUDGET_MIB`, `NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB`) | S3-FIFO + manifest pruning |
+| `SstCache.text_indexes` / `vector_indexes` | weighted foyer caches for decoded `.ft` / `.vg` indexes | 512 MiB each (`NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB`, `NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB`) | S3-FIFO + manifest pruning |
 | `NodeViewCache` (RFC-019) | `HashMap<NodeCacheKey,(CachedNodeView,seq)>` + `BTreeMap<(version,seq),key>` order index | 256 MiB (`NAMIDB_NODE_CACHE_..`) | oldest manifest version, O(log n) |
 | `AdjacencyCache` (RFC-018) | `Mutex<HashMap<AdjacencyKey,Arc<EdgeAdjacency>>>` | 512 MiB (`NAMIDB_ADJACENCY_..`) | lowest manifest version |
 
@@ -325,7 +330,7 @@ Factorization (RFC-017, `crates/namidb-query/src/exec/factor.rs`) replaces `Vec<
 
 ### The write path
 
-Write execution (RFC-009, `crates/namidb-query/src/exec/writer.rs`) drives a `LogicalPlan` against a mutable `WriterSession`, delegating read sub-plans to the read walker over `WriterSession::overlay_snapshot`, which reflects the staged batch so a `MATCH`/`MERGE`-probe/unique-check sees the writer's own uncommitted rows (read-your-own-writes, RFC-026). `execute_write_inner` iterates input rows and applies each write operator per row: `apply_create` builds `core_props`, resolves `{_id: …}` to the storage `NodeId` (rejecting a collision against the overlay), enforces unique/composite-unique/NOT-NULL/vector-dimension constraints, then calls `upsert_node_with_labels` / `upsert_edge`; `apply_sets`/`apply_removes` re-upsert the mutated node; `apply_delete` tombstones the target (with `detach=true` first stripping incident edges across every edge type in the manifest schema via `detach_incident_edges`); `MERGE` (`apply_merge`) probes the pattern (single node or one node-rel-node chain) against the overlay and applies `ON MATCH SET` on a hit or `apply_create` + `ON CREATE SET` on a miss. Unique-constraint checking (`find_unique_conflict`/`find_composite_conflict`) probes the per-writer transactional unique-value index via `writer.unique_probe`, which returns `Conflict(id)`/`NoConflict`/`Unindexable`; `Unindexable` (non-scalar value) falls back to a label scan over the overlay, the source of truth. A write commit becomes a memtable+WAL commit in `WriterSession::commit_batch`: staged mutations accumulate as WAL records and `pending_payloads` `(MemKey, LSN, MemOp)`; commit seals the pending WAL segment, PUTs it with `PutMode::Create`, CAS-swaps the `Manifest` to register the segment (epoch-fenced), and only after the CAS lands drains `pending_payloads` into the in-memory memtable; any failure before the CAS leaves the memtable untouched, and `execute_write` `discard_batch`es on error so a shared long-lived writer is not left with orphan records.
+Write execution (RFC-009, `crates/namidb-query/src/exec/writer.rs`) drives a `LogicalPlan` against a mutable `WriterSession`, delegating read sub-plans to the read walker over `WriterSession::overlay_snapshot`, which reflects the staged batch so a `MATCH`/`MERGE`-probe/unique-check sees the writer's own uncommitted rows (read-your-own-writes, RFC-026). `execute_write_inner` iterates input rows and applies each write operator per row: `apply_create` builds `core_props`, resolves `{_id: …}` to the storage `NodeId` (rejecting a collision against the overlay), enforces unique/composite-unique/NOT-NULL/vector-dimension constraints, then calls `upsert_node_with_labels` / `upsert_edge`; `apply_sets`/`apply_removes` re-upsert the mutated node; `apply_delete` tombstones the target (with `detach=true` first stripping incident edges across every edge type in the manifest schema via `detach_incident_edges`); `MERGE` (`apply_merge`) probes the pattern (single node or one node-rel-node chain) against the overlay and applies `ON MATCH SET` on a hit or `apply_create` + `ON CREATE SET` on a miss. Unique-constraint checking (`find_unique_conflict`/`find_composite_conflict`) probes the per-writer transactional property index via `writer.unique_probe`, which returns `Conflict(id)`/`NoConflict`/`Unindexable`; the same holder maps serve non-unique string postings. `Unindexable` values fall back to the exact overlay scan. A write commit becomes a memtable+WAL commit in `WriterSession::commit_batch`: staged mutations accumulate as WAL records and `pending_payloads` `(MemKey, LSN, MemOp)` while `staged_memtable` keeps their last-write-wins view; commit seals the pending WAL segment, PUTs it with `PutMode::Create`, CAS-swaps the `Manifest` to register the segment (epoch-fenced), and only after the CAS lands drains `pending_payloads` into the committed in-memory memtable and clears the staged view. Any failure before the CAS leaves committed memory untouched, and `execute_write` `discard_batch`es on error, clears the staged view, and rolls the property-index journal back so a shared long-lived writer is not left with orphan state.
 
 ### The value and equality model
 
@@ -708,7 +713,7 @@ The project's design record. Each is at `docs/rfc/<n>-*.md`.
 
 ## Appendix B: Selected Constants and Defaults
 
-Read from the source at 2.0.0. Runtime-tunable values give their environment variable.
+Read from the source at 2.0.2. Runtime-tunable values give their environment variable.
 
 | Subsystem | Constant | Value |
 |---|---|---|
@@ -728,8 +733,8 @@ Read from the source at 2.0.0. Runtime-tunable values give their environment var
 | Kernels | deadline poll stride | 4096 iterations |
 | Bolt | max nesting depth; max frame; pre/post-auth message cap; connection cap; max tx lifetime | 128; 16 MiB; 64 KiB / 16 MiB; 1024 (`NAMIDB_BOLT_MAX_CONNECTIONS`); 300 s |
 | Server | writer-lock timeout; flush/stall bytes; HTTP timeout; HTTP concurrency; max namespaces; idle timeout | 30 s (`NAMIDB_WRITER_LOCK_TIMEOUT`); 64 MiB / 256 MiB; 120 s; 1024; 100; 1 h |
-| Caches (process-wide, global budget) | SST body; decoded row-group tier | 256 MiB (`NAMIDB_SST_CACHE_BUDGET_MIB`); 256 MiB (`NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`) |
+| Caches (process-wide, per-tier global budgets) | SST body; decoded row group; metadata; edge stream/reader; property/bloom; text/vector | 256; 256; 64; 256/256; 512/64; 512/512 MiB (all overrideable with the `NAMIDB_*_CACHE_BUDGET_MIB` variables above) |
 
 ---
 
-<sub>NamiDB is developed by NamiDB, Inc. (Delaware, USA) and licensed under the Business Source License 1.1. This report describes version 2.0.0. Corrections and questions: the source is the authority; every claim here is traceable to a file path cited inline.</sub>
+<sub>NamiDB is developed by NamiDB, Inc. (Delaware, USA) and licensed under the Business Source License 1.1. This report describes version 2.0.2. Corrections and questions: the source is the authority; every claim here is traceable to a file path cited inline.</sub>

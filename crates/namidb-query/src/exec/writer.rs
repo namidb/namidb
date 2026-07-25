@@ -31,10 +31,10 @@ use namidb_core::id::NodeId;
 use namidb_core::value::Value as CoreValue;
 use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, UniqueProbe, WriterSession};
 
-use super::expr::{evaluate, Params};
+use super::expr::{evaluate, is_equal, Params};
 use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
-use super::walker::{execute_inner, ExecError};
+use super::walker::{execute_inner_with_routing, ExecError, PlanRouting};
 use crate::parser::{Expression, RelationshipDirection};
 use crate::plan::logical::{CreateElement, LogicalPlan, RemoveOp, SetOp};
 
@@ -81,10 +81,15 @@ pub async fn execute_write_staged_with_deadline(
     deadline: Option<Instant>,
 ) -> Result<WriteOutcome, ExecError> {
     let mut outcome = WriteOutcome::default();
+    // Analyse the complete statement once. Read subplans delegated from below
+    // must retain write-parent context: in particular, an Expand under bare
+    // `DELETE r` needs the sparse identity route instead of looking like an
+    // unreferenced topology-only Expand and rebuilding a whole-type CSR.
+    let routing = PlanRouting::analyze(plan);
     let rows = crate::exec::limits::with_limits(
         deadline,
         None,
-        execute_write_inner(plan, writer, params, &mut outcome),
+        execute_write_inner(plan, writer, params, &mut outcome, &routing),
     )
     .await?;
     outcome.rows = rows;
@@ -145,12 +150,13 @@ fn execute_write_inner<'a>(
     writer: &'a mut WriterSession,
     params: &'a Params,
     outcome: &'a mut WriteOutcome,
+    routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
     async move {
         match plan {
             // ─── Write operators ────────────────────────────────────
             LogicalPlan::Create { input, elements } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
@@ -161,7 +167,7 @@ fn execute_write_inner<'a>(
             }
 
             LogicalPlan::Set { input, items } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
@@ -172,7 +178,7 @@ fn execute_write_inner<'a>(
             }
 
             LogicalPlan::Remove { input, items } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
@@ -187,7 +193,7 @@ fn execute_write_inner<'a>(
                 targets,
                 detach,
             } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
@@ -203,7 +209,7 @@ fn execute_write_inner<'a>(
                 on_match_sets,
                 on_create_sets,
             } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len().max(1));
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
@@ -228,7 +234,7 @@ fn execute_write_inner<'a>(
                 list,
                 body,
             } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 for row in &rows {
                     crate::exec::limits::check_deadline()?;
                     let items = match evaluate(list, row, params)? {
@@ -254,7 +260,7 @@ fn execute_write_inner<'a>(
             // each subplan row. A read-only Apply falls through to the read
             // delegation below.
             LogicalPlan::Apply { input, subplan } if subplan.contains_write() => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in &rows {
                     crate::exec::limits::check_deadline()?;
@@ -278,7 +284,7 @@ fn execute_write_inner<'a>(
                 distinct,
                 discard_input_bindings,
             } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut projected = crate::exec::walker::project_rows(
                     &rows,
                     items,
@@ -291,7 +297,7 @@ fn execute_write_inner<'a>(
                 Ok(projected)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     let v = evaluate(predicate, &row, params)?;
@@ -309,7 +315,7 @@ fn execute_write_inner<'a>(
             } => {
                 let skip = crate::exec::walker::resolve_row_count(skip, params, "SKIP")?;
                 let limit = crate::exec::walker::resolve_row_count(limit, params, "LIMIT")?;
-                let mut rows = execute_write_inner(input, writer, params, outcome).await?;
+                let mut rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 if !keys.is_empty() {
                     crate::exec::walker::sort_rows(&mut rows, keys, params)?;
                 }
@@ -333,7 +339,7 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
             LogicalPlan::Distinct { input } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 Ok(crate::exec::walker::dedup_rows(rows))
             }
             LogicalPlan::Aggregate {
@@ -341,11 +347,11 @@ fn execute_write_inner<'a>(
                 group_by,
                 aggregations,
             } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 crate::exec::walker::execute_aggregate(rows, group_by, aggregations, params)
             }
             LogicalPlan::Unwind { input, list, alias } => {
-                let rows = execute_write_inner(input, writer, params, outcome).await?;
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::new();
                 for row in rows {
                     let v = evaluate(list, &row, params)?;
@@ -369,8 +375,8 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
             LogicalPlan::Union { left, right, all } => {
-                let mut l = execute_write_inner(left, writer, params, outcome).await?;
-                let r = execute_write_inner(right, writer, params, outcome).await?;
+                let mut l = execute_write_inner(left, writer, params, outcome, routing).await?;
+                let r = execute_write_inner(right, writer, params, outcome, routing).await?;
                 l.extend(r);
                 if *all {
                     Ok(l)
@@ -379,8 +385,8 @@ fn execute_write_inner<'a>(
                 }
             }
             LogicalPlan::CrossProduct { left, right } => {
-                let l = execute_write_inner(left, writer, params, outcome).await?;
-                let r = execute_write_inner(right, writer, params, outcome).await?;
+                let l = execute_write_inner(left, writer, params, outcome, routing).await?;
+                let r = execute_write_inner(right, writer, params, outcome, routing).await?;
                 Ok(crate::exec::walker::cross_product(l, r))
             }
 
@@ -389,14 +395,14 @@ fn execute_write_inner<'a>(
                 // never touch subtrees that contain writes). In a write
                 // path we delegate to the post-write snapshot reader so
                 // the executor lives in exactly one place.
-                let snap = writer.overlay_snapshot();
-                crate::exec::walker::execute_inner(plan, &snap, params, None).await
+                let snap = snapshot_for_write_read(writer, routing);
+                execute_inner_with_routing(plan, &snap, params, None, routing).await
             }
 
             LogicalPlan::EdgeTypeCount { .. } => {
                 // Read-only leaf: delegate to the post-write snapshot reader.
-                let snap = writer.overlay_snapshot();
-                crate::exec::walker::execute_inner(plan, &snap, params, None).await
+                let snap = snapshot_for_write_read(writer, routing);
+                execute_inner_with_routing(plan, &snap, params, None, routing).await
             }
 
             // ─── NodeById can have a write-bearing input (e.g. CREATE
@@ -409,8 +415,9 @@ fn execute_write_inner<'a>(
                 alias,
                 id,
             } => {
-                let input_rows = execute_write_inner(input, writer, params, outcome).await?;
-                let snap = writer.overlay_snapshot();
+                let input_rows =
+                    execute_write_inner(input, writer, params, outcome, routing).await?;
+                let snap = snapshot_for_write_read(writer, routing);
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let id_value = evaluate(id, &row, params)?;
@@ -444,8 +451,11 @@ fn execute_write_inner<'a>(
                 value,
                 multi,
             } => {
-                let input_rows = execute_write_inner(input, writer, params, outcome).await?;
-                let snap = writer.overlay_snapshot();
+                let input_rows =
+                    execute_write_inner(input, writer, params, outcome, routing).await?;
+                let use_transactional =
+                    routing.transactional_property_reads() || writer.has_staged_node_mutations();
+                let snap = snapshot_for_write_read(writer, routing);
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
@@ -465,14 +475,16 @@ fn execute_write_inner<'a>(
                             );
                             out.push(new_row);
                         }
-                    } else if let Some(view) =
-                        crate::exec::walker::lookup_node_by_property_via_scan(
-                            &snap,
-                            label,
-                            property,
-                            &lookup_val,
-                        )
-                        .await?
+                    } else if let Some(view) = lookup_unique_node_for_write(
+                        writer,
+                        &snap,
+                        label,
+                        property,
+                        &lookup_val,
+                        value,
+                        use_transactional,
+                    )
+                    .await?
                     {
                         let mut new_row = row;
                         new_row.set(
@@ -493,10 +505,10 @@ fn execute_write_inner<'a>(
             // materialise the source rows, then run the traversal step against
             // the read-your-own-writes overlay so the just-staged edge is
             // visible. A pure-read Expand still falls to the read-leaf arm
-            // below. `want_properties = true` / `skip_target_materialize =
-            // false`: the routing optimisation that prunes those is a read-only
-            // walker concern, so materialise fully here (correct, just not
-            // pruned).
+            // below. `EdgeReadMode::Properties` / `skip_target_materialize =
+            // false`: the routing optimisation that prunes those is a
+            // read-only walker concern, so materialise fully here (correct,
+            // just not pruned).
             LogicalPlan::Expand {
                 input,
                 source,
@@ -511,8 +523,9 @@ fn execute_write_inner<'a>(
                 shortest,
                 path_binding,
             } if input.contains_write() => {
-                let input_rows = execute_write_inner(input, writer, params, outcome).await?;
-                let snap = writer.overlay_snapshot();
+                let input_rows =
+                    execute_write_inner(input, writer, params, outcome, routing).await?;
+                let snap = snapshot_for_write_read(writer, routing);
                 let length = crate::exec::walker::resolve_length(length, params)?;
                 crate::exec::walker::execute_expand(
                     input_rows,
@@ -528,7 +541,7 @@ fn execute_write_inner<'a>(
                     *shortest,
                     path_binding.as_deref(),
                     &snap,
-                    true,
+                    crate::exec::walker::EdgeReadMode::Properties,
                     false,
                     None,
                 )
@@ -548,12 +561,153 @@ fn execute_write_inner<'a>(
             | LogicalPlan::MultiwayJoin { .. }
             | LogicalPlan::VectorSearch { .. }
             | LogicalPlan::CallProcedure { .. } => {
-                let snap = writer.overlay_snapshot();
-                execute_inner(plan, &snap, params, None).await
+                let snap = snapshot_for_write_read(writer, routing);
+                execute_inner_with_routing(plan, &snap, params, None, routing).await
             }
         }
     }
     .boxed()
+}
+
+fn snapshot_for_write_read<'a>(
+    writer: &'a WriterSession,
+    routing: &PlanRouting,
+) -> namidb_storage::Snapshot<'a> {
+    if routing.transactional_property_reads() || writer.has_staged_node_mutations() {
+        writer.transactional_overlay_snapshot()
+    } else {
+        writer.overlay_snapshot()
+    }
+}
+
+/// Unique-property lookup used by write plans after their input may already
+/// have staged node mutations.
+///
+/// The read-only walker can use committed caches/SST sidecars, but a RYOW
+/// lookup must also see values claimed or freed earlier in the transaction.
+/// Probe the writer-private transactional tuple index, including the small
+/// I64/F64 variant set required by Cypher numeric equality, then confirm the
+/// candidate against the exact overlay snapshot. Unindexable values retain the
+/// scan fallback; NULL never matches under three-valued equality.
+async fn lookup_unique_node_for_write(
+    writer: &WriterSession,
+    snapshot: &namidb_storage::Snapshot<'_>,
+    label: &str,
+    property: &str,
+    lookup_value: &RuntimeValue,
+    value_expr: &Expression,
+    use_transactional: bool,
+) -> Result<Option<namidb_storage::NodeView>, ExecError> {
+    if lookup_value.is_null() {
+        return Ok(None);
+    }
+    if matches!(lookup_value, RuntimeValue::String(_)) && !use_transactional {
+        // Edge-only plans do not invalidate node-property state. Their
+        // committed unique sidecar/cache is the true point-read path and
+        // avoids a cold full-label population on a large reopened store.
+        // Node-mutating plans select the transactional map below.
+        return crate::exec::walker::lookup_node_by_property_via_scan(
+            snapshot,
+            label,
+            property,
+            lookup_value,
+        )
+        .await;
+    }
+    let declared_unique = !label.is_empty()
+        && writer.schema().label(label).is_some_and(|def| {
+            def.properties
+                .iter()
+                .any(|prop| prop.name == property && prop.unique)
+        });
+    if !declared_unique {
+        return crate::exec::walker::lookup_node_by_property_via_scan(
+            snapshot,
+            label,
+            property,
+            lookup_value,
+        )
+        .await;
+    }
+
+    let core = match runtime_to_core(lookup_value, value_expr) {
+        Ok(core) => core,
+        Err(_) => {
+            // A runtime Node/Rel/Path is not a storable index key. Preserve the
+            // expression engine's previous comparison semantics (normally no
+            // match) instead of turning a read predicate into a write error.
+            return crate::exec::walker::lookup_node_by_property_via_scan(
+                snapshot,
+                label,
+                property,
+                lookup_value,
+            )
+            .await;
+        }
+    };
+    let tuple = vec![(property.to_string(), core)];
+    let Some(variants) = merge_unique_probe_variants(&tuple) else {
+        return crate::exec::walker::lookup_node_by_property_via_scan(
+            snapshot,
+            label,
+            property,
+            lookup_value,
+        )
+        .await;
+    };
+
+    let mut candidate_ids = BTreeSet::new();
+    for variant in variants {
+        let refs: Vec<(&str, &CoreValue)> = variant
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect();
+        match writer
+            .unique_probe(label, &refs, None)
+            .await
+            .map_err(ExecError::Storage)?
+        {
+            UniqueProbe::Conflict(id) => {
+                candidate_ids.insert(id);
+            }
+            UniqueProbe::NoConflict => {}
+            UniqueProbe::Unindexable => {
+                return crate::exec::walker::lookup_node_by_property_via_scan(
+                    snapshot,
+                    label,
+                    property,
+                    lookup_value,
+                )
+                .await;
+            }
+        }
+    }
+
+    let mut confirmed: Option<namidb_storage::NodeView> = None;
+    for id in candidate_ids {
+        let Some(view) = snapshot
+            .lookup_node(label, id)
+            .await
+            .map_err(ExecError::Storage)?
+        else {
+            continue;
+        };
+        let matches = view
+            .properties
+            .get(property)
+            .map(|stored| is_equal(&RuntimeValue::from(stored.clone()), lookup_value))
+            .unwrap_or(false);
+        if !matches {
+            continue;
+        }
+        let replace = confirmed.as_ref().is_none_or(|current| {
+            view.lsn > current.lsn || (view.lsn == current.lsn && view.id < current.id)
+        });
+        if replace {
+            confirmed = Some(view);
+        }
+    }
+    Ok(confirmed)
 }
 
 /// Execute a FOREACH body for one element, seeded with `seed` (the per-element
@@ -1976,9 +2130,21 @@ async fn find_merge_matches(
                 Some(RuntimeValue::Node(n)) => n.id,
                 _ => continue,
             };
+            // MERGE is a correlated relationship existence probe. Keep it on
+            // the source-keyed SST path instead of the manifest-versioned CSR:
+            // bulk loaders commit many small batches, so rebuilding the whole
+            // edge type after every commit would make relationship MERGE
+            // quadratic in the accumulated graph size. The full SST view is
+            // also required for correctness — relationship properties may be
+            // part of the MERGE pattern, returned through the alias, or used
+            // by ON MATCH SET (which must preserve the existing property map).
             let neighbours = match rel_direction {
-                RelationshipDirection::Right => snap.out_edges(rel_edge_type, source_node_id).await,
-                RelationshipDirection::Left => snap.in_edges(rel_edge_type, source_node_id).await,
+                RelationshipDirection::Right => {
+                    snap.out_edges_via_sst(rel_edge_type, source_node_id).await
+                }
+                RelationshipDirection::Left => {
+                    snap.in_edges_via_sst(rel_edge_type, source_node_id).await
+                }
                 RelationshipDirection::Both => {
                     return Err(ExecError::Runtime(
                         "MERGE relationship must be directed".into(),
@@ -2355,7 +2521,11 @@ async fn merge_node_candidates(
     if let Some((label, property, value)) =
         covered_merge_equality_key(writer, pattern.labels, &expected)
     {
-        let snap = writer.overlay_snapshot();
+        // MERGE can create/update a node, invalidating committed claimant
+        // caches at every auto-commit. Use the writer-private map even before
+        // the first staged mutation so one-row statements stay O(1) after one
+        // population.
+        let snap = writer.transactional_overlay_snapshot();
         let lookup_value = RuntimeValue::String(value);
         let candidates = crate::exec::walker::lookup_nodes_by_property_via_scan(
             &snap,

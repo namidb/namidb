@@ -382,22 +382,24 @@ fn bucket_nodes_and_edges(
     (nodes, edges)
 }
 
-/// Union of every `indexed` property across all schema labels, as a synthetic
-/// `LabelDef` used ONLY to harvest a node SST's equality-index sidecars (the
-/// columns themselves are built from an empty `LabelDef`). The equality index
-/// is rebuilt from the record values, so it survives the id-primary move.
+/// Union of every `indexed` or `unique` property across all schema labels, as
+/// a synthetic `LabelDef` used ONLY to harvest a node SST's equality posting
+/// sidecars (the columns themselves are built from an empty `LabelDef`).
 ///
-/// `unique` is intentionally cleared: a single-value unique sidecar cannot
-/// represent per-label uniqueness across a multi-label SST, so unique-property
-/// lookups fall back to a (correct) scan rather than risk a false negative.
+/// A single-value unique sidecar cannot represent per-label uniqueness across
+/// a multi-label SST, so `unique` is cleared and `indexed` is set instead. The
+/// posting list safely represents duplicate values from different labels and
+/// also gives label-agnostic `MATCH (n {key})` a global lookup route; callers
+/// confirm each candidate's current value and labels.
 pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
     let mut by_name: BTreeMap<String, PropertyDef> = BTreeMap::new();
     for label in schema.labels.values() {
         for p in &label.properties {
-            if p.indexed {
+            if p.indexed || p.unique {
                 by_name.entry(p.name.clone()).or_insert_with(|| {
                     let mut p = p.clone();
                     p.unique = false;
+                    p.indexed = true;
                     p
                 });
             }
@@ -798,9 +800,16 @@ impl LabelIndexCollector {
     pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
         for &lid in &rec.labels {
             let ids = self.index.entry(lid).or_default();
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+            // Node SST input is id-primary: flush receives one memtable
+            // winner per id and compaction emits one reconciled winner per
+            // id, both in ascending order. `record.labels` is itself
+            // sorted/deduplicated, so a linear `contains` here was redundant
+            // and made a 1.5M-node label sidecar O(N²).
+            debug_assert!(
+                ids.last().is_none_or(|previous| *previous < id),
+                "label posting input must be strictly id-ascending"
+            );
+            ids.push(id);
         }
     }
 
@@ -1180,15 +1189,26 @@ impl EqualitySidecarCollector {
         for (name, index) in &mut self.entries {
             if let Some(Value::Str(s)) = rec.properties.get(name) {
                 let ids = index.entry(s.clone()).or_default();
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
+                // Same id-primary invariant as LabelIndexCollector. For a
+                // low-cardinality value, `Vec::contains` made this posting
+                // construction quadratic in its frequency; append is O(1)
+                // and preserves the on-disk sorted/unique contract.
+                debug_assert!(
+                    ids.last().is_none_or(|previous| *previous < id),
+                    "equality posting input must be strictly id-ascending"
+                );
+                ids.push(id);
             }
         }
     }
 
-    /// Serialise the harvested postings into one sidecar per non-empty
-    /// property.
+    /// Serialise one sidecar per indexed property, including an empty map.
+    ///
+    /// The descriptor is also a coverage marker: readers can only prove that
+    /// a label-agnostic posting lookup is complete when every node SST
+    /// advertises the property. Omitting an empty sidecar (for example on a
+    /// tombstone-only SST) would force every later lookup back to a full graph
+    /// scan even though that SST contributes no claimant.
     pub(crate) fn finish(
         self,
         paths: &NamespacePaths,
@@ -1199,9 +1219,6 @@ impl EqualitySidecarCollector {
         let mut descriptors = Vec::new();
         let mut bodies = Vec::new();
         for (name, index) in self.entries {
-            if index.is_empty() {
-                continue;
-            }
             let distinct_values = index.len() as u64;
             let body_bytes = bincode::serialize(&index)
                 .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?;

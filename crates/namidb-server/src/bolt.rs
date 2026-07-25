@@ -12,13 +12,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use namidb_bolt::{
-    AuthPolicy, Authenticator, Backend, BackendError, RunOutcome, ServerInfo, Session,
-    StatementType, Value,
+    AuthPolicy, Authenticator, Backend, BackendError, RunCancellation, RunOutcome, ServerInfo,
+    Session, StatementType, Value,
 };
 use namidb_query::{
-    execute_with_limits, execute_write_staged_with_deadline, execute_write_with_deadline,
-    parse as cypher_parse, plan as build_plan, ExecError, LowerError, Params, ParseError, Row,
-    WriteOutcome,
+    execute_with_limits, execute_write_staged_with_deadline, parse as cypher_parse,
+    plan as build_plan, ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
 };
 use namidb_storage::WriterSession;
 use tokio::net::TcpListener;
@@ -27,7 +26,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{AuthConfig, Principal};
-use crate::metrics::{Protocol, QueryKind};
+use crate::metrics::{Protocol, QueryKind, WriterLockKind};
 use crate::AppState;
 
 /// One executed Bolt query, classified for metrics: read vs write (`None` if
@@ -46,6 +45,19 @@ struct RunObservation {
     kind: Option<QueryKind>,
     elapsed: std::time::Duration,
     result: std::result::Result<RunOutcome, BackendError>,
+}
+
+fn disconnected_observation(
+    started: std::time::Instant,
+    kind: Option<QueryKind>,
+) -> RunObservation {
+    RunObservation {
+        kind,
+        elapsed: started.elapsed(),
+        result: Err(BackendError::Other(
+            "Bolt client disconnected while RUN was executing".into(),
+        )),
+    }
 }
 
 /// In-flight explicit transaction (BEGIN..COMMIT/ROLLBACK). Holds the
@@ -142,7 +154,7 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+        let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
@@ -223,7 +235,7 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+        let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
@@ -289,7 +301,7 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+        let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
@@ -368,7 +380,7 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+        let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
@@ -452,7 +464,7 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
-        let Some(mut writer) = self.state.lock_writer_bounded().await else {
+        let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
                 elapsed: started.elapsed(),
@@ -527,8 +539,16 @@ impl ServerBackend {
     /// metrics. Mirrors the HTTP `run_cypher`. The stopwatch stops at the end
     /// of execution, before the optional write-stall sleep, so backpressure is
     /// not counted as query latency.
-    async fn run_query(&self, cypher: &str, params: Params) -> RunObservation {
+    async fn run_query(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: &RunCancellation,
+    ) -> RunObservation {
         let started = std::time::Instant::now();
+        if cancellation.is_cancelled() {
+            return disconnected_observation(started, None);
+        }
 
         let parsed = match cypher_parse(cypher) {
             Ok(p) => p,
@@ -637,6 +657,16 @@ impl ServerBackend {
                 result: Err(err),
             };
         }
+        if cancellation.is_cancelled() {
+            return disconnected_observation(
+                started,
+                Some(if plan.contains_write() {
+                    QueryKind::Write
+                } else {
+                    QueryKind::Read
+                }),
+            );
+        }
 
         if plan.contains_write() {
             // A read-only token may not write — reject before the writer lock.
@@ -651,22 +681,75 @@ impl ServerBackend {
             // bounded so queued writes fail fast behind a stuck writer.
             // On success we refresh the snapshot cell so subsequent reads
             // see the just-committed records (RFC-021).
-            let Some(mut writer) = self.state.lock_writer_bounded().await else {
+            let writer_lock = self.state.lock_writer_bounded(WriterLockKind::Bolt);
+            tokio::pin!(writer_lock);
+            let writer = tokio::select! {
+                writer = &mut writer_lock => writer,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Write));
+                }
+            };
+            let Some(mut writer) = writer else {
                 return RunObservation {
                     kind: Some(QueryKind::Write),
                     elapsed: started.elapsed(),
                     result: Err(writer_busy_error()),
                 };
             };
-            match execute_write_with_deadline(
-                &plan,
-                &mut writer,
-                &params,
-                self.state.write_deadline(),
-            )
-            .await
-            {
-                Ok(outcome) => {
+
+            // Applying a write only mutates the in-memory pending batch, so it
+            // is cancellation-safe: on EOF drop the apply future, discard the
+            // partial batch, and release the writer. The durability commit
+            // below is deliberately NOT selected against cancellation — once
+            // WAL/manifest publication starts it must run to a definite
+            // outcome before this guard can be released.
+            let staged = {
+                let apply = execute_write_staged_with_deadline(
+                    &plan,
+                    &mut writer,
+                    &params,
+                    self.state.write_deadline(),
+                );
+                tokio::pin!(apply);
+                tokio::select! {
+                    result = &mut apply => Some(result),
+                    _ = cancellation.cancelled() => None,
+                }
+            };
+            let outcome = match staged {
+                Some(Ok(outcome)) => outcome,
+                Some(Err(error)) => {
+                    writer.discard_batch();
+                    crate::recovery::recover_after_write_error(
+                        &mut writer,
+                        &self.state.snapshot,
+                        &self.state.writer_health,
+                        &self.state.namespace,
+                        &error,
+                    )
+                    .await;
+                    drop(writer);
+                    return RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed: started.elapsed(),
+                        result: Err(map_exec_err(error)),
+                    };
+                }
+                None => {
+                    writer.discard_batch();
+                    drop(writer);
+                    return disconnected_observation(started, Some(QueryKind::Write));
+                }
+            };
+
+            if cancellation.is_cancelled() {
+                writer.discard_batch();
+                drop(writer);
+                return disconnected_observation(started, Some(QueryKind::Write));
+            }
+
+            match writer.commit_batch().await {
+                Ok(_) => {
                     self.state.snapshot.store(writer.owned_snapshot());
                     // Soft write stall (RFC-027 P5): sample under the lock,
                     // release, then back off this request if L0 (or the
@@ -674,8 +757,19 @@ impl ServerBackend {
                     let stall = self.state.after_commit_backpressure(&writer);
                     drop(writer);
                     let elapsed = started.elapsed();
+                    if cancellation.is_cancelled() {
+                        return disconnected_observation(started, Some(QueryKind::Write));
+                    }
                     if let Some(delay) = stall {
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancellation.cancelled() => {
+                                return disconnected_observation(
+                                    started,
+                                    Some(QueryKind::Write),
+                                );
+                            }
+                        }
                     }
                     RunObservation {
                         kind: Some(QueryKind::Write),
@@ -683,22 +777,23 @@ impl ServerBackend {
                         result: Ok(write_run_outcome(outcome)),
                     }
                 }
-                Err(e) => {
+                Err(error) => {
+                    writer.discard_batch();
                     // A fenced/poisoned session would fail every later write
                     // on both protocols; reopen it in place under the lock.
-                    crate::recovery::recover_after_write_error(
+                    crate::recovery::recover_writer_if_needed(
                         &mut writer,
                         &self.state.snapshot,
                         &self.state.writer_health,
                         &self.state.namespace,
-                        &e,
+                        &error,
                     )
                     .await;
                     drop(writer);
                     RunObservation {
                         kind: Some(QueryKind::Write),
                         elapsed: started.elapsed(),
-                        result: Err(map_exec_err(e)),
+                        result: Err(map_storage_err(error)),
                     }
                 }
             }
@@ -707,14 +802,20 @@ impl ServerBackend {
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
             let snap = owned.borrow();
-            let rows = execute_with_limits(
+            let read = execute_with_limits(
                 &plan,
                 &snap,
                 &params,
                 self.state.query_deadline(),
                 self.state.query_row_cap(),
-            )
-            .await;
+            );
+            tokio::pin!(read);
+            let rows = tokio::select! {
+                rows = &mut read => rows,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
             let elapsed = started.elapsed();
             RunObservation {
                 kind: Some(QueryKind::Read),
@@ -727,8 +828,16 @@ impl ServerBackend {
     /// In-transaction query: stage writes into the held transaction's writer
     /// (no commit) or read with the staged batch overlaid (RFC-026), timing the
     /// work for the metrics. Mirrors the auto-commit `run_query`.
-    async fn run_query_in_tx(&self, cypher: &str, params: Params) -> RunObservation {
+    async fn run_query_in_tx(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: &RunCancellation,
+    ) -> RunObservation {
         let started = std::time::Instant::now();
+        if cancellation.is_cancelled() {
+            return disconnected_observation(started, None);
+        }
 
         let parsed = match cypher_parse(cypher) {
             Ok(p) => p,
@@ -816,6 +925,16 @@ impl ServerBackend {
                 result: Err(err),
             };
         }
+        if cancellation.is_cancelled() {
+            return disconnected_observation(
+                started,
+                Some(if plan.contains_write() {
+                    QueryKind::Write
+                } else {
+                    QueryKind::Read
+                }),
+            );
+        }
 
         if plan.contains_write() {
             // A read-only token may not write, even inside an open transaction.
@@ -828,7 +947,14 @@ impl ServerBackend {
             }
             // Stage into the transaction's held writer; do NOT commit. The
             // RETURN rows are computed during the apply, so they stream now.
-            let mut slot = self.tx.lock().await;
+            let tx_lock = self.tx.lock();
+            tokio::pin!(tx_lock);
+            let mut slot = tokio::select! {
+                slot = &mut tx_lock => slot,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Write));
+                }
+            };
             let tx = match slot.as_mut() {
                 Some(tx) => tx,
                 None => {
@@ -842,25 +968,38 @@ impl ServerBackend {
                     };
                 }
             };
-            let result = match execute_write_staged_with_deadline(
-                &plan,
-                &mut tx.writer,
-                &params,
-                self.state.write_deadline(),
-            )
-            .await
-            {
-                Ok(outcome) => {
+            let staged = {
+                let apply = execute_write_staged_with_deadline(
+                    &plan,
+                    &mut tx.writer,
+                    &params,
+                    self.state.write_deadline(),
+                );
+                tokio::pin!(apply);
+                tokio::select! {
+                    result = &mut apply => Some(result),
+                    _ = cancellation.cancelled() => None,
+                }
+            };
+            let result = match staged {
+                Some(Ok(outcome)) => {
                     tx.staged = true;
                     Ok(write_run_outcome(outcome))
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     // A failed statement aborts the transaction. Drop whatever
                     // it (or an earlier statement) staged so a stray COMMIT
                     // cannot seal a partial write; the session moves to FAILED
                     // and the client must ROLLBACK / RESET.
                     tx.writer.discard_batch();
                     Err(map_exec_err(e))
+                }
+                None => {
+                    tx.writer.discard_batch();
+                    tx.staged = false;
+                    Err(BackendError::Other(
+                        "Bolt client disconnected while RUN was executing".into(),
+                    ))
                 }
             };
             RunObservation {
@@ -873,7 +1012,14 @@ impl ServerBackend {
             // is visible (RFC-026). The writer pins the committed state at
             // tx-begin (no commit happens mid-tx while we hold the lock) and
             // overlays everything statements 1..N-1 staged.
-            let mut slot = self.tx.lock().await;
+            let tx_lock = self.tx.lock();
+            tokio::pin!(tx_lock);
+            let mut slot = tokio::select! {
+                slot = &mut tx_lock => slot,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
             let tx = match slot.as_mut() {
                 Some(tx) => tx,
                 None => {
@@ -887,14 +1033,20 @@ impl ServerBackend {
                 }
             };
             let snap = tx.writer.overlay_snapshot();
-            let rows = execute_with_limits(
+            let read = execute_with_limits(
                 &plan,
                 &snap,
                 &params,
                 self.state.query_deadline(),
                 self.state.query_row_cap(),
-            )
-            .await;
+            );
+            tokio::pin!(read);
+            let rows = tokio::select! {
+                rows = &mut read => rows,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
             let elapsed = started.elapsed();
             RunObservation {
                 kind: Some(QueryKind::Read),
@@ -902,6 +1054,63 @@ impl ServerBackend {
                 result: rows.map(read_run_outcome).map_err(map_exec_err),
             }
         }
+    }
+
+    async fn run_observed(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        // Memgraph-style schema introspection (gdotv and other Bolt GUIs)
+        // bypasses the Cypher parser. It is a short metadata probe and does
+        // not acquire the writer.
+        {
+            let owned = self.state.snapshot.load();
+            let snap = owned.borrow();
+            if let Some(result) = crate::introspect::try_introspect(cypher, &snap).await {
+                return result;
+            }
+        }
+
+        let _in_flight = self.state.metrics.track_in_flight();
+        let obs = self.run_query(cypher, params, &cancellation).await;
+        self.state.metrics.observe_query(
+            Protocol::Bolt,
+            obs.kind,
+            obs.result.is_ok(),
+            obs.elapsed,
+            cypher,
+        );
+        obs.result
+    }
+
+    async fn run_in_tx_observed(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        // Introspection stays on the published schema snapshot; data reads
+        // below use the transaction overlay.
+        {
+            let owned = self.state.snapshot.load();
+            let snap = owned.borrow();
+            if let Some(result) = crate::introspect::try_introspect(cypher, &snap).await {
+                return result;
+            }
+        }
+
+        let _in_flight = self.state.metrics.track_in_flight();
+        let obs = self.run_query_in_tx(cypher, params, &cancellation).await;
+        self.state.metrics.observe_query(
+            Protocol::Bolt,
+            obs.kind,
+            obs.result.is_ok(),
+            obs.elapsed,
+            cypher,
+        );
+        obs.result
     }
 }
 
@@ -912,30 +1121,17 @@ impl Backend for ServerBackend {
         cypher: &str,
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
-        // Memgraph-style schema introspection (gdotv and other Bolt
-        // GUIs) hits procedures the Cypher parser has no `CALL` clause
-        // for. Answer them from the live snapshot before the parser
-        // would reject them as a syntax error. See `crate::introspect`.
-        // These are schema metadata probes, not user queries, so they are
-        // intentionally not counted toward the query metrics.
-        {
-            let owned = self.state.snapshot.load();
-            let snap = owned.borrow();
-            if let Some(result) = crate::introspect::try_introspect(cypher, &snap).await {
-                return result;
-            }
-        }
+        self.run_observed(cypher, params, RunCancellation::new())
+            .await
+    }
 
-        let _in_flight = self.state.metrics.track_in_flight();
-        let obs = self.run_query(cypher, params).await;
-        self.state.metrics.observe_query(
-            Protocol::Bolt,
-            obs.kind,
-            obs.result.is_ok(),
-            obs.elapsed,
-            cypher,
-        );
-        obs.result
+    async fn run_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run_observed(cypher, params, cancellation).await
     }
 
     async fn logoff(&self) {
@@ -958,14 +1154,27 @@ impl Backend for ServerBackend {
         // think-time) until COMMIT/ROLLBACK — see TxState.
         let timeout = self.state.writer_lock_timeout();
         let lock = self.state.writer.clone().lock_owned();
+        let lock_started = std::time::Instant::now();
         let writer = if timeout.is_zero() {
             lock.await
         } else {
             match tokio::time::timeout(timeout, lock).await {
                 Ok(guard) => guard,
-                Err(_) => return Err(writer_busy_error()),
+                Err(_) => {
+                    self.state.metrics.observe_writer_lock(
+                        WriterLockKind::BoltTransaction,
+                        lock_started.elapsed(),
+                        false,
+                    );
+                    return Err(writer_busy_error());
+                }
             }
         };
+        self.state.metrics.observe_writer_lock(
+            WriterLockKind::BoltTransaction,
+            lock_started.elapsed(),
+            true,
+        );
         *slot = Some(TxState {
             writer,
             staged: false,
@@ -978,29 +1187,17 @@ impl Backend for ServerBackend {
         cypher: &str,
         params: Params,
     ) -> std::result::Result<RunOutcome, BackendError> {
-        // Introspection runs against the published snapshot (schema only).
-        // Data reads, below, run against the transaction's own writer with
-        // its staged batch overlaid, so an in-tx read sees the tx's own
-        // staged writes (read-your-own-writes, RFC-026). Introspection is a
-        // schema probe, not a user query, so it is not counted in the metrics.
-        {
-            let owned = self.state.snapshot.load();
-            let snap = owned.borrow();
-            if let Some(result) = crate::introspect::try_introspect(cypher, &snap).await {
-                return result;
-            }
-        }
+        self.run_in_tx_observed(cypher, params, RunCancellation::new())
+            .await
+    }
 
-        let _in_flight = self.state.metrics.track_in_flight();
-        let obs = self.run_query_in_tx(cypher, params).await;
-        self.state.metrics.observe_query(
-            Protocol::Bolt,
-            obs.kind,
-            obs.result.is_ok(),
-            obs.elapsed,
-            cypher,
-        );
-        obs.result
+    async fn run_in_tx_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run_in_tx_observed(cypher, params, cancellation).await
     }
 
     async fn commit_tx(&self) -> std::result::Result<(), BackendError> {
@@ -1391,7 +1588,99 @@ fn parse_err_to_string(e: &ParseError) -> String {
 mod tests {
     use super::*;
     use crate::auth::Role;
+    use namidb_core::{NodeId, Schema, Value as CoreValue};
+    use namidb_storage::{NodeWriteRecord, SessionCaches};
+    use object_store::ObjectStore;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    /// Blocks exactly one cold SST read so a cancellation test can stop a
+    /// write after it has acquired the global writer and staged an earlier
+    /// clause, without relying on wall-clock timing.
+    #[derive(Debug)]
+    struct BlockOneSstGet {
+        inner: Arc<dyn ObjectStore>,
+        should_block: AtomicBool,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl std::fmt::Display for BlockOneSstGet {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BlockOneSstGet({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BlockOneSstGet {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if location.as_ref().contains("/sst/")
+                && self.should_block.swap(false, Ordering::SeqCst)
+            {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
 
     // A hook that denies everything — to prove the Bolt path consults it (the
     // gap the adversarial review found: Bolt used to skip the AuthzHook).
@@ -1492,6 +1781,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.rows.len(), 1, "exactly the recovered write is durable");
+    }
+
+    /// A client EOF during an unbounded write must cancel the reversible apply
+    /// phase, discard clauses already staged by that statement, and release
+    /// the single writer even when the configured lock timeout is disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_run_discards_partial_batch_and_releases_writer() {
+        let (_unused, paths) =
+            namidb_storage::parse_uri("memory://bolt-cancel-releases-writer").unwrap();
+        let blocking_store = Arc::new(BlockOneSstGet {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            should_block: AtomicBool::new(false),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let store: Arc<dyn ObjectStore> = blocking_store.clone();
+
+        // Seed one cold SST without read caches, then reopen the writer so the
+        // MATCH below has to reach the object store after staging `Partial`.
+        let mut seeder = namidb_storage::WriterSession::open_with_caches(
+            store.clone(),
+            paths.clone(),
+            SessionCaches::none(),
+        )
+        .await
+        .unwrap();
+        seeder
+            .upsert_node(
+                "Seed",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("k".into(), CoreValue::I64(1))]),
+                    schema_version: 0,
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+        seeder.commit_batch().await.unwrap();
+        seeder.flush(Schema::empty()).await.unwrap();
+        drop(seeder);
+
+        let writer =
+            namidb_storage::WriterSession::open_with_caches(store, paths, SessionCaches::none())
+                .await
+                .unwrap();
+        let state = AppState::new(writer, None, "bolt-cancel".into());
+        let backend = Arc::new(ServerBackend::new(
+            state.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        blocking_store.should_block.store(true, Ordering::SeqCst);
+        let cancellation = RunCancellation::new();
+        let task = {
+            let backend = Arc::clone(&backend);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                backend
+                    .run_with_cancellation(
+                        "CREATE (p:Partial {k: 9}) \
+                         WITH p MATCH (s:Seed) RETURN s.k AS k",
+                        Params::new(),
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            blocking_store.started.notified(),
+        )
+        .await
+        .expect("write did not reach the blocked SST read");
+        assert!(
+            state.writer.try_lock().is_err(),
+            "RUN must hold the writer while its apply phase is blocked"
+        );
+
+        cancellation.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("cancelled RUN kept the writer pinned")
+            .expect("cancelled RUN task panicked");
+        assert!(
+            matches!(result, Err(BackendError::Other(_))),
+            "disconnect cancellation must terminate RUN, got {result:?}"
+        );
+
+        {
+            let writer =
+                tokio::time::timeout(std::time::Duration::from_secs(1), state.writer.lock())
+                    .await
+                    .expect("writer was not released after cancellation");
+            assert_eq!(
+                writer.pending_len(),
+                0,
+                "the clause staged before cancellation leaked into the next commit"
+            );
+        }
+
+        backend
+            .run("CREATE (:AfterCancel {k: 2})", Params::new())
+            .await
+            .expect("the next Bolt writer must make progress without restart");
+        let partial = backend
+            .run("MATCH (p:Partial) RETURN p", Params::new())
+            .await
+            .unwrap();
+        assert!(
+            partial.rows.is_empty(),
+            "cancelled statement became visible later"
+        );
+        let after = backend
+            .run("MATCH (n:AfterCancel) RETURN n.k AS k", Params::new())
+            .await
+            .unwrap();
+        assert_eq!(after.rows.len(), 1, "subsequent committed write is visible");
+
+        // No blocked future remains, but wake defensively if an object-store
+        // implementation polls cancellation differently.
+        blocking_store.release.notify_waiters();
     }
 
     #[tokio::test]

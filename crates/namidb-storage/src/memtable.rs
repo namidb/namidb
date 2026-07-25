@@ -159,12 +159,38 @@ impl Memtable {
         &'a self,
         edge_type: &'a str,
     ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
-        // We cannot tightly bound the map range across the (src, dst)
-        // pair without overflow gymnastics; a filtering scan is fine for the
-        // memtable since it is bounded by the flush threshold.
-        self.inner.iter().filter(
-            move |(k, _)| matches!(k, MemKey::Edge { edge_type: et, .. } if et == edge_type),
-        )
+        let start = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src: NodeId::from_uuid(uuid::Uuid::nil()),
+            dst: NodeId::from_uuid(uuid::Uuid::nil()),
+        };
+        let end = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src: NodeId::from_uuid(uuid::Uuid::max()),
+            dst: NodeId::from_uuid(uuid::Uuid::max()),
+        };
+        self.inner
+            .range((Bound::Included(start), Bound::Included(end)))
+    }
+
+    /// Iterate only outgoing edges for one `(edge_type, src)` prefix.
+    pub fn iter_out_edges<'a>(
+        &'a self,
+        edge_type: &'a str,
+        src: NodeId,
+    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+        let start = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst: NodeId::from_uuid(uuid::Uuid::nil()),
+        };
+        let end = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst: NodeId::from_uuid(uuid::Uuid::max()),
+        };
+        self.inner
+            .range((Bound::Included(start), Bound::Included(end)))
     }
 
     /// Swap out the contents into a frozen [`FrozenMemtable`], leaving `self`
@@ -268,9 +294,38 @@ impl MemtableSnapshot {
         &'a self,
         edge_type: &'a str,
     ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
-        self.inner.iter().filter(
-            move |(k, _)| matches!(k, MemKey::Edge { edge_type: et, .. } if et == edge_type),
-        )
+        let start = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src: NodeId::from_uuid(uuid::Uuid::nil()),
+            dst: NodeId::from_uuid(uuid::Uuid::nil()),
+        };
+        let end = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src: NodeId::from_uuid(uuid::Uuid::max()),
+            dst: NodeId::from_uuid(uuid::Uuid::max()),
+        };
+        self.inner
+            .range((Bound::Included(start), Bound::Included(end)))
+    }
+
+    /// Iterate only outgoing edges for one `(edge_type, src)` prefix.
+    pub fn iter_out_edges<'a>(
+        &'a self,
+        edge_type: &'a str,
+        src: NodeId,
+    ) -> impl Iterator<Item = (&'a MemKey, &'a MemEntry)> + 'a {
+        let start = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst: NodeId::from_uuid(uuid::Uuid::nil()),
+        };
+        let end = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst: NodeId::from_uuid(uuid::Uuid::max()),
+        };
+        self.inner
+            .range((Bound::Included(start), Bound::Included(end)))
     }
 }
 
@@ -424,12 +479,37 @@ mod tests {
             3,
             MemOp::Upsert(Bytes::from_static(b"c")),
         );
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: nid(2),
+                dst: nid(3),
+            },
+            4,
+            MemOp::Upsert(Bytes::from_static(b"d")),
+        );
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "OTHER".into(),
+                src: nid(1),
+                dst: nid(3),
+            },
+            5,
+            MemOp::Upsert(Bytes::from_static(b"e")),
+        );
 
         // Nodes are no longer scoped by label in the key; iter_nodes yields
         // every node entry regardless of label (two distinct ids inserted).
         assert_eq!(mt.iter_nodes().count(), 2);
-        assert_eq!(mt.iter_edge_type("KNOWS").count(), 1);
-        assert_eq!(mt.iter_edge_type("OTHER").count(), 0);
+        assert_eq!(mt.iter_edge_type("KNOWS").count(), 2);
+        assert_eq!(mt.iter_edge_type("OTHER").count(), 1);
+        assert_eq!(mt.iter_out_edges("KNOWS", nid(1)).count(), 1);
+        assert_eq!(mt.iter_out_edges("KNOWS", nid(2)).count(), 1);
+        assert_eq!(mt.iter_out_edges("KNOWS", nid(3)).count(), 0);
+
+        let snapshot = mt.snapshot_view();
+        assert_eq!(snapshot.iter_edge_type("KNOWS").count(), 2);
+        assert_eq!(snapshot.iter_out_edges("KNOWS", nid(1)).count(), 1);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! A hand-rolled registry of lock-free atomic counters and fixed-bucket
 //! histograms, rendered on demand in the Prometheus text exposition format
 //! at `GET /v0/metrics`. There is no metrics-crate dependency: the surface we
-//! need (a handful of counters, a gauge, and four latency histograms) is small
+//! need (a bounded set of counters, gauges, and latency histograms) is small
 //! enough that hand-rolling keeps the hot path allocation-free and the
 //! dependency tree honest, matching the style of [`namidb_core::profile`].
 //!
@@ -58,11 +58,130 @@ impl QueryKind {
     }
 }
 
+/// Why a task is waiting for the namespace's single-writer mutex. The finite
+/// set keeps the Prometheus label cardinality bounded while separating
+/// foreground queueing from background maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum WriterLockKind {
+    Http = 0,
+    Bolt = 1,
+    BoltTransaction = 2,
+    Flush = 3,
+    CompactionBasis = 4,
+    CompactionInstall = 5,
+}
+
+impl WriterLockKind {
+    const ALL: [Self; 6] = [
+        Self::Http,
+        Self::Bolt,
+        Self::BoltTransaction,
+        Self::Flush,
+        Self::CompactionBasis,
+        Self::CompactionInstall,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Bolt => "bolt",
+            Self::BoltTransaction => "bolt_transaction",
+            Self::Flush => "flush",
+            Self::CompactionBasis => "compaction_basis",
+            Self::CompactionInstall => "compaction_install",
+        }
+    }
+}
+
+/// What scheduled a compaction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CompactionTrigger {
+    Periodic = 0,
+    Reactive = 1,
+}
+
+impl CompactionTrigger {
+    const ALL: [Self; 2] = [Self::Periodic, Self::Reactive];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Periodic => "periodic",
+            Self::Reactive => "reactive",
+        }
+    }
+}
+
+/// Individually timed compaction phases. `Prepare` is the expensive off-lock
+/// merge/upload work. `InstallWait` is queueing to reacquire the writer, and
+/// `InstallHold` is the manifest-validation/CAS critical section plus any
+/// failure recovery that must run while retaining the writer guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CompactionPhase {
+    Prepare = 0,
+    InstallWait = 1,
+    InstallHold = 2,
+}
+
+impl CompactionPhase {
+    const ALL: [Self; 3] = [Self::Prepare, Self::InstallWait, Self::InstallHold];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::InstallWait => "install_wait",
+            Self::InstallHold => "install_hold",
+        }
+    }
+}
+
+/// Terminal classification of one compaction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CompactionStatus {
+    Applied = 0,
+    Noop = 1,
+    Stale = 2,
+    Coalesced = 3,
+    PrepareError = 4,
+    InstallError = 5,
+    Cancelled = 6,
+}
+
+impl CompactionStatus {
+    const ALL: [Self; 7] = [
+        Self::Applied,
+        Self::Noop,
+        Self::Stale,
+        Self::Coalesced,
+        Self::PrepareError,
+        Self::InstallError,
+        Self::Cancelled,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Noop => "noop",
+            Self::Stale => "stale",
+            Self::Coalesced => "coalesced",
+            Self::PrepareError => "prepare_error",
+            Self::InstallError => "install_error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Upper bounds (seconds) for the latency histogram buckets. A query is placed
 /// in the first bucket whose bound is `>= elapsed`; anything slower lands in an
 /// implicit `+Inf` overflow bucket. The range spans a sub-millisecond point
-/// read up to the 30s default query timeout and beyond.
-const BUCKET_BOUNDS_S: [f64; 10] = [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0];
+/// read through the multi-minute tail seen when object-store compaction is
+/// backlogged, so 30–222s incidents do not all collapse into `+Inf`.
+const BUCKET_BOUNDS_S: [f64; 14] = [
+    0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
 
 /// A cumulative-renderable latency histogram: a per-bucket count, the running
 /// sum, and the observation count. Counts are stored per bucket (not yet
@@ -152,6 +271,47 @@ impl ProtoMetrics {
     }
 }
 
+#[derive(Debug)]
+struct WriterLockMetrics {
+    wait: Histogram,
+    timeouts: AtomicU64,
+}
+
+impl WriterLockMetrics {
+    fn new() -> Self {
+        Self {
+            wait: Histogram::new(),
+            timeouts: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompactionMetrics {
+    phases: [Histogram; CompactionPhase::ALL.len()],
+    statuses: [AtomicU64; CompactionStatus::ALL.len()],
+    /// Most recently observed maximum L0 bucket depth at attempt start/end.
+    /// These are intentionally process/trigger scoped: no namespace label,
+    /// and therefore no user-controlled cardinality.
+    l0_before: AtomicU64,
+    l0_after: AtomicU64,
+    removed_ssts: AtomicU64,
+    written_ssts: AtomicU64,
+}
+
+impl CompactionMetrics {
+    fn new() -> Self {
+        Self {
+            phases: std::array::from_fn(|_| Histogram::new()),
+            statuses: std::array::from_fn(|_| AtomicU64::new(0)),
+            l0_before: AtomicU64::new(0),
+            l0_after: AtomicU64::new(0),
+            removed_ssts: AtomicU64::new(0),
+            written_ssts: AtomicU64::new(0),
+        }
+    }
+}
+
 /// The process-wide query metrics registry. One per server, shared across all
 /// connections via the `Arc` held on `AppState`.
 #[derive(Debug)]
@@ -165,6 +325,8 @@ pub struct Metrics {
     slow_queries: AtomicU64,
     http: ProtoMetrics,
     bolt: ProtoMetrics,
+    writer_locks: [WriterLockMetrics; WriterLockKind::ALL.len()],
+    compactions: [CompactionMetrics; CompactionTrigger::ALL.len()],
 }
 
 impl Metrics {
@@ -179,6 +341,8 @@ impl Metrics {
             slow_queries: AtomicU64::new(0),
             http: ProtoMetrics::new(),
             bolt: ProtoMetrics::new(),
+            writer_locks: std::array::from_fn(|_| WriterLockMetrics::new()),
+            compactions: std::array::from_fn(|_| CompactionMetrics::new()),
         })
     }
 
@@ -234,11 +398,69 @@ impl Metrics {
         }
     }
 
+    /// Record one attempt to acquire the namespace writer mutex. Call this
+    /// immediately after acquisition or timeout, before doing work under the
+    /// guard. The histogram contains both successful and timed-out waits;
+    /// `namidb_writer_lock_timeouts_total` separates the latter.
+    pub fn observe_writer_lock(&self, kind: WriterLockKind, wait: Duration, acquired: bool) {
+        let metrics = &self.writer_locks[kind as usize];
+        metrics.wait.observe(wait);
+        if !acquired {
+            metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one compaction phase duration. Keeping prepare, install queueing,
+    /// and install critical-section time separate makes it possible to tell
+    /// object-store/merge debt from actual writer-lock contention.
+    pub fn observe_compaction_phase(
+        &self,
+        trigger: CompactionTrigger,
+        phase: CompactionPhase,
+        elapsed: Duration,
+    ) {
+        self.compactions[trigger as usize].phases[phase as usize].observe(elapsed);
+    }
+
+    /// Record the terminal result and L0/SST deltas of one compaction attempt.
+    /// `l0_before`/`l0_after` are the maximum L0 bucket depths sampled at the
+    /// basis/install boundaries. In multi-tenant mode the gauge is the latest
+    /// observation for each trigger, avoiding a namespace label with
+    /// user-controlled cardinality.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_compaction_result(
+        &self,
+        trigger: CompactionTrigger,
+        status: CompactionStatus,
+        l0_before: usize,
+        l0_after: usize,
+        removed: usize,
+        written: usize,
+    ) {
+        let metrics = &self.compactions[trigger as usize];
+        metrics.statuses[status as usize].fetch_add(1, Ordering::Relaxed);
+        // A coalesced trigger never captured a basis of its own. Do not let
+        // its placeholder zeros overwrite the last real backlog boundary.
+        if !matches!(
+            status,
+            CompactionStatus::Coalesced | CompactionStatus::Cancelled
+        ) {
+            metrics.l0_before.store(l0_before as u64, Ordering::Relaxed);
+            metrics.l0_after.store(l0_after as u64, Ordering::Relaxed);
+        }
+        metrics
+            .removed_ssts
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        metrics
+            .written_ssts
+            .fetch_add(written as u64, Ordering::Relaxed);
+    }
+
     /// Render the whole registry in the Prometheus text exposition format
     /// (`text/plain; version=0.0.4`).
     pub fn render(&self) -> String {
         use std::fmt::Write as _;
-        let mut out = String::with_capacity(2048);
+        let mut out = String::with_capacity(16_384);
 
         let _ = writeln!(out, "# HELP namidb_build_info Build information.");
         let _ = writeln!(out, "# TYPE namidb_build_info gauge");
@@ -310,6 +532,117 @@ impl Metrics {
                 &mut out,
                 "namidb_query_duration_seconds",
                 &format!("protocol=\"{proto}\",kind=\"write\""),
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_writer_lock_wait_seconds Time spent waiting for the namespace writer mutex."
+        );
+        let _ = writeln!(out, "# TYPE namidb_writer_lock_wait_seconds histogram");
+        for kind in WriterLockKind::ALL {
+            self.writer_locks[kind as usize].wait.render_into(
+                &mut out,
+                "namidb_writer_lock_wait_seconds",
+                &format!("purpose=\"{}\"", kind.as_str()),
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_writer_lock_timeouts_total Writer-mutex acquisitions that hit their configured bound."
+        );
+        let _ = writeln!(out, "# TYPE namidb_writer_lock_timeouts_total counter");
+        for kind in WriterLockKind::ALL {
+            let _ = writeln!(
+                out,
+                "namidb_writer_lock_timeouts_total{{purpose=\"{}\"}} {}",
+                kind.as_str(),
+                self.writer_locks[kind as usize]
+                    .timeouts
+                    .load(Ordering::Relaxed)
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_compaction_phase_duration_seconds Compaction wall-clock split into off-lock prepare, install wait, and install hold."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE namidb_compaction_phase_duration_seconds histogram"
+        );
+        for trigger in CompactionTrigger::ALL {
+            for phase in CompactionPhase::ALL {
+                self.compactions[trigger as usize].phases[phase as usize].render_into(
+                    &mut out,
+                    "namidb_compaction_phase_duration_seconds",
+                    &format!(
+                        "trigger=\"{}\",phase=\"{}\"",
+                        trigger.as_str(),
+                        phase.as_str()
+                    ),
+                );
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_compactions_total Compaction attempts by trigger and terminal status."
+        );
+        let _ = writeln!(out, "# TYPE namidb_compactions_total counter");
+        for trigger in CompactionTrigger::ALL {
+            for status in CompactionStatus::ALL {
+                let _ = writeln!(
+                    out,
+                    "namidb_compactions_total{{trigger=\"{}\",status=\"{}\"}} {}",
+                    trigger.as_str(),
+                    status.as_str(),
+                    self.compactions[trigger as usize].statuses[status as usize]
+                        .load(Ordering::Relaxed)
+                );
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_compaction_l0_backlog_ssts Most recently observed maximum L0 bucket depth at a compaction boundary."
+        );
+        let _ = writeln!(out, "# TYPE namidb_compaction_l0_backlog_ssts gauge");
+        for trigger in CompactionTrigger::ALL {
+            let metrics = &self.compactions[trigger as usize];
+            let _ = writeln!(
+                out,
+                "namidb_compaction_l0_backlog_ssts{{trigger=\"{}\",stage=\"before\"}} {}",
+                trigger.as_str(),
+                metrics.l0_before.load(Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "namidb_compaction_l0_backlog_ssts{{trigger=\"{}\",stage=\"after\"}} {}",
+                trigger.as_str(),
+                metrics.l0_after.load(Ordering::Relaxed)
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP namidb_compaction_ssts_total SST descriptors removed or written by compaction."
+        );
+        let _ = writeln!(out, "# TYPE namidb_compaction_ssts_total counter");
+        for trigger in CompactionTrigger::ALL {
+            let metrics = &self.compactions[trigger as usize];
+            let _ = writeln!(
+                out,
+                "namidb_compaction_ssts_total{{trigger=\"{}\",action=\"removed\"}} {}",
+                trigger.as_str(),
+                metrics.removed_ssts.load(Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "namidb_compaction_ssts_total{{trigger=\"{}\",action=\"written\"}} {}",
+                trigger.as_str(),
+                metrics.written_ssts.load(Ordering::Relaxed)
             );
         }
 
@@ -437,6 +770,104 @@ mod tests {
             assert!(m.render().contains("namidb_queries_in_flight 2"));
         }
         assert!(m.render().contains("namidb_queries_in_flight 0"));
+    }
+
+    #[test]
+    fn writer_lock_metrics_separate_waits_and_timeouts() {
+        let m = Metrics::new("0.0.0-test", Duration::ZERO);
+        m.observe_writer_lock(WriterLockKind::Http, Duration::from_millis(2), true);
+        m.observe_writer_lock(WriterLockKind::Http, Duration::from_secs(45), false);
+        m.observe_writer_lock(
+            WriterLockKind::CompactionInstall,
+            Duration::from_millis(3),
+            true,
+        );
+
+        let text = m.render();
+        assert!(text.contains("namidb_writer_lock_wait_seconds_count{purpose=\"http\"} 2"));
+        assert!(
+            text.contains("namidb_writer_lock_wait_seconds_bucket{purpose=\"http\",le=\"60.0\"} 2")
+        );
+        assert!(text
+            .contains("namidb_writer_lock_wait_seconds_count{purpose=\"compaction_install\"} 1"));
+        assert!(text.contains("namidb_writer_lock_timeouts_total{purpose=\"http\"} 1"));
+        assert!(
+            text.contains("namidb_writer_lock_timeouts_total{purpose=\"compaction_install\"} 0")
+        );
+    }
+
+    #[test]
+    fn compaction_metrics_render_phase_result_and_backlog_deltas() {
+        let m = Metrics::new("0.0.0-test", Duration::ZERO);
+        m.observe_compaction_phase(
+            CompactionTrigger::Reactive,
+            CompactionPhase::Prepare,
+            Duration::from_secs(90),
+        );
+        m.observe_compaction_phase(
+            CompactionTrigger::Reactive,
+            CompactionPhase::InstallWait,
+            Duration::from_millis(8),
+        );
+        m.observe_compaction_phase(
+            CompactionTrigger::Reactive,
+            CompactionPhase::InstallHold,
+            Duration::from_millis(4),
+        );
+        m.observe_compaction_result(
+            CompactionTrigger::Reactive,
+            CompactionStatus::Applied,
+            24,
+            3,
+            21,
+            2,
+        );
+        m.observe_compaction_result(
+            CompactionTrigger::Periodic,
+            CompactionStatus::Stale,
+            8,
+            9,
+            0,
+            0,
+        );
+        m.observe_compaction_result(
+            CompactionTrigger::Periodic,
+            CompactionStatus::Coalesced,
+            9,
+            9,
+            0,
+            0,
+        );
+
+        let text = m.render();
+        assert!(text.contains(
+            "namidb_compaction_phase_duration_seconds_count{trigger=\"reactive\",phase=\"prepare\"} 1"
+        ));
+        assert!(text.contains(
+            "namidb_compaction_phase_duration_seconds_bucket{trigger=\"reactive\",phase=\"prepare\",le=\"120.0\"} 1"
+        ));
+        assert!(text.contains(
+            "namidb_compaction_phase_duration_seconds_count{trigger=\"reactive\",phase=\"install_wait\"} 1"
+        ));
+        assert!(text.contains(
+            "namidb_compaction_phase_duration_seconds_count{trigger=\"reactive\",phase=\"install_hold\"} 1"
+        ));
+        assert!(
+            text.contains("namidb_compactions_total{trigger=\"reactive\",status=\"applied\"} 1")
+        );
+        assert!(text.contains("namidb_compactions_total{trigger=\"periodic\",status=\"stale\"} 1"));
+        assert!(
+            text.contains("namidb_compactions_total{trigger=\"periodic\",status=\"coalesced\"} 1")
+        );
+        assert!(text.contains(
+            "namidb_compaction_l0_backlog_ssts{trigger=\"reactive\",stage=\"before\"} 24"
+        ));
+        assert!(text
+            .contains("namidb_compaction_l0_backlog_ssts{trigger=\"reactive\",stage=\"after\"} 3"));
+        assert!(text
+            .contains("namidb_compaction_ssts_total{trigger=\"reactive\",action=\"removed\"} 21"));
+        assert!(text
+            .contains("namidb_compaction_ssts_total{trigger=\"reactive\",action=\"written\"} 2"));
     }
 
     #[test]

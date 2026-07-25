@@ -25,7 +25,7 @@ use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSes
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute, lower, parse, Params, RuntimeValue};
+use namidb_query::{execute, execute_write, lower, parse, Params, RuntimeValue};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -235,6 +235,44 @@ async fn sst_used_when_rel_returned_whole() {
 }
 
 #[tokio::test]
+async fn sst_used_when_persisted_path_is_returned() {
+    // The path binding owns the relationship value even when the pattern has
+    // no explicit relationship alias. It must therefore force the full SST
+    // route; otherwise the slim CSR silently strips `weight` from the
+    // relationship embedded in `p`.
+    let (writer, _ids) = build_weighted_graph("plan-route-path-whole").await;
+    let snapshot = writer.snapshot();
+
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    let q = parse("MATCH p=(a:Person)-[:WORKS_WITH]->(b:Person) RETURN p ORDER BY a.name, b.name")
+        .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        let Some(RuntimeValue::Path(items)) = row.get("p") else {
+            panic!("expected path, got {:?}", row.get("p"));
+        };
+        assert_eq!(items.len(), 3, "one-hop path must be Node, Rel, Node");
+        match &items[1] {
+            RuntimeValue::Rel(rel) => assert!(
+                rel.properties.contains_key("weight"),
+                "path relationship must retain persisted properties; got {:?}",
+                rel.properties
+            ),
+            other => panic!("path middle item must be a relationship, got {other:?}"),
+        }
+    }
+
+    let cache = writer.adjacency_cache().expect("adjacency cache on");
+    assert_eq!(
+        cache.namespace_entries("tenants/plan-route-path-whole"),
+        0,
+        "whole-path return must not populate the slim CSR cache"
+    );
+}
+
+#[tokio::test]
 async fn sst_used_when_rel_property_in_where() {
     // `WHERE r.weight > 2.0` — filter must see real values, not Null.
     let (writer, _ids) = build_weighted_graph("plan-route-rel-where").await;
@@ -325,5 +363,82 @@ async fn csr_and_sst_route_independently_within_one_query() {
         cache.builds() >= 1,
         "r2 unused — expected at least one CSR build for that Expand, got {}",
         cache.builds()
+    );
+}
+
+#[tokio::test]
+async fn delete_relationship_routes_through_sparse_sst_identity() {
+    // DELETE needs the relationship identity `(type, src, dst)`, but not its
+    // property map. It must use source-keyed SST identity ranges: rebuilding
+    // the whole-type, manifest-versioned CSR after every delete batch makes a
+    // keyed cleanup quadratic in the accumulated graph size.
+    let (mut writer, _ids) = build_weighted_graph("plan-route-delete-rel").await;
+
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    let q = parse("MATCH (:Person)-[r:WORKS_WITH]->(:Person) DELETE r").unwrap();
+    let plan = lower(&q).unwrap();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.edges_deleted, 3);
+
+    let cache = writer.adjacency_cache().expect("adjacency cache on");
+    assert_eq!(
+        cache.namespace_entries("tenants/plan-route-delete-rel"),
+        0,
+        "DELETE r must use sparse SST identity reads, not build whole-type CSR"
+    );
+}
+
+#[tokio::test]
+async fn declared_edge_endpoint_does_not_replace_live_label_validation() {
+    // EdgeTypeDef describes the intended endpoint labels, but raw ingestion
+    // does not currently enforce them. The executor must therefore confirm
+    // the persisted target instead of synthesising a schema-trusted id-only
+    // stub when the target alias is otherwise unused.
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    let mut writer = WriterSession::open(store(), paths("plan-route-untrusted-edge-endpoint"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(person_label())
+        .unwrap()
+        .label(LabelDef {
+            name: "Other".into(),
+            properties: vec![],
+        })
+        .unwrap()
+        .edge_type(works_with_edge())
+        .unwrap()
+        .build();
+    let source = NodeId::new();
+    let wrong_target = NodeId::new();
+    writer
+        .upsert_node("Person", source, &person("Alice"))
+        .unwrap();
+    writer
+        .upsert_node(
+            "Other",
+            wrong_target,
+            &NodeWriteRecord {
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer
+        .upsert_edge("WORKS_WITH", source, wrong_target, &weighted_edge(1.0))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let plan =
+        lower(&parse("MATCH (:Person)-[:WORKS_WITH]->(:Person) RETURN 1 AS matched").unwrap())
+            .unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "the declared dst_label is not proof that a raw edge's live target carries it"
     );
 }

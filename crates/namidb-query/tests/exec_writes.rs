@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::{
-    Constraint, ConstraintKind, DataType, LabelDef, PropertyDef, SchemaBuilder,
+    Constraint, ConstraintKind, DataType, EdgeTypeDef, LabelDef, PropertyDef, SchemaBuilder,
 };
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{
+    AdjacencyCache, EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -782,6 +784,129 @@ async fn merge_with_relationship_creates_then_matches_idempotently() {
         .unwrap();
     assert_eq!(outcome2.nodes_created, 0, "MERGE must not duplicate nodes");
     assert_eq!(outcome2.edges_created, 0, "MERGE must not duplicate edges");
+}
+
+#[tokio::test]
+async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_match() {
+    // A relationship MERGE is a point probe from its already-bound source.
+    // Routing that probe through the whole-type CSR rebuilds every persisted
+    // edge after each manifest-changing loader batch. Slim CSR also omits
+    // properties, which makes a persisted `{weight: 1}` edge look absent and
+    // makes `ON MATCH SET` overwrite rather than extend its property map.
+    let adjacency = Arc::new(AdjacencyCache::new(64 * 1024 * 1024));
+    let mut caches = SessionCaches::shared();
+    caches.adjacency_cache = Some(Arc::clone(&adjacency));
+    let mut writer = WriterSession::open_with_caches(store(), paths("w-merge-rel-sst"), caches)
+        .await
+        .unwrap();
+
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "KNOWS".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            properties: vec![
+                PropertyDef::new("weight", DataType::Int64, false).unwrap(),
+                PropertyDef::new("retained", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("touched", DataType::Bool, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    for (id, key) in [(alice, "alice"), (bob, "bob")] {
+        writer
+            .upsert_node(
+                "Person",
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("key".into(), CoreValue::Str(key.to_string()))]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_edge(
+            "KNOWS",
+            alice,
+            bob,
+            &EdgeWriteRecord {
+                properties: BTreeMap::from([
+                    ("weight".into(), CoreValue::I64(1)),
+                    ("retained".into(), CoreValue::Str("keep".into())),
+                ]),
+                schema_version: 1,
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+    assert!(
+        writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .ssts
+            .iter()
+            .any(|sst| sst.kind == namidb_storage::SstKind::EdgesFwd),
+        "the relationship must be persisted so MERGE exercises the SST/CSR choice"
+    );
+
+    let query = parse(
+        "MATCH (a:Person {key: 'alice'}), (b:Person {key: 'bob'}) \
+         MERGE (a)-[r:KNOWS {weight: 1}]->(b) \
+         ON MATCH SET r.touched = true \
+         RETURN r",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+
+    let csr_builds_before = adjacency.builds();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.edges_created, 0,
+        "the persisted relationship and its pattern properties must match"
+    );
+    assert_eq!(outcome.properties_set, 1);
+    assert_eq!(
+        adjacency.builds(),
+        csr_builds_before,
+        "relationship MERGE must use one source-keyed SST range, not build a whole-type CSR"
+    );
+
+    let edges = writer
+        .snapshot()
+        .out_edges_via_sst("KNOWS", alice)
+        .await
+        .unwrap()
+        .edges;
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].properties.get("weight"), Some(&CoreValue::I64(1)));
+    assert_eq!(
+        edges[0].properties.get("retained"),
+        Some(&CoreValue::Str("keep".into())),
+        "ON MATCH SET must extend the persisted relationship property map"
+    );
+    assert_eq!(
+        edges[0].properties.get("touched"),
+        Some(&CoreValue::Bool(true))
+    );
 }
 
 #[tokio::test]
@@ -2011,6 +2136,243 @@ async fn bulk_create_under_unique_constraint_pays_one_scan_not_one_per_row() {
 }
 
 #[tokio::test]
+async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
+    // Regression for the legal-graph cleanup shape:
+    //
+    //   UNWIND $keys AS key
+    //   MATCH (n {key: key})-[r]->(:Target)
+    //   DELETE r
+    //
+    // Before the correlated lookup rewrite, the anchor lowered to
+    // Filter(CrossProduct(Unwind, NodeScan)) and the edge path swept the whole
+    // memtable for every key. One real edge makes the assertion sensitive to
+    // false-negative lookup rewrites; the other 1,999 keys exercise the empty
+    // adjacency hot path. The label-agnostic posting lookup preserves matches
+    // without guessing `:Source`.
+    let adjacency = Arc::new(AdjacencyCache::new(64 * 1024 * 1024));
+    let mut caches = SessionCaches::shared();
+    caches.adjacency_cache = Some(Arc::clone(&adjacency));
+    let mut writer =
+        WriterSession::open_with_caches(store(), paths("w-delete-edge-correlated-lookup"), caches)
+            .await
+            .unwrap();
+    let mut keys = Vec::with_capacity(2_000);
+    let mut first_source = None;
+    for i in 0..2_000 {
+        let key = format!("legal-{i}");
+        keys.push(RuntimeValue::String(key.clone()));
+        let id = NodeId::new();
+        first_source.get_or_insert(id);
+        writer
+            .upsert_node(
+                "Source",
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("key".into(), CoreValue::Str(key))]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    // Several declared edge types make the untyped `-[r]->` faithful to the
+    // production shape. Half target :Target and half target :Other; no edge
+    // rows are present for any of them.
+    let mut schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Source".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Target".into(),
+            properties: vec![],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Other".into(),
+            properties: vec![],
+        })
+        .unwrap();
+    for i in 0..8 {
+        schema = schema
+            .edge_type(EdgeTypeDef {
+                name: format!("REL_{i}"),
+                src_label: "Source".into(),
+                dst_label: if i % 2 == 0 {
+                    "Target".into()
+                } else {
+                    "Other".into()
+                },
+                properties: vec![],
+            })
+            .unwrap();
+    }
+    let schema = schema.build();
+    writer.flush(schema.clone()).await.unwrap();
+
+    let first_source = first_source.unwrap();
+    let target = NodeId::new();
+    writer
+        .upsert_node(
+            "Target",
+            target,
+            &NodeWriteRecord {
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer
+        .upsert_edge(
+            "REL_0",
+            first_source,
+            target,
+            &EdgeWriteRecord {
+                properties: BTreeMap::new(),
+                schema_version: 1,
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+    assert!(
+        writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .ssts
+            .iter()
+            .any(|sst| matches!(
+                sst.kind,
+                namidb_storage::SstKind::EdgesFwd | namidb_storage::SstKind::EdgesInv
+            )),
+        "the relationship must be persisted so the regression exercises the SST/CSR choice"
+    );
+
+    let query = parse(
+        "UNWIND $keys AS key \
+         MATCH (n {key: key})-[r]->(:Target) \
+         DELETE r",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+
+    fn count_lookups(plan: &namidb_query::LogicalPlan) -> usize {
+        usize::from(matches!(
+            plan,
+            namidb_query::LogicalPlan::NodeByPropertyValue {
+                label,
+                property,
+                multi: true,
+                ..
+            } if label.is_empty() && property == "key"
+        )) + plan
+            .children()
+            .iter()
+            .map(|p| count_lookups(p))
+            .sum::<usize>()
+    }
+    assert_eq!(
+        count_lookups(&plan),
+        1,
+        "optimized delete must contain one correlated global key posting lookup: {plan:?}"
+    );
+
+    let mut params = Params::new();
+    params.insert("keys".into(), RuntimeValue::List(keys));
+    let lookups_before = writer.property_index_cache().equality_lookup_calls();
+    let expected_sidecar_inserts = writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .ssts
+        .iter()
+        .filter(|sst| {
+            sst.kind == namidb_storage::SstKind::Nodes
+                && sst
+                    .equality_property_indices
+                    .iter()
+                    .any(|index| index.property == "key")
+        })
+        .count() as u64;
+    let sidecar_inserts_before = writer
+        .sst_cache()
+        .map(|cache| cache.property_sidecar_inserts())
+        .unwrap_or(0);
+    let csr_builds_before = adjacency.builds();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(
+        outcome.edges_deleted, 1,
+        "the global posting lookup must bind the real source and delete its edge"
+    );
+    assert_eq!(
+        outcome.rows.len(),
+        1,
+        "the delete pipeline must carry the one matched relationship row"
+    );
+    assert_eq!(
+        writer.property_index_cache().equality_lookup_calls() - lookups_before,
+        2_000,
+        "each batch key must route through the global equality posting index"
+    );
+    assert_eq!(
+        writer
+            .sst_cache()
+            .map(|cache| cache.property_sidecar_inserts())
+            .unwrap_or(0)
+            - sidecar_inserts_before,
+        expected_sidecar_inserts,
+        "the 2,000 lookups must decode each key sidecar exactly once"
+    );
+    assert_eq!(
+        adjacency.builds(),
+        csr_builds_before,
+        "a keyed DELETE must use sparse SST identity ranges, not build a whole-type CSR"
+    );
+
+    // Correlated values are runtime data and may be NULL. Cypher's
+    // `n.key = NULL` never matches; prove that the point-lookup path cannot
+    // accidentally bind the label's first node and delete its edge.
+    // Re-create the deleted edge, then prove NULL cannot bind the first node.
+    writer
+        .upsert_edge(
+            "REL_0",
+            first_source,
+            target,
+            &EdgeWriteRecord {
+                properties: BTreeMap::new(),
+                schema_version: 1,
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let null_params = Params::from([("keys".into(), RuntimeValue::List(vec![RuntimeValue::Null]))]);
+    let null_outcome = execute_write(&plan, &mut writer, &null_params)
+        .await
+        .unwrap();
+    assert_eq!(null_outcome.edges_deleted, 0);
+    assert_eq!(
+        writer
+            .snapshot()
+            .out_edges("REL_0", first_source)
+            .await
+            .unwrap()
+            .edges
+            .len(),
+        1,
+        "a NULL correlated key must not match/delete the first Source node's edge"
+    );
+}
+
+#[tokio::test]
 async fn merge_unique_unwind_500_uses_one_index_population_across_commit_and_flush() {
     // Regression for the legal-graph loader shape. MERGE's implicit match
     // used to call scan_label once per UNWIND row (O(store_size * rows)).
@@ -2095,6 +2457,223 @@ async fn merge_numeric_unique_key_preserves_cross_type_cypher_equality() {
     assert_eq!(
         accounts[0].properties.get("seen"),
         Some(&CoreValue::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn unique_indexed_match_unwind_uses_numeric_transactional_probes() {
+    let mut writer = WriterSession::open(store(), paths("w-match-unique-numeric-ryow"))
+        .await
+        .unwrap();
+    // Load before declaring the constraint so the transactional map starts
+    // cold, mirroring a reopened/imported store.
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 500) AS i CREATE (:Account {account_no: i})",
+    )
+    .await;
+    writer.flush(int_unique_schema()).await.unwrap();
+
+    let one = writer
+        .snapshot()
+        .scan_label("Account")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|node| node.properties.get("account_no") == Some(&CoreValue::I64(1)))
+        .expect("account 1");
+    writer
+        .upsert_node(
+            "Account",
+            one.id,
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("account_no".into(), CoreValue::I64(1_001))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let query = parse(
+        "UNWIND range(1, 500) AS i \
+         MATCH (a:Account {account_no: toFloat(i)}) \
+         SET a.seen = true",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    let outcome = execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.rows.len(), 499, "staged account 1 moved to 1001");
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "numeric UNIQUE MATCH must populate the RYOW tuple map once"
+    );
+    assert!(
+        writer.unique_index().probes() >= probes_before + 1_000,
+        "each float key probes its strict F64 and Cypher-equal I64 variants"
+    );
+
+    let null_query =
+        parse("UNWIND [NULL] AS i MATCH (a:Account {account_no: i}) SET a.null_hit = true")
+            .unwrap();
+    let null_plan = optimize(lower(&null_query).unwrap(), &catalog);
+    let null_outcome = execute_write_staged(&null_plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        null_outcome.rows.len(),
+        0,
+        "property equality with NULL must never bind a node"
+    );
+    writer.discard_batch();
+}
+
+#[tokio::test]
+async fn unique_string_match_before_edge_only_write_keeps_committed_point_index() {
+    let mut writer = WriterSession::open(store(), paths("w-match-unique-string-sidecar"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 500) AS i CREATE (:Account {key: toString(i)})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse(
+        "UNWIND range(1, 500) AS i \
+         MATCH (a:Account {key: toString(i)}) \
+         CREATE (a)-[:SEEN]->(a)",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let scans_before = writer.unique_index().populate_scans();
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.rows.len(), 500);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "committed String MATCH must use sidecars/cache, not full-label tx population"
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        500,
+        "every correlated key must route through the committed point-index API"
+    );
+}
+
+#[tokio::test]
+async fn unique_string_match_set_stays_transactional_across_auto_commits() {
+    const ROWS: i64 = 128;
+    let mut writer = WriterSession::open(store(), paths("w-match-unique-string-auto-commits"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 128) AS i CREATE (:Account {key: toString(i)})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse("MATCH (a:Account {key: $key}) SET a.touch = $touch").unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    for i in 1..=ROWS {
+        let mut params = Params::new();
+        params.insert("key".into(), RuntimeValue::String(i.to_string()));
+        params.insert("touch".into(), RuntimeValue::Integer(i));
+        let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+        assert_eq!(outcome.rows.len(), 1);
+    }
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "MATCH(unique String)+SET auto-commits must populate the tx map once"
+    );
+    assert!(
+        writer.unique_index().probes() >= probes_before + ROWS as u64,
+        "every auto-commit must probe the preserved transactional unique map"
+    );
+}
+
+#[tokio::test]
+async fn unique_string_match_delete_stays_transactional_across_auto_commits() {
+    const ROWS: i64 = 128;
+    let mut writer = WriterSession::open(store(), paths("w-delete-unique-string-auto-commits"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 128) AS i CREATE (:Account {key: toString(i)})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse("MATCH (a:Account {key: $key}) DELETE a").unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let scans_before = writer.unique_index().populate_scans();
+    let probes_before = writer.unique_index().probes();
+    for i in 1..=ROWS {
+        let mut params = Params::new();
+        params.insert("key".into(), RuntimeValue::String(i.to_string()));
+        let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+        assert_eq!(outcome.nodes_deleted, 1);
+    }
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "MATCH(unique String)+DELETE auto-commits must populate the tx map once"
+    );
+    assert!(
+        writer.unique_index().probes() >= probes_before + ROWS as u64,
+        "every node DELETE auto-commit must probe the preserved tx map"
     );
 }
 
@@ -2288,6 +2867,187 @@ async fn merge_non_unique_index_uses_posting_list_then_residual_filter() {
         writer.property_index_cache().equality_lookup_calls() > lookups_before,
         "MERGE must call lookup_nodes_by_property, not scan_label"
     );
+}
+
+#[tokio::test]
+async fn merge_non_unique_index_unwind_stays_transactional_in_fresh_store() {
+    // Regression for a fresh loader namespace: before the writer-private
+    // postings map and incremental staged memtable, every MERGE rebuilt and
+    // scanned the growing RYOW overlay.
+    let mut writer = WriterSession::open(store(), paths("w-merge-equality-fresh-unwind"))
+        .await
+        .unwrap();
+    writer.create_property_index("Doc", "key").await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let postings_before = writer.unique_index().posting_probes();
+    let query = lower(
+        &parse(
+            "UNWIND range(1, 500) AS i \
+             MERGE (d:Doc {key: toString(i)}) \
+             SET d.payload = i",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let created = execute_write(&query, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(created.nodes_created, 500);
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "the growing staged overlay must populate its postings map once"
+    );
+    assert!(
+        writer.unique_index().posting_probes() >= postings_before + 499,
+        "every lookup after the first staged row must hit transactional postings"
+    );
+    assert_eq!(writer.staged_memtable_len(), 0, "auto-commit drains RYOW");
+
+    // Commit and flush only change representation; the postings map remains a
+    // valid baseline and an idempotent replay performs no corpus scan.
+    let schema = writer.schema().clone();
+    writer.flush(schema).await.unwrap();
+    let scans_after_first = writer.unique_index().populate_scans();
+    let replay = execute_write(&query, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(replay.nodes_created, 0);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_after_first,
+        "commit + flush must preserve the warm non-unique postings map"
+    );
+}
+
+#[tokio::test]
+async fn non_unique_index_stays_transactional_across_one_row_auto_commits() {
+    const ROWS: i64 = 128;
+
+    // MERGE: every statement begins with an empty staged batch. The
+    // writer-private postings map must still survive each commit; relying on
+    // the shared committed cache would make every node commit invalidate it
+    // and re-scan the growing memtable.
+    let mut merge_writer = WriterSession::open(store(), paths("w-merge-equality-auto-commits"))
+        .await
+        .unwrap();
+    merge_writer
+        .create_property_index("Doc", "key")
+        .await
+        .unwrap();
+    let merge_plan =
+        lower(&parse("MERGE (d:Doc {key: $key}) SET d.touch = $touch").unwrap()).unwrap();
+    let merge_scans_before = merge_writer.unique_index().populate_scans();
+    let merge_probes_before = merge_writer.unique_index().posting_probes();
+    for i in 1..=ROWS {
+        let mut params = Params::new();
+        params.insert("key".into(), RuntimeValue::String(i.to_string()));
+        params.insert("touch".into(), RuntimeValue::Integer(i));
+        let outcome = execute_write(&merge_plan, &mut merge_writer, &params)
+            .await
+            .unwrap();
+        assert_eq!(outcome.nodes_created, 1);
+    }
+    assert_eq!(
+        merge_writer.unique_index().populate_scans() - merge_scans_before,
+        1,
+        "one-row MERGE auto-commits must populate transactional postings once"
+    );
+    assert!(
+        merge_writer.unique_index().posting_probes() >= merge_probes_before + ROWS as u64,
+        "every MERGE auto-commit must probe the preserved postings map"
+    );
+
+    // MATCH+SET: this is also a write plan, so it must retain the same map
+    // across commits even though the read itself happens before each SET.
+    let mut match_writer = WriterSession::open(store(), paths("w-match-equality-auto-commits"))
+        .await
+        .unwrap();
+    match_writer
+        .create_property_index("Doc", "key")
+        .await
+        .unwrap();
+    write_q(
+        &mut match_writer,
+        "UNWIND range(1, 128) AS i CREATE (:Doc {key: toString(i)})",
+    )
+    .await;
+    let snapshot = match_writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let match_plan = optimize(
+        lower(&parse("MATCH (d:Doc {key: $key}) SET d.touch = $touch").unwrap()).unwrap(),
+        &catalog,
+    );
+    let match_scans_before = match_writer.unique_index().populate_scans();
+    let match_probes_before = match_writer.unique_index().posting_probes();
+    for i in 1..=ROWS {
+        let mut params = Params::new();
+        params.insert("key".into(), RuntimeValue::String(i.to_string()));
+        params.insert("touch".into(), RuntimeValue::Integer(i));
+        let outcome = execute_write(&match_plan, &mut match_writer, &params)
+            .await
+            .unwrap();
+        assert_eq!(outcome.rows.len(), 1);
+    }
+    assert_eq!(
+        match_writer.unique_index().populate_scans() - match_scans_before,
+        1,
+        "one-row MATCH+SET auto-commits must populate transactional postings once"
+    );
+    assert!(
+        match_writer.unique_index().posting_probes() >= match_probes_before + ROWS as u64,
+        "every MATCH auto-commit must probe the preserved postings map"
+    );
+}
+
+#[tokio::test]
+async fn indexed_match_unwind_after_staged_state_populates_once() {
+    let mut writer = WriterSession::open(store(), paths("w-match-equality-ryow-unwind"))
+        .await
+        .unwrap();
+    writer.create_property_index("Doc", "key").await.unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 500) AS i CREATE (:Doc {key: toString(i)})",
+    )
+    .await;
+
+    // Stage a value change before the MATCH statement, as an explicit Bolt
+    // transaction would. The delegated read subplan must see it and must not
+    // rebuild/scan the overlay for every correlated key.
+    let staged = lower(&parse("MATCH (d:Doc {key: '1'}) SET d.key = 'one'").unwrap()).unwrap();
+    execute_write_staged(&staged, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    let query = parse(
+        "UNWIND range(1, 500) AS i \
+         MATCH (d:Doc {key: toString(i)}) \
+         SET d.seen = true",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+
+    let scans_before = writer.unique_index().populate_scans();
+    let postings_before = writer.unique_index().posting_probes();
+    let outcome = execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.rows.len(), 499, "staged rename removes key '1'");
+    assert_eq!(
+        writer.unique_index().populate_scans() - scans_before,
+        1,
+        "MATCH over a node-mutated overlay gets one transactional population"
+    );
+    assert!(
+        writer.unique_index().posting_probes() >= postings_before + 500,
+        "every correlated MATCH key must probe the transactional postings map"
+    );
+    writer.discard_batch();
 }
 
 #[tokio::test]

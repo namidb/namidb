@@ -1,4 +1,5 @@
-//! Point-lookup rewrites over `Filter(... , NodeScan(...))`:
+//! Point-lookup rewrites over a labelled node scan, including its correlated
+//! `Filter(..., CrossProduct(outer, NodeScan(...)))` form:
 //!
 //! - `a.<prop> == <literal>` → `NodeByPropertyValue` when `<prop>` is
 //!   declared `unique` in the schema (see `PropertyDef::unique`).
@@ -14,18 +15,22 @@
 //! optimisation in Kuzu / Neo4j range indexes).
 //!
 //! The pass is conservative: it only fires when
-//! 1. The Filter's predicate is exactly `Property(a, <prop>) == <literal>`
+//! 1. The Filter's predicate is exactly `Property(a, <prop>) == <value>`
 //!    (single conjunct; multiple conjuncts fall through unchanged —
 //!    a follow-up could combine the unique lookup with residual filters).
-//! 2. The immediate child is `NodeScan { label: Some(L), predicates: [],
-//!    projection: None }` — no other pushed predicates or projections
-//!    (we want the cheapest possible rewrite to avoid composing with
-//!    later passes).
-//! 3. The catalog reports `props[prop].unique == true` for `(L, prop)`.
+//! 2. The immediate child is either a bare `NodeScan` or a `CrossProduct`
+//!    whose right side is that scan and whose left side produces every alias
+//!    referenced by `<value>`.
+//! 3. The scan has no pushed predicates/projection and either (a) has an
+//!    explicit label whose property is unique/equality-indexed or (b) is
+//!    label-agnostic and at least one declared label indexes that property.
+//!    The latter uses the id-primary global posting sidecar and always fans
+//!    out, preserving equal values across different labels.
 //!
 //! All other shapes pass through. Runs once per fixpoint iteration like
 //! the other rewrites in `optimize::mod`.
 
+use super::{expression_aliases, produced_aliases};
 use crate::cost::StatsCatalog;
 use crate::parser::ast::{Expression, ExpressionKind};
 use crate::plan::LogicalPlan;
@@ -41,7 +46,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         LogicalPlan::Filter { input, predicate } => {
             // Try to match the rewrite pattern.
             if let LogicalPlan::NodeScan {
-                label: Some(label),
+                label,
                 alias,
                 predicates,
                 projection,
@@ -49,27 +54,106 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             {
                 if predicates.is_empty() && projection.is_none() {
                     if let Some((prop, value_expr)) = extract_eq_on_prop(&predicate, alias) {
-                        let pstats = catalog.label(label).and_then(|l| l.properties.get(&prop));
-                        let is_unique = pstats.map(|p| p.unique).unwrap_or(false);
-                        // A non-unique `indexed` property resolves through the
-                        // equality posting-list sidecar and may match many
-                        // nodes (`multi`). No cost gate yet: `ndv` is unseeded
-                        // so the index always wins the fallback estimate; a
-                        // selectivity gate is a follow-up.
-                        let is_indexed = pstats.map(|p| p.indexed && !p.unique).unwrap_or(false);
-                        if is_unique || is_indexed {
+                        // The lookup input is `Empty`, so the scan alias is not
+                        // bound while `value_expr` is evaluated. Rewriting
+                        // `p.city = p.other` (or even `p.city = p.city`) would
+                        // therefore turn a valid per-row comparison into an
+                        // unbound-variable error. Correlated scans below have
+                        // the analogous, stricter subset check against the
+                        // aliases produced by their outer input.
+                        if expression_aliases(&value_expr).contains(alias) {
+                            return LogicalPlan::Filter {
+                                input: Box::new(rewrite(*input, catalog)),
+                                predicate,
+                            };
+                        }
+                        let lookup = match label {
+                            Some(label) => property_lookup_mode(catalog, label, &prop)
+                                .map(|multi| (label.clone(), multi)),
+                            None if global_property_lookup_available(catalog, &prop) => {
+                                // Empty label is the internal label-agnostic
+                                // scope. It always fans out: uniqueness is
+                                // per-label, not global.
+                                Some((String::new(), true))
+                            }
+                            None => None,
+                        };
+                        if let Some((label, multi)) = lookup {
                             return LogicalPlan::NodeByPropertyValue {
                                 input: Box::new(LogicalPlan::Empty),
-                                label: label.clone(),
+                                label,
                                 alias: alias.clone(),
                                 property: prop,
                                 value: value_expr,
-                                multi: is_indexed,
+                                multi,
                             };
                         }
                     }
                 }
             }
+
+            // Correlated inline-property lookup:
+            //
+            //   UNWIND $keys AS key
+            //   MATCH (n:Doc {key: key})-[r]->(:Target)
+            //
+            // Lowering must keep `key` in scope, so the node pattern becomes
+            // `Filter(n.key = key, CrossProduct(Unwind, NodeScan(n)))`. The
+            // old rewrite only recognised `Filter(NodeScan)` above, and the
+            // later join-conversion pass consequently turned this into a
+            // HashJoin that decoded the entire :Doc label once per batch.
+            //
+            // A NodeByPropertyValue already has an `input` precisely for this
+            // correlated shape: execute the outer rows, evaluate the lookup
+            // expression against each one, then bind `n` from the index. Only
+            // consume the filter when every alias used by the value expression
+            // is produced by the outer/left input; otherwise evaluating it
+            // before `n` is bound would change semantics.
+            let correlated = match input.as_ref() {
+                LogicalPlan::CrossProduct { left, right } => match right.as_ref() {
+                    LogicalPlan::NodeScan {
+                        label,
+                        alias,
+                        predicates,
+                        projection,
+                    } if predicates.is_empty() && projection.is_none() => {
+                        extract_eq_on_prop(&predicate, alias).and_then(|(prop, value_expr)| {
+                            let outer_aliases = produced_aliases(left);
+                            let value_aliases = expression_aliases(&value_expr);
+                            if !value_aliases.is_subset(&outer_aliases) {
+                                return None;
+                            }
+                            let lookup = match label {
+                                Some(label) => property_lookup_mode(catalog, label, &prop)
+                                    .map(|multi| (label.clone(), multi)),
+                                None if global_property_lookup_available(catalog, &prop) => {
+                                    Some((String::new(), true))
+                                }
+                                None => None,
+                            };
+                            lookup.map(|(label, multi)| {
+                                (label, alias.clone(), prop, value_expr, multi)
+                            })
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((label, alias, property, value, multi)) = correlated {
+                let LogicalPlan::CrossProduct { left, .. } = *input else {
+                    unreachable!("correlated lookup was matched as CrossProduct")
+                };
+                return LogicalPlan::NodeByPropertyValue {
+                    input: Box::new(rewrite(*left, catalog)),
+                    label,
+                    alias,
+                    property,
+                    value,
+                    multi,
+                };
+            }
+
             // `WHERE elementId(n) = <v>` / `WHERE id(n) = <v>` over a bare
             // scan becomes a NodeById point lookup by UUID — scoped to the
             // scan's label when it has one, or fanned across observed labels
@@ -305,6 +389,35 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     }
 }
 
+/// Return the `NodeByPropertyValue::multi` flag for an indexed property.
+///
+/// Unique properties use a point lookup (`false`); non-unique equality indexes
+/// use their posting list (`true`). `None` means the property has no lookup
+/// index and the caller must preserve the scan/filter plan.
+fn property_lookup_mode(catalog: &StatsCatalog, label: &str, property: &str) -> Option<bool> {
+    let stats = catalog
+        .label(label)
+        .and_then(|l| l.properties.get(property))?;
+    if stats.unique {
+        Some(false)
+    } else if stats.indexed {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Whether id-primary node SSTs carry (or legacy storage can lazily build) a
+/// label-agnostic posting index for `property`.
+fn global_property_lookup_available(catalog: &StatsCatalog, property: &str) -> bool {
+    catalog.label_names().any(|label| {
+        catalog
+            .label(label)
+            .and_then(|stats| stats.properties.get(property))
+            .is_some_and(|stats| stats.unique || stats.indexed)
+    })
+}
+
 /// If `expr` is exactly `alias.<prop> == <literal-ish>`, return
 /// `(prop, value_expr)`. Otherwise `None`.
 fn extract_eq_on_prop(expr: &Expression, scan_alias: &str) -> Option<(String, Expression)> {
@@ -411,6 +524,11 @@ mod tests {
         plan.children().into_iter().find_map(find_lookup)
     }
 
+    fn plan_contains_filter(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::Filter { .. })
+            || plan.children().into_iter().any(plan_contains_filter)
+    }
+
     fn rewrite_query(q: &str, cat: &StatsCatalog) -> LogicalPlan {
         let parsed = parse(q).unwrap();
         let plan = lower(&parsed).unwrap();
@@ -436,6 +554,95 @@ mod tests {
             find_lookup(&plan),
             Some(false),
             "a unique property should stay a single point lookup"
+        );
+    }
+
+    #[test]
+    fn unique_property_comparison_to_same_scan_alias_keeps_filter() {
+        let cat = catalog_with_city(true, false);
+        let plan = rewrite_query("MATCH (p:Person) WHERE p.city = p.city RETURN p", &cat);
+        assert_eq!(
+            find_lookup(&plan),
+            None,
+            "the lookup value cannot read p before NodeByPropertyValue binds p"
+        );
+        assert!(
+            plan_contains_filter(&plan),
+            "the per-row self comparison must remain as a Filter: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn indexed_property_comparison_to_scan_binding_keeps_filter() {
+        let cat = catalog_with_city(false, true);
+        let plan = rewrite_query("MATCH (p:Person) WHERE p.city = p RETURN p", &cat);
+        assert_eq!(
+            find_lookup(&plan),
+            None,
+            "a multi lookup must not evaluate the scanned binding against Empty"
+        );
+        assert!(
+            plan_contains_filter(&plan),
+            "the alias-dependent comparison must remain as a Filter: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_unique_property_under_expand_emits_point_lookup() {
+        let cat = catalog_with_city(true, false);
+        let plan = rewrite_query(
+            "UNWIND ['LA', 'NYC'] AS wanted \
+             MATCH (p:Person {city: wanted})-[r]->(:Place) \
+             DELETE r",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup(&plan),
+            Some(false),
+            "the UNWIND-correlated anchor must use one unique lookup per key"
+        );
+
+        fn lookup_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            if let LogicalPlan::NodeByPropertyValue { input, .. } = plan {
+                return Some(input);
+            }
+            plan.children().into_iter().find_map(lookup_input)
+        }
+        assert!(
+            matches!(lookup_input(&plan), Some(LogicalPlan::Unwind { .. })),
+            "the outer UNWIND must become the lookup input, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_unindexed_property_keeps_scan_join() {
+        let cat = catalog_with_city(false, false);
+        let plan = rewrite_query(
+            "UNWIND ['LA', 'NYC'] AS wanted \
+             MATCH (p:Person {city: wanted})-[r]->(:Place) \
+             DELETE r",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup(&plan),
+            None,
+            "an outer binding must not make an unindexed property indexable"
+        );
+    }
+
+    #[test]
+    fn correlated_unlabelled_property_uses_global_posting_lookup() {
+        let cat = catalog_with_city(true, false);
+        let plan = rewrite_query(
+            "UNWIND ['LA', 'NYC'] AS wanted \
+             MATCH (p {city: wanted})-[r]->(:Place) \
+             DELETE r",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup(&plan),
+            Some(true),
+            "the label-agnostic anchor uses a global posting lookup, never a guessed unique scope"
         );
     }
 

@@ -18,12 +18,12 @@ use namidb_core::id::NodeId;
 use namidb_storage::sst::predicates::eval_against_value;
 use namidb_storage::{EdgeDirection, EdgeView, Snapshot};
 
-use super::expr::{evaluate, order_for_sort, EvalError, Params};
+use super::expr::{evaluate, is_equal, order_for_sort, EvalError, Params};
 use super::factor::{factorize_enabled, FactorArena, FactorIdx, FactorRowSet, Slot};
 use super::leapfrog::{LeapfrogIntersect, SortedSliceIter};
 use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
-use crate::parser::{Expression, RelationshipDirection, SourceSpan};
+use crate::parser::{Expression, ExpressionKind, RelationshipDirection, SourceSpan};
 use crate::plan::logical::{
     AggregateExpr, EdgeConstraint, LogicalPlan, NodeBinding, OrderKey, ProjectionItem, RowCount,
 };
@@ -185,24 +185,6 @@ pub async fn execute_factor_path(
     let rows = set.materialize_all(None);
     crate::exec::limits::check_row_cap(rows.len())?;
     Ok(rows)
-}
-
-/// Public wrapper for callers outside `walker.rs` (e.g. `writer.rs`,
-/// SemiApply subplan recursion below). Computes plan-aware routing for
-/// the given subplan once and delegates. Recursive calls inside
-/// `execute_inner_with_routing` reuse the parent's routing — see the
-/// note in [`PlanRouting`].
-pub(crate) fn execute_inner<'a>(
-    plan: &'a LogicalPlan,
-    snapshot: &'a Snapshot<'_>,
-    params: &'a Params,
-    outer: Option<&'a Row>,
-) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
-    async move {
-        let routing = PlanRouting::analyze(plan);
-        execute_inner_with_routing(plan, snapshot, params, outer, &routing).await
-    }
-    .boxed()
 }
 
 pub(crate) fn execute_inner_with_routing<'a>(
@@ -806,7 +788,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     *shortest,
                     path_binding.as_deref(),
                     snapshot,
-                    routing.needs_properties(rel_alias.as_deref()),
+                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
                         snapshot,
                         routing,
@@ -933,7 +915,7 @@ fn execute_capped<'a>(
                     *shortest,
                     path_binding.as_deref(),
                     snapshot,
-                    routing.needs_properties(rel_alias.as_deref()),
+                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
                         snapshot,
                         routing,
@@ -1058,7 +1040,7 @@ pub(crate) async fn execute_expand(
     shortest: crate::plan::ShortestMode,
     path_binding: Option<&str>,
     snapshot: &Snapshot<'_>,
-    want_properties: bool,
+    edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
     cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
@@ -1208,7 +1190,7 @@ pub(crate) async fn execute_expand(
                 std::collections::HashSet::new();
             for step in frontier.drain(..) {
                 let neighbours =
-                    neighbours_of_any(snapshot, &edge_types, direction, step.tail, want_properties)
+                    neighbours_of_any(snapshot, &edge_types, direction, step.tail, edge_read_mode)
                         .await?;
                 if !back_reference && !skip_target_materialize {
                     for edge in &neighbours {
@@ -1282,11 +1264,10 @@ pub(crate) async fn execute_expand(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        // Fix #3: the binding is "transit only" — the next
-                        // Expand reads only `.id`. Skip the SST decode and
-                        // synthesise an id-only stub below. Schema-guaranteed
-                        // dst_label means no correctness drift vs the
-                        // `continue`-on-None branch below.
+                        // Reserved for a future store that persists endpoint
+                        // conformance. The current routing function keeps this
+                        // false because EdgeTypeDef alone is not proof for raw
+                        // writes; see `should_skip_target_materialize`.
                         None
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
@@ -3800,19 +3781,29 @@ fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&[String]>) -> 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeReadMode {
+    /// Topology-only read that may use the process-wide CSR cache.
+    Topology,
+    /// Full relationship value: source-keyed SST range plus properties.
+    Properties,
+    /// Bare `DELETE r`: source-keyed SST range without property decoding.
+    SparseIdentity,
+}
+
 async fn neighbours_of_any(
     snapshot: &Snapshot<'_>,
     edge_types: &[String],
     direction: RelationshipDirection,
     node: NodeId,
-    want_properties: bool,
+    mode: EdgeReadMode,
 ) -> Result<Vec<EdgeView>, ExecError> {
     if edge_types.len() == 1 {
-        return neighbours_of(snapshot, &edge_types[0], direction, node, want_properties).await;
+        return neighbours_of(snapshot, &edge_types[0], direction, node, mode).await;
     }
     let mut all = Vec::new();
     for et in edge_types {
-        let edges = neighbours_of(snapshot, et, direction, node, want_properties).await?;
+        let edges = neighbours_of(snapshot, et, direction, node, mode).await?;
         all.extend(edges);
     }
     Ok(all)
@@ -3823,16 +3814,16 @@ async fn neighbours_of(
     edge_type: &str,
     direction: RelationshipDirection,
     node: NodeId,
-    want_properties: bool,
+    mode: EdgeReadMode,
 ) -> Result<Vec<EdgeView>, ExecError> {
-    // Plan-aware routing (RFC-018 §4): when the rel binding the
-    // Expand produces is read downstream — as `r` or as `r.prop` — we
-    // force the SST path so `EdgeView.properties` is populated.
-    // Otherwise we go through the default `out_edges` / `in_edges`
-    // dispatch, which uses the CSR path when `NAMIDB_ADJACENCY=1` is
-    // set and an adjacency cache is attached. Memtable-sourced edges
-    // carry full properties on both paths.
-    if want_properties {
+    // Plan-aware routing (RFC-018 §4): when the rel binding the Expand
+    // produces is consumed downstream as a whole value or as `r.prop`, we
+    // force the SST path so `EdgeView.properties` is populated. A bare
+    // `DELETE r` also uses the source-keyed SST path, but only decodes the
+    // relationship identity: rebuilding a whole-type CSR after every
+    // manifest-changing delete batch would be O(total edges) per batch.
+    // Unreferenced topology-only expands retain the default CSR dispatch.
+    if mode == EdgeReadMode::Properties {
         return match direction {
             RelationshipDirection::Right => {
                 Ok(snapshot.out_edges_via_sst(edge_type, node).await?.edges)
@@ -3852,6 +3843,28 @@ async fn neighbours_of(
                         .edges
                         .into_iter()
                         .filter(|e| e.src != e.dst),
+                );
+                Ok(out)
+            }
+        };
+    }
+    if mode == EdgeReadMode::SparseIdentity {
+        return match direction {
+            RelationshipDirection::Right => {
+                identity_edges_via_sst(snapshot, edge_type, node, EdgeDirection::Forward).await
+            }
+            RelationshipDirection::Left => {
+                identity_edges_via_sst(snapshot, edge_type, node, EdgeDirection::Inverse).await
+            }
+            RelationshipDirection::Both => {
+                let mut out =
+                    identity_edges_via_sst(snapshot, edge_type, node, EdgeDirection::Forward)
+                        .await?;
+                out.extend(
+                    identity_edges_via_sst(snapshot, edge_type, node, EdgeDirection::Inverse)
+                        .await?
+                        .into_iter()
+                        .filter(|edge| edge.src != edge.dst),
                 );
                 Ok(out)
             }
@@ -3877,6 +3890,35 @@ async fn neighbours_of(
     }
 }
 
+async fn identity_edges_via_sst(
+    snapshot: &Snapshot<'_>,
+    edge_type: &str,
+    node: NodeId,
+    direction: EdgeDirection,
+) -> Result<Vec<EdgeView>, ExecError> {
+    let partners = snapshot
+        .sorted_partners_via_sst(edge_type, node, direction)
+        .await?;
+    Ok(partners
+        .into_iter()
+        .map(|partner| {
+            let (src, dst) = match direction {
+                EdgeDirection::Forward => (node, partner),
+                EdgeDirection::Inverse => (partner, node),
+            };
+            EdgeView {
+                edge_type: edge_type.to_string(),
+                src,
+                dst,
+                properties: Default::default(),
+                // Runtime relationship values do not expose LSN, and a
+                // tombstone is keyed solely by (type, src, dst).
+                lsn: 0,
+            }
+        })
+        .collect())
+}
+
 fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId) -> NodeId {
     match direction {
         RelationshipDirection::Right => edge.dst,
@@ -3891,80 +3933,27 @@ fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId)
     }
 }
 
-/// Fix #3 entry point: decide whether the Expand's `target_alias`
-/// binding can be stubbed (id-only) instead of materialised via
-/// `lookup_node`. Five conditions must hold:
+/// Decide whether an Expand target may be represented by an id-only stub.
 ///
-/// 1. `target_alias` is never read by any expression in the plan —
-///    not in RETURN, WHERE, ORDER BY, projection items, join keys,
-///    aggregation args, etc. Determined by [`PlanRouting::references`].
-///    A `Variable(t)` or `Property(t, _)` anywhere flips this off.
-/// 2. The length is single-hop (`*1..1`, the default). Variable-length
-///    paths bind `target_alias` at every intermediate hop, so the
-///    "transit only" assumption breaks down.
-/// 3. The Expand is not a back-reference (the existing binding already
-///    carries the materialised NodeView; we leave it alone).
-/// 4. The edge_type is known statically (un-typed expand `(-[]-)` would
-///    require enumerating every edge_type and we can't constrain the
-///    target label).
-/// 5. The `(edge_type, direction, target_label)` triple is
-///    schema-guaranteed: the schema declares an edge_type whose
-///    dst_label (Right) or src_label (Left) matches the target_label.
-///    Any edge surfacing through the CSR / SST adjacency for that
-///    `(edge_type, direction)` then points at a node guaranteed to be
-///    of that label — the same invariant `lookup_node(label, id)`
-///    enforces via its `continue`-on-None branch, but for free.
+/// This remains deliberately disabled until endpoint conformance is a
+/// persisted storage invariant. `EdgeTypeDef::{src_label,dst_label}` describes
+/// the intended shape, but raw ingestion and the low-level writer currently do
+/// not reject dangling or differently-labelled endpoints. Treating that
+/// declaration as proof can therefore make `MATCH ()-[:R]->(:Expected)` emit a
+/// false positive. A candidate edge must keep its point lookup + live-label
+/// check; the lookup is proportional to matched degree and is cacheable.
 #[allow(clippy::too_many_arguments)]
 fn should_skip_target_materialize(
-    snapshot: &Snapshot<'_>,
-    routing: &PlanRouting,
-    target_alias: &str,
-    edge_type: Option<&[String]>,
-    direction: RelationshipDirection,
-    target_labels: &[String],
-    length: Option<crate::parser::RelationshipLength>,
-    back_reference: bool,
+    _snapshot: &Snapshot<'_>,
+    _routing: &PlanRouting,
+    _target_alias: &str,
+    _edge_type: Option<&[String]>,
+    _direction: RelationshipDirection,
+    _target_labels: &[String],
+    _length: Option<crate::parser::RelationshipLength>,
+    _back_reference: bool,
 ) -> bool {
-    if back_reference {
-        return false;
-    }
-    if routing.references(target_alias) {
-        return false;
-    }
-    // Single-hop only. None means "default *1..1" by lowering convention.
-    let single_hop = length.map(|l| l.min == 1 && l.max == 1).unwrap_or(true);
-    if !single_hop {
-        return false;
-    }
-    let Some(edge_types) = edge_type else {
-        return false;
-    };
-    // Skip is only safe for exactly ONE schema-guaranteed target label: the
-    // optimization synthesises an id-only stub WITHOUT decoding the node, so it
-    // can't confirm extra labels. An unlabelled target (len 0, legacy
-    // `scan_node_for_id` path) and a multi-label target (len > 1, which needs
-    // the conjunctive materialise-and-check) both fall through to the full path.
-    let [target_label] = target_labels else {
-        return false;
-    };
-    let target_label = target_label.as_str();
-    let schema = &snapshot.manifest().manifest.schema;
-    // Type alternation `[:A|:B]`: every listed type has to point at the
-    // same target label, otherwise we'd silently drop matches where the
-    // label diverges. Walking each declaration is O(types.len()), well
-    // bounded in practice (the parser caps alternation at a handful).
-    edge_types.iter().all(|et| {
-        let Some(edge_def) = schema.edge_type(et) else {
-            return false;
-        };
-        match direction {
-            RelationshipDirection::Right => edge_def.dst_label == target_label,
-            RelationshipDirection::Left => edge_def.src_label == target_label,
-            RelationshipDirection::Both => {
-                edge_def.dst_label == target_label && edge_def.src_label == target_label
-            }
-        }
-    })
+    false
 }
 
 /// Resolve a node when the logical operator carries no label constraint.
@@ -4488,57 +4477,60 @@ pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<N
     }
 }
 
-/// Lookup a node by a unique user property via predicate-pushed scan
-/// + first-match short-circuit. Used by `LogicalPlan::NodeByPropertyValue`.
+/// Lookup a node by a unique user property. String values take the storage
+/// equality-index path; other values scan and then confirm exact Cypher
+/// equality before first-match short-circuiting.
 ///
-/// The storage layer's `scan_label_with_predicates` already pushes the
-/// `Eq` predicate to the row-group level (only matching row-groups are
-/// decoded — bloom + min/max prune away the rest). Once it returns the
-/// candidate set, we filter exactly and take the first match: per the
-/// `PropertyDef::unique` contract there's at most one.
-///
-/// Future optimisation: a dedicated `Snapshot::lookup_node_by_property`
-/// that short-circuits the *storage-side* iteration once the first
-/// match is found (today the scan still materialises all matches
-/// before returning; for a truly unique property that's exactly one
-/// row, so the waste is bounded — for a misdeclared "unique" property
-/// with multiple matches, we silently take the first).
+/// The confirmation is correctness-critical. Storage scan predicates use
+/// strict physical types, while Cypher considers (for example) integer `1`
+/// equal to float `1.0`; and types without a `StatScalar` representation
+/// cannot be predicate-pruned at all. Returning the first decoded row without
+/// checking its property would bind an unrelated node.
 pub(crate) async fn lookup_node_by_property_via_scan(
     snapshot: &Snapshot<'_>,
     label: &str,
     property: &str,
     value: &RuntimeValue,
 ) -> Result<Option<namidb_storage::NodeView>, ExecError> {
+    // `prop = NULL` is NULL (not true) under Cypher three-valued logic.
+    // This guard is especially important for correlated lookups driven by an
+    // UNWIND row: falling through to the generic scan below would otherwise
+    // take the label's first node for a NULL key.
+    if value.is_null() {
+        return Ok(None);
+    }
+
     // For v0 we only index String-valued properties (LDBC's `id`).
-    // Other scalar types fall back to `scan_label_with_predicates` —
-    // accurate but pays the per-row decoder overhead every call.
+    // Other value types fall back to the exact scan below.
     if let RuntimeValue::String(s) = value {
+        if label.is_empty() {
+            return snapshot
+                .lookup_nodes_by_property_any_label(property, s)
+                .await
+                .map(|nodes| nodes.into_iter().next())
+                .map_err(ExecError::from);
+        }
         return snapshot
             .lookup_node_by_property(label, property, s)
             .await
             .map_err(ExecError::from);
     }
 
-    // Fallback for non-string keys.
-    let scalar = match value {
-        RuntimeValue::Integer(i) => Some(namidb_storage::sst::stats::StatScalar::Int64(*i)),
-        RuntimeValue::Bool(b) => Some(namidb_storage::sst::stats::StatScalar::Bool(*b)),
-        RuntimeValue::Float(f) => Some(namidb_storage::sst::stats::StatScalar::Float64(*f)),
-        _ => None,
-    };
-    let candidates = if let Some(s) = scalar {
-        let pred = namidb_storage::sst::predicates::ScanPredicate::Eq {
-            column: property.to_string(),
-            value: s,
-        };
+    // Until typed equality sidecars exist, a strict storage predicate is not a
+    // safe pre-filter for numeric values: it would exclude an I64 row queried
+    // with the Cypher-equal F64 value (and vice versa). Scan the requested
+    // scope and apply the query evaluator's equality semantics below.
+    let candidates = if label.is_empty() {
         snapshot
-            .scan_label_with_predicates(label, &[pred])
+            .scan_all_nodes_with_predicates_and_projection(&[], None)
             .await
             .map_err(ExecError::from)?
     } else {
         snapshot.scan_label(label).await.map_err(ExecError::from)?
     };
-    Ok(candidates.into_iter().next())
+    Ok(candidates
+        .into_iter()
+        .find(|view| node_property_equals(view, property, value)))
 }
 
 /// Multi-match variant of [`lookup_node_by_property_via_scan`] for a
@@ -4552,22 +4544,46 @@ pub(crate) async fn lookup_nodes_by_property_via_scan(
     property: &str,
     value: &RuntimeValue,
 ) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
     if let RuntimeValue::String(s) = value {
+        if label.is_empty() {
+            return snapshot
+                .lookup_nodes_by_property_any_label(property, s)
+                .await
+                .map_err(ExecError::from);
+        }
         return snapshot
             .lookup_nodes_by_property(label, property, s)
             .await
             .map_err(ExecError::from);
     }
-    let all = snapshot.scan_label(label).await.map_err(ExecError::from)?;
+    let all = if label.is_empty() {
+        snapshot
+            .scan_all_nodes_with_predicates_and_projection(&[], None)
+            .await
+            .map_err(ExecError::from)?
+    } else {
+        snapshot.scan_label(label).await.map_err(ExecError::from)?
+    };
     Ok(all
         .into_iter()
-        .filter(|view| {
-            view.properties
-                .get(property)
-                .map(|cv| RuntimeValue::from(cv.clone()) == *value)
-                .unwrap_or(false)
-        })
+        .filter(|view| node_property_equals(view, property, value))
         .collect())
+}
+
+/// Compare one materialised property with a lookup value using the same
+/// equality relation as the Cypher expression evaluator.
+fn node_property_equals(
+    view: &namidb_storage::NodeView,
+    property: &str,
+    value: &RuntimeValue,
+) -> bool {
+    view.properties
+        .get(property)
+        .map(|stored| is_equal(&RuntimeValue::from(stored.clone()), value))
+        .unwrap_or(false)
 }
 
 // ────────────────────────── Factor path ────────────────────────
@@ -4838,7 +4854,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         *shortest,
                         path_binding.as_deref(),
                         snapshot,
-                        routing.needs_properties(rel_alias.as_deref()),
+                        routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                         false,
                         None,
                     )
@@ -4857,7 +4873,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     *optional,
                     *back_reference,
                     snapshot,
-                    routing.needs_properties(rel_alias.as_deref()),
+                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
                         snapshot,
                         routing,
@@ -5158,7 +5174,8 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
             // Correlated subplan operators: the outer row is threaded into
             // the inner execute. Inner planning is read-once but the outer
             // may bind ad-hoc fields, so we materialise the outer per row
-            // to thread it through `execute_inner(subplan, ..., Some(row))`.
+            // to thread it through
+            // `execute_inner_with_routing(subplan, ..., Some(row), routing)`.
             LogicalPlan::SemiApply {
                 input,
                 subplan,
@@ -5323,7 +5340,7 @@ async fn execute_expand_factor(
     optional: bool,
     back_reference: bool,
     snapshot: &Snapshot<'_>,
-    want_properties: bool,
+    edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
 ) -> Result<FactorRowSet, ExecError> {
     namidb_core::profile_scope!("walker::execute_expand_factor");
@@ -5443,7 +5460,7 @@ async fn execute_expand_factor(
                 std::collections::HashSet::new();
             for (cur_parent, tail, rels) in frontier.drain(..) {
                 let neighbours =
-                    neighbours_of_any(snapshot, &edge_types, direction, tail, want_properties)
+                    neighbours_of_any(snapshot, &edge_types, direction, tail, edge_read_mode)
                         .await?;
                 if !back_reference && !skip_target_materialize {
                     for edge in &neighbours {
@@ -5484,7 +5501,8 @@ async fn execute_expand_factor(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        // Fix #3: transit-only binding, see flat-path comment.
+                        // Future endpoint-validated transit-only fast path; see
+                        // the flat-path comment.
                         None
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
@@ -5525,7 +5543,8 @@ async fn execute_expand_factor(
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
                         });
                     } else if skip_target_materialize && !back_reference {
-                        // id-only stub for the next Expand's `.id` read.
+                        // Future endpoint-validated fast path: id-only stub
+                        // for the next Expand's `.id` read.
                         slots.push(Slot {
                             name: target_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue {
@@ -6260,10 +6279,10 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
 // RFC-018 §4 documented a properties caveat: with the slim CSR
 // adjacency on, `EdgeView.properties` for SST-sourced edges comes back
 // empty. The mitigation promised here is that the walker inspects the
-// query plan; any `Expand` whose `rel_alias` is read downstream
-// (whether as `r` or as `r.prop`) routes through the full-property SST
-// path on a per-call-site basis, leaving the CSR path for the strictly
-// topology-only majority of edge traversals.
+// query plan; any `Expand` whose `rel_alias` is consumed as a whole value or
+// through `r.prop` routes through the full-property SST path on a per-call-site
+// basis. Identity-only uses (`DELETE r`) take the sparse SST path, while
+// genuinely unreferenced aliases retain the topology-only CSR route.
 //
 // The analysis is a single visit at every public entry point. It
 // reuses [`collect_referenced_variables`] for the per-expression work
@@ -6271,52 +6290,199 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
 // invariant we need (whole-rel returns must also see populated
 // properties, so they take the SST path too).
 //
-// Second invariant: the same set drives **target-materialise skipping**
-// for chained Expands (Fix #3 — closes cold IC09 by removing the
-// per-edge `lookup_node` on intermediate hops). A target_alias that
-// never appears in any expression (RETURN / WHERE / ORDER BY /
-// projection / join key / aggregation) is only ever read by the next
-// Expand's `source` lookup, which uses only `NodeValue.id`. We can
-// therefore stub the binding with an id-only `NodeValue` and avoid the
-// SST decode entirely. Correctness is preserved when the
-// `(edge_type, direction, target_label)` triple is schema-guaranteed
-// (the dst/src label of the edge matches the declared target label) —
-// any edge surfacing through neighbours_of_any then points at a node
-// that *is* of the expected label.
+// The same reference set can eventually drive target-materialise skipping for
+// chained Expands, but that optimisation is currently fenced off. EdgeTypeDef
+// declares intended endpoint labels while low-level/raw writes do not enforce
+// them, so the declaration is not proof that an adjacent live node carries the
+// requested label. Every candidate retains its point lookup and label check.
 #[derive(Debug, Default)]
 pub(crate) struct PlanRouting {
     referenced_aliases: BTreeSet<String>,
+    /// Aliases whose full value (including a relationship's property map) is
+    /// consumed downstream. This intentionally excludes a bare `DELETE r`:
+    /// deleting a relationship only needs its `(type, src, dst)` identity.
+    value_referenced_aliases: BTreeSet<String>,
+    /// A node-mutating write invalidates the committed property cache at
+    /// commit. Correlated indexed reads in such a statement must therefore
+    /// use the writer-private transactional postings map so a sequence of
+    /// one-row auto-commits does not re-scan the growing memtable each time.
+    /// Edge-only DELETE/CREATE plans keep this false and retain SST-sidecar
+    /// point reads for sparse sweeps.
+    transactional_property_reads: bool,
 }
 
 impl PlanRouting {
     pub(crate) fn analyze(plan: &LogicalPlan) -> Self {
         let mut refs: BTreeSet<String> = BTreeSet::new();
         collect_plan_referenced_variables(plan, &mut refs);
+        let mut value_refs: BTreeSet<String> = BTreeSet::new();
+        collect_plan_value_referenced_variables(plan, &mut value_refs);
         Self {
             referenced_aliases: refs,
+            value_referenced_aliases: value_refs,
+            transactional_property_reads: plan_requires_transactional_property_reads(plan),
         }
     }
 
-    pub(crate) fn needs_properties(&self, rel_alias: Option<&str>) -> bool {
-        match rel_alias {
-            None => false,
-            Some(a) => self.referenced_aliases.contains(a),
-        }
+    pub(crate) fn transactional_property_reads(&self) -> bool {
+        self.transactional_property_reads
     }
 
-    /// `true` ⇔ `alias` is read anywhere in the plan — RETURN, WHERE,
-    /// ORDER BY, projection, join keys, aggregation args, etc. Bare
-    /// `Variable(alias)` and `Property(alias, k)` both count.
-    ///
-    /// An Expand whose `target_alias` returns `false` here is "transit
-    /// only": the next Expand reads its `.id`, nothing else, so we can
-    /// skip materialising the NodeView entirely (Fix #3).
-    pub(crate) fn references(&self, alias: &str) -> bool {
-        self.referenced_aliases.contains(alias)
+    fn edge_read_mode(&self, rel_alias: Option<&str>, path_binding: Option<&str>) -> EdgeReadMode {
+        // A path value owns its relationship values. Even when the explicit
+        // relationship alias is not returned, `RETURN p` must observe the
+        // persisted property maps rather than a slim CSR projection.
+        if path_binding.is_some() {
+            return EdgeReadMode::Properties;
+        }
+        let Some(alias) = rel_alias else {
+            return EdgeReadMode::Topology;
+        };
+        if self.value_referenced_aliases.contains(alias) {
+            EdgeReadMode::Properties
+        } else if self.referenced_aliases.contains(alias) {
+            // The only reference deliberately absent from value refs is a
+            // bare DELETE target. Keep it source-keyed and sparse instead of
+            // rebuilding the manifest-versioned whole-type CSR.
+            EdgeReadMode::SparseIdentity
+        } else {
+            EdgeReadMode::Topology
+        }
+    }
+}
+
+fn plan_requires_transactional_property_reads(plan: &LogicalPlan) -> bool {
+    use crate::plan::logical::CreateElement;
+
+    let mutating_here = match plan {
+        // SET/REMOVE can target either a node or a relationship. Treat them
+        // conservatively as node-mutating; the only cost of a relationship
+        // target is one writer-private population, while treating a node SET
+        // as edge-only reintroduces O(N²) across auto-commits.
+        LogicalPlan::Set { .. } | LogicalPlan::Remove { .. } | LogicalPlan::Merge { .. } => true,
+        LogicalPlan::Create { elements, .. } => elements
+            .iter()
+            .any(|element| matches!(element, CreateElement::Node { .. })),
+        LogicalPlan::Delete {
+            input,
+            targets,
+            detach,
+        } => {
+            // A proven bare relationship DELETE is the legal-loader sweep hot
+            // path and does not invalidate node-property caches. DETACH or an
+            // unknown/non-relationship target is conservatively node-mutating:
+            // node tombstones reset committed property caches at commit.
+            let mut relationship_aliases = BTreeSet::new();
+            let mut node_aliases = BTreeSet::new();
+            collect_plan_relationship_aliases(input, &mut relationship_aliases);
+            collect_plan_node_aliases(input, &mut node_aliases);
+            *detach
+                || !targets.iter().all(|target| match &target.kind {
+                    ExpressionKind::Variable(id) => {
+                        relationship_aliases.contains(&id.name) && !node_aliases.contains(&id.name)
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    mutating_here
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_requires_transactional_property_reads(child))
+}
+
+fn collect_plan_relationship_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    use crate::plan::logical::CreateElement;
+
+    match plan {
+        LogicalPlan::Expand {
+            rel_alias: Some(alias),
+            ..
+        } => {
+            out.insert(alias.clone());
+        }
+        LogicalPlan::Create { elements, .. } => {
+            for element in elements {
+                if let CreateElement::Rel {
+                    alias: Some(alias), ..
+                } = element
+                {
+                    out.insert(alias.clone());
+                }
+            }
+        }
+        LogicalPlan::Merge { pattern, .. } => {
+            for element in pattern {
+                if let CreateElement::Rel {
+                    alias: Some(alias), ..
+                } = element
+                {
+                    out.insert(alias.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in plan.children() {
+        collect_plan_relationship_aliases(child, out);
+    }
+}
+
+fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    use crate::plan::logical::CreateElement;
+
+    match plan {
+        LogicalPlan::NodeScan { alias, .. }
+        | LogicalPlan::NodeById { alias, .. }
+        | LogicalPlan::NodeByPropertyValue { alias, .. }
+        | LogicalPlan::VectorSearch { alias, .. } => {
+            out.insert(alias.clone());
+        }
+        LogicalPlan::Expand { target_alias, .. } => {
+            out.insert(target_alias.clone());
+        }
+        LogicalPlan::MultiwayJoin { vars, .. } => {
+            out.extend(vars.iter().map(|binding| binding.alias.clone()));
+        }
+        LogicalPlan::Create { elements, .. } => {
+            for element in elements {
+                if let CreateElement::Node { alias, .. } = element {
+                    out.insert(alias.clone());
+                }
+            }
+        }
+        LogicalPlan::Merge { pattern, .. } => {
+            for element in pattern {
+                if let CreateElement::Node { alias, .. } = element {
+                    out.insert(alias.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in plan.children() {
+        collect_plan_node_aliases(child, out);
     }
 }
 
 fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    collect_plan_references(plan, out, true);
+}
+
+/// Same plan walk as [`collect_plan_referenced_variables`], except a bare
+/// `DELETE <alias>` is treated as an identity-only use. Every other expression
+/// remains conservative and requires the full value.
+fn collect_plan_value_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    collect_plan_references(plan, out, false);
+}
+
+fn collect_plan_references(
+    plan: &LogicalPlan,
+    out: &mut BTreeSet<String>,
+    delete_needs_full_value: bool,
+) {
     use crate::plan::logical::{AggregateExpr, CreateElement, RemoveOp};
 
     match plan {
@@ -6447,7 +6613,11 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
         }
         LogicalPlan::Delete { targets, .. } => {
             for e in targets {
-                collect_referenced_variables(e, out);
+                if delete_needs_full_value
+                    || !matches!(&e.kind, crate::parser::ExpressionKind::Variable(_))
+                {
+                    collect_referenced_variables(e, out);
+                }
             }
         }
         LogicalPlan::Expand { .. }
@@ -6464,7 +6634,7 @@ fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<Stri
     }
 
     for child in plan.children() {
-        collect_plan_referenced_variables(child, out);
+        collect_plan_references(child, out, delete_needs_full_value);
     }
 }
 
@@ -6496,7 +6666,13 @@ fn visit_set_op(s: &crate::plan::logical::SetOp, out: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use namidb_core::id::NodeId;
+    use namidb_core::id::{NamespaceId, NodeId};
+    use namidb_core::value::Value as CoreValue;
+    use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     #[test]
     fn node_id_from_string_value() {
@@ -6548,6 +6724,102 @@ mod tests {
         let v = RuntimeValue::String("not-a-uuid".into());
         let err = node_id_from_value(&v, SourceSpan::point(0)).unwrap_err();
         assert!(matches!(err, ExecError::Eval(_)));
+    }
+
+    #[tokio::test]
+    async fn non_string_property_lookup_confirms_candidate_and_numeric_equality() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = NamespacePaths::new(
+            "tenants",
+            NamespaceId::new("query-typed-property-lookup").unwrap(),
+        );
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+        // Deterministic ids make the non-match sort before the match. The old
+        // fallback returned `.next()` from this scan and therefore bound
+        // `wrong_date` for a lookup of day 22.
+        let wrong_date: NodeId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let right_date: NodeId = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        for (id, day) in [(wrong_date, 11_i32), (right_date, 22_i32)] {
+            writer
+                .upsert_node(
+                    "Event",
+                    id,
+                    &NodeWriteRecord {
+                        properties: BTreeMap::from([("day".into(), CoreValue::Date(day))]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let wrong_number: NodeId = "00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let right_number: NodeId = "00000000-0000-0000-0000-000000000004".parse().unwrap();
+        for (id, number) in [(wrong_number, 1_i64), (right_number, 2_i64)] {
+            writer
+                .upsert_node(
+                    "Metric",
+                    id,
+                    &NodeWriteRecord {
+                        properties: BTreeMap::from([("number".into(), CoreValue::I64(number))]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+
+        let snapshot = writer.snapshot();
+        let date =
+            lookup_node_by_property_via_scan(&snapshot, "Event", "day", &RuntimeValue::Date(22))
+                .await
+                .unwrap()
+                .expect("the exact date-key row");
+        assert_eq!(date.id, right_date);
+
+        let numeric = lookup_node_by_property_via_scan(
+            &snapshot,
+            "Metric",
+            "number",
+            &RuntimeValue::Float(2.0),
+        )
+        .await
+        .unwrap()
+        .expect("Cypher equality must match integer 2 with float 2.0");
+        assert_eq!(numeric.id, right_number);
+
+        let all_numeric = lookup_nodes_by_property_via_scan(
+            &snapshot,
+            "Metric",
+            "number",
+            &RuntimeValue::Float(2.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            all_numeric.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![right_number],
+            "single- and multi-match fallbacks must share Cypher numeric equality"
+        );
+    }
+
+    #[test]
+    fn delete_relationship_needs_identity_but_not_properties() {
+        let query = crate::parser::parse(
+            "MATCH (n:Source)-[r:REL]->(:Target) \
+             DELETE r",
+        )
+        .unwrap();
+        let plan = crate::plan::lower(&query).unwrap();
+        let routing = PlanRouting::analyze(&plan);
+
+        assert_eq!(
+            routing.edge_read_mode(Some("r"), None),
+            EdgeReadMode::SparseIdentity,
+            "DELETE r must use a source-keyed identity lookup, never a whole-type CSR rebuild"
+        );
     }
 
     #[test]

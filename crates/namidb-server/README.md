@@ -13,8 +13,7 @@ cargo install --path crates/namidb-server
 ```
 
 Container image (official, multi-arch amd64/arm64, from
-[Docker Hub](https://hub.docker.com/r/namidb/namidb-server) — also mirrored
-at `ghcr.io/namidb/namidb-server`):
+[Docker Hub](https://hub.docker.com/r/namidb/namidb-server)):
 
 ```bash
 docker pull namidb/namidb-server:2

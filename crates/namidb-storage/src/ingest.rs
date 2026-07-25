@@ -168,6 +168,14 @@ pub struct WriterSession {
     next_wal_seq: u64,
     pending: WalSegment,
     pending_payloads: Vec<(MemKey, u64, MemOp)>,
+    /// Last-write-wins view of the uncommitted batch. Kept incrementally at
+    /// staging time so [`Self::overlay_snapshot`] can clone the persistent
+    /// `OrdMap` in O(1), rather than replaying every pending WAL payload on
+    /// every correlated RYOW lookup (which made large UNWIND batches O(N²)).
+    staged_memtable: Memtable,
+    /// O(1) companion to `pending_has_node_mutations()`. Avoids walking the
+    /// growing pending history for every overlay/index probe.
+    pending_node_mutations: bool,
     /// CSR adjacency cache shared across every `Snapshot` this writer
     /// emits (RFC-018). By default the PROCESS-WIDE shared instance
     /// ([`crate::adjacency::shared_adjacency_cache`], keys embed the
@@ -317,7 +325,7 @@ impl WriterSession {
         } = caches;
 
         let published_memtable = Arc::new(recovered.memtable.snapshot_view());
-        Ok(Self {
+        let session = Self {
             manifest_store,
             wal_store,
             fence,
@@ -329,6 +337,8 @@ impl WriterSession {
             next_wal_seq,
             pending: WalSegment::new(next_wal_seq),
             pending_payloads: Vec::new(),
+            staged_memtable: Memtable::new(),
+            pending_node_mutations: false,
             adjacency_cache,
             node_cache,
             sst_cache,
@@ -338,7 +348,13 @@ impl WriterSession {
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
             poisoned: false,
-        })
+        };
+        // Publish this namespace's current immutable-object set to the shared
+        // cache before handing out any snapshot. Besides reclaiming stale
+        // entries after a reopen, this re-enables admission after registry
+        // eviction called `prune_namespace` with an empty live set.
+        session.prune_sst_cache();
+        Ok(session)
     }
 
     /// Refresh [`Self::published_memtable`] from the current `memtable`.
@@ -393,8 +409,21 @@ impl WriterSession {
         // Not populated yet: one label scan over the RYOW overlay — the same
         // source of truth the per-row scan fallback uses — then re-probe.
         let views = self.overlay_snapshot().scan_label(label).await?;
-        self.unique_index
-            .populate(label, &names, views.iter().map(|v| (v.id, &v.properties)));
+        if self.pending_has_node_mutations() {
+            // The overlay already contains staged node mutations whose prior
+            // tuples were not observed. Keep the map exact for RYOW, but mark
+            // it disposable if this pending batch is rolled back.
+            self.unique_index.populate_staged(
+                label,
+                &names,
+                views.iter().map(|v| (v.id, &v.properties)),
+            );
+        } else {
+            // An empty or edge-only batch cannot affect scan_label: this is a
+            // committed node baseline that can stay hot across rollback.
+            self.unique_index
+                .populate(label, &names, views.iter().map(|v| (v.id, &v.properties)));
+        }
         Ok(self
             .unique_index
             .probe(label, &names, &key, exclude)
@@ -406,6 +435,13 @@ impl WriterSession {
     /// scans / probe counters) instead of a per-row label scan.
     pub fn unique_index(&self) -> &crate::unique_index::UniqueConstraintIndex {
         &self.unique_index
+    }
+
+    /// Whether the pending transaction changes the node view. Edge-only
+    /// batches leave both node property caches exact and do not turn a
+    /// unique-index population over `scan_label` into staged state.
+    fn pending_has_node_mutations(&self) -> bool {
+        self.pending_node_mutations
     }
 
     /// Adjacency cache attached to this writer (RFC-018) — the shared
@@ -473,6 +509,23 @@ impl WriterSession {
         self.pending.records.len()
     }
 
+    /// Distinct keys in the incrementally maintained RYOW overlay.
+    ///
+    /// Normally equal to `pending_len`; lower when a transaction rewrites the
+    /// same key. Exposed for observability/regressions around overlay growth.
+    pub fn staged_memtable_len(&self) -> usize {
+        self.staged_memtable.len()
+    }
+
+    /// Whether the pending transaction changes node labels/properties.
+    ///
+    /// Query routing uses this to keep committed String point lookups on their
+    /// SST sidecars while selecting the writer-private index only when RYOW
+    /// node state actually differs.
+    pub fn has_staged_node_mutations(&self) -> bool {
+        self.pending_node_mutations
+    }
+
     /// `true` when a prior terminal commit failure poisoned this session:
     /// every further `commit_batch` is refused and the caller must drop the
     /// session and reopen the namespace (or call [`Self::reopen`]). The
@@ -519,9 +572,13 @@ impl WriterSession {
         let discarded = self.pending.records.len();
         self.pending = WalSegment::new(self.pending.seq);
         self.pending_payloads.clear();
-        // The unique-value index tracked the discarded staged writes; drop it
-        // so the next probe repopulates from committed state only.
-        self.unique_index.reset();
+        self.staged_memtable = Memtable::new();
+        self.pending_node_mutations = false;
+        // The unique-value index journals the pre-batch tuple for every
+        // touched node. Restore those entries instead of dropping the whole
+        // committed index: a timeout after a large write must not make the
+        // next MERGE pay a full corpus scan (amplified by any L0 backlog).
+        self.unique_index.rollback_staged();
         discarded
     }
 
@@ -583,6 +640,7 @@ impl WriterSession {
             adjacency_cache: self.adjacency_cache.clone(),
             shared_node_cache: self.node_cache.clone(),
             property_index_cache: Some(self.property_index_cache.clone()),
+            property_index_generation: Some(self.property_index_cache.generation()),
         })
     }
 
@@ -622,24 +680,21 @@ impl WriterSession {
     /// (same caches, no overlay), so a write statement's first read before
     /// any mutation pays nothing.
     ///
-    /// The overlay is built from `pending_payloads`, so it reflects exactly
-    /// what [`commit_batch`](Self::commit_batch) would make durable. The
+    /// The overlay is an O(1) persistent-map snapshot of `staged_memtable`, so
+    /// it reflects exactly what [`commit_batch`](Self::commit_batch) would make
+    /// durable without replaying the growing pending WAL on every lookup. The
     /// cross-snapshot NodeView and property-index caches are deliberately
     /// NOT attached: they are keyed by manifest version and shared across
     /// sessions, so caching a staged (uncommitted) row in them would leak
     /// it to a concurrent reader pinned at the same version. The immutable
-    /// SST/adjacency body caches are safe to keep.
+    /// SST/adjacency body caches are safe to keep. Instead, the overlay attaches
+    /// the writer-private transactional property index, whose rollback journal
+    /// makes committed+staged equality lookups reusable without cross-reader
+    /// leakage.
     pub fn overlay_snapshot(&self) -> Snapshot<'_> {
-        if self.pending_payloads.is_empty() {
+        let staged_node_mutations = self.pending_has_node_mutations();
+        if self.staged_memtable.is_empty() {
             return self.snapshot();
-        }
-        // Materialise the staged batch as a second memtable. `apply` in
-        // pending (LSN-ascending) order leaves each key at its highest-LSN
-        // op, exactly as `commit_batch` would drain it into the live
-        // memtable.
-        let mut staged = Memtable::new();
-        for (key, lsn, op) in &self.pending_payloads {
-            staged.apply(key.clone(), *lsn, op.clone());
         }
         // Resolve labels through the writer's live dictionary, not the
         // committed manifest's: a node staged in this batch may carry a
@@ -660,7 +715,33 @@ impl WriterSession {
         if let Some(cache) = &self.adjacency_cache {
             snap = snap.with_adjacency_cache(cache.clone());
         }
-        snap.with_overlay(staged.snapshot_view())
+        snap = snap.with_overlay(self.staged_memtable.snapshot_view());
+        if staged_node_mutations {
+            // Node values differ from the published generation: only the
+            // writer-private transactional postings index is safe.
+            snap.with_transactional_property_index(&self.unique_index, true)
+        } else {
+            // Edge-only RYOW leaves every node/cache entry exact.
+            if let Some(cache) = &self.node_cache {
+                snap = snap.with_shared_node_cache(cache.clone());
+            }
+            snap.with_property_index_cache(self.property_index_cache.clone())
+        }
+    }
+
+    /// RYOW snapshot for a statement that can mutate node state.
+    ///
+    /// Unlike [`Self::overlay_snapshot`], this attaches the writer-private
+    /// transactional property postings even before the first mutation. That
+    /// lets one-row auto-commit `MERGE` / `MATCH ... SET` sequences retain one
+    /// populated map across commits instead of rebuilding the committed
+    /// memtable cache after each node write. Edge-only write plans should use
+    /// [`Self::overlay_snapshot`] so a cold keyed sweep keeps the immutable
+    /// SST-sidecar point path.
+    pub fn transactional_overlay_snapshot(&self) -> Snapshot<'_> {
+        let staged_node_mutations = self.pending_has_node_mutations();
+        self.overlay_snapshot()
+            .with_transactional_property_index(&self.unique_index, staged_node_mutations)
     }
 
     /// Schema of the current manifest version. The write path consults it to
@@ -873,6 +954,7 @@ impl WriterSession {
         let base_seq = self.pending.seq;
         let last_lsn = self.pending.last_lsn();
         let records = self.pending.records.len();
+        let committed_node_mutations = self.pending_has_node_mutations();
 
         // The WAL segment path is fully determined by `seq`, so we can
         // build the next manifest body before the WAL PUT lands and
@@ -941,25 +1023,28 @@ impl WriterSession {
         for (key, lsn, op) in drained {
             self.memtable.apply(key, lsn, op);
         }
+        self.staged_memtable = Memtable::new();
+        self.pending_node_mutations = false;
         self.pending = WalSegment::new(committed_seq.saturating_add(1));
 
         self.current = new_current;
         self.next_wal_seq = committed_seq.saturating_add(1);
+        // A node commit makes every cached value→NodeId map stale. Clear it
+        // before publishing the new memtable so no fresh reader can pair new
+        // node state with an old negative-answer cache. Edge-only commits do
+        // not change those maps and should leave them hot.
+        if committed_node_mutations {
+            self.property_index_cache.reset();
+        }
         // Publish the new memtable snapshot so subsequent reads (HTTP,
         // Bolt, embedded) pick up the just-committed records without
         // taking the writer lock. See RFC-021.
         self.refresh_published();
-        // Invalidate the cross-snapshot property index. A commit adds new
-        // nodes to the live memtable, but a previously warmed value→NodeId
-        // map was frozen against an older snapshot and would otherwise hide
-        // the just-committed records from `lookup_node_by_property`
-        // (read-after-write bug). Subsequent snapshots rebuild on their
-        // first miss. Mirrors the reset in `flush`/`attach_ssts`.
-        self.property_index_cache.reset();
-        // Do NOT reset `unique_index`: every committed node mutation already
-        // passed through apply_upsert/apply_tombstone while staged, so its maps
-        // now describe the committed state exactly. Keeping them warm is what
-        // makes auto-commit MERGE-by-key O(1) after the first population.
+        // Every committed node mutation already passed through
+        // apply_upsert/apply_tombstone while staged, so the maps now describe
+        // committed state exactly. Forget only their rollback journal; keeping
+        // the maps warm is what makes auto-commit MERGE-by-key O(1).
+        self.unique_index.commit_staged();
 
         // Auto-snapshot tick. Best effort: a snapshot is a cache, the
         // WAL is the source of truth. Log the failure and keep going
@@ -1110,10 +1195,9 @@ impl WriterSession {
         Ok(outcome)
     }
 
-    /// Drop `SstCache` side-map entries (Parquet metadata, decoded edge streams,
-    /// edge readers) for SSTs the current manifest no longer references. Those
-    /// maps are insert-only and keyed by absolute SST path, so without this they
-    /// grow without bound as flush/compaction churns SSTs.
+    /// Drop every `SstCache` tier (raw bodies, row groups, metadata, decoded
+    /// streams/readers, property indexes, blooms, vector and text indexes) for
+    /// immutable objects the current manifest no longer references.
     ///
     /// Scoped to this session's namespace prefix: the cache is shared
     /// process-wide, and this writer's live set says nothing about sibling
@@ -1125,13 +1209,22 @@ impl WriterSession {
         };
         let prefix = self.manifest_store.paths().namespace_prefix();
         let prefix = prefix.as_ref();
-        let live: std::collections::HashSet<String> = self
-            .current
-            .manifest
-            .ssts
-            .iter()
-            .map(|d| format!("{prefix}/{}", d.path))
-            .collect();
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for descriptor in &self.current.manifest.ssts {
+            live.insert(format!("{prefix}/{}", descriptor.path));
+            if let Some(bloom) = &descriptor.bloom {
+                live.insert(format!("{prefix}/{}", bloom.path));
+            }
+            for index in &descriptor.unique_property_indices {
+                live.insert(format!("{prefix}/{}", index.path));
+            }
+            for index in &descriptor.equality_property_indices {
+                live.insert(format!("{prefix}/{}", index.path));
+            }
+            if let Some(index) = &descriptor.label_index {
+                live.insert(format!("{prefix}/{}", index.path));
+            }
+        }
         cache.retain_paths(prefix, &live);
     }
 
@@ -1507,6 +1600,11 @@ impl WriterSession {
             .await?;
         let version = committed.manifest.version;
         self.current = committed;
+        // The manifest no longer references the `.vg` objects. Release both
+        // decoded graphs and cached bodies immediately (and reject a late
+        // decode from a stale pinned snapshot) instead of waiting for LRU
+        // pressure.
+        self.prune_sst_cache();
         self.refresh_published();
         self.property_index_cache.reset();
         Ok(version)
@@ -1549,6 +1647,9 @@ impl WriterSession {
             .await?;
         let version = committed.manifest.version;
         self.current = committed;
+        // Mirrors vector DROP: purge decoded `.ft` indexes and raw bodies as
+        // part of the successful metadata transition.
+        self.prune_sst_cache();
         self.refresh_published();
         self.property_index_cache.reset();
         Ok(version)
@@ -1826,7 +1927,14 @@ impl WriterSession {
     fn append_pending(&mut self, entry: WalEntry, op: MemOp, lsn: u64, key: MemKey) -> Result<()> {
         let payload = entry.encode()?;
         self.pending.push(WalRecord { lsn, payload });
-        self.pending_payloads.push((key, lsn, op));
+        self.pending_payloads.push((key.clone(), lsn, op.clone()));
+        if matches!(key, MemKey::Node { .. }) {
+            self.pending_node_mutations = true;
+        }
+        // `Memtable::apply` replaces the previous entry for the same key, so
+        // multiple writes in one transaction retain exactly the highest-LSN
+        // operation while the WAL/pending_payloads keep the full history.
+        self.staged_memtable.apply(key, lsn, op);
         Ok(())
     }
 }
@@ -1864,9 +1972,8 @@ fn value_datatype(v: &Value) -> Option<DataType> {
 /// still be served correctly (keys embed the namespace and the manifest
 /// version), just uselessly.
 ///
-/// The `SstCache`'s byte-budgeted foyer tiers (SST bodies, decoded node
-/// row groups) expose no iteration API and are reclaimed lazily by their
-/// own budget eviction; everything map-backed is dropped eagerly here.
+/// `SstCache` tracks every path-bearing foyer tier, including raw bodies and
+/// decoded row groups, so all namespace-local entries are dropped eagerly.
 pub fn prune_shared_caches(paths: &NamespacePaths) {
     let prefix = paths.namespace_prefix();
     let prefix = prefix.as_ref();
@@ -2047,6 +2154,25 @@ mod tests {
             .build()
     }
 
+    async fn seeded_two_l0_person_session(ns: &str) -> WriterSession {
+        let mut session = WriterSession::open(make_store(), make_paths(ns))
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", Some(30)))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", Some(40)))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        assert!(
+            session.compaction_basis().needs_compaction(),
+            "fixture must expose a real two-L0 compaction"
+        );
+        session
+    }
+
     #[tokio::test]
     async fn open_bootstraps_fresh_namespace() {
         let store = make_store();
@@ -2175,7 +2301,16 @@ mod tests {
 
         let store = make_store();
         let paths = make_paths("ingest-drop-vecidx");
-        let mut session = WriterSession::open(store, paths).await.unwrap();
+        let mut session = WriterSession::open_with_caches(
+            store,
+            paths,
+            SessionCaches {
+                sst_cache: Some(SstCache::new(8 * 1024 * 1024)),
+                ..SessionCaches::none()
+            },
+        )
+        .await
+        .unwrap();
 
         let doc_schema = SchemaBuilder::new()
             .label(LabelDef {
@@ -2237,14 +2372,19 @@ mod tests {
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session.compact_l0(&doc_schema).await.unwrap();
-        assert!(
-            session
-                .current
-                .manifest
-                .ssts
-                .iter()
-                .any(|d| d.kind == SstKind::VectorGraph && d.scope == "doc_emb"),
-            "compaction must have built the .vg SST for the registered index"
+        let vg_relative = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::VectorGraph && d.scope == "doc_emb")
+            .expect("compaction must have built the .vg SST for the registered index")
+            .path
+            .clone();
+        let vg_absolute = format!(
+            "{}/{}",
+            session.manifest_store.paths().namespace_prefix().as_ref(),
+            vg_relative
         );
         // The index path actually serves (fresh, and the .vg answers the KNN) —
         // not the trivially-equal flat fallback.
@@ -2257,6 +2397,15 @@ mod tests {
         assert_eq!(hits.len(), 1, "the .vg must answer the KNN before the drop");
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
+        let cache = session.sst_cache().unwrap().clone();
+        assert!(
+            cache.get_vector_index(&vg_absolute).is_some(),
+            "the serving query must populate the decoded graph cache"
+        );
+        assert!(
+            cache.get(&vg_absolute).is_some(),
+            "the serving query must populate the raw body cache"
+        );
 
         // A registration over the occupied (label, property, metric) slot is
         // still a duplicate at this point.
@@ -2289,6 +2438,14 @@ mod tests {
             !m.ssts.iter().any(|d| d.kind == SstKind::VectorGraph),
             "the .vg SST refs are gone from the same manifest version"
         );
+        assert!(
+            cache.get_vector_index(&vg_absolute).is_none(),
+            "DROP must eagerly prune the decoded graph"
+        );
+        assert!(
+            cache.get(&vg_absolute).is_none(),
+            "DROP must eagerly prune the raw graph body"
+        );
 
         // The flat scan still sees every row — dropping the index loses no data.
         let snap = session.snapshot();
@@ -2317,7 +2474,16 @@ mod tests {
     async fn drop_text_index_removes_descriptor_and_ft_ssts_and_falls_back() {
         let store = make_store();
         let paths = make_paths("ingest-drop-ftidx");
-        let mut session = WriterSession::open(store, paths).await.unwrap();
+        let mut session = WriterSession::open_with_caches(
+            store,
+            paths,
+            SessionCaches {
+                sst_cache: Some(SstCache::new(8 * 1024 * 1024)),
+                ..SessionCaches::none()
+            },
+        )
+        .await
+        .unwrap();
 
         let note_schema = SchemaBuilder::new()
             .label(LabelDef {
@@ -2354,14 +2520,19 @@ mod tests {
             .unwrap();
         session.flush(note_schema.clone()).await.unwrap();
         session.compact_l0(&note_schema).await.unwrap();
-        assert!(
-            session
-                .current
-                .manifest
-                .ssts
-                .iter()
-                .any(|d| d.kind == SstKind::TextIndex && d.scope == "note_ft"),
-            "compaction must have built the .ft SST for the registered index"
+        let ft_relative = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::TextIndex && d.scope == "note_ft")
+            .expect("compaction must have built the .ft SST for the registered index")
+            .path
+            .clone();
+        let ft_absolute = format!(
+            "{}/{}",
+            session.manifest_store.paths().namespace_prefix().as_ref(),
+            ft_relative
         );
         // The index path actually serves (`Some`, not the flat fallback).
         let snap = session.snapshot();
@@ -2378,6 +2549,15 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
+        let cache = session.sst_cache().unwrap().clone();
+        assert!(
+            cache.get_text_index(&ft_absolute).is_some(),
+            "the serving query must populate the decoded text cache"
+        );
+        assert!(
+            cache.get(&ft_absolute).is_some(),
+            "the serving query must populate the raw body cache"
+        );
 
         // Missing name: an error without IF EXISTS, a version-preserving no-op
         // with it.
@@ -2395,6 +2575,14 @@ mod tests {
         assert!(
             !m.ssts.iter().any(|d| d.kind == SstKind::TextIndex),
             "the .ft SST refs are gone from the same manifest version"
+        );
+        assert!(
+            cache.get_text_index(&ft_absolute).is_none(),
+            "DROP must eagerly prune the decoded text index"
+        );
+        assert!(
+            cache.get(&ft_absolute).is_none(),
+            "DROP must eagerly prune the raw text body"
         );
 
         // The read path reports "no index" (`None` → the caller flat-scans) and
@@ -2744,6 +2932,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_after_interleaved_data_commit_and_flush_preserves_new_l0() {
+        let mut session =
+            seeded_two_l0_person_session("ingest-prep-interleave-data-universal").await;
+        let basis = session.compaction_basis();
+        let compact_schema = basis.schema().clone();
+        let prepared = basis.prepare(&compact_schema).await.unwrap();
+        let base_version = prepared.base_version();
+        let prepared_inputs: Vec<Uuid> =
+            session.current.manifest.ssts.iter().map(|d| d.id).collect();
+
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("Carol", Some(50)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        session.flush(compact_schema).await.unwrap();
+        assert_eq!(session.manifest_version(), base_version + 2);
+        let interleaved_l0: Vec<Uuid> = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| d.level == SstLevel::L0 && !prepared_inputs.contains(&d.id))
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(
+            interleaved_l0.len(),
+            1,
+            "the data flush must add one L0 outside the prepare basis"
+        );
+
+        let outcome = session.install_prepared_compaction(prepared).await.unwrap();
+        assert_eq!(outcome.committed.manifest.version, base_version + 3);
+        for id in prepared_inputs {
+            assert!(!outcome.committed.manifest.ssts.iter().any(|d| d.id == id));
+        }
+        assert!(outcome
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .any(|d| interleaved_l0.contains(&d.id)));
+        for id in [sorted_node_id(1), sorted_node_id(2), sorted_node_id(3)] {
+            assert!(session
+                .snapshot()
+                .lookup_node("Person", id)
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_rejects_concurrent_schema_ddl() {
+        let mut session = seeded_two_l0_person_session("ingest-prep-schema-drift").await;
+        let basis = session.compaction_basis();
+        let compact_schema = basis.schema().clone();
+        let prepared = basis.prepare(&compact_schema).await.unwrap();
+
+        session
+            .create_property_index("Person", "name")
+            .await
+            .unwrap();
+        let ddl_manifest = session.current.manifest.clone();
+        let err = session
+            .install_prepared_compaction(prepared)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        assert!(err.to_string().contains("schema changed"), "{err}");
+        assert_eq!(
+            session.current.manifest, ddl_manifest,
+            "rejected install must leave the DDL manifest untouched"
+        );
+        assert_eq!(
+            session
+                .manifest_store
+                .load_current()
+                .await
+                .unwrap()
+                .manifest,
+            ddl_manifest,
+            "rejected install must not commit a durable manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_rejects_concurrent_search_index_ddl() {
+        use crate::manifest::{VectorMetric, VectorQuantization};
+
+        let mut session = seeded_two_l0_person_session("ingest-prep-search-ddl-drift").await;
+        let basis = session.compaction_basis();
+        let compact_schema = basis.schema().clone();
+        let prepared = basis.prepare(&compact_schema).await.unwrap();
+
+        session
+            .register_vector_index(
+                VectorIndexDescriptor {
+                    name: "person_vec".into(),
+                    label: "Person".into(),
+                    property: "embedding".into(),
+                    dim: 4,
+                    metric: VectorMetric::Cosine,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("person_ft".into(), "Person".into(), vec!["name".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        let ddl_manifest = session.current.manifest.clone();
+        let err = session
+            .install_prepared_compaction(prepared)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("vector indexes"), "{message}");
+        assert!(message.contains("text indexes"), "{message}");
+        assert_eq!(
+            session.current.manifest, ddl_manifest,
+            "rejected install must preserve both registered index descriptors"
+        );
+        assert_eq!(
+            session
+                .manifest_store
+                .load_current()
+                .await
+                .unwrap()
+                .manifest,
+            ddl_manifest,
+            "rejected install must not commit a durable manifest"
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_then_commit_makes_data_visible_via_snapshot() {
         let store = make_store();
         let paths = make_paths("ingest-upsert");
@@ -2809,7 +3143,14 @@ mod tests {
         session
             .upsert_node("Person", bob, &node_record("Bob", Some(40)))
             .unwrap();
+        // A second write to the same key remains two WAL mutations but one
+        // highest-LSN overlay entry.
+        session
+            .upsert_node("Person", bob, &node_record("Bob", Some(41)))
+            .unwrap();
         session.tombstone_node("Person", alice).unwrap();
+        assert_eq!(session.pending_len(), 3);
+        assert_eq!(session.staged_memtable_len(), 2);
 
         // Plain snapshot: committed only — Alice visible, Bob not.
         let committed = session.snapshot();
@@ -2829,7 +3170,8 @@ mod tests {
         // Overlay snapshot: Bob is visible; Alice is hidden by the staged
         // tombstone; the label scan reflects exactly the staged batch.
         let overlay = session.overlay_snapshot();
-        assert!(overlay.lookup_node("Person", bob).await.unwrap().is_some());
+        let staged_bob = overlay.lookup_node("Person", bob).await.unwrap().unwrap();
+        assert_eq!(staged_bob.properties.get("age"), Some(&Value::I64(41)));
         assert!(overlay
             .lookup_node("Person", alice)
             .await
@@ -2842,6 +3184,7 @@ mod tests {
 
         // Nothing staged: overlay_snapshot collapses to the committed view.
         session.discard_batch();
+        assert_eq!(session.staged_memtable_len(), 0);
         let after = session.overlay_snapshot();
         assert!(after.lookup_node("Person", alice).await.unwrap().is_some());
         assert!(after.lookup_node("Person", bob).await.unwrap().is_none());
@@ -2926,6 +3269,13 @@ mod tests {
             .upsert_node("Person", bob, &node_record("Bob", Some(40)))
             .unwrap();
         let _ = session.commit_batch().await.unwrap();
+        assert!(
+            session
+                .property_index_cache()
+                .get("Person", "name")
+                .is_none(),
+            "a node commit must invalidate the stale property map before publication"
+        );
 
         // Bob must now be visible BOTH to scan and to property lookup.
         let snap = session.snapshot();
@@ -2942,6 +3292,46 @@ mod tests {
             found.is_some(),
             "Bob committed via commit_batch must be visible to \
              lookup_node_by_property (property index cache reset on commit)"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_only_commit_keeps_property_index_cache_hot() {
+        let store = make_store();
+        let paths = make_paths("ingest-edge-commit-prop-index");
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        // With no node SSTs this miss takes the legacy scan path and leaves a
+        // concrete cross-snapshot property map in the writer cache.
+        assert!(session
+            .snapshot()
+            .lookup_node_by_property("Person", "name", "missing")
+            .await
+            .unwrap()
+            .is_none());
+        let before = session
+            .property_index_cache()
+            .get("Person", "name")
+            .expect("lookup should populate the property cache");
+
+        session
+            .upsert_edge("KNOWS", alice, sorted_node_id(2), &edge_record())
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        let after = session
+            .property_index_cache()
+            .get("Person", "name")
+            .expect("an edge-only commit cannot stale a node property map");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "edge-only commit should preserve the exact cached map"
         );
     }
 
@@ -4445,8 +4835,8 @@ mod tests {
             "staged maintenance must not force rescans"
         );
 
-        // Stage a claim on 11, then discard the batch: the index must forget
-        // the staged state and answer from committed state after a rescan.
+        // Stage a claim on 11, then discard the batch: the index must undo
+        // only the staged state and keep its committed map hot.
         s.upsert_node("Account", y, &int_record("code", 11))
             .unwrap();
         s.discard_batch();
@@ -4465,9 +4855,40 @@ mod tests {
         );
         assert_eq!(
             s.unique_index().populate_scans(),
-            2,
-            "discard invalidates; the next probe repopulates once"
+            1,
+            "discard rolls back touched ids without a corpus rescan"
         );
+
+        // A successful commit promotes the staged map state to the next
+        // rollback baseline. Discarding a later rewrite must restore code=12,
+        // again without invalidating the populated constraint map.
+        let twelve = Value::I64(12);
+        s.upsert_node("Account", y, &int_record("code", 12))
+            .unwrap();
+        s.commit_batch().await.unwrap();
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &twelve)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(y)
+        );
+        let thirteen = Value::I64(13);
+        s.upsert_node("Account", y, &int_record("code", 13))
+            .unwrap();
+        s.discard_batch();
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &twelve)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(y)
+        );
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &thirteen)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1);
 
         // Values without a canonical scalar encoding are not indexed.
         let list = Value::List(vec![Value::I64(1)]);
@@ -4477,6 +4898,291 @@ mod tests {
                 .unwrap(),
             UniqueProbe::Unindexable
         );
+    }
+
+    #[tokio::test]
+    async fn transactional_postings_track_value_label_tombstone_and_lifecycle() {
+        let store = make_store();
+        let paths = make_paths("ingest-transactional-postings-lifecycle");
+        let mut s = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        s.create_property_index("Person", "key").await.unwrap();
+
+        let keyed = |value: &str| NodeWriteRecord {
+            properties: BTreeMap::from([("key".into(), Value::Str(value.into()))]),
+            schema_version: 1,
+            ..Default::default()
+        };
+        let a = sorted_node_id(1);
+        let b = sorted_node_id(2);
+        let c = sorted_node_id(3);
+        s.upsert_node("Person", a, &keyed("red")).unwrap();
+        s.upsert_node("Person", b, &keyed("blue")).unwrap();
+        s.upsert_node("Person", c, &keyed("gone")).unwrap();
+        s.commit_batch().await.unwrap();
+
+        // Populate a committed baseline once. The same `(label, property)` map
+        // is used for unique conflict probes and non-unique posting lists.
+        let red = Value::Str("red".into());
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &red)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(a)
+        );
+        let scans = s.unique_index().populate_scans();
+
+        // Change a label, change another value, and tombstone a third node in
+        // one batch. Overlay equality reads must see every mutation without a
+        // new population scan.
+        s.upsert_node_with_labels(vec!["Other".into()], a, &keyed("red"))
+            .unwrap();
+        s.upsert_node("Person", b, &keyed("green")).unwrap();
+        s.tombstone_node("Person", c).unwrap();
+        let overlay = s.overlay_snapshot();
+        assert!(overlay
+            .lookup_nodes_by_property("Person", "key", "red")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            overlay
+                .lookup_nodes_by_property("Person", "key", "green")
+                .await
+                .unwrap()
+                .iter()
+                .map(|view| view.id)
+                .collect::<Vec<_>>(),
+            vec![b]
+        );
+        assert!(overlay
+            .lookup_nodes_by_property("Person", "key", "gone")
+            .await
+            .unwrap()
+            .is_empty());
+        drop(overlay);
+        assert_eq!(s.unique_index().populate_scans(), scans);
+
+        // Rollback restores the warm committed postings exactly.
+        s.discard_batch();
+        let blue = Value::Str("blue".into());
+        let gone = Value::Str("gone".into());
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &red)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(a)
+        );
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &blue)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(b)
+        );
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &gone)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(c)
+        );
+        assert_eq!(s.unique_index().populate_scans(), scans);
+
+        // Commit and flush preserve the logical map.
+        s.upsert_node_with_labels(vec!["Other".into()], a, &keyed("red"))
+            .unwrap();
+        s.upsert_node("Person", b, &keyed("green")).unwrap();
+        s.tombstone_node("Person", c).unwrap();
+        s.commit_batch().await.unwrap();
+        let schema = s.schema().clone();
+        s.flush(schema).await.unwrap();
+        let green = Value::Str("green".into());
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &green)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(b)
+        );
+        assert_eq!(s.unique_index().populate_scans(), scans);
+
+        // Relevant DDL invalidates maps; the next probe rebuilds exactly once.
+        s.create_property_index("Person", "secondary")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.unique_probe("Person", &[("key", &green)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(b)
+        );
+        assert_eq!(s.unique_index().populate_scans(), scans + 1);
+
+        // Reopen owns a fresh transactional index and repopulates from durable
+        // state, while still observing the committed label/value/tombstone set.
+        drop(s);
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        assert_eq!(reopened.unique_index().populate_scans(), 0);
+        assert_eq!(
+            reopened
+                .unique_probe("Person", &[("key", &green)], None)
+                .await
+                .unwrap(),
+            crate::unique_index::UniqueProbe::Conflict(b)
+        );
+        assert_eq!(reopened.unique_index().populate_scans(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_unique_memtable_only_lookup_builds_claimants_once() {
+        let mut s = WriterSession::open(make_store(), make_paths("ingest-equality-memtable-only"))
+            .await
+            .unwrap();
+        s.create_property_index("Doc", "key").await.unwrap();
+        for i in 0..500u16 {
+            let id = NodeId::new();
+            let record = NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), Value::Str(i.to_string()))]),
+                schema_version: 1,
+                ..Default::default()
+            };
+            s.upsert_node("Doc", id, &record).unwrap();
+        }
+        s.commit_batch().await.unwrap();
+
+        let claimant_scans = s.property_index_cache().memtable_population_scans();
+        let snap = s.snapshot();
+        for i in 0..500u16 {
+            assert_eq!(
+                snap.lookup_nodes_by_property("Doc", "key", &i.to_string())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            s.property_index_cache().memtable_population_scans() - claimant_scans,
+            1,
+            "a fresh store must index its committed memtable once, not label-scan per key"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_probe_empty_rollback_keeps_population_hot() {
+        use crate::unique_index::UniqueProbe;
+
+        let store = make_store();
+        let paths = make_paths("ingest-unique-empty-rollback");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        let x = sorted_node_id(1);
+        s.upsert_node("Account", x, &int_record("code", 7)).unwrap();
+        s.commit_batch().await.unwrap();
+
+        let seven = Value::I64(7);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1);
+
+        assert_eq!(s.discard_batch(), 0);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            1,
+            "an empty rollback must not invalidate a warm constraint map"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_probe_edge_only_rollback_keeps_new_population_hot() {
+        use crate::unique_index::UniqueProbe;
+
+        let store = make_store();
+        let paths = make_paths("ingest-unique-edge-rollback");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        let x = sorted_node_id(1);
+        s.upsert_node("Account", x, &int_record("code", 7)).unwrap();
+        s.commit_batch().await.unwrap();
+
+        // Populate the constraint map while an edge is staged. Edges cannot
+        // affect scan_label, so this is still a committed node baseline.
+        s.upsert_edge("LINK", x, sorted_node_id(2), &edge_record())
+            .unwrap();
+        let seven = Value::I64(7);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1);
+
+        assert_eq!(s.discard_batch(), 1);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            1,
+            "rolling back only edges must preserve the node map populated in that batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_probe_population_after_node_staging_is_dropped_on_rollback() {
+        use crate::unique_index::UniqueProbe;
+
+        let store = make_store();
+        let paths = make_paths("ingest-unique-staged-population");
+        let mut s = WriterSession::open(store, paths).await.unwrap();
+        let x = sorted_node_id(1);
+        s.upsert_node("Account", x, &int_record("code", 7)).unwrap();
+        s.commit_batch().await.unwrap();
+
+        // No map exists yet when this node is staged, so there is no
+        // pre-batch tuple journal from which to reconstruct a committed map.
+        let y = sorted_node_id(2);
+        s.upsert_node("Account", y, &int_record("code", 9)).unwrap();
+        let nine = Value::I64(9);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &nine)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(y)
+        );
+        assert_eq!(s.unique_index().populate_scans(), 1);
+
+        assert_eq!(s.discard_batch(), 1);
+        let seven = Value::I64(7);
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &seven)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::Conflict(x)
+        );
+        assert_eq!(
+            s.unique_index().populate_scans(),
+            2,
+            "a map first built from staged nodes must be removed and rebuilt"
+        );
+        assert_eq!(
+            s.unique_probe("Account", &[("code", &nine)], None)
+                .await
+                .unwrap(),
+            UniqueProbe::NoConflict
+        );
+        assert_eq!(s.unique_index().populate_scans(), 2);
     }
 
     #[tokio::test]

@@ -93,6 +93,8 @@ pub enum LogicalPlan {
     /// the pattern.
     NodeByPropertyValue {
         input: Box<LogicalPlan>,
+        /// Explicit label scope, or the internal empty-string sentinel for a
+        /// label-agnostic posting lookup over id-primary node SSTs.
         label: String,
         alias: String,
         property: String,

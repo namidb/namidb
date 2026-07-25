@@ -485,11 +485,22 @@ The defaults are fine for almost everything; reach for these when chasing a perf
 |---|---|---|
 | `NAMIDB_ADJACENCY` | ON | CSR adjacency in RAM, shared across snapshots. |
 | `NAMIDB_NODE_CACHE` | ON | Cross-snapshot `NodeView` lookup cache. |
-| `NAMIDB_SST_CACHE` | ON | SST body + decoded edge property streams cache. |
+| `NAMIDB_SST_CACHE` | ON | Raw SST body cache; decoded tiers have independent budgets. |
 | `NAMIDB_FACTORIZE` | OFF | Factorized intermediate results in the executor. |
 | `NAMIDB_EMBED_PROVIDER` | unset | Remote embedder for `load-vault --embed` (`openai`/`voyage`/`cohere`/`gemini`/`jina`; needs `--features remote-embedder`). |
 
-The cache budgets (`NAMIDB_SST_CACHE_BUDGET_MIB`, `NAMIDB_NODE_CACHE_*`, `NAMIDB_ADJACENCY_*`, `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`) are **process-wide** — one shared pool across every namespace, so a busy tenant cannot starve the box. The server also takes durability/backpressure knobs for critical workloads:
+The cache budgets are **process-wide** — one shared pool across every namespace,
+so a busy tenant cannot multiply the memory limit. The main knobs are
+`NAMIDB_SST_CACHE_BUDGET_MIB` (256), `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`
+(256), `NAMIDB_SST_METADATA_CACHE_BUDGET_MIB` (64),
+`NAMIDB_EDGE_STREAM_CACHE_BUDGET_MIB` (256),
+`NAMIDB_EDGE_READER_CACHE_BUDGET_MIB` (256),
+`NAMIDB_PROPERTY_SIDECAR_CACHE_BUDGET_MIB` (512),
+`NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB` (64),
+`NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB` (512), and
+`NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB` (512), plus the existing
+`NAMIDB_NODE_CACHE_*` and `NAMIDB_ADJACENCY_*` pools. Values are MiB.
+The server also takes durability/backpressure knobs for critical workloads:
 
 | Flag (env var) | Default | What it does |
 |---|---|---|

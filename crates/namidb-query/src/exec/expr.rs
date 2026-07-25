@@ -462,7 +462,10 @@ fn runtime_to_string_concat(v: &RuntimeValue) -> String {
     }
 }
 
-fn is_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
+/// Cypher value equality after NULL propagation has been handled by the
+/// caller. Kept crate-visible so point-lookup fallbacks can confirm decoded
+/// storage candidates with exactly the same numeric coercion rules as `=`.
+pub(crate) fn is_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
     match (a, b) {
         (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => false,
         (RuntimeValue::Integer(x), RuntimeValue::Integer(y)) => x == y,

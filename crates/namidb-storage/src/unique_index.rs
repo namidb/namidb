@@ -1,4 +1,4 @@
-//! Per-writer transactional index over declared-unique property values.
+//! Per-writer transactional index over property values.
 //!
 //! [`crate::WriterSession::unique_probe`] answers "which node currently
 //! holds this value tuple for `(label, properties)`?" in O(1) after a
@@ -14,13 +14,19 @@
 //!
 //! Consistency contract: a populated `(label, property-set)` map must agree
 //! with a fresh `scan_label` over the overlay snapshot at all times. Node
-//! mutations are applied at the staging chokepoints, so a successful commit
-//! or flush preserves the maps (those operations change durability or physical
-//! representation, not logical content). Events that bypass or undo those
-//! chokepoints — external SST attachment, batch discard, session reopen, and
-//! relevant DDL — reset the index; the next probe repopulates from a scan.
+//! mutations are applied at the staging chokepoints. The first mutation of
+//! each node in a pending batch journals its prior tuple, so commit can simply
+//! forget the journal while discard restores the already-populated maps
+//! without a corpus scan. Maps first populated from an overlay that already
+//! contains staged rows are removed on discard because they have no committed
+//! baseline. The same maps also back non-unique String equality postings used
+//! by indexed `MATCH` / `MERGE`: `holders` already retains every claimant, so
+//! no second transactional index is needed. Flush preserves the maps (it
+//! changes physical representation, not logical content). Events that bypass
+//! the chokepoints — external SST attachment, session reopen, and relevant DDL
+//! — reset the index.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -99,6 +105,71 @@ fn encode_node_key(names: &[String], props: &BTreeMap<String, Value>) -> Option<
 
 /// One populated `(label, property-set)` constraint map.
 ///
+/// Holder representation optimized for the dominant high-cardinality-index
+/// shape: one distinct value per node must not allocate a tiny hash table 1.5M
+/// times. A duplicate/non-unique value promotes lazily to a set; deletion
+/// collapses it back to the inline singleton.
+// Keep the common singleton variant compact: this map has one entry per
+// indexed value (about 1.5M in the legal corpus), while duplicate postings
+// are rare and can afford the extra indirection.
+#[allow(clippy::box_collection)]
+#[derive(Debug)]
+enum Holders {
+    One(NodeId),
+    Many(Box<HashSet<NodeId>>),
+}
+
+impl Holders {
+    fn insert(&mut self, id: NodeId) {
+        match self {
+            Self::One(existing) => {
+                debug_assert_ne!(*existing, id);
+                let mut ids = HashSet::with_capacity(2);
+                ids.insert(*existing);
+                ids.insert(id);
+                *self = Self::Many(Box::new(ids));
+            }
+            Self::Many(ids) => {
+                debug_assert!(!ids.contains(&id));
+                ids.insert(id);
+            }
+        }
+    }
+
+    /// Remove `id`; return true when no holder remains.
+    fn remove(&mut self, id: NodeId) -> bool {
+        match self {
+            Self::One(existing) => *existing == id,
+            Self::Many(ids) => {
+                ids.remove(&id);
+                match ids.len() {
+                    0 => true,
+                    1 => {
+                        let remaining = *ids.iter().next().expect("len checked");
+                        *self = Self::One(remaining);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn first_other(&self, exclude: Option<NodeId>) -> Option<NodeId> {
+        match self {
+            Self::One(id) => (Some(*id) != exclude).then_some(*id),
+            Self::Many(ids) => ids.iter().copied().find(|id| Some(*id) != exclude),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<NodeId> {
+        match self {
+            Self::One(id) => vec![*id],
+            Self::Many(ids) => ids.iter().copied().collect(),
+        }
+    }
+}
+
 /// `holders` keeps EVERY node currently carrying a value tuple (normally one,
 /// but pre-existing duplicates — e.g. a constraint declared over data that
 /// already violates it — must keep answering "conflict" exactly like the
@@ -107,29 +178,54 @@ fn encode_node_key(names: &[String], props: &BTreeMap<String, Value>) -> Option<
 /// previous tuple, then files it under the new one.
 #[derive(Debug, Default)]
 struct ConstraintMap {
-    holders: HashMap<UniqueKey, Vec<NodeId>>,
+    holders: HashMap<UniqueKey, Holders>,
     by_node: HashMap<NodeId, UniqueKey>,
 }
 
 impl ConstraintMap {
     fn detach(&mut self, id: NodeId) {
         if let Some(old) = self.by_node.remove(&id) {
-            if let Some(ids) = self.holders.get_mut(&old) {
-                ids.retain(|x| *x != id);
-                if ids.is_empty() {
-                    self.holders.remove(&old);
-                }
+            let empty = self
+                .holders
+                .get_mut(&old)
+                .is_some_and(|holders| holders.remove(id));
+            if empty {
+                self.holders.remove(&old);
             }
         }
     }
 
     fn file(&mut self, id: NodeId, key: UniqueKey) {
-        let ids = self.holders.entry(key.clone()).or_default();
-        if !ids.contains(&id) {
-            ids.push(id);
+        debug_assert!(!self.by_node.contains_key(&id));
+        match self.holders.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Holders::One(id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().insert(id);
+            }
         }
         self.by_node.insert(id, key);
     }
+}
+
+type ConstraintId = (String, Vec<String>);
+
+/// Rollback state for one constraint map during the current pending batch.
+///
+/// Existing maps journal each touched node's tuple before its first staged
+/// mutation. A map populated from an already-staged overlay has no committed
+/// baseline to restore, so `created_in_batch` makes rollback remove it.
+#[derive(Debug, Default)]
+struct ConstraintUndo {
+    created_in_batch: bool,
+    by_node: HashMap<NodeId, Option<UniqueKey>>,
+}
+
+#[derive(Debug, Default)]
+struct IndexState {
+    maps: HashMap<ConstraintId, ConstraintMap>,
+    undo: HashMap<ConstraintId, ConstraintUndo>,
 }
 
 /// The per-writer index: `(label, sorted property names) → ConstraintMap`.
@@ -138,12 +234,14 @@ impl ConstraintMap {
 /// so the mutex is uncontended.
 #[derive(Debug, Default)]
 pub struct UniqueConstraintIndex {
-    maps: Mutex<HashMap<(String, Vec<String>), ConstraintMap>>,
+    state: Mutex<IndexState>,
     /// Label scans performed to populate a constraint map. Exposed so tests
     /// can assert a bulk write pays exactly one scan, not one per row.
     populate_scans: AtomicU64,
     /// Probes answered from a populated map (i.e. without scanning).
     probes: AtomicU64,
+    /// Non-unique posting-list probes answered from a populated map.
+    posting_probes: AtomicU64,
 }
 
 impl UniqueConstraintIndex {
@@ -160,17 +258,41 @@ impl UniqueConstraintIndex {
         key: &UniqueKey,
         exclude: Option<NodeId>,
     ) -> Option<UniqueProbe> {
-        let maps = self.maps.lock().expect("unique index lock");
-        let map = maps.get(&(label.to_string(), names.to_vec()))?;
+        let state = self.state.lock().expect("unique index lock");
+        let map = state.maps.get(&(label.to_string(), names.to_vec()))?;
         self.probes.fetch_add(1, Ordering::Relaxed);
         let conflict = map
             .holders
             .get(key)
-            .and_then(|ids| ids.iter().find(|id| Some(**id) != exclude));
+            .and_then(|holders| holders.first_other(exclude));
         Some(match conflict {
-            Some(id) => UniqueProbe::Conflict(*id),
+            Some(id) => UniqueProbe::Conflict(id),
             None => UniqueProbe::NoConflict,
         })
+    }
+
+    /// Return every node currently holding `key` for `(label, names)`.
+    ///
+    /// `None` means the map has not been populated yet; `Some(empty)` is an
+    /// authoritative negative answer. This is the non-unique counterpart of
+    /// [`Self::probe`], used by String equality indexes in writer/RYOW
+    /// snapshots. Cloning the normally-small holder vector keeps the index
+    /// mutex out of async point-read confirmation.
+    pub(crate) fn probe_all(
+        &self,
+        label: &str,
+        names: &[String],
+        key: &UniqueKey,
+    ) -> Option<Vec<NodeId>> {
+        let state = self.state.lock().expect("unique index lock");
+        let map = state.maps.get(&(label.to_string(), names.to_vec()))?;
+        self.posting_probes.fetch_add(1, Ordering::Relaxed);
+        Some(
+            map.holders
+                .get(key)
+                .map(Holders::to_vec)
+                .unwrap_or_default(),
+        )
     }
 
     /// Install the `(label, names)` map from a label scan over the overlay
@@ -182,6 +304,31 @@ impl UniqueConstraintIndex {
         names: &[String],
         entries: impl Iterator<Item = (NodeId, &'a BTreeMap<String, Value>)>,
     ) {
+        self.populate_inner(label, names, entries, false);
+    }
+
+    /// Populate from an overlay that already contains staged mutations.
+    ///
+    /// The resulting map is exact for the current transaction, but it cannot
+    /// be incrementally restored to committed state because the pre-staged
+    /// tuples were never observed. Mark it for removal on rollback; commit
+    /// promotes it by merely dropping that marker.
+    pub(crate) fn populate_staged<'a>(
+        &self,
+        label: &str,
+        names: &[String],
+        entries: impl Iterator<Item = (NodeId, &'a BTreeMap<String, Value>)>,
+    ) {
+        self.populate_inner(label, names, entries, true);
+    }
+
+    fn populate_inner<'a>(
+        &self,
+        label: &str,
+        names: &[String],
+        entries: impl Iterator<Item = (NodeId, &'a BTreeMap<String, Value>)>,
+        staged: bool,
+    ) {
         let mut map = ConstraintMap::default();
         for (id, props) in entries {
             if let Some(key) = encode_node_key(names, props) {
@@ -189,10 +336,16 @@ impl UniqueConstraintIndex {
             }
         }
         self.populate_scans.fetch_add(1, Ordering::Relaxed);
-        self.maps
-            .lock()
-            .expect("unique index lock")
-            .insert((label.to_string(), names.to_vec()), map);
+        let identity = (label.to_string(), names.to_vec());
+        let mut state = self.state.lock().expect("unique index lock");
+        state.maps.insert(identity.clone(), map);
+        if staged {
+            let undo = state.undo.entry(identity).or_default();
+            undo.created_in_batch = true;
+            undo.by_node.clear();
+        } else {
+            state.undo.remove(&identity);
+        }
     }
 
     /// Maintain every populated map for a staged full-record node upsert:
@@ -205,10 +358,21 @@ impl UniqueConstraintIndex {
         labels: &[&str],
         props: &BTreeMap<String, Value>,
     ) {
-        let mut maps = self.maps.lock().expect("unique index lock");
-        for ((clabel, cnames), map) in maps.iter_mut() {
+        let mut state = self.state.lock().expect("unique index lock");
+        let IndexState { maps, undo } = &mut *state;
+        for (identity @ (clabel, cnames), map) in maps.iter_mut() {
+            let rollback = undo.entry(identity.clone()).or_default();
+            if !rollback.created_in_batch {
+                rollback
+                    .by_node
+                    .entry(id)
+                    .or_insert_with(|| map.by_node.get(&id).cloned());
+            }
             map.detach(id);
-            if !labels.iter().any(|l| l == clabel) {
+            // An empty label is the physical any-label scope used by
+            // `MATCH (n {prop: ...})`. Every node, including an unlabelled one,
+            // belongs to that global postings map.
+            if !clabel.is_empty() && !labels.iter().any(|l| l == clabel) {
                 continue;
             }
             if let Some(key) = encode_node_key(cnames, props) {
@@ -219,15 +383,54 @@ impl UniqueConstraintIndex {
 
     /// Maintain every populated map for a staged node tombstone.
     pub(crate) fn apply_tombstone(&self, id: NodeId) {
-        let mut maps = self.maps.lock().expect("unique index lock");
-        for map in maps.values_mut() {
+        let mut state = self.state.lock().expect("unique index lock");
+        let IndexState { maps, undo } = &mut *state;
+        for (identity, map) in maps.iter_mut() {
+            let rollback = undo.entry(identity.clone()).or_default();
+            if !rollback.created_in_batch {
+                rollback
+                    .by_node
+                    .entry(id)
+                    .or_insert_with(|| map.by_node.get(&id).cloned());
+            }
             map.detach(id);
+        }
+    }
+
+    /// Promote the current staged view to committed state. The populated maps
+    /// already contain those mutations, so only the rollback journal changes.
+    pub(crate) fn commit_staged(&self) {
+        self.state.lock().expect("unique index lock").undo.clear();
+    }
+
+    /// Restore every populated map to its pre-batch committed state without a
+    /// label scan. This is proportional to the number of distinct node ids
+    /// touched in the discarded batch, not to the stored graph size.
+    pub(crate) fn rollback_staged(&self) {
+        let mut state = self.state.lock().expect("unique index lock");
+        let undo = std::mem::take(&mut state.undo);
+        for (identity, rollback) in undo {
+            if rollback.created_in_batch {
+                state.maps.remove(&identity);
+                continue;
+            }
+            let Some(map) = state.maps.get_mut(&identity) else {
+                continue;
+            };
+            for (id, old_key) in rollback.by_node {
+                map.detach(id);
+                if let Some(key) = old_key {
+                    map.file(id, key);
+                }
+            }
         }
     }
 
     /// Drop every populated map; the next probe repopulates from a scan.
     pub(crate) fn reset(&self) {
-        self.maps.lock().expect("unique index lock").clear();
+        let mut state = self.state.lock().expect("unique index lock");
+        state.maps.clear();
+        state.undo.clear();
     }
 
     /// Number of populating label scans performed so far.
@@ -238,6 +441,11 @@ impl UniqueConstraintIndex {
     /// Number of probes answered from a populated map (no scan).
     pub fn probes(&self) -> u64 {
         self.probes.load(Ordering::Relaxed)
+    }
+
+    /// Number of non-unique posting probes served from populated maps.
+    pub fn posting_probes(&self) -> u64 {
+        self.posting_probes.load(Ordering::Relaxed)
     }
 }
 
@@ -304,6 +512,97 @@ mod tests {
         assert_eq!(
             idx.probe("User", &names, &key_b, None),
             Some(UniqueProbe::NoConflict)
+        );
+    }
+
+    #[test]
+    fn postings_promote_only_on_duplicate_and_collapse_after_remove() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["group".to_string()];
+        let a = props(&[("group", Value::Str("legal".into()))]);
+        let b = props(&[("group", Value::Str("legal".into()))]);
+        idx.populate("Doc", &names, vec![(nid(1), &a), (nid(2), &b)].into_iter());
+        let key = encode_probe_key(&[&Value::Str("legal".into())]).unwrap();
+        let mut both = idx.probe_all("Doc", &names, &key).unwrap();
+        both.sort();
+        assert_eq!(both, vec![nid(1), nid(2)]);
+        {
+            let state = idx.state.lock().unwrap();
+            let map = state.maps.get(&("Doc".into(), names.clone())).unwrap();
+            assert!(matches!(map.holders.get(&key), Some(Holders::Many(_))));
+        }
+
+        idx.apply_tombstone(nid(1));
+        assert_eq!(idx.probe_all("Doc", &names, &key), Some(vec![nid(2)]));
+        {
+            let state = idx.state.lock().unwrap();
+            let map = state.maps.get(&("Doc".into(), names.clone())).unwrap();
+            assert!(matches!(
+                map.holders.get(&key),
+                Some(Holders::One(id)) if *id == nid(2)
+            ));
+        }
+
+        idx.apply_tombstone(nid(2));
+        assert_eq!(idx.probe_all("Doc", &names, &key), Some(Vec::new()));
+    }
+
+    #[test]
+    fn rollback_restores_warm_map_and_commit_advances_its_baseline() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["email".to_string()];
+        let a = props(&[("email", Value::Str("a@x".into()))]);
+        idx.populate("User", &names, vec![(nid(1), &a)].into_iter());
+        let key_a = encode_probe_key(&[&Value::Str("a@x".into())]).unwrap();
+
+        // Rolling back an empty batch is a true no-op: the populated map
+        // remains available and still describes committed state.
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe("User", &names, &key_a, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+
+        let b = props(&[("email", Value::Str("b@x".into()))]);
+        idx.apply_upsert(nid(1), &["User"], &b);
+        idx.apply_upsert(nid(2), &["User"], &a);
+        idx.rollback_staged();
+
+        let key_b = encode_probe_key(&[&Value::Str("b@x".into())]).unwrap();
+        assert_eq!(
+            idx.probe("User", &names, &key_a, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+        assert_eq!(
+            idx.probe("User", &names, &key_b, None),
+            Some(UniqueProbe::NoConflict)
+        );
+
+        // A committed mutation becomes the next rollback baseline.
+        idx.apply_upsert(nid(1), &["User"], &b);
+        idx.commit_staged();
+        idx.apply_tombstone(nid(1));
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe("User", &names, &key_b, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+    }
+
+    #[test]
+    fn rollback_drops_map_first_populated_from_staged_overlay() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["email".to_string()];
+        let staged = props(&[("email", Value::Str("staged@x".into()))]);
+        idx.populate_staged("User", &names, vec![(nid(1), &staged)].into_iter());
+        let key = encode_probe_key(&[&Value::Str("staged@x".into())]).unwrap();
+        assert!(idx.probe("User", &names, &key, None).is_some());
+
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe("User", &names, &key, None),
+            None,
+            "no committed baseline existed for this map"
         );
     }
 

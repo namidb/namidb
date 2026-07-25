@@ -11,6 +11,83 @@ the release notes.
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-07-25: Sustained bulk graph loads
+
+This patch keeps idempotent multi-million-row graph loads on indexed paths,
+drains compaction backlog without starving foreground writes, and bounds the
+decoded read working set. The public API and on-disk format are unchanged.
+
+### Changed — performance
+
+- **Node `MERGE` now performs the same index seek as an explicit `MATCH`.**
+  Correlated `UNWIND … MERGE (n:Label {key: row.key})` plans preserve the outer
+  binding while probing the unique/equality sidecar, instead of converting the
+  implicit existence check into a growing label scan. Label-free indexed
+  equality probes use the global id-primary posting index and preserve
+  cross-label duplicates; every canonical scalar type is rechecked with
+  Cypher equality semantics.
+- **Read-your-own-writes lookups stay indexed throughout large transactions.**
+  The writer maintains its staged memtable incrementally, so every overlay
+  snapshot is O(1) instead of replaying the growing pending WAL. Transactional
+  postings cover both unique and non-unique indexed properties across
+  `MERGE` and correlated `MATCH … SET/DELETE`, including commit, rollback,
+  relabel, value-change and tombstone transitions.
+- **Relationship `MERGE` probes only the bound endpoint's SST range.**
+  Idempotent edge batches no longer rebuild a manifest-versioned whole-type CSR
+  after every commit. Persisted relationship properties remain available for
+  pattern matching and `ON MATCH SET`, so the sparse route is both bounded and
+  semantically identical to an in-memory match.
+- **Keyed relationship sweeps stay proportional to the requested keys and
+  matched edges.** `UNWIND … MATCH (n {key})-[r]->(:Label) DELETE r` uses one
+  indexed anchor lookup per key, exact typed/source memtable edge ranges, and
+  sparse source-keyed SST identity ranges when relationship properties are not
+  read. The 2,000-key regression covers both the zero-match path and a real
+  deletion without materialising the complete relationship type.
+- **One compaction pass consumes the complete captured L0 backlog.** Planning
+  scales beyond the former three-file-shaped workload and folds every eligible
+  L0 in each bucket into the leveled output, avoiding repeated passes whose
+  read amplification grew with a heavy loader.
+- **Compaction is single-flight and prepared off the writer lock.** Periodic
+  and reactive triggers coalesce per namespace; input reads, merge/index
+  rebuilds, and immutable object uploads run concurrently with foreground
+  writes, followed by a short validated manifest install. A trigger received
+  during a pass schedules one fresh follow-up so L0 files created meanwhile
+  are drained without maintenance-task storms.
+- **Decoded graph and search caches have process-wide byte budgets.** Property
+  posting sidecars, graph metadata/readers/streams and vector/FTS indexes use
+  weighted eviction with configurable budgets. Manifest publication retires
+  superseded immutable paths, and namespace eviction removes that tenant's
+  decoded entries so old snapshots cannot repopulate dead cache state.
+
+### Fixed
+
+- **Prepared compaction cannot publish across DDL drift.** Install validates
+  the schema plus vector and full-text index catalogs captured by the prepare;
+  concurrent data commits and flushes remain valid and their newer L0 files
+  survive the install.
+- **Aborted batches keep warm unique indexes correct.** The transactional
+  unique-key map journals only touched nodes, restores them on rollback, and
+  advances its baseline on commit instead of forcing a corpus rescan. Node
+  commits invalidate stale property maps by generation, while edge-only
+  commits and rollbacks keep unaffected maps hot.
+- **Namespace retirement fences stale maintenance work.** Eviction marks the
+  old incarnation retired, cancels and joins its flush/compaction tasks, and
+  quiesces its writer before a replacement session can claim the namespace,
+  preventing zombie recovery from fencing the new writer.
+- **Bolt disconnects cancel reversible write application.** The session keeps
+  reading with cancellation-safe framing while `RUN` executes, preserves
+  pipelined partial frames, discards a partially staged batch on EOF, and
+  releases the single writer. A durability commit that has already begun still
+  runs to a definite outcome before the guard is released.
+- **Traversal labels are verified from the live endpoint.** An edge type's
+  declared source/destination labels are no longer treated as proof for raw
+  writes that the storage API does not yet validate, preventing false-positive
+  matches without changing the on-disk format.
+- **Compaction pressure is observable.** Metrics separate prepare,
+  install-wait and install-hold time, report per-trigger outcomes and L0/SST
+  backlog, and attribute writer-lock waits across HTTP, Bolt, flush and
+  maintenance paths.
+
 ## [2.0.1] - 2026-07-23: Indexed MERGE and search correctness
 
 This patch removes the last quadratic path from idempotent bulk graph loads,
@@ -1921,7 +1998,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/namidb/namidb/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/namidb/namidb/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/namidb/namidb/releases/tag/v2.0.0
 [0.13.0]: https://github.com/namidb/namidb/releases/tag/v0.13.0
