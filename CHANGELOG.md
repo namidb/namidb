@@ -15,6 +15,10 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+- PyPI's post-publication integrity gate now treats an initial version-JSON
+  `404` as propagation lag and keeps polling. A successful five-file OIDC
+  upload no longer leaves the workflow red during the brief visibility window.
+
 ## [2.0.5] - 2026-07-26: Indexed incremental graph reads and native vector filters
 
 This patch removes corpus-sized work from existing-key node `MERGE`, filtered

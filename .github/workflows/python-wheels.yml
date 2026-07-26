@@ -362,6 +362,7 @@ jobs:
           import os
           import pathlib
           import time
+          import urllib.error
           import urllib.request
 
           version = os.environ["RELEASE_TAG"].removeprefix("py-v")
@@ -378,8 +379,17 @@ jobs:
                   url,
                   headers={"User-Agent": "namidb-release-verifier/1"},
               )
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  payload = json.load(response)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+                  # PyPI accepted every upload before returning, but its JSON
+                  # endpoint may lag briefly. Treat an initial 404 exactly like
+                  # an empty/incomplete release and keep polling until the
+                  # deadline instead of failing the successful publication.
+                  payload = {"urls": []}
               remote = {
                   item["filename"]: item["digests"]["sha256"]
                   for item in payload["urls"]
