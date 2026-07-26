@@ -6,9 +6,10 @@
 #                              and Docker Hub (credentials are mandatory)
 #                              tagged `X.Y.Z`, `X.Y`, `X` and `latest`.
 #   * workflow_dispatch      → with a `version` input (e.g. `2.0.0`): checks out
-#                              tag `v<version>` and publishes it — for releases
-#                              that predate this workflow. Without the input:
-#                              build-check only.
+#                              tag `v<version>` and publishes only that immutable
+#                              version — for releases that predate this workflow.
+#                              Historical dispatches never move rolling tags.
+#                              Without the input: build-check only.
 #   * pull_request           → build-check on both arches, no push, so a broken
 #                              Dockerfile is caught before the release tag.
 #
@@ -45,9 +46,15 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Released version to publish (e.g. 2.0.0) — checks out tag v<version> and pushes. Empty = build-check only."
+        description: "Historical version to publish (e.g. 2.0.0) — checks out tag v<version> and pushes only that immutable tag. Empty = build-check only."
         required: false
         default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A second immutable-tag publication must queue, never cancel a run that may
+  # already have pushed one architecture. Branch/PR preflights may supersede.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -71,7 +78,7 @@ jobs:
       publish: ${{ steps.compute.outputs.publish }}
       version: ${{ steps.compute.outputs.version }}
       ref: ${{ steps.compute.outputs.ref }}
-      tags: ${{ steps.compute.outputs.tags }}          # space-separated tag suffixes
+      rolling_tags: ${{ steps.compute.outputs.rolling_tags }}
     steps:
       - name: Compute version and tags
         id: compute
@@ -79,36 +86,42 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          PUBLISH=false VERSION="" REF="$GITHUB_REF"
+          PUBLISH=false PROMOTE_ROLLING=false VERSION="" REF="$GITHUB_REF"
           case "$GITHUB_REF" in
-            refs/tags/v*) VERSION="${GITHUB_REF#refs/tags/v}"; PUBLISH=true ;;
+            refs/tags/v*)
+              VERSION="${GITHUB_REF#refs/tags/v}"
+              PUBLISH=true
+              PROMOTE_ROLLING=true
+              ;;
           esac
           if [[ -n "$INPUT_VERSION" ]]; then
             VERSION="${INPUT_VERSION#v}"; PUBLISH=true; REF="refs/tags/v$VERSION"
+            # A historical/manual republish must never roll `latest`, `X`, or
+            # `X.Y` backwards. Only the immutable version is reconstructed.
+            PROMOTE_ROLLING=false
           fi
 
-          TAGS=""
-          if [[ "$PUBLISH" == "true" ]]; then
-            TAGS="$VERSION"
-            # Rolling tags only for stable X.Y.Z releases, not prereleases.
-            if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-              TAGS="$TAGS ${BASH_REMATCH[1]}.${BASH_REMATCH[2]} ${BASH_REMATCH[1]} latest"
-            fi
+          ROLLING_TAGS=""
+          # Rolling tags belong only to a new stable tag push. They are
+          # promoted after both registries' immutable manifests validate.
+          if [[ "$PROMOTE_ROLLING" == "true" \
+            && "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            ROLLING_TAGS="${BASH_REMATCH[1]}.${BASH_REMATCH[2]} ${BASH_REMATCH[1]} latest"
           fi
 
           {
             echo "publish=$PUBLISH"
             echo "version=$VERSION"
             echo "ref=$REF"
-            echo "tags=$TAGS"
+            echo "rolling_tags=$ROLLING_TAGS"
           } >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH version=$VERSION tags=[$TAGS]"
+          echo "publish=$PUBLISH version=$VERSION rolling_tags=[$ROLLING_TAGS]"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ steps.compute.outputs.ref }}
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -172,7 +185,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.meta.outputs.ref }}
 
@@ -181,11 +194,11 @@ jobs:
         shell: bash
         run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         if: needs.meta.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -193,7 +206,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: needs.meta.outputs.publish == 'true' && env.HAS_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -214,7 +227,7 @@ jobs:
 
       - name: Build ${{ matrix.platform }}
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: crates/namidb-server/Dockerfile
@@ -233,7 +246,7 @@ jobs:
           DIGEST="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${DIGEST#sha256:}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.meta.outputs.publish == 'true'
         with:
           name: digest-${{ matrix.arch }}
@@ -248,16 +261,16 @@ jobs:
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: digest-*
           path: /tmp/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -265,32 +278,42 @@ jobs:
 
       - name: Log in to Docker Hub
         if: env.HAS_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Create multi-arch manifests
+      - name: Publish immutable manifests, verify both registries, then promote rolling tags
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          ROLLING_TAGS_TEXT: ${{ needs.meta.outputs.rolling_tags }}
         run: |
           set -euo pipefail
-          DIGESTS=$(ls /tmp/digests)
-          IMAGES="ghcr.io/namidb/namidb-server"
-          if [[ "$HAS_DOCKERHUB" == "true" ]]; then
-            IMAGES="$IMAGES docker.io/namidb/namidb-server"
-          fi
-          for IMG in $IMAGES; do
-            TAG_ARGS=""
-            for TAG in ${{ needs.meta.outputs.tags }}; do
-              TAG_ARGS="$TAG_ARGS -t $IMG:$TAG"
-            done
-            SRCS=""
-            for D in $DIGESTS; do
-              SRCS="$SRCS $IMG@sha256:$D"
-            done
-            docker buildx imagetools create $TAG_ARGS $SRCS
-            docker buildx imagetools inspect "$IMG:${{ needs.meta.outputs.version }}"
 
-            VERSION="${{ needs.meta.outputs.version }}"
+          mapfile -t DIGESTS < <(
+            find /tmp/digests -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          test "${#DIGESTS[@]}" -eq 2
+
+          IMAGES=(ghcr.io/namidb/namidb-server)
+          if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+            IMAGES+=(docker.io/namidb/namidb-server)
+          fi
+
+          # Phase 1: create only the immutable version in every registry. No
+          # rolling tag moves until both copies have the required platforms and
+          # identical child digests.
+          for IMG in "${IMAGES[@]}"; do
+            SRCS=()
+            for D in "${DIGESTS[@]}"; do
+              SRCS+=("$IMG@sha256:$D")
+            done
+            docker buildx imagetools create -t "$IMG:$VERSION" "${SRCS[@]}"
+          done
+
+          EXPECTED_DIGESTS=""
+          for IMG in "${IMAGES[@]}"; do
+            docker buildx imagetools inspect "$IMG:$VERSION"
             PLATFORMS=$(
               docker buildx imagetools inspect --raw "$IMG:$VERSION" |
                 jq -c '[.manifests[].platform |
@@ -303,11 +326,32 @@ jobs:
               docker buildx imagetools inspect --raw "$IMG:$VERSION" |
                 jq -cS '[.manifests[].digest] | sort'
             )
-            for TAG in ${{ needs.meta.outputs.tags }}; do
+            if [[ -z "$EXPECTED_DIGESTS" ]]; then
+              EXPECTED_DIGESTS="$VERSION_DIGESTS"
+            else
+              test "$VERSION_DIGESTS" = "$EXPECTED_DIGESTS"
+            fi
+          done
+
+          # Phase 2: only a fresh stable tag push promotes rolling aliases.
+          # A historical workflow_dispatch intentionally leaves them alone.
+          ROLLING_TAGS=()
+          if [[ -n "$ROLLING_TAGS_TEXT" ]]; then
+            read -r -a ROLLING_TAGS <<< "$ROLLING_TAGS_TEXT"
+          fi
+          for IMG in "${IMAGES[@]}"; do
+            for TAG in "${ROLLING_TAGS[@]}"; do
+              docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$VERSION"
+            done
+          done
+
+          # Verify every promoted alias in both registries after promotion.
+          for IMG in "${IMAGES[@]}"; do
+            for TAG in "${ROLLING_TAGS[@]}"; do
               TAG_DIGESTS=$(
                 docker buildx imagetools inspect --raw "$IMG:$TAG" |
                   jq -cS '[.manifests[].digest] | sort'
               )
-              test "$TAG_DIGESTS" = "$VERSION_DIGESTS"
+              test "$TAG_DIGESTS" = "$EXPECTED_DIGESTS"
             done
           done

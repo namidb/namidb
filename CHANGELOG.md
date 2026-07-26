@@ -174,6 +174,12 @@ new accelerator and memory metadata.
   gated at a `GLIBC_2.35` baseline on both x86_64 and arm64. Its builder pins
   Rust 1.85.1 instead of letting the workspace's local `stable` override
   silently replace the declared container toolchain.
+- Release actions are pinned to immutable commits. GitHub verifies the exact
+  16-asset archive/checksum set before making a draft public, and PyPI accepts
+  resumable uploads only when any pre-existing file is byte-identical before
+  verifying the final five-file release. Docker now creates and validates the
+  immutable version in GHCR and Docker Hub before promoting rolling tags;
+  historical dispatches cannot move `latest`, `X` or `X.Y` backwards.
 - Paged sidecars are built by streaming borrowed maps/postings rather than
   cloning the corpus. Sidecar-seeded transactional maps are dropped after
   flush, and pressure reclamation no longer leaves writer-local fallback maps

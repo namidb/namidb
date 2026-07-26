@@ -64,18 +64,19 @@ on:
   workflow_dispatch: {}
 
 # Cancel in-progress runs of the same branch / PR so tag pushes
-# always race to the head.
+# always race to the head. A tag publication queues instead of cancelling once
+# an upload may have started.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   validate-release:
     name: validate release metadata
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Validate Cargo, lockfile, changelog, Python metadata, and license
@@ -106,18 +107,18 @@ jobs:
           - { os: macos,   arch: arm64,   rust_target: aarch64-apple-darwin,        runner: macos-14,     manylinux: "" }
           - { os: windows, arch: x86_64,  rust_target: x86_64-pc-windows-msvc,      runner: windows-2022, manylinux: "" }
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Build wheel via maturin-action
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: ${{ matrix.target.rust_target }}
           args: --locked --release --out dist --manifest-path crates/namidb-py/Cargo.toml
           manylinux: ${{ matrix.target.manylinux }}
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: dist/*.whl
@@ -130,19 +131,19 @@ jobs:
     needs: validate-release
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: Build sdist via maturin-action
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           # maturin 1.14 removed `--locked` from the `sdist` subcommand (there
           # is no Cargo build in this path). The preceding release validator
           # checks the workspace lockfile and every internal version pin.
           args: --out dist --manifest-path crates/namidb-py/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -154,16 +155,16 @@ jobs:
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: sdist
           path: dist
@@ -220,11 +221,11 @@ jobs:
           - { os: macos-14,     python: "3.12", artifact: wheel-macos-arm64 }
           - { os: windows-2022, python: "3.12", artifact: wheel-windows-x86_64 }
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ matrix.artifact }}
           path: dist
@@ -282,12 +283,125 @@ jobs:
     permissions:
       id-token: write   # OIDC — no token secret required
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
       - name: Inspect what will be uploaded
         run: ls -lh dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Reject non-identical pre-existing PyPI files
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["RELEASE_TAG"].removeprefix("py-v")
+          artifacts = [
+              path
+              for path in pathlib.Path("dist").iterdir()
+              if path.is_file()
+              and (path.suffix == ".whl" or path.name.endswith(".tar.gz"))
+          ]
+          local = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in artifacts
+          }
+          if len(local) != 5:
+              raise SystemExit(f"expected 5 local distributions, found {sorted(local)}")
+
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/namidb/{version}/json",
+              headers={"User-Agent": "namidb-release-verifier/1"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              payload = {"urls": []}
+
+          remote = {
+              item["filename"]: item["digests"]["sha256"]
+              for item in payload["urls"]
+          }
+          unexpected = sorted(remote.keys() - local.keys())
+          mismatched = sorted(
+              name for name in remote.keys() & local.keys()
+              if remote[name] != local[name]
+          )
+          if unexpected or mismatched:
+              raise SystemExit(
+                  "PyPI collision: "
+                  f"unexpected={unexpected}, hash_mismatch={mismatched}"
+              )
+          print(
+              f"PyPI preflight ok: {len(remote)}/5 byte-identical files "
+              "already present"
+          )
+          PY
+
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
         with:
           skip-existing: true
+
+      - name: Verify the complete immutable PyPI release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.request
+
+          version = os.environ["RELEASE_TAG"].removeprefix("py-v")
+          local = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in pathlib.Path("dist").iterdir()
+              if path.is_file()
+              and (path.suffix == ".whl" or path.name.endswith(".tar.gz"))
+          }
+          deadline = time.monotonic() + 180
+          url = f"https://pypi.org/pypi/namidb/{version}/json"
+          while True:
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "namidb-release-verifier/1"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+              remote = {
+                  item["filename"]: item["digests"]["sha256"]
+                  for item in payload["urls"]
+              }
+              if remote == local:
+                  print("PyPI release verified: exactly 5 byte-identical files")
+                  break
+
+              unexpected = sorted(remote.keys() - local.keys())
+              mismatched = sorted(
+                  name for name in remote.keys() & local.keys()
+                  if remote[name] != local[name]
+              )
+              if unexpected or mismatched:
+                  raise SystemExit(
+                      "PyPI verification failed: "
+                      f"unexpected={unexpected}, hash_mismatch={mismatched}"
+                  )
+              if time.monotonic() >= deadline:
+                  missing = sorted(local.keys() - remote.keys())
+                  raise SystemExit(
+                      f"PyPI did not expose the complete release: missing={missing}"
+                  )
+              time.sleep(10)
+          PY
