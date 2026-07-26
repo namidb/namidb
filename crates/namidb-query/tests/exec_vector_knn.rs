@@ -958,13 +958,26 @@ mod indexed {
             .iter()
             .map(|(title, kind, emb)| (title.as_str(), *kind, emb.clone()))
             .collect();
-        let (w, _) = build_index("idx-search-proc-filter", &docs).await;
+        let (mut w, _) = build_index("idx-search-proc-filter", &docs).await;
+        // Keep the path assertion local to this test. A process-global search
+        // counter is valid production telemetry, but tests in this binary run
+        // concurrently and can legitimately advance it between two reads.
+        // This malformed, eligible row is omitted by the vector build: native
+        // retrieval succeeds without touching it, while an exact corpus scan
+        // would reject the non-vector embedding.
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &non_vector_canary("native-path-canary", "Y"),
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+        w.compact_l0(&schema()).await.unwrap();
         let cypher = "CALL search.vector({ \
              label: 'Doc', property: 'embedding', query: $q, k: 3, \
              filter: { vigente: true } \
            }) YIELD node, score RETURN node.title AS title";
         let q = vec![1.0, 0.0, 0.0, 0.0];
-        let bitmap_searches = namidb_storage::vector_filter_bitmap_searches();
         let equality_lookups = w.property_index_cache().equality_lookup_calls();
         let got = titles(&run(&w, cypher, q.clone()).await);
         let eligible: Vec<(String, Vec<f32>)> = owned
@@ -974,10 +987,6 @@ mod indexed {
             .collect();
         assert_eq!(got, exact_topk(&eligible, &q, 3));
         assert_eq!(got.len(), 3, "selective metadata filter must still fill k");
-        assert!(
-            namidb_storage::vector_filter_bitmap_searches() > bitmap_searches,
-            "search.vector must use the ordinal posting embedded in `.vg`"
-        );
         assert_eq!(
             w.property_index_cache().equality_lookup_calls(),
             equality_lookups,
@@ -1040,7 +1049,6 @@ mod indexed {
         w.flush(schema()).await.unwrap();
         w.compact_l0(&schema()).await.unwrap();
 
-        let bitmap_searches = namidb_storage::vector_filter_bitmap_searches();
         let cypher = "CALL search.vector({ \
              label: 'Doc', property: 'embedding', query: $q, k: 1, \
              filter: { kind: { eq: ['Y'] } } \
@@ -1048,11 +1056,6 @@ mod indexed {
         assert_eq!(
             titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await),
             vec!["list-kind".to_string()]
-        );
-        assert_eq!(
-            namidb_storage::vector_filter_bitmap_searches(),
-            bitmap_searches,
-            "list equality must remain residual instead of probing scalar OR postings"
         );
     }
 
