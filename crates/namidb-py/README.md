@@ -94,6 +94,12 @@ client.cypher(
     "METRIC cosine DIMENSION 384"
 )
 client.cypher("CREATE FULLTEXT INDEX doc_text ON :Doc(title, body)")
+client.cypher(
+    "CREATE INDEX IF NOT EXISTS FOR (d:Doc) ON (d.tenant_id)"
+)
+client.cypher(
+    "CREATE INDEX IF NOT EXISTS FOR (d:Doc) ON (d.vigente)"
+)
 ```
 
 Index bodies are built by an authoritative compaction. `compact()` prepares
@@ -109,6 +115,28 @@ print(report["applied"], report["l0_before"], report["l0_after"])
 `await client.acompact()` is the coroutine equivalent. Until a body is
 materialized, and whenever freshness cannot be proven, vector and BM25
 queries automatically use their exact flat fallback.
+
+`search.vector` can apply metadata eligibility before the returned `k`, so a
+selective slice does not get truncated out of an unfiltered top-k:
+
+```python
+hits = client.cypher(
+    """
+    CALL search.vector({
+      label: 'Doc', property: 'embedding', query: $q, k: 10,
+      filter: { tenant_id: $tenant, vigente: true }
+    })
+    YIELD node, score
+    RETURN node, score
+    """,
+    params={"q": [0.1] * 384, "tenant": "laboral"},
+).rows()
+```
+
+A scalar filter value means equality, a list means `IN`, and different keys
+AND-combine. Indexed String/Boolean equality and `IN` clauses use native
+vector-ordinal postings; unsupported or range clauses retain the exact
+widening/flat-scan fallback. The index changes the cost, not the result.
 
 ## Async API
 
@@ -241,7 +269,7 @@ table = client.scan_label_arrow("Person")
 | URI scheme | Backend | Status |
 |---|---|---|
 | `memory://<ns>` | `object_store::memory::InMemory` | Stable. Ephemeral, single-process. |
-| `file:///abs/dir?ns=<ns>` (or `file://./rel?ns=<ns>`) | NamiDB `LocalFileObjectStore` (wraps `LocalFileSystem` and adds manifest CAS via `flock` + atomic rename) | Stable. |
+| `file:///abs/dir?ns=<ns>` (or `file://./rel?ns=<ns>`) | NamiDB `LocalFileObjectStore` over `LocalFileSystem`; Create-only pointer CAS uses `O_CREAT\|O_EXCL` | Stable. |
 | `s3://<bucket>[/<prefix>]?ns=<ns>...` | `object_store::aws::AmazonS3` | Stable. AWS S3, Cloudflare R2, MinIO, Tigris, LocalStack, any S3-compatible service. |
 | `gs://<bucket>[/<prefix>]?ns=<ns>` | `object_store::gcp::GoogleCloudStorage` | Stable. Auth via `GOOGLE_APPLICATION_CREDENTIALS` or `?service_account=...`. |
 | `az://<account>/<container>[/<prefix>]?ns=<ns>` | `object_store::azure::MicrosoftAzure` | Stable. Auth via `AZURE_STORAGE_*` env vars; `?use_emulator=true` for Azurite. |
@@ -249,8 +277,9 @@ table = client.scan_label_arrow("Person")
 ### Local filesystem
 
 For development, single-machine deployments, and CI fixtures. Full
-manifest CAS via per-namespace `flock` plus atomic rename, and it passes
-the same concurrency test suite as `s3://`.
+manifest CAS uses the same Create-only versioned pointer family as the cloud
+backends, with local `O_CREAT|O_EXCL` providing PUT-if-absent. It passes the
+same concurrency test suite as `s3://`.
 
 ```python
 import namidb
@@ -330,13 +359,14 @@ client = namidb.Client(
 You need `allow_http=true` because LocalStack doesn't serve TLS by
 default.
 
-## Scope (v0)
+## Scope
 
-- Six storage backends: `memory://`, `file://`, `s3://`, `gs://`,
-  `az://`. All five non-memory backends share the same manifest CAS
-  protocol (`If-Match` on object stores, `flock` plus atomic rename on
-  the filesystem) and the same single-writer-per-namespace epoch
-  fencing.
+- Five storage backends: `memory://`, `file://`, `s3://`, `gs://`,
+  `az://`. All four non-memory backends share the same Create-only
+  versioned manifest-pointer protocol: each `p<N>.json` is written once
+  with PUT-if-absent (`If-None-Match: *` on object stores,
+  `O_CREAT|O_EXCL` locally), the highest `N` is current, and the same
+  single-writer-per-namespace epoch fencing applies.
 - A synchronous Python API plus async coroutine APIs (`acypher`,
   `acompact`).
   Under the hood every call drives a tokio runtime owned by the
@@ -384,8 +414,12 @@ Run every command below from the repository root.
    python scripts/check-release-metadata.py \
      --tag "py-v$VERSION" --tag-kind python
    ```
-4. Commit and push the release commit, wait for `ci` and `python-wheels` to
-   pass on `main`, then create both annotated tags on that exact commit:
+4. Commit and push the release commit and wait for `ci` and `python-wheels` to
+   pass on `main`. Before creating an immutable tag, manually dispatch
+   `release-binaries.yml` (full OS/architecture release dry-run) and
+   `docker-image.yml` with an empty `version` (native amd64/arm64 build-check)
+   on that same commit, and wait for both to pass.
+5. Create both annotated tags on that exact commit:
    ```bash
    git tag -a "v$VERSION" -m "NamiDB $VERSION"
    git tag -a "py-v$VERSION" -m "namidb Python $VERSION"
@@ -393,7 +427,7 @@ Run every command below from the repository root.
         "$(git rev-parse "py-v$VERSION^{commit}")"
    git push --atomic origin "v$VERSION" "py-v$VERSION"
    ```
-5. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
+6. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
    arm64, Windows x86_64) plus the sdist, smoke-tests one wheel on
    Python 3.9 and 3.13, then publishes to PyPI via OIDC trusted
    publishing (set up once per account at

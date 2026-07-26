@@ -3,9 +3,10 @@
 # can run them without a Rust toolchain.
 #
 # Triggers:
-#   * `v*` tag push       → build per-platform archives + upload to the release.
-#   * PR / workflow_dispatch → debug build-check only (catch breakage early,
-#                              no upload).
+#   * `v*` tag push      → build per-platform archives + upload to the release.
+#   * PR                 → fast debug build-check, no upload.
+#   * workflow_dispatch → full release-matrix build/archive/checksum preflight
+#                         in dry-run mode, no upload.
 #
 # The release build inherits the workspace `[profile.release]` (fat LTO,
 # codegen-units = 1), so per-target builds are slow but compact. The wheels
@@ -49,25 +50,93 @@ jobs:
             --tag "$RELEASE_TAG" --tag-kind engine
 
   # Fast debug build to catch binary regressions on PRs without paying for the
-  # release LTO build or touching the release.
+  # release LTO build or touching the release. A manual dispatch uses the full
+  # release matrix below instead.
   build-check:
     name: build-check
     needs: validate-release
-    if: github.event_name != 'push'
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --bin namidb --bin namidb-mcp
+      - run: cargo build --locked --bin namidb --bin namidb-mcp
       # The HTTP server is shipped with vector + text search ON (see the `upload`
       # job), so gate that exact config on PRs — `ci.yml` builds/tests without
       # features, leaving the feature-gated server code otherwise uncovered.
-      - run: cargo build -p namidb-server --features vector-index,text-index
+      - run: cargo build --locked -p namidb-server --features vector-index,text-index
 
-  # On a `v*` tag: ensure the GitHub Release exists before the matrix tries to
-  # upload to it. taiki-e/upload-rust-binary-action does NOT create the
-  # release, and a lightweight tag has none, so without this the upload jobs
-  # fail with "release not found".
+  # A manual preflight exercises the exact release profile, target matrix,
+  # archive layout, feature set, and checksums without creating a GitHub Release
+  # or uploading assets. Run this and docker-image's empty-version dispatch
+  # before creating an immutable v* tag.
+  preflight-matrix:
+    name: preflight · ${{ matrix.target }}
+    needs: validate-release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and package namidb + namidb-mcp (dry run)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: namidb,namidb-mcp
+          locked: true
+          target: ${{ matrix.target }}
+          archive: namidb-$tag-$target
+          tar: unix
+          zip: windows
+          include: LICENSE,README.md
+          checksum: sha256
+          dry-run: true
+          dry-run-intended: true
+      - name: Build and package namidb-server (dry run)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: namidb-server
+          locked: true
+          features: vector-index,text-index
+          manifest-path: crates/namidb-server/Cargo.toml
+          target: ${{ matrix.target }}
+          archive: namidb-server-$tag-$target
+          tar: unix
+          zip: windows
+          include: LICENSE,README.md
+          checksum: sha256
+          dry-run: true
+          dry-run-intended: true
+      - name: Verify GNU/Linux glibc baseline
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_GLIBC=$(
+            for BIN in namidb namidb-mcp namidb-server; do
+              readelf --version-info "target/${{ matrix.target }}/release/$BIN"
+            done |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' |
+              sed 's/^GLIBC_//' |
+              sort -Vu |
+              tail -1
+          )
+          test -n "$MAX_GLIBC"
+          if [[ "$(printf '%s\n' "$MAX_GLIBC" 2.35 | sort -V | tail -1)" != "2.35" ]]; then
+            echo "::error::GNU/Linux archive requires GLIBC_$MAX_GLIBC; maximum supported baseline is GLIBC_2.35"
+            exit 1
+          fi
+          echo "GNU/Linux archive baseline ok: GLIBC_$MAX_GLIBC <= GLIBC_2.35"
+
+  # On a `v*` tag: create a draft before the matrix uploads. The final job
+  # publishes it only after every platform succeeds, so users never see a
+  # partially populated release after one target fails.
   create-release:
     needs: validate-release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -81,7 +150,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+            || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
   # On a `v*` tag: build release archives per platform and upload to the
   # release created above.
@@ -97,7 +166,9 @@ jobs:
       matrix:
         include:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          # Match the x86_64 glibc baseline. Building natively on 24.04 linked
+          # the nominally generic GNU archive against GLIBC_2.39.
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
           - { target: aarch64-apple-darwin, runner: macos-14 }
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
@@ -106,6 +177,7 @@ jobs:
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: namidb,namidb-mcp
+          locked: true
           target: ${{ matrix.target }}
           archive: namidb-$tag-$target
           tar: unix
@@ -123,6 +195,7 @@ jobs:
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: namidb-server
+          locked: true
           features: vector-index,text-index
           manifest-path: crates/namidb-server/Cargo.toml
           target: ${{ matrix.target }}
@@ -132,3 +205,37 @@ jobs:
           include: LICENSE,README.md
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify GNU/Linux glibc baseline before finalizing the draft
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_GLIBC=$(
+            for BIN in namidb namidb-mcp namidb-server; do
+              readelf --version-info "target/${{ matrix.target }}/release/$BIN"
+            done |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' |
+              sed 's/^GLIBC_//' |
+              sort -Vu |
+              tail -1
+          )
+          test -n "$MAX_GLIBC"
+          if [[ "$(printf '%s\n' "$MAX_GLIBC" 2.35 | sort -V | tail -1)" != "2.35" ]]; then
+            echo "::error::GNU/Linux archive requires GLIBC_$MAX_GLIBC; maximum supported baseline is GLIBC_2.35"
+            exit 1
+          fi
+          echo "GNU/Linux archive baseline ok: GLIBC_$MAX_GLIBC <= GLIBC_2.35"
+
+  finalize-release:
+    name: publish complete release
+    needs: upload
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the fully populated draft (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

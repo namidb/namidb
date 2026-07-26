@@ -474,6 +474,7 @@ pub(crate) fn is_equal(a: &RuntimeValue, b: &RuntimeValue) -> bool {
         | (RuntimeValue::Float(y), RuntimeValue::Integer(x)) => (*x as f64) == *y,
         (RuntimeValue::Bool(x), RuntimeValue::Bool(y)) => x == y,
         (RuntimeValue::String(x), RuntimeValue::String(y)) => x == y,
+        (RuntimeValue::Bytes(x), RuntimeValue::Bytes(y)) => x == y,
         (RuntimeValue::List(x), RuntimeValue::List(y)) => x == y,
         (RuntimeValue::Map(x), RuntimeValue::Map(y)) => x == y,
         (RuntimeValue::Node(x), RuntimeValue::Node(y)) => x.id == y.id,
@@ -1543,6 +1544,18 @@ mod tests {
     fn arith_int_float_promotion() {
         let r = eval_str("1 + 2.5", &Row::new(), &Params::new());
         assert_eq!(r, RuntimeValue::Float(3.5));
+    }
+
+    #[test]
+    fn bytes_equality_compares_payloads() {
+        assert!(is_equal(
+            &RuntimeValue::Bytes(vec![0, 1, 255]),
+            &RuntimeValue::Bytes(vec![0, 1, 255])
+        ));
+        assert!(!is_equal(
+            &RuntimeValue::Bytes(vec![0, 1, 255]),
+            &RuntimeValue::Bytes(vec![0, 2, 255])
+        ));
     }
 
     #[test]

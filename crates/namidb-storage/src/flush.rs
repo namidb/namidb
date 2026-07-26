@@ -78,7 +78,7 @@ use crate::paths::NamespacePaths;
 use crate::sst::bloom::{BloomDescriptor, BloomFilter};
 use crate::sst::edges::inverse::transpose_forward_to_inverse;
 use crate::sst::edges::writer::{
-    EdgeRecord as EdgeStreamRow, EdgeSstFinish, EdgeSstWriter, EdgeSstWriterOptions,
+    EdgeRecord as EdgeStreamRow, EdgeSstBuild, EdgeSstWriter, EdgeSstWriterOptions,
 };
 use crate::sst::edges::EdgeDirection;
 use crate::sst::hll::{Hll, DEFAULT_PRECISION};
@@ -312,10 +312,9 @@ pub async fn flush(
 
 /// Per-SST work product: descriptor + body bytes + their object-store paths,
 /// kept together so the parallel-PUT phase can issue them without re-touching
-/// the schema/Arrow builders. `index_sidecars` is non-empty when the SST is
-/// a Node SST and the label declares one or more `unique` properties — each
-/// entry is a `(value_string → NodeId)` map serialised to bincode that the
-/// reader can probe in O(log N) without rescanning the SST body.
+/// the schema/Arrow builders. `index_sidecars` contains optional Node lookup
+/// accelerators and, for current forward Edge SSTs, the complete exact-edge
+/// point sidecar.
 #[derive(Debug)]
 struct PendingSst {
     descriptor: SstDescriptor,
@@ -323,9 +322,8 @@ struct PendingSst {
     body: Bytes,
     bloom_path: Option<Path>,
     bloom_body: Option<Bytes>,
-    /// `(path, body)` for each unique-property side-car emitted alongside
-    /// this SST. Empty for edge SSTs and for node SSTs whose label has no
-    /// `PropertyDef::unique == true`.
+    /// `(path, body)` for each optional accelerator emitted alongside this
+    /// SST. Every object lands before the manifest can expose its marker.
     index_sidecars: Vec<(Path, Bytes)>,
 }
 
@@ -396,12 +394,32 @@ pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
     for label in schema.labels.values() {
         for p in &label.properties {
             if p.indexed || p.unique {
-                by_name.entry(p.name.clone()).or_insert_with(|| {
-                    let mut p = p.clone();
-                    p.unique = false;
-                    p.indexed = true;
-                    p
-                });
+                let mut candidate = p.clone();
+                candidate.unique = false;
+                candidate.indexed = true;
+                by_name
+                    .entry(p.name.clone())
+                    .and_modify(|current| {
+                        // The synthetic definition is global: declarations
+                        // with the same property name may legitimately use
+                        // different types on different labels.  Its type is
+                        // only a capability marker for the equality
+                        // harvester/planner, so never let an arbitrary
+                        // lexically-first unsupported declaration (for
+                        // example Int64) hide a later String/Bool index.
+                        let current_supported = matches!(
+                            current.data_type,
+                            DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                        );
+                        let candidate_supported = matches!(
+                            p.data_type,
+                            DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                        );
+                        if !current_supported && candidate_supported {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
             }
         }
     }
@@ -639,7 +657,7 @@ pub(crate) fn build_edge_sst(
     edge_def: Option<&EdgeTypeDef>,
     rows: &[EdgeStreamRow],
     direction: EdgeDirection,
-) -> Result<EdgeSstFinish> {
+) -> Result<EdgeSstBuild> {
     let (src_label, dst_label) = match edge_def {
         Some(def) => (def.src_label.clone(), def.dst_label.clone()),
         None => ("_".to_string(), "_".to_string()),
@@ -666,7 +684,7 @@ pub(crate) fn build_edge_sst(
     for row in rows {
         writer.append(row.clone())?;
     }
-    writer.finish()
+    writer.finish_with_point_index()
 }
 
 // ── PUT helpers ────────────────────────────────────────────────────────
@@ -715,6 +733,9 @@ fn prepare_node_pending(
     if let Some(sidecar) = label_sidecar {
         index_sidecars.push(sidecar);
     }
+    let (node_locator, locator_sidecar) =
+        prepare_node_locator_sidecar(paths, level.as_u32(), &id, rows.iter().map(|row| row.id))?;
+    index_sidecars.push(locator_sidecar);
 
     let stats = finish.stats;
     let descriptor = SstDescriptor {
@@ -740,6 +761,7 @@ fn prepare_node_pending(
         unique_property_indices,
         equality_property_indices,
         label_index,
+        node_locator: Some(node_locator),
         per_label_property_stats: compute_per_label_property_stats(rows, schema, label_dict)?,
     };
 
@@ -751,6 +773,40 @@ fn prepare_node_pending(
         bloom_body,
         index_sidecars,
     })
+}
+
+/// Build the exact `NodeId -> row ordinal` locator paired with a node SST.
+///
+/// The input order is the physical Parquet row order. Current flush and
+/// compaction writers both guarantee strict NodeId ordering, which also makes
+/// the locator's B+tree input sorted without an additional allocation/sort.
+pub(crate) fn prepare_node_locator_sidecar(
+    paths: &NamespacePaths,
+    level: u32,
+    sst_id: &Uuid,
+    ids: impl IntoIterator<Item = [u8; 16]>,
+) -> Result<(crate::manifest::NodeLocatorDescriptor, (Path, Bytes))> {
+    let body = crate::sst::paged_index::build_node_locator(ids)?;
+    let file_name = format!(
+        "{}-{}.nloc",
+        uuid_path_id(sst_id),
+        SstKind::Nodes.path_tag()
+    );
+    let object_path = paths.sst_object(level, &file_name);
+    let relative = relative_sst_path(level, &file_name);
+    let entry_count = {
+        // The paged header carries the count, but the manifest already knows
+        // the node SST row count. Read it from the fixed header to keep this
+        // helper independent from a second input traversal.
+        let raw: [u8; 8] = body[28..36].try_into().expect("paged header length");
+        u64::from_le_bytes(raw)
+    };
+    let descriptor = crate::manifest::NodeLocatorDescriptor {
+        path: relative,
+        size_bytes: body.len() as u64,
+        entry_count,
+    };
+    Ok((descriptor, (object_path, body)))
 }
 
 /// Build the per-SST label index sidecar: `LabelId -> [NodeId, ...]` posting
@@ -1103,27 +1159,50 @@ impl UniqueSidecarCollector {
             if index.is_empty() {
                 continue;
             }
-            let body_bytes = bincode::serialize(&index)
-                .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?;
             let entry_count = index.len() as u64;
-            let body = Bytes::from(body_bytes);
-
-            let file_name = format!(
+            let legacy = Bytes::from(
+                bincode::serialize(&index)
+                    .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?,
+            );
+            let paged = crate::sst::paged_index::unique_keys_fit(&index)
+                .then(|| crate::sst::paged_index::build_unique(&index))
+                .transpose()?;
+            let legacy_name = format!(
                 "{}-{}-{}.idx_{}.bin",
                 uuid_path_id(sst_id),
                 SstKind::Nodes.path_tag(),
                 label,
                 name,
             );
-            let object_path = paths.sst_object(level, &file_name);
-            let relative = relative_sst_path(level, &file_name);
+            let paged_name = format!(
+                "{}-{}-{}.idx_{}.pidx",
+                uuid_path_id(sst_id),
+                SstKind::Nodes.path_tag(),
+                label,
+                name,
+            );
+            let legacy_path = paths.sst_object(level, &legacy_name);
+            let legacy_relative = relative_sst_path(level, &legacy_name);
+            let paged_descriptor = paged.as_ref().map(|body| {
+                let paged_relative = relative_sst_path(level, &paged_name);
+                crate::manifest::PagedPropertyIndexDescriptor {
+                    path: paged_relative,
+                    size_bytes: body.len() as u64,
+                }
+            });
             descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
                 property: name,
-                path: relative,
-                size_bytes: body.len() as u64,
+                path: legacy_relative,
+                size_bytes: legacy.len() as u64,
                 entry_count,
+                format: crate::manifest::PropertyIndexFormat::BincodeV0,
+                paged: paged_descriptor,
+                paged_build_unsupported: paged.is_none(),
             });
-            bodies.push((object_path, body));
+            bodies.push((legacy_path, legacy));
+            if let Some(paged) = paged {
+                bodies.push((paths.sst_object(level, &paged_name), paged));
+            }
         }
         Ok((descriptors, bodies))
     }
@@ -1140,8 +1219,10 @@ type EqualityPropertySidecars = (
 /// property. Unlike [`prepare_unique_property_sidecars`] a value maps to
 /// MANY ids, so the reader unions postings across SSTs and confirms each
 /// candidate against the node's current value (which discards tombstoned
-/// or value-changed ids). Same string-only, upsert-only harvesting as the
-/// unique path; non-string values are skipped (typed keys are a follow-up).
+/// or value-changed ids). Scalar-v1 currently materialises String and Boolean
+/// declarations. Numeric Cypher equality crosses I64/F64 domains, while
+/// temporal values require schema coercion; both retain the exact scan
+/// fallback until their canonical encodings are proven end-to-end.
 ///
 /// `pub(crate)` so `compact.rs` can re-emit the sidecars on L0->L1 merge.
 pub(crate) fn prepare_equality_property_sidecars(
@@ -1163,14 +1244,23 @@ pub(crate) fn prepare_equality_property_sidecars(
 }
 
 /// One property's harvested `value → [id, ...]` postings, in def order.
-/// Aliased for clippy's type-complexity lint.
-type EqualityPostingEntries = Vec<(String, BTreeMap<String, Vec<[u8; 16]>>)>;
+///
+/// Once a property is declared with a ScalarV1-compatible type, the collector
+/// harvests every actually encodable String/Bool runtime value. This is
+/// deliberate even for a legacy label-scoped SST: the raw storage API can
+/// contain rows that predate or disagree with the later schema declaration,
+/// and an authoritative negative-answer index must cover those rows too.
+#[derive(Debug)]
+struct EqualityPostingEntry {
+    name: String,
+    index: BTreeMap<String, Vec<[u8; 16]>>,
+}
 
 /// Streaming harvester behind [`prepare_equality_property_sidecars`]; the
 /// posting-list analogue of [`UniqueSidecarCollector`].
 #[derive(Debug)]
 pub(crate) struct EqualitySidecarCollector {
-    entries: EqualityPostingEntries,
+    entries: Vec<EqualityPostingEntry>,
 }
 
 impl EqualitySidecarCollector {
@@ -1179,16 +1269,39 @@ impl EqualitySidecarCollector {
             entries: label_def
                 .properties
                 .iter()
-                .filter(|p| p.indexed)
-                .map(|p| (p.name.clone(), BTreeMap::new()))
+                .filter(|p| {
+                    p.indexed
+                        && matches!(
+                            p.data_type,
+                            DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                        )
+                })
+                .map(|p| EqualityPostingEntry {
+                    name: p.name.clone(),
+                    index: BTreeMap::new(),
+                })
                 .collect(),
         }
     }
 
     pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
-        for (name, index) in &mut self.entries {
-            if let Some(Value::Str(s)) = rec.properties.get(name) {
-                let ids = index.entry(s.clone()).or_default();
+        for entry in &mut self.entries {
+            let value = rec.properties.get(&entry.name);
+            // The declaration only decides whether this property has a
+            // ScalarV1 sidecar. Coverage follows the stored value: both
+            // supported runtime types must be harvested so a schema change,
+            // heterogeneous label, or legacy mismatched row cannot become an
+            // authoritative false miss.
+            let compatible = matches!(
+                value,
+                Some(namidb_core::Value::Str(_) | namidb_core::Value::Bool(_))
+            );
+            if let Some(key) = compatible
+                .then_some(value)
+                .flatten()
+                .and_then(crate::cache::encode_equality_property_value)
+            {
+                let ids = entry.index.entry(key).or_default();
                 // Same id-primary invariant as LabelIndexCollector. For a
                 // low-cardinality value, `Vec::contains` made this posting
                 // construction quadratic in its frequency; append is O(1)
@@ -1218,27 +1331,53 @@ impl EqualitySidecarCollector {
     ) -> Result<EqualityPropertySidecars> {
         let mut descriptors = Vec::new();
         let mut bodies = Vec::new();
-        for (name, index) in self.entries {
+        for EqualityPostingEntry { name, index, .. } in self.entries {
             let distinct_values = index.len() as u64;
-            let body_bytes = bincode::serialize(&index)
-                .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?;
-            let body = Bytes::from(body_bytes);
-            let file_name = format!(
+            let legacy = Bytes::from(
+                bincode::serialize(&index)
+                    .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?,
+            );
+            let paged = crate::sst::paged_index::equality_keys_fit(&index)
+                .then(|| crate::sst::paged_index::build_equality(&index))
+                .transpose()?;
+            let legacy_name = format!(
                 "{}-{}-{}.eqidx_{}.bin",
                 uuid_path_id(sst_id),
                 SstKind::Nodes.path_tag(),
                 label,
                 name,
             );
-            let object_path = paths.sst_object(level, &file_name);
-            let relative = relative_sst_path(level, &file_name);
+            let paged_name = format!(
+                "{}-{}-{}.eqidx_{}.pidx",
+                uuid_path_id(sst_id),
+                SstKind::Nodes.path_tag(),
+                label,
+                name,
+            );
+            let legacy_path = paths.sst_object(level, &legacy_name);
+            let legacy_relative = relative_sst_path(level, &legacy_name);
+            let paged_descriptor = paged.as_ref().map(|body| {
+                let paged_relative = relative_sst_path(level, &paged_name);
+                crate::manifest::PagedPropertyIndexDescriptor {
+                    path: paged_relative,
+                    size_bytes: body.len() as u64,
+                }
+            });
             descriptors.push(crate::manifest::EqualityIndexDescriptor {
                 property: name,
-                path: relative,
-                size_bytes: body.len() as u64,
+                path: legacy_relative,
+                size_bytes: legacy.len() as u64,
                 distinct_values,
+                key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
+                mixed_type_complete: true,
+                format: crate::manifest::PropertyIndexFormat::BincodeV0,
+                paged: paged_descriptor,
+                paged_build_unsupported: paged.is_none(),
             });
-            bodies.push((object_path, body));
+            bodies.push((legacy_path, legacy));
+            if let Some(paged) = paged {
+                bodies.push((paths.sst_object(level, &paged_name), paged));
+            }
         }
         Ok((descriptors, bodies))
     }
@@ -1248,23 +1387,39 @@ fn prepare_edge_pending(
     paths: &NamespacePaths,
     edge_type: &str,
     direction: EdgeDirection,
-    finish: EdgeSstFinish,
+    build: EdgeSstBuild,
 ) -> PendingSst {
+    let EdgeSstBuild {
+        finish,
+        point_index,
+    } = build;
     let id = Uuid::now_v7();
     let level = SstLevel::L0;
     let kind = match direction {
         EdgeDirection::Forward => SstKind::EdgesFwd,
         EdgeDirection::Inverse => SstKind::EdgesInv,
     };
+    let point_index_present = point_index.is_some();
     let file_name = format!(
-        "{}-{}-{}.csr",
+        "{}-{}-{}.{}csr",
         uuid_path_id(&id),
         direction.path_tag(),
-        edge_type
+        edge_type,
+        if point_index_present { "ep." } else { "" },
     );
     let body_path = paths.sst_object(level.as_u32(), &file_name);
     let relative_path = relative_sst_path(level.as_u32(), &file_name);
     let body_len = finish.body.len() as u64;
+    let point_file_name = format!(
+        "{}-{}-{}.epidx",
+        uuid_path_id(&id),
+        direction.path_tag(),
+        edge_type
+    );
+    let point_path = paths.sst_object(level.as_u32(), &point_file_name);
+    let index_sidecars = point_index
+        .map(|point_body| vec![(point_path, point_body)])
+        .unwrap_or_default();
 
     let (bloom_descriptor, bloom_path, bloom_body) = prepare_bloom_sidecar(
         paths,
@@ -1301,6 +1456,7 @@ fn prepare_edge_pending(
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
         label_index: None,
+        node_locator: None,
         per_label_property_stats: Vec::new(),
     };
 
@@ -1310,7 +1466,7 @@ fn prepare_edge_pending(
         body: finish.body,
         bloom_path,
         bloom_body,
-        index_sidecars: Vec::new(),
+        index_sidecars,
     }
 }
 
@@ -1754,7 +1910,7 @@ pub mod builder {
 
     use namidb_core::{LabelDef, LabelDictionary, Schema, Value};
 
-    use crate::error::Result;
+    use crate::error::{Error, Result};
     use crate::manifest::SstDescriptor;
     use crate::memtable::MemOp;
     use crate::paths::NamespacePaths;
@@ -1814,9 +1970,15 @@ pub mod builder {
     }
 
     impl BuiltSst {
-        /// Label names carried by this SST's nodes (empty for edge SSTs).
-        pub(crate) fn label_names(&self) -> Vec<String> {
-            self.label_dict.iter().map(|(_, n)| n.to_string()).collect()
+        /// Exact `(raw LabelId, name)` mapping baked into this SST's node
+        /// rows. Empty for edge SSTs. `attach_ssts` validates every mapping
+        /// before issuing object-store writes so independently-built node
+        /// SSTs cannot silently disagree about an id.
+        pub(crate) fn label_entries(&self) -> Vec<(u32, String)> {
+            self.label_dict
+                .iter()
+                .map(|(id, name)| (id.get(), name.to_string()))
+                .collect()
         }
 
         /// Highest LSN carried by this SST (the `next_lsn` floor after attach).
@@ -1889,10 +2051,23 @@ pub mod builder {
             return Ok(None);
         }
         let rows = dedup_keep_last_node(rows);
-        // Intern the label so records carry its LabelId; the dict travels with
-        // the BuiltSst and `attach_ssts` installs it in the manifest.
+        // Every independent builder call must mint the same raw LabelId for
+        // the same schema label. A singleton dictionary assigned id 0 to
+        // every label, so attaching separately-built A and B SSTs made B's
+        // rows resolve as A. Schema labels live in a BTreeMap: intern the
+        // complete catalog in that stable order before selecting this row's
+        // id, and carry the mapping with the opaque BuiltSst for attach-time
+        // preflight.
         let mut node_dict = LabelDictionary::new();
-        let lid = node_dict.intern(label).get();
+        for name in schema.labels.keys() {
+            node_dict.intern(name);
+        }
+        let lid = node_dict.id(label).ok_or_else(|| {
+            Error::precondition(format!(
+                "offline node SST label '{label}' is not declared in the supplied schema"
+            ))
+        })?;
+        let lid = lid.get();
         let node_rows: Vec<NodeRow> = rows
             .into_iter()
             .enumerate()
@@ -2180,6 +2355,68 @@ mod tests {
         let bytes = r.encode().unwrap();
         let back = NodeWriteRecord::decode(&bytes).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn label_scoped_equality_sidecar_covers_supported_runtime_type_mismatches() {
+        // Legacy per-label SSTs can contain rows written before a later schema
+        // declaration (and the raw storage API is intentionally schemaless).
+        // Once advertised as complete, their posting sidecar must therefore
+        // cover the stored String/Bool value, not merely the declared type.
+        for (suffix, declared, runtime, encoded) in [
+            (
+                "string-decl-bool-row",
+                DataType::Utf8,
+                Value::Bool(true),
+                "b:1",
+            ),
+            (
+                "bool-decl-string-row",
+                DataType::Bool,
+                Value::Str("runtime-string".into()),
+                "runtime-string",
+            ),
+        ] {
+            let label = LabelDef {
+                name: "Legacy".into(),
+                properties: vec![PropertyDef::new("key", declared.clone(), false)
+                    .unwrap()
+                    .with_indexed(true)],
+            };
+            let id = *sorted_node_id(1).as_bytes();
+            let record = NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), runtime)]),
+                schema_version: 1,
+                ..Default::default()
+            };
+            let mut collector = EqualitySidecarCollector::new(&label);
+            collector.observe(id, &record);
+            let paths = make_paths(suffix);
+            let (descriptors, bodies) = collector
+                .finish(&paths, 0, &Uuid::now_v7(), "Legacy")
+                .unwrap();
+
+            assert_eq!(descriptors.len(), 1);
+            assert!(
+                descriptors[0].mixed_type_complete,
+                "only a sidecar with full runtime-type coverage may advertise completeness"
+            );
+            let legacy = bodies
+                .iter()
+                .find(|(path, _)| path.as_ref().ends_with(".bin"))
+                .map(|(_, body)| body)
+                .expect("legacy equality body");
+            let postings: BTreeMap<String, Vec<[u8; 16]>> = bincode::deserialize(legacy).unwrap();
+            assert_eq!(
+                postings.get(encoded),
+                Some(&vec![id]),
+                "{declared:?} declaration must not omit its {encoded:?} runtime claimant"
+            );
+            assert!(
+                !postings.contains_key("absent"),
+                "an absent key remains an authoritative miss"
+            );
+        }
     }
 
     #[test]

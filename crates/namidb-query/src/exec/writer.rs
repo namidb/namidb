@@ -22,14 +22,14 @@
 //! - Property values must be representable as `core::Value` scalars
 //! (List/Map/Node/Rel are rejected with an explicit error).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use namidb_core::id::NodeId;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, UniqueProbe, WriterSession};
+use namidb_storage::{EdgeWriteRecord, NodeWriteRecord, StagedValue, UniqueProbe, WriterSession};
 
 use super::expr::{evaluate, is_equal, Params};
 use super::row::Row;
@@ -211,19 +211,74 @@ fn execute_write_inner<'a>(
             } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len().max(1));
-                for row in rows {
-                    crate::exec::limits::check_deadline()?;
-                    let merged = apply_merge(
-                        pattern,
-                        on_match_sets,
-                        on_create_sets,
-                        row,
-                        writer,
-                        params,
-                        outcome,
-                    )
-                    .await?;
-                    out.extend(merged);
+                if let Some(PreparedSingleNodeMergeBatch {
+                    rows: prepared,
+                    mut prefetched_nodes,
+                }) = prepare_single_node_merge_batch(pattern, &rows, writer, params).await?
+                {
+                    debug_assert_eq!(prepared.len(), rows.len());
+                    for (row, expected) in rows.into_iter().zip(prepared) {
+                        crate::exec::limits::check_deadline()?;
+                        let merged = apply_merge(
+                            pattern,
+                            on_match_sets,
+                            on_create_sets,
+                            row,
+                            writer,
+                            params,
+                            outcome,
+                            Some(&expected),
+                            Some(&mut prefetched_nodes),
+                            None,
+                            None,
+                        )
+                        .await?;
+                        out.extend(merged);
+                    }
+                } else if let Some(PreparedBoundRelationshipMergeBatch {
+                    rows: prepared,
+                    mut prefetched_edges,
+                }) =
+                    prepare_bound_relationship_merge_batch(pattern, &rows, writer).await?
+                {
+                    debug_assert_eq!(prepared.len(), rows.len());
+                    for (row, expected) in rows.into_iter().zip(prepared) {
+                        crate::exec::limits::check_deadline()?;
+                        let merged = apply_merge(
+                            pattern,
+                            on_match_sets,
+                            on_create_sets,
+                            row,
+                            writer,
+                            params,
+                            outcome,
+                            None,
+                            None,
+                            Some(&expected),
+                            Some(&mut prefetched_edges),
+                        )
+                        .await?;
+                        out.extend(merged);
+                    }
+                } else {
+                    for row in rows {
+                        crate::exec::limits::check_deadline()?;
+                        let merged = apply_merge(
+                            pattern,
+                            on_match_sets,
+                            on_create_sets,
+                            row,
+                            writer,
+                            params,
+                            outcome,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?;
+                        out.extend(merged);
+                    }
                 }
                 Ok(out)
             }
@@ -457,13 +512,21 @@ fn execute_write_inner<'a>(
                     routing.transactional_property_reads() || writer.has_staged_node_mutations();
                 let snap = snapshot_for_write_read(writer, routing);
 
-                // A correlated unique String lookup over committed state can
-                // resolve the whole input in one storage call. Evaluate every
-                // RHS first so expression errors retain eager-operator
-                // semantics and no partial batch lookup has happened when one
-                // row fails. RYOW, multi-value and non-String probes keep the
-                // exact per-row paths below.
-                if !*multi && !use_transactional {
+                // A label-agnostic correlated lookup is necessarily
+                // multi-valued: equal values can belong to nodes under
+                // different labels. Resolve every String probe in one global
+                // posting lookup rather than scanning all nodes once per
+                // input row. `snap` is the transactional overlay whenever
+                // this statement must observe staged mutations, so the batch
+                // retains read-your-own-writes and discard/rollback semantics.
+                //
+                // The result is aligned to the String subsequence, including
+                // duplicates and misses. NULL still never matches and runtime
+                // types without a String sidecar retain the exact scan
+                // fallback. Evaluate every RHS before I/O so expression
+                // errors remain eager and cannot leave a partially consumed
+                // result batch.
+                if *multi && label.is_empty() {
                     let evaluated_rows = input_rows
                         .into_iter()
                         .map(|row| {
@@ -481,7 +544,7 @@ fn execute_write_inner<'a>(
                     let batch_results = if string_values.is_empty() {
                         Vec::new()
                     } else {
-                        snap.batch_lookup_nodes_by_property(label, property, &string_values)
+                        snap.batch_lookup_nodes_by_property_any_label(property, &string_values)
                             .await
                             .map_err(ExecError::Storage)?
                     };
@@ -494,14 +557,114 @@ fn execute_write_inner<'a>(
                     }
 
                     let mut batch_results = batch_results.into_iter();
-                    let mut out = Vec::with_capacity(evaluated_rows.len());
+                    let mut out = Vec::new();
                     for (row, lookup_value) in evaluated_rows {
-                        let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
-                            batch_results.next().ok_or_else(|| {
+                        let matches = match lookup_value {
+                            RuntimeValue::String(_) => batch_results.next().ok_or_else(|| {
                                 ExecError::Runtime(
                                     "batch property lookup result alignment was lost".into(),
                                 )
-                            })?
+                            })?,
+                            RuntimeValue::Null => Vec::new(),
+                            other => {
+                                crate::exec::walker::lookup_nodes_by_property_via_scan(
+                                    &snap, label, property, &other,
+                                )
+                                .await?
+                            }
+                        };
+                        for view in matches {
+                            let mut new_row = row.clone();
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    }
+                    return Ok(out);
+                }
+
+                // A correlated unique String lookup can resolve the whole
+                // input in one storage call, including node-mutating plans
+                // such as:
+                //
+                //   UNWIND $rows AS row
+                //   MATCH (n:Doc {key: row.key})
+                //   SET n.embedding = row.embedding
+                //
+                // Those plans require RYOW, but populating the transactional
+                // tuple map with `unique_probe` would scan the full label on
+                // the first row. Seed just this batch's exact hit/miss keys
+                // from the immutable sidecar instead; the storage helper
+                // reconciles any bounded staged overlay and journals the
+                // partial keys for rollback. Multi-value and non-String
+                // probes retain the exact per-row paths below.
+                //
+                // Evaluate every RHS first so expression errors retain
+                // eager-operator semantics and no partial seed has happened
+                // when one row fails.
+                if !*multi {
+                    let evaluated_rows = input_rows
+                        .into_iter()
+                        .map(|row| {
+                            let lookup_value = evaluate(value, &row, params)?;
+                            Ok::<_, ExecError>((row, lookup_value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let string_values = evaluated_rows
+                        .iter()
+                        .filter_map(|(_, lookup_value)| match lookup_value {
+                            RuntimeValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let batch_results = if string_values.is_empty() {
+                        Some(Vec::new())
+                    } else if use_transactional {
+                        writer
+                            .seed_unique_string_candidates(label, property, &string_values)
+                            .await
+                            .map_err(ExecError::Storage)?
+                    } else {
+                        Some(
+                            snap.batch_lookup_nodes_by_property(label, property, &string_values)
+                                .await
+                                .map_err(ExecError::Storage)?,
+                        )
+                    };
+                    if let Some(results) = &batch_results {
+                        if results.len() != string_values.len() {
+                            return Err(ExecError::Runtime(format!(
+                                "batch property lookup returned {} results for {} values",
+                                results.len(),
+                                string_values.len()
+                            )));
+                        }
+                    }
+
+                    let mut batch_results = batch_results.map(IntoIterator::into_iter);
+                    let mut out = Vec::with_capacity(evaluated_rows.len());
+                    for (row, lookup_value) in evaluated_rows {
+                        let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
+                            if let Some(results) = &mut batch_results {
+                                results.next().ok_or_else(|| {
+                                    ExecError::Runtime(
+                                        "batch property lookup result alignment was lost".into(),
+                                    )
+                                })?
+                            } else {
+                                lookup_unique_node_for_write(
+                                    writer,
+                                    &snap,
+                                    label,
+                                    property,
+                                    &lookup_value,
+                                    value,
+                                    use_transactional,
+                                )
+                                .await?
+                            }
                         } else {
                             lookup_unique_node_for_write(
                                 writer,
@@ -510,7 +673,7 @@ fn execute_write_inner<'a>(
                                 property,
                                 &lookup_value,
                                 value,
-                                false,
+                                use_transactional,
                             )
                             .await?
                         };
@@ -850,6 +1013,10 @@ fn exec_foreach_body<'a>(
                             writer,
                             params,
                             outcome,
+                            None,
+                            None,
+                            None,
+                            None,
                         )
                         .await?,
                     );
@@ -1067,7 +1234,7 @@ pub async fn enforce_node_unique_constraints(
     enforce_unique_on_create(writer, labels, core_props)
         .await
         .map_err(to_msg)?;
-    enforce_composite_unique(writer, labels, core_props, None)
+    enforce_composite_unique(writer, labels, core_props, None, None)
         .await
         .map_err(to_msg)
 }
@@ -1167,6 +1334,7 @@ async fn enforce_composite_unique(
     labels: &[String],
     core_props: &BTreeMap<String, CoreValue>,
     exclude: Option<NodeId>,
+    changed_properties: Option<&[&str]>,
 ) -> Result<(), ExecError> {
     // Collect the tuples to check first so the schema borrow is released before
     // we take a snapshot.
@@ -1178,6 +1346,17 @@ async fn enforce_composite_unique(
                 continue;
             }
             if !labels.iter().any(|l| l == &c.label) {
+                continue;
+            }
+            if changed_properties.is_some_and(|changed| {
+                !c.properties
+                    .iter()
+                    .any(|property| changed.contains(&property.as_str()))
+            }) {
+                // Updating an unrelated property cannot create a new claimant
+                // for this tuple. Avoid populating its transactional index with
+                // a label scan merely to prove the unchanged node still does
+                // not conflict with itself.
                 continue;
             }
             let mut tuple = Vec::with_capacity(c.properties.len());
@@ -1452,7 +1631,7 @@ async fn apply_create(
                 // node, so a duplicate staged earlier in the same uncommitted
                 // batch is caught as well as one already committed.
                 enforce_unique_on_create(writer, labels, &core_props).await?;
-                enforce_composite_unique(writer, labels, &core_props, None).await?;
+                enforce_composite_unique(writer, labels, &core_props, None, None).await?;
                 enforce_notnull_on_create(writer, labels, &core_props)?;
                 // CREATE introduces every property → validate them all.
                 enforce_vector_dims(writer, labels, &mut core_props, None)?;
@@ -1557,6 +1736,88 @@ async fn apply_sets(
     Ok(row)
 }
 
+/// Keep aliases that reference the same physical node coherent after a SET.
+///
+/// Cypher permits one node to be bound under multiple names. Updating only
+/// the target alias leaves the other bindings with a stale property map; a
+/// later SET through that alias can then rewrite from stale state, and MERGE's
+/// batch-prefetch refresh can cache the wrong clone. The storage write is
+/// id-primary, so mirror its complete post-write value to every matching
+/// binding in the row.
+fn synchronize_node_bindings(row: &mut Row, updated: &NodeValue) {
+    for value in row.bindings.values_mut() {
+        if matches!(value, RuntimeValue::Node(node) if node.id == updated.id) {
+            *value = RuntimeValue::Node(Box::new(updated.clone()));
+        }
+    }
+}
+
+/// Relationship counterpart of [`synchronize_node_bindings`].
+///
+/// Relationships are identity-keyed by `(type, src, dst)` in storage. Mirror
+/// the complete post-write value to every alias for that key so a later SET
+/// cannot rewrite it from an older property map.
+fn synchronize_rel_bindings(row: &mut Row, updated: &RelValue) {
+    for value in row.bindings.values_mut() {
+        if matches!(
+            value,
+            RuntimeValue::Rel(rel)
+                if rel.edge_type == updated.edge_type
+                    && rel.src == updated.src
+                    && rel.dst == updated.dst
+        ) {
+            *value = RuntimeValue::Rel(Box::new(updated.clone()));
+        }
+    }
+}
+
+/// Refresh the SET target from the writer-private last-write-wins memtable.
+///
+/// Logical operators materialize their input rows before applying writes.
+/// Under `UNWIND` (and MERGE's prefetched batches), later rows therefore carry
+/// clones from before an earlier row's mutation. A direct staged point lookup
+/// repairs that clone in O(log pending distinct keys) without probing SSTs,
+/// then synchronizes every alias of the same entity before the RHS is
+/// evaluated.
+fn refresh_staged_write_target(
+    row: &mut Row,
+    target_alias: &str,
+    writer: &WriterSession,
+) -> Result<(), ExecError> {
+    match row.get(target_alias).cloned() {
+        Some(RuntimeValue::Node(node)) => {
+            match writer.staged_node(node.id).map_err(ExecError::Storage)? {
+                StagedValue::Untouched => {}
+                StagedValue::Tombstone => {
+                    return Err(ExecError::Runtime(format!(
+                        "SET target `{target_alias}` was deleted earlier in this transaction"
+                    )));
+                }
+                StagedValue::Upsert(view) => {
+                    synchronize_node_bindings(row, &NodeValue::from(view));
+                }
+            }
+        }
+        Some(RuntimeValue::Rel(rel)) => match writer
+            .staged_edge(&rel.edge_type, rel.src, rel.dst)
+            .map_err(ExecError::Storage)?
+        {
+            StagedValue::Untouched => {}
+            StagedValue::Tombstone => {
+                return Err(ExecError::Runtime(format!(
+                    "SET target `{target_alias}` was deleted earlier in this transaction"
+                )));
+            }
+            StagedValue::Upsert(view) => {
+                synchronize_rel_bindings(row, &RelValue::from(view));
+            }
+        },
+        // Preserve the existing type/unbound diagnostics in `apply_set`.
+        Some(_) | None => {}
+    }
+    Ok(())
+}
+
 async fn apply_set(
     op: &SetOp,
     mut row: Row,
@@ -1564,6 +1825,7 @@ async fn apply_set(
     params: &Params,
     outcome: &mut WriteOutcome,
 ) -> Result<Row, ExecError> {
+    refresh_staged_write_target(&mut row, op.target_alias(), writer)?;
     match op {
         SetOp::Property {
             target_alias,
@@ -1573,7 +1835,7 @@ async fn apply_set(
             let new_val = evaluate(value, &row, params)?;
             let core = runtime_to_core(&new_val, value).map_err(ExecError::Runtime)?;
             match row.get(target_alias).cloned() {
-                Some(RuntimeValue::Node(mut n)) => {
+                Some(RuntimeValue::Node(n)) => {
                     // Enforce unique constraints if `key` is a declared unique
                     // property on one of the node's labels. Self-update (setting
                     // the node's own value) is allowed.
@@ -1587,31 +1849,21 @@ async fn apply_set(
                             )));
                         }
                     }
-                    // Base the full-record rewrite on the node's CURRENT staged
-                    // property map (read-your-own-writes overlay), not the row's
-                    // clone captured at match time: two SETs to the same node in
-                    // one statement (e.g. under different aliases) would
-                    // otherwise each rewrite from their stale clone and the
-                    // earlier one's delta would be lost (last-LSN-wins). Fall
-                    // back to the row clone if the node isn't yet visible.
-                    let mut core_props = {
-                        let snap = writer.overlay_snapshot();
-                        let current = match n.labels.iter().next() {
-                            Some(label) => snap
-                                .lookup_node(label, n.id)
-                                .await
-                                .map_err(ExecError::Storage)?,
-                            None => None,
-                        };
-                        match current {
-                            Some(view) => view.properties,
-                            None => node_runtime_props_to_core(&n.properties)?,
-                        }
-                    };
+                    // `refresh_staged_write_target` made this row clone current
+                    // before the RHS was evaluated, so the full-record rewrite
+                    // never needs a second committed/SST lookup.
+                    let mut core_props = node_runtime_props_to_core(&n.properties)?;
                     core_props.insert(key.clone(), core);
                     // Composite uniqueness is checked against the node's full
                     // post-SET property set, excluding the node itself.
-                    enforce_composite_unique(writer, &label_vec, &core_props, Some(n.id)).await?;
+                    enforce_composite_unique(
+                        writer,
+                        &label_vec,
+                        &core_props,
+                        Some(n.id),
+                        Some(&[key.as_str()]),
+                    )
+                    .await?;
                     // Validate only the property being SET, not the node's other
                     // (possibly pre-index, legacy) embeddings.
                     enforce_vector_dims(
@@ -1620,6 +1872,10 @@ async fn apply_set(
                         &mut core_props,
                         Some(&[key.as_str()]),
                     )?;
+                    let runtime_props = core_props
+                        .iter()
+                        .map(|(name, value)| (name.clone(), RuntimeValue::from(value.clone())))
+                        .collect();
                     let record = NodeWriteRecord {
                         properties: core_props,
                         schema_version: 1,
@@ -1631,9 +1887,13 @@ async fn apply_set(
                     writer
                         .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                         .map_err(ExecError::Storage)?;
-                    n.properties.insert(key.clone(), new_val);
                     outcome.properties_set += 1;
-                    row.set(target_alias.clone(), RuntimeValue::Node(n));
+                    let updated = NodeValue {
+                        id: n.id,
+                        labels: n.labels,
+                        properties: runtime_props,
+                    };
+                    synchronize_node_bindings(&mut row, &updated);
                 }
                 Some(RuntimeValue::Rel(mut r)) => {
                     let mut core_props = node_runtime_props_to_core(&r.properties)?;
@@ -1647,7 +1907,7 @@ async fn apply_set(
                         .map_err(ExecError::Storage)?;
                     r.properties.insert(key.clone(), new_val);
                     outcome.properties_set += 1;
-                    row.set(target_alias.clone(), RuntimeValue::Rel(r));
+                    synchronize_rel_bindings(&mut row, &r);
                 }
                 Some(other) => {
                     return Err(ExecError::Runtime(format!(
@@ -1707,7 +1967,12 @@ async fn apply_set(
                 for (k, cv) in &core_props {
                     enforce_unique_on_set(writer, &added_labels, k, cv, n.id).await?;
                 }
-                enforce_composite_unique(writer, &added_labels, &core_props, Some(n.id)).await?;
+                enforce_composite_unique(writer, &added_labels, &core_props, Some(n.id), None)
+                    .await?;
+                let runtime_props = core_props
+                    .iter()
+                    .map(|(name, value)| (name.clone(), RuntimeValue::from(value.clone())))
+                    .collect();
                 let record = NodeWriteRecord {
                     properties: core_props,
                     schema_version: 1,
@@ -1717,7 +1982,12 @@ async fn apply_set(
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                     .map_err(ExecError::Storage)?;
                 outcome.labels_set += added_labels.len() as u64;
-                row.set(target_alias.clone(), RuntimeValue::Node(n));
+                let updated = NodeValue {
+                    id: n.id,
+                    labels: n.labels,
+                    properties: runtime_props,
+                };
+                synchronize_node_bindings(&mut row, &updated);
             }
             other => {
                 return Err(ExecError::Runtime(format!(
@@ -1789,23 +2059,30 @@ async fn apply_set_map(
     };
 
     match row.get(target_alias).cloned() {
-        Some(RuntimeValue::Node(mut n)) => {
+        Some(RuntimeValue::Node(n)) => {
             let final_runtime = merged_props(replace, &n.properties, &incoming);
             let mut final_core = node_runtime_props_to_core(&final_runtime)?;
             let labels: Vec<String> = n.labels.iter().cloned().collect();
+            let changed: Vec<&str> = incoming.iter().map(|(k, _)| k.as_str()).collect();
             // Uniqueness against the final set, excluding the node's own row so
             // a self-update is allowed; then NOT NULL so a `=` that drops a
             // required column is rejected, not silently committed.
-            for (k, cv) in &final_core {
-                enforce_unique_on_set(writer, &labels, k, cv, n.id).await?;
+            for key in &changed {
+                if let Some(value) = final_core.get(*key) {
+                    enforce_unique_on_set(writer, &labels, key, value, n.id).await?;
+                }
             }
-            enforce_composite_unique(writer, &labels, &final_core, Some(n.id)).await?;
+            enforce_composite_unique(writer, &labels, &final_core, Some(n.id), Some(&changed))
+                .await?;
             enforce_notnull_on_create(writer, &labels, &final_core)?;
             // Validate only the properties this SET introduces (a `+=` must not
             // re-validate the node's untouched legacy embeddings; a `=` replaces
             // the whole set, so `incoming` IS the final embedding set).
-            let changed: Vec<&str> = incoming.iter().map(|(k, _)| k.as_str()).collect();
             enforce_vector_dims(writer, &labels, &mut final_core, Some(&changed))?;
+            let final_runtime = final_core
+                .iter()
+                .map(|(name, value)| (name.clone(), RuntimeValue::from(value.clone())))
+                .collect();
             let record = NodeWriteRecord {
                 properties: final_core,
                 schema_version: 1,
@@ -1815,8 +2092,12 @@ async fn apply_set_map(
                 .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                 .map_err(ExecError::Storage)?;
             outcome.properties_set += incoming.len() as u64;
-            n.properties = final_runtime;
-            row.set(target_alias.to_string(), RuntimeValue::Node(n));
+            let updated = NodeValue {
+                id: n.id,
+                labels: n.labels,
+                properties: final_runtime,
+            };
+            synchronize_node_bindings(&mut row, &updated);
         }
         Some(RuntimeValue::Rel(mut r)) => {
             let final_runtime = merged_props(replace, &r.properties, &incoming);
@@ -1830,7 +2111,7 @@ async fn apply_set_map(
                 .map_err(ExecError::Storage)?;
             outcome.properties_set += incoming.len() as u64;
             r.properties = final_runtime;
-            row.set(target_alias.to_string(), RuntimeValue::Rel(r));
+            synchronize_rel_bindings(&mut row, &r);
         }
         Some(other) => {
             return Err(ExecError::Runtime(format!(
@@ -1867,6 +2148,12 @@ fn apply_remove(
     writer: &mut WriterSession,
     outcome: &mut WriteOutcome,
 ) -> Result<Row, ExecError> {
+    let target_alias = match op {
+        RemoveOp::Property { target_alias, .. } | RemoveOp::Labels { target_alias, .. } => {
+            target_alias.as_str()
+        }
+    };
+    refresh_staged_write_target(&mut row, target_alias, writer)?;
     match op {
         RemoveOp::Property { target_alias, key } => match row.get(target_alias).cloned() {
             Some(RuntimeValue::Node(mut n)) => {
@@ -1891,7 +2178,7 @@ fn apply_remove(
                     .map_err(ExecError::Storage)?;
                 n.properties.remove(key);
                 outcome.properties_set += 1;
-                row.set(target_alias.clone(), RuntimeValue::Node(n));
+                synchronize_node_bindings(&mut row, &n);
             }
             Some(RuntimeValue::Rel(mut r)) => {
                 let mut core_props = node_runtime_props_to_core(&r.properties)?;
@@ -1905,7 +2192,7 @@ fn apply_remove(
                     .map_err(ExecError::Storage)?;
                 r.properties.remove(key);
                 outcome.properties_set += 1;
-                row.set(target_alias.clone(), RuntimeValue::Rel(r));
+                synchronize_rel_bindings(&mut row, &r);
             }
             other => {
                 return Err(ExecError::Runtime(format!(
@@ -1931,7 +2218,7 @@ fn apply_remove(
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
                     .map_err(ExecError::Storage)?;
                 outcome.labels_set += removed as u64;
-                row.set(target_alias.clone(), RuntimeValue::Node(n));
+                synchronize_node_bindings(&mut row, &n);
             }
             other => {
                 return Err(ExecError::Runtime(format!(
@@ -2034,6 +2321,276 @@ async fn detach_incident_edges(
 
 // ──────────────────────────── MERGE ──────────────────────────────────
 
+/// Materialise and hydrate the existing-node candidates for a correlated
+/// single-node MERGE in bulk.
+///
+/// The transactional unique index answers a hit with a `NodeId`, but the
+/// complete `NodeValue` is still needed for residual properties, RETURN and
+/// SET. Resolving those ids one row at a time makes a compacted id-primary SST
+/// pay one targeted Parquet walk per existing key. Misses never hydrate a
+/// node, which is why new-key MERGE stayed fast while idempotent replay
+/// degraded with total corpus size.
+///
+/// Single-String unique keys first use the same sidecar-backed batch point
+/// path as MATCH and seed those exact hit/miss keys into the transactional
+/// index. Other key shapes retain the generic unique-probe fallback. Candidate
+/// ids are then hydrated in row-group-aware batches. Per-row execution below
+/// still re-probes the live transactional index, so duplicate keys and ON
+/// MATCH mutations retain strict RYOW semantics. The prefetched map is
+/// refreshed after every row that mutates a node.
+struct PreparedSingleNodeMergeBatch {
+    rows: Vec<MaterializedMergeNode>,
+    prefetched_nodes: HashMap<NodeId, NodeValue>,
+}
+
+async fn prepare_single_node_merge_batch(
+    pattern: &[CreateElement],
+    rows: &[Row],
+    writer: &WriterSession,
+    params: &Params,
+) -> Result<Option<PreparedSingleNodeMergeBatch>, ExecError> {
+    namidb_core::profile_scope!("writer::prepare_single_node_merge_batch");
+    let [CreateElement::Node {
+        labels,
+        properties,
+        properties_spread,
+        ..
+    }] = pattern
+    else {
+        return Ok(None);
+    };
+    if rows.is_empty() || !merge_labels_have_unique_key(writer, labels) {
+        return Ok(None);
+    }
+
+    let node_pattern = MergeNodePattern {
+        labels,
+        properties,
+        properties_spread: properties_spread.as_ref(),
+    };
+    let mut prepared = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        if index % namidb_storage::cancel::CHECK_STRIDE == 0 {
+            crate::exec::limits::check_deadline()?;
+        }
+        let expected = materialize_merge_node_pattern(node_pattern, row, params)?;
+        prepared.push(expected);
+    }
+
+    let mut prefetched = HashMap::new();
+    // Group all eligible probes so one sidecar pass + one node batch serves
+    // the whole UNWIND. If an earlier clause already staged node mutations,
+    // the storage seed reconciles that bounded LWW overlay over the committed
+    // point answers without scanning the stored label.
+    let mut string_groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for expected in &prepared {
+        if let Some((label, property, value)) =
+            covered_single_string_unique_key(writer, labels, expected)
+        {
+            string_groups
+                .entry((label, property))
+                .or_default()
+                .push(value);
+        }
+    }
+    for ((label, property), values) in string_groups {
+        if let Some(views) = writer
+            .seed_unique_string_candidates(&label, &property, &values)
+            .await
+            .map_err(ExecError::Storage)?
+        {
+            for view in views.into_iter().flatten() {
+                prefetched.insert(view.id, NodeValue::from(view));
+            }
+        }
+    }
+
+    let mut ids_by_label: BTreeMap<String, BTreeSet<NodeId>> = BTreeMap::new();
+    for expected in &prepared {
+        if let Some((label, ids)) = probe_merge_unique_candidates(writer, labels, expected).await? {
+            ids_by_label.entry(label).or_default().extend(ids);
+        }
+    }
+    if !ids_by_label.is_empty() {
+        let snapshot = writer.overlay_snapshot();
+        for (label, ids) in ids_by_label {
+            let ids: Vec<NodeId> = ids
+                .into_iter()
+                .filter(|id| !prefetched.contains_key(id))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let views = snapshot
+                .batch_lookup_nodes(&label, &ids)
+                .await
+                .map_err(ExecError::Storage)?;
+            if views.len() != ids.len() {
+                return Err(ExecError::Runtime(format!(
+                    "batch MERGE hydration returned {} results for {} ids",
+                    views.len(),
+                    ids.len()
+                )));
+            }
+            for (id, view) in ids.into_iter().zip(views) {
+                if let Some(view) = view {
+                    prefetched.insert(id, NodeValue::from(view));
+                }
+            }
+        }
+    }
+    Ok(Some(PreparedSingleNodeMergeBatch {
+        rows: prepared,
+        prefetched_nodes: prefetched,
+    }))
+}
+
+/// The sidecar-compatible unique-key subset used by batch MERGE seeding.
+///
+/// Composite and non-String tuples still use the canonical typed
+/// transactional probe. Strings cover the loader's dominant `{key: ...}`
+/// shape and are exactly the key domain supported by legacy unique sidecars.
+fn covered_single_string_unique_key(
+    writer: &WriterSession,
+    labels: &[String],
+    expected: &MaterializedMergeNode,
+) -> Option<(String, String, String)> {
+    covered_merge_unique_keys(writer, labels, expected)
+        .into_iter()
+        .find_map(|(label, tuple)| {
+            let [(property, CoreValue::Str(value))] = tuple.as_slice() else {
+                return None;
+            };
+            Some((label, property.clone(), value.clone()))
+        })
+}
+
+/// Cheap schema-only guard for the bulk preparation above. Dynamic spread
+/// maps may or may not actually cover the key on a given row; preparing those
+/// rows is still useful because `probe_merge_unique_candidates` decides that
+/// from the already-materialised map without evaluating expressions twice.
+fn merge_labels_have_unique_key(writer: &WriterSession, labels: &[String]) -> bool {
+    writer.schema().constraints().iter().any(|constraint| {
+        constraint.kind == namidb_core::ConstraintKind::Unique
+            && labels.iter().any(|label| label == &constraint.label)
+    }) || labels.iter().any(|label| {
+        writer
+            .schema()
+            .label(label)
+            .is_some_and(|definition| definition.properties.iter().any(|property| property.unique))
+    })
+}
+
+type EdgeMergeKey = (String, NodeId, NodeId);
+
+/// One input row whose MERGE relationship has both endpoints already bound.
+///
+/// Keeping only the physical identity here is intentional: relationship
+/// property expressions are still evaluated at their original per-row point,
+/// preserving errors and RYOW semantics. The expensive committed lookup is
+/// the part shared across the whole input batch.
+struct PreparedBoundRelationshipMerge {
+    key: EdgeMergeKey,
+}
+
+struct PreparedBoundRelationshipMergeBatch {
+    rows: Vec<PreparedBoundRelationshipMerge>,
+    prefetched_edges: HashMap<EdgeMergeKey, Option<RelValue>>,
+}
+
+/// Batch the loader's dominant `MATCH a, MATCH b, MERGE (a)-[:T]->(b)`
+/// existence probes.
+///
+/// The CSR fallback is opened at most once per SST, while current SSTs use one
+/// range-readable B+tree probe for all endpoint pairs. Only patterns whose
+/// source and target are genuine outer-scope back-references are eligible;
+/// fresh pattern nodes retain the expand/filter matcher below.
+async fn prepare_bound_relationship_merge_batch(
+    pattern: &[CreateElement],
+    rows: &[Row],
+    writer: &WriterSession,
+) -> Result<Option<PreparedBoundRelationshipMergeBatch>, ExecError> {
+    namidb_core::profile_scope!("writer::prepare_bound_relationship_merge_batch");
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let local_nodes: BTreeSet<&str> = pattern
+        .iter()
+        .filter_map(|element| match element {
+            CreateElement::Node { alias, .. } => Some(alias.as_str()),
+            CreateElement::Rel { .. } => None,
+        })
+        .collect();
+    let mut rels = pattern.iter().filter_map(|element| match element {
+        CreateElement::Rel {
+            edge_type,
+            direction,
+            source_alias,
+            target_alias,
+            ..
+        } => Some((
+            edge_type.as_str(),
+            *direction,
+            source_alias.as_str(),
+            target_alias.as_str(),
+        )),
+        CreateElement::Node { .. } => None,
+    });
+    let Some((edge_type, direction, source_alias, target_alias)) = rels.next() else {
+        return Ok(None);
+    };
+    if rels.next().is_some()
+        || local_nodes.contains(source_alias)
+        || local_nodes.contains(target_alias)
+        || matches!(direction, RelationshipDirection::Both)
+    {
+        return Ok(None);
+    }
+
+    let mut prepared = Vec::with_capacity(rows.len());
+    let mut pairs = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        if index % namidb_storage::cancel::CHECK_STRIDE == 0 {
+            crate::exec::limits::check_deadline()?;
+        }
+        let (Some(RuntimeValue::Node(source)), Some(RuntimeValue::Node(target))) =
+            (row.get(source_alias), row.get(target_alias))
+        else {
+            return Ok(None);
+        };
+        let (src, dst) = match direction {
+            RelationshipDirection::Right => (source.id, target.id),
+            RelationshipDirection::Left => (target.id, source.id),
+            RelationshipDirection::Both => unreachable!("undirected relationship rejected above"),
+        };
+        prepared.push(PreparedBoundRelationshipMerge {
+            key: (edge_type.to_string(), src, dst),
+        });
+        pairs.push((src, dst));
+    }
+
+    let views = writer
+        .overlay_snapshot()
+        .batch_lookup_edges_via_sst(edge_type, &pairs)
+        .await
+        .map_err(ExecError::Storage)?;
+    if views.len() != prepared.len() {
+        return Err(ExecError::Runtime(format!(
+            "batch relationship MERGE returned {} results for {} endpoint pairs",
+            views.len(),
+            prepared.len()
+        )));
+    }
+    let mut prefetched_edges = HashMap::with_capacity(prepared.len());
+    for (expected, view) in prepared.iter().zip(views) {
+        prefetched_edges.insert(expected.key.clone(), view.map(RelValue::from));
+    }
+    Ok(Some(PreparedBoundRelationshipMergeBatch {
+        rows: prepared,
+        prefetched_edges,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_merge(
     pattern: &[CreateElement],
@@ -2043,14 +2600,30 @@ async fn apply_merge(
     writer: &mut WriterSession,
     params: &Params,
     outcome: &mut WriteOutcome,
+    prepared_node: Option<&MaterializedMergeNode>,
+    mut prefetched_nodes: Option<&mut HashMap<NodeId, NodeValue>>,
+    prepared_edge: Option<&PreparedBoundRelationshipMerge>,
+    mut prefetched_edges: Option<&mut HashMap<EdgeMergeKey, Option<RelValue>>>,
 ) -> Result<Vec<Row>, ExecError> {
     // v0: support a single Node pattern, or a Node-Rel-Node chain.
-    let matches = find_merge_matches(pattern, &row, writer, params).await?;
+    let hints = MergeMatchHints {
+        prepared_node,
+        prefetched_nodes: prefetched_nodes.as_deref(),
+        prepared_edge,
+        prefetched_edges: prefetched_edges.as_deref(),
+    };
+    let matches = find_merge_matches(pattern, &row, writer, params, hints).await?;
     if !matches.is_empty() {
         let mut out = Vec::with_capacity(matches.len());
         for mut m_row in matches {
             for op in on_match_sets {
                 m_row = apply_set(op, m_row, writer, params, outcome).await?;
+            }
+            if let Some(prefetched) = prefetched_nodes.as_mut() {
+                refresh_prefetched_nodes(prefetched, &m_row, pattern);
+            }
+            if let (Some(expected), Some(prefetched)) = (prepared_edge, prefetched_edges.as_mut()) {
+                refresh_prefetched_edge(writer, expected, prefetched)?;
             }
             out.push(m_row);
         }
@@ -2062,7 +2635,57 @@ async fn apply_merge(
         for op in on_create_sets {
             created = apply_set(op, created, writer, params, outcome).await?;
         }
+        if let Some(prefetched) = prefetched_nodes.as_mut() {
+            refresh_prefetched_nodes(prefetched, &created, pattern);
+        }
+        if let (Some(expected), Some(prefetched)) = (prepared_edge, prefetched_edges.as_mut()) {
+            refresh_prefetched_edge(writer, expected, prefetched)?;
+        }
         Ok(vec![created])
+    }
+}
+
+fn refresh_prefetched_edge(
+    writer: &WriterSession,
+    expected: &PreparedBoundRelationshipMerge,
+    prefetched: &mut HashMap<EdgeMergeKey, Option<RelValue>>,
+) -> Result<(), ExecError> {
+    let (edge_type, src, dst) = &expected.key;
+    match writer
+        .staged_edge(edge_type, *src, *dst)
+        .map_err(ExecError::Storage)?
+    {
+        StagedValue::Untouched => {}
+        StagedValue::Tombstone => {
+            prefetched.insert(expected.key.clone(), None);
+        }
+        StagedValue::Upsert(view) => {
+            prefetched.insert(expected.key.clone(), Some(RelValue::from(view)));
+        }
+    }
+    Ok(())
+}
+
+/// Refresh only the node aliases introduced by the MERGE pattern.
+///
+/// An input row may already bind the same physical node under another alias.
+/// Those aliases are kept coherent by `synchronize_node_bindings`, but they
+/// are not authoritative inputs to this cache: restricting the refresh to
+/// pattern aliases prevents an unrelated/stale outer binding from replacing
+/// the just-mutated MERGE value if a future row-producing operator constructs
+/// bindings without going through SET synchronization.
+fn refresh_prefetched_nodes(
+    prefetched: &mut HashMap<NodeId, NodeValue>,
+    row: &Row,
+    pattern: &[CreateElement],
+) {
+    for alias in pattern.iter().filter_map(|element| match element {
+        CreateElement::Node { alias, .. } => Some(alias),
+        CreateElement::Rel { .. } => None,
+    }) {
+        if let Some(RuntimeValue::Node(node)) = row.get(alias) {
+            prefetched.insert(node.id, (**node).clone());
+        }
     }
 }
 
@@ -2074,13 +2697,27 @@ async fn apply_merge(
 /// positional layout. We locate the head by alias (the source of the
 /// single Rel for a 1-hop pattern, or the only Node for a 0-hop one)
 /// and dispatch by alias from there.
+struct MergeMatchHints<'a> {
+    prepared_node: Option<&'a MaterializedMergeNode>,
+    prefetched_nodes: Option<&'a HashMap<NodeId, NodeValue>>,
+    prepared_edge: Option<&'a PreparedBoundRelationshipMerge>,
+    prefetched_edges: Option<&'a HashMap<EdgeMergeKey, Option<RelValue>>>,
+}
+
 #[allow(clippy::type_complexity)] // local BTreeMap of borrowed pattern slots
 async fn find_merge_matches(
     pattern: &[CreateElement],
     outer_row: &Row,
     writer: &mut WriterSession,
     params: &Params,
+    hints: MergeMatchHints<'_>,
 ) -> Result<Vec<Row>, ExecError> {
+    let MergeMatchHints {
+        prepared_node,
+        prefetched_nodes,
+        prepared_edge,
+        prefetched_edges,
+    } = hints;
     // Split the pattern into Nodes (by alias) and Rels (in insertion
     // order). v0 supports either a single Node, or exactly one Rel
     // joining two Nodes.
@@ -2118,7 +2755,13 @@ async fn find_merge_matches(
         }
         let (head_alias, head) = nodes.into_iter().next().expect("len == 1");
         let mut matched_rows: Vec<Row> = Vec::new();
-        for node_val in merge_node_candidates(head, outer_row, writer, params).await? {
+        let candidates = match prepared_node {
+            Some(expected) => {
+                merge_node_candidates_materialized(head, expected, writer, prefetched_nodes).await?
+            }
+            None => merge_node_candidates(head, outer_row, writer, params).await?,
+        };
+        for node_val in candidates {
             let mut new_row = outer_row.clone();
             new_row.set(
                 head_alias.to_string(),
@@ -2217,16 +2860,29 @@ async fn find_merge_matches(
                         ));
                     }
                 };
+                let prefetched_edge = prepared_edge
+                    .filter(|expected| {
+                        expected.key.0.as_str() == rel_edge_type
+                            && expected.key.1 == physical_src
+                            && expected.key.2 == physical_dst
+                    })
+                    .and_then(|expected| {
+                        prefetched_edges.and_then(|edges| edges.get(&expected.key))
+                    })
+                    .cloned();
                 // The common loader shape `MERGE (a)-[:R]->(b)` needs only an
                 // existence answer when the relationship is anonymous and no
                 // relationship properties participate in the pattern. Avoid
                 // decoding the winning SST's property streams altogether.
                 if expected_rel_props.is_empty() && rel_alias.is_none() {
-                    if !snap
-                        .contains_edge_via_sst(rel_edge_type, physical_src, physical_dst)
-                        .await
-                        .map_err(ExecError::Storage)?
-                    {
+                    let exists = match &prefetched_edge {
+                        Some(edge) => edge.is_some(),
+                        None => snap
+                            .contains_edge_via_sst(rel_edge_type, physical_src, physical_dst)
+                            .await
+                            .map_err(ExecError::Storage)?,
+                    };
+                    if !exists {
                         continue;
                     }
                     let mut new_row = source_row;
@@ -2237,14 +2893,20 @@ async fn find_merge_matches(
                     next.push(new_row);
                     continue;
                 }
-                let Some(edge) = snap
-                    .lookup_edge_via_sst(rel_edge_type, physical_src, physical_dst)
-                    .await
-                    .map_err(ExecError::Storage)?
-                else {
-                    continue;
+                let rel_value = match prefetched_edge {
+                    Some(Some(edge)) => edge,
+                    Some(None) => continue,
+                    None => {
+                        let Some(edge) = snap
+                            .lookup_edge_via_sst(rel_edge_type, physical_src, physical_dst)
+                            .await
+                            .map_err(ExecError::Storage)?
+                        else {
+                            continue;
+                        };
+                        RelValue::from(edge)
+                    }
                 };
-                let rel_value = RelValue::from(edge);
                 if !materialized_props_match(&expected_rel_props, &rel_value.properties) {
                     continue;
                 }
@@ -2471,9 +3133,12 @@ fn materialized_node_matches(
 }
 
 /// Unique keys declared by the schema and fully covered by this MERGE node
-/// pattern. Composite constraints are included (longest first); legacy
-/// single-property `PropertyDef::unique` flags are included even when the
-/// named-constraint list predates them. Labels may be secondary in
+/// pattern. Sidecar-compatible single-String keys come first so batch seeding
+/// and the canonical probe both reuse their preseeded O(1) postings instead
+/// of populating a composite index with a label scan. Remaining constraints
+/// are ordered longest first; legacy single-property `PropertyDef::unique`
+/// flags are included even when the named-constraint list predates them.
+/// Labels may be secondary in
 /// `MERGE (n:A:B)`: the lookup is scoped to the label that owns the
 /// constraint, then all required labels are checked as residuals.
 fn covered_merge_unique_keys(
@@ -2525,7 +3190,14 @@ fn covered_merge_unique_keys(
             (label, values)
         })
         .collect();
-    out.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    out.sort_by(|a, b| {
+        let a_seeded = matches!(a.1.as_slice(), [(_, CoreValue::Str(_))]);
+        let b_seeded = matches!(b.1.as_slice(), [(_, CoreValue::Str(_))]);
+        b_seeded
+            .cmp(&a_seeded)
+            .then_with(|| b.1.len().cmp(&a.1.len()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     out
 }
 
@@ -2570,7 +3242,15 @@ async fn merge_node_candidates(
     params: &Params,
 ) -> Result<Vec<NodeValue>, ExecError> {
     let expected = materialize_merge_node_pattern(pattern, row, params)?;
+    merge_node_candidates_materialized(pattern, &expected, writer, None).await
+}
 
+async fn merge_node_candidates_materialized(
+    pattern: MergeNodePattern<'_>,
+    expected: &MaterializedMergeNode,
+    writer: &WriterSession,
+    prefetched_nodes: Option<&HashMap<NodeId, NodeValue>>,
+) -> Result<Vec<NodeValue>, ExecError> {
     if let Some(id) = expected.explicit_id {
         let snap = writer.overlay_snapshot();
         let found = if pattern.labels.is_empty() {
@@ -2582,12 +3262,92 @@ async fn merge_node_candidates(
         };
         return Ok(found
             .map(NodeValue::from)
-            .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
+            .filter(|node| materialized_node_matches(node, pattern.labels, expected))
             .into_iter()
             .collect());
     }
 
-    for (label, tuple) in covered_merge_unique_keys(writer, pattern.labels, &expected) {
+    if let Some((label, candidate_ids)) =
+        probe_merge_unique_candidates(writer, pattern.labels, expected).await?
+    {
+        // Absence across every Cypher-equal encoding proves that the full
+        // pattern cannot match. For numeric keys this includes both strict
+        // I64/F64 storage domains.
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut found = Vec::with_capacity(candidate_ids.len());
+        let mut unresolved = Vec::new();
+        for id in candidate_ids {
+            if let Some(node) = prefetched_nodes.and_then(|nodes| nodes.get(&id)).cloned() {
+                if materialized_node_matches(&node, pattern.labels, expected) {
+                    found.push(node);
+                }
+            } else {
+                unresolved.push(id);
+            }
+        }
+        if !unresolved.is_empty() {
+            let snap = writer.overlay_snapshot();
+            let resolved = snap
+                .batch_lookup_nodes(&label, &unresolved)
+                .await
+                .map_err(ExecError::Storage)?;
+            for node in resolved.into_iter().flatten().map(NodeValue::from) {
+                if materialized_node_matches(&node, pattern.labels, expected) {
+                    found.push(node);
+                }
+            }
+        }
+        return Ok(found);
+    }
+
+    if let Some((label, property, value)) =
+        covered_merge_equality_key(writer, pattern.labels, expected)
+    {
+        // MERGE can create/update a node, invalidating committed claimant
+        // caches at every auto-commit. Use the writer-private map even before
+        // the first staged mutation so one-row statements stay O(1) after one
+        // population.
+        let snap = writer.transactional_overlay_snapshot();
+        let lookup_value = RuntimeValue::String(value);
+        let candidates = crate::exec::walker::lookup_nodes_by_property_via_scan(
+            &snap,
+            &label,
+            &property,
+            &lookup_value,
+        )
+        .await?;
+        return Ok(candidates
+            .into_iter()
+            .map(NodeValue::from)
+            .filter(|node| materialized_node_matches(node, pattern.labels, expected))
+            .collect());
+    }
+
+    let snap = writer.overlay_snapshot();
+    let candidates = snap
+        .scan_label(merge_scan_label(pattern.labels))
+        .await
+        .map_err(ExecError::Storage)?;
+    Ok(candidates
+        .into_iter()
+        .map(NodeValue::from)
+        .filter(|node| materialized_node_matches(node, pattern.labels, expected))
+        .collect())
+}
+
+/// Return the authoritative candidate ids from the first fully-covered,
+/// indexable unique key. `Some((label, empty))` proves a miss; `None` means no
+/// covered key can safely answer this runtime value and the caller must try
+/// an equality index or scan.
+async fn probe_merge_unique_candidates(
+    writer: &WriterSession,
+    labels: &[String],
+    expected: &MaterializedMergeNode,
+) -> Result<Option<(String, BTreeSet<NodeId>)>, ExecError> {
+    for (label, tuple) in covered_merge_unique_keys(writer, labels, expected) {
         let Some(variants) = merge_unique_probe_variants(&tuple) else {
             continue;
         };
@@ -2619,65 +3379,9 @@ async fn merge_node_candidates(
         if !fully_indexable {
             continue;
         }
-
-        // Absence across every Cypher-equal encoding proves that the full
-        // pattern cannot match. For numeric keys this includes both strict
-        // I64/F64 storage domains.
-        if candidate_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let snap = writer.overlay_snapshot();
-        let mut found = Vec::with_capacity(candidate_ids.len());
-        for id in candidate_ids {
-            let Some(node) = snap
-                .lookup_node(&label, id)
-                .await
-                .map_err(ExecError::Storage)?
-                .map(NodeValue::from)
-            else {
-                continue;
-            };
-            if materialized_node_matches(&node, pattern.labels, &expected) {
-                found.push(node);
-            }
-        }
-        return Ok(found);
+        return Ok(Some((label, candidate_ids)));
     }
-
-    if let Some((label, property, value)) =
-        covered_merge_equality_key(writer, pattern.labels, &expected)
-    {
-        // MERGE can create/update a node, invalidating committed claimant
-        // caches at every auto-commit. Use the writer-private map even before
-        // the first staged mutation so one-row statements stay O(1) after one
-        // population.
-        let snap = writer.transactional_overlay_snapshot();
-        let lookup_value = RuntimeValue::String(value);
-        let candidates = crate::exec::walker::lookup_nodes_by_property_via_scan(
-            &snap,
-            &label,
-            &property,
-            &lookup_value,
-        )
-        .await?;
-        return Ok(candidates
-            .into_iter()
-            .map(NodeValue::from)
-            .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
-            .collect());
-    }
-
-    let snap = writer.overlay_snapshot();
-    let candidates = snap
-        .scan_label(merge_scan_label(pattern.labels))
-        .await
-        .map_err(ExecError::Storage)?;
-    Ok(candidates
-        .into_iter()
-        .map(NodeValue::from)
-        .filter(|node| materialized_node_matches(node, pattern.labels, &expected))
-        .collect())
+    Ok(None)
 }
 
 /// Strict storage uniqueness distinguishes integers from floats, while Cypher

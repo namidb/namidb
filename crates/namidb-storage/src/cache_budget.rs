@@ -23,7 +23,7 @@ use crate::node_cache::DEFAULT_NODE_CACHE_BUDGET_MIB;
 /// Default aggregate capacity of all process-wide caches: 1 GiB.
 pub const DEFAULT_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
-const CACHE_TIER_COUNT: usize = 11;
+const CACHE_TIER_COUNT: usize = 10;
 
 /// Effective capacities after applying the process-wide maximum.
 ///
@@ -40,8 +40,10 @@ pub struct CacheCapacities {
     pub(crate) edge_stream_bytes: usize,
     pub(crate) edge_reader_bytes: usize,
     pub(crate) bloom_filter_bytes: usize,
-    pub(crate) text_index_bytes: usize,
-    pub(crate) vector_index_bytes: usize,
+    /// Shared decoded-search-index pool. Vector and full-text indexes are
+    /// mutually evictable so either workload can use the whole assignment
+    /// instead of being rejected by an artificial per-kind split.
+    pub(crate) search_index_bytes: usize,
     pub(crate) node_view_bytes: usize,
     pub(crate) adjacency_bytes: usize,
 }
@@ -87,22 +89,22 @@ impl CacheCapacities {
                 "NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB",
                 DEFAULT_BLOOM_FILTER_CACHE_BUDGET_MIB,
             ),
-            text_index_bytes: if cfg!(feature = "text-index") {
+            search_index_bytes: (if cfg!(feature = "text-index") {
                 sst(
                     "NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB",
                     DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB,
                 )
             } else {
                 0
-            },
-            vector_index_bytes: if cfg!(feature = "vector-index") {
+            })
+            .saturating_add(if cfg!(feature = "vector-index") {
                 sst(
                     "NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB",
                     DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
                 )
             } else {
                 0
-            },
+            }),
             node_view_bytes: if node_enabled {
                 legacy_budget_bytes(
                     "NAMIDB_NODE_CACHE_BUDGET_MIB",
@@ -161,6 +163,34 @@ impl CacheCapacities {
         Self::from_array(max_bytes, scaled)
     }
 
+    /// Resolve an optional dedicated search-index assignment without ever
+    /// exceeding the aggregate maximum.
+    ///
+    /// An explicit `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` is a reservation
+    /// inside (not in addition to) `NAMIDB_CACHE_MAX_BYTES`: search gets that
+    /// amount first and every other enabled tier is proportionally fitted into
+    /// the remainder. Without the override, search participates in the legacy
+    /// proportional plan using the sum of the old vector/text requests.
+    fn scaled_with_search_reservation(
+        mut self,
+        max_bytes: usize,
+        search_reservation: Option<usize>,
+    ) -> Self {
+        let Some(search_reservation) = search_reservation else {
+            return self.scaled_to(max_bytes);
+        };
+        if self.search_index_bytes == 0 || max_bytes == 0 {
+            return self.scaled_to(max_bytes);
+        }
+
+        let reserved = search_reservation.min(max_bytes);
+        self.search_index_bytes = 0;
+        let mut resolved = self.scaled_to(max_bytes.saturating_sub(reserved));
+        resolved.max_bytes = max_bytes;
+        resolved.search_index_bytes = reserved;
+        resolved
+    }
+
     fn as_array(self) -> [usize; CACHE_TIER_COUNT] {
         [
             self.sst_body_bytes,
@@ -170,8 +200,7 @@ impl CacheCapacities {
             self.edge_stream_bytes,
             self.edge_reader_bytes,
             self.bloom_filter_bytes,
-            self.text_index_bytes,
-            self.vector_index_bytes,
+            self.search_index_bytes,
             self.node_view_bytes,
             self.adjacency_bytes,
         ]
@@ -187,18 +216,22 @@ impl CacheCapacities {
             edge_stream_bytes: values[4],
             edge_reader_bytes: values[5],
             bloom_filter_bytes: values[6],
-            text_index_bytes: values[7],
-            vector_index_bytes: values[8],
-            node_view_bytes: values[9],
-            adjacency_bytes: values[10],
+            search_index_bytes: values[7],
+            node_view_bytes: values[8],
+            adjacency_bytes: values[9],
         }
     }
 
-    /// Sum of the nine active `SstCache` tier ceilings.
+    /// Sum of the eight active `SstCache` tier ceilings.
     pub fn sst_capacity_bytes(&self) -> usize {
-        self.as_array()[..9]
+        self.as_array()[..8]
             .iter()
             .fold(0usize, |sum, value| sum.saturating_add(*value))
+    }
+
+    /// Effective shared decoded vector/full-text index ceiling.
+    pub fn search_index_capacity_bytes(&self) -> usize {
+        self.search_index_bytes
     }
 
     /// Effective `NodeViewCache` ceiling.
@@ -230,17 +263,29 @@ pub fn cache_max_bytes() -> usize {
         .unwrap_or(DEFAULT_CACHE_MAX_BYTES)
 }
 
+/// Optional exact-byte reservation for the shared decoded vector/full-text
+/// index pool. The value is carved out of [`cache_max_bytes`], never added on
+/// top of it. `None` retains proportional legacy allocation; `Some(0)`
+/// deliberately disables decoded search-index caching.
+pub fn search_index_cache_max_bytes() -> Option<usize> {
+    std::env::var("NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 /// Process-wide effective capacity plan. Environment configuration is sampled
 /// once because the shared cache instances cannot be resized after creation.
 pub fn shared_cache_capacities() -> CacheCapacities {
     static CAPACITIES: OnceLock<CacheCapacities> = OnceLock::new();
     *CAPACITIES.get_or_init(|| {
         let max_bytes = cache_max_bytes();
-        let capacities = CacheCapacities::requested_from_env(max_bytes).scaled_to(max_bytes);
+        let capacities = CacheCapacities::requested_from_env(max_bytes)
+            .scaled_with_search_reservation(max_bytes, search_index_cache_max_bytes());
         tracing::info!(
             cache_max_bytes = capacities.max_bytes,
             cache_assigned_bytes = capacities.total_capacity_bytes(),
             sst_cache_bytes = capacities.sst_capacity_bytes(),
+            search_index_cache_bytes = capacities.search_index_capacity_bytes(),
             node_cache_bytes = capacities.node_view_capacity_bytes(),
             adjacency_cache_bytes = capacities.adjacency_capacity_bytes(),
             "resolved process-wide cache capacities"
@@ -304,8 +349,7 @@ mod tests {
             256 * mib,
             256 * mib,
             64 * mib,
-            512 * mib,
-            512 * mib,
+            1024 * mib,
             256 * mib,
             512 * mib,
         ];
@@ -326,7 +370,7 @@ mod tests {
 
     #[test]
     fn ceilings_are_preserved_when_they_fit() {
-        let legacy = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5];
+        let legacy = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
         let plan = requested(legacy).scaled_to(1024);
         assert_eq!(plan.as_array(), legacy);
         assert_eq!(plan.total_capacity_bytes(), legacy.iter().sum::<usize>());
@@ -344,7 +388,33 @@ mod tests {
     #[test]
     fn sub_tier_byte_max_is_distributed_without_overflow() {
         let plan = requested([1; CACHE_TIER_COUNT]).scaled_to(4);
-        assert_eq!(plan.as_array(), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(plan.as_array(), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(plan.total_capacity_bytes(), 4);
+    }
+
+    #[test]
+    fn explicit_search_reservation_is_carved_out_before_other_tiers() {
+        let requested = requested([100; CACHE_TIER_COUNT]);
+        let plan = requested.scaled_with_search_reservation(1_000, Some(700));
+
+        assert_eq!(plan.search_index_capacity_bytes(), 700);
+        assert_eq!(plan.total_capacity_bytes(), 1_000);
+        assert_eq!(
+            plan.as_array()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 7)
+                .map(|(_, bytes)| *bytes)
+                .sum::<usize>(),
+            300
+        );
+    }
+
+    #[test]
+    fn explicit_search_reservation_is_clamped_to_global_max() {
+        let plan =
+            requested([100; CACHE_TIER_COUNT]).scaled_with_search_reservation(512, Some(4_096));
+        assert_eq!(plan.search_index_capacity_bytes(), 512);
+        assert_eq!(plan.total_capacity_bytes(), 512);
     }
 }

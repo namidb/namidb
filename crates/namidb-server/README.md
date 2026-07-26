@@ -40,6 +40,59 @@ Every flag can also be set as an env var (`NAMIDB_STORE`,
 `--store` URI follows the same scheme grammar as the Python client and
 the CLI, see [`namidb-storage/src/uri.rs`](../namidb-storage/src/uri.rs).
 
+For shared machines, `--memory-max-bytes` /
+`NAMIDB_MEMORY_MAX_BYTES` sets an exact-byte RSS/working-set admission
+ceiling (`0` disables it). At 90% the server clears shared caches and weakly
+registered, reconstructible writer property/constraint maps. A process-wide
+500 ms watchdog performs the same single-flight reclamation even when no
+request arrives; at the ceiling new Cypher work returns HTTP 503 or Bolt
+`Neo.TransientError.General.DatabaseUnavailable` until memory falls. Pair it
+with Docker `--memory` or another cgroup/OS limit for hard containment of an
+already-running query. Authenticated `POST /v0/admin/flush` bypasses Cypher
+admission and is serialized process-wide so an operator can drain a live
+memtable. It is excluded from the ordinary request timeout and its storage
+work survives a disconnected client; the global request cap still bounds
+waiting callers. Under hard pressure
+multi-tenant mode refuses to open a cold namespace merely to flush it.
+
+Large `.vg` and `.ft` bodies use one shared decoded-index eviction pool.
+`NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` optionally reserves exact bytes for that
+pool inside `NAMIDB_CACHE_MAX_BYTES`; the remaining cache tiers are fitted into
+the remainder. If a valid index's conservative decoded estimate cannot fit,
+HTTP returns retryable 503 with `code: "search_index_cache_capacity"` and Bolt
+returns `Neo.TransientError.General.DatabaseUnavailable`, rather than silently
+running an O(corpus) flat scan. The error reports required and assigned bytes.
+Missing/stale/corrupt index generations still use the exact correctness
+fallback.
+
+Current forward edge SSTs also build an optional exact relationship sidecar
+for bound-endpoint `MERGE`. `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` (64 KiB) and
+`NAMIDB_EDGE_POINT_MAX_SST_BYTES` (512 MiB) bound its per-record and per-SST
+footprint; setting either to `0`, crossing either limit, or losing/corrupting
+the optional object selects the authoritative CSR path.
+
+Filtered vector indexes keep bounded String/Bool ordinal postings inside each
+`.vg`. Tune `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` (default 4096 values/property)
+and `NAMIDB_VECTOR_FILTER_MAX_BYTES` (default 64 MiB/body); crossing a bound
+omits the whole property rather than writing an incomplete posting. A legacy or
+omitted-property query may lazily use at most
+`NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` complete sidecar IDs (default 8192,
+`0` disables) before retaining the exact scan fallback.
+
+Filtered `search.hybrid` widens its authoritative BM25 prefix up to
+`NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP` (default 65536) and applies the
+predicate before sparse top-k. Reaching the cap switches to the exact flat
+scorer, so the cap bounds indexed hydration without reducing recall.
+
+Manifest/pointer versions are append-only per durable commit and are retained
+temporarily for pinned readers and crash-safe CAS. The maintenance janitor
+reclaims versions below the live-reader horizon after
+`NAMIDB_SWEEP_MIN_AGE` (24 h by default) only while
+`NAMIDB_COMPACTION_INTERVAL` is non-zero and `NAMIDB_SWEEP_DELETE=true`
+(otherwise maintenance is disabled or the sweep is dry-run). Thus
+object-count growth observed during the first hours of a bulk load is bounded
+history under the default maintenance settings.
+
 If you don't set `--auth-token`, the server boots in **unauthenticated**
 mode and prints a loud warning. Don't expose that port to the public
 internet.
@@ -62,6 +115,14 @@ TLS: pass `--tls-cert` and `--tls-key` (PEM) to serve HTTPS (and Bolt over TLS);
 omit them for plaintext (terminate TLS at a proxy/mesh instead). The Bolt
 listener shares the same token and TLS config as HTTP.
 
+The official container's liveness probe follows `NAMIDB_LISTEN` and switches
+to HTTPS when `NAMIDB_TLS_CERT` or `NAMIDB_TLS_KEY` is set. Its loopback-only
+HTTPS request deliberately skips certificate verification because deployment
+certificates commonly omit loopback addresses. When overriding listen or TLS
+with container command-line flags, mirror the same values in those environment
+variables so the probe sees the effective endpoint, or explicitly replace the
+image healthcheck in your orchestrator.
+
 `jwt` and `pdp` are optional Cargo features (default off → the build is
 byte-identical to static-token-only). Build the server with, e.g.,
 `cargo build -p namidb-server --features jwt,pdp` to enable them.
@@ -75,7 +136,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `GET`  | `/v0/version`      | public  | Server build version |
 | `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
-| `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush |
+| `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
 
 ### `POST /v0/cypher`
 
@@ -173,7 +234,9 @@ fenced via epoch CAS).
 
 `--flush-interval` (default `30s`) controls how often the background
 task turns the memtable into L0 SSTs. Set it to `0s` to disable the loop
-and call `POST /v0/admin/flush` from cron or a sidecar instead.
+and call `POST /v0/admin/flush` from cron or a sidecar instead. Manual flush is
+also the authenticated pressure-relief escape hatch when new Cypher admission
+is closed; its SST build still needs transient headroom.
 
 ## Metrics and the slow-query log
 
@@ -192,8 +255,15 @@ curl -s http://127.0.0.1:8080/v0/metrics
 | `namidb_query_duration_seconds` | histogram | `protocol`, `kind`   | Execution wall-clock, by `http`/`bolt` and `read`/`write` |
 | `namidb_queries_in_flight`      | gauge     |                      | Queries currently executing |
 | `namidb_cache_max_bytes`        | gauge     |                      | Configured aggregate cache ceiling |
+| `namidb_memory_max_bytes`       | gauge     |                      | Configured process RSS/working-set admission ceiling |
+| `namidb_memory_resident_bytes`  | gauge     |                      | Most recently sampled process RSS/working set |
+| `namidb_memory_reclaims_total`  | counter   |                      | Cache pressure-relief passes |
+| `namidb_memory_rejected_queries_total` | counter |                | Queries rejected at the memory ceiling |
 | `namidb_cache_capacity_bytes`   | gauge     |                      | Capacity assigned to enabled cache tiers |
 | `namidb_cache_resident_bytes`   | gauge     |                      | Cache-accounted bytes currently resident |
+| `namidb_search_index_cache_capacity_bytes` | gauge |              | Capacity assigned to the shared decoded `.vg`/`.ft` pool |
+| `namidb_search_index_cache_admission_rejections_total` | counter | `kind` | Valid vector/text indexes rejected by the configured pool |
+| `namidb_vector_filter_bitmap_searches_total` | counter |             | Vector queries that applied embedded `.vg` metadata postings (vector-enabled builds) |
 | `namidb_slow_queries_total`     | counter   |                      | Queries that crossed the slow-query threshold |
 | `namidb_build_info`             | gauge     | `version`            | Always `1`; carries the build version |
 | `namidb_uptime_seconds`         | gauge     |                      | Seconds since the server started |

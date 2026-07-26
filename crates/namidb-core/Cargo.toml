@@ -1,5 +1,6 @@
 [package]
 name = "namidb-core"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

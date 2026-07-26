@@ -41,6 +41,14 @@ fn writer_busy_error() -> BackendError {
     )
 }
 
+fn memory_pressure_error(pressure: crate::memory::MemoryPressure) -> BackendError {
+    BackendError::Storage(format!(
+        "process memory pressure: resident {} bytes reached configured maximum {} bytes; \
+         reconstructible caches were reclaimed, retry after memory falls",
+        pressure.resident_bytes, pressure.max_bytes
+    ))
+}
+
 struct RunObservation {
     kind: Option<QueryKind>,
     elapsed: std::time::Duration,
@@ -1062,9 +1070,23 @@ impl ServerBackend {
         params: Params,
         cancellation: RunCancellation,
     ) -> std::result::Result<RunOutcome, BackendError> {
+        let admission_started = std::time::Instant::now();
+        if let Err(pressure) = self.state.memory.admit_query().await {
+            let error = memory_pressure_error(pressure);
+            self.state.metrics.observe_query(
+                Protocol::Bolt,
+                None,
+                false,
+                admission_started.elapsed(),
+                cypher,
+            );
+            return Err(error);
+        }
+
         // Memgraph-style schema introspection (gdotv and other Bolt GUIs)
         // bypasses the Cypher parser. It is a short metadata probe and does
-        // not acquire the writer.
+        // not acquire the writer. Admission deliberately precedes it so this
+        // parser bypass cannot evade process-wide memory pressure.
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -1091,8 +1113,22 @@ impl ServerBackend {
         params: Params,
         cancellation: RunCancellation,
     ) -> std::result::Result<RunOutcome, BackendError> {
+        let admission_started = std::time::Instant::now();
+        if let Err(pressure) = self.state.memory.admit_query().await {
+            let error = memory_pressure_error(pressure);
+            self.state.metrics.observe_query(
+                Protocol::Bolt,
+                None,
+                false,
+                admission_started.elapsed(),
+                cypher,
+            );
+            return Err(error);
+        }
+
         // Introspection stays on the published schema snapshot; data reads
-        // below use the transaction overlay.
+        // below use the transaction overlay. Keep admission ahead of this
+        // parser bypass for the same reason as the auto-commit path.
         {
             let owned = self.state.snapshot.load();
             let snap = owned.borrow();
@@ -1147,6 +1183,13 @@ impl Backend for ServerBackend {
         let mut slot = self.tx.lock().await;
         if slot.is_some() {
             return Err(BackendError::Other("a transaction is already open".into()));
+        }
+        // BEGIN admits a new unit of work before it queues for (and then pins)
+        // the global writer. COMMIT and ROLLBACK intentionally remain
+        // available under pressure so an already-open transaction can always
+        // release the lock and its staged memory.
+        if let Err(pressure) = self.state.memory.admit_query().await {
+            return Err(memory_pressure_error(pressure));
         }
         // Take the global writer lock for the whole transaction, bounded so
         // a BEGIN queued behind a stuck/long transaction fails fast instead
@@ -1729,6 +1772,111 @@ mod tests {
         let backend = backend_with_authz(Arc::new(crate::authz::NoOpAuthz)).await;
         let out = backend.run("MATCH (n) RETURN n", Params::new()).await;
         assert!(out.is_ok(), "default authz should allow: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn bolt_memory_admission_precedes_introspection_and_begin_lock() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-memory-admission").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let governor = Arc::new(crate::memory::MemoryGovernor::new(1));
+        let state = AppState::new(writer, None, "bolt-memory".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let backend = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+
+        // This query normally bypasses the parser/executor entirely. It must
+        // still be rejected before it reads the schema snapshot.
+        let introspection = backend
+            .run("CALL db.labels()", Params::new())
+            .await
+            .expect_err("introspection must not bypass memory admission");
+        assert!(
+            matches!(&introspection, BackendError::Storage(text) if text.contains("memory pressure")),
+            "got {introspection:?}"
+        );
+
+        // BEGIN is also a new unit of work and must fail before taking the
+        // long-lived global writer lock.
+        let begin = backend
+            .begin_tx()
+            .await
+            .expect_err("BEGIN must be rejected under memory pressure");
+        assert!(
+            matches!(&begin, BackendError::Storage(text) if text.contains("memory pressure")),
+            "got {begin:?}"
+        );
+        assert!(
+            state.writer.try_lock().is_ok(),
+            "a rejected BEGIN must not pin the writer"
+        );
+        assert_eq!(governor.rejected_queries(), 2);
+    }
+
+    #[tokio::test]
+    async fn bolt_commit_and_rollback_remain_available_under_memory_pressure() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-memory-close-tx").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let governor = Arc::new(crate::memory::MemoryGovernor::new(1));
+        let state = AppState::new(writer, None, "bolt-memory-close".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let backend = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+
+        // Model a transaction that was admitted before pressure rose. Closing
+        // it must not consult admission: COMMIT needs to release staged memory
+        // and the writer lock, and ROLLBACK is the emergency escape hatch.
+        let mut commit_writer = state.writer.clone().lock_owned().await;
+        commit_writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("k".into(), CoreValue::I64(1))]),
+                    schema_version: 0,
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+        *backend.tx.lock().await = Some(TxState {
+            writer: commit_writer,
+            staged: true,
+        });
+        backend
+            .commit_tx()
+            .await
+            .expect("COMMIT must remain available under pressure");
+
+        let mut rollback_writer = state.writer.clone().lock_owned().await;
+        rollback_writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("k".into(), CoreValue::I64(2))]),
+                    schema_version: 0,
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+        *backend.tx.lock().await = Some(TxState {
+            writer: rollback_writer,
+            staged: true,
+        });
+        backend
+            .rollback_tx()
+            .await
+            .expect("ROLLBACK must remain available under pressure");
+        assert!(
+            state.writer.try_lock().is_ok(),
+            "closing either transaction must release the writer"
+        );
+        assert_eq!(
+            governor.rejected_queries(),
+            0,
+            "COMMIT/ROLLBACK must not run admission"
+        );
     }
 
     /// Regression for the fenced-writer dead end over Bolt: a COMMIT that

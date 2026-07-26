@@ -182,25 +182,100 @@ async fn copy_snapshot_pinned(
 
     // 1. SST bodies and their side-cars, addressed by their relative path
     //    (`<prefix>/<relative>`), which is identical at source and destination.
-    for sst in &manifest.ssts {
-        let mut rels: Vec<&str> = vec![sst.path.as_str()];
+    for sst in &mut manifest.ssts {
+        // Authoritative bodies and legacy sidecars are mandatory. Optional
+        // range-readable accelerators are copied separately below so a
+        // downgrade-era janitor that swept fields it did not understand does
+        // not make an otherwise exact snapshot unrestorable.
+        let mut rels: Vec<String> = vec![sst.path.clone()];
         if let Some(b) = &sst.bloom {
-            rels.push(b.path.as_str());
+            rels.push(b.path.clone());
         }
         for u in &sst.unique_property_indices {
-            rels.push(u.path.as_str());
+            rels.push(u.path.clone());
         }
         for e in &sst.equality_property_indices {
-            rels.push(e.path.as_str());
+            rels.push(e.path.clone());
         }
         if let Some(l) = &sst.label_index {
-            rels.push(l.path.as_str());
+            rels.push(l.path.clone());
         }
         for rel in rels {
             let from = Path::from(format!("{}/{}", src_prefix.as_ref(), rel));
             let to = Path::from(format!("{}/{}", dst_prefix.as_ref(), rel));
             bytes_copied += copy_object(src_store, dst_store, &from, &to).await?;
             objects_copied += 1;
+            pin.renew_if_due().await?;
+        }
+
+        for unique in &mut sst.unique_property_indices {
+            let Some(paged) = unique.paged.clone() else {
+                continue;
+            };
+            match copy_optional_accelerator(
+                src_store,
+                dst_store,
+                &src_prefix,
+                &dst_prefix,
+                &paged.path,
+            )
+            .await?
+            {
+                Some(size) => {
+                    bytes_copied += size;
+                    objects_copied += 1;
+                }
+                None => unique.paged = None,
+            }
+            pin.renew_if_due().await?;
+        }
+        for equality in &mut sst.equality_property_indices {
+            let Some(paged) = equality.paged.clone() else {
+                continue;
+            };
+            match copy_optional_accelerator(
+                src_store,
+                dst_store,
+                &src_prefix,
+                &dst_prefix,
+                &paged.path,
+            )
+            .await?
+            {
+                Some(size) => {
+                    bytes_copied += size;
+                    objects_copied += 1;
+                }
+                None => equality.paged = None,
+            }
+            pin.renew_if_due().await?;
+        }
+        if let Some(point) = crate::manifest::edge_point_sidecar_path(sst) {
+            if let Some(size) =
+                copy_optional_accelerator(src_store, dst_store, &src_prefix, &dst_prefix, &point)
+                    .await?
+            {
+                bytes_copied += size;
+                objects_copied += 1;
+            }
+            pin.renew_if_due().await?;
+        }
+        if let Some(locator) = sst.node_locator.clone() {
+            match copy_optional_accelerator(
+                src_store,
+                dst_store,
+                &src_prefix,
+                &dst_prefix,
+                &locator.path,
+            )
+            .await?
+            {
+                Some(size) => {
+                    bytes_copied += size;
+                    objects_copied += 1;
+                }
+                None => sst.node_locator = None,
+            }
             pin.renew_if_due().await?;
         }
     }
@@ -371,11 +446,22 @@ async fn verify_snapshot(
             .chain(sst.bloom.as_ref().map(|b| b.path.as_str()))
             .chain(sst.unique_property_indices.iter().map(|u| u.path.as_str()))
             .chain(
+                sst.unique_property_indices
+                    .iter()
+                    .filter_map(|u| u.paged.as_ref().map(|p| p.path.as_str())),
+            )
+            .chain(
                 sst.equality_property_indices
                     .iter()
                     .map(|e| e.path.as_str()),
             )
+            .chain(
+                sst.equality_property_indices
+                    .iter()
+                    .filter_map(|e| e.paged.as_ref().map(|p| p.path.as_str())),
+            )
             .chain(sst.label_index.as_ref().map(|l| l.path.as_str()))
+            .chain(sst.node_locator.as_ref().map(|l| l.path.as_str()))
             .collect();
         for rel in rels {
             let p = Path::from(format!("{}/{}", prefix.as_ref(), rel));
@@ -425,6 +511,39 @@ async fn copy_object(
     to: &Path,
 ) -> Result<u64> {
     copy_object_with_part_size(src, dst, from, to, COPY_PART_SIZE).await
+}
+
+/// Copy a cache-like range accelerator when it still exists.
+///
+/// Older binaries ignore the new manifest fields and their janitor may sweep
+/// `.pidx` / `.nloc` objects while leaving the authoritative legacy sidecar or
+/// Parquet body intact. A backup remains exact without those accelerators:
+/// omit the missing object and let the caller clear its destination-manifest
+/// descriptor so reads fall back and a later node merge rebuilds it.
+async fn copy_optional_accelerator(
+    src: &Arc<dyn ObjectStore>,
+    dst: &Arc<dyn ObjectStore>,
+    src_prefix: &Path,
+    dst_prefix: &Path,
+    relative: &str,
+) -> Result<Option<u64>> {
+    let from = Path::from(format!("{}/{}", src_prefix.as_ref(), relative));
+    let to = Path::from(format!("{}/{}", dst_prefix.as_ref(), relative));
+    match src.head(&from).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => {
+            debug!(
+                path = relative,
+                "optional snapshot accelerator is absent; omitting its destination descriptor"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(Error::ObjectStore(error)),
+    }
+    // Once the source is known to exist, propagate every copy failure. In
+    // particular a destination multipart `NotFound` must not be mistaken for
+    // an absent source accelerator and silently swallowed.
+    copy_object(src, dst, &from, &to).await.map(Some)
 }
 
 /// [`copy_object`] with the part-size threshold explicit so tests can force
@@ -846,12 +965,24 @@ mod tests {
             }
             for u in &sst.unique_property_indices {
                 sidecars.push(u.path.clone());
+                if let Some(paged) = &u.paged {
+                    sidecars.push(paged.path.clone());
+                }
             }
             for e in &sst.equality_property_indices {
                 sidecars.push(e.path.clone());
+                if let Some(paged) = &e.paged {
+                    sidecars.push(paged.path.clone());
+                }
             }
             if let Some(l) = &sst.label_index {
                 sidecars.push(l.path.clone());
+            }
+            if let Some(locator) = &sst.node_locator {
+                sidecars.push(locator.path.clone());
+            }
+            if let Some(point) = crate::manifest::edge_point_sidecar_path(sst) {
+                sidecars.push(point);
             }
         }
         assert!(
@@ -887,6 +1018,150 @@ mod tests {
         let snap = restored.snapshot();
         assert_eq!(snap.scan_label("Person").await.unwrap().len(), 3);
         assert_eq!(snap.scan_label("Admin").await.unwrap().len(), 3);
+        let by_email = snap
+            .lookup_node_by_property("Person", "email", "a@x")
+            .await
+            .unwrap();
+        assert!(
+            by_email.is_some(),
+            "restored paged index + locator must probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_omits_swept_optional_accelerators_and_restores_exactly() {
+        let (src_store, src_paths) = (store(), paths("bk-optional-swept-src"));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true)],
+            })
+            .unwrap()
+            .build();
+        {
+            let mut writer = WriterSession::open(src_store.clone(), src_paths.clone())
+                .await
+                .unwrap();
+            let mut properties = BTreeMap::new();
+            properties.insert("key".into(), Value::Str("person-1".into()));
+            writer
+                .upsert_node(
+                    "Person",
+                    NodeId::from_uuid(uuid::Uuid::from_u128(1)),
+                    &NodeWriteRecord {
+                        properties,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            writer.flush(schema.clone()).await.unwrap();
+        }
+
+        // Model a rollback to a reader whose janitor did not understand the
+        // optional fields: objects disappear, but the newer JSON manifest
+        // still names them.
+        let source_manifest = ManifestStore::new(src_store.clone(), src_paths.clone())
+            .load_current()
+            .await
+            .unwrap()
+            .manifest;
+        let src_prefix = src_paths.namespace_prefix();
+        let optional_paths: Vec<String> =
+            source_manifest
+                .ssts
+                .iter()
+                .flat_map(|sst| {
+                    sst.unique_property_indices
+                        .iter()
+                        .filter_map(|index| index.paged.as_ref().map(|paged| paged.path.clone()))
+                        .chain(sst.equality_property_indices.iter().filter_map(|index| {
+                            index.paged.as_ref().map(|paged| paged.path.clone())
+                        }))
+                        .chain(
+                            sst.node_locator
+                                .as_ref()
+                                .map(|locator| locator.path.clone()),
+                        )
+                        .chain(crate::manifest::edge_point_sidecar_path(sst))
+                })
+                .collect();
+        assert!(!optional_paths.is_empty());
+        for relative in &optional_paths {
+            src_store
+                .delete(&Path::from(format!("{}/{}", src_prefix.as_ref(), relative)))
+                .await
+                .unwrap();
+        }
+
+        let (dst_store, dst_paths) = (store(), paths("bk-optional-swept-dst"));
+        copy_namespace_snapshot(
+            src_store,
+            src_paths,
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let restored_manifest = ManifestStore::new(dst_store.clone(), dst_paths.clone())
+            .load_current()
+            .await
+            .unwrap()
+            .manifest;
+        for sst in restored_manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == crate::manifest::SstKind::Nodes)
+        {
+            assert!(sst.node_locator.is_none());
+            assert!(sst
+                .unique_property_indices
+                .iter()
+                .all(|index| index.paged.is_none()));
+            assert!(sst
+                .equality_property_indices
+                .iter()
+                .all(|index| index.paged.is_none()));
+        }
+
+        let mut restored = WriterSession::open(dst_store.clone(), dst_paths.clone())
+            .await
+            .unwrap();
+        let found = restored
+            .snapshot()
+            .lookup_node_by_property("Person", "key", "person-1")
+            .await
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "legacy equality + Parquet authority must restore exactly"
+        );
+        assert!(
+            restored.compaction_basis().needs_compaction(),
+            "cleared optional descriptors schedule one online rebuild"
+        );
+        restored.compact_l0(&schema).await.unwrap();
+        let rebuilt_manifest = ManifestStore::new(dst_store, dst_paths)
+            .load_current()
+            .await
+            .unwrap()
+            .manifest;
+        let rebuilt = &rebuilt_manifest.ssts;
+        assert!(rebuilt
+            .iter()
+            .filter(|sst| sst.kind == crate::manifest::SstKind::Nodes)
+            .all(|sst| sst.node_locator.is_some()
+                && sst
+                    .equality_property_indices
+                    .iter()
+                    .all(|index| index.paged.is_some() || index.paged_build_unsupported)));
     }
 
     #[tokio::test]

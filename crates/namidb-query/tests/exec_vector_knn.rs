@@ -237,7 +237,12 @@ mod indexed {
                 properties: vec![
                     PropertyDef::new("embedding", DataType::FloatVector { dim: DIM }, false)
                         .unwrap(),
-                    PropertyDef::new("kind", DataType::Utf8, true).unwrap(),
+                    PropertyDef::new("kind", DataType::Utf8, true)
+                        .unwrap()
+                        .with_indexed(true),
+                    PropertyDef::new("vigente", DataType::Bool, true)
+                        .unwrap()
+                        .with_indexed(true),
                     PropertyDef::new("title", DataType::Utf8, true).unwrap(),
                 ],
             })
@@ -249,12 +254,26 @@ mod indexed {
         let mut p = BTreeMap::new();
         p.insert("title".into(), CoreValue::Str(title.into()));
         p.insert("kind".into(), CoreValue::Str(kind.into()));
+        p.insert("vigente".into(), CoreValue::Bool(kind == "Y"));
         p.insert("embedding".into(), CoreValue::Vec(emb));
         NodeWriteRecord {
             properties: p,
             schema_version: 1,
             ..Default::default()
         }
+    }
+
+    /// Low-level/imported data can be schemaless even when the current vector
+    /// declaration is stricter. The vector index correctly omits this row, while
+    /// an exact flat KNN would reject its non-vector embedding. Tests use it as a
+    /// canary: a successful indexed short page proves execution did not silently
+    /// fall back to a corpus scan.
+    fn non_vector_canary(title: &str, kind: &str) -> NodeWriteRecord {
+        let mut record = rec(title, kind, vec![1.0, 0.0, 0.0, 0.0]);
+        record
+            .properties
+            .insert("embedding".into(), CoreValue::Str("not-a-vector".into()));
+        record
     }
 
     /// Register a Doc cosine index, write the docs across two L0 SSTs, and
@@ -442,7 +461,7 @@ mod indexed {
         let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), vg_path);
         backing
             .put(
-                &object_store::path::Path::from(absolute),
+                &object_store::path::Path::from(absolute.clone()),
                 object_store::PutPayload::from_static(b"NAMIVG00corrupt"),
             )
             .await
@@ -462,6 +481,25 @@ mod indexed {
              cosine_similarity(d.embedding, $q) AS score ORDER BY score DESC LIMIT 1";
         let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
         assert_eq!(got, vec!["persisted-best".to_string()]);
+
+        // A rollback janitor can remove a newer optional object entirely. Use
+        // a fresh cache-free session so the next query must observe NotFound,
+        // not the corrupt bytes retained by the first session's raw cache.
+        backing
+            .delete(&object_store::path::Path::from(absolute))
+            .await
+            .unwrap();
+        drop(w);
+        let reopened =
+            WriterSession::open_with_caches(backing, p, namidb_storage::SessionCaches::none())
+                .await
+                .unwrap();
+        let got = titles(&run(&reopened, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        assert_eq!(
+            got,
+            vec!["persisted-best".to_string()],
+            "a missing .vg must select the same exact flat fallback"
+        );
     }
 
     #[tokio::test]
@@ -492,6 +530,37 @@ mod indexed {
             "flushed-but-uncompacted L0 node must be visible (got {got:?})"
         );
         assert_eq!(got.first().map(String::as_str), Some("fresh-top"));
+    }
+
+    #[tokio::test]
+    async fn source_filter_runs_before_embedding_in_exact_fallback() {
+        let docs = vec![
+            ("x1", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("x2", "X", vec![0.8, 0.2, 0.0, 0.0]),
+            ("y1", "Y", vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let (mut w, _) = build_index("idx-prefilter-before-score", &docs).await;
+
+        // Make the persisted vector index stale so VectorSearch must use its
+        // exact label-scan fallback. This Y row is excluded by the source WHERE,
+        // but its malformed embedding used to be scored first and abort the
+        // whole query.
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &non_vector_canary("excluded-malformed", "Y"),
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+
+        let cypher = "MATCH (d:Doc) WHERE d.kind = 'X' \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 2";
+        assert_eq!(
+            titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await),
+            vec!["x1".to_string(), "x2".to_string()],
+            "a source-filtered malformed embedding must never be scored"
+        );
     }
 
     #[tokio::test]
@@ -630,6 +699,26 @@ mod indexed {
                 "WITH-based KNN must reach the index, plan: {cypher}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn with_where_after_limit_filters_post_k_without_refill() {
+        let docs = vec![
+            ("top-excluded", "Y", vec![1.0, 0.0, 0.0, 0.0]),
+            ("second-kept", "X", vec![0.9, 0.1, 0.0, 0.0]),
+            ("third-x", "X", vec![0.8, 0.2, 0.0, 0.0]),
+        ];
+        let (w, _) = build_index("idx-post-k-filter", &docs).await;
+        let cypher = "MATCH (d:Doc) \
+             WITH d, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 2 WHERE d.kind = 'X' \
+             RETURN d.title AS title, score";
+
+        assert_eq!(
+            titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await),
+            vec!["second-kept".to_string()],
+            "the post-k WHERE may shorten the page; it must not pull in rank 3"
+        );
     }
 
     /// Build a `.vg` for an arbitrary metric (mirrors `build_index`, which is
@@ -795,9 +884,10 @@ mod indexed {
     async fn query_nodes_procedure_filter_serves_from_the_index() {
         // The same corpus, but a `filter: { kind: 'Y' }` in the optional 4th map.
         // Unfiltered, the top-2 for q∥x is [a, e] (both not all Y). Constrained to
-        // kind Y, the index over-fetch must surface e (cos ~.707) then c (cos 0),
-        // dropping the higher-ranked a (kind X) — i.e. the filter is applied
-        // index-side, NOT as a post-truncation of an already-cut top-k.
+        // kind Y, the typed `kind` posting list is passed into the vector index:
+        // e (cos ~.707) then c (cos 0), dropping the higher-ranked a (kind X).
+        // The filter is applied inside retrieval, NOT as a post-truncation of
+        // an already-cut top-k.
         let docs = vec![
             ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
             ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
@@ -810,6 +900,160 @@ mod indexed {
              YIELD node, score RETURN node.title AS title";
         let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
         assert_eq!(got, vec!["e".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn query_nodes_rejects_extra_and_malformed_options() {
+        let w = WriterSession::open(store(), paths("idx-qn-invalid-options"))
+            .await
+            .unwrap();
+        let mut params = Params::new();
+        params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0, 0.0]));
+        for (cypher, expected) in [
+            (
+                "CALL db.index.vector.queryNodes('missing', 2, $q, 42) \
+                 YIELD node RETURN node",
+                "fourth argument must be a map",
+            ),
+            (
+                "CALL db.index.vector.queryNodes('missing', 2, $q, {}, 42) \
+                 YIELD node RETURN node",
+                "queryNodes(indexName",
+            ),
+            (
+                "CALL db.index.vector.queryNodes('missing', 2, $q, {ef: 'wide'}) \
+                 YIELD node RETURN node",
+                "option `ef` must be a non-negative integer",
+            ),
+        ] {
+            let plan = lower(&parse(cypher).unwrap()).unwrap();
+            let err = execute(&plan, &w.snapshot(), &params)
+                .await
+                .expect_err("invalid queryNodes arguments must fail before index lookup");
+            assert!(
+                format!("{err:?}").contains(expected),
+                "expected {expected:?} for {cypher}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_vector_procedure_prefilters_indexed_metadata_before_k() {
+        // Twenty close, non-current documents dominate the unfiltered ranking.
+        // The four current documents are farther from q, but `vigente` has a
+        // typed BOOLEAN equality index, so compaction embeds an ordinal bitmap
+        // in `.vg`; k=3 is counted among current members inside retrieval.
+        let mut owned: Vec<(String, &'static str, Vec<f32>)> = Vec::new();
+        for i in 0..20 {
+            owned.push((format!("x{i}"), "X", vec![1.0, i as f32 * 0.001, 0.0, 0.0]));
+        }
+        for i in 0..4 {
+            owned.push((
+                format!("y{i}"),
+                "Y",
+                vec![0.2, 1.0 + i as f32 * 0.001, 0.0, 0.0],
+            ));
+        }
+        let docs: Vec<(&str, &str, Vec<f32>)> = owned
+            .iter()
+            .map(|(title, kind, emb)| (title.as_str(), *kind, emb.clone()))
+            .collect();
+        let (w, _) = build_index("idx-search-proc-filter", &docs).await;
+        let cypher = "CALL search.vector({ \
+             label: 'Doc', property: 'embedding', query: $q, k: 3, \
+             filter: { vigente: true } \
+           }) YIELD node, score RETURN node.title AS title";
+        let q = vec![1.0, 0.0, 0.0, 0.0];
+        let bitmap_searches = namidb_storage::vector_filter_bitmap_searches();
+        let equality_lookups = w.property_index_cache().equality_lookup_calls();
+        let got = titles(&run(&w, cypher, q.clone()).await);
+        let eligible: Vec<(String, Vec<f32>)> = owned
+            .iter()
+            .filter(|(_, kind, _)| *kind == "Y")
+            .map(|(title, _, emb)| (title.clone(), emb.clone()))
+            .collect();
+        assert_eq!(got, exact_topk(&eligible, &q, 3));
+        assert_eq!(got.len(), 3, "selective metadata filter must still fill k");
+        assert!(
+            namidb_storage::vector_filter_bitmap_searches() > bitmap_searches,
+            "search.vector must use the ordinal posting embedded in `.vg`"
+        );
+        assert_eq!(
+            w.property_index_cache().equality_lookup_calls(),
+            equality_lookups,
+            "v4 native filtering must not eagerly open/hydrate equality sidecars"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_filter_eq_list_stays_residual_not_membership() {
+        // The low-level writer is intentionally schemaless: legacy/imported
+        // data can carry a List under a property whose current declaration is
+        // indexed String. `{eq: ['Y']}` means list equality, not `IN ('Y')`.
+        // Native String postings omit the List row, so extracting an OR group
+        // here would prove a false empty slice before the residual can match.
+        let mut w = WriterSession::open(store(), paths("idx-filter-eq-list"))
+            .await
+            .unwrap();
+        w.register_vector_index(
+            VectorIndexDescriptor {
+                name: "doc_emb".into(),
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: DIM,
+                metric: VectorMetric::Cosine,
+                r: 32,
+                l_build: 64,
+                alpha: 1.2,
+                quantization: VectorQuantization::None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut list_props = BTreeMap::new();
+        list_props.insert("title".into(), CoreValue::Str("list-kind".into()));
+        list_props.insert(
+            "kind".into(),
+            CoreValue::List(vec![CoreValue::Str("Y".into())]),
+        );
+        list_props.insert("embedding".into(), CoreValue::Vec(vec![1.0, 0.0, 0.0, 0.0]));
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: list_props,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("scalar-kind", "X", vec![0.0, 1.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        w.flush(schema()).await.unwrap();
+        w.compact_l0(&schema()).await.unwrap();
+
+        let bitmap_searches = namidb_storage::vector_filter_bitmap_searches();
+        let cypher = "CALL search.vector({ \
+             label: 'Doc', property: 'embedding', query: $q, k: 1, \
+             filter: { kind: { eq: ['Y'] } } \
+           }) YIELD node, score RETURN node.title AS title";
+        assert_eq!(
+            titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await),
+            vec!["list-kind".to_string()]
+        );
+        assert_eq!(
+            namidb_storage::vector_filter_bitmap_searches(),
+            bitmap_searches,
+            "list equality must remain residual instead of probing scalar OR postings"
+        );
     }
 
     #[tokio::test]
@@ -999,22 +1243,99 @@ mod indexed {
     }
 
     #[tokio::test]
-    async fn widening_too_selective_falls_back_to_flat() {
-        // A filter that matches exactly ONE doc with LIMIT 5: the index is
-        // exhausted before k survivors accumulate, so the loop breaks and the flat
-        // fallback returns the single correct match (never a short, wrong result).
+    async fn exhaustive_native_filter_returns_exact_short_page_without_flat_scan() {
+        // A filter that matches exactly ONE persisted vector with LIMIT 5. Once
+        // the native posting returns its complete eligible cardinality, the short
+        // page is already exact; scanning the label cannot add a second match.
         let docs = vec![
             ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
             ("b", "Y", vec![0.9, 0.1, 0.0, 0.0]),
             ("c", "Y", vec![0.0, 1.0, 0.0, 0.0]),
             ("d", "Y", vec![0.0, 0.0, 1.0, 0.0]),
         ];
-        let w = build_index_metric("idx-widen-fallback", VectorMetric::Cosine, &docs).await;
+        let mut w = build_index_metric("idx-exact-short-filter", VectorMetric::Cosine, &docs).await;
+        // This fresh, non-vector Y row is outside the filter. It is harmless to
+        // the index+delta path but makes the old whole-label flat fallback error.
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &non_vector_canary("flat-scan-canary", "Y"),
+        )
+        .unwrap();
+        w.commit_batch().await.unwrap();
         let cypher = "MATCH (n:Doc) WHERE n.kind = 'X' \
              RETURN n.title AS title, cosine_similarity(n.embedding, $q) AS score \
              ORDER BY score DESC LIMIT 5";
         let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
         assert_eq!(got, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn k_above_vector_corpus_returns_exact_short_page_without_flat_scan() {
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "Y", vec![0.8, 0.2, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let mut w = build_index_metric("idx-exact-short-corpus", VectorMetric::Cosine, &docs).await;
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &non_vector_canary("flat-scan-canary", "Y"),
+        )
+        .unwrap();
+        w.commit_batch().await.unwrap();
+
+        let cypher = "CALL search.vector({ \
+             label: 'Doc', property: 'embedding', query: $q, k: 10 \
+           }) YIELD node, score RETURN node.title AS title";
+        let got = titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await);
+        let live: Vec<(String, Vec<f32>)> = docs
+            .iter()
+            .map(|(title, _, embedding)| (title.to_string(), embedding.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            exact_topk(&live, &[1.0, 0.0, 0.0, 0.0], 10),
+            "k above the decoded body cardinality returns every vector exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_short_page_reconciles_fresh_delta_and_tombstone() {
+        let docs = vec![
+            ("old-best", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("survivor", "X", vec![0.8, 0.2, 0.0, 0.0]),
+            ("other", "Y", vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let (mut w, ids) = build_index("idx-exact-short-delta", &docs).await;
+
+        // Suppress one persisted posting member and add a new matching vector in
+        // the fresh overlay. Both must participate before the short-page proof.
+        w.tombstone_node("Doc", ids["old-best"]).unwrap();
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("fresh-best", "X", vec![0.95, 0.05, 0.0, 0.0]),
+        )
+        .unwrap();
+        w.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &non_vector_canary("flat-scan-canary", "Y"),
+        )
+        .unwrap();
+        w.commit_batch().await.unwrap();
+
+        let cypher = "CALL search.vector({ \
+             label: 'Doc', property: 'embedding', query: $q, k: 10, \
+             filter: { kind: 'X' } \
+           }) YIELD node, score RETURN node.title AS title";
+        assert_eq!(
+            titles(&run(&w, cypher, vec![1.0, 0.0, 0.0, 0.0]).await),
+            vec!["fresh-best".to_string(), "survivor".to_string()],
+            "fresh vectors merge into rank order and tombstones suppress stale hits"
+        );
     }
 
     // ── Natural-form beam width via `$__vector_ef` (issue e) ──────────────────
@@ -1037,11 +1358,10 @@ mod indexed {
              RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
              ORDER BY score DESC LIMIT 2";
         let plan = optimize(lower(&parse(cypher).unwrap()).unwrap(), &catalog);
+        let plan_json = serde_json::to_string(&plan).unwrap();
         assert!(
-            serde_json::to_string(&plan)
-                .unwrap()
-                .contains("VectorSearch"),
-            "filtered KNN must reach the index"
+            plan_json.contains("VectorSearch"),
+            "filtered KNN must reach the index; plan={plan_json}"
         );
         let mut params = Params::new();
         params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0, 0.0]));

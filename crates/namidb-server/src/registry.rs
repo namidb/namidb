@@ -133,6 +133,20 @@ impl NamespaceRegistry {
         self.max_namespaces != 0 && len >= self.max_namespaces
     }
 
+    /// Return an already-open namespace without recovering or allocating a
+    /// new writer. Used by pressure-relief operations at the hard RSS limit:
+    /// flushing a live memtable can free memory, while opening a cold
+    /// namespace cannot and may make the pressure episode worse.
+    pub async fn get_if_open(&self, namespace: &str) -> Option<Arc<NamespaceState>> {
+        let state = self.sessions.read().await.get(namespace).cloned();
+        if let Some(state) = &state {
+            state
+                .last_access
+                .store(self.now_secs(), std::sync::atomic::Ordering::Relaxed);
+        }
+        state
+    }
+
     /// Get or create a `NamespaceState` for `namespace`. Returns an error
     /// if the namespace ID is invalid.
     pub async fn get_or_open(&self, namespace: &str) -> Result<Arc<NamespaceState>, RegistryError> {
@@ -887,8 +901,13 @@ mod tests {
                 )
                 .await
                 .expect("seed adjacency entry");
+            let sst_path = format!("{ns}/sst/level0/seed.csr");
+            // Model the real commit order: the manifest publishes its exact
+            // live paths before a subsequent read can populate decoded
+            // side-state. An empty manifest is intentionally deny-all.
+            sst_cache.retain_paths(ns, &std::collections::HashSet::from([sst_path.clone()]));
             sst_cache.insert_edge_streams(
-                format!("{ns}/sst/level0/seed.csr"),
+                sst_path,
                 std::sync::Arc::new(EdgeStreamBundle {
                     overflow: None,
                     declared: Vec::new(),

@@ -3,11 +3,11 @@
 **Status:** accepted
 **Author(s):** NamiDB team
 **Created:** 2026-06-26
-**Updated:** 2026-06-26
+**Updated:** 2026-07-25
 **Implements:** the `vector-index` Cargo feature across `namidb-ann`,
 `namidb-storage`, `namidb-query`, `namidb-server`, `namidb-graph`; the
-full-metric ANN + int8 change set; the filtered-ANN adaptive-widening and
-procedure `filter`/`ef` change set.
+full-metric ANN + int8 change set; filtered-ANN adaptive widening; procedure
+`filter`/`ef`; and v4 bounded adaptive ordinal metadata postings.
 
 ## Summary
 
@@ -25,8 +25,8 @@ indexed path returns exactly what a brute-force scan would. This RFC is the
 authoritative description of the subsystem as shipped in v1.4 plus the change
 set just landed (full-metric ANN + int8, filtered-ANN adaptive widening, the
 procedure `filter`/`ef` arguments, the natural-form `$__vector_ef` knob, and
-`CREATE VECTOR INDEX … IF NOT EXISTS`). It is referenced throughout the
-codebase as "RFC-030".
+`CREATE VECTOR INDEX … IF NOT EXISTS`, and v4 native String/Bool prefilter
+postings). It is referenced throughout the codebase as "RFC-030".
 
 The whole integration is gated behind the `vector-index` Cargo feature
 (`namidb-storage`'s `vector-index = ["dep:namidb-ann"]`, re-exported by
@@ -211,13 +211,13 @@ dimension (~0.87 at dim 1536); per-vector scaling restores it.
 
 A `.vg` body is **self-contained**: it carries the indexed vectors plus the
 Vamana graph, so a read needs no extra GETs. Layout is an 8-byte magic
-`MAGIC = b"NAMIVG03"` (`NAMI` `VG` `\0` major=3) followed by a
+`MAGIC = b"NAMIVG04"` followed by a
 bincode-serialized `VectorGraphBody`. **There is no checksum** — which is
 exactly why `decode` validates ranges (below) and the read path treats any
-decode error as "index absent". (v2 stored the original f32 vectors and
-reranked with the true metric, making all three metrics indexable; v3
-generalized the vector store to f32 *or* per-vector int8. An older body
-mismatches the magic and is skipped.)
+decode error as "index absent". v3 generalized the vector store to f32 or
+per-vector int8; v4 adds bounded typed metadata postings. The exact v3 wire
+shape (`NAMIVG03`, no postings) remains readable and uses the residual filtered
+path until authoritative compaction emits v4.
 
 ```text
 VectorGraphBody {
@@ -226,12 +226,14 @@ VectorGraphBody {
   ids:     Vec<[u8;16]>,           // NodeId per graph node i
   storage: VectorStorage,          // F32 | Int8, parallel to ids
   graph:   VamanaGraph,            // adjacency + entry, parallel to ids
+  filter_postings: Map<Property, Map<ScalarV1, Posting>>,
 }
 VectorStorage = F32(Vec<Vec<f32>>)
               | Int8 { codes: Vec<Vec<i8>>, scales: Vec<f32> }
+Posting = Sparse(Vec<u32>) | Dense(Vec<u64>)  // vector ordinals, never NodeIds
 ```
 
-**Build** (`build_body(desc, members)`): returns `Ok(None)` when fewer than 2
+**Build** (`build_body_with_filter_postings(desc, members, postings)`): returns `Ok(None)` when fewer than 2
 members (the caller keeps the flat scan). It validates each vector's length
 against `desc.dim`. **For cosine only, all-zero vectors are excluded** (a
 zero-norm vector is not cosine-rankable; the flat scan's `vector_score(Cosine,
@@ -244,11 +246,31 @@ quantization × metric: int8 → quantize each, build over `Int8Space`, store
 original (un-normalized) `F32` vectors. The build is deterministic via the
 `xxh3_64(name)` seed.
 
-**Decode** (`VectorGraphIndex::decode`): rejects a too-short buffer, a magic
-mismatch (incl. a legacy body), an unknown metric, a length mismatch among
+The authoritative compaction winner stream simultaneously collects every
+indexed String/Bool property for vector members. A posting stays sorted sparse
+or switches to a bitmap once cardinality exceeds N/64; if a once-common value
+becomes sparse later, it switches back rather than extending a mostly-empty
+bitmap. `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` (default 4096/property) and
+`NAMIDB_VECTOR_FILTER_MAX_BYTES` (default 64 MiB/body) bound the build using
+the adaptive representation's actual payload plus conservative map overhead.
+Crossing either cap atomically omits the property—never truncates it. Cosine
+zero-vector removal remaps postings to the final parallel ordinal table.
+
+**Decode** (`VectorGraphIndex::decode`): rejects a too-short buffer, an unknown
+magic (while explicitly accepting v3), an unknown metric, a length mismatch among
 `storage`/`ids`/`adjacency`, an out-of-range graph entry, or mismatched int8
-`codes.len()`/`scales.len()`. Because the read path treats any of these as
+`codes.len()`/`scales.len()`, and invalid/out-of-range sparse or dense postings.
+Because the read path treats any of these as
 "index absent" and flat-falls-back, **a corrupt `.vg` never panics a query**.
+That fallback does not apply to a valid body rejected by configured memory
+capacity. Decoded `.vg` and `.ft` bodies share one Foyer eviction pool; an
+optional `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` reservation is carved out of
+`NAMIDB_CACHE_MAX_BYTES`. The read path evaluates the same conservative
+wire/corpus-shape estimate before GET and at insertion. If one monolithic index
+cannot fit, it returns typed `CacheCapacity` (HTTP 503 / Bolt transient, with
+required and assigned bytes) and increments
+`namidb_search_index_cache_admission_rejections_total{kind="vector"}` rather
+than hiding a sizing error behind an O(corpus) scan.
 
 **Search** (`VectorGraphIndex::search(query, k, ef)`): `k == 0` or a
 dimension mismatch returns empty (the caller flat-falls-back, which raises the
@@ -332,8 +354,9 @@ are matched:
   (the score alias is read from the outer projection);
 - non-terminal `WITH`: `TopN{ Project[…, dist AS score]{ [Filter] NodeScan } }`
   → a bare `VectorSearch`;
-- a threshold on the ranked output, `Filter{ TopN }` (e.g. `WHERE score >=
-  0.86`), is folded into the `VectorSearch`'s `post_filter`.
+- a predicate on the ranked output, `Filter{ TopN }`, remains
+  `Filter{ VectorSearch }`. It is post-k by definition and may shorten the page;
+  folding it into retrieval would incorrectly refill from ranks below `k`.
 
 `try_match` is conservative and bails (leaving the flat plan, which still
 honours everything) on: a non-zero `SKIP`; an unbounded `ORDER BY` with no
@@ -343,16 +366,17 @@ euclidean; the wrong direction asks for the *farthest* k, which the index does
 not compute); a non-vector key function; a scan alias that doesn't match the
 distance call; a predicate already pushed into `NodeScan.predicates` (it can't
 be reconstructed, so the flat path must run it); a missing index; or a
-`post_filter` that references anything other than the searched binding / score
-alias. `StatsCatalog::vector_index_for(label, property, metric)` does the
+source filter that references anything other than the searched binding.
+`StatsCatalog::vector_index_for(label, property, metric)` does the
 descriptor lookup; `VectorGraph` SSTs contribute nothing to cost statistics.
 
 **Executor** (`namidb-query/src/exec/walker.rs`). `vector_search_rows` is the
 shared core for both the `VectorSearch` operator and the procedures. It tries
 `try_index_search` first (feature-gated); on `Ok(None)` it runs the **exact
-flat scan** — scanning every node of the label(s), scoring with `vector_score`,
-sorting, applying the `post_filter` *before* truncating to the limit, and
-materializing whole nodes (a downstream projection may read any property).
+flat scan** — scanning every node of the label(s), evaluating the source filter
+before reading/scoring its embedding, scoring survivors with `vector_score`,
+sorting, and truncating to the limit. Whole nodes remain materialized because a
+downstream projection may read any property.
 
 `try_index_search` returns `Ok(None)` (→ flat scan) when any of these hold,
 otherwise serves from the index:
@@ -379,17 +403,23 @@ When it does serve from the index, the path merges the index hits with a
 **freshness delta** (`vector_fresh_delta(label, property)`: the committed
 memtable plus the staged overlay, highest-LSN-per-id wins; `Some(emb)` is a
 live embedding to merge, `None` suppresses a now-stale id — tombstoned, label
-removed, or embedding dropped). The delta is **pre-scored once** with
-`vector_score(distance, …)` (for an int8 index the delta vector is round-tripped
-through the same quantizer so both halves of the merge sit on the same quantized
-cosine scale).
+removed, or embedding dropped). With a source filter, live delta nodes are
+hydrated and filtered before their embedding is scored. Surviving deltas are
+then **pre-scored once** with `vector_score(distance, …)`.
 
-**Adaptive over-fetch / widening + flat fallback** is the filtered-ANN
-correctness mechanism. A residual `post_filter` is a *post*-filter — the index
-navigates without knowing the predicate, then the engine scores, sorts, and
-applies the filter while materializing up to `k` survivors. Because a selective
-filter can leave fewer than `k` of an over-fetched candidate set, the path
-widens geometrically before giving up:
+**Native pre-filter + adaptive widening + flat fallback** is the filtered-ANN
+correctness mechanism. String/Bool equality and `IN` groups come from either a
+procedure `filter` map or a natural `MATCH … WHERE` predicate and are passed as
+typed keys to `search_filter_groups`; the `.vg` ORs alternatives, ANDs
+conjuncts, and tests the resulting ordinal bitmap before
+reranking/truncating to `k`. Unique-property and `elementId` predicates remain
+exact point seeks rather than being swallowed by ANN.
+Non-matching nodes remain Vamana routing waypoints. A missing property returns
+`Unsupported` (not empty); only then does the executor lazily try a complete
+sidecar ID set bounded to 8192. Numeric/range/negative or omitted properties
+remain a residual source filter (in the historically named `post_filter`
+field). Because that residual can leave fewer than `k` of the native candidate
+set, the path widens geometrically before giving up:
 
 ```text
 const OVERFETCH_BASE = 8; WIDEN_GROWTH = 4; MAX_WIDEN_ROUNDS = 4;
@@ -398,7 +428,9 @@ mult  = widen ? 8 : 1;                  // no-filter ⇒ exactly one round, mult
 for round in 0..(widen ? 4 : 1):
     kprime = max(k, k*mult + delta_ids.len());
     ef     = ef_search ? ef_search.max(kprime) : max(kprime, 64);
-    hits   = snapshot.vector_search(index_name, qv, kprime, ef);   // unions .vg SSTs
+    hits   = .vg.search_filter_groups(groups, kprime, ef)
+             OR lazy capped-sidecar search when Unsupported
+             OR unfiltered .vg search when no complete prefilter applies;
     merge hits (deduped, delta-suppressed) with the pre-scored delta;
     sort by orientation; materialize ≤ k applying post_filter (per-candidate deadline);
     if survivors >= k: return them;
@@ -406,6 +438,10 @@ for round in 0..(widen ? 4 : 1):
     mult *= 4;                           // 8 → 32 → 128 → 512
 return Ok(None);                         // fall back to the exact flat scan
 ```
+
+This residual is part of the source and therefore runs before `k`. A logical
+`Filter` above the ranking `TopN` is not part of this loop: it remains above
+`VectorSearch` and filters the already bounded result without refilling it.
 
 So a filtered query over-fetches `8k`, then `32k`, `128k`, `512k`, and only
 then falls back to the `O(n)` flat scan — a moderately selective filter (the
@@ -425,9 +461,10 @@ up, never wrong), and the `Ok(None)` flat fallback (after the round cap or once
 **Beam width (`ef`).** The procedures take a first-class `ef`. The
 natural/operator form has no Cypher syntax for it, so the executor reads a
 reserved, namespaced parameter `$__vector_ef` in `flat_vector_search` and
-threads it into the same `ef_search` slot. Because it only ever raises the beam
-(`ef_search.max(kprime)` downstream), it cannot corrupt results; absent, the
-per-round default `max(kprime, 64)` applies. **`$__vector_ef` is an explicitly
+threads it into the same `ef_search` slot. An explicit value replaces the
+default beam and is clamped to `kprime`; absent, the per-round default
+`max(kprime, 64)` applies. A value below 64 can therefore trade approximate
+recall for latency when `kprime` is small. **`$__vector_ef` is an explicitly
 NON-STABLE knob** — it is global to the query (every `VectorSearch` node in the
 query sees the same value), it is namespaced to avoid clashing with a user's own
 `$ef`, and it is intended to be superseded by a first-class `OPTIONS { ef }`
@@ -441,8 +478,12 @@ form):
 
 - `CALL search.vector({ label, property, query, k?=10, ef?, metric?=cosine,
   filter? }) YIELD node, score` — the procedure counterpart to the optimizer
-  rewrite. `filter` becomes the index-side `post_filter` (over-fetch + exact
-  fallback); `ef` is the beam width.
+  rewrite. Indexed String/Bool equality/IN conjuncts OR/AND adaptive ordinal
+  postings inside `.vg` before `k`, without hydrating a matching NodeId corpus.
+  A missing property/v3 body lazily tries at most
+  `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` complete sidecar IDs (default 8192);
+  unindexed/range/oversized predicates retain adaptive over-fetch + exact
+  fallback. `ef` is the beam width.
 - `CALL db.index.vector.queryNodes(indexName, k, queryVector [, { ef, filter
   }]) YIELD node, score` — Neo4j-compatible. Resolves the index **by name** to
   `(label, property, metric)` from its descriptor, then takes the same path;
@@ -456,8 +497,13 @@ form):
   `alpha` on the dense leg. Each leg over-fetches `k·8` candidates by default
   (`k_dense`/`k_sparse`). The dense leg requires **both** `query_vector` and
   `vector_property` (supplying exactly one is an error). A `filter` applies to
-  the dense leg as an index-side `post_filter` *and* to the fused output (so a
-  sparse-only hit that fails the predicate is also dropped).
+  the dense leg as the same native eligibility/residual filter and to BM25
+  before the sparse top-k. An authoritative FTS prefix widens geometrically up
+  to `NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP` (default 65536); exhausting the
+  prefix returns the exact survivors, while reaching the cap selects the exact
+  two-pass flat scorer. The fused output rechecks the predicate defensively.
+  Thus the cap bounds indexed hydration but cannot shorten a result through
+  post-filter under-fill.
 
 #### 9. Write-time dimension enforcement (`namidb-query/src/exec/writer.rs`)
 
@@ -499,9 +545,12 @@ list overrides it.
 | `metric` | DDL `METRIC`, descriptor | required | `cosine` \| `dot` \| `euclidean` |
 | `dimension` | DDL `DIMENSION`, descriptor | required | enforced at write time and against each embedding at build time |
 | `quantization` | DDL `WITH`, descriptor | `none` | `int8` is cosine-only (~4× smaller, recall floor ~0.80) |
-| `ef` (query beam width) | procedures `ef`; natural-form `$__vector_ef` | per-round `max(kprime, 64)` | only ever clamped up (`ef.max(kprime)`); `$__vector_ef` is NON-STABLE |
+| `ef` (query beam width) | procedures `ef`; natural-form `$__vector_ef` | per-round `max(kprime, 64)` | explicit values replace the default and are clamped to `kprime`; `$__vector_ef` is NON-STABLE |
 | `k` (top-k) | query `LIMIT` / procedure `k` | `10` (procedures) | |
 | over-fetch multiplier | executor, filtered path | `8 → 32 → 128 → 512` | `OVERFETCH_BASE=8`, `WIDEN_GROWTH=4`, `MAX_WIDEN_ROUNDS=4`; `1` with no filter |
+| filter distinct cap | `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` | `4096` | per String/Bool property; crossing drops the whole posting |
+| filter byte cap | `NAMIDB_VECTOR_FILTER_MAX_BYTES` | `64 MiB` | per `.vg`, adaptive ordinal payload + conservative map overhead |
+| legacy/high-card ID fallback | `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` | `8192` | resolved lazily only after `.vg` reports unsupported; `0` disables |
 | FastRP `dimension` | `FastRpOptions` | `256` | |
 | FastRP `iteration_weights` | `FastRpOptions` | `[0, 1, 1, 1]` | |
 | FastRP `normalization_strength` | `FastRpOptions` | `0.0` | |
@@ -523,18 +572,12 @@ forward references scattered through the code and this RFC resolve.
   back to the param only while the bridge is being retired, so both can coexist
   during migration. Touches the parser/AST/lowering/optimizer/explain chain.
 
-- **True pre-filtering / filtered-DiskANN (RFC-032).** Today a `WHERE`
-  alongside a KNN is a *post*-filter: the predicate never enters Vamana
-  navigation, so a selective filter widens (§7) and ultimately flat-falls-back.
-  True pre-filtering makes the predicate count toward `k`/`ef` during traversal
-  (non-matching nodes remain routing waypoints). The layering gap is that
-  `beam_search` is sync and sees only ordinals, while the predicate lives two
-  crates up over `NodeId` + properties. The recommended composition is
-  attribute bitmaps over ordinals materialized at compaction (keyed by the
-  index's `max_lsn`, so the existing freshness gate covers staleness for free)
-  for the cheap equality slice, plus the residual `post_filter` and the
-  adaptive widening from §7 as the safety net. Per-tenant subgraphs and a
-  general ordinal→predicate callback are alternatives with worse trade-offs.
+- **Richer native predicates (RFC-032 follow-up).** v4 implements the cheap,
+  high-value slice—complete String/Bool equality/`IN` ordinal postings.
+  Cross-typed numeric equality, ranges, negation, and compound encoded keys
+  still use the residual widening/exact fallback. Extending postings to those
+  predicates requires preserving Cypher coercion/null semantics without
+  turning `.vg` metadata into a second unbounded column store.
 
 - **Incremental / mergeable index maintenance (RFC-035).** The index is
   rebuilt only on an authoritative (deepest) compaction, so a large delta sits
@@ -572,12 +615,11 @@ forward references scattered through the code and this RFC resolve.
   by default (rerank-with-true-metric, all three metrics) and offers int8 as an
   opt-in, cosine-only quantization.
 
-- **True pre-filtering in v1.** Filtered-DiskANN needs label-aware graph
-  construction or attribute bitmaps and a way to push a predicate into a sync,
-  ordinal-only traversal — a real design with its own trade-offs (RFC-032).
-  Shipping post-filter + adaptive widening + exact flat fallback gets correct
-  filtered results now, with the index serving the common moderately-selective
-  case, and defers the harder navigation change.
+- **Bounded ordinal postings rather than per-tenant subgraphs.** Embedding
+  complete adaptive postings in the authoritative `.vg` keeps one navigation
+  graph, lets rejected nodes remain routing waypoints, and gets String/Bool
+  equality pre-filtering in one object fetch. Per-tenant subgraphs multiply
+  rebuild/storage cost and perform poorly for filters crossing tenants.
 
 - **A first-class `ef` hint in v1.** No query-level hint/`OPTIONS` mechanism
   exists in the grammar. Rather than design and plumb one immediately, the
@@ -594,10 +636,10 @@ forward references scattered through the code and this RFC resolve.
   RFC-035, a large freshly written delta stays on the flat-fallback path until
   the next authoritative merge.
 
-- **Post-filter, not pre-filter.** A selective `WHERE` widens the over-fetch and
-  can still flat-fall-back to `O(n)`. The widening bounds the damage (a
-  moderately selective filter is served from the index), but a highly selective
-  filter over a large label is a flat scan every query until RFC-032.
+- **Only equality/IN String/Bool is native.** Numeric/range/negative predicates,
+  an unindexed property, or a property omitted by the posting caps can still
+  widen and flat-fall-back to `O(n)`. This preserves exact semantics but means
+  those filter shapes do not receive v4's native speedup.
 
 - **No checksum on the `.vg` body.** Integrity rests on `decode`'s range
   validation plus the flat fallback. A corrupt-but-in-range body could in
@@ -612,11 +654,10 @@ forward references scattered through the code and this RFC resolve.
 - **int8 is cosine-only and lossy.** It trades ~0.05 recall and the non-cosine
   metrics for a ~4× smaller body; it is not a free win.
 
-- **Repeated decode/navigate under widening.** Each widening round re-decodes
-  the `.vg` body and re-runs the beam search; geometric growth makes the final
-  round dominate and the round cap bounds it at ≤4×, and it is still far cheaper
-  than the `O(n)` flat scan it avoids — but a per-query decoded-index cache
-  would help.
+- **Repeated navigation under widening.** The decoded `.vg` is process-cached,
+  but each widening round re-runs the beam search. Geometric growth makes the
+  final round dominate and the round cap bounds the extra work; reusing a beam
+  frontier across rounds remains future work.
 
 ## Open questions
 

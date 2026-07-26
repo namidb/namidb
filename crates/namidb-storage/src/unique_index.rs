@@ -180,6 +180,16 @@ impl Holders {
 struct ConstraintMap {
     holders: HashMap<UniqueKey, Holders>,
     by_node: HashMap<NodeId, UniqueKey>,
+    /// A full map can answer every negative probe. A partial map, seeded from
+    /// immutable point sidecars for one MERGE batch, may answer only occupied
+    /// keys in `holders` and confirmed misses in `known_misses`; any other key
+    /// returns `None` and triggers the existing authoritative population path.
+    ///
+    /// Hits deliberately are not duplicated here: their presence in
+    /// `holders` is already the positive-knowledge bit. This keeps a long
+    /// loader from retaining a third copy of every unique value.
+    complete: bool,
+    known_misses: HashSet<UniqueKey>,
 }
 
 impl ConstraintMap {
@@ -191,12 +201,18 @@ impl ConstraintMap {
                 .is_some_and(|holders| holders.remove(id));
             if empty {
                 self.holders.remove(&old);
+                if !self.complete {
+                    // A staged delete/re-home of the last holder turns a
+                    // previously-known hit into an authoritative miss.
+                    self.known_misses.insert(old);
+                }
             }
         }
     }
 
     fn file(&mut self, id: NodeId, key: UniqueKey) {
         debug_assert!(!self.by_node.contains_key(&id));
+        self.known_misses.remove(&key);
         match self.holders.entry(key.clone()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(Holders::One(id));
@@ -220,6 +236,11 @@ type ConstraintId = (String, Vec<String>);
 struct ConstraintUndo {
     created_in_batch: bool,
     by_node: HashMap<NodeId, Option<UniqueKey>>,
+    /// Exact pre-batch membership for every partial-map miss touched by this
+    /// batch. A key introduced only by a staged upsert was previously
+    /// *unknown*, not an authoritative miss; restoring only `by_node` would
+    /// otherwise turn it into a false-negative answer on rollback.
+    known_misses: HashMap<UniqueKey, bool>,
 }
 
 #[derive(Debug, Default)]
@@ -260,6 +281,9 @@ impl UniqueConstraintIndex {
     ) -> Option<UniqueProbe> {
         let state = self.state.lock().expect("unique index lock");
         let map = state.maps.get(&(label.to_string(), names.to_vec()))?;
+        if !map.complete && !map.holders.contains_key(key) && !map.known_misses.contains(key) {
+            return None;
+        }
         self.probes.fetch_add(1, Ordering::Relaxed);
         let conflict = map
             .holders
@@ -286,6 +310,9 @@ impl UniqueConstraintIndex {
     ) -> Option<Vec<NodeId>> {
         let state = self.state.lock().expect("unique index lock");
         let map = state.maps.get(&(label.to_string(), names.to_vec()))?;
+        if !map.complete && !map.holders.contains_key(key) && !map.known_misses.contains(key) {
+            return None;
+        }
         self.posting_probes.fetch_add(1, Ordering::Relaxed);
         Some(
             map.holders
@@ -335,6 +362,7 @@ impl UniqueConstraintIndex {
                 map.file(id, key);
             }
         }
+        map.complete = true;
         self.populate_scans.fetch_add(1, Ordering::Relaxed);
         let identity = (label.to_string(), names.to_vec());
         let mut state = self.state.lock().expect("unique index lock");
@@ -343,8 +371,113 @@ impl UniqueConstraintIndex {
             let undo = state.undo.entry(identity).or_default();
             undo.created_in_batch = true;
             undo.by_node.clear();
+            undo.known_misses.clear();
         } else {
             state.undo.remove(&identity);
+        }
+    }
+
+    /// Seed authoritative point answers without claiming that the whole
+    /// `(label, names)` domain is populated.
+    ///
+    /// `entries` must come from a current committed sidecar-backed lookup and
+    /// include misses as `(key, None)`. This is called before a statement
+    /// stages node mutations. Subsequent upsert/tombstone chokepoints maintain
+    /// the seeded keys exactly; an unseeded probe still returns `None` and
+    /// takes the full-population fallback.
+    pub(crate) fn seed_committed_keys(
+        &self,
+        label: &str,
+        names: &[String],
+        entries: impl IntoIterator<Item = (UniqueKey, Option<NodeId>)>,
+    ) {
+        let identity = (label.to_string(), names.to_vec());
+        let mut state = self.state.lock().expect("unique index lock");
+        if state.maps.get(&identity).is_some_and(|map| map.complete) {
+            return;
+        }
+        debug_assert!(
+            !state.undo.contains_key(&identity),
+            "committed key seeding must happen before staged mutations"
+        );
+        let map = state.maps.entry(identity).or_default();
+        for (key, holder) in entries {
+            if map.holders.contains_key(&key) || map.known_misses.contains(&key) {
+                continue;
+            }
+            if let Some(id) = holder {
+                // A confirmed unique node can only occupy one current tuple.
+                // Detaching defensively also makes reseeding robust to a
+                // previously-known key whose node was moved.
+                map.detach(id);
+                map.file(id, key);
+            } else {
+                map.known_misses.insert(key);
+            }
+        }
+    }
+
+    /// Seed authoritative point answers for the current committed+staged
+    /// overlay without claiming the whole `(label, names)` domain.
+    ///
+    /// Unlike [`Self::seed_committed_keys`], this may run after node mutations
+    /// have already been staged. An absent map is therefore disposable on
+    /// rollback. When a committed partial map already exists, newly learned
+    /// hits/misses are journalled too: an answer may depend on a staged
+    /// delete/re-home whose old tuple was unknown to that partial map, so
+    /// retaining the answer after rollback would risk a false miss.
+    pub(crate) fn seed_staged_keys(
+        &self,
+        label: &str,
+        names: &[String],
+        entries: impl IntoIterator<Item = (UniqueKey, Option<NodeId>)>,
+    ) {
+        let identity = (label.to_string(), names.to_vec());
+        let mut state = self.state.lock().expect("unique index lock");
+        if state.maps.get(&identity).is_some_and(|map| map.complete) {
+            return;
+        }
+
+        let created_in_batch = !state.maps.contains_key(&identity);
+        let IndexState { maps, undo } = &mut *state;
+        let map = maps.entry(identity.clone()).or_default();
+        let rollback = undo.entry(identity).or_default();
+        if created_in_batch {
+            rollback.created_in_batch = true;
+        }
+
+        for (key, holder) in entries {
+            if map.holders.contains_key(&key) || map.known_misses.contains(&key) {
+                continue;
+            }
+            if let Some(id) = holder {
+                if !rollback.created_in_batch {
+                    rollback
+                        .by_node
+                        .entry(id)
+                        .or_insert_with(|| map.by_node.get(&id).cloned());
+                    rollback
+                        .known_misses
+                        .entry(key.clone())
+                        .or_insert_with(|| map.known_misses.contains(&key));
+                    if let Some(old_key) = map.by_node.get(&id) {
+                        rollback
+                            .known_misses
+                            .entry(old_key.clone())
+                            .or_insert_with(|| map.known_misses.contains(old_key));
+                    }
+                }
+                map.detach(id);
+                map.file(id, key);
+            } else {
+                if !rollback.created_in_batch {
+                    rollback
+                        .known_misses
+                        .entry(key.clone())
+                        .or_insert_with(|| map.known_misses.contains(&key));
+                }
+                map.known_misses.insert(key);
+            }
         }
     }
 
@@ -368,14 +501,30 @@ impl UniqueConstraintIndex {
                     .entry(id)
                     .or_insert_with(|| map.by_node.get(&id).cloned());
             }
+            let new_key = if clabel.is_empty() || labels.iter().any(|l| l == clabel) {
+                encode_node_key(cnames, props)
+            } else {
+                None
+            };
+            if !map.complete && !rollback.created_in_batch {
+                if let Some(old_key) = map.by_node.get(&id) {
+                    rollback
+                        .known_misses
+                        .entry(old_key.clone())
+                        .or_insert_with(|| map.known_misses.contains(old_key));
+                }
+                if let Some(new_key) = &new_key {
+                    rollback
+                        .known_misses
+                        .entry(new_key.clone())
+                        .or_insert_with(|| map.known_misses.contains(new_key));
+                }
+            }
             map.detach(id);
             // An empty label is the physical any-label scope used by
             // `MATCH (n {prop: ...})`. Every node, including an unlabelled one,
             // belongs to that global postings map.
-            if !clabel.is_empty() && !labels.iter().any(|l| l == clabel) {
-                continue;
-            }
-            if let Some(key) = encode_node_key(cnames, props) {
+            if let Some(key) = new_key {
                 map.file(id, key);
             }
         }
@@ -393,6 +542,14 @@ impl UniqueConstraintIndex {
                     .entry(id)
                     .or_insert_with(|| map.by_node.get(&id).cloned());
             }
+            if !map.complete && !rollback.created_in_batch {
+                if let Some(old_key) = map.by_node.get(&id) {
+                    rollback
+                        .known_misses
+                        .entry(old_key.clone())
+                        .or_insert_with(|| map.known_misses.contains(old_key));
+                }
+            }
             map.detach(id);
         }
     }
@@ -400,7 +557,7 @@ impl UniqueConstraintIndex {
     /// Promote the current staged view to committed state. The populated maps
     /// already contain those mutations, so only the rollback journal changes.
     pub(crate) fn commit_staged(&self) {
-        self.state.lock().expect("unique index lock").undo.clear();
+        self.state.lock().expect("unique index lock").undo = HashMap::new();
     }
 
     /// Restore every populated map to its pre-batch committed state without a
@@ -423,14 +580,43 @@ impl UniqueConstraintIndex {
                     map.file(id, key);
                 }
             }
+            for (key, was_known_miss) in rollback.known_misses {
+                if was_known_miss {
+                    debug_assert!(
+                        !map.holders.contains_key(&key),
+                        "a committed holder cannot also be a known miss"
+                    );
+                    map.known_misses.insert(key);
+                } else {
+                    map.known_misses.remove(&key);
+                }
+            }
         }
     }
 
     /// Drop every populated map; the next probe repopulates from a scan.
     pub(crate) fn reset(&self) {
         let mut state = self.state.lock().expect("unique index lock");
-        state.maps.clear();
-        state.undo.clear();
+        // Replacing the state drops the HashMap bucket arrays too. `clear()`
+        // would leave allocations sized for the largest historical corpus or
+        // staged batch resident after an RSS-pressure pass.
+        *state = IndexState::default();
+    }
+
+    /// Drop sidecar-seeded partial maps after a successful flush.
+    ///
+    /// The newly committed SST sidecars are now the authoritative point index,
+    /// so retaining every key touched since the previous flush would only
+    /// duplicate immutable state. Complete maps populated for generic
+    /// multi-property constraints remain hot because they can still answer
+    /// the whole domain without I/O.
+    pub(crate) fn drop_partial_maps(&self) {
+        let mut state = self.state.lock().expect("unique index lock");
+        debug_assert!(
+            state.undo.is_empty(),
+            "partial maps may only be reclaimed after commit"
+        );
+        state.maps.retain(|_, map| map.complete);
     }
 
     /// Number of populating label scans performed so far.
@@ -516,6 +702,26 @@ mod tests {
     }
 
     #[test]
+    fn reset_releases_index_and_undo_bucket_allocations() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["email".to_string()];
+        let original = props(&[("email", Value::Str("a@x".into()))]);
+        idx.populate("User", &names, std::iter::once((nid(1), &original)));
+        let replacement = props(&[("email", Value::Str("b@x".into()))]);
+        idx.apply_upsert(nid(1), &["User"], &replacement);
+        {
+            let state = idx.state.lock().unwrap();
+            assert!(state.maps.capacity() > 0);
+            assert!(state.undo.capacity() > 0);
+        }
+
+        idx.reset();
+        let state = idx.state.lock().unwrap();
+        assert_eq!(state.maps.capacity(), 0);
+        assert_eq!(state.undo.capacity(), 0);
+    }
+
+    #[test]
     fn postings_promote_only_on_duplicate_and_collapse_after_remove() {
         let idx = UniqueConstraintIndex::new();
         let names = vec!["group".to_string()];
@@ -545,6 +751,132 @@ mod tests {
 
         idx.apply_tombstone(nid(2));
         assert_eq!(idx.probe_all("Doc", &names, &key), Some(Vec::new()));
+    }
+
+    #[test]
+    fn partial_sidecar_seed_answers_only_known_keys_and_rolls_back_mutations() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["key".to_string()];
+        let key_a = encode_probe_key(&[&Value::Str("a".into())]).unwrap();
+        let key_b = encode_probe_key(&[&Value::Str("b".into())]).unwrap();
+        let key_unknown = encode_probe_key(&[&Value::Str("unknown".into())]).unwrap();
+        idx.seed_committed_keys(
+            "Account",
+            &names,
+            vec![(key_a.clone(), Some(nid(1))), (key_b.clone(), None)],
+        );
+        {
+            let state = idx.state.lock().unwrap();
+            let map = state.maps.get(&("Account".into(), names.clone())).unwrap();
+            assert!(
+                !map.known_misses.contains(&key_a),
+                "a seeded hit must not retain a third copy of its key"
+            );
+            assert!(map.known_misses.contains(&key_b));
+        }
+
+        assert_eq!(
+            idx.probe("Account", &names, &key_a, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+        assert_eq!(
+            idx.probe("Account", &names, &key_b, None),
+            Some(UniqueProbe::NoConflict),
+            "seeded misses are authoritative"
+        );
+        assert_eq!(
+            idx.probe("Account", &names, &key_unknown, None),
+            None,
+            "an unseeded key must retain the full-population fallback"
+        );
+
+        let b = props(&[("key", Value::Str("b".into()))]);
+        idx.apply_upsert(nid(2), &["Account"], &b);
+        assert_eq!(
+            idx.probe("Account", &names, &key_b, None),
+            Some(UniqueProbe::Conflict(nid(2)))
+        );
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe("Account", &names, &key_b, None),
+            Some(UniqueProbe::NoConflict),
+            "rollback restores the seeded committed miss"
+        );
+
+        let unknown = props(&[("key", Value::Str("unknown".into()))]);
+        idx.apply_upsert(nid(1), &["Account"], &unknown);
+        assert_eq!(
+            idx.probe("Account", &names, &key_unknown, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe("Account", &names, &key_a, None),
+            Some(UniqueProbe::Conflict(nid(1))),
+            "rollback restores the original seeded hit"
+        );
+        assert_eq!(
+            idx.probe("Account", &names, &key_unknown, None),
+            None,
+            "a key introduced only by a rolled-back write remains unknown"
+        );
+        assert_eq!(idx.populate_scans(), 0);
+    }
+
+    #[test]
+    fn staged_point_seed_is_disposable_and_rolls_back_overlay_only_misses() {
+        let names = vec!["key".to_string()];
+        let staged_key = encode_probe_key(&[&Value::Str("staged".into())]).unwrap();
+
+        // With no committed map, every answer was learned from an already
+        // mutated overlay. Rollback must drop the whole partial map.
+        let fresh = UniqueConstraintIndex::new();
+        fresh.seed_staged_keys("Account", &names, vec![(staged_key.clone(), Some(nid(1)))]);
+        assert_eq!(
+            fresh.probe("Account", &names, &staged_key, None),
+            Some(UniqueProbe::Conflict(nid(1)))
+        );
+        fresh.rollback_staged();
+        assert_eq!(fresh.probe("Account", &names, &staged_key, None), None);
+
+        // A pre-existing partial map can lack the old tuple of a node deleted
+        // during this batch. A subsequently seeded overlay miss is valid now,
+        // but must become unknown (not a false committed miss) on rollback.
+        let warm = UniqueConstraintIndex::new();
+        let known_key = encode_probe_key(&[&Value::Str("known".into())]).unwrap();
+        let deleted_key = encode_probe_key(&[&Value::Str("deleted".into())]).unwrap();
+        warm.seed_committed_keys("Account", &names, vec![(known_key, Some(nid(1)))]);
+        warm.apply_tombstone(nid(2));
+        warm.seed_staged_keys("Account", &names, vec![(deleted_key.clone(), None)]);
+        assert_eq!(
+            warm.probe("Account", &names, &deleted_key, None),
+            Some(UniqueProbe::NoConflict)
+        );
+        warm.rollback_staged();
+        assert_eq!(
+            warm.probe("Account", &names, &deleted_key, None),
+            None,
+            "rollback must forget a miss that depended on an unknown staged tombstone"
+        );
+    }
+
+    #[test]
+    fn successful_flush_reclamation_drops_only_partial_maps() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["key".to_string()];
+        let partial_key = encode_probe_key(&[&Value::Str("partial".into())]).unwrap();
+        idx.seed_committed_keys("Partial", &names, vec![(partial_key.clone(), Some(nid(1)))]);
+
+        let full_props = props(&[("key", Value::Str("full".into()))]);
+        let full_key = encode_probe_key(&[&Value::Str("full".into())]).unwrap();
+        idx.populate("Full", &names, vec![(nid(2), &full_props)].into_iter());
+
+        idx.drop_partial_maps();
+        assert_eq!(idx.probe("Partial", &names, &partial_key, None), None);
+        assert_eq!(
+            idx.probe("Full", &names, &full_key, None),
+            Some(UniqueProbe::Conflict(nid(2)))
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod authz;
 pub mod bolt;
 mod introspect;
 mod maintenance;
+pub mod memory;
 pub mod metrics;
 pub mod recovery;
 pub mod registry;
@@ -78,14 +79,14 @@ pub struct Config {
     /// Interval for the background maintenance task (L0->L1 compaction +
     /// orphan sweep). `Duration::ZERO` disables it.
     pub compaction_interval: Duration,
-    /// Minimum age before the orphan sweep may delete an unreferenced SST
-    /// body — the sole guard against deleting a file a slow reader's pinned
-    /// snapshot still references.
+    /// Minimum age before the orphan sweep may delete an unreachable immutable
+    /// object. Live readers are protected independently by the exact retention
+    /// horizon; this age guards the upload-before-manifest/pointer-CAS window.
     pub sweep_min_age: Duration,
-    /// When `true` (the default) the orphan sweep deletes unreferenced SST
-    /// bodies; the retention horizon (RFC-027) makes that safe by
-    /// construction. Set `false` for a dry-run that only logs what it would
-    /// free.
+    /// When `true` (the default) the orphan sweep deletes unreachable
+    /// immutable bodies, WALs, manifests, and pointers; the retention horizon
+    /// (RFC-027) makes that safe by construction. Set `false` for a dry-run
+    /// that only logs what it would free.
     pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
@@ -221,6 +222,10 @@ pub struct AppState {
     /// disables each. The server sets them from [`Config`] at boot.
     memtable_flush_bytes: usize,
     memtable_stall_bytes: usize,
+    /// Process-wide RSS/working-set admission shared by HTTP, Bolt, and every
+    /// namespace. Unlike the storage cache budget, this observes total
+    /// resident memory.
+    pub(crate) memory: Arc<memory::MemoryGovernor>,
     /// Foreground writer-lock acquisition bound (see `Config`). `ZERO`
     /// disables it.
     writer_lock_timeout: Duration,
@@ -271,6 +276,9 @@ impl AppState {
             write_stall_delay: Duration::ZERO,
             memtable_flush_bytes: 0,
             memtable_stall_bytes: 0,
+            memory: Arc::new(memory::MemoryGovernor::new(
+                memory::DEFAULT_MEMORY_MAX_BYTES,
+            )),
             writer_lock_timeout: Duration::ZERO,
             flush_notify: Arc::new(tokio::sync::Notify::new()),
             memtable_bytes_gauge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -309,6 +317,12 @@ impl AppState {
     pub fn with_memtable_thresholds(mut self, flush_bytes: usize, stall_bytes: usize) -> Self {
         self.memtable_flush_bytes = flush_bytes;
         self.memtable_stall_bytes = stall_bytes;
+        self
+    }
+
+    /// Attach the process-wide total-memory admission governor.
+    pub fn with_memory_governor(mut self, memory: Arc<memory::MemoryGovernor>) -> Self {
+        self.memory = memory;
         self
     }
 
@@ -458,12 +472,32 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/version", get(version))
         .route("/v0/metrics", get(metrics_handler));
 
-    let private = Router::new()
+    // Cypher is the only private HTTP work that creates an unbounded query
+    // working set. Admission runs before its JSON extractor, so a large body
+    // is not materialised after the process reaches its RSS ceiling.
+    let admitted = Router::new()
         .route("/v0/cypher", post(cypher))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_memory_admission,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    // Flush is an authenticated pressure-relief operation: rejecting it at
+    // the same gate as new Cypher work can leave a large memtable with no
+    // operator escape hatch. It is excluded from the request timeout; the
+    // handler has its own process-wide single-flight gate, while the storage
+    // flush restores its frozen memtable on cancellation. The outer global
+    // concurrency cap bounds clients waiting for that gate.
+    let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    harden_router(Router::new().merge(public).merge(private).with_state(state))
+    limit_router(
+        Router::new()
+            .merge(timeout_router(Router::new().merge(public).merge(admitted)))
+            .merge(maintenance)
+            .with_state(state),
+    )
 }
 
 /// Default request-processing deadline and global in-flight cap for the HTTP
@@ -486,17 +520,34 @@ fn http_max_concurrency() -> usize {
         .unwrap_or(1024)
 }
 
-/// Apply the shared HTTP hardening layers (request timeout + global concurrency
-/// limit) to a fully-built router.
-fn harden_router(router: Router) -> Router {
-    router
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            http_request_timeout(),
-        ))
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-            http_max_concurrency(),
-        ))
+/// Apply the shared HTTP request timeout to ordinary request routes.
+///
+/// Operator maintenance routes are merged outside this layer: a flush can
+/// legitimately outlive the request deadline. The storage-layer restore guard
+/// makes client cancellation safe after the memtable has frozen.
+fn timeout_router<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        http_request_timeout(),
+    ))
+}
+
+/// Keep one process-wide in-flight request cap, including maintenance.
+///
+/// This bounds authenticated clients queuing behind the single-flight flush
+/// semaphore. Memory-pressure query rejections complete quickly and release
+/// their permits, so the relief route remains reachable without admitting an
+/// unbounded number of waiting tasks.
+fn limit_router<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+        http_max_concurrency(),
+    ))
 }
 
 /// Build the multi-tenant router with namespace extraction.
@@ -523,24 +574,40 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     // Also register unprefixed /v0/... routes that resolve the namespace from
     // the X-NamiDB-Namespace header (or the configured default), so clients
     // can target a namespace without a path prefix.
-    let namespace_routes = Router::new()
+    let namespace_public = Router::new()
         .route("/:namespace/v0/livez", get(livez_multi))
         .route("/:namespace/v0/health", get(health_multi))
-        .route("/:namespace/v0/cypher", post(cypher_multi))
-        .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
         .route("/v0/livez", get(livez_multi))
-        .route("/v0/health", get(health_multi_unprefixed))
+        .route("/v0/health", get(health_multi_unprefixed));
+
+    let namespace_admitted = Router::new()
+        .route("/:namespace/v0/cypher", post(cypher_multi))
         .route("/v0/cypher", post(cypher_multi_unprefixed))
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_memory_admission_multi,
+        ))
+        .layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_auth_multi,
+        ));
+    let namespace_maintenance = Router::new()
+        .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_auth_multi,
         ));
 
-    harden_router(
+    limit_router(
         Router::new()
-            .merge(public)
-            .merge(namespace_routes)
+            .merge(timeout_router(
+                Router::new()
+                    .merge(public)
+                    .merge(namespace_public)
+                    .merge(namespace_admitted),
+            ))
+            .merge(namespace_maintenance)
             .with_state(shared),
     )
 }
@@ -585,6 +652,29 @@ fn resolve_request_namespace(
 /// spawn a periodic flush task, and serve until the process receives
 /// SIGINT.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    let memory_max_bytes = match std::env::var("NAMIDB_MEMORY_MAX_BYTES") {
+        Ok(raw) => raw.parse::<usize>().map_err(|error| {
+            anyhow::anyhow!("NAMIDB_MEMORY_MAX_BYTES must be an exact byte count: {error}")
+        })?,
+        Err(std::env::VarError::NotPresent) => memory::DEFAULT_MEMORY_MAX_BYTES,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "NAMIDB_MEMORY_MAX_BYTES is not valid UTF-8: {error}"
+            ))
+        }
+    };
+    run_with_memory_max_bytes(config, memory_max_bytes).await
+}
+
+/// Boot the server with an explicit process-wide RSS/working-set ceiling.
+///
+/// The standalone binary uses this entry point for its CLI/env-parsed value;
+/// [`run`] retains the 2.0 `Config` shape and reads
+/// `NAMIDB_MEMORY_MAX_BYTES` for embedded callers.
+pub async fn run_with_memory_max_bytes(
+    config: Config,
+    memory_max_bytes: usize,
+) -> anyhow::Result<()> {
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
@@ -648,6 +738,39 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             Arc::new(authz::NoOpAuthz)
         }
     };
+    let memory = Arc::new(memory::MemoryGovernor::new(memory_max_bytes));
+    if memory_max_bytes > 0 {
+        info!(
+            memory_max_bytes,
+            reclaim_at_bytes = memory_max_bytes.saturating_mul(90) / 100,
+            watchdog_interval_ms = 500,
+            "process resident-memory admission and watchdog enabled"
+        );
+        let cache_max = namidb_storage::cache_max_bytes();
+        if cache_max >= memory_max_bytes {
+            warn!(
+                cache_max_bytes = cache_max,
+                memory_max_bytes,
+                "cache ceiling leaves no headroom under the total-memory ceiling; \
+                 lower NAMIDB_CACHE_MAX_BYTES"
+            );
+        }
+    }
+
+    // One shutdown signal is shared by HTTP, optional Bolt, and the resident
+    // memory watchdog in both single- and multi-tenant modes. Starting the
+    // watchdog before namespace recovery lets it reclaim reconstructible
+    // state even when opening a large writer moves RSS without any request.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    if memory_max_bytes > 0 {
+        // Dropping a Tokio JoinHandle deliberately detaches the task; the
+        // shared shutdown receiver still terminates it cleanly.
+        drop(Arc::clone(&memory).spawn_watchdog(shutdown_rx.clone()));
+    }
 
     // Multi-tenant mode: create a registry and build the multi-tenant router.
     // The registry lazily creates WriterSessions per namespace on first access.
@@ -671,7 +794,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             maintenance,
         );
         let registry = Arc::new(registry);
-        let shared = SharedAppState::new(
+        let shared = SharedAppState::new_with_memory(
             registry,
             auth,
             metrics,
@@ -682,18 +805,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.write_stall_delay,
             config.memtable_flush_bytes,
             config.memtable_stall_bytes,
+            memory.clone(),
             config.writer_lock_timeout,
             config.default_namespace.clone(),
         )
         .with_authz(authz.clone());
         let app = build_multi_tenant_router(shared);
-
-        // Shutdown signal.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            wait_for_shutdown_signal().await;
-            let _ = shutdown_tx.send(true);
-        });
 
         // TLS on the serving path.
         let tls_config: Option<Arc<rustls::ServerConfig>> =
@@ -729,6 +846,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_query_row_cap(config.query_row_cap)
         .with_write_stall(config.write_stall_l0, config.write_stall_delay)
         .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
+        .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_slow_query_threshold(config.slow_query_threshold);
 
@@ -914,15 +1032,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Optional Bolt listener (binds an extra TCP port for native
     // Neo4j drivers — see RFC-022). When not configured we stay
     // HTTP-only.
-    // A single shutdown signal, flipped to `true` on SIGINT or SIGTERM, that
-    // both the HTTP server and the Bolt listener observe, so a `docker stop`
-    // or a Kubernetes pod termination drains cleanly instead of being killed.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
-
     // TLS on the serving path: when `--tls-cert` / `--tls-key` are set, both
     // the HTTP server and the Bolt listener speak TLS from one shared config;
     // otherwise the server stays plaintext.
@@ -1023,6 +1132,37 @@ async fn wait_for_shutdown_signal() {
 }
 
 // ── auth ──────────────────────────────────────────────────────────────
+
+/// Reject new private HTTP work before Axum materialises its JSON body.
+///
+/// This middleware is layered inside authentication, so invalid credentials
+/// are still rejected without disclosing process-pressure telemetry.
+async fn require_memory_admission(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    match state.memory.admit_query().await {
+        Ok(()) => next.run(req).await,
+        Err(pressure) => memory_pressure_observation(started, pressure).response,
+    }
+}
+
+/// Multi-tenant twin of [`require_memory_admission`]. It runs before namespace
+/// lookup, preventing a cold tenant from allocating a recovered writer after
+/// the process has reached its ceiling.
+async fn require_memory_admission_multi(
+    State(shared): State<SharedAppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    match shared.memory.admit_query().await {
+        Ok(()) => next.run(req).await,
+        Err(pressure) => memory_pressure_observation(started, pressure).response,
+    }
+}
 
 async fn require_auth_multi(
     State(shared): State<SharedAppState>,
@@ -1128,6 +1268,10 @@ fn exec_error_classification(
         // A unique-constraint violation is a client error (duplicate value), not
         // a server fault — surface it as 409 Conflict.
         ExecError::Constraint(_) => (StatusCode::CONFLICT, Some("constraint")),
+        ExecError::Storage(namidb_storage::Error::CacheCapacity { .. }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("search_index_cache_capacity"),
+        ),
         other if other.is_unsupported() => (StatusCode::BAD_REQUEST, Some("unsupported")),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
     }
@@ -1204,6 +1348,11 @@ struct HealthResponse {
     /// multi-tenant probe, which has no single gauge.
     #[serde(skip_serializing_if = "Option::is_none")]
     memtable_bytes: Option<usize>,
+    /// Process RSS/working-set telemetry. `memory_pressure` becomes true only
+    /// when a configured non-zero ceiling has actually been reached.
+    memory_resident_bytes: usize,
+    memory_max_bytes: usize,
+    memory_pressure: bool,
 }
 
 /// Build the health payload + status code from the published snapshot and
@@ -1216,17 +1365,23 @@ fn health_response(
     manifest: &Manifest,
     writer_health: &WriterHealth,
     memtable_bytes: Option<usize>,
+    memory: &memory::MemoryGovernor,
 ) -> Response {
     let writer_error = writer_health.degraded_reason();
-    let degraded = writer_error.is_some();
+    let writer_degraded = writer_error.is_some();
+    let memory_pressure = memory.over_limit();
+    let degraded = writer_degraded || memory_pressure;
     let body = HealthResponse {
         status: if degraded { "degraded" } else { "ok" },
         namespace,
         manifest_version: manifest.version,
         epoch: manifest.epoch.as_u64(),
-        writer: if degraded { "degraded" } else { "ok" },
+        writer: if writer_degraded { "degraded" } else { "ok" },
         writer_error,
         memtable_bytes,
+        memory_resident_bytes: memory.resident_bytes(),
+        memory_max_bytes: memory.max_bytes(),
+        memory_pressure,
     };
     let code = if degraded {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1253,6 +1408,7 @@ async fn livez() -> impl IntoResponse {
 /// reopen has not yet landed turns the probe 503 so writes are not routed
 /// to a server that can only fail them.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let _ = state.memory.sample();
     let owned = state.snapshot.load();
     let m = &owned.manifest().manifest;
     health_response(
@@ -1264,6 +1420,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 .memtable_bytes_gauge
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        &state.memory,
     )
 }
 
@@ -1284,12 +1441,13 @@ async fn version() -> impl IntoResponse {
 /// exposition format. Unauthenticated, like the health probes, so a scraper
 /// needs no bearer token.
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let _ = state.memory.sample();
     (
         [(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
         )],
-        state.metrics.render(),
+        state.metrics.render_with_memory(&state.memory),
     )
 }
 
@@ -1338,6 +1496,28 @@ struct ObservedQuery {
     ok: bool,
     elapsed: Duration,
     response: Response,
+}
+
+fn memory_pressure_observation(
+    started: std::time::Instant,
+    pressure: memory::MemoryPressure,
+) -> ObservedQuery {
+    ObservedQuery {
+        kind: None,
+        ok: false,
+        elapsed: started.elapsed(),
+        response: (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: format!(
+                    "process memory pressure: resident {} bytes reached configured maximum {} \
+                     bytes; reconstructible caches were reclaimed, retry after memory falls",
+                    pressure.resident_bytes, pressure.max_bytes
+                ),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 fn namespace_retired_observation(started: std::time::Instant) -> ObservedQuery {
@@ -2395,11 +2575,24 @@ async fn admin_flush(
         )
             .into_response();
     }
+
+    // The storage flush owns an RAII restore guard from `memtable.freeze()`
+    // until manifest success. A disconnected client therefore cancels this
+    // future safely and, unlike a detached task, cannot leave an unbounded
+    // queue of hidden flush waiters behind the process-wide semaphore.
+    run_admin_flush(state).await
+}
+
+async fn run_admin_flush(state: AppState) -> Response {
+    let _flush_permit = state.memory.admin_flush_permit().await;
     let mut w = state.writer.lock().await;
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
         Ok(outcome) => {
             state.snapshot.store(w.owned_snapshot());
+            state
+                .memtable_bytes_gauge
+                .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
             Json(FlushResponse {
                 ssts_written: outcome.ssts_written,
                 bloom_sidecars_written: outcome.bloom_sidecars_written,
@@ -2454,11 +2647,29 @@ async fn health_multi_unprefixed(
 }
 
 async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Response {
+    let _ = shared.memory.sample();
+    if shared.memory.over_limit() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: format!(
+                    "process memory pressure: resident {} bytes reached configured maximum {} \
+                     bytes; namespace health work is paused until memory falls",
+                    shared.memory.resident_bytes(),
+                    shared.memory.max_bytes()
+                ),
+            }),
+        )
+            .into_response();
+    }
     match shared.registry.get_or_open(&namespace).await {
         Ok(ns_state) => {
+            // Opening/recovery can itself move RSS over the limit. Refresh the
+            // gauge so readiness reports that immediately.
+            let _ = shared.memory.sample();
             let owned = ns_state.snapshot.load();
             let m = &owned.manifest().manifest;
-            health_response(namespace, m, &ns_state.writer_health, None)
+            health_response(namespace, m, &ns_state.writer_health, None, &shared.memory)
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2906,16 +3117,45 @@ async fn dispatch_admin_flush_multi(
         )
             .into_response();
     }
-    let ns_state = match shared.registry.get_or_open(namespace).await {
-        Ok(ns) => ns,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
+
+    run_admin_flush_multi(shared.clone(), namespace.to_string()).await
+}
+
+async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Response {
+    let _flush_permit = shared.memory.admin_flush_permit().await;
+    // Refresh the gauge because this route intentionally bypasses query
+    // admission. At the hard limit, only an already-open namespace can own a
+    // memtable worth flushing; recovering a cold one would allocate memory
+    // while providing no relief.
+    let _ = shared.memory.sample();
+    let ns_state = if shared.memory.over_limit() {
+        match shared.registry.get_if_open(&namespace).await {
+            Some(ns) => ns,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: format!(
+                            "process memory pressure: namespace '{namespace}' is not open; \
+                             refusing to recover a cold writer for admin flush"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match shared.registry.get_or_open(&namespace).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
         }
     };
     let mut w = ns_state.writer.lock().await;
@@ -2959,12 +3199,13 @@ async fn dispatch_admin_flush_multi(
 
 /// Prometheus metrics handler in multi-tenant mode.
 async fn metrics_handler_multi(State(shared): State<SharedAppState>) -> impl IntoResponse {
+    let _ = shared.memory.sample();
     (
         [(
             axum::http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
         )],
-        shared.metrics.render(),
+        shared.metrics.render_with_memory(&shared.memory),
     )
 }
 
@@ -3129,6 +3370,23 @@ mod tests {
         build_router(state)
     }
 
+    #[test]
+    fn search_index_capacity_is_retryable_http_503() {
+        let error = namidb_query::exec::ExecError::Storage(namidb_storage::Error::CacheCapacity {
+            index_kind: "vector",
+            path: "tenants/test/sst/search.vg".into(),
+            required_bytes: 8_000,
+            capacity_bytes: 4_000,
+        });
+        assert_eq!(
+            exec_error_classification(&error),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("search_index_cache_capacity")
+            )
+        );
+    }
+
     /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the
     /// real `--auth-tokens-file` path), exercising per-token roles.
     async fn fixture_with_tokens(ns: &str, tokens_json: &str) -> Router {
@@ -3202,6 +3460,74 @@ mod tests {
         let app = fixture(None).await;
         let resp = post_cypher(&app, None, "MATCH (n) RETURN n").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn memory_admission_rejects_before_json_but_keeps_admin_flush_available() {
+        let (store, paths) = namidb_storage::parse_uri("memory://memory-pre-extractor").unwrap();
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        writer
+            .upsert_node(
+                "Pressure",
+                namidb_core::id::NodeId::new(),
+                &namidb_storage::NodeWriteRecord {
+                    properties: std::collections::BTreeMap::new(),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert!(writer.memtable_bytes() > 0);
+        let before_version = writer.manifest_version();
+        // One byte is deliberately below the resident set of this test
+        // process, making the real sampler deterministic without a mock-only
+        // admission path.
+        let governor = Arc::new(memory::MemoryGovernor::new(1));
+        let state = AppState::new(writer, None, "memory-test".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let app = build_router(state.clone());
+
+        // Malformed JSON would be a 400 if the handler's Json extractor ran.
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Admin flush is the authenticated escape hatch: it bypasses new-work
+        // admission and drains the already-committed memtable.
+        let flush = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flush.status(), StatusCode::OK);
+        assert!(state.snapshot.manifest_version() > before_version);
+        assert_eq!(
+            state
+                .memtable_bytes_gauge
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            governor.rejected_queries(),
+            1,
+            "watchdog/admin maintenance must not be counted as rejected queries"
+        );
     }
 
     const ROLE_TOKENS: &str = r#"{ "tokens": [
@@ -3735,8 +4061,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_flush_is_forbidden_for_a_read_only_token() {
+    async fn admin_flush_stays_authenticated_and_forbids_read_only_tokens() {
         let app = fixture_with_tokens("authz-flush", ROLE_TOKENS).await;
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
         let flush = |token: &'static str| {
             let app = app.clone();
             async move {
@@ -4412,7 +4751,7 @@ mod tests {
             metrics.clone(),
             registry::MaintenanceConfig::default(),
         ));
-        let shared = SharedAppState::new(
+        let shared = SharedAppState::new_with_memory(
             registry,
             Arc::new(AuthConfig::open()),
             metrics,
@@ -4423,6 +4762,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Arc::new(memory::MemoryGovernor::new(0)),
             Duration::ZERO,
             default_ns.to_string(),
         );
@@ -4488,6 +4828,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_admission_does_not_open_a_cold_namespace() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-memory-cold").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let governor = Arc::new(memory::MemoryGovernor::new(1));
+        let shared = SharedAppState::new_with_memory(
+            Arc::clone(&registry),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::clone(&governor),
+            Duration::ZERO,
+            "default".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cold/v0/cypher")
+                    .header("content-type", "application/json")
+                    // Also proves admission precedes the namespace handler's
+                    // JSON extraction.
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            registry.is_empty().await,
+            "memory-rejected work must not recover/open a cold namespace"
+        );
+        assert_eq!(governor.rejected_queries(), 1);
+
+        let flush = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cold/v0/admin/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flush.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            registry.is_empty().await,
+            "pressure-relief flush must not recover a namespace with no live memtable"
+        );
+        assert_eq!(
+            governor.rejected_queries(),
+            1,
+            "admin maintenance is not a rejected query"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_flush_remains_available_for_an_open_namespace_under_pressure() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-memory-open-flush").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let ns = registry.get_or_open("active").await.unwrap();
+        {
+            let mut writer = ns.writer.lock().await;
+            writer
+                .upsert_node(
+                    "Pressure",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: std::collections::BTreeMap::new(),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+        }
+        let before_version = ns.snapshot.load().manifest_version();
+        let governor = Arc::new(memory::MemoryGovernor::new(1));
+        let shared = SharedAppState::new_with_memory(
+            Arc::clone(&registry),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::clone(&governor),
+            Duration::ZERO,
+            "default".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+
+        let flush = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/active/v0/admin/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flush.status(), StatusCode::OK);
+        assert!(ns.snapshot.load().manifest_version() > before_version);
+        assert_eq!(registry.len().await, 1);
+        assert_eq!(governor.rejected_queries(), 0);
+    }
+
     /// A request may clone a namespace state, finish planning, and queue on
     /// its writer before eviction retires that incarnation. It must
     /// revalidate only after the mutex becomes available and leave storage
@@ -4504,7 +4980,7 @@ mod tests {
             metrics.clone(),
             registry::MaintenanceConfig::default(),
         ));
-        let shared = SharedAppState::new(
+        let shared = SharedAppState::new_with_memory(
             Arc::clone(&registry),
             Arc::new(AuthConfig::open()),
             metrics,
@@ -4515,6 +4991,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Arc::new(memory::MemoryGovernor::new(0)),
             Duration::ZERO,
             "default".to_string(),
         );
@@ -4565,7 +5042,7 @@ mod tests {
             metrics.clone(),
             registry::MaintenanceConfig::default(),
         ));
-        let shared = SharedAppState::new(
+        let shared = SharedAppState::new_with_memory(
             registry,
             Arc::new(AuthConfig::open()),
             metrics,
@@ -4576,6 +5053,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Arc::new(memory::MemoryGovernor::new(0)),
             Duration::ZERO,
             "default".to_string(),
         );
@@ -4632,7 +5110,7 @@ mod tests {
             metrics.clone(),
             registry::MaintenanceConfig::default(),
         ));
-        let shared = SharedAppState::new(
+        let shared = SharedAppState::new_with_memory(
             registry,
             auth,
             metrics,
@@ -4643,6 +5121,7 @@ mod tests {
             Duration::ZERO,
             0,
             0,
+            Arc::new(memory::MemoryGovernor::new(0)),
             Duration::ZERO,
             default_ns.to_string(),
         );

@@ -2,15 +2,17 @@
 //!
 //! Defined by [RFC-002](../../../../../docs/rfc/002-sst-format.md) §3.
 //!
-//! Each flush emits **two** physical files per `(edge_type, level)` bucket:
-//! a **forward** SST (sorted by `src_id`) and an **inverse** SST (sorted by
-//! `dst_id`). Both share the same wire format, differentiated by
-//! `flags.INVERSE_PARTNER`.
+//! Each flush emits two authoritative physical files per `(edge_type, level)`
+//! bucket: a **forward** SST (sorted by `src_id`) and an **inverse** SST
+//! (sorted by `dst_id`). Both share the same wire format, differentiated by
+//! `flags.INVERSE_PARTNER`. Current forward SSTs may also carry a bounded,
+//! optional `.epidx` point accelerator; the CSR remains the authority.
 
 pub mod encoding;
 pub mod fence_index;
 pub mod format;
 pub mod inverse;
+pub(crate) mod point_index;
 pub mod reader;
 pub mod writer;
 

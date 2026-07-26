@@ -70,15 +70,14 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     let plan = apply_edge_count_pushdown(plan);
     let mut current = plan;
     for _ in 0..MAX_FIXPOINT_ROUNDS {
-        // RFC-pending: unique-property lookup rewrite runs FIRST so the
-        // downstream pushdowns (which assume NodeScan input) see the
-        // already-replaced point-lookup operator and don't re-introduce
-        // a Filter on top of it.
+        // Indexed equality runs first. Unique properties / elementId remain
+        // point lookups even under a KNN, while non-unique posting lookups are
+        // consumed by the vector rewrite below and become native pre-k filters.
         let unique_lookup = unique_lookup::apply_unique_property_lookup(current.clone(), catalog);
         // RFC-030 (`vector-index`): collapse a flat KNN shape into a
-        // VectorSearch when a backing index exists. Runs right after
-        // unique_lookup (also a NodeScan-shape rewrite) and before pushdown so
-        // the new leaf operator is visible to the column analysis.
+        // VectorSearch when a backing index exists. Runs after unique_lookup so
+        // point-selective filters keep their cheaper exact plan; the rewrite
+        // explicitly recognises non-unique NodeByPropertyValue leaves.
         #[cfg(feature = "vector-index")]
         let unique_lookup = vector_search::apply_vector_search(unique_lookup, catalog);
         let pushed = normalize_filters(predicate_pushdown(unique_lookup));

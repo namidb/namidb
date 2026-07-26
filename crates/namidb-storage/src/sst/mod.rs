@@ -12,6 +12,7 @@ pub mod bloom;
 pub mod edges;
 pub mod hll;
 pub mod nodes;
+pub(crate) mod paged_index;
 pub mod predicates;
 pub mod stats;
 #[cfg(feature = "text-index")]

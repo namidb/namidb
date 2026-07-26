@@ -379,6 +379,46 @@ async fn boot_bolt_tokens(
 }
 
 #[tokio::test]
+async fn bolt_search_vector_filter_map_is_public_and_applies_before_k() {
+    // Regression for the exact public/Bolt spelling. `YIELD node WHERE ...`
+    // is not the filter surface: the predicate belongs in search.vector's
+    // argument map, and must be applied before k so the farther live document
+    // is not starved by nearer excluded documents.
+    let (bolt_addr, task) = boot_bolt("bolt-vector-filter", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    for query in [
+        "CREATE (:Doc {title: 'near-dead', vigente: false, embedding: vector([1.0, 0.0])})",
+        "CREATE (:Doc {title: 'near-dead-2', vigente: false, embedding: vector([0.99, 0.01])})",
+        "CREATE (:Doc {title: 'far-live', vigente: true, embedding: vector([0.0, 1.0])})",
+    ] {
+        let _ = run_pull(&mut stream, query).await;
+    }
+
+    let (_, rows) = run_pull(
+        &mut stream,
+        "CALL search.vector({\
+             label: 'Doc', property: 'embedding', query: [1.0, 0.0], k: 1, \
+             filter: {vigente: true}\
+         }) YIELD node, score \
+         RETURN node.title AS title",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "filter must be accepted on the Bolt path");
+    assert_eq!(
+        rows[0].get("title"),
+        Some(&Value::String("far-live".into())),
+        "k=1 is taken after filtering, not before"
+    );
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
 async fn bolt_read_only_token_cannot_write() {
     let tokens = r#"{ "tokens": [
         { "name": "reader", "token": "rkey", "role": "read-only" },

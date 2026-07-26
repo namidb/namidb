@@ -52,6 +52,22 @@ pub enum Error {
     #[error("read query exceeded its deadline")]
     Timeout,
 
+    /// A valid monolithic search accelerator cannot fit inside the configured
+    /// decoded-index cache pool. This is intentionally not treated as
+    /// "index absent": silently selecting the exact O(corpus) fallback would
+    /// hide a production sizing error and can saturate the service.
+    #[error(
+        "{index_kind} index at {path} requires an estimated {required_bytes} decoded bytes, \
+         but the shared search-index cache pool has {capacity_bytes} bytes; raise \
+         NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES and, if needed, NAMIDB_CACHE_MAX_BYTES"
+    )]
+    CacheCapacity {
+        index_kind: &'static str,
+        path: String,
+        required_bytes: usize,
+        capacity_bytes: usize,
+    },
+
     /// The expected manifest version does not exist yet.
     #[error("manifest version {0} not found")]
     ManifestNotFound(u64),

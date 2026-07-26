@@ -295,6 +295,20 @@ impl NodeViewCache {
         }
     }
 
+    /// Drop every cached node view while preserving counters and capacity.
+    ///
+    /// Cache contents are never authoritative, so process-level memory
+    /// pressure may call this without changing query semantics.
+    pub fn clear(&self) {
+        let inner = &mut *self.inner.lock().unwrap();
+        // `HashMap::clear` retains its peak bucket allocation. Memory-pressure
+        // reclamation must return that backing storage too, while the
+        // configured logical byte ceiling remains unchanged.
+        inner.map = HashMap::new();
+        inner.order = BTreeMap::new();
+        inner.used_bytes = 0;
+    }
+
     /// Count of entries whose key belongs to `namespace`. Observability +
     /// test probe for namespace isolation and [`Self::prune_namespace`].
     pub fn namespace_entries(&self, namespace: &str) -> usize {
@@ -548,6 +562,30 @@ mod tests {
             );
         }
         assert_eq!(c.namespace_entries("tenants/a"), 5);
+    }
+
+    #[test]
+    fn clear_releases_views_and_accounting_but_preserves_capacity() {
+        let c = NodeViewCache::new(1024 * 1024);
+        let key = NodeCacheKey::new(NS, 1, "Person", nid(1));
+        c.insert(key.clone(), Some(make_view("Alice")));
+        assert_eq!(c.entries(), 1);
+        assert!(c.used_bytes() > 0);
+        assert!(c.inner.lock().unwrap().map.capacity() > 0);
+
+        c.clear();
+        assert_eq!(c.entries(), 0);
+        assert_eq!(c.used_bytes(), 0);
+        assert_eq!(c.capacity_bytes(), 1024 * 1024);
+        assert_eq!(
+            c.inner.lock().unwrap().map.capacity(),
+            0,
+            "clear must release the HashMap bucket allocation"
+        );
+        assert!(c.get(&key).is_none());
+
+        c.insert(key.clone(), Some(make_view("Alice")));
+        assert!(c.get(&key).is_some());
     }
 
     #[test]

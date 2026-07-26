@@ -1,12 +1,13 @@
 [package]
 name = "namidb"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "NamiDB: cloud-native graph database — public façade crate"
+description = "NamiDB: cloud-native graph database workspace façade"
 readme = "README.md"
 
 [dependencies]

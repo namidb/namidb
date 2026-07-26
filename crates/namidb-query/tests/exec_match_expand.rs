@@ -77,6 +77,20 @@ fn person_city(name: &str, city: &str) -> NodeWriteRecord {
     }
 }
 
+fn indexed_legal_label() -> LabelDef {
+    LabelDef {
+        name: "Norma".into(),
+        properties: vec![
+            PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true),
+            PropertyDef::new("vigente", DataType::Bool, false)
+                .unwrap()
+                .with_indexed(true),
+        ],
+    }
+}
+
 fn edge() -> EdgeWriteRecord {
     EdgeWriteRecord {
         properties: BTreeMap::new(),
@@ -1650,6 +1664,532 @@ async fn indexed_property_match_uses_index_and_returns_all_matches() {
         got,
         vec!["Ann".to_string(), "Bob".to_string()],
         "both LA persons must come back, not the NYC one"
+    );
+}
+
+#[tokio::test]
+async fn indexed_boolean_property_uses_scalar_postings() {
+    let mut writer = WriterSession::open(store(), paths("exec-eqidx-bool"))
+        .await
+        .unwrap();
+    for i in 0..20 {
+        writer
+            .upsert_node(
+                "Norma",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(format!("n-{i:03}"))),
+                        ("vigente".into(), CoreValue::Bool(i % 3 != 0)),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(
+            SchemaBuilder::new()
+                .label(indexed_legal_label())
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(
+        lower(
+            &parse(
+                "MATCH (n:Norma) WHERE n.vigente = true \
+                 RETURN n.key AS key ORDER BY key",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        &catalog,
+    );
+    assert!(
+        explain(&plan).contains("NodeByPropertyValue"),
+        "the boolean equality predicate must use the secondary index"
+    );
+    let lookups = writer.property_index_cache().equality_lookup_calls();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 13);
+    assert_eq!(
+        writer.property_index_cache().equality_lookup_calls() - lookups,
+        1,
+        "one boolean predicate must perform one posting-list lookup"
+    );
+    assert!(rows.iter().all(|row| {
+        matches!(
+            row.get("key"),
+            Some(RuntimeValue::String(key)) if !matches!(key.as_str(), "n-000" | "n-003" | "n-006" | "n-009" | "n-012" | "n-015" | "n-018")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn indexed_boolean_limit_confirms_only_requested_prefix() {
+    let mut writer = WriterSession::open(store(), paths("exec-eqidx-bool-limit"))
+        .await
+        .unwrap();
+    for i in 0..1_000 {
+        writer
+            .upsert_node(
+                "Norma",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(format!("n-{i:04}"))),
+                        ("vigente".into(), CoreValue::Bool(true)),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(
+            SchemaBuilder::new()
+                .label(indexed_legal_label())
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(
+        lower(
+            &parse(
+                "MATCH (n:Norma) WHERE n.vigente = true \
+                 RETURN n.key AS key LIMIT 5",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        &catalog,
+    );
+    assert!(
+        explain(&plan).contains("NodeByPropertyValue"),
+        "the boolean equality predicate must use the secondary index"
+    );
+
+    let confirmations = writer
+        .property_index_cache()
+        .equality_confirmation_candidates();
+    let iterated = writer.property_index_cache().equality_candidates_iterated();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(
+        writer.property_index_cache().equality_candidates_iterated() - iterated,
+        5,
+        "LIMIT 5 must consume five posting ids, not union all 1,000 first"
+    );
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .equality_confirmation_candidates()
+            - confirmations,
+        5,
+        "LIMIT 5 must confirm five postings, not materialise all 1,000"
+    );
+
+    let iterated = writer.property_index_cache().equality_candidates_iterated();
+    let confirmations = writer
+        .property_index_cache()
+        .equality_confirmation_candidates();
+    assert!(
+        snapshot
+            .indexed_node_ids_by_property_value_capped(
+                "Norma",
+                "vigente",
+                &CoreValue::Bool(true),
+                10,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "an oversized posting must select the caller's fallback"
+    );
+    assert_eq!(
+        writer.property_index_cache().equality_candidates_iterated(),
+        iterated,
+        "candidate cap must reject before walking the posting"
+    );
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .equality_confirmation_candidates(),
+        confirmations,
+        "candidate cap must reject before hydrating nodes"
+    );
+}
+
+#[tokio::test]
+async fn indexed_string_order_positions_before_skip() {
+    let mut writer = WriterSession::open(store(), paths("exec-index-order"))
+        .await
+        .unwrap();
+    for i in 0..200 {
+        writer
+            .upsert_node(
+                "Norma",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(format!("n-{i:04}"))),
+                        ("vigente".into(), CoreValue::Bool(true)),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(
+            SchemaBuilder::new()
+                .label(indexed_legal_label())
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+
+    let prefix = snapshot
+        .ordered_node_ids_by_string_property("Norma", "key", 110)
+        .await
+        .unwrap()
+        .expect("the complete key sidecar must serve the ordered prefix");
+    assert_eq!(prefix.len(), 110);
+
+    let plan = lower(
+        &parse(
+            "MATCH (n:Norma) RETURN n.key AS key \
+             ORDER BY n.key SKIP 100 LIMIT 10",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let ordered_calls = writer.property_index_cache().ordered_prefix_calls();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(
+        writer.property_index_cache().ordered_prefix_calls() - ordered_calls,
+        1,
+        "TopN must position through the ordered equality index"
+    );
+    let keys: Vec<&str> = rows
+        .iter()
+        .map(|row| match row.get("key") {
+            Some(RuntimeValue::String(key)) => key.as_str(),
+            other => panic!("unexpected ordered key: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        (100..110).map(|i| format!("n-{i:04}")).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn count_by_label_uses_exact_metadata_only_when_authoritative() {
+    let mut writer = WriterSession::open(store(), paths("exec-label-count-meta"))
+        .await
+        .unwrap();
+    for i in 0..40 {
+        writer
+            .upsert_node(
+                "Norma",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(format!("n-{i:04}"))),
+                        ("vigente".into(), CoreValue::Bool(true)),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    assert_eq!(
+        writer.snapshot().metadata_node_count(Some("Norma")),
+        None,
+        "an unflushed memtable must disable additive metadata"
+    );
+    writer
+        .flush(
+            SchemaBuilder::new()
+                .label(indexed_legal_label())
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+    writer.property_index_cache().reset();
+    let snapshot = writer.snapshot();
+    assert_eq!(snapshot.metadata_node_count(Some("Norma")), Some(40));
+
+    let plan = lower(&parse("MATCH (n:Norma) RETURN count(*) AS total").unwrap()).unwrap();
+    let scans = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("total"), Some(&RuntimeValue::Integer(40)));
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans(),
+        scans,
+        "authoritative manifest metadata must avoid a reconciliation scan"
+    );
+}
+
+#[tokio::test]
+async fn exact_node_counts_follow_committed_label_deltas() {
+    let mut writer = WriterSession::open(store(), paths("exec-label-count-deltas"))
+        .await
+        .unwrap();
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let c = NodeId::new();
+    let d = NodeId::new();
+    let record = |key: &str| NodeWriteRecord {
+        properties: BTreeMap::from([
+            ("key".into(), CoreValue::Str(key.to_string())),
+            ("vigente".into(), CoreValue::Bool(true)),
+        ]),
+        schema_version: 1,
+        ..Default::default()
+    };
+
+    writer
+        .upsert_node_with_labels(vec!["Norma".into(), "Laboral".into()], a, &record("a"))
+        .unwrap();
+    writer.upsert_node("Norma", b, &record("b")).unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let memtable_scans = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.metadata_node_count(Some("Norma")), None);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 2);
+        let plan = lower(&parse("MATCH (n:Norma) RETURN count(*) AS total").unwrap()).unwrap();
+        let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+        assert_eq!(rows[0].get("total"), Some(&RuntimeValue::Integer(2)));
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans(),
+        memtable_scans,
+        "committed memtable count(*) must use writer deltas, not scan"
+    );
+
+    let mut schema = SchemaBuilder::new();
+    for name in ["Norma", "Laboral", "Derogada"] {
+        let mut label = indexed_legal_label();
+        label.name = name.to_string();
+        schema = schema.label(label).unwrap();
+    }
+    let schema = schema.build();
+    writer.flush(schema.clone()).await.unwrap();
+
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 0);
+    }
+    let scans = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    assert_eq!(
+        scans, 0,
+        "fresh committed memtable counts must derive from writer deltas"
+    );
+
+    // A normal incremental property update rewrites the full node record but
+    // keeps its label set. It must advance the snapshot generation without
+    // changing cardinality or triggering a reconciliation.
+    writer
+        .upsert_node("Norma", b, &record("b-updated"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 1);
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans(),
+        scans
+    );
+
+    // One commit combines relabel, delete, and create. The count cache must
+    // move to the new generation by exact old/new label deltas.
+    writer
+        .upsert_node_with_labels(vec!["Derogada".into()], a, &record("a"))
+        .unwrap();
+    writer.tombstone_node("Norma", b).unwrap();
+    writer
+        .upsert_node_with_labels(vec!["Norma".into(), "Laboral".into()], c, &record("c"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 1);
+
+        let plan = lower(&parse("MATCH (n:Norma) RETURN count(*) AS total").unwrap()).unwrap();
+        let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+        assert_eq!(
+            rows[0].get("total"),
+            Some(&RuntimeValue::Integer(1)),
+            "the Cypher aggregate must consume the writer's exact generation count"
+        );
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans(),
+        scans,
+        "a durable node commit must carry warm exact counts by delta"
+    );
+
+    // Rolled-back labels never advance the generation or alter published
+    // cardinalities.
+    let generation = writer.property_index_cache().generation();
+    writer.tombstone_node("Derogada", a).unwrap();
+    writer.upsert_node("Norma", d, &record("d")).unwrap();
+    assert_eq!(writer.discard_batch(), 2);
+    assert_eq!(writer.property_index_cache().generation(), generation);
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 1);
+    }
+
+    // Reopen intentionally starts with an empty bounded cache. The recovered
+    // overlapping WAL/memtable view reconciles once, then all label counts
+    // reuse that one exact vector.
+    writer.reopen().await.unwrap();
+    let reopened_scans = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 1);
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans()
+            - reopened_scans,
+        1,
+        "WAL recovery reconciles once and caches every label count together"
+    );
+
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+        assert_eq!(
+            writer
+                .property_index_cache()
+                .node_count_reconciliation_scans()
+                - reopened_scans,
+            1,
+            "a second snapshot of the recovered memtable must be O(1)"
+        );
+    }
+
+    // Moving the recovered memtable into a new overlapping SST is
+    // representation-only: the warm logical counters survive unchanged.
+    let scans_before_flush = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    writer.flush(schema).await.unwrap();
+    {
+        let snapshot = writer.snapshot();
+        assert!(
+            snapshot.metadata_node_count(None).is_none(),
+            "the old and replacement node SST key ranges intentionally overlap"
+        );
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans(),
+        scans_before_flush,
+        "flush must carry exact logical counts across physical SST overlap"
+    );
+
+    // A cold reopen cannot add overlapping physical summaries. It reconciles
+    // once, after which a committed create+relabel+delete advances the exact
+    // vector without another corpus scan.
+    writer.reopen().await.unwrap();
+    let overlap_scans = writer
+        .property_index_cache()
+        .node_count_reconciliation_scans();
+    {
+        let snapshot = writer.snapshot();
+        assert!(snapshot.metadata_node_count(None).is_none());
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 1);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 1);
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans()
+            - overlap_scans,
+        1
+    );
+
+    writer.upsert_node("Norma", a, &record("a")).unwrap();
+    writer.tombstone_node("Norma", c).unwrap();
+    writer.upsert_node("Norma", d, &record("d")).unwrap();
+    writer.commit_batch().await.unwrap();
+    {
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Norma")).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Laboral")).await.unwrap(), 0);
+        assert_eq!(snapshot.count_nodes(Some("Derogada")).await.unwrap(), 0);
+    }
+    assert_eq!(
+        writer
+            .property_index_cache()
+            .node_count_reconciliation_scans()
+            - overlap_scans,
+        1,
+        "committed writes after overlap reconciliation must remain O(1)"
     );
 }
 

@@ -105,10 +105,10 @@ struct Cli {
     )]
     compaction_interval: Duration,
 
-    /// Minimum age an orphaned SST body must reach before the sweep may
-    /// delete it. This is the only guard against removing a file a slow
-    /// reader's pinned snapshot still references, so keep it comfortably
-    /// above the longest expected query/snapshot lifetime.
+    /// Minimum age an unreachable SST/manifest/pointer/WAL object must reach
+    /// before the sweep may delete it. Live readers are protected separately
+    /// by the exact retention horizon; this age is the secondary guard for an
+    /// uploaded body whose manifest/pointer CAS has not landed yet.
     #[arg(
         long,
         env = "NAMIDB_SWEEP_MIN_AGE",
@@ -117,11 +117,11 @@ struct Cli {
     )]
     sweep_min_age: Duration,
 
-    /// Delete orphaned SST bodies during the sweep. On by default: the
-    /// retention horizon (RFC-027) makes deletion safe by construction (an
-    /// object referenced by no manifest version from the horizon to current
-    /// is unreachable by any reader). Set to `false` for a dry-run that only
-    /// logs what it would free.
+    /// Delete unreachable immutable bodies, WALs, manifests, and pointers
+    /// during the sweep. On by default: the retention horizon (RFC-027) makes
+    /// deletion safe by construction (an object referenced by no manifest
+    /// version from the horizon to current is unreachable by any reader).
+    /// Set to `false` for a dry-run that only logs what it would free.
     #[arg(
         long,
         env = "NAMIDB_SWEEP_DELETE",
@@ -227,6 +227,18 @@ struct Cli {
         default_value_t = 256 * 1024 * 1024
     )]
     memtable_stall_bytes: usize,
+
+    /// Process resident-memory/working-set ceiling in exact bytes. At 90%
+    /// NamiDB clears reconstructible caches; at the ceiling new Cypher work
+    /// receives a retryable 503/Bolt transient error until RSS falls below
+    /// the limit. This complements (and is broader than)
+    /// NAMIDB_CACHE_MAX_BYTES. `0` disables total-memory admission.
+    #[arg(
+        long,
+        env = "NAMIDB_MEMORY_MAX_BYTES",
+        default_value_t = namidb_server::memory::DEFAULT_MEMORY_MAX_BYTES
+    )]
+    memory_max_bytes: usize,
 
     /// Bound on how long a foreground request (write, DDL, admin flush, Bolt
     /// BEGIN) may wait for the writer lock before failing fast with 503, so
@@ -347,5 +359,8 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(namidb_server::run(config))
+    rt.block_on(namidb_server::run_with_memory_max_bytes(
+        config,
+        cli.memory_max_bytes,
+    ))
 }

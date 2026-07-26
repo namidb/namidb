@@ -23,7 +23,7 @@
 //! - Legacy per-tier budgets are scaled under the process-wide
 //! `NAMIDB_CACHE_MAX_BYTES` ceiling before the shared cache is constructed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -31,6 +31,8 @@ use arrow_array::RecordBatch;
 use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
 use parquet::file::metadata::ParquetMetaData;
+
+use namidb_core::Value;
 
 use crate::cache_budget::{legacy_budget_bytes, shared_cache_capacities, CacheCapacities};
 use crate::sst::bloom::BloomFilter;
@@ -108,6 +110,56 @@ pub type UniquePropertySidecar = BTreeMap<String, [u8; 16]>;
 
 /// Decoded non-unique equality sidecar (`value -> posting list`).
 pub type EqualityPropertySidecar = BTreeMap<String, Vec<[u8; 16]>>;
+
+/// Canonical key used by scalar-v1 equality posting sidecars.
+///
+/// String keys deliberately retain the legacy raw representation. That keeps
+/// sidecars written by a new server safe for rolling upgrades and rollback:
+/// a 2.0.4 reader ignores the new manifest encoding field, but can still probe
+/// every String value correctly. Non-String scalars use tagged encodings.
+///
+/// A raw String such as `"b:1"` can consequently share a posting with the
+/// tagged Bool `true`. Equality and ordered readers always hydrate and confirm
+/// candidates against the current typed value, so the collision only adds a
+/// conservative candidate; it cannot produce a false result.
+pub fn encode_equality_property_value(value: &Value) -> Option<String> {
+    let mut out = String::new();
+    match value {
+        Value::Str(s) => out.push_str(s),
+        Value::Bool(v) => out.push_str(if *v { "b:1" } else { "b:0" }),
+        Value::I64(v) => {
+            use std::fmt::Write as _;
+            write!(&mut out, "i:{:016x}", (*v as u64) ^ (1_u64 << 63)).ok()?;
+        }
+        Value::F64(v) if !v.is_nan() => {
+            let normalized = if *v == 0.0 { 0.0 } else { *v };
+            use std::fmt::Write as _;
+            write!(&mut out, "f:{:016x}", normalized.to_bits()).ok()?;
+        }
+        Value::Bytes(bytes) => {
+            use std::fmt::Write as _;
+            out.push_str("x:");
+            for byte in bytes {
+                write!(&mut out, "{byte:02x}").ok()?;
+            }
+        }
+        Value::Date(v) => {
+            use std::fmt::Write as _;
+            write!(&mut out, "d:{:08x}", (*v as u32) ^ (1_u32 << 31)).ok()?;
+        }
+        Value::DateTime(v) => {
+            use std::fmt::Write as _;
+            write!(&mut out, "t:{:016x}", (*v as u64) ^ (1_u64 << 63)).ok()?;
+        }
+        Value::Null
+        | Value::F64(_)
+        | Value::Vec(_)
+        | Value::VecI8 { .. }
+        | Value::List(_)
+        | Value::Map(_) => return None,
+    }
+    Some(out)
+}
 
 #[derive(Debug, Clone)]
 enum DecodedPropertySidecar {
@@ -206,6 +258,7 @@ fn bloom_filter_weight(key: &str, filter: &Arc<BloomFilter>) -> usize {
 }
 
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[derive(Debug)]
 struct WeightedArc<T> {
     value: Arc<T>,
     estimated_bytes: usize,
@@ -216,16 +269,46 @@ fn weighted_arc_weight<T>(key: &str, value: &WeightedArc<T>) -> usize {
     key.len().saturating_add(value.estimated_bytes)
 }
 
+/// Vector and full-text accelerators share one eviction pool. They are both
+/// monolithic decoded indexes and compete for the same bounded memory; keeping
+/// separate Foyer instances made a free text allocation unusable by vector
+/// search (and vice versa).
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[derive(Debug)]
+enum CachedSearchIndex {
+    #[cfg(feature = "text-index")]
+    Text(WeightedArc<crate::sst::text::TextIndex>),
+    #[cfg(feature = "vector-index")]
+    Vector(WeightedArc<crate::sst::vector::VectorGraphIndex>),
+}
+
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+fn cached_search_index_weight(key: &str, value: &CachedSearchIndex) -> usize {
+    match value {
+        #[cfg(feature = "text-index")]
+        CachedSearchIndex::Text(value) => weighted_arc_weight(key, value),
+        #[cfg(feature = "vector-index")]
+        CachedSearchIndex::Vector(value) => weighted_arc_weight(key, value),
+    }
+}
+
+/// Capacity refusal returned before a monolithic search index is decoded.
+/// The query layer turns this into a typed storage error instead of silently
+/// selecting an O(corpus) flat scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchIndexCapacityError {
+    pub required_bytes: usize,
+    pub capacity_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DecodedCacheBudgets {
     metadata_bytes: usize,
     edge_stream_bytes: usize,
     edge_reader_bytes: usize,
     bloom_bytes: usize,
-    #[cfg(feature = "text-index")]
-    text_index_bytes: usize,
-    #[cfg(feature = "vector-index")]
-    vector_index_bytes: usize,
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    search_index_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -246,10 +329,8 @@ impl SstCacheBudgets {
             .saturating_add(self.decoded.edge_stream_bytes)
             .saturating_add(self.decoded.edge_reader_bytes)
             .saturating_add(self.decoded.bloom_bytes);
-        #[cfg(feature = "text-index")]
-        let base = base.saturating_add(self.decoded.text_index_bytes);
-        #[cfg(feature = "vector-index")]
-        let base = base.saturating_add(self.decoded.vector_index_bytes);
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        let base = base.saturating_add(self.decoded.search_index_bytes);
         base
     }
 }
@@ -273,16 +354,23 @@ impl DecodedCacheBudgets {
                 "NAMIDB_BLOOM_FILTER_CACHE_BUDGET_MIB",
                 DEFAULT_BLOOM_FILTER_CACHE_BUDGET_MIB,
             ),
-            #[cfg(feature = "text-index")]
-            text_index_bytes: legacy_budget_bytes(
-                "NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB",
-                DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB,
-            ),
-            #[cfg(feature = "vector-index")]
-            vector_index_bytes: legacy_budget_bytes(
-                "NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB",
-                DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
-            ),
+            #[cfg(any(feature = "text-index", feature = "vector-index"))]
+            search_index_bytes: (if cfg!(feature = "text-index") {
+                legacy_budget_bytes(
+                    "NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB",
+                    DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB,
+                )
+            } else {
+                0
+            })
+            .saturating_add(if cfg!(feature = "vector-index") {
+                legacy_budget_bytes(
+                    "NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB",
+                    DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
+                )
+            } else {
+                0
+            }),
         }
     }
 
@@ -292,10 +380,8 @@ impl DecodedCacheBudgets {
             edge_stream_bytes: capacities.edge_stream_bytes,
             edge_reader_bytes: capacities.edge_reader_bytes,
             bloom_bytes: capacities.bloom_filter_bytes,
-            #[cfg(feature = "text-index")]
-            text_index_bytes: capacities.text_index_bytes,
-            #[cfg(feature = "vector-index")]
-            vector_index_bytes: capacities.vector_index_bytes,
+            #[cfg(any(feature = "text-index", feature = "vector-index"))]
+            search_index_bytes: capacities.search_index_bytes,
         }
     }
 
@@ -306,10 +392,8 @@ impl DecodedCacheBudgets {
             edge_stream_bytes: bytes,
             edge_reader_bytes: bytes,
             bloom_bytes: bytes,
-            #[cfg(feature = "text-index")]
-            text_index_bytes: bytes,
-            #[cfg(feature = "vector-index")]
-            vector_index_bytes: bytes,
+            #[cfg(any(feature = "text-index", feature = "vector-index"))]
+            search_index_bytes: bytes,
         }
     }
 }
@@ -339,6 +423,42 @@ fn metadata_weight(key: &str, value: &Arc<ParquetMetaData>) -> usize {
 
 fn fits_capacity(capacity_bytes: usize, weight: usize) -> bool {
     capacity_bytes > 0 && weight <= capacity_bytes
+}
+
+#[cfg(feature = "text-index")]
+fn text_index_estimated_weight(key: &str, wire_bytes: usize, doc_count: usize) -> usize {
+    // Bincode's wire body is a stable lower bound. A 6x multiplier
+    // conservatively covers BTree/posting Vec allocator overhead and the
+    // separately sorted id copy. The independent per-document floor protects
+    // malformed/legacy descriptors whose serialized size understates the
+    // decoded object.
+    key.len().saturating_add(
+        wire_bytes
+            .saturating_mul(6)
+            .max(doc_count.saturating_mul(512))
+            .max(std::mem::size_of::<crate::sst::text::TextIndex>()),
+    )
+}
+
+#[cfg(feature = "vector-index")]
+fn vector_index_estimated_weight(
+    key: &str,
+    wire_bytes: usize,
+    point_count: usize,
+    dim: usize,
+) -> usize {
+    // Decode retains the serialized graph's vectors/adjacency and builds a
+    // second navigation-space vector set. Six wire copies is conservative for
+    // normal Vamana degree; the independent corpus-shape estimate protects the
+    // no-body-cache path and, importantly, is used both before and after
+    // decode so an admitted miss cannot turn into an uncached decode loop.
+    let per_point = dim.saturating_mul(8).saturating_add(512);
+    key.len().saturating_add(
+        wire_bytes
+            .saturating_mul(6)
+            .max(point_count.saturating_mul(per_point))
+            .max(std::mem::size_of::<crate::sst::vector::VectorGraphIndex>()),
+    )
 }
 
 /// Read `NAMIDB_SST_CACHE` and return `false` only for `"0"`. Default
@@ -442,18 +562,123 @@ struct CachePathRegistry {
     /// Normalized namespace prefix (always trailing `/`) -> absolute live
     /// object paths from the latest manifest this process observed.
     live_by_namespace: HashMap<String, HashSet<String>>,
+    /// Recently-evicted namespaces reject cache insertions from decodes that
+    /// started before eviction. This is deliberately separate from
+    /// `live_by_namespace`: an empty live set is normal for a newly-opened
+    /// namespace, while an eviction is a deny-all admission rule.
+    denied_namespaces: HashSet<String>,
+    /// FIFO for authoritative empty-manifest live rules. Embedded callers can
+    /// open and drop arbitrarily many fresh namespaces without a registry
+    /// eviction callback, so these guards need the same bounded-lateness
+    /// contract as eviction tombstones.
+    empty_live_order: VecDeque<String>,
+    /// FIFO order for the bounded deny set. Namespace eviction is a cold
+    /// control-plane path, so FIFO gives deterministic O(1) admission without
+    /// adding an LRU dependency to every cache miss.
+    denied_order: VecDeque<String>,
 }
+
+const MAX_DENIED_CACHE_NAMESPACES: usize = 4096;
+// Bounds metadata even for embedded callers that do not use NamespaceRegistry.
+const MAX_EMPTY_LIVE_NAMESPACES: usize = 4096;
 
 impl CachePathRegistry {
     fn admits(&self, path: &str) -> bool {
+        // Every engine-owned cache path is `<namespace-prefix>/sst/...`.
+        // Recover the normalized prefix as a borrowed slice so the hot path
+        // performs two hash probes without allocating or walking up to 4096
+        // eviction tombstones. `rfind` tolerates a custom root containing an
+        // earlier segment named `sst`.
+        if let Some(prefix) = canonical_namespace_prefix(path) {
+            if self.denied_namespaces.contains(prefix) {
+                return false;
+            }
+            if let Some(live) = self.live_by_namespace.get(prefix) {
+                return live.contains(path);
+            }
+        }
+
         // Namespace prefixes should not overlap, but choosing the longest
-        // match makes the rule deterministic for custom embedded layouts.
-        self.live_by_namespace
+        // match keeps non-canonical custom embedded layouts deterministic.
+        let live = self
+            .live_by_namespace
             .iter()
             .filter(|(prefix, _)| path.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .is_none_or(|(_, live)| live.contains(path))
+            .max_by_key(|(prefix, _)| prefix.len());
+        let denied = self
+            .denied_namespaces
+            .iter()
+            .filter(|prefix| path.starts_with(prefix.as_str()))
+            .max_by_key(|prefix| prefix.len());
+        match (live, denied) {
+            (None, None) => true,
+            (Some((_, live)), None) => live.contains(path),
+            (None, Some(_)) => false,
+            (Some((live_prefix, live)), Some(denied_prefix)) => {
+                live_prefix.len() > denied_prefix.len() && live.contains(path)
+            }
+        }
     }
+
+    fn allow_namespace(&mut self, prefix: &str, live: &HashSet<String>) {
+        if self.denied_namespaces.remove(prefix) {
+            self.denied_order.retain(|denied| denied != prefix);
+        }
+        // Empty is an authoritative manifest live set, not "no rule". It
+        // occurs both on a fresh namespace and after compaction GCs the final
+        // tombstone. Retaining it prevents a decode begun against the previous
+        // manifest from repopulating an obsolete body after that transition.
+        // The first flush publishes its non-empty live set before any later
+        // read can cache the new immutable object.
+        if live.is_empty() {
+            if !self
+                .live_by_namespace
+                .get(prefix)
+                .is_some_and(HashSet::is_empty)
+            {
+                self.empty_live_order.retain(|empty| empty != prefix);
+                self.empty_live_order.push_back(prefix.to_string());
+            }
+        } else {
+            self.empty_live_order.retain(|empty| empty != prefix);
+        }
+        self.live_by_namespace
+            .insert(prefix.to_string(), live.clone());
+        while self.empty_live_order.len() > MAX_EMPTY_LIVE_NAMESPACES {
+            let Some(expired) = self.empty_live_order.pop_front() else {
+                break;
+            };
+            if self
+                .live_by_namespace
+                .get(&expired)
+                .is_some_and(HashSet::is_empty)
+            {
+                self.live_by_namespace.remove(&expired);
+            }
+        }
+    }
+
+    fn deny_namespace(&mut self, prefix: String) {
+        self.live_by_namespace.remove(&prefix);
+        self.empty_live_order.retain(|empty| empty != &prefix);
+        if self.live_by_namespace.is_empty() {
+            self.live_by_namespace.shrink_to_fit();
+        }
+        if self.denied_namespaces.insert(prefix.clone()) {
+            self.denied_order.push_back(prefix);
+        }
+        while self.denied_namespaces.len() > MAX_DENIED_CACHE_NAMESPACES {
+            let Some(expired) = self.denied_order.pop_front() else {
+                break;
+            };
+            self.denied_namespaces.remove(&expired);
+        }
+    }
+}
+
+fn canonical_namespace_prefix(path: &str) -> Option<&str> {
+    let marker = path.rfind("/sst/")?;
+    Some(&path[..=marker])
 }
 
 fn normalized_namespace_prefix(namespace_prefix: &str) -> String {
@@ -492,6 +717,33 @@ struct CacheStats {
     node_rg_hits: AtomicU64,
     node_rg_misses: AtomicU64,
     node_rg_inserts: AtomicU64,
+    /// Sparse node-id RowFilter probes and complete payload rows they
+    /// materialised. These distinguish the MERGE batch path from a hidden
+    /// full row-group decode in performance regressions.
+    node_sparse_filter_scans: AtomicU64,
+    node_sparse_filter_rows: AtomicU64,
+    /// Exact LIMIT pushdown over globally-disjoint node SSTs. These counters
+    /// distinguish a true lazy prefix scan from the legacy full scan followed
+    /// by `take(k)`.
+    node_limited_scan_fast_paths: AtomicU64,
+    node_limited_scan_fallbacks: AtomicU64,
+    node_limited_scan_decoded_rows: AtomicU64,
+    node_limited_scan_examined_rows: AtomicU64,
+    node_limited_scan_output_rows: AtomicU64,
+    node_limited_scan_row_groups: AtomicU64,
+    node_limited_scan_range_bytes: AtomicU64,
+    /// Range-readable node-locator work. These counters make it possible to
+    /// distinguish exact B+tree paths from a hidden full-id-column scan.
+    node_locator_probes: AtomicU64,
+    node_locator_pages: AtomicU64,
+    node_locator_entries_examined: AtomicU64,
+    node_locator_bytes: AtomicU64,
+    /// Range-readable exact-edge sidecar work. One probe may contain a whole
+    /// UNWIND batch and visit each distinct B+tree page once.
+    edge_point_probes: AtomicU64,
+    edge_point_pages: AtomicU64,
+    edge_point_entries_examined: AtomicU64,
+    edge_point_bytes: AtomicU64,
     /// Parsed property sidecars. Body bytes are already byte-cached, but
     /// bincode decoding is O(entries), so it needs its own observable tier.
     property_sidecar_hits: AtomicU64,
@@ -503,6 +755,13 @@ struct CacheStats {
     bloom_hits: AtomicU64,
     bloom_misses: AtomicU64,
     bloom_inserts: AtomicU64,
+    /// Valid persisted search indexes refused because their conservative
+    /// decoded footprint exceeded the configured shared search-index pool.
+    /// These are deliberately distinct from absent/stale/corrupt fallbacks.
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    vector_index_capacity_rejections: AtomicU64,
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    text_index_capacity_rejections: AtomicU64,
 }
 
 /// Process-wide cache shared between [`crate::Snapshot`] instances.
@@ -540,17 +799,12 @@ pub struct SstCache {
     property_sidecars: Arc<Cache<String, DecodedPropertySidecar>>,
     /// Parsed bloom filters keyed by absolute immutable sidecar path.
     bloom_filters: Arc<Cache<String, Arc<BloomFilter>>>,
-    /// Decoded `.ft` text indexes per SST path. Decoding bincode-deserialises
-    /// the whole inverted index; without this every `search.bm25` paid
-    /// `O(index size)` per query even with the body bytes cached.
-    #[cfg(feature = "text-index")]
-    text_indexes: Arc<Cache<String, WeightedArc<crate::sst::text::TextIndex>>>,
-    /// Decoded `.vg` vector indexes per SST path. Decoding deserialises every
-    /// stored vector plus the full Vamana adjacency AND clones the vectors into
-    /// the navigation space; without this every KNN (and each widening round)
-    /// paid `O(index size)` per query.
-    #[cfg(feature = "vector-index")]
-    vector_indexes: Arc<Cache<String, WeightedArc<crate::sst::vector::VectorGraphIndex>>>,
+    /// Shared decoded `.vg` / `.ft` pool. Either kind can use all assigned
+    /// search memory and evict the other, avoiding an artificial fixed split.
+    /// Entries remain deeply weighted and admission rejects a body that cannot
+    /// fit as one bounded resident object.
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    search_indexes: Arc<Cache<String, CachedSearchIndex>>,
     /// Coordinates insertion with manifest pruning. Foyer itself is
     /// thread-safe; this small mutex covers only path admission/bookkeeping,
     /// never decoding or object-store I/O.
@@ -611,6 +865,42 @@ impl std::fmt::Debug for SstCache {
                 &self.stats.node_rg_inserts.load(Ordering::Relaxed),
             )
             .field(
+                "node_sparse_filter_scans",
+                &self.stats.node_sparse_filter_scans.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_sparse_filter_rows",
+                &self.stats.node_sparse_filter_rows.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_limited_scan_fast_paths",
+                &self
+                    .stats
+                    .node_limited_scan_fast_paths
+                    .load(Ordering::Relaxed),
+            )
+            .field(
+                "node_limited_scan_fallbacks",
+                &self
+                    .stats
+                    .node_limited_scan_fallbacks
+                    .load(Ordering::Relaxed),
+            )
+            .field(
+                "node_limited_scan_decoded_rows",
+                &self
+                    .stats
+                    .node_limited_scan_decoded_rows
+                    .load(Ordering::Relaxed),
+            )
+            .field(
+                "node_limited_scan_range_bytes",
+                &self
+                    .stats
+                    .node_limited_scan_range_bytes
+                    .load(Ordering::Relaxed),
+            )
+            .field(
                 "property_sidecar_capacity_bytes",
                 &self.budgets.property_sidecar_bytes,
             )
@@ -641,18 +931,26 @@ impl std::fmt::Debug for SstCache {
                 "bloom_inserts",
                 &self.stats.bloom_inserts.load(Ordering::Relaxed),
             );
-        #[cfg(feature = "text-index")]
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
         out.field(
-            "text_index_capacity_bytes",
-            &self.budgets.decoded.text_index_bytes,
+            "search_index_capacity_bytes",
+            &self.budgets.decoded.search_index_bytes,
         )
-        .field("text_index_usage_bytes", &self.text_indexes.usage());
-        #[cfg(feature = "vector-index")]
-        out.field(
-            "vector_index_capacity_bytes",
-            &self.budgets.decoded.vector_index_bytes,
+        .field("search_index_usage_bytes", &self.search_indexes.usage())
+        .field(
+            "vector_index_capacity_rejections",
+            &self
+                .stats
+                .vector_index_capacity_rejections
+                .load(Ordering::Relaxed),
         )
-        .field("vector_index_usage_bytes", &self.vector_indexes.usage());
+        .field(
+            "text_index_capacity_rejections",
+            &self
+                .stats
+                .text_index_capacity_rejections
+                .load(Ordering::Relaxed),
+        );
         out.finish()
     }
 }
@@ -676,6 +974,11 @@ impl SstCache {
             property_sidecar_cache_budget_bytes(),
             DecodedCacheBudgets::from_env(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_uniform_budgets(bytes: usize) -> Self {
+        Self::with_all_budgets(bytes, bytes, bytes, DecodedCacheBudgets::uniform(bytes))
     }
 
     fn with_shared_capacities(capacities: CacheCapacities) -> Self {
@@ -768,37 +1071,20 @@ impl SstCache {
                 fits_capacity(bloom_capacity, bloom_filter_weight(key, value))
             })
             .build();
-        #[cfg(feature = "text-index")]
-        let text_index_capacity = decoded.text_index_bytes;
-        #[cfg(feature = "text-index")]
-        let text_indexes = CacheBuilder::new(text_index_capacity.max(1))
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        let search_index_capacity = decoded.search_index_bytes;
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        let search_indexes = CacheBuilder::new(search_index_capacity.max(1))
             .with_shards(1)
-            .with_weighter(
-                |key: &String, value: &WeightedArc<crate::sst::text::TextIndex>| {
-                    weighted_arc_weight(key, value)
-                },
-            )
-            .with_filter(
-                move |key: &String, value: &WeightedArc<crate::sst::text::TextIndex>| {
-                    fits_capacity(text_index_capacity, weighted_arc_weight(key, value))
-                },
-            )
-            .build();
-        #[cfg(feature = "vector-index")]
-        let vector_index_capacity = decoded.vector_index_bytes;
-        #[cfg(feature = "vector-index")]
-        let vector_indexes = CacheBuilder::new(vector_index_capacity.max(1))
-            .with_shards(1)
-            .with_weighter(
-                |key: &String, value: &WeightedArc<crate::sst::vector::VectorGraphIndex>| {
-                    weighted_arc_weight(key, value)
-                },
-            )
-            .with_filter(
-                move |key: &String, value: &WeightedArc<crate::sst::vector::VectorGraphIndex>| {
-                    fits_capacity(vector_index_capacity, weighted_arc_weight(key, value))
-                },
-            )
+            .with_weighter(|key: &String, value: &CachedSearchIndex| {
+                cached_search_index_weight(key, value)
+            })
+            .with_filter(move |key: &String, value: &CachedSearchIndex| {
+                fits_capacity(
+                    search_index_capacity,
+                    cached_search_index_weight(key, value),
+                )
+            })
             .build();
         Self {
             budgets,
@@ -809,10 +1095,8 @@ impl SstCache {
             edge_readers: Arc::new(edge_readers),
             property_sidecars: Arc::new(property_sidecars),
             bloom_filters: Arc::new(bloom_filters),
-            #[cfg(feature = "text-index")]
-            text_indexes: Arc::new(text_indexes),
-            #[cfg(feature = "vector-index")]
-            vector_indexes: Arc::new(vector_indexes),
+            #[cfg(any(feature = "text-index", feature = "vector-index"))]
+            search_indexes: Arc::new(search_indexes),
             tracked_paths: Arc::new(Mutex::new(CachePathRegistry::default())),
             stats: Arc::new(CacheStats::default()),
         }
@@ -835,34 +1119,70 @@ impl SstCache {
     /// stale; superseded paths are pruned by [`Self::retain_paths`].
     #[cfg(feature = "text-index")]
     pub fn get_text_index(&self, key: &str) -> Option<Arc<crate::sst::text::TextIndex>> {
-        self.text_indexes
+        self.search_indexes
             .get(key)
-            .map(|entry| entry.value().value.clone())
+            .and_then(|entry| match entry.value() {
+                CachedSearchIndex::Text(value) => Some(value.value.clone()),
+                #[cfg(feature = "vector-index")]
+                CachedSearchIndex::Vector(_) => None,
+            })
     }
 
-    /// Cheap preflight for a serialized text-index body.
+    /// Preflight a serialized text-index body against the shared search pool.
     ///
-    /// Call this with the manifest/object length before downloading or
-    /// decoding a monolithic index. `false` means the decoded representation's
-    /// six-wire-copy lower estimate cannot fit and the exact flat fallback
-    /// should be used instead.
+    /// Call this with the manifest/object length and corpus count before GET.
+    /// A refusal is observable and must be returned to the client; it is not
+    /// equivalent to an absent/stale/corrupt optional accelerator.
+    #[cfg(feature = "text-index")]
+    pub fn admit_text_index_wire_bytes(
+        &self,
+        key: &str,
+        wire_bytes: usize,
+        doc_count: usize,
+    ) -> Result<usize, SearchIndexCapacityError> {
+        let required_bytes = text_index_estimated_weight(key, wire_bytes, doc_count);
+        self.admit_search_index("text", required_bytes)
+    }
+
+    /// Compatibility preflight for callers that only know the serialized
+    /// body length.
+    ///
+    /// Text and vector indexes now share one eviction pool, so this checks the
+    /// historical six-wire-copy lower bound against that shared capacity.
+    /// Engine read paths should prefer [`Self::admit_text_index_wire_bytes`],
+    /// which also accounts for the corpus shape and returns the exact refusal.
     #[cfg(feature = "text-index")]
     pub fn can_admit_text_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
         fits_capacity(
-            self.budgets.decoded.text_index_bytes,
+            self.budgets.decoded.search_index_bytes,
             key.len().saturating_add(wire_bytes.saturating_mul(6)),
         )
     }
 
     /// Store a decoded text index for an SST path.
+    ///
+    /// This source-compatible wrapper preserves the historical best-effort
+    /// contract: an oversized entry is not cached. Engine read paths that must
+    /// surface a capacity refusal use [`Self::try_insert_text_index`].
     #[cfg(feature = "text-index")]
     pub fn insert_text_index(&self, key: String, idx: Arc<crate::sst::text::TextIndex>) {
+        let _ = self.try_insert_text_index(key, idx);
+    }
+
+    /// Store a decoded text index or return its exact shared-pool capacity
+    /// refusal.
+    #[cfg(feature = "text-index")]
+    pub fn try_insert_text_index(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::text::TextIndex>,
+    ) -> Result<(), SearchIndexCapacityError> {
         let wire_bytes = self
             .inner
             .get(&key)
             .map(|entry| entry.value().len())
             .unwrap_or_default();
-        self.insert_text_index_with_wire_bytes(key, idx, wire_bytes);
+        self.try_insert_text_index_with_wire_bytes(key, idx, wire_bytes)
     }
 
     /// Store a decoded text index, using the serialized body length supplied
@@ -877,58 +1197,96 @@ impl SstCache {
         idx: Arc<crate::sst::text::TextIndex>,
         wire_bytes: usize,
     ) {
-        // Bincode's wire body is a stable lower bound. A 6x multiplier
-        // conservatively covers BTree/posting Vec allocator overhead and the
-        // separately sorted id copy. An uncached body falls back to a
-        // per-document estimate; either way the tier has a hard byte budget.
+        let _ = self.try_insert_text_index_with_wire_bytes(key, idx, wire_bytes);
+    }
+
+    /// Store a decoded text index with an explicit serialized-body length or
+    /// return its exact shared-pool capacity refusal.
+    #[cfg(feature = "text-index")]
+    pub fn try_insert_text_index_with_wire_bytes(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::text::TextIndex>,
+        wire_bytes: usize,
+    ) -> Result<(), SearchIndexCapacityError> {
         let doc_count = usize::try_from(idx.doc_count()).unwrap_or(usize::MAX);
-        let estimated_bytes = wire_bytes
-            .saturating_mul(6)
-            .max(doc_count.saturating_mul(512))
-            .max(std::mem::size_of_val(idx.as_ref()));
+        let required_bytes = text_index_estimated_weight(&key, wire_bytes, doc_count);
+        self.admit_search_index("text", required_bytes)?;
         let value = WeightedArc {
             value: idx,
-            estimated_bytes,
+            estimated_bytes: required_bytes.saturating_sub(key.len()),
         };
-        if !fits_capacity(
-            self.budgets.decoded.text_index_bytes,
-            weighted_arc_weight(&key, &value),
-        ) {
-            return;
-        }
         let tracked = TrackedCacheEntry::TextIndex(key.clone());
         self.insert_tracked(tracked, || {
-            self.text_indexes.insert(key, value);
+            self.search_indexes
+                .insert(key, CachedSearchIndex::Text(value));
         });
+        Ok(())
     }
 
     /// Look up a decoded vector index for an SST path. Same contract as
     /// [`Self::get_text_index`].
     #[cfg(feature = "vector-index")]
     pub fn get_vector_index(&self, key: &str) -> Option<Arc<crate::sst::vector::VectorGraphIndex>> {
-        self.vector_indexes
+        self.search_indexes
             .get(key)
-            .map(|entry| entry.value().value.clone())
+            .and_then(|entry| match entry.value() {
+                CachedSearchIndex::Vector(value) => Some(value.value.clone()),
+                #[cfg(feature = "text-index")]
+                CachedSearchIndex::Text(_) => None,
+            })
     }
 
     /// Preflight a serialized vector-index body before GET/decode.
     #[cfg(feature = "vector-index")]
+    pub fn admit_vector_index_wire_bytes(
+        &self,
+        key: &str,
+        wire_bytes: usize,
+        point_count: usize,
+        dim: usize,
+    ) -> Result<usize, SearchIndexCapacityError> {
+        let required_bytes = vector_index_estimated_weight(key, wire_bytes, point_count, dim);
+        self.admit_search_index("vector", required_bytes)
+    }
+
+    /// Compatibility preflight for callers that only know the serialized
+    /// body length.
+    ///
+    /// Both search-index kinds use the same eviction pool. This keeps the
+    /// historical lower-bound check available; engine paths should use
+    /// [`Self::admit_vector_index_wire_bytes`] for shape-aware admission.
+    #[cfg(feature = "vector-index")]
     pub fn can_admit_vector_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
         fits_capacity(
-            self.budgets.decoded.vector_index_bytes,
+            self.budgets.decoded.search_index_bytes,
             key.len().saturating_add(wire_bytes.saturating_mul(6)),
         )
     }
 
     /// Store a decoded vector index for an SST path.
+    ///
+    /// This source-compatible wrapper is best-effort. Engine read paths that
+    /// must report a capacity refusal use [`Self::try_insert_vector_index`].
     #[cfg(feature = "vector-index")]
     pub fn insert_vector_index(&self, key: String, idx: Arc<crate::sst::vector::VectorGraphIndex>) {
+        let _ = self.try_insert_vector_index(key, idx);
+    }
+
+    /// Store a decoded vector index or return its exact shared-pool capacity
+    /// refusal.
+    #[cfg(feature = "vector-index")]
+    pub fn try_insert_vector_index(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::vector::VectorGraphIndex>,
+    ) -> Result<(), SearchIndexCapacityError> {
         let wire_bytes = self
             .inner
             .get(&key)
             .map(|entry| entry.value().len())
             .unwrap_or_default();
-        self.insert_vector_index_with_wire_bytes(key, idx, wire_bytes);
+        self.try_insert_vector_index_with_wire_bytes(key, idx, wire_bytes)
     }
 
     /// Store a decoded vector index with an explicit serialized-body length.
@@ -942,30 +1300,69 @@ impl SstCache {
         idx: Arc<crate::sst::vector::VectorGraphIndex>,
         wire_bytes: usize,
     ) {
-        // Decode retains the serialized graph's vectors/adjacency and builds a
-        // second navigation-space vector set. Six wire copies is conservative
-        // for normal Vamana degrees; the independent point/dimension estimate
-        // protects the no-body-cache path.
-        let per_point = (idx.dim() as usize).saturating_mul(8).saturating_add(512);
+        let _ = self.try_insert_vector_index_with_wire_bytes(key, idx, wire_bytes);
+    }
+
+    /// Store a decoded vector index with an explicit serialized-body length or
+    /// return its exact shared-pool capacity refusal.
+    #[cfg(feature = "vector-index")]
+    pub fn try_insert_vector_index_with_wire_bytes(
+        &self,
+        key: String,
+        idx: Arc<crate::sst::vector::VectorGraphIndex>,
+        wire_bytes: usize,
+    ) -> Result<(), SearchIndexCapacityError> {
         let point_count = usize::try_from(idx.point_count()).unwrap_or(usize::MAX);
-        let estimated_bytes = wire_bytes
-            .saturating_mul(6)
-            .max(point_count.saturating_mul(per_point))
-            .max(std::mem::size_of_val(idx.as_ref()));
+        let required_bytes =
+            vector_index_estimated_weight(&key, wire_bytes, point_count, idx.dim() as usize);
+        self.admit_search_index("vector", required_bytes)?;
         let value = WeightedArc {
             value: idx,
-            estimated_bytes,
+            estimated_bytes: required_bytes.saturating_sub(key.len()),
         };
-        if !fits_capacity(
-            self.budgets.decoded.vector_index_bytes,
-            weighted_arc_weight(&key, &value),
-        ) {
-            return;
-        }
         let tracked = TrackedCacheEntry::VectorIndex(key.clone());
         self.insert_tracked(tracked, || {
-            self.vector_indexes.insert(key, value);
+            self.search_indexes
+                .insert(key, CachedSearchIndex::Vector(value));
         });
+        Ok(())
+    }
+
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    fn admit_search_index(
+        &self,
+        kind: &'static str,
+        required_bytes: usize,
+    ) -> Result<usize, SearchIndexCapacityError> {
+        let capacity_bytes = self.budgets.decoded.search_index_bytes;
+        if fits_capacity(capacity_bytes, required_bytes) {
+            return Ok(required_bytes);
+        }
+
+        match kind {
+            "vector" => {
+                self.stats
+                    .vector_index_capacity_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "text" => {
+                self.stats
+                    .text_index_capacity_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        tracing::warn!(
+            index_kind = kind,
+            required_bytes,
+            pool_capacity_bytes = capacity_bytes,
+            config = "NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES/NAMIDB_CACHE_MAX_BYTES",
+            "decoded search index rejected by configured cache capacity"
+        );
+        Err(SearchIndexCapacityError {
+            required_bytes,
+            capacity_bytes,
+        })
     }
 
     /// Look up a cached [`crate::sst::edges::EdgeSstReader`] for an SST
@@ -1238,6 +1635,169 @@ impl SstCache {
         self.stats.node_rg_inserts.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn record_sparse_node_filter(&self, rows: usize) {
+        self.stats
+            .node_sparse_filter_scans
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .node_sparse_filter_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn sparse_node_filter_scans(&self) -> u64 {
+        self.stats.node_sparse_filter_scans.load(Ordering::Relaxed)
+    }
+
+    pub fn sparse_node_filter_rows(&self) -> u64 {
+        self.stats.node_sparse_filter_rows.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_limited_node_scan_fast_path(&self) {
+        self.stats
+            .node_limited_scan_fast_paths
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_limited_node_scan_fallback(&self) {
+        self.stats
+            .node_limited_scan_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_limited_node_scan_work(
+        &self,
+        decoded_rows: usize,
+        examined_rows: usize,
+        output_rows: usize,
+        row_groups: usize,
+        range_bytes: u64,
+    ) {
+        self.stats
+            .node_limited_scan_decoded_rows
+            .fetch_add(decoded_rows as u64, Ordering::Relaxed);
+        self.stats
+            .node_limited_scan_examined_rows
+            .fetch_add(examined_rows as u64, Ordering::Relaxed);
+        self.stats
+            .node_limited_scan_output_rows
+            .fetch_add(output_rows as u64, Ordering::Relaxed);
+        self.stats
+            .node_limited_scan_row_groups
+            .fetch_add(row_groups as u64, Ordering::Relaxed);
+        self.stats
+            .node_limited_scan_range_bytes
+            .fetch_add(range_bytes, Ordering::Relaxed);
+    }
+
+    pub fn limited_node_scan_fast_paths(&self) -> u64 {
+        self.stats
+            .node_limited_scan_fast_paths
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_fallbacks(&self) -> u64 {
+        self.stats
+            .node_limited_scan_fallbacks
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_decoded_rows(&self) -> u64 {
+        self.stats
+            .node_limited_scan_decoded_rows
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_examined_rows(&self) -> u64 {
+        self.stats
+            .node_limited_scan_examined_rows
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_output_rows(&self) -> u64 {
+        self.stats
+            .node_limited_scan_output_rows
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_row_groups(&self) -> u64 {
+        self.stats
+            .node_limited_scan_row_groups
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn limited_node_scan_range_bytes(&self) -> u64 {
+        self.stats
+            .node_limited_scan_range_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_node_locator_probe(
+        &self,
+        stats: crate::sst::paged_index::PagedProbeStats,
+    ) {
+        self.stats
+            .node_locator_probes
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .node_locator_pages
+            .fetch_add(stats.pages_read as u64, Ordering::Relaxed);
+        self.stats
+            .node_locator_entries_examined
+            .fetch_add(stats.leaf_entries_examined as u64, Ordering::Relaxed);
+        self.stats
+            .node_locator_bytes
+            .fetch_add(stats.bytes_read as u64, Ordering::Relaxed);
+    }
+
+    pub fn node_locator_probes(&self) -> u64 {
+        self.stats.node_locator_probes.load(Ordering::Relaxed)
+    }
+
+    pub fn node_locator_pages(&self) -> u64 {
+        self.stats.node_locator_pages.load(Ordering::Relaxed)
+    }
+
+    pub fn node_locator_entries_examined(&self) -> u64 {
+        self.stats
+            .node_locator_entries_examined
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn node_locator_bytes(&self) -> u64 {
+        self.stats.node_locator_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_edge_point_probe(&self, stats: crate::sst::paged_index::PagedProbeStats) {
+        self.stats.edge_point_probes.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .edge_point_pages
+            .fetch_add(stats.pages_read as u64, Ordering::Relaxed);
+        self.stats
+            .edge_point_entries_examined
+            .fetch_add(stats.leaf_entries_examined as u64, Ordering::Relaxed);
+        self.stats
+            .edge_point_bytes
+            .fetch_add(stats.bytes_read as u64, Ordering::Relaxed);
+    }
+
+    pub fn edge_point_probes(&self) -> u64 {
+        self.stats.edge_point_probes.load(Ordering::Relaxed)
+    }
+
+    pub fn edge_point_pages(&self) -> u64 {
+        self.stats.edge_point_pages.load(Ordering::Relaxed)
+    }
+
+    pub fn edge_point_entries_examined(&self) -> u64 {
+        self.stats
+            .edge_point_entries_examined
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn edge_point_bytes(&self) -> u64 {
+        self.stats.edge_point_bytes.load(Ordering::Relaxed)
+    }
+
     /// Look up decoded edge property streams for an SST path.
     /// Returns `None` on miss; the caller decodes + re-inserts via
     /// [`Self::insert_edge_streams`].
@@ -1350,11 +1910,11 @@ impl SstCache {
             }
             #[cfg(feature = "text-index")]
             TrackedCacheEntry::TextIndex(path) => {
-                self.text_indexes.remove(path);
+                self.search_indexes.remove(path);
             }
             #[cfg(feature = "vector-index")]
             TrackedCacheEntry::VectorIndex(path) => {
-                self.vector_indexes.remove(path);
+                self.search_indexes.remove(path);
             }
         }
     }
@@ -1372,9 +1932,15 @@ impl SstCache {
             TrackedCacheEntry::PropertySidecar(path) => self.property_sidecars.get(path).is_some(),
             TrackedCacheEntry::Bloom(path) => self.bloom_filters.get(path).is_some(),
             #[cfg(feature = "text-index")]
-            TrackedCacheEntry::TextIndex(path) => self.text_indexes.get(path).is_some(),
+            TrackedCacheEntry::TextIndex(path) => self
+                .search_indexes
+                .get(path)
+                .is_some_and(|entry| matches!(entry.value(), CachedSearchIndex::Text(_))),
             #[cfg(feature = "vector-index")]
-            TrackedCacheEntry::VectorIndex(path) => self.vector_indexes.get(path).is_some(),
+            TrackedCacheEntry::VectorIndex(path) => self
+                .search_indexes
+                .get(path)
+                .is_some_and(|entry| matches!(entry.value(), CachedSearchIndex::Vector(_))),
         }
     }
 
@@ -1396,7 +1962,7 @@ impl SstCache {
         &self,
         namespace_prefix: &str,
         live: &std::collections::HashSet<String>,
-        enforce_empty: bool,
+        evicted: bool,
     ) {
         // Normalize to a path-segment boundary so "tenants/acme" cannot
         // match "tenants/acme2/...".
@@ -1405,13 +1971,13 @@ impl SstCache {
         // Publish the admission rule before removing entries while holding the
         // same lock used by insertions. A decode from a pre-prune snapshot
         // finishing later sees this rule and cannot resurrect a dead path.
-        if live.is_empty() && !enforce_empty {
-            // A freshly-opened empty namespace has no previous immutable path
-            // that could race this call. Leave it permissive so its first
-            // flush can mint UUID paths before the post-commit retain.
-            paths.live_by_namespace.remove(&prefix);
+        if evicted {
+            paths.deny_namespace(prefix.clone());
         } else {
-            paths.live_by_namespace.insert(prefix.clone(), live.clone());
+            // Reopening removes an older eviction tombstone. An empty live set
+            // remains an authoritative deny-all until the first successful
+            // flush publishes its new immutable paths.
+            paths.allow_namespace(&prefix, live);
         }
         let stale: Vec<TrackedCacheEntry> = paths
             .entries
@@ -1431,6 +1997,36 @@ impl SstCache {
     /// weight in the shared cache.
     pub fn prune_namespace(&self, namespace_prefix: &str) {
         self.retain_paths_inner(namespace_prefix, &std::collections::HashSet::new(), true);
+    }
+
+    /// Drop every resident entry from every process-wide SST cache tier.
+    ///
+    /// Immutable object data remains authoritative in the backing store and
+    /// every entry is rebuilt on demand. Per-namespace live-path admission
+    /// rules and bounded eviction tombstones are retained so a decode from an
+    /// old pinned snapshot still cannot resurrect an object made obsolete by
+    /// a newer manifest or an evicted namespace.
+    pub fn clear(&self) {
+        let mut paths = self.tracked_paths.lock().unwrap();
+        // foyer-memory 0.22's bulk `clear()` drains its index but leaves the
+        // shard usage counter unchanged. Remove the tracked keys explicitly
+        // so both resident values and byte accounting reach zero; insertion
+        // is serialized by this same mutex, so no tier can race the sweep.
+        let entries: Vec<_> = paths.entries.iter().cloned().collect();
+        for entry in entries {
+            self.remove_tracked(&entry);
+        }
+        // `HashSet::clear` retains its peak bucket allocation. This hook runs
+        // specifically under RSS pressure, so replace the registry storage as
+        // well as dropping its logical entries.
+        paths.entries = HashSet::new();
+        for live in paths.live_by_namespace.values_mut() {
+            live.shrink_to_fit();
+        }
+        paths.live_by_namespace.shrink_to_fit();
+        paths.empty_live_order.shrink_to_fit();
+        paths.denied_namespaces.shrink_to_fit();
+        paths.denied_order.shrink_to_fit();
     }
 
     /// Count of resident entries across every tier whose SST path sits under
@@ -1474,24 +2070,58 @@ impl SstCache {
         self.budgets.decoded.metadata_bytes
     }
 
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    pub fn search_index_usage_bytes(&self) -> usize {
+        self.search_indexes.usage()
+    }
+
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    pub fn search_index_capacity_bytes(&self) -> usize {
+        self.budgets.decoded.search_index_bytes
+    }
+
+    /// Cache-accounted bytes in the shared text/vector decoded-index pool.
+    ///
+    /// Kept as a source-compatible alias after the two formerly independent
+    /// pools were combined.
     #[cfg(feature = "text-index")]
     pub fn text_index_usage_bytes(&self) -> usize {
-        self.text_indexes.usage()
+        self.search_index_usage_bytes()
+    }
+
+    /// Capacity of the shared text/vector decoded-index pool.
+    #[cfg(feature = "text-index")]
+    pub fn text_index_capacity_bytes(&self) -> usize {
+        self.search_index_capacity_bytes()
+    }
+
+    /// Cache-accounted bytes in the shared text/vector decoded-index pool.
+    ///
+    /// Kept as a source-compatible alias after the two formerly independent
+    /// pools were combined.
+    #[cfg(feature = "vector-index")]
+    pub fn vector_index_usage_bytes(&self) -> usize {
+        self.search_index_usage_bytes()
+    }
+
+    /// Capacity of the shared text/vector decoded-index pool.
+    #[cfg(feature = "vector-index")]
+    pub fn vector_index_capacity_bytes(&self) -> usize {
+        self.search_index_capacity_bytes()
+    }
+
+    #[cfg(feature = "vector-index")]
+    pub fn vector_index_capacity_rejections(&self) -> u64 {
+        self.stats
+            .vector_index_capacity_rejections
+            .load(Ordering::Relaxed)
     }
 
     #[cfg(feature = "text-index")]
-    pub fn text_index_capacity_bytes(&self) -> usize {
-        self.budgets.decoded.text_index_bytes
-    }
-
-    #[cfg(feature = "vector-index")]
-    pub fn vector_index_usage_bytes(&self) -> usize {
-        self.vector_indexes.usage()
-    }
-
-    #[cfg(feature = "vector-index")]
-    pub fn vector_index_capacity_bytes(&self) -> usize {
-        self.budgets.decoded.vector_index_bytes
+    pub fn text_index_capacity_rejections(&self) -> u64 {
+        self.stats
+            .text_index_capacity_rejections
+            .load(Ordering::Relaxed)
     }
 
     /// Look up a body. Returns `None` on miss; the caller must perform
@@ -1532,7 +2162,7 @@ impl SstCache {
     }
 
     /// Sum of all compiled SST cache tier capacities (seven base tiers plus
-    /// optional text and vector tiers).
+    /// one optional shared search-index tier).
     pub fn aggregate_capacity_bytes(&self) -> usize {
         self.budgets.aggregate_capacity_bytes()
     }
@@ -1548,10 +2178,8 @@ impl SstCache {
             .saturating_add(self.edge_streams.usage())
             .saturating_add(self.edge_readers.usage())
             .saturating_add(self.bloom_filters.usage());
-        #[cfg(feature = "text-index")]
-        let base = base.saturating_add(self.text_indexes.usage());
-        #[cfg(feature = "vector-index")]
-        let base = base.saturating_add(self.vector_indexes.usage());
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        let base = base.saturating_add(self.search_indexes.usage());
         base
     }
 
@@ -1576,8 +2204,35 @@ impl SstCache {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scalar_equality_keys_preserve_legacy_strings_and_tag_other_types() {
+        assert_eq!(
+            encode_equality_property_value(&Value::Bool(true)).as_deref(),
+            Some("b:1")
+        );
+        assert_eq!(
+            encode_equality_property_value(&Value::Str("true".into())).as_deref(),
+            Some("true")
+        );
+        assert_ne!(
+            encode_equality_property_value(&Value::Bool(true)),
+            encode_equality_property_value(&Value::Str("true".into()))
+        );
+        assert_eq!(
+            encode_equality_property_value(&Value::Bool(true)),
+            encode_equality_property_value(&Value::Str("b:1".into())),
+            "legacy-compatible String keys may conservatively share a posting with tagged scalars"
+        );
+        assert_eq!(
+            encode_equality_property_value(&Value::F64(-0.0)),
+            encode_equality_property_value(&Value::F64(0.0))
+        );
+        assert!(encode_equality_property_value(&Value::Null).is_none());
+        assert!(encode_equality_property_value(&Value::F64(f64::NAN)).is_none());
+    }
+
     fn tight_cache(bytes: usize) -> SstCache {
-        SstCache::with_all_budgets(bytes, bytes, bytes, DecodedCacheBudgets::uniform(bytes))
+        SstCache::with_uniform_budgets(bytes)
     }
 
     #[test]
@@ -1609,13 +2264,10 @@ mod tests {
         assert_eq!(cache.edge_readers.capacity(), budget);
         assert_eq!(cache.property_sidecars.capacity(), budget);
         assert_eq!(cache.bloom_filters.capacity(), budget);
-        #[cfg(feature = "text-index")]
-        assert_eq!(cache.text_indexes.capacity(), budget);
-        #[cfg(feature = "vector-index")]
-        assert_eq!(cache.vector_indexes.capacity(), budget);
-        let compiled_tiers = 7
-            + usize::from(cfg!(feature = "text-index"))
-            + usize::from(cfg!(feature = "vector-index"));
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        assert_eq!(cache.search_indexes.capacity(), budget);
+        let compiled_tiers =
+            7 + usize::from(cfg!(any(feature = "text-index", feature = "vector-index")));
         assert_eq!(cache.aggregate_capacity_bytes(), compiled_tiers * budget);
     }
 
@@ -1648,10 +2300,30 @@ mod tests {
             .unwrap();
         let index = Arc::new(crate::sst::text::TextIndex::decode(&body).unwrap());
 
+        let preflight = cache
+            .admit_text_index_wire_bytes(&key, 1024, 1)
+            .unwrap_err();
+        assert!(preflight.required_bytes > preflight.capacity_bytes);
         assert!(!cache.can_admit_text_index_wire_bytes(&key, 1024));
+        let insertion = cache
+            .try_insert_text_index_with_wire_bytes(key.clone(), index.clone(), 1024)
+            .unwrap_err();
+        assert_eq!(insertion, preflight);
+        assert!(cache.get_text_index(&key).is_none());
+        assert_eq!(cache.search_index_usage_bytes(), 0);
+        assert_eq!(
+            cache.text_index_usage_bytes(),
+            cache.search_index_usage_bytes()
+        );
+        assert_eq!(
+            cache.text_index_capacity_bytes(),
+            cache.search_index_capacity_bytes()
+        );
+        assert_eq!(cache.text_index_capacity_rejections(), 2);
+
         cache.insert_text_index_with_wire_bytes(key.clone(), index, 1024);
         assert!(cache.get_text_index(&key).is_none());
-        assert_eq!(cache.text_index_usage_bytes(), 0);
+        assert_eq!(cache.text_index_capacity_rejections(), 3);
     }
 
     #[cfg(feature = "vector-index")]
@@ -1680,10 +2352,30 @@ mod tests {
         .unwrap();
         let index = Arc::new(crate::sst::vector::VectorGraphIndex::decode(&body).unwrap());
 
+        let preflight = cache
+            .admit_vector_index_wire_bytes(&key, 1024, 2, 2)
+            .unwrap_err();
+        assert!(preflight.required_bytes > preflight.capacity_bytes);
         assert!(!cache.can_admit_vector_index_wire_bytes(&key, 1024));
+        let insertion = cache
+            .try_insert_vector_index_with_wire_bytes(key.clone(), index.clone(), 1024)
+            .unwrap_err();
+        assert_eq!(insertion, preflight);
+        assert!(cache.get_vector_index(&key).is_none());
+        assert_eq!(cache.search_index_usage_bytes(), 0);
+        assert_eq!(
+            cache.vector_index_usage_bytes(),
+            cache.search_index_usage_bytes()
+        );
+        assert_eq!(
+            cache.vector_index_capacity_bytes(),
+            cache.search_index_capacity_bytes()
+        );
+        assert_eq!(cache.vector_index_capacity_rejections(), 2);
+
         cache.insert_vector_index_with_wire_bytes(key.clone(), index, 1024);
         assert!(cache.get_vector_index(&key).is_none());
-        assert_eq!(cache.vector_index_usage_bytes(), 0);
+        assert_eq!(cache.vector_index_capacity_rejections(), 3);
     }
 
     #[test]
@@ -1799,6 +2491,110 @@ mod tests {
     }
 
     #[test]
+    fn pruned_namespace_tombstones_are_bounded_without_empty_live_sets() {
+        let cache = tight_cache(1 << 20);
+        let live_path = "tenants/gone/sst/level0/live.parquet".to_string();
+        cache.retain_paths("tenants/gone", &HashSet::from([live_path]));
+        assert_eq!(
+            cache.tracked_paths.lock().unwrap().live_by_namespace.len(),
+            1
+        );
+
+        cache.prune_namespace("tenants/gone");
+        for i in 0..MAX_DENIED_CACHE_NAMESPACES + 128 {
+            cache.prune_namespace(&format!("tenants/empty-{i}"));
+        }
+
+        let paths = cache.tracked_paths.lock().unwrap();
+        assert!(
+            paths.live_by_namespace.is_empty(),
+            "deny-all tombstones must not be represented as empty live sets"
+        );
+        assert_eq!(
+            paths.live_by_namespace.capacity(),
+            0,
+            "removing the last live namespace must release registry buckets"
+        );
+        assert_eq!(
+            paths.denied_namespaces.len(),
+            MAX_DENIED_CACHE_NAMESPACES,
+            "namespace churn must not grow eviction admission state forever"
+        );
+        assert_eq!(paths.denied_order.len(), MAX_DENIED_CACHE_NAMESPACES);
+    }
+
+    #[test]
+    fn evicted_namespace_rejects_late_decode_until_reopened() {
+        let cache = tight_cache(1 << 20);
+        let stale = "tenants/evicted/sst/level0/stale.parquet".to_string();
+        cache.retain_paths("tenants/evicted", &HashSet::from([stale.clone()]));
+
+        // Model a read that missed the cache and began decoding before the
+        // namespace was evicted, but reached its cache insert afterwards.
+        cache.prune_namespace("tenants/evicted");
+        cache.insert(stale.clone(), Bytes::from_static(b"late body"));
+        cache.insert_edge_streams(
+            stale.clone(),
+            Arc::new(EdgeStreamBundle {
+                overflow: None,
+                declared: Vec::new(),
+            }),
+        );
+        assert!(cache.get(&stale).is_none());
+        assert!(cache.get_edge_streams(&stale).is_none());
+
+        // Reopening clears the eviction tombstone, but its empty manifest is
+        // still an authoritative deny-all. Publishing the first successful
+        // flush's live set admits only that exact new path.
+        cache.retain_paths("tenants/evicted", &HashSet::new());
+        let fresh = "tenants/evicted/sst/level0/fresh.parquet".to_string();
+        cache.insert(fresh.clone(), Bytes::from_static(b"fresh body"));
+        assert!(cache.get(&fresh).is_none());
+        cache.retain_paths("tenants/evicted", &HashSet::from([fresh.clone()]));
+        cache.insert(fresh.clone(), Bytes::from_static(b"fresh body"));
+        assert!(cache.get(&fresh).is_some());
+    }
+
+    #[test]
+    fn transition_to_empty_manifest_rejects_late_decode_even_after_clear() {
+        let cache = tight_cache(1 << 20);
+        let stale = "tenants/gc/sst/level1/stale.parquet".to_string();
+        cache.retain_paths("tenants/gc", &HashSet::from([stale.clone()]));
+        cache.insert(stale.clone(), Bytes::from_static(b"old body"));
+        assert!(cache.get(&stale).is_some());
+
+        // Model compaction/GC publishing a manifest with no immutable objects,
+        // then a pre-commit read finishing its decode after the retain.
+        cache.retain_paths("tenants/gc", &HashSet::new());
+        cache.insert(stale.clone(), Bytes::from_static(b"late body"));
+        assert!(cache.get(&stale).is_none());
+
+        // RSS pressure must not erase the authoritative empty live rule.
+        cache.clear();
+        cache.insert(stale.clone(), Bytes::from_static(b"later body"));
+        assert!(cache.get(&stale).is_none());
+    }
+
+    #[test]
+    fn embedded_empty_namespace_rules_are_fifo_bounded() {
+        let cache = tight_cache(1 << 20);
+        for i in 0..MAX_EMPTY_LIVE_NAMESPACES + 128 {
+            cache.retain_paths(&format!("embedded/empty-{i}"), &HashSet::new());
+        }
+        let paths = cache.tracked_paths.lock().unwrap();
+        assert_eq!(paths.empty_live_order.len(), MAX_EMPTY_LIVE_NAMESPACES);
+        assert_eq!(
+            paths
+                .live_by_namespace
+                .values()
+                .filter(|live| live.is_empty())
+                .count(),
+            MAX_EMPTY_LIVE_NAMESPACES,
+            "fresh embedded namespace churn must not retain empty rules forever"
+        );
+    }
+
+    #[test]
     fn stale_decode_cannot_reinsert_after_manifest_prune() {
         let cache = tight_cache(1 << 20);
         let live = "tenants/a/sst/level0/live.csr".to_string();
@@ -1836,6 +2632,42 @@ mod tests {
             "decoded tier pruned eagerly"
         );
         assert_eq!(cache.namespace_side_entries("tenants/a"), 0);
+    }
+
+    #[test]
+    fn clear_drops_all_tiers_and_preserves_live_path_admission_rules() {
+        let cache = tight_cache(1 << 20);
+        let live = "tenants/a/sst/level0/live.parquet".to_string();
+        let dead = "tenants/a/sst/level0/dead.parquet".to_string();
+        cache.retain_paths("tenants/a", &HashSet::from([live.clone()]));
+        cache.insert(live.clone(), Bytes::from_static(b"body"));
+        cache.insert_equality_property_sidecar(
+            live.clone(),
+            Arc::new(BTreeMap::from([("s:k".into(), vec![[1; 16]])])),
+        );
+        cache.insert_bloom_filter(live.clone(), Arc::new(BloomFilter::with_capacity(10, 10)));
+        assert!(cache.aggregate_usage_bytes() > 0);
+        assert_eq!(cache.namespace_side_entries("tenants/a"), 3);
+        assert!(cache.tracked_paths.lock().unwrap().entries.capacity() > 0);
+
+        cache.clear();
+        assert_eq!(cache.aggregate_usage_bytes(), 0);
+        assert_eq!(cache.namespace_side_entries("tenants/a"), 0);
+        assert_eq!(
+            cache.tracked_paths.lock().unwrap().entries.capacity(),
+            0,
+            "pressure clear must release the tracking table allocation"
+        );
+        assert!(cache.get(&live).is_none());
+        assert!(cache.get_equality_property_sidecar(&live).is_none());
+        assert!(cache.get_bloom_filter(&live).is_none());
+
+        // Clearing residents must not let a decode racing an older manifest
+        // repopulate a path already declared dead.
+        cache.insert(dead.clone(), Bytes::from_static(b"obsolete"));
+        assert!(cache.get(&dead).is_none());
+        cache.insert(live.clone(), Bytes::from_static(b"current"));
+        assert!(cache.get(&live).is_some());
     }
 
     #[test]

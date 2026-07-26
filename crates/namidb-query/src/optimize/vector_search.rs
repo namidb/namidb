@@ -14,11 +14,18 @@
 //! When the catalog has a `VectorIndexDescriptor` for `(L, prop, metric)`, the
 //! `TopN[ [Filter] NodeScan ]` ranking sub-tree collapses to a `VectorSearch`
 //! leaf the executor serves from the index (falling back to the flat scan when
-//! no index matches); any outer `Project` is preserved on top. A `WHERE` the
-//! rewrite folds in is captured as the `VectorSearch`'s `post_filter` so the
-//! index path survives a filter (RFC-030 filtered ANN). The rewrite reaches a
-//! KNN nested in a UNION branch, a `CALL {}` subquery, a join, or an aggregate
-//! (bottom-up recursion).
+//! no index matches); any outer `Project` or post-ranking `Filter` is preserved
+//! on top. The same applies
+//! after a non-unique equality filter has already become
+//! `NodeByPropertyValue`; unique and element-id point seeks deliberately remain
+//! direct `TopN` inputs. A folded `WHERE` is captured as the `VectorSearch`'s
+//! residual filter, and lossless String/Bool equality groups become native
+//! ordinal-posting eligibility before k (RFC-030 filtered ANN). A predicate
+//! attached after `ORDER BY … LIMIT k` is never folded into the source: it must
+//! filter the already bounded page and may therefore return fewer than `k`.
+//! The rewrite
+//! reaches a KNN nested in a UNION branch, a `CALL {}` subquery, a join, or an
+//! aggregate (bottom-up recursion).
 //!
 //! The order key must be in the metric's *nearest-first* direction — `DESC` for
 //! the higher-is-closer metrics (`cosine_similarity`, `dot_product`), `ASC` for
@@ -35,7 +42,7 @@
 
 use crate::cost::StatsCatalog;
 use crate::parser::ast::{BinaryOp, OrderDirection};
-use crate::parser::{Expression, ExpressionKind};
+use crate::parser::{Expression, ExpressionKind, Identifier, PropertyAccess};
 use crate::plan::logical::{LogicalPlan, OrderKey, ProjectionItem, RowCount, VectorDistance};
 
 /// Run the rewrite over `plan`. No-op when no index matches.
@@ -65,7 +72,7 @@ fn try_rewrite_here(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     {
         if let LogicalPlan::TopN { keys, .. } = input.as_ref() {
             let sa = outer_score_alias_of(&items, keys);
-            if let Some(vs) = try_match(&input, catalog, None, sa.as_deref()) {
+            if let Some(vs) = try_match(&input, catalog, sa.as_deref()) {
                 return LogicalPlan::Project {
                     items,
                     input: Box::new(vs),
@@ -83,20 +90,24 @@ fn try_rewrite_here(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         };
     }
 
-    // A threshold / filter on the *ranked* output (e.g. `WHERE score >= 0.86`)
-    // lowers to a Filter wrapping the TopN. Fold it into the VectorSearch's
-    // `post_filter` when it references only the searched binding; otherwise leave
-    // the plan alone so the filter still runs (flat path).
-    if let LogicalPlan::Filter { predicate, input } = &plan {
+    // A predicate attached to the *ranked* output lowers to a Filter wrapping
+    // the TopN. Preserve that boundary: moving it into VectorSearch would apply
+    // it before k and refill from lower-ranked candidates, while Cypher requires
+    // filtering the already bounded page (which may return fewer than k).
+    if let LogicalPlan::Filter { predicate, input } = plan {
         if matches!(input.as_ref(), LogicalPlan::TopN { .. }) {
-            if let Some(vs) = try_match(input, catalog, Some(predicate), None) {
-                return vs;
+            if let Some(vs) = try_match(&input, catalog, None) {
+                return LogicalPlan::Filter {
+                    predicate,
+                    input: Box::new(vs),
+                };
             }
         }
+        return LogicalPlan::Filter { predicate, input };
     }
 
     // Bare TopN at the root (non-terminal `WITH`, or a hand-built plan).
-    if let Some(vs) = try_match(&plan, catalog, None, None) {
+    if let Some(vs) = try_match(&plan, catalog, None) {
         vs
     } else {
         plan
@@ -224,13 +235,12 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
 }
 
 /// Borrow-based matcher: if `plan` is the KNN chain AND a backing index exists,
-/// return the replacement `VectorSearch`. `above` is an optional predicate from
-/// a Filter wrapping the TopN (a threshold on the ranked output) to fold into
-/// `post_filter`.
+/// return the replacement `VectorSearch`. Only a predicate belonging to the
+/// source below TopN may be captured; a Filter above TopN is a post-k operator
+/// and is deliberately preserved by [`try_rewrite_here`].
 fn try_match(
     plan: &LogicalPlan,
     catalog: &StatsCatalog,
-    above: Option<&Expression>,
     outer_score_alias: Option<&str>,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::TopN {
@@ -260,7 +270,7 @@ fn try_match(
     // `RETURN`, whose projection sits *outside* the TopN — a `[Filter →] NodeScan`
     // directly. Resolve the score alias and peel an optional `WHERE` Filter in
     // both cases.
-    let (score_alias, between, scan) = match input.as_ref() {
+    let (score_alias, source) = match input.as_ref() {
         LogicalPlan::Project {
             items,
             distinct: false,
@@ -275,67 +285,46 @@ fn try_match(
                 })
                 .or_else(|| outer_score_alias.map(str::to_string))
                 .unwrap_or_else(|| "score".to_string());
-            let (scan, between) = peel_filter(proj_input.as_ref());
-            (sa, between, scan)
+            let source = peel_vector_source(proj_input.as_ref())?;
+            (sa, source)
         }
         other => {
             let sa = outer_score_alias
                 .map(str::to_string)
                 .unwrap_or_else(|| "score".to_string());
-            let (scan, between) = peel_filter(other);
-            (sa, between, scan)
+            let source = peel_vector_source(other)?;
+            (sa, source)
         }
     };
 
-    let LogicalPlan::NodeScan {
-        label: Some(label),
-        alias: scan_alias,
-        predicates,
-        ..
-    } = scan
-    else {
-        return None;
-    };
-    if scan_alias != &alias {
+    if source.alias != alias {
         return None;
     }
-    // `predicate_pushdown` can fold a `WHERE` into `NodeScan.predicates` before
-    // this rewrite runs (the fixpoint interleaves the passes). Those storage-level
-    // predicates cannot be reconstructed into a `post_filter` Expression here, so
-    // swallowing the scan into a `VectorSearch` would silently drop them. Refuse
-    // the rewrite when any are present — the flat path keeps and honours them. The
-    // common filtered-ANN case is unaffected: a `Filter` directly above the scan
-    // is captured via `peel_filter` before pushdown moves it.
-    if !predicates.is_empty() {
+    // The query vector is evaluated once against an empty row by the executor.
+    // A correlated vector expression therefore cannot be collapsed into this
+    // source operator without losing its outer bindings.
+    if !super::expression_aliases(&query).is_empty() {
         return None;
     }
 
     // Index must exist for (label, prop, metric).
-    catalog.vector_index_for(label, &prop, metric_to_storage(distance))?;
+    catalog.vector_index_for(source.label, &prop, metric_to_storage(distance))?;
 
-    // Fold the captured predicate(s) into `post_filter`, but ONLY when they
-    // reference solely the searched binding (`alias`) / the score column
-    // (`score_alias`). A predicate that touches another binding must NOT be
-    // swallowed — bail so the plan keeps its Filter and runs via the flat path.
-    let mut post_filter: Option<Expression> = None;
-    if let Some(b) = between {
-        if !aliases_within(&b, &[&alias]) {
+    // Capture only a source predicate and only when it references the searched
+    // binding. Although the public field retains its historical `post_filter`
+    // name, this expression is semantically a pre-k source filter. A predicate
+    // touching another binding cannot be evaluated by this leaf.
+    let post_filter = if let Some(source_filter) = source.filter {
+        if !aliases_within(&source_filter, &[&alias]) {
             return None;
         }
-        post_filter = Some(b);
-    }
-    if let Some(a) = above {
-        if !aliases_within(a, &[&alias, &score_alias]) {
-            return None;
-        }
-        post_filter = Some(match post_filter {
-            Some(p) => and_expr(p, a.clone()),
-            None => a.clone(),
-        });
-    }
+        Some(source_filter)
+    } else {
+        None
+    };
 
     Some(LogicalPlan::VectorSearch {
-        label: Some(label.clone()),
+        label: Some(source.label.to_string()),
         alias,
         property: prop,
         query,
@@ -352,19 +341,6 @@ fn aliases_within(expr: &Expression, allowed: &[&str]) -> bool {
     super::expression_aliases(expr)
         .iter()
         .all(|a| allowed.contains(&a.as_str()))
-}
-
-/// `a AND b` as one predicate Expression.
-fn and_expr(a: Expression, b: Expression) -> Expression {
-    let span = a.span;
-    Expression {
-        kind: ExpressionKind::Binary {
-            op: BinaryOp::And,
-            left: Box::new(a),
-            right: Box::new(b),
-        },
-        span,
-    }
 }
 
 /// `true` when a larger metric value means a closer match — cosine similarity
@@ -418,13 +394,85 @@ fn distance_call_parts(expr: &Expression) -> Option<(VectorDistance, String, Str
     Some((metric, prop, alias, query))
 }
 
-/// Peel an optional `WHERE` Filter directly above the NodeScan, returning the
-/// inner plan and the captured predicate (e.g. `d.emb IS NOT NULL`,
-/// `cosine_similarity(d.emb,$q) >= 0.86`, or a label/property predicate).
-fn peel_filter(plan: &LogicalPlan) -> (&LogicalPlan, Option<Expression>) {
+/// Labelled source that a KNN can collapse into `VectorSearch`.
+struct VectorSource<'a> {
+    label: &'a str,
+    alias: &'a str,
+    filter: Option<Expression>,
+}
+
+/// Peel a labelled scan and its optional filter. A non-unique
+/// `NodeByPropertyValue` is the equality-index rewrite of exactly the same
+/// logical source, so reconstruct its predicate for the vector operator. Unique
+/// point lookups and `NodeById` deliberately do not match: scoring their one
+/// candidate directly is cheaper and exact.
+fn peel_vector_source(plan: &LogicalPlan) -> Option<VectorSource<'_>> {
     match plan {
-        LogicalPlan::Filter { input, predicate } => (input.as_ref(), Some(predicate.clone())),
-        other => (other, None),
+        LogicalPlan::Filter { input, predicate } => {
+            let LogicalPlan::NodeScan {
+                label: Some(label),
+                alias,
+                predicates,
+                ..
+            } = input.as_ref()
+            else {
+                return None;
+            };
+            predicates.is_empty().then(|| VectorSource {
+                label,
+                alias,
+                filter: Some(predicate.clone()),
+            })
+        }
+        LogicalPlan::NodeScan {
+            label: Some(label),
+            alias,
+            predicates,
+            ..
+        } => predicates.is_empty().then(|| VectorSource {
+            label,
+            alias,
+            filter: None,
+        }),
+        LogicalPlan::NodeByPropertyValue {
+            input,
+            label,
+            alias,
+            property,
+            value,
+            multi: true,
+        } if matches!(input.as_ref(), LogicalPlan::Empty) && !label.is_empty() => {
+            Some(VectorSource {
+                label,
+                alias,
+                filter: Some(property_equality(alias, property, value)),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn property_equality(alias: &str, property: &str, value: &Expression) -> Expression {
+    let span = value.span;
+    let target = Expression {
+        kind: ExpressionKind::Variable(Identifier::new(alias, span)),
+        span,
+    };
+    let property = Expression {
+        kind: ExpressionKind::Property(Box::new(PropertyAccess {
+            target,
+            key: Identifier::new(property, span),
+            span,
+        })),
+        span,
+    };
+    Expression {
+        kind: ExpressionKind::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(property),
+            right: Box::new(value.clone()),
+        },
+        span,
     }
 }
 
@@ -469,6 +517,7 @@ mod tests {
     use crate::parser::{Identifier, PropertyAccess, SourceSpan};
     use crate::plan::logical::{RowCount, VectorDistance};
     use crate::plan::{LogicalPlan, OrderKey, ProjectionItem};
+    use namidb_core::{DataType, LabelDef, PropertyDef, SchemaBuilder};
     use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
 
     fn sp() -> SourceSpan {
@@ -477,7 +526,15 @@ mod tests {
 
     /// `cosine_similarity(d.emb, $q)` as an Expression.
     fn dist_call(metric_fn: &str) -> Expression {
-        let prop = Expression {
+        let query = Expression {
+            kind: ExpressionKind::Parameter("q".into()),
+            span: sp(),
+        };
+        dist_call_with_query(metric_fn, query)
+    }
+
+    fn dist_call_with_query(metric_fn: &str, query: Expression) -> Expression {
+        let property = Expression {
             kind: ExpressionKind::Property(Box::new(PropertyAccess {
                 target: Expression {
                     kind: ExpressionKind::Variable(Identifier::new("d", sp())),
@@ -488,14 +545,10 @@ mod tests {
             })),
             span: sp(),
         };
-        let query = Expression {
-            kind: ExpressionKind::Parameter("q".into()),
-            span: sp(),
-        };
         Expression {
             kind: ExpressionKind::FunctionCall {
                 name: QualifiedName::single(Identifier::new(metric_fn, sp())),
-                args: vec![prop, query],
+                args: vec![property, query],
                 distinct: false,
             },
             span: sp(),
@@ -503,7 +556,10 @@ mod tests {
     }
 
     fn knn_plan(metric_fn: &str) -> LogicalPlan {
-        let call = dist_call(metric_fn);
+        knn_plan_for_call(dist_call(metric_fn))
+    }
+
+    fn knn_plan_for_call(call: Expression) -> LogicalPlan {
         let scan = LogicalPlan::NodeScan {
             label: Some("Doc".into()),
             alias: "d".into(),
@@ -555,6 +611,65 @@ mod tests {
         StatsCatalog::from_manifest(&m)
     }
 
+    fn catalog_with_property_index(unique: bool, indexed: bool) -> StatsCatalog {
+        let mut m = namidb_storage::Manifest::empty(namidb_storage::Epoch::ZERO, uuid::Uuid::nil());
+        m.schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 16 }, false).unwrap(),
+                    PropertyDef::new("key", DataType::Utf8, false)
+                        .unwrap()
+                        .with_unique(unique)
+                        .with_indexed(indexed),
+                ],
+            })
+            .unwrap()
+            .build();
+        m.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 16,
+            metric: VectorMetric::Cosine,
+            r: 32,
+            l_build: 64,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        StatsCatalog::from_manifest(&m)
+    }
+
+    fn contains_vector_search(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::VectorSearch { .. })
+            || plan.children().into_iter().any(contains_vector_search)
+    }
+
+    fn contains_topn(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::TopN { .. }) || plan.children().into_iter().any(contains_topn)
+    }
+
+    fn property_lookup_mode(plan: &LogicalPlan) -> Option<bool> {
+        if let LogicalPlan::NodeByPropertyValue { multi, .. } = plan {
+            return Some(*multi);
+        }
+        plan.children().into_iter().find_map(property_lookup_mode)
+    }
+
+    fn contains_node_by_id(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::NodeById { .. })
+            || plan.children().into_iter().any(contains_node_by_id)
+    }
+
+    fn lower_knn_with_where(predicate: &str) -> LogicalPlan {
+        let query = format!(
+            "MATCH (d:Doc) WHERE {predicate} \
+             RETURN d, cosine_similarity(d.emb, $q) AS score \
+             ORDER BY score DESC LIMIT 10"
+        );
+        crate::plan::lower(&crate::parser::parse(&query).unwrap()).unwrap()
+    }
+
     #[test]
     fn rewrites_knn_to_vector_search_when_indexed() {
         let plan = knn_plan("cosine_similarity");
@@ -579,6 +694,79 @@ mod tests {
             }
             other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
         }
+    }
+
+    #[test]
+    fn non_unique_lookup_under_knn_is_consumed_by_vector_search() {
+        let catalog = catalog_with_property_index(false, true);
+        let lowered = lower_knn_with_where("d.key = 'group-a'");
+
+        // Prove the ordering boundary explicitly: equality lookup first emits
+        // the non-unique posting leaf, then the vector rewrite consumes that
+        // leaf and reconstructs its equality as a pre-k residual filter.
+        let lookup =
+            crate::optimize::unique_lookup::apply_unique_property_lookup(lowered.clone(), &catalog);
+        assert_eq!(
+            property_lookup_mode(&lookup),
+            Some(true),
+            "fixture must reach a non-unique NodeByPropertyValue before vector rewrite"
+        );
+
+        let optimized = crate::optimize::optimize(lowered, &catalog);
+        assert!(
+            contains_vector_search(&optimized),
+            "indexed non-unique KNN filter must terminate in VectorSearch: {optimized:?}"
+        );
+        assert_eq!(
+            property_lookup_mode(&optimized),
+            None,
+            "the posting leaf must be folded into VectorSearch, not hide the KNN shape"
+        );
+    }
+
+    #[test]
+    fn unique_and_node_id_lookups_remain_seek_plus_topn() {
+        let unique_catalog = catalog_with_property_index(true, false);
+        let unique = crate::optimize::optimize(
+            lower_knn_with_where("d.key = 'one-document'"),
+            &unique_catalog,
+        );
+        assert_eq!(
+            property_lookup_mode(&unique),
+            Some(false),
+            "unique equality must remain an exact point lookup"
+        );
+        assert!(
+            contains_topn(&unique) && !contains_vector_search(&unique),
+            "unique point lookup must be scored directly under TopN: {unique:?}"
+        );
+
+        let vector_catalog = catalog_with_index(VectorMetric::Cosine);
+        let by_id =
+            crate::optimize::optimize(lower_knn_with_where("elementId(d) = $id"), &vector_catalog);
+        assert!(
+            contains_node_by_id(&by_id),
+            "elementId equality must remain NodeById"
+        );
+        assert!(
+            contains_topn(&by_id) && !contains_vector_search(&by_id),
+            "NodeById must be scored directly under TopN: {by_id:?}"
+        );
+    }
+
+    #[test]
+    fn binding_dependent_query_vector_is_not_rewritten() {
+        let outer_query = Expression {
+            kind: ExpressionKind::Variable(Identifier::new("outer_query", sp())),
+            span: sp(),
+        };
+        let plan = knn_plan_for_call(dist_call_with_query("cosine_similarity", outer_query));
+        let catalog = catalog_with_index(VectorMetric::Cosine);
+        let optimized = apply_vector_search(plan, &catalog);
+        assert!(
+            matches!(optimized, LogicalPlan::TopN { .. }) && !contains_vector_search(&optimized),
+            "a correlated query vector needs its outer row and cannot become VectorSearch"
+        );
     }
 
     #[test]
@@ -696,6 +884,51 @@ mod tests {
         match apply_vector_search(plan, &cat) {
             LogicalPlan::VectorSearch { post_filter, .. } => assert!(post_filter.is_none()),
             other => panic!("expected VectorSearch, got {:?}", other.operator_name()),
+        }
+    }
+
+    #[test]
+    fn filter_above_topn_remains_a_post_k_operator() {
+        let predicate = Expression {
+            kind: ExpressionKind::IsNull {
+                expr: Box::new(Expression {
+                    kind: ExpressionKind::Variable(Identifier::new("score", sp())),
+                    span: sp(),
+                }),
+                negated: true,
+            },
+            span: sp(),
+        };
+        let plan = LogicalPlan::Filter {
+            predicate: predicate.clone(),
+            input: Box::new(knn_plan("cosine_similarity")),
+        };
+        let cat = catalog_with_index(VectorMetric::Cosine);
+
+        // Exercise this root matcher directly: the public recursive entry point
+        // may already have rewritten the child TopN by the time it rebuilds the
+        // Filter, which would otherwise leave this semantic boundary untested.
+        match try_rewrite_here(plan, &cat) {
+            LogicalPlan::Filter {
+                predicate: actual,
+                input,
+            } => {
+                assert_eq!(actual, predicate);
+                match *input {
+                    LogicalPlan::VectorSearch { post_filter, .. } => assert!(
+                        post_filter.is_none(),
+                        "an outer Filter must not become a pre-k source filter"
+                    ),
+                    other => panic!(
+                        "expected Filter(VectorSearch), got Filter({})",
+                        other.operator_name()
+                    ),
+                }
+            }
+            other => panic!(
+                "expected post-k Filter to survive, got {}",
+                other.operator_name()
+            ),
         }
     }
 

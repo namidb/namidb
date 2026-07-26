@@ -24,8 +24,9 @@
 //! `WriterSession::open` LISTs the whole `wal/` prefix, so cold-open
 //! cost grows with total history, not live state.
 //! - **Superseded memtable snapshots.** `memtable_snapshot.bin` is
-//! overwritten in place but a flush can strand it stale (recovery
-//! already ignores a stale one; the object is pure storage cost).
+//! overwritten in place but a commit or flush can strand it bound to a WAL
+//! closure the current manifest no longer references (recovery already
+//! ignores it; the object is pure storage cost).
 //!
 //! ## What the janitor does
 //!
@@ -39,7 +40,10 @@
 //! side-cars). The horizon is the oldest version any live reader is
 //! pinned to (RFC-027), so a reader still reading an old version keeps
 //! every object that version needs in the live set.
-//! 2. Lists `sst/level0/`, `sst/level1/`, … up to a configurable max level.
+//! 2. Lists the namespace's `sst/` prefix recursively and discovers every
+//! canonical numeric `levelN/` present. The configured max level remains a
+//! compatibility hint, not a correctness boundary: a failed compaction CAS
+//! can strand its output one level deeper than every retained manifest.
 //! 3. For every listed object not in the live set, checks its
 //! `last_modified` age. Any object younger than `min_age` is skipped —
 //! this is a secondary guard against an in-flight writer whose body PUT
@@ -55,7 +59,7 @@
 //! 6. Lists `wal/` and reclaims every segment referenced by no retained
 //! manifest version, under the same `min_age` guard (see the deletion
 //! rule inline at the sweep). Also removes a stale `memtable_snapshot.bin`
-//! once the horizon manifest's flushed high-water subsumes it.
+//! once its exact WAL binding no longer matches the current manifest.
 //!
 //! ## Safety
 //!
@@ -129,10 +133,10 @@ pub struct JanitorReport {
     /// `delete = true`, otherwise what *would* be freed).
     pub wal_bytes_freed: u64,
     /// Stale `memtable_snapshot.bin` objects reclaimable this sweep (0 or 1:
-    /// there is one snapshot path per namespace). Stale means its `last_lsn`
-    /// is at or below the flushed high-water of the horizon manifest, so no
-    /// retained version's recovery would consume it. Populated in dry-run
-    /// too; the body is removed only when `delete = true`.
+    /// there is one snapshot path per namespace). Stale means its exact v2
+    /// `wal_segments` binding differs from the current manifest, so current
+    /// recovery cannot consume it. Populated in dry-run too; the body is
+    /// removed only when `delete = true`.
     pub memtable_snapshots_reclaimed: usize,
     /// Bytes held by the snapshot in `memtable_snapshots_reclaimed` (freed
     /// when `delete = true`, otherwise what *would* be freed).
@@ -178,10 +182,13 @@ async fn current_pin_floor(
     Ok(floor)
 }
 
-/// Scan `sst/level{0..max_level}/` for objects not referenced by the
-/// current manifest and (when `delete = true`) remove the ones older than
-/// `min_age`, then reclaim manifest snapshots retired below the retention
-/// horizon. See module docs for the safety reasoning.
+/// Scan every canonical numeric level discovered below `sst/` for objects not
+/// referenced by the current manifest and (when `delete = true`) remove the
+/// ones older than `min_age`, then reclaim manifest snapshots retired below
+/// the retention horizon. `max_level` is retained as an expected-level hint
+/// for diagnostics; deeper levels are still scanned because a failed
+/// compaction CAS can leave output beyond the manifest high-water mark. See
+/// module docs for the safety reasoning.
 ///
 /// The function loads the manifest **once** at the start of the sweep.
 /// If a writer commits a fresh manifest while we are listing objects, any
@@ -277,19 +284,15 @@ pub async fn sweep_orphans(
     // Deepest SST level occupied by ANY retained manifest version. Leveled-lite
     // compaction cascades output to deeper levels (L2, L3, …) as buckets grow,
     // and levels only ever increase, so the deepest level any retained manifest
-    // references bounds where every reclaimable orphan can live. The passed
-    // `max_level` is treated as a floor: hardcoding it to 1 (as the callers used
-    // to) leaked the entire superseded body of every L2+ rewrite forever.
+    // references predicts the normal scan depth. It is not a safe upper bound:
+    // compaction writes level N+1 before its manifest CAS, so a lost CAS can
+    // leave the only object at that deeper level absent from every manifest.
     let mut max_seen_level: u32 = 0;
     // WAL seqs referenced by ANY retained manifest version. Recovery replays
     // exactly the `wal_segments` list of the manifest it is handed, so this
     // union is the complete read surface of the `wal/` prefix (see the WAL
     // sweep below for the full deletion rule).
     let mut referenced_wal: HashSet<u64> = HashSet::new();
-    // Flushed LSN high-water of the HORIZON manifest — the oldest retained
-    // version and therefore the smallest high-water among them (flush only
-    // ever raises it). Governs the stale-snapshot reclaim below.
-    let mut horizon_flushed_hwm: u64 = 0;
     let mut mark_live = |manifest: &crate::manifest::Manifest| {
         for seg in &manifest.wal_segments {
             referenced_wal.insert(seg.seq);
@@ -307,16 +310,27 @@ pub async fn sweep_orphans(
             // typed-column layout) label scans.
             for u in &desc.unique_property_indices {
                 referenced.insert(u.path.clone());
+                if let Some(paged) = &u.paged {
+                    referenced.insert(paged.path.clone());
+                }
             }
             for e in &desc.equality_property_indices {
                 referenced.insert(e.path.clone());
+                if let Some(paged) = &e.paged {
+                    referenced.insert(paged.path.clone());
+                }
             }
             if let Some(li) = &desc.label_index {
                 referenced.insert(li.path.clone());
             }
+            if let Some(locator) = &desc.node_locator {
+                referenced.insert(locator.path.clone());
+            }
+            if let Some(point) = crate::manifest::edge_point_sidecar_path(desc) {
+                referenced.insert(point);
+            }
         }
     };
-    let mut horizon_hwm_seen = false;
     for version in horizon..=current_version {
         let loaded;
         let manifest = if version == current_version {
@@ -345,18 +359,12 @@ pub async fn sweep_orphans(
             }
         };
         mark_live(manifest);
-        if !horizon_hwm_seen {
-            // The oldest retained version that still loads carries the
-            // smallest flushed high-water among the retained set.
-            horizon_flushed_hwm = manifest.ssts.iter().map(|s| s.max_lsn).max().unwrap_or(0);
-            horizon_hwm_seen = true;
-        }
     }
 
     let ns_prefix = paths.namespace_prefix();
     let ns_prefix_str = ns_prefix.as_ref();
 
-    let scan_max_level = max_level.max(max_seen_level);
+    let expected_max_level = max_level.max(max_seen_level);
     // Pre-delete pin re-check (defense in depth): a lease that landed while
     // the live set was being built pins a version this sweep's horizon does
     // not honour — deleting now would race the new holder's copy. Abort the
@@ -372,38 +380,64 @@ pub async fn sweep_orphans(
         return Ok(report);
     }
 
-    for level in 0..=scan_max_level {
-        let level_dir = paths.sst_dir(level);
-        let mut stream = store.list(Some(&level_dir));
-        while let Some(meta) = stream.try_next().await.map_err(Error::ObjectStore)? {
-            let absolute = meta.location.as_ref();
-            // Convert to namespace-relative form so the comparison matches
-            // what's stored in `SstDescriptor::path`.
-            let Some(relative) = absolute
-                .strip_prefix(ns_prefix_str)
-                .and_then(|s| s.strip_prefix('/'))
-            else {
-                debug!(path = %absolute, "list returned object outside namespace prefix; skipping");
-                continue;
-            };
-            if referenced.contains(relative) {
-                continue;
-            }
-            let age_secs = (now - meta.last_modified).num_seconds();
-            if age_secs < min_age_secs {
-                report.skipped_too_young += 1;
-                debug!(path = %absolute, age_secs, "orphan candidate too young, deferring");
-                continue;
-            }
-            report.orphans_found += 1;
-            report.bytes_freed = report.bytes_freed.saturating_add(meta.size);
-            if delete {
-                store
-                    .delete(&meta.location)
-                    .await
-                    .map_err(Error::ObjectStore)?;
-                report.orphans_deleted += 1;
-            }
+    // One recursive LIST discovers numeric levels that no retained manifest
+    // references. Listing `0..=expected_max_level` cannot see a level N+1
+    // output stranded when compaction loses its install CAS.
+    let sst_root = object_store::path::Path::from(format!("{ns_prefix_str}/sst"));
+    let mut sst_objects = store.list(Some(&sst_root));
+    while let Some(meta) = sst_objects.try_next().await.map_err(Error::ObjectStore)? {
+        let absolute = meta.location.as_ref();
+        // Convert to namespace-relative form so the comparison matches what's
+        // stored in `SstDescriptor::path`.
+        let Some(relative) = absolute
+            .strip_prefix(ns_prefix_str)
+            .and_then(|s| s.strip_prefix('/'))
+        else {
+            debug!(path = %absolute, "list returned object outside namespace prefix; skipping");
+            continue;
+        };
+        let Some((level, file_name)) = relative
+            .strip_prefix("sst/level")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(raw_level, file_name)| {
+                raw_level
+                    .parse::<u32>()
+                    .ok()
+                    .map(|level| (level, file_name))
+            })
+        else {
+            debug!(path = %absolute, "non-canonical object below sst prefix; leaving it alone");
+            continue;
+        };
+        if file_name.is_empty() || file_name.contains('/') {
+            debug!(path = %absolute, "nested/non-canonical SST object; leaving it alone");
+            continue;
+        }
+        if level > expected_max_level {
+            debug!(
+                path = %absolute,
+                level,
+                expected_max_level,
+                "discovered SST level deeper than retained manifests/configuration"
+            );
+        }
+        if referenced.contains(relative) {
+            continue;
+        }
+        let age_secs = (now - meta.last_modified).num_seconds();
+        if age_secs < min_age_secs {
+            report.skipped_too_young += 1;
+            debug!(path = %absolute, age_secs, "orphan candidate too young, deferring");
+            continue;
+        }
+        report.orphans_found += 1;
+        report.bytes_freed = report.bytes_freed.saturating_add(meta.size);
+        if delete {
+            store
+                .delete(&meta.location)
+                .await
+                .map_err(Error::ObjectStore)?;
+            report.orphans_deleted += 1;
         }
     }
 
@@ -529,25 +563,21 @@ pub async fn sweep_orphans(
     }
 
     // Reclaim a stale `memtable_snapshot.bin`. The snapshot is a cold-start
-    // cache over UNflushed memtable state; recovery ignores it whenever its
-    // `last_lsn` is at or below the flushed SST high-water of the manifest it
-    // recovers against. Once `last_lsn <= horizon_flushed_hwm` — the smallest
-    // high-water any retained version presents — no retained version's
-    // recovery will ever consume it, so the object is pure storage cost.
-    // This is a cost measure, not a correctness one (recovery already refuses
-    // stale snapshots), so on any doubt — undecodable body, unknown version —
-    // the object is left alone. `min_age` guards the window where the writer
-    // overwrites the object with a fresh snapshot right after our GET.
+    // cache over the CURRENT manifest's unflushed WAL closure; version 2 names
+    // that exact descriptor vector. A flush can garbage-collect the highest
+    // LSN and make an SST high-water decrease, so an LSN comparison is not a
+    // safe staleness proof. Exact WAL binding is: once it differs from the
+    // current manifest, recovery cannot consume it and the object is pure
+    // storage cost. On any doubt — legacy/corrupt/future wire — leave it
+    // alone. `min_age` guards the window where the writer overwrites the
+    // object with a fresh snapshot right after our GET.
     let snap_path = paths.memtable_snapshot();
     match store.get(&snap_path).await {
         Ok(res) => {
             let meta = res.meta.clone();
             let body = res.bytes().await.map_err(Error::ObjectStore)?;
-            let stale = bincode::deserialize::<crate::recovery::MemtableSnapshotFile>(&body)
-                .map(|snap| {
-                    snap.version == crate::recovery::MEMTABLE_SNAPSHOT_VERSION
-                        && snap.last_lsn <= horizon_flushed_hwm
-                })
+            let stale = crate::recovery::decode_memtable_snapshot(&body)
+                .map(|snapshot| !snapshot.covers_manifest(&current.manifest))
                 .unwrap_or(false);
             if stale {
                 let age_secs = (now - meta.last_modified).num_seconds();
@@ -605,7 +635,9 @@ mod tests {
     fn person_label() -> LabelDef {
         LabelDef {
             name: "Person".into(),
-            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false)
+                .unwrap()
+                .with_indexed(true)],
         }
     }
 
@@ -690,6 +722,22 @@ mod tests {
 
         let _after = flush_one_node(&ms, &fence, &base, &schema, sorted_node_id(1), "A", 1).await;
 
+        let current = ms.load_current().await.unwrap();
+        let nodes = current
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == crate::manifest::SstKind::Nodes)
+            .unwrap();
+        assert!(nodes.node_locator.is_some());
+        assert!(
+            nodes
+                .equality_property_indices
+                .iter()
+                .any(|index| index.paged.is_some()),
+            "fixture must cover both new live sidecar classes"
+        );
+
         let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
             .await
             .unwrap();
@@ -773,31 +821,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_respects_max_level_window() {
+    async fn sweep_discovers_deep_orphan_after_failed_compaction_cas() {
         let store = make_store();
         let paths = make_paths("janitor-levels");
         let ms = ManifestStore::new(store.clone(), paths.clone());
         let _base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
 
-        // Plant orphans at L0 and L3.
+        // Model a flush orphan at L0 plus a prepared compaction that wrote its
+        // L7 output before losing the manifest CAS. No retained manifest names
+        // L7, so manifest high-water discovery alone cannot find it.
         let l0 = paths.sst_object(0, "l0-orphan.parquet");
-        let l3 = paths.sst_object(3, "l3-orphan.parquet");
+        let l7 = paths.sst_object(7, "l7-failed-cas-orphan.parquet");
         store
             .put(&l0, PutPayload::from(Bytes::from_static(b"l0")))
             .await
             .unwrap();
         store
-            .put(&l3, PutPayload::from(Bytes::from_static(b"l3")))
+            .put(&l7, PutPayload::from(Bytes::from_static(b"l7")))
             .await
             .unwrap();
 
-        // max_level = 1 catches only the L0 body.
+        // The legacy hint is deliberately shallower than the orphan.
         let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 1, true)
             .await
             .unwrap();
-        assert_eq!(report.orphans_found, 1);
+        assert_eq!(report.orphans_found, 2);
+        assert_eq!(report.orphans_deleted, 2);
         assert!(store.head(&l0).await.is_err(), "l0 orphan must be deleted");
-        assert!(store.head(&l3).await.is_ok(), "l3 orphan must survive");
+        assert!(
+            store.head(&l7).await.is_err(),
+            "the orphan beyond both configured and manifest levels must be deleted"
+        );
     }
 
     /// With no live reader pinned (horizon clamps to current), every manifest
@@ -1040,9 +1094,9 @@ mod tests {
         assert!(store.head(&paths.wal_segment(seq)).await.is_err());
     }
 
-    /// A `memtable_snapshot.bin` is kept while it still covers unflushed
-    /// state and reclaimed once a flush supersedes it (its `last_lsn` falls
-    /// at or below the horizon manifest's flushed high-water).
+    /// A `memtable_snapshot.bin` is kept while its exact WAL binding matches
+    /// current unflushed state and reclaimed once a flush supersedes that
+    /// closure.
     #[tokio::test]
     async fn sweep_reclaims_stale_memtable_snapshot_once_superseded() {
         let store = make_store();
@@ -1282,15 +1336,16 @@ mod tests {
         assert_eq!(again.expired_pins_reclaimed, 0);
     }
 
-    /// The staleness cut is the HORIZON manifest's flushed high-water, not the
-    /// current one: a snapshot newer than what a retained older version has
-    /// flushed is kept until the horizon passes it.
+    /// Snapshot staleness follows the exact CURRENT WAL closure, not an SST
+    /// high-water or retention horizon. Versioned readers recover from their
+    /// retained WAL objects; the single overwritten snapshot is only a
+    /// current-writer cache.
     #[tokio::test]
-    async fn sweep_keeps_memtable_snapshot_above_horizon_high_water() {
+    async fn sweep_reclaims_snapshot_with_stale_wal_binding_despite_old_horizon() {
         let store = make_store();
         let paths = make_paths("janitor-snap-horizon");
         let (mut session, _) = session_with_commits(&store, &paths, &["Ada"]).await;
-        // First flush: SST high-water = 1 at version v_f.
+        // First flush: retained version v_f has no WAL.
         let v_f = session
             .flush(person_schema())
             .await
@@ -1298,9 +1353,8 @@ mod tests {
             .committed
             .manifest
             .version;
-        // Second row (lsn 2), snapshot at last_lsn = 2, then flush again so
-        // the CURRENT high-water (2) subsumes the snapshot but v_f's (1)
-        // does not.
+        // Second row: snapshot binds its commit WAL, then flush clears that
+        // closure from the current manifest.
         session
             .upsert_node("Person", sorted_node_id(2), &node_record("Bob"))
             .unwrap();
@@ -1314,15 +1368,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            pinned.memtable_snapshots_reclaimed, 0,
-            "the horizon manifest has not flushed past the snapshot"
+            pinned.memtable_snapshots_reclaimed, 1,
+            "a stale current-writer cache is not retained by an old manifest horizon"
         );
-        assert!(store.head(&snap_path).await.is_ok());
+        assert!(store.head(&snap_path).await.is_err());
 
         let free = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 4, true)
             .await
             .unwrap();
-        assert_eq!(free.memtable_snapshots_reclaimed, 1);
+        assert_eq!(free.memtable_snapshots_reclaimed, 0);
         assert!(store.head(&snap_path).await.is_err());
     }
 }

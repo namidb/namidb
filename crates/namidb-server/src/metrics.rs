@@ -518,6 +518,65 @@ impl Metrics {
             "namidb_cache_resident_bytes {}",
             namidb_storage::shared_cache_usage_bytes()
         );
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let _ = writeln!(
+                out,
+                "# HELP namidb_search_index_cache_capacity_bytes Assigned byte ceiling for the shared decoded vector/full-text index pool."
+            );
+            let _ = writeln!(out, "# TYPE namidb_search_index_cache_capacity_bytes gauge");
+            let _ = writeln!(
+                out,
+                "namidb_search_index_cache_capacity_bytes {}",
+                namidb_storage::shared_cache_capacities().search_index_capacity_bytes()
+            );
+            let _ = writeln!(
+                out,
+                "# HELP namidb_search_index_cache_admission_rejections_total Valid search indexes rejected because their estimated decoded footprint exceeds the configured pool."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE namidb_search_index_cache_admission_rejections_total counter"
+            );
+            let cache = namidb_storage::shared_sst_cache();
+            #[cfg(feature = "vector-index")]
+            {
+                let count = cache.as_ref().map_or(
+                    0,
+                    namidb_storage::SstCache::vector_index_capacity_rejections,
+                );
+                let _ = writeln!(
+                    out,
+                    "namidb_search_index_cache_admission_rejections_total{{kind=\"vector\"}} {count}"
+                );
+            }
+            #[cfg(feature = "text-index")]
+            {
+                let count = cache
+                    .as_ref()
+                    .map_or(0, namidb_storage::SstCache::text_index_capacity_rejections);
+                let _ = writeln!(
+                    out,
+                    "namidb_search_index_cache_admission_rejections_total{{kind=\"text\"}} {count}"
+                );
+            }
+        }
+        #[cfg(feature = "vector-index")]
+        {
+            let _ = writeln!(
+                out,
+                "# HELP namidb_vector_filter_bitmap_searches_total Vector searches that applied at least one embedded .vg metadata posting."
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE namidb_vector_filter_bitmap_searches_total counter"
+            );
+            let _ = writeln!(
+                out,
+                "namidb_vector_filter_bitmap_searches_total {}",
+                namidb_storage::vector_filter_bitmap_searches()
+            );
+        }
 
         let _ = writeln!(
             out,
@@ -679,6 +738,49 @@ impl Metrics {
 
         out
     }
+
+    /// Render query/storage metrics plus the process resident-memory governor.
+    pub fn render_with_memory(&self, memory: &crate::memory::MemoryGovernor) -> String {
+        use std::fmt::Write as _;
+        let mut out = self.render();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_memory_max_bytes Configured process RSS/working-set admission ceiling; zero disables it."
+        );
+        let _ = writeln!(out, "# TYPE namidb_memory_max_bytes gauge");
+        let _ = writeln!(out, "namidb_memory_max_bytes {}", memory.max_bytes());
+        let _ = writeln!(
+            out,
+            "# HELP namidb_memory_resident_bytes Most recently sampled process RSS/working-set bytes."
+        );
+        let _ = writeln!(out, "# TYPE namidb_memory_resident_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_memory_resident_bytes {}",
+            memory.resident_bytes()
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_memory_reclaims_total Shared-cache pressure-relief passes triggered near the process memory ceiling."
+        );
+        let _ = writeln!(out, "# TYPE namidb_memory_reclaims_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_memory_reclaims_total {}",
+            memory.reclaim_events()
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_memory_rejected_queries_total New Cypher queries rejected at the process memory ceiling."
+        );
+        let _ = writeln!(out, "# TYPE namidb_memory_rejected_queries_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_memory_rejected_queries_total {}",
+            memory.rejected_queries()
+        );
+        out
+    }
 }
 
 /// RAII guard returned by [`Metrics::track_in_flight`]; decrements the
@@ -773,6 +875,20 @@ mod tests {
         assert!(text.contains("namidb_cache_max_bytes "));
         assert!(text.contains("namidb_cache_capacity_bytes "));
         assert!(text.contains("namidb_cache_resident_bytes "));
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            assert!(text.contains("namidb_search_index_cache_capacity_bytes "));
+            assert!(text.contains("namidb_search_index_cache_admission_rejections_total"));
+        }
+        #[cfg(feature = "vector-index")]
+        assert!(text.contains("namidb_vector_filter_bitmap_searches_total "));
+
+        let memory = crate::memory::MemoryGovernor::new(123_456);
+        let with_memory = m.render_with_memory(&memory);
+        assert!(with_memory.contains("namidb_memory_max_bytes 123456"));
+        assert!(with_memory.contains("namidb_memory_resident_bytes "));
+        assert!(with_memory.contains("namidb_memory_reclaims_total 0"));
+        assert!(with_memory.contains("namidb_memory_rejected_queries_total 0"));
     }
 
     #[test]

@@ -1,42 +1,32 @@
 # namidb
 
-The public façade crate for [NamiDB](https://github.com/namidb/namidb),
+The workspace façade crate for [NamiDB](https://github.com/namidb/namidb),
 the graph database that lives in your bucket.
 
-This is the **stable umbrella API**. It re-exports the types you reach
-for most often from
+This crate is not currently published to crates.io and its low-level Rust
+surface is not covered by NamiDB's released-artifact compatibility guarantee.
+It is the intended future umbrella API for curated types from
 [`namidb-core`](../namidb-core/),
 [`namidb-storage`](../namidb-storage/),
 [`namidb-graph`](../namidb-graph/) and
-[`namidb-query`](../namidb-query/), so downstream code can depend on a
-single `namidb = "0.1"` line in `Cargo.toml`.
-
-If you're embedding NamiDB into a Rust application, **start here**.
+[`namidb-query`](../namidb-query/). Until that façade is published, Rust
+embedders should use an explicit git/path revision and expect implementation
+types to evolve between patch releases.
 
 ## Example
 
 ```rust
-use std::sync::Arc;
+use namidb::{DataType, LabelDef, PropertyDef, Schema};
 
-use namidb::core::id::NamespaceId;
-use namidb::query::{execute, lower, parse, Params};
-use namidb::storage::{NamespacePaths, WriterSession};
-use object_store::{memory::InMemory, ObjectStore};
+fn main() -> namidb::Result<()> {
+    let schema = Schema::builder()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false)?],
+        })?
+        .build();
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let paths   = NamespacePaths::new("tenants", NamespaceId::new("demo")?);
-    let mut writer = WriterSession::open(store, paths).await?;
-
-    // ... upsert nodes / edges, then commit_batch + flush ...
-
-    let snap = writer.snapshot();
-    let q    = parse("MATCH (a:Person) RETURN count(*) AS n")?;
-    let plan = lower(&q)?;
-    let rows = execute(&plan, &snap, &Params::new()).await?;
-
-    println!("{rows:?}");
+    assert!(schema.label("Person").is_some());
     Ok(())
 }
 ```

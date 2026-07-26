@@ -92,7 +92,7 @@ use parquet::file::metadata::ParquetMetaData;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use namidb_core::{EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
+use namidb_core::{DataType, EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
@@ -116,7 +116,7 @@ use crate::sst::edges::format::{
     SECTION_PER_EDGE_LSN, SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
 };
 use crate::sst::edges::reader::EdgeSstReader;
-use crate::sst::edges::writer::{EdgeRecord, EdgeSstFinish, EdgeSstWriter, EdgeSstWriterOptions};
+use crate::sst::edges::writer::{EdgeRecord, EdgeSstBuild, EdgeSstWriter, EdgeSstWriterOptions};
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
     parse_node_sst_metadata, prop_column_name, NodeSstFinish, NodeSstReader, NodeSstWriterOptions,
@@ -162,6 +162,7 @@ pub struct PreparedCompaction {
     /// publish outputs computed for a different catalog.
     base_vector_indexes: Vec<crate::manifest::VectorIndexDescriptor>,
     base_text_indexes: Vec<crate::manifest::TextIndexDescriptor>,
+    search_build_states: Vec<crate::manifest::SearchIndexBuildState>,
 }
 
 impl PreparedCompaction {
@@ -223,7 +224,7 @@ impl CompactionBasis {
     /// still plans a merge.
     pub fn needs_compaction(&self) -> bool {
         any_bucket_plans(
-            &self.base.manifest.ssts,
+            &self.base.manifest,
             compaction_base_bytes(),
             compaction_level_ratio(),
         )
@@ -242,10 +243,10 @@ impl CompactionBasis {
 /// [`plan_bucket_merge`] calls the prepare phase makes, with no object-store
 /// I/O. Vector/text index SSTs are rebuilt from node buckets rather than
 /// planned directly, so only node and edge buckets participate.
-fn any_bucket_plans(ssts: &[SstDescriptor], base_bytes: u64, ratio: u64) -> bool {
+fn any_bucket_plans(manifest: &crate::manifest::Manifest, base_bytes: u64, ratio: u64) -> bool {
     let mut buckets: std::collections::HashMap<(SstKind, &str), Vec<&SstDescriptor>> =
         std::collections::HashMap::new();
-    for d in ssts {
+    for d in &manifest.ssts {
         if matches!(
             d.kind,
             SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv
@@ -256,9 +257,31 @@ fn any_bucket_plans(ssts: &[SstDescriptor], base_bytes: u64, ratio: u64) -> bool
                 .push(d);
         }
     }
-    buckets
-        .values()
-        .any(|sources| plan_bucket_merge(sources, base_bytes, ratio).is_some())
+    let single_node_scope = buckets
+        .keys()
+        .filter(|(kind, _)| *kind == SstKind::Nodes)
+        .count()
+        <= 1;
+    let rebuild_search = single_node_scope && search_indexes_need_rebuild(manifest);
+    buckets.iter().any(|((kind, scope), sources)| {
+        if *kind == SstKind::Nodes {
+            let required = if scope.is_empty() {
+                crate::flush::union_indexed_props(&manifest.schema)
+            } else {
+                manifest
+                    .schema
+                    .label(scope)
+                    .cloned()
+                    .unwrap_or_else(|| LabelDef {
+                        name: (*scope).to_string(),
+                        properties: Vec::new(),
+                    })
+            };
+            plan_node_bucket(sources, base_bytes, ratio, &required, rebuild_search).is_some()
+        } else {
+            plan_bucket_merge(sources, base_bytes, ratio).is_some()
+        }
+    })
 }
 
 /// Run a pure-CPU compaction section (row merges, index construction) on the
@@ -392,6 +415,184 @@ fn plan_bucket_merge<'a>(
     })
 }
 
+/// Node-specific planner wrapper that performs a one-time online format
+/// migration. A namespace created by 2.0.4 can consist of one fully compacted
+/// L1 SST, so ordinary leveled policy would never rewrite it. If any source
+/// lacks the exact row locator (or one of its property indexes lacks the
+/// range-readable mirror), merge the complete bucket at its deepest level.
+/// The output carries every current sidecar and the predicate becomes false,
+/// preventing rewrite churn on later maintenance ticks.
+fn plan_node_bucket<'a>(
+    sources: &[&'a SstDescriptor],
+    base: u64,
+    ratio: u64,
+    required: &LabelDef,
+    force_search_rebuild: bool,
+) -> Option<BucketPlan<'a>> {
+    if let Some(plan) = plan_bucket_merge(sources, base, ratio) {
+        return Some(plan);
+    }
+    let required_equality: Vec<&str> = required
+        .properties
+        .iter()
+        .filter(|property| {
+            property.indexed
+                && matches!(
+                    property.data_type,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                )
+        })
+        .map(|property| property.name.as_str())
+        .collect();
+    let needs_migration = force_search_rebuild
+        || sources.iter().any(|desc| {
+            desc.node_locator.is_none()
+                || desc
+                    .unique_property_indices
+                    .iter()
+                    .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
+                || desc
+                    .equality_property_indices
+                    .iter()
+                    .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
+                || required_equality.iter().any(|property| {
+                    !desc.equality_property_indices.iter().any(|index| {
+                        index.property == *property
+                            && index.mixed_type_complete
+                            && (index.paged.is_some() || index.paged_build_unsupported)
+                    })
+                })
+        });
+    if !needs_migration || sources.is_empty() {
+        return None;
+    }
+    let target_level = sources
+        .iter()
+        .map(|desc| desc.level.as_u32())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    Some(BucketPlan {
+        inputs: sources.to_vec(),
+        target_level,
+        is_deepest: true,
+    })
+}
+
+fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
+    let max_node_lsn = manifest
+        .ssts
+        .iter()
+        .filter(|sst| sst.kind == SstKind::Nodes)
+        .map(|sst| sst.max_lsn)
+        .max()
+        .unwrap_or(0);
+    #[cfg(feature = "vector-index")]
+    if manifest.vector_indexes.iter().any(|index| {
+        let signature = vector_catalog_signature(manifest, index);
+        !manifest.search_index_builds.iter().any(|state| {
+            state.kind == SstKind::VectorGraph
+                && state.name == index.name
+                && state.catalog_signature == signature
+                && state.max_node_lsn >= max_node_lsn
+        })
+    }) {
+        return true;
+    }
+    #[cfg(feature = "text-index")]
+    if manifest.text_indexes.iter().any(|index| {
+        let signature = text_catalog_signature(index);
+        !manifest.search_index_builds.iter().any(|state| {
+            state.kind == SstKind::TextIndex
+                && state.name == index.name
+                && state.catalog_signature == signature
+                && state.max_node_lsn >= max_node_lsn
+        })
+    }) {
+        return true;
+    }
+    let _ = max_node_lsn;
+    false
+}
+
+#[cfg(feature = "vector-index")]
+fn vector_catalog_signature(
+    manifest: &crate::manifest::Manifest,
+    index: &crate::manifest::VectorIndexDescriptor,
+) -> String {
+    // Native vector pre-filters are compiled into the immutable `.vg` body.
+    // Include their schema slice in the generation signature so CREATE/DROP
+    // INDEX on a Bool/String property rebuilds postings even when no node LSN
+    // changed. Sorting makes the signature insensitive to schema declaration
+    // order while still tracking name, type and index flags exactly.
+    let mut filter_properties: Vec<(&String, &DataType, bool, bool)> = manifest
+        .schema
+        .label(&index.label)
+        .into_iter()
+        .flat_map(|label| &label.properties)
+        .filter(|property| {
+            (property.indexed || property.unique)
+                && matches!(
+                    property.data_type,
+                    DataType::Bool | DataType::Utf8 | DataType::LargeUtf8
+                )
+        })
+        .map(|property| {
+            (
+                &property.name,
+                &property.data_type,
+                property.indexed,
+                property.unique,
+            )
+        })
+        .collect();
+    filter_properties.sort_by(|left, right| left.0.cmp(right.0));
+    serde_json::to_string(&(index, filter_properties))
+        .expect("vector descriptor and filter schema serialize")
+}
+
+#[cfg(feature = "text-index")]
+fn text_catalog_signature(index: &crate::manifest::TextIndexDescriptor) -> String {
+    serde_json::to_string(index).expect("text descriptor serializes")
+}
+
+fn catalog_build_states(
+    manifest: &crate::manifest::Manifest,
+    max_node_lsn: u64,
+    attempted: &HashSet<(SstKind, String)>,
+) -> Vec<crate::manifest::SearchIndexBuildState> {
+    #[allow(unused_mut)]
+    let mut states = Vec::new();
+    #[cfg(feature = "vector-index")]
+    states.extend(
+        manifest
+            .vector_indexes
+            .iter()
+            .filter(|index| attempted.contains(&(SstKind::VectorGraph, index.name.clone())))
+            .map(|index| crate::manifest::SearchIndexBuildState {
+                kind: SstKind::VectorGraph,
+                name: index.name.clone(),
+                catalog_signature: vector_catalog_signature(manifest, index),
+                max_node_lsn,
+            }),
+    );
+    #[cfg(feature = "text-index")]
+    states.extend(
+        manifest
+            .text_indexes
+            .iter()
+            .filter(|index| attempted.contains(&(SstKind::TextIndex, index.name.clone())))
+            .map(|index| crate::manifest::SearchIndexBuildState {
+                kind: SstKind::TextIndex,
+                name: index.name.clone(),
+                catalog_signature: text_catalog_signature(index),
+                max_node_lsn,
+            }),
+    );
+    let _ = (manifest, max_node_lsn, attempted);
+    states
+}
+
 /// Run one leveled-lite compaction sweep across every `(kind, scope)`
 /// bucket, reading the level budgets from the environment.
 pub async fn compact_l0_to_l1(
@@ -521,6 +722,7 @@ async fn prepare_leveled(
     let mut new_descs: Vec<SstDescriptor> = Vec::new();
     let mut removed_ids: Vec<Uuid> = Vec::new();
     let mut bloom_count: usize = 0;
+    let mut search_build_states = Vec::new();
 
     // Node tombstone GC needs the merge authoritative for every node key it
     // touches. Nodes are id-primary, so a key can live in any node SST
@@ -540,12 +742,10 @@ async fn prepare_leveled(
         .map(|d| d.scope.as_str())
         .collect();
     let node_gc_safe = node_scopes.len() <= 1;
+    let rebuild_search = node_gc_safe && search_indexes_need_rebuild(&base.manifest);
 
     // Nodes.
     for (label, sources) in node_buckets {
-        let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
-            continue;
-        };
         let label_def = schema.label(&label).cloned().unwrap_or_else(|| LabelDef {
             name: label.clone(),
             properties: vec![],
@@ -560,6 +760,11 @@ async fn prepare_leveled(
             crate::flush::union_indexed_props(schema)
         } else {
             label_def.clone()
+        };
+        let Some(plan) =
+            plan_node_bucket(&sources, base_bytes, ratio, &sidecar_def, rebuild_search)
+        else {
+            continue;
         };
         // GC tombstones only when this merge is authoritative: a single node
         // scope (no other scope can hold the key) AND the output is the
@@ -620,43 +825,28 @@ async fn prepare_leveled(
             )
         })
         .await??;
-        // The highest LSN in the merged corpus — stamped onto any SST-backed
-        // index (vector / text) rebuilt from these rows so a later freshness
-        // check can tell whether a newer Nodes SST has outrun the index.
-        #[cfg(any(feature = "vector-index", feature = "text-index"))]
-        let finish_max_lsn = out.finish.stats.max_lsn;
-        if out.finish.stats.row_count == 0 {
-            // Nothing to write; still mark the merged sources for removal so
-            // the bucket truly shrinks.
-            for src in &plan.inputs {
-                removed_ids.push(src.id);
-            }
-            continue;
-        }
-        let (descriptor, wrote_bloom) = put_node_sst_leveled(
-            store.clone(),
-            paths,
-            plan.target_level,
-            &label,
-            out.sidecars,
-            out.finish,
-        )
-        .await?;
-        if wrote_bloom {
-            bloom_count += 1;
-        }
-        for src in &plan.inputs {
-            removed_ids.push(src.id);
-        }
-        new_descs.push(descriptor);
+        // The highest LSN covered by this authoritative generation. Use the
+        // source high-water mark rather than only the surviving winner rows:
+        // an all-tombstone merge has no output rows, but it still advances the
+        // search corpus to an authoritatively empty generation.
+        let finish_max_lsn = plan
+            .inputs
+            .iter()
+            .map(|source| source.max_lsn)
+            .max()
+            .unwrap_or(out.finish.stats.max_lsn);
 
-        // RFC-030 (`vector-index`): rebuild Vamana indexes whose label has
-        // nodes in this bucket. A graph is not row-mergeable, so any prior
-        // VectorGraph SST for a rebuilt index is dropped (replaced) and the
-        // fresh one built from the members the winner stream collected.
+        // Rebuild vector/text bodies before the empty-node-body fast path.
+        // An authoritative merge can legitimately reduce an index corpus to
+        // zero (or one vector): that successful empty build must remove the
+        // prior body and persist a generation marker, otherwise compaction
+        // either loops forever or keeps serving a stale pre-delete index.
+        #[allow(unused_mut)]
+        let mut attempted_search_builds: HashSet<(SstKind, String)> = HashSet::new();
+
         #[cfg(feature = "vector-index")]
         {
-            let (new_vg, old_vg_ids) = build_vector_indexes_from_members(
+            let (new_vg, old_vg_ids, attempted) = build_vector_indexes_from_members(
                 store.clone(),
                 paths,
                 plan.target_level,
@@ -667,13 +857,16 @@ async fn prepare_leveled(
             .await?;
             new_descs.extend(new_vg);
             removed_ids.extend(old_vg_ids);
+            attempted_search_builds.extend(
+                attempted
+                    .into_iter()
+                    .map(|name| (SstKind::VectorGraph, name)),
+            );
         }
 
-        // (`text-index`): rebuild full-text indexes whose label has nodes in this
-        // bucket, from the same winner stream (rebuild-not-merge).
         #[cfg(feature = "text-index")]
         {
-            let (new_ft, old_ft_ids) = build_text_indexes_from_members(
+            let (new_ft, old_ft_ids, attempted) = build_text_indexes_from_members(
                 store.clone(),
                 paths,
                 plan.target_level,
@@ -684,7 +877,44 @@ async fn prepare_leveled(
             .await?;
             new_descs.extend(new_ft);
             removed_ids.extend(old_ft_ids);
+            attempted_search_builds
+                .extend(attempted.into_iter().map(|name| (SstKind::TextIndex, name)));
         }
+
+        if gc {
+            search_build_states =
+                catalog_build_states(&base.manifest, finish_max_lsn, &attempted_search_builds);
+        }
+        if out.finish.stats.row_count == 0 {
+            // Nothing to write; still mark the merged sources for removal so
+            // the bucket truly shrinks.
+            for src in &plan.inputs {
+                removed_ids.push(src.id);
+            }
+            continue;
+        }
+        let (mut descriptor, wrote_bloom) = put_node_sst_leveled(
+            store.clone(),
+            paths,
+            plan.target_level,
+            &label,
+            out.sidecars,
+            out.finish,
+        )
+        .await?;
+        // The descriptor is also the corpus freshness fence used by the
+        // vector/text readers. Preserve the source high-water mark even when
+        // the highest-LSN winner was a tombstone removed by authoritative GC;
+        // otherwise the freshly rebuilt search indexes appear to outrun the
+        // node corpus and every read falls back to a flat scan.
+        descriptor.max_lsn = finish_max_lsn;
+        if wrote_bloom {
+            bloom_count += 1;
+        }
+        for src in &plan.inputs {
+            removed_ids.push(src.id);
+        }
+        new_descs.push(descriptor);
     }
 
     // Edges (forward).
@@ -760,6 +990,7 @@ async fn prepare_leveled(
         base_schema: base.manifest.schema.clone(),
         base_vector_indexes: base.manifest.vector_indexes.clone(),
         base_text_indexes: base.manifest.text_indexes.clone(),
+        search_build_states,
     })
 }
 
@@ -846,6 +1077,11 @@ pub async fn install_prepared(
     let removed_set: HashSet<Uuid> = prepared.removed_ids.into_iter().collect();
     next.ssts.retain(|d| !removed_set.contains(&d.id));
     next.ssts.extend(prepared.new_descs);
+    for state in prepared.search_build_states {
+        next.search_index_builds
+            .retain(|existing| existing.kind != state.kind || existing.name != state.name);
+        next.search_index_builds.push(state);
+    }
     let committed = manifest_store.commit(fence, current, next).await?;
 
     Ok(CompactionOutcome {
@@ -894,7 +1130,7 @@ async fn compact_and_write_edges(
     })
     .await??;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
-    if finish.stats.edge_count == 0 {
+    if finish.finish.stats.edge_count == 0 {
         return Ok((None, false, removed));
     }
     let (descriptor, wrote_bloom) =
@@ -1145,13 +1381,18 @@ struct NodeSidecarHarvest {
     unique: UniqueSidecarCollector,
     equality: EqualitySidecarCollector,
     label_index: LabelIndexCollector,
+    node_locator_ids: Vec<[u8; 16]>,
     per_label_property_stats: Vec<PerLabelPropertyStat>,
 }
 
 /// Per-index `(descriptor, collected (id, embedding) members)` pairs the
 /// winner stream produced. Aliased for clippy's type-complexity lint.
 #[cfg(feature = "vector-index")]
-type VectorIndexMembers = Vec<(VectorIndexDescriptor, Vec<([u8; 16], Vec<f32>)>)>;
+type VectorIndexMembers = Vec<(
+    VectorIndexDescriptor,
+    Vec<([u8; 16], Vec<f32>)>,
+    crate::sst::vector::VectorFilterPostings,
+)>;
 
 /// Per-index `(descriptor, collected (id, document) members)` pairs the
 /// winner stream produced. Aliased for clippy's type-complexity lint.
@@ -1222,12 +1463,13 @@ fn merge_node_sources(
     let mut unique = UniqueSidecarCollector::new(sidecar_def);
     let mut equality = EqualitySidecarCollector::new(sidecar_def);
     let mut label_index = LabelIndexCollector::new();
+    let mut node_locator_ids = Vec::new();
     let mut stats = PerLabelStatsCollector::new();
     #[cfg(feature = "vector-index")]
     let mut vector_collectors: Vec<VectorMemberCollector> = index_specs
         .vector
         .into_iter()
-        .map(|desc| VectorMemberCollector::new(desc, label_dict))
+        .map(|desc| VectorMemberCollector::new(desc, label_dict, schema))
         .collect();
     #[cfg(feature = "text-index")]
     let mut text_collectors: Vec<TextMemberCollector> = index_specs
@@ -1253,6 +1495,7 @@ fn merge_node_sources(
             last_id = Some(entry.id);
             let (row, rec) = cursor.materialize_current(label_def)?;
             if !(gc_tombstones && matches!(row.op, MemOp::Tombstone)) {
+                node_locator_ids.push(row.id);
                 if let Some(rec) = &rec {
                     unique.observe(row.id, rec);
                     equality.observe(row.id, rec);
@@ -1290,12 +1533,13 @@ fn merge_node_sources(
             unique,
             equality,
             label_index,
+            node_locator_ids,
             per_label_property_stats: stats.finish(schema, label_dict)?,
         },
         #[cfg(feature = "vector-index")]
         vector_members: vector_collectors
             .into_iter()
-            .map(|c| (c.desc, c.members))
+            .map(|c| (c.desc, c.members, c.filter_postings.finish()))
             .collect(),
         #[cfg(feature = "text-index")]
         text_members: text_collectors
@@ -1737,7 +1981,7 @@ fn merge_edge_sources(
     declared_property_names: &[String],
     direction: EdgeDirection,
     gc_tombstones: bool,
-) -> Result<EdgeSstFinish> {
+) -> Result<EdgeSstBuild> {
     let mut cursors: Vec<EdgeSourceCursor> = Vec::with_capacity(bodies.len());
     let mut total_keys: u64 = 0;
     for body in bodies {
@@ -1798,7 +2042,7 @@ fn merge_edge_sources(
         }
     }
 
-    writer.finish()
+    writer.finish_with_point_index()
 }
 
 // ── PUT helpers (L1 variants) ───────────────────────────────────────────
@@ -1868,6 +2112,13 @@ async fn put_node_sst_leveled(
     if let Some(sidecar) = label_sidecar {
         index_sidecars.push(sidecar);
     }
+    let (node_locator, locator_sidecar) = crate::flush::prepare_node_locator_sidecar(
+        paths,
+        level.as_u32(),
+        &id,
+        sidecars.node_locator_ids.iter().copied(),
+    )?;
+    index_sidecars.push(locator_sidecar);
     for (path, body) in &index_sidecars {
         crate::flush::put_object(store.clone(), path, body.clone()).await?;
     }
@@ -1896,6 +2147,7 @@ async fn put_node_sst_leveled(
         unique_property_indices,
         equality_property_indices,
         label_index,
+        node_locator: Some(node_locator),
         // Per-(label, property) stats recomputed off the winner stream so
         // they survive L0->L1 the same way the label index does (RFC 025).
         per_label_property_stats: sidecars.per_label_property_stats,
@@ -1916,15 +2168,34 @@ struct VectorMemberCollector {
     /// The index label resolved to its raw dictionary id (if interned).
     label_id: Option<u32>,
     members: Vec<([u8; 16], Vec<f32>)>,
+    /// Complete String/Bool equality postings collected in the same winner
+    /// stream as the vectors, bounded and adaptive before they enter `.vg`.
+    filter_postings: crate::sst::vector::VectorFilterPostingsBuilder,
 }
 
 #[cfg(feature = "vector-index")]
 impl VectorMemberCollector {
-    fn new(desc: VectorIndexDescriptor, label_dict: &LabelDictionary) -> Self {
+    fn new(desc: VectorIndexDescriptor, label_dict: &LabelDictionary, schema: &Schema) -> Self {
+        let filter_properties = schema
+            .label(&desc.label)
+            .into_iter()
+            .flat_map(|label| &label.properties)
+            .filter(|property| {
+                (property.indexed || property.unique)
+                    && matches!(
+                        property.data_type,
+                        DataType::Bool | DataType::Utf8 | DataType::LargeUtf8
+                    )
+            })
+            .map(|property| property.name.clone());
         Self {
             label_id: label_dict.id(&desc.label).map(|lid| lid.0),
             desc,
             members: Vec::new(),
+            filter_postings: crate::sst::vector::VectorFilterPostingsBuilder::new(
+                filter_properties,
+                crate::sst::vector::VectorFilterLimits::from_env(),
+            ),
         }
     }
 
@@ -1949,6 +2220,12 @@ impl VectorMemberCollector {
             Value::VecI8 { codes, scale } => codes.iter().map(|&c| c as f32 * *scale).collect(),
             _ => return,
         };
+        // `build_body` rejects an over-u32 corpus. Do not wrap postings before
+        // that invariant error is surfaced; still retain the member so the
+        // whole index build is rejected rather than silently truncated.
+        if let Ok(ordinal) = u32::try_from(self.members.len()) {
+            self.filter_postings.observe(ordinal, &rec.properties);
+        }
         self.members.push((id, v));
     }
 }
@@ -2006,8 +2283,9 @@ impl TextMemberCollector {
 /// and return the new descriptors **plus** the ids of any prior VectorGraph
 /// SSTs for the same index (which must be removed — a graph is not
 /// row-mergeable, so compaction rebuilds rather than merges). Indexes whose
-/// label had no nodes in the bucket, or with fewer than two live
-/// embeddings, yield nothing (and keep their prior SST).
+/// authoritative corpus has fewer than two live embeddings, it yields no new
+/// body and removes any prior SST; a durable generation marker prevents
+/// repeatedly rewriting the node level for that legitimate empty result.
 ///
 /// The authority gate lives at the collection site (`prepare_leveled`): on
 /// a partial (non-authoritative) merge no members are collected, this
@@ -2023,27 +2301,53 @@ async fn build_vector_indexes_from_members(
     corpus_max_lsn: u64,
     collected: VectorIndexMembers,
     old_vector_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
-) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
-    use crate::sst::vector::build_body;
+) -> Result<(Vec<SstDescriptor>, Vec<Uuid>, Vec<String>)> {
+    use crate::sst::vector::build_body_with_filter_postings;
 
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
+    let mut attempted = Vec::new();
 
-    for (desc, members) in collected {
+    for (desc, members, filter_postings) in collected {
+        // Reaching the deterministic body builder is an authoritative attempt
+        // for this exact catalog signature + node generation. Persist that
+        // fact even when validation rejects the body: otherwise an idle lone
+        // L1 is rewritten on every maintenance tick without any input change.
+        // Physical availability is still represented solely by a VectorGraph
+        // SST descriptor; this marker is never consulted by reads.
+        attempted.push(desc.name.clone());
         // Skip-and-warn on a per-index build error (e.g. a malformed descriptor)
         // rather than `?`-aborting the whole compaction — one bad index must
         // never wedge the namespace's compaction permanently. The Vamana
         // construction is O(n·R·L·dim) pure CPU, so it runs on the blocking
         // pool instead of stalling the async runtime for its duration.
         let build_desc = desc.clone();
-        let built = match run_cpu(move || build_body(&build_desc, members)).await? {
+        let built = match run_cpu(move || {
+            build_body_with_filter_postings(&build_desc, members, filter_postings)
+        })
+        .await?
+        {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(index = %desc.name, error = %e, "skipping vector index build");
+                // A body from an older catalog/generation must not remain
+                // physically discoverable after this authoritative generation
+                // was rejected. Removing only its manifest descriptor makes
+                // reads choose the exact flat fallback; the attempt marker
+                // suppresses unchanged maintenance churn.
+                if let Some(old) = old_vector_by_scope.get(&desc.name) {
+                    removed.extend(old.iter().map(|d| d.id));
+                }
                 continue;
             }
         };
+        // `Ok(None)` is a successful authoritative build of a corpus too
+        // small for a graph. Remove any older graph; the durable attempt marker
+        // prevents a rewrite loop while reads use the exact flat fallback.
         let Some((body, stats)) = built else {
+            if let Some(old) = old_vector_by_scope.get(&desc.name) {
+                removed.extend(old.iter().map(|d| d.id));
+            }
             continue;
         };
 
@@ -2095,6 +2399,7 @@ async fn build_vector_indexes_from_members(
             unique_property_indices: vec![],
             equality_property_indices: vec![],
             label_index: None,
+            node_locator: None,
             per_label_property_stats: vec![],
         };
         new_descs.push(descriptor);
@@ -2105,7 +2410,7 @@ async fn build_vector_indexes_from_members(
         }
     }
 
-    Ok((new_descs, removed))
+    Ok((new_descs, removed, attempted))
 }
 
 /// (`text-index`): for every registered full-text index, build a fresh
@@ -2118,7 +2423,8 @@ async fn build_vector_indexes_from_members(
 /// Like [`build_vector_indexes_from_members`], the authority gate lives at
 /// the collection site: on a partial merge no members are collected, the
 /// prior `.ft` is kept, and the freshness gate falls back to the flat scan
-/// rather than truncating the index to the shallow subset.
+/// rather than truncating the index to the shallow subset. An authoritative
+/// empty corpus does remove the prior body and records a completed generation.
 #[cfg(feature = "text-index")]
 async fn build_text_indexes_from_members(
     store: Arc<dyn ObjectStore>,
@@ -2127,16 +2433,40 @@ async fn build_text_indexes_from_members(
     corpus_max_lsn: u64,
     collected: TextIndexMembers,
     old_text_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
-) -> Result<(Vec<SstDescriptor>, Vec<Uuid>)> {
+) -> Result<(Vec<SstDescriptor>, Vec<Uuid>, Vec<String>)> {
     use crate::sst::text::build_body;
 
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
+    let mut attempted = Vec::new();
 
     for (desc, members) in collected {
+        // Same generation-attempt contract as vector builds. A deterministic
+        // encoder/build invariant must not make an unchanged L1 rewrite
+        // forever; no TextIndex descriptor means reads remain on the exact
+        // fallback. Runtime join failures and object-store errors still abort
+        // compaction and therefore publish no marker.
+        attempted.push(desc.name.clone());
         // BM25 postings construction is pure CPU over the collected corpus;
         // run it on the blocking pool like the Vamana build above.
-        let Some((body, stats)) = run_cpu(move || build_body(members)).await?? else {
+        let built = match run_cpu(move || build_body(members)).await? {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    index = %desc.name,
+                    error = %error,
+                    "skipping text index build"
+                );
+                if let Some(old) = old_text_by_scope.get(&desc.name) {
+                    removed.extend(old.iter().map(|d| d.id));
+                }
+                continue;
+            }
+        };
+        let Some((body, stats)) = built else {
+            if let Some(old) = old_text_by_scope.get(&desc.name) {
+                removed.extend(old.iter().map(|d| d.id));
+            }
             continue;
         };
 
@@ -2183,6 +2513,7 @@ async fn build_text_indexes_from_members(
             unique_property_indices: vec![],
             equality_property_indices: vec![],
             label_index: None,
+            node_locator: None,
             per_label_property_stats: vec![],
         };
         new_descs.push(descriptor);
@@ -2193,7 +2524,7 @@ async fn build_text_indexes_from_members(
         }
     }
 
-    Ok((new_descs, removed))
+    Ok((new_descs, removed, attempted))
 }
 
 async fn put_edge_sst_leveled(
@@ -2202,19 +2533,25 @@ async fn put_edge_sst_leveled(
     out_level: u32,
     edge_type: &str,
     direction: EdgeDirection,
-    finish: EdgeSstFinish,
+    build: EdgeSstBuild,
 ) -> Result<(SstDescriptor, bool)> {
+    let EdgeSstBuild {
+        finish,
+        point_index,
+    } = build;
     let id = Uuid::now_v7();
     let level = SstLevel(out_level);
     let kind = match direction {
         EdgeDirection::Forward => SstKind::EdgesFwd,
         EdgeDirection::Inverse => SstKind::EdgesInv,
     };
+    let point_index_present = point_index.is_some();
     let file_name = format!(
-        "{}-{}-{}.csr",
+        "{}-{}-{}.{}csr",
         uuid_path_id(&id),
         direction.path_tag(),
-        edge_type
+        edge_type,
+        if point_index_present { "ep." } else { "" },
     );
     let object_path = paths.sst_object(level.as_u32(), &file_name);
     let relative_path = relative_sst_path(level.as_u32(), &file_name);
@@ -2222,6 +2559,16 @@ async fn put_edge_sst_leveled(
     let body = finish.body;
     let body_len = body.len() as u64;
     crate::flush::put_object(store.clone(), &object_path, body).await?;
+    let point_file_name = format!(
+        "{}-{}-{}.epidx",
+        uuid_path_id(&id),
+        direction.path_tag(),
+        edge_type
+    );
+    let point_path = paths.sst_object(level.as_u32(), &point_file_name);
+    if let Some(point_body) = point_index {
+        crate::flush::put_object(store.clone(), &point_path, point_body).await?;
+    }
 
     let (bloom_descriptor, wrote_bloom) = put_bloom_sidecar(
         store,
@@ -2260,6 +2607,7 @@ async fn put_edge_sst_leveled(
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
         label_index: None,
+        node_locator: None,
         per_label_property_stats: Vec::new(),
     };
     Ok((descriptor, wrote_bloom))
@@ -2366,6 +2714,34 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[15] = b;
         NodeId::from_uuid(Uuid::from_bytes(bytes))
+    }
+
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    fn search_generation_node_sst(max_lsn: u64) -> SstDescriptor {
+        SstDescriptor {
+            id: Uuid::now_v7(),
+            kind: SstKind::Nodes,
+            scope: String::new(),
+            level: SstLevel(1),
+            path: "sst/level1/search-generation.parquet".into(),
+            size_bytes: 1,
+            row_count: 1,
+            created_at: Utc::now(),
+            min_key: [0; 16],
+            max_key: [0xff; 16],
+            min_lsn: max_lsn,
+            max_lsn,
+            schema_version_min: 1,
+            schema_version_max: 1,
+            property_stats: Vec::new(),
+            kind_specific: KindSpecificStats::Nodes { tombstone_count: 0 },
+            bloom: None,
+            unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
+            label_index: None,
+            node_locator: None,
+            per_label_property_stats: Vec::new(),
+        }
     }
 
     fn node_payload(name: &str, age: Option<i32>) -> Bytes {
@@ -2844,8 +3220,8 @@ mod tests {
             .unwrap();
 
         let mut props_ac: BTreeMap<String, Value> = BTreeMap::new();
-        props_ac.insert("since".into(), Value::I64(2024));
-        props_ac.insert("weight".into(), Value::F64(0.9));
+        props_ac.insert("since".into(), Value::Null);
+        props_ac.insert("note".into(), Value::Null);
 
         let mut mt2 = Memtable::new();
         mt2.apply(
@@ -2875,6 +3251,24 @@ mod tests {
         let by_dst: BTreeMap<NodeId, &EdgeView> = outs.edges.iter().map(|e| (e.dst, e)).collect();
         assert_eq!(by_dst[&bob].properties, props_ab);
         assert_eq!(by_dst[&carol].properties, props_ac);
+        let exact = snap
+            .lookup_edge_via_sst("KNOWS", alice, carol)
+            .await
+            .unwrap()
+            .expect("compacted exact edge");
+        assert_eq!(exact.properties.get("since"), Some(&Value::Null));
+        assert_eq!(exact.properties.get("note"), Some(&Value::Null));
+        assert!(
+            !exact.properties.contains_key("weight"),
+            "absent declared value must not be reconstructed as explicit null"
+        );
+        assert!(out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.kind == SstKind::EdgesFwd
+                && descriptor.path.ends_with(".ep.csr")));
     }
 
     // ── Leveled-lite ────────────────────────────────────────────────────
@@ -2973,6 +3367,437 @@ mod tests {
 
         // 7. A lone over-budget L1 with no L0 → not worth a pure rewrite.
         assert_eq!(plan_levels(&[mk(1, 5000)], bb, r), None);
+    }
+
+    #[tokio::test]
+    async fn lone_legacy_l1_is_rewritten_once_for_sidecar_migration() {
+        let s = store();
+        let p = paths("compact-migrate-node-locator");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let mut indexed_person = person_label();
+        indexed_person.properties[0].indexed = true;
+        let sc = SchemaBuilder::new()
+            .label(indexed_person)
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                id: sorted_node_id(7),
+            },
+            1,
+            MemOp::Upsert(node_payload("legacy", None)),
+        );
+        let current = flush(&ms, &fence, &base, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        // The coverage marker alone is sufficient to schedule a rebuild.
+        // Pre-fix ScalarV1 sidecars could advertise a property while silently
+        // omitting a value whose label declared the same name with another
+        // type; readers must not trust their negative answers.
+        let mut incomplete_coverage = current.clone();
+        let descriptor = incomplete_coverage
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        descriptor.level = SstLevel(1);
+        for index in &mut descriptor.equality_property_indices {
+            index.mixed_type_complete = false;
+        }
+        let incomplete_refs: Vec<_> = incomplete_coverage
+            .manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == SstKind::Nodes)
+            .collect();
+        let required = crate::flush::union_indexed_props(&sc);
+        assert!(
+            plan_node_bucket(&incomplete_refs, u64::MAX, 10, &required, false).is_some(),
+            "an incomplete-coverage marker must force a one-time rewrite"
+        );
+
+        // Simulate a fully-compacted 2.0.4 namespace: one L1 body whose
+        // manifest predates both the locator and paged mirrors.
+        let mut legacy = current.clone();
+        let descriptor = legacy
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        descriptor.level = SstLevel(1);
+        descriptor.node_locator = None;
+        for index in &mut descriptor.unique_property_indices {
+            index.paged = None;
+        }
+        for index in &mut descriptor.equality_property_indices {
+            index.paged = None;
+        }
+        let refs: Vec<_> = legacy
+            .manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == SstKind::Nodes)
+            .collect();
+        let required = crate::flush::union_indexed_props(&sc);
+        let migration =
+            plan_node_bucket(&refs, u64::MAX, 10, &required, false).expect("migration plan");
+        assert_eq!(migration.inputs.len(), 1);
+        assert_eq!(migration.target_level, 1);
+
+        let out = compact_leveled(&ms, &fence, &legacy, &sc, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(out.source_ssts_removed, 1);
+        let upgraded = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        assert!(upgraded.node_locator.is_some());
+        assert!(upgraded
+            .unique_property_indices
+            .iter()
+            .all(|index| index.paged.is_some()));
+        assert!(upgraded
+            .equality_property_indices
+            .iter()
+            .all(|index| index.paged.is_some()));
+        assert!(upgraded
+            .equality_property_indices
+            .iter()
+            .all(|index| index.mixed_type_complete));
+
+        let upgraded_refs = vec![upgraded];
+        assert!(
+            plan_node_bucket(&upgraded_refs, u64::MAX, 10, &required, false).is_none(),
+            "migration must not rewrite the same L1 again"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_property_index_rewrites_a_lone_l1_once() {
+        let s = store();
+        let p = paths("compact-ddl-index-migration");
+        let ms = ManifestStore::new(s, p);
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let old_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+            })
+            .unwrap()
+            .build();
+
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                id: sorted_node_id(1),
+            },
+            1,
+            MemOp::Upsert(node_payload("Alice", None)),
+        );
+        let old = flush(&ms, &fence, &base, &mt.freeze(), old_schema)
+            .await
+            .unwrap()
+            .committed;
+        assert!(old.manifest.ssts[0].equality_property_indices.is_empty());
+
+        // Model metadata-only CREATE INDEX after the namespace has settled at
+        // one L1. No data LSN changes, so the schema coverage test itself must
+        // schedule the rewrite.
+        let indexed_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .build();
+        let mut ddl = old.manifest.next_version(fence.writer_id);
+        ddl.schema = indexed_schema.clone();
+        ddl.ssts[0].level = SstLevel(1);
+        let ddl = ms.commit(&fence, &old, ddl).await.unwrap();
+        let refs: Vec<_> = ddl
+            .manifest
+            .ssts
+            .iter()
+            .filter(|sst| sst.kind == SstKind::Nodes)
+            .collect();
+        let required = crate::flush::union_indexed_props(&indexed_schema);
+        assert!(plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_some());
+
+        let out = compact_leveled(&ms, &fence, &ddl, &indexed_schema, u64::MAX, 10)
+            .await
+            .unwrap();
+        let node = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        assert!(node
+            .equality_property_indices
+            .iter()
+            .any(|index| index.property == "name" && index.paged.is_some()));
+        let refs = vec![node];
+        assert!(
+            plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_none(),
+            "the DDL migration must be a one-time rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_string_keys_keep_legacy_indexes_without_rewrite_churn() {
+        let s = store();
+        let p = paths("compact-oversized-paged-key");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let indexed_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Person".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true)
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .build();
+        let long_key = "x".repeat(4 * 1024 + 512);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node {
+                id: sorted_node_id(1),
+            },
+            1,
+            MemOp::Upsert(node_payload(&long_key, None)),
+        );
+        let current = flush(&ms, &fence, &base, &mt.freeze(), indexed_schema.clone())
+            .await
+            .unwrap()
+            .committed;
+        let node = current
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        let equality = node
+            .equality_property_indices
+            .iter()
+            .find(|index| index.property == "name")
+            .unwrap();
+        assert!(equality.paged.is_none() && equality.paged_build_unsupported);
+
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(current.clone(), &view, s, p);
+        let found = snap
+            .lookup_node_by_property("Person", "name", &long_key)
+            .await
+            .unwrap()
+            .expect("legacy equality sidecar remains authoritative");
+        assert_eq!(found.id, sorted_node_id(1));
+
+        let refs = vec![node];
+        let required = crate::flush::union_indexed_props(&indexed_schema);
+        assert!(
+            plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_none(),
+            "unsupported PagedV1 key must not trigger endless maintenance"
+        );
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn vector_build_attempt_markers_prevent_error_churn_and_retry_on_change() {
+        use crate::manifest::{Manifest, VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        let descriptor = VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        };
+        let schema_without_filter = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 2 }, false).unwrap(),
+                    PropertyDef::new("vigente", DataType::Bool, false).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let mut manifest = Manifest::empty(crate::Epoch::ZERO, Uuid::now_v7());
+        manifest.schema = schema_without_filter;
+        manifest.vector_indexes.push(descriptor.clone());
+        manifest.ssts.push(search_generation_node_sst(7));
+
+        // A malformed two-member corpus reaches vector validation and is
+        // skipped per-index. The authoritative attempt is still durable for
+        // this exact generation, so unchanged maintenance does not rewrite L1
+        // forever. No VectorGraph descriptor is emitted, hence reads continue
+        // through the exact fallback.
+        let invalid_members = vec![(
+            descriptor.clone(),
+            vec![
+                ((*sorted_node_id(1).as_bytes()), vec![1.0]),
+                ((*sorted_node_id(2).as_bytes()), vec![0.0]),
+            ],
+            BTreeMap::new(),
+        )];
+        let mut old_vector = search_generation_node_sst(7);
+        old_vector.kind = SstKind::VectorGraph;
+        old_vector.scope = "doc_emb".into();
+        old_vector.kind_specific = KindSpecificStats::VectorGraph {
+            dim: 2,
+            metric: "cosine".into(),
+            point_count: 2,
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            entry_medoid: 0,
+        };
+        let old_vector_id = old_vector.id;
+        let old_vectors = BTreeMap::from([("doc_emb".to_string(), vec![&old_vector])]);
+        let (new_descriptors, removed, attempted) = build_vector_indexes_from_members(
+            store(),
+            &paths("vector-marker-error"),
+            1,
+            7,
+            invalid_members,
+            &old_vectors,
+        )
+        .await
+        .unwrap();
+        assert!(new_descriptors.is_empty());
+        assert_eq!(
+            removed,
+            vec![old_vector_id],
+            "a rejected generation must retire any stale physical graph"
+        );
+        assert_eq!(attempted, vec!["doc_emb"]);
+        let attempted_set = HashSet::from([(SstKind::VectorGraph, "doc_emb".to_string())]);
+        manifest.search_index_builds = catalog_build_states(&manifest, 7, &attempted_set);
+        assert!(
+            !search_indexes_need_rebuild(&manifest),
+            "the rejected generation was already attempted"
+        );
+
+        manifest.ssts[0].max_lsn = 8;
+        assert!(
+            search_indexes_need_rebuild(&manifest),
+            "a newer node generation must retry the rejected build"
+        );
+        manifest.ssts[0].max_lsn = 7;
+
+        // One valid vector is a legitimate `Ok(None)` corpus: no graph body,
+        // but the attempted generation is durable and must not rewrite L1 on
+        // every maintenance tick.
+        let small_members = vec![(
+            descriptor.clone(),
+            vec![((*sorted_node_id(1).as_bytes()), vec![1.0, 0.0])],
+            BTreeMap::new(),
+        )];
+        let (_, _, attempted) = build_vector_indexes_from_members(
+            store(),
+            &paths("vector-marker-empty"),
+            1,
+            7,
+            small_members,
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempted, vec!["doc_emb"]);
+        let attempted_set = HashSet::from([(SstKind::VectorGraph, "doc_emb".to_string())]);
+        manifest.search_index_builds = catalog_build_states(&manifest, 7, &attempted_set);
+        assert!(!search_indexes_need_rebuild(&manifest));
+
+        // Native filter postings are part of `.vg`. CREATE INDEX on a filter
+        // property changes the signature without any node write/LSN advance.
+        manifest.schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 2 }, false).unwrap(),
+                    PropertyDef::new("vigente", DataType::Bool, false)
+                        .unwrap()
+                        .with_indexed(true),
+                ],
+            })
+            .unwrap()
+            .build();
+        assert!(
+            search_indexes_need_rebuild(&manifest),
+            "filter DDL must invalidate the vector build generation"
+        );
+    }
+
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn text_build_attempt_marker_retries_only_on_generation_or_catalog_change() {
+        use crate::manifest::{Manifest, TextIndexDescriptor};
+
+        let mut manifest = Manifest::empty(crate::Epoch::ZERO, Uuid::now_v7());
+        manifest.text_indexes.push(TextIndexDescriptor::new(
+            "doc_text".into(),
+            "Doc".into(),
+            vec!["title".into()],
+        ));
+        manifest.ssts.push(search_generation_node_sst(11));
+
+        // `attempted` is populated before the deterministic FTS body builder.
+        // Thus the same marker covers success, an empty corpus, and a rejected
+        // body without claiming that a physical TextIndex SST exists.
+        let attempted = HashSet::from([(SstKind::TextIndex, "doc_text".to_string())]);
+        manifest.search_index_builds = catalog_build_states(&manifest, 11, &attempted);
+        assert!(!search_indexes_need_rebuild(&manifest));
+        assert!(
+            manifest
+                .ssts
+                .iter()
+                .all(|sst| sst.kind != SstKind::TextIndex),
+            "an attempt marker alone must not manufacture index availability"
+        );
+
+        manifest.ssts[0].max_lsn = 12;
+        assert!(
+            search_indexes_need_rebuild(&manifest),
+            "a newer node generation must retry FTS"
+        );
+        manifest.ssts[0].max_lsn = 11;
+
+        manifest.text_indexes[0] = TextIndexDescriptor::new(
+            "doc_text".into(),
+            "Doc".into(),
+            vec!["title".into(), "body".into()],
+        );
+        assert!(
+            search_indexes_need_rebuild(&manifest),
+            "a catalog signature change must retry FTS"
+        );
     }
 
     #[tokio::test]

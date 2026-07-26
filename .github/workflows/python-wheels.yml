@@ -114,7 +114,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target.rust_target }}
-          args: --release --out dist --manifest-path crates/namidb-py/Cargo.toml
+          args: --locked --release --out dist --manifest-path crates/namidb-py/Cargo.toml
           manylinux: ${{ matrix.target.manylinux }}
           sccache: "true"
       - uses: actions/upload-artifact@v4
@@ -138,6 +138,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
+          # maturin 1.14 removed `--locked` from the `sdist` subcommand (there
+          # is no Cargo build in this path). The preceding release validator
+          # checks the workspace lockfile and every internal version pin.
           args: --out dist --manifest-path crates/namidb-py/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:

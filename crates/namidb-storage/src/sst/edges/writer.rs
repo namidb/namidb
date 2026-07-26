@@ -10,12 +10,14 @@
 //! Properties NOT in the declared schema (or carried by overflow-only
 //! edge types) fall back to the legacy single `__overflow_json` stream.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
+use namidb_core::Value;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result};
@@ -29,12 +31,25 @@ use crate::sst::edges::format::{
     SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
 };
 use crate::sst::edges::EdgeDirection;
+use crate::sst::paged_index::EdgePointIndexBuilder;
 use crate::sst::stats::{DegreeHistogram, PropertyColumnStats};
 
 /// Maximum degree kept in the sequentially-decodable split representation by
 /// default. Above this bound the dense block supports allocation-free binary
 /// search for exact endpoint probes.
 pub const DEFAULT_SKEW_THRESHOLD: usize = 1024;
+/// One unusually large relationship must not make the exact-point mirror
+/// duplicate an unbounded property blob. Exceeding this omits the complete
+/// sidecar for the SST; the CSR remains the exact fallback.
+pub const DEFAULT_EDGE_POINT_MAX_ENTRY_BYTES: usize = 64 * 1024;
+/// Maximum serialized `.epidx` footprint per forward Edge SST. A compacted
+/// 3.5M-edge legal graph with small scalar properties is roughly 350-450 MiB
+/// (32-byte key + 21-byte value header + page/value overhead per edge), so the
+/// default keeps that production case indexed while bounding peak build RAM
+/// and storage duplication.
+pub const DEFAULT_EDGE_POINT_MAX_SST_BYTES: usize = 512 * 1024 * 1024;
+const EDGE_POINT_ESTIMATED_OVERHEAD_PER_ENTRY: usize = 32 + 18 + 64;
+const EDGE_POINT_MIN_SERIALIZED_BYTES: usize = 64 + 4096;
 
 /// One row in the edge SST input. `key_id` and `partner_id` carry the
 /// **direction-specific** mapping: for a forward partner SST `key_id` is
@@ -111,6 +126,15 @@ pub struct EdgeSstFinish {
     pub body: Bytes,
     pub stats: EdgeSstStats,
     pub bloom: Option<BloomFilter>,
+}
+
+/// Internal flush/compaction product. Kept separate from the public
+/// [`EdgeSstFinish`] so adding the optional accelerator does not break
+/// downstream exhaustive struct patterns.
+#[derive(Debug)]
+pub(crate) struct EdgeSstBuild {
+    pub(crate) finish: EdgeSstFinish,
+    pub(crate) point_index: Option<Bytes>,
 }
 
 /// Statistics for the manifest's `SstDescriptor` (RFC-002 §3.3).
@@ -190,6 +214,10 @@ pub struct EdgeSstWriter {
     declared_streams: Vec<PropertyStream>,
 
     bloom: BloomFilter,
+    point_index: Option<EdgePointIndexBuilder>,
+    point_index_estimated_bytes: usize,
+    point_index_max_entry_bytes: usize,
+    point_index_max_sst_bytes: usize,
 }
 
 /// Per-property mini-batched Arrow IPC stream of JSON-encoded `Value`
@@ -318,6 +346,17 @@ impl EdgeSstWriter {
             .iter()
             .map(PropertyStream::new)
             .collect();
+        let point_index_max_entry_bytes = env_usize(
+            "NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES",
+            DEFAULT_EDGE_POINT_MAX_ENTRY_BYTES,
+        );
+        let point_index_max_sst_bytes = env_usize(
+            "NAMIDB_EDGE_POINT_MAX_SST_BYTES",
+            DEFAULT_EDGE_POINT_MAX_SST_BYTES,
+        );
+        let point_index_enabled = matches!(options.direction, EdgeDirection::Forward)
+            && point_index_max_entry_bytes > 0
+            && point_index_max_sst_bytes > 0;
         Self {
             options,
             skew_threshold,
@@ -342,6 +381,10 @@ impl EdgeSstWriter {
             overflow: PropertyStream::new(OVERFLOW_JSON_NAME),
             declared_streams,
             bloom,
+            point_index: point_index_enabled.then(EdgePointIndexBuilder::new),
+            point_index_estimated_bytes: EDGE_POINT_MIN_SERIALIZED_BYTES,
+            point_index_max_entry_bytes,
+            point_index_max_sst_bytes,
         }
     }
 
@@ -363,6 +406,68 @@ impl EdgeSstWriter {
                 self.declared_streams.len(),
                 self.options.edge_type,
             )));
+        }
+        if self.point_index.is_some() {
+            // Refuse obviously oversized source material before decoding and
+            // re-encoding it into a second property map. False refusals are
+            // safe (the CSR remains authoritative); allocating beyond the
+            // configured per-entry ceiling is not.
+            let source_bytes = self
+                .options
+                .declared_properties
+                .iter()
+                .zip(&record.declared_properties)
+                .fold(
+                    record.overflow_json.as_ref().map_or(0, String::len),
+                    |size, (name, value)| {
+                        size.saturating_add(name.len())
+                            .saturating_add(value.as_ref().map_or(0, String::len))
+                    },
+                );
+            if !record.tombstone
+                && source_bytes.saturating_add(EDGE_POINT_ESTIMATED_OVERHEAD_PER_ENTRY)
+                    > self.point_index_max_entry_bytes
+            {
+                self.point_index = None;
+                self.point_index_estimated_bytes = 0;
+            }
+        }
+        if self.point_index.is_some() {
+            let point_properties = if record.tombstone {
+                Bytes::new()
+            } else {
+                encode_point_properties(
+                    &self.options.declared_properties,
+                    &record.declared_properties,
+                    record.overflow_json.as_deref(),
+                )?
+            };
+            let point_value = crate::sst::edges::point_index::encode(
+                record.lsn,
+                record.tombstone,
+                &point_properties,
+            )?;
+            let next_estimate = self
+                .point_index_estimated_bytes
+                .saturating_add(EDGE_POINT_ESTIMATED_OVERHEAD_PER_ENTRY)
+                .saturating_add(point_value.len());
+            let entry_estimate = point_value
+                .len()
+                .saturating_add(EDGE_POINT_ESTIMATED_OVERHEAD_PER_ENTRY);
+            if entry_estimate > self.point_index_max_entry_bytes
+                || next_estimate > self.point_index_max_sst_bytes
+            {
+                // Coverage is all-or-nothing. Drop the builder immediately so
+                // neither this nor any earlier entry is published partially.
+                self.point_index = None;
+                self.point_index_estimated_bytes = 0;
+            } else {
+                self.point_index
+                    .as_mut()
+                    .expect("point index checked above")
+                    .push(&record.key_id, &record.partner_id, &point_value)?;
+                self.point_index_estimated_bytes = next_estimate;
+            }
         }
         if let Some(prev_key) = self.current_key {
             if record.key_id < prev_key {
@@ -461,7 +566,11 @@ impl EdgeSstWriter {
     }
 
     /// Serialise the SST body.
-    pub fn finish(mut self) -> Result<EdgeSstFinish> {
+    pub fn finish(self) -> Result<EdgeSstFinish> {
+        Ok(self.finish_with_point_index()?.finish)
+    }
+
+    pub(crate) fn finish_with_point_index(mut self) -> Result<EdgeSstBuild> {
         // Drain any open bucket.
         self.flush_current_bucket();
 
@@ -639,9 +748,49 @@ impl EdgeSstWriter {
             schema_version_min: opts.schema_version,
             schema_version_max: opts.schema_version,
         };
+        let point_index_max_sst_bytes = self.point_index_max_sst_bytes;
+        let point_index = self
+            .point_index
+            .map(EdgePointIndexBuilder::finish)
+            .transpose()?
+            .filter(|body| body.len() <= point_index_max_sst_bytes);
 
-        Ok(EdgeSstFinish { body, stats, bloom })
+        Ok(EdgeSstBuild {
+            finish: EdgeSstFinish { body, stats, bloom },
+            point_index,
+        })
     }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn encode_point_properties(
+    declared_names: &[String],
+    declared_values: &[Option<String>],
+    overflow_json: Option<&str>,
+) -> Result<Bytes> {
+    let mut properties: BTreeMap<String, Value> = match overflow_json {
+        Some(json) => serde_json::from_str(json)
+            .map_err(|error| Error::invariant(format!("edge overflow decode: {error}")))?,
+        None => BTreeMap::new(),
+    };
+    for (name, encoded) in declared_names.iter().zip(declared_values) {
+        let Some(encoded) = encoded else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(encoded).map_err(|error| {
+            Error::invariant(format!("edge declared property '{name}' decode: {error}"))
+        })?;
+        properties.insert(name.clone(), value);
+    }
+    serde_json::to_vec(&properties)
+        .map(Bytes::from)
+        .map_err(|error| Error::invariant(format!("edge point properties encode: {error}")))
 }
 
 /// Append `bit` at position `count` in `bits`, growing the buffer with a
@@ -680,6 +829,9 @@ fn emit_section(kind: u16, name: &str, codec: u8, body: &[u8], file: &mut Vec<u8
 mod tests {
     use super::*;
     use crate::sst::edges::format::{EdgeFileHeader, FLAG_INVERSE_PARTNER};
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
     fn key(top: u64, bot: u64) -> [u8; 16] {
         let mut k = [0u8; 16];
@@ -755,6 +907,103 @@ mod tests {
         let finish = w.finish().unwrap();
         let header = EdgeFileHeader::decode(&finish.body).unwrap();
         assert!(header.flags & FLAG_INVERSE_PARTNER != 0);
+    }
+
+    #[tokio::test]
+    async fn point_sidecar_preserves_absent_null_and_declared_precedence() {
+        let mut opts =
+            EdgeSstWriterOptions::new(EdgeDirection::Forward, "KNOWS", "Person", "Person");
+        opts.declared_properties = vec!["absent".into(), "explicit_null".into(), "shadow".into()];
+        let mut writer = EdgeSstWriter::new(opts);
+        writer
+            .append(EdgeRecord {
+                key_id: key(1, 0),
+                partner_id: key(2, 0),
+                lsn: 42,
+                tombstone: false,
+                declared_properties: vec![None, Some("null".into()), Some(r#""declared""#.into())],
+                overflow_json: Some(r#"{"extra":7,"shadow":"overflow"}"#.into()),
+            })
+            .unwrap();
+        let build = writer.finish_with_point_index().unwrap();
+        let point = build
+            .point_index
+            .expect("small forward SST receives a complete sidecar");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("edge.epidx");
+        store.put(&path, PutPayload::from(point)).await.unwrap();
+        let (found, stats) =
+            crate::sst::paged_index::probe_edge_points(store, path, &[(key(1, 0), key(2, 0))])
+                .await
+                .unwrap();
+        assert_eq!(stats.index_entries, 1);
+        let decoded = crate::sst::edges::point_index::decode(
+            found.get(&(key(1, 0), key(2, 0))).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(!decoded.properties.contains_key("absent"));
+        assert_eq!(decoded.properties.get("explicit_null"), Some(&Value::Null));
+        assert_eq!(decoded.properties.get("extra"), Some(&Value::I64(7)));
+        assert_eq!(
+            decoded.properties.get("shadow"),
+            Some(&Value::Str("declared".into()))
+        );
+    }
+
+    #[test]
+    fn point_sidecar_caps_are_complete_or_omitted_and_inverse_never_emits_one() {
+        let mut by_entry = EdgeSstWriter::new(EdgeSstWriterOptions::new(
+            EdgeDirection::Forward,
+            "KNOWS",
+            "P",
+            "P",
+        ));
+        by_entry.point_index_max_entry_bytes = 256;
+        by_entry.append(record(key(1, 0), key(2, 0), 1)).unwrap();
+        let mut oversized = record(key(1, 1), key(2, 1), 2);
+        oversized.overflow_json = Some(format!(r#"{{"blob":"{}"}}"#, "x".repeat(512)));
+        by_entry.append(oversized).unwrap();
+        let build = by_entry.finish_with_point_index().unwrap();
+        assert_eq!(build.finish.stats.edge_count, 2);
+        assert!(
+            build.point_index.is_none(),
+            "one oversized entry omits the whole sidecar, never a partial map"
+        );
+
+        let mut by_total = EdgeSstWriter::new(EdgeSstWriterOptions::new(
+            EdgeDirection::Forward,
+            "KNOWS",
+            "P",
+            "P",
+        ));
+        by_total.point_index_max_sst_bytes = EDGE_POINT_MIN_SERIALIZED_BYTES + 256;
+        for n in 0..8 {
+            by_total
+                .append(record(key(1, n), key(2, n), n + 1))
+                .unwrap();
+        }
+        assert!(
+            by_total
+                .finish_with_point_index()
+                .unwrap()
+                .point_index
+                .is_none(),
+            "estimated or final total overflow omits the complete sidecar"
+        );
+
+        let mut inverse = EdgeSstWriter::new(EdgeSstWriterOptions::new(
+            EdgeDirection::Inverse,
+            "KNOWS",
+            "P",
+            "P",
+        ));
+        inverse.append(record(key(1, 0), key(2, 0), 1)).unwrap();
+        assert!(inverse
+            .finish_with_point_index()
+            .unwrap()
+            .point_index
+            .is_none());
     }
 
     #[test]

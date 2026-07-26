@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.4"
+version = "2.0.5"
 edition = "2021"
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -85,6 +85,8 @@ base64 = "0.22"
 blake3 = "1.5"
 fs2 = "0.4"
 url = "2"
+memory-stats = { version = "1.2", features = ["always_use_statm"] }
+libc = "0.2"
 
 # Errors
 anyhow = "1"
@@ -120,13 +122,13 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 
 # Local workspace crates
-namidb-core = { path = "crates/namidb-core", version = "2.0.4" }
-namidb-storage = { path = "crates/namidb-storage", version = "2.0.4" }
-namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.4" }
-namidb-graph = { path = "crates/namidb-graph", version = "2.0.4" }
-namidb-ann = { path = "crates/namidb-ann", version = "2.0.4" }
-namidb-query = { path = "crates/namidb-query", version = "2.0.4" }
-namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.4" }
+namidb-core = { path = "crates/namidb-core", version = "2.0.5" }
+namidb-storage = { path = "crates/namidb-storage", version = "2.0.5" }
+namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.5" }
+namidb-graph = { path = "crates/namidb-graph", version = "2.0.5" }
+namidb-ann = { path = "crates/namidb-ann", version = "2.0.5" }
+namidb-query = { path = "crates/namidb-query", version = "2.0.5" }
+namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.5" }
 
 [profile.release]
 opt-level = 3

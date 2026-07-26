@@ -51,11 +51,25 @@ services:
       NAMIDB_AUTH_TOKEN: "${NAMIDB_AUTH_TOKEN:?set NAMIDB_AUTH_TOKEN in your env (e.g. openssl rand -hex 32)}"
       NAMIDB_FLUSH_INTERVAL: "30s"
       NAMIDB_CACHE_MAX_BYTES: "${NAMIDB_CACHE_MAX_BYTES:-1073741824}"
+      # Optional exact-byte reservation carved out of CACHE_MAX for the shared
+      # decoded .vg/.ft pool. Empty keeps proportional legacy allocation.
+      NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES: "${NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES:-}"
+      NAMIDB_MEMORY_MAX_BYTES: "${NAMIDB_MEMORY_MAX_BYTES:-0}"
+      NAMIDB_VECTOR_FILTER_MAX_DISTINCT: "${NAMIDB_VECTOR_FILTER_MAX_DISTINCT:-4096}"
+      NAMIDB_VECTOR_FILTER_MAX_BYTES: "${NAMIDB_VECTOR_FILTER_MAX_BYTES:-67108864}"
+      NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP: "${NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP:-8192}"
+      NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP: "${NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP:-65536}"
+      NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES: "${NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES:-65536}"
+      NAMIDB_EDGE_POINT_MAX_SST_BYTES: "${NAMIDB_EDGE_POINT_MAX_SST_BYTES:-536870912}"
       AWS_ACCESS_KEY_ID: "minioadmin"
       AWS_SECRET_ACCESS_KEY: "minioadmin"
       RUST_LOG: "info"
     ports:
       - "8080:8080"
+    # Optional OS-enforced containment for shared hosts. Set, for example,
+    # NAMIDB_CONTAINER_MEMORY_LIMIT=4g together with a lower
+    # NAMIDB_MEMORY_MAX_BYTES admission threshold. Zero leaves it unlimited.
+    mem_limit: "${NAMIDB_CONTAINER_MEMORY_LIMIT:-0}"
 
 volumes:
   minio-data: {}

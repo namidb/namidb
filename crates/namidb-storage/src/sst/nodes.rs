@@ -26,24 +26,27 @@
 //! - All non-nullable columns have non-null values.
 //! - The batch's schema is exactly the canonical schema built from `LabelDef`.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
     TimestampMicrosecondArray, UInt64Array,
 };
-use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef,
+};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -476,111 +479,28 @@ impl NodeSstReader {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
     ) -> Result<Vec<RecordBatch>> {
+        let reader = self.scan_iter_with_predicates_and_projection(predicates, projection)?;
+        reader
+            .map(|batch| batch.map_err(|e| Error::invariant(format!("parquet read: {e}"))))
+            .collect()
+    }
+
+    /// Lazy in-memory counterpart to
+    /// [`Self::scan_with_predicates_and_projection`].
+    ///
+    /// The ordinary full scan collects this iterator for backwards
+    /// compatibility. A capped query consumes it only through the batch that
+    /// contains its final match, avoiding Arrow decode work for the remaining
+    /// batches when the immutable SST body is already cached.
+    pub fn scan_iter_with_predicates_and_projection(
+        &self,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+    ) -> Result<ParquetRecordBatchReader> {
         let builder = ParquetRecordBatchReaderBuilder::try_new(self.body.clone())
             .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
         let md = builder.metadata().clone();
-        let schema_descr = md.file_metadata().schema_descr();
-
-        // 1) Row-group pruning (RFC-013).
-        let keep = if predicates.is_empty() {
-            (0..md.row_groups().len()).collect::<Vec<_>>()
-        } else {
-            // Resolve (column → leaf index + declared PropertyDef) for
-            // every column any predicate references.
-            let mut col_lookup: std::collections::BTreeMap<&str, Option<(usize, &PropertyDef)>> =
-                std::collections::BTreeMap::new();
-            for pred in predicates {
-                let col = pred.column();
-                if col_lookup.contains_key(col) {
-                    continue;
-                }
-                let prop = self.label.properties.iter().find(|p| p.name == col);
-                let resolved = prop.and_then(|p| {
-                    let parquet_name = prop_column_name(p);
-                    schema_descr
-                        .columns()
-                        .iter()
-                        .position(|c| c.name() == parquet_name)
-                        .map(|idx| (idx, p))
-                });
-                col_lookup.insert(col, resolved);
-            }
-
-            let mut keep: Vec<usize> = Vec::new();
-            for (rg_idx, rg) in md.row_groups().iter().enumerate() {
-                let mut absent = false;
-                for pred in predicates {
-                    let col = pred.column();
-                    let resolved = col_lookup.get(col).and_then(|r| r.as_ref());
-                    let synthetic = match resolved {
-                        Some((leaf_idx, prop)) => {
-                            let cc = rg.column(*leaf_idx);
-                            synthesize_property_stats(col, &prop.data_type, cc.statistics())
-                        }
-                        None => PropertyColumnStats::empty(col),
-                    };
-                    if eval_row_group(pred, &synthetic) == RowGroupVerdict::Absent {
-                        absent = true;
-                        break;
-                    }
-                }
-                if !absent {
-                    keep.push(rg_idx);
-                }
-            }
-            keep
-        };
-
-        if keep.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 2) Column projection (RFC-015). Build a leaf-index mask that
-        // always includes the engine columns plus the property leafs the
-        // caller requested. When `projection.is_none()` we skip the mask
-        // and Parquet reads every leaf.
-        let projection_mask = projection.map(|cols| {
-            let mut leaves: Vec<usize> = Vec::with_capacity(cols.len() + 6);
-            // Match on the leaf column's top-level path component, not its leaf
-            // name: `__labels` is a `List<UInt32>` whose Parquet leaf is named
-            // `element` (path `__labels.list.element`), so a `c.name()` match
-            // would silently miss it — and eliding `__labels` makes
-            // `decode_node_labels` fall back to the (now empty) scope and drop
-            // every row at the label filter under the id-primary layout.
-            let root_of = |c: &parquet::schema::types::ColumnDescriptor| -> Option<String> {
-                c.path().parts().first().cloned()
-            };
-            for engine in [
-                COL_NODE_ID,
-                COL_TOMBSTONE,
-                COL_LSN,
-                SCHEMA_VERSION,
-                OVERFLOW_JSON,
-                COL_LABELS,
-            ] {
-                if let Some(idx) = schema_descr
-                    .columns()
-                    .iter()
-                    .position(|c| root_of(c).as_deref() == Some(engine))
-                {
-                    leaves.push(idx);
-                }
-            }
-            for col in cols {
-                let prop = self.label.properties.iter().find(|p| p.name == *col);
-                if let Some(p) = prop {
-                    let parquet_name = prop_column_name(p);
-                    if let Some(idx) = schema_descr
-                        .columns()
-                        .iter()
-                        .position(|c| c.name() == parquet_name)
-                    {
-                        leaves.push(idx);
-                    }
-                }
-            }
-            ProjectionMask::leaves(schema_descr, leaves)
-        });
+        let (keep, projection_mask) = node_scan_plan(&md, &self.label, predicates, projection);
 
         // Optimisation: full row-group set + no projection ⇒ avoid the
         // overhead of `with_row_groups` / `with_projection`.
@@ -592,14 +512,9 @@ impl NodeSstReader {
         if let Some(mask) = projection_mask {
             builder = builder.with_projection(mask);
         }
-        let reader = builder
+        builder
             .build()
-            .map_err(|e| Error::invariant(format!("parquet build: {e}")))?;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        for b in reader {
-            batches.push(b.map_err(|e| Error::invariant(format!("parquet read: {e}")))?);
-        }
-        Ok(batches)
+            .map_err(|e| Error::invariant(format!("parquet build: {e}")))
     }
 
     /// Decode only the row groups whose `node_id` column min/max stats
@@ -702,6 +617,216 @@ impl NodeSstReader {
         }
         Ok(out)
     }
+
+    /// Decode complete node rows only for `keys` inside `row_groups`.
+    ///
+    /// Parquet evaluates the `node_id` predicate before materialising the
+    /// wide property/overflow columns. This is the sparse-batch counterpart
+    /// to [`Self::scan_row_groups_each`]: a MERGE replay that probes 2,000
+    /// UUIDs spread across a 700k-row compacted SST scans the narrow sorted id
+    /// stream, but allocates/decodes only the requested node payloads instead
+    /// of every row in every touched group.
+    pub fn scan_row_groups_for_keys(
+        &self,
+        md: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+        keys: Arc<HashSet<[u8; 16]>>,
+    ) -> Result<Vec<RecordBatch>> {
+        let meta = ArrowReaderMetadata::try_new(
+            md.clone(),
+            ArrowReaderOptions::new().with_page_index(true),
+        )
+        .map_err(|e| Error::invariant(format!("parquet metadata reuse: {e}")))?;
+        let filter = node_id_row_filter(md, keys)?;
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(self.body.clone(), meta)
+            .with_row_groups(row_groups.to_vec())
+            .with_row_filter(filter)
+            .build()
+            .map_err(|e| Error::invariant(format!("parquet sparse batch build: {e}")))?;
+        let mut batches = Vec::new();
+        for batch in reader {
+            batches.push(
+                batch.map_err(|e| Error::invariant(format!("parquet sparse batch read: {e}")))?,
+            );
+        }
+        Ok(batches)
+    }
+
+    /// Decode exact physical row ordinals using Parquet's offset index.
+    ///
+    /// Unlike a `node_id` RowFilter this never evaluates the id column across
+    /// the SST: unselected data pages are skipped before decode.
+    pub fn scan_rows_by_ordinals(
+        &self,
+        md: &Arc<ParquetMetaData>,
+        ordinals: &[u64],
+    ) -> Result<Vec<RecordBatch>> {
+        let total_rows = md.file_metadata().num_rows() as u64;
+        let selection = row_selection_for_ordinals(total_rows, ordinals)?;
+        let meta = ArrowReaderMetadata::try_new(
+            md.clone(),
+            ArrowReaderOptions::new().with_page_index(true),
+        )
+        .map_err(|e| Error::invariant(format!("parquet metadata reuse: {e}")))?;
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(self.body.clone(), meta)
+            .with_row_selection(selection)
+            .build()
+            .map_err(|e| Error::invariant(format!("parquet ordinal batch build: {e}")))?;
+        reader
+            .map(|batch| {
+                batch.map_err(|e| Error::invariant(format!("parquet ordinal batch read: {e}")))
+            })
+            .collect()
+    }
+}
+
+/// Build the row-group and column plan shared by the in-memory and ranged
+/// node scanners. Row-group statistics are conservative: an undeclared
+/// property (the normal id-primary layout stores it in overflow JSON) keeps
+/// the group so row-level evaluation can decide.
+fn node_scan_plan(
+    md: &ParquetMetaData,
+    label: &LabelDef,
+    predicates: &[ScanPredicate],
+    projection: Option<&[String]>,
+) -> (Vec<usize>, Option<ProjectionMask>) {
+    let schema_descr = md.file_metadata().schema_descr();
+    let keep = if predicates.is_empty() {
+        (0..md.row_groups().len()).collect::<Vec<_>>()
+    } else {
+        let mut col_lookup: BTreeMap<&str, Option<(usize, &PropertyDef)>> = BTreeMap::new();
+        for pred in predicates {
+            let col = pred.column();
+            if col_lookup.contains_key(col) {
+                continue;
+            }
+            let prop = label.properties.iter().find(|p| p.name == col);
+            let resolved = prop.and_then(|p| {
+                let parquet_name = prop_column_name(p);
+                schema_descr
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == parquet_name)
+                    .map(|idx| (idx, p))
+            });
+            col_lookup.insert(col, resolved);
+        }
+
+        let mut keep = Vec::new();
+        for (rg_idx, rg) in md.row_groups().iter().enumerate() {
+            let absent = predicates.iter().any(|pred| {
+                let col = pred.column();
+                let resolved = col_lookup.get(col).and_then(|value| value.as_ref());
+                let synthetic = match resolved {
+                    Some((leaf_idx, prop)) => {
+                        let chunk = rg.column(*leaf_idx);
+                        synthesize_property_stats(col, &prop.data_type, chunk.statistics())
+                    }
+                    None => PropertyColumnStats::empty(col),
+                };
+                eval_row_group(pred, &synthetic) == RowGroupVerdict::Absent
+            });
+            if !absent {
+                keep.push(rg_idx);
+            }
+        }
+        keep
+    };
+
+    // Match top-level paths because `__labels` is a List whose leaf is named
+    // `element`. Engine columns stay available even for an empty property
+    // projection.
+    let projection_mask = projection.map(|cols| {
+        let root_of = |column: &parquet::schema::types::ColumnDescriptor| -> Option<String> {
+            column.path().parts().first().cloned()
+        };
+        let mut leaves = Vec::with_capacity(cols.len() + 6);
+        for engine in [
+            COL_NODE_ID,
+            COL_TOMBSTONE,
+            COL_LSN,
+            SCHEMA_VERSION,
+            OVERFLOW_JSON,
+            COL_LABELS,
+        ] {
+            if let Some(idx) = schema_descr
+                .columns()
+                .iter()
+                .position(|column| root_of(column).as_deref() == Some(engine))
+            {
+                leaves.push(idx);
+            }
+        }
+        for col in cols {
+            let Some(prop) = label.properties.iter().find(|prop| prop.name == *col) else {
+                continue;
+            };
+            let parquet_name = prop_column_name(prop);
+            if let Some(idx) = schema_descr
+                .columns()
+                .iter()
+                .position(|column| column.name() == parquet_name)
+            {
+                leaves.push(idx);
+            }
+        }
+        ProjectionMask::leaves(schema_descr, leaves)
+    });
+
+    (keep, projection_mask)
+}
+
+fn row_selection_for_ordinals(total_rows: u64, ordinals: &[u64]) -> Result<RowSelection> {
+    let mut sorted = ordinals.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.last().is_some_and(|row| *row >= total_rows) {
+        return Err(Error::invariant("node locator row ordinal exceeds SST"));
+    }
+    let mut selectors = Vec::with_capacity(sorted.len().saturating_mul(2));
+    let mut cursor = 0u64;
+    let mut idx = 0usize;
+    while idx < sorted.len() {
+        let start = sorted[idx];
+        if start > cursor {
+            selectors.push(RowSelector::skip((start - cursor) as usize));
+        }
+        let mut end = start + 1;
+        idx += 1;
+        while idx < sorted.len() && sorted[idx] == end {
+            end += 1;
+            idx += 1;
+        }
+        selectors.push(RowSelector::select((end - start) as usize));
+        cursor = end;
+    }
+    Ok(RowSelection::from(selectors))
+}
+
+fn node_id_row_filter(md: &ParquetMetaData, keys: Arc<HashSet<[u8; 16]>>) -> Result<RowFilter> {
+    let schema = md.file_metadata().schema_descr();
+    let leaf_idx = schema
+        .columns()
+        .iter()
+        .position(|column| column.name() == COL_NODE_ID)
+        .ok_or_else(|| Error::invariant("node_id column not in parquet schema"))?;
+    let projection = ProjectionMask::leaves(schema, [leaf_idx]);
+    let predicate = ArrowPredicateFn::new(projection, move |batch| {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| {
+                ArrowError::SchemaError(
+                    "node_id sparse predicate expected FixedSizeBinary(16)".into(),
+                )
+            })?;
+        Ok(BooleanArray::from_iter((0..ids.len()).map(|row| {
+            let id: Option<[u8; 16]> = ids.value(row).try_into().ok();
+            Some(id.is_some_and(|id| keys.contains(&id)))
+        })))
+    });
+    Ok(RowFilter::new(vec![Box::new(predicate)]))
 }
 
 /// Row groups whose `node_id` min/max range can contain at least one of
@@ -808,6 +933,7 @@ pub async fn load_node_sst_metadata_async(
         path: path.clone(),
         file_size,
         cached_metadata: None,
+        scan_stats: None,
     };
     AsyncFileReader::get_metadata(&mut reader, None)
         .await
@@ -829,11 +955,23 @@ pub async fn load_node_sst_metadata_async(
 /// `cached_metadata` short-circuits the footer + page-index round-trip
 /// when the caller has it from a previous warm lookup on the same SST
 /// (RFC-003 §"Cache integration"). Bypasses `get_metadata` entirely.
+#[derive(Debug, Default)]
+pub struct RangedNodeScanStats {
+    bytes_read: AtomicU64,
+}
+
+impl RangedNodeScanStats {
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+}
+
 struct ObjectStoreRangedReader {
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
     file_size: u64,
     cached_metadata: Option<Arc<ParquetMetaData>>,
+    scan_stats: Option<Arc<RangedNodeScanStats>>,
 }
 
 impl AsyncFileReader for ObjectStoreRangedReader {
@@ -843,6 +981,7 @@ impl AsyncFileReader for ObjectStoreRangedReader {
     ) -> BoxFuture<'_, std::result::Result<Bytes, ParquetError>> {
         let store = self.store.clone();
         let path = self.path.clone();
+        let stats = self.scan_stats.clone();
         async move {
             let opts = GetOptions {
                 range: Some(GetRange::Bounded(range)),
@@ -852,9 +991,16 @@ impl AsyncFileReader for ObjectStoreRangedReader {
                 .get_opts(&path, opts)
                 .await
                 .map_err(|e| ParquetError::External(Box::new(e)))?;
-            resp.bytes()
+            let bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| ParquetError::External(Box::new(e)))
+                .map_err(|e| ParquetError::External(Box::new(e)))?;
+            if let Some(stats) = stats {
+                stats
+                    .bytes_read
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            Ok(bytes)
         }
         .boxed()
     }
@@ -874,11 +1020,19 @@ impl AsyncFileReader for ObjectStoreRangedReader {
     ) -> BoxFuture<'_, std::result::Result<Vec<Bytes>, ParquetError>> {
         let store = self.store.clone();
         let path = self.path.clone();
+        let stats = self.scan_stats.clone();
         async move {
-            store
+            let chunks = store
                 .get_ranges(&path, &ranges)
                 .await
-                .map_err(|e| ParquetError::External(Box::new(e)))
+                .map_err(|e| ParquetError::External(Box::new(e)))?;
+            if let Some(stats) = stats {
+                let bytes = chunks.iter().fold(0_u64, |total, chunk| {
+                    total.saturating_add(chunk.len() as u64)
+                });
+                stats.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Ok(chunks)
         }
         .boxed()
     }
@@ -911,6 +1065,98 @@ impl AsyncFileReader for ObjectStoreRangedReader {
         }
         .boxed()
     }
+}
+
+/// Lazy ranged node scan. Parquet fetches one row group's selected pages when
+/// [`Self::next_row_group`] is awaited; dropping this value prevents every
+/// later row group from issuing object-store reads.
+pub struct RangedNodeBatchStream {
+    inner: parquet::arrow::async_reader::ParquetRecordBatchStream<ObjectStoreRangedReader>,
+    stats: Arc<RangedNodeScanStats>,
+}
+
+impl std::fmt::Debug for RangedNodeBatchStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RangedNodeBatchStream")
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RangedNodeBatchStream {
+    pub async fn next_row_group(&mut self) -> Result<Option<ParquetRecordBatchReader>> {
+        self.inner
+            .next_row_group()
+            .await
+            .map_err(|e| Error::invariant(format!("parquet ranged row group: {e}")))
+    }
+
+    pub fn stats(&self) -> &Arc<RangedNodeScanStats> {
+        &self.stats
+    }
+}
+
+/// Open a row-group-pruned, column-projected node scan over byte-range GETs.
+///
+/// Unlike the collecting ranged helpers used by point probes, this returns the
+/// Parquet row-group stream itself. A LIMIT caller can therefore stop after
+/// the batch containing its final live match without fetching any later row
+/// group. `cached_metadata` avoids a footer round trip but never changes the
+/// selected rows.
+pub async fn scan_with_predicates_and_projection_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    predicates: &[ScanPredicate],
+    projection: Option<&[String]>,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> Result<(RangedNodeBatchStream, Arc<ParquetMetaData>)> {
+    let stats = Arc::new(RangedNodeScanStats::default());
+    let reader = ObjectStoreRangedReader {
+        store,
+        path: path.clone(),
+        file_size,
+        cached_metadata,
+        scan_stats: Some(stats.clone()),
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        reader,
+        ArrowReaderOptions::new().with_page_index(true),
+    )
+    .await
+    .map_err(|e| Error::invariant(format!("parquet limited open async {path}: {e}")))?;
+    let md = builder.metadata().clone();
+
+    let expected = node_arrow_schema(label);
+    let got = builder.schema();
+    if got.fields().len() != expected.fields().len()
+        || got
+            .fields()
+            .iter()
+            .zip(expected.fields())
+            .any(|(got, want)| got.name() != want.name() || got.data_type() != want.data_type())
+    {
+        return Err(Error::Corrupted {
+            path: path.to_string(),
+            detail: "node SST schema does not match the declared node schema".into(),
+        });
+    }
+
+    let (keep, projection_mask) = node_scan_plan(&md, label, predicates, projection);
+    let all_row_groups = keep.len() == md.row_groups().len();
+    let mut builder = builder;
+    if !all_row_groups {
+        builder = builder.with_row_groups(keep);
+    }
+    if let Some(mask) = projection_mask {
+        builder = builder.with_projection(mask);
+    }
+    let inner = builder
+        .build()
+        .map_err(|e| Error::invariant(format!("parquet limited build async {path}: {e}")))?;
+    Ok((RangedNodeBatchStream { inner, stats }, md))
 }
 
 /// Ranged-read variant of [`NodeSstReader::targeted_scan`] (RFC-003).
@@ -953,9 +1199,15 @@ pub async fn targeted_scan_async(
     // Row-group prune by min/max stats on node_id. Same logic as
     // `targeted_scan`.
     let target = *target;
-    ranged_scan_selected_row_groups(store, path, file_size, label, cached_metadata, move |md| {
-        row_groups_for_keys(md, std::slice::from_ref(&target))
-    })
+    ranged_scan_selected_row_groups(
+        store,
+        path,
+        file_size,
+        label,
+        cached_metadata,
+        None,
+        move |md| row_groups_for_keys(md, std::slice::from_ref(&target)),
+    )
     .await
 }
 
@@ -978,10 +1230,85 @@ pub async fn scan_row_groups_async(
         file_size,
         label,
         cached_metadata,
+        None,
         move |_| Ok(row_groups),
     )
     .await?;
     Ok(batches)
+}
+
+/// Ranged counterpart to [`NodeSstReader::scan_row_groups_for_keys`].
+/// The object-store reader first fetches/decodes the narrow `node_id` pages;
+/// wide node payload pages are selected only for matching rows.
+pub async fn scan_row_groups_for_keys_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    row_groups: Vec<usize>,
+    keys: Arc<HashSet<[u8; 16]>>,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> Result<Vec<RecordBatch>> {
+    let (batches, _md) = ranged_scan_selected_row_groups(
+        store,
+        path,
+        file_size,
+        label,
+        cached_metadata,
+        Some(keys),
+        move |_| Ok(row_groups),
+    )
+    .await?;
+    Ok(batches)
+}
+
+/// Ranged counterpart to [`NodeSstReader::scan_rows_by_ordinals`].
+///
+/// Offset-index page pruning happens before any column is decoded, so work is
+/// proportional to selected payload pages rather than total SST rows.
+pub async fn scan_rows_by_ordinals_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    ordinals: Vec<u64>,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> Result<Vec<RecordBatch>> {
+    let reader = ObjectStoreRangedReader {
+        store,
+        path: path.clone(),
+        file_size,
+        cached_metadata,
+        scan_stats: None,
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        reader,
+        ArrowReaderOptions::new().with_page_index(true),
+    )
+    .await
+    .map_err(|e| Error::invariant(format!("parquet ordinal open async {path}: {e}")))?;
+    let expected = node_arrow_schema(label);
+    let got = builder.schema();
+    if got.fields().len() != expected.fields().len() {
+        return Err(Error::Corrupted {
+            path: path.to_string(),
+            detail: format!(
+                "node SST has {} columns, expected {}",
+                got.fields().len(),
+                expected.fields().len()
+            ),
+        });
+    }
+    let total_rows = builder.metadata().file_metadata().num_rows() as u64;
+    let selection = row_selection_for_ordinals(total_rows, &ordinals)?;
+    let stream = builder
+        .with_row_selection(selection)
+        .build()
+        .map_err(|e| Error::invariant(format!("parquet ordinal build async {path}: {e}")))?;
+    stream
+        .try_collect()
+        .await
+        .map_err(|e| Error::invariant(format!("parquet ordinal collect async {path}: {e}")))
 }
 
 /// Shared driver for the ranged-read scans: open the stream builder over
@@ -993,6 +1320,7 @@ async fn ranged_scan_selected_row_groups(
     file_size: u64,
     label: &LabelDef,
     cached_metadata: Option<Arc<ParquetMetaData>>,
+    filter_keys: Option<Arc<HashSet<[u8; 16]>>>,
     select: impl FnOnce(&ParquetMetaData) -> Result<Vec<usize>>,
 ) -> Result<(Vec<RecordBatch>, Arc<ParquetMetaData>)> {
     let reader = ObjectStoreRangedReader {
@@ -1000,6 +1328,7 @@ async fn ranged_scan_selected_row_groups(
         path: path.clone(),
         file_size,
         cached_metadata,
+        scan_stats: None,
     };
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(
         reader,
@@ -1029,8 +1358,13 @@ async fn ranged_scan_selected_row_groups(
         return Ok((Vec::new(), md));
     }
 
+    let builder = builder.with_row_groups(keep);
+    let builder = if let Some(keys) = filter_keys {
+        builder.with_row_filter(node_id_row_filter(&md, keys)?)
+    } else {
+        builder
+    };
     let stream = builder
-        .with_row_groups(keep)
         .build()
         .map_err(|e| Error::invariant(format!("parquet build async {path}: {e}")))?;
 

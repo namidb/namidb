@@ -272,15 +272,15 @@ async fn vector_procedure_filter_null_value_rejected() {
 
 #[tokio::test]
 async fn hybrid_sparse_filter_does_not_starve_past_k_sparse() {
-    // 12 `other`-tenant docs with a high-tf body rank above 1 `target`-tenant doc
-    // whose body has tf=1 diluted by length, so `target` ranks last (position 13).
-    // A sparse-only filtered hybrid with k=1 (k_sparse default = 8) would, without
-    // fetching the full BM25 ranking, truncate to the top-8 (all `other`) and then
-    // filter to zero. The fix fetches the complete ranking so `target` survives.
+    // 520 `other`-tenant docs with a high-tf body rank above one `target` doc
+    // whose tf=1 is diluted by length. This deliberately places the only valid
+    // hit past the old fixed `k * 512` post-filter window. Adaptive refill must
+    // either reach it or take the exact filtered fallback; returning zero is
+    // never acceptable while a matching document exists.
     let mut writer = WriterSession::open(store(), paths("hybrid-starve"))
         .await
         .unwrap();
-    for i in 0..12 {
+    for i in 0..520 {
         let mut p = BTreeMap::new();
         p.insert("title".into(), CoreValue::Str(format!("other{i}")));
         p.insert("tenant".into(), CoreValue::Str("other".into()));
@@ -394,4 +394,523 @@ async fn search_vector_procedure_ranks_by_closeness() {
     let got = titles(&run(&w, cypher, vec![0.0, 1.0, 0.0]).await);
     // Query along y → beta closest, then gamma.
     assert_eq!(got, vec!["beta".to_string(), "gamma".to_string()]);
+}
+
+#[cfg(feature = "text-index")]
+mod indexed_sparse_filter {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::{ManifestStore, TextIndexDescriptor};
+    use namidb_storage::memtable::{MemKey, MemOp, Memtable};
+    use namidb_storage::text::parse_query;
+    use namidb_storage::{compact_l0_to_l1, flush, SessionCaches, WriterFence, WriterSession};
+    use object_store::path::Path;
+    use object_store::ObjectStoreExt;
+
+    use super::*;
+
+    const INDEX_NAME: &str = "doc_ft";
+    const CAP_ENV: &str = "NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP";
+
+    /// These tests change the process-global candidate cap. Keep their complete
+    /// async execution under one lock so each query sees the intended value.
+    static CAP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CapEnvGuard {
+        previous: Option<String>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl CapEnvGuard {
+        fn set(value: usize) -> Self {
+            let lock = CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var(CAP_ENV).ok();
+            std::env::set_var(CAP_ENV, value.to_string());
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn update(&self, value: usize) {
+            std::env::set_var(CAP_ENV, value.to_string());
+        }
+    }
+
+    impl Drop for CapEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(CAP_ENV, value),
+                None => std::env::remove_var(CAP_ENV),
+            }
+        }
+    }
+
+    /// Cache-free probes must GET the immutable `.ft` once per widening round.
+    /// Counting those GETs makes the indexed route observable without relying on
+    /// execution time or on a corpus scan returning a different logical answer.
+    #[derive(Debug)]
+    struct TextGetProbe {
+        inner: Arc<dyn ObjectStore>,
+        text_gets: AtomicUsize,
+    }
+
+    impl TextGetProbe {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                text_gets: AtomicUsize::new(0),
+            }
+        }
+
+        fn text_gets(&self) -> usize {
+            self.text_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for TextGetProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TextGetProbe({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for TextGetProbe {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if location.as_ref().ends_with(".ft") {
+                self.text_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// Build two node L0s, compact the complete corpus into one authoritative
+    /// `.ft`, then reopen without caches so each text-index probe is observable.
+    async fn indexed_corpus(
+        name: &str,
+        docs: &[(&str, &str, &str)],
+    ) -> (WriterSession, BTreeMap<String, NodeId>, Arc<TextGetProbe>) {
+        let probe = Arc::new(TextGetProbe::new());
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let namespace_paths = paths(name);
+        let manifest_store = ManifestStore::new(store.clone(), namespace_paths.clone());
+        let mut current = manifest_store
+            .bootstrap(uuid::Uuid::now_v7())
+            .await
+            .unwrap();
+        let label_id = current.manifest.label_dict.intern("Doc");
+        current.manifest.text_indexes.push(TextIndexDescriptor::new(
+            INDEX_NAME.into(),
+            "Doc".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                    PropertyDef::new("tenant", DataType::Utf8, true).unwrap(),
+                    PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(current.manifest.epoch);
+        let mut ids = BTreeMap::new();
+        let mut lsn = 0u64;
+        let chunk_size = docs.len().div_ceil(2).max(1);
+        for chunk in docs.chunks(chunk_size) {
+            let mut memtable = Memtable::new();
+            for &(title, tenant, body) in chunk {
+                let id = NodeId::new();
+                ids.insert(title.to_string(), id);
+                let mut properties = BTreeMap::new();
+                properties.insert("title".into(), CoreValue::Str(title.into()));
+                properties.insert("tenant".into(), CoreValue::Str(tenant.into()));
+                properties.insert("body".into(), CoreValue::Str(body.into()));
+                let record = NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    labels: vec![label_id.0],
+                };
+                lsn += 1;
+                memtable.apply(
+                    MemKey::Node { id },
+                    lsn,
+                    MemOp::Upsert(record.encode().unwrap()),
+                );
+            }
+            current = flush(
+                &manifest_store,
+                &fence,
+                &current,
+                &memtable.freeze(),
+                schema.clone(),
+            )
+            .await
+            .unwrap()
+            .committed;
+        }
+        compact_l0_to_l1(&manifest_store, &fence, &current, &schema)
+            .await
+            .unwrap();
+
+        let writer = WriterSession::open_with_caches(store, namespace_paths, SessionCaches::none())
+            .await
+            .unwrap();
+        (writer, ids, probe)
+    }
+
+    async fn authoritative_hits(
+        writer: &WriterSession,
+        query: &str,
+        k: usize,
+    ) -> Vec<(NodeId, f64)> {
+        writer
+            .snapshot()
+            .text_search(INDEX_NAME, "Doc", &parse_query(query), Some(k))
+            .await
+            .unwrap()
+            .expect("the compacted .ft must be authoritative")
+    }
+
+    fn other_docs(count: usize) -> Vec<(String, String, String)> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("other-{index:02}"),
+                    "other".to_string(),
+                    "alpha alpha alpha alpha".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn borrowed_docs(docs: &[(String, String, String)]) -> Vec<(&str, &str, &str)> {
+        docs.iter()
+            .map(|(title, tenant, body)| (title.as_str(), tenant.as_str(), body.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_authoritative_ft_widens_without_starvation() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(16);
+        docs.push((
+            "target".into(),
+            "acme".into(),
+            "alpha w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, ids, probe) = indexed_corpus("hybrid-ft-widen", &borrowed).await;
+
+        let initial = authoritative_hits(&writer, "alpha", 8).await;
+        assert_eq!(initial.len(), 8);
+        assert!(
+            initial.iter().all(|(id, _)| *id != ids["target"]),
+            "the matching tenant must sit beyond the initial indexed prefix"
+        );
+        let widened = authoritative_hits(&writer, "alpha", 32).await;
+        assert!(
+            widened.iter().any(|(id, _)| *id == ids["target"]),
+            "the second authoritative prefix must expose the target"
+        );
+
+        let before = probe.text_gets();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            vec![],
+        )
+        .await;
+        assert_eq!(titles(&rows), vec!["target".to_string()]);
+        assert_eq!(
+            probe.text_gets() - before,
+            2,
+            "cache-free execution must probe .ft at fetch=8 and widened fetch=32"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_authoritative_ft_returns_exact_short_page() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(10);
+        docs.push((
+            "eligible-a".into(),
+            "acme".into(),
+            "alpha a1 a2 a3 a4 a5 a6".into(),
+        ));
+        docs.push((
+            "eligible-b".into(),
+            "acme".into(),
+            "alpha b1 b2 b3 b4 b5 b6 b7 b8 b9 b10".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, _, probe) = indexed_corpus("hybrid-ft-short", &borrowed).await;
+        assert_eq!(
+            authoritative_hits(&writer, "alpha", 40).await.len(),
+            docs.len(),
+            "fetch=40 proves the authoritative matching corpus is exhausted"
+        );
+
+        let before = probe.text_gets();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 5, k_sparse: 5, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            titles(&rows),
+            vec!["eligible-a".to_string(), "eligible-b".to_string()]
+        );
+        assert_eq!(
+            probe.text_gets() - before,
+            1,
+            "an exhausted .ft returns the exact <k page without another probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_candidate_cap_falls_back_with_result_parity() {
+        let cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(16);
+        docs.extend([
+            (
+                "eligible-a".into(),
+                "acme".into(),
+                "alpha a1 a2 a3 a4 a5".into(),
+            ),
+            (
+                "eligible-b".into(),
+                "acme".into(),
+                "alpha b1 b2 b3 b4 b5 b6 b7".into(),
+            ),
+            (
+                "eligible-c".into(),
+                "acme".into(),
+                "alpha c1 c2 c3 c4 c5 c6 c7 c8 c9".into(),
+            ),
+        ]);
+        let borrowed = borrowed_docs(&docs);
+        let (writer, ids, probe) = indexed_corpus("hybrid-ft-cap", &borrowed).await;
+        let top_eight = authoritative_hits(&writer, "alpha", 8).await;
+        assert!(
+            ["eligible-a", "eligible-b", "eligible-c"]
+                .iter()
+                .all(|title| top_eight.iter().all(|(id, _)| *id != ids[*title])),
+            "cap=8 must end before every eligible document"
+        );
+        let cypher = "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 3, k_sparse: 3, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score";
+
+        let indexed_before = probe.text_gets();
+        let indexed = run(&writer, cypher, vec![]).await;
+        assert_eq!(
+            probe.text_gets() - indexed_before,
+            1,
+            "the uncapped authoritative route exhausts this corpus in one .ft probe"
+        );
+
+        cap.update(8);
+        let capped_before = probe.text_gets();
+        let capped = run(&writer, cypher, vec![]).await;
+        assert_eq!(
+            probe.text_gets() - capped_before,
+            1,
+            "the capped route must consult the initial authoritative .ft prefix"
+        );
+        assert_eq!(
+            titles(&capped),
+            titles(&indexed),
+            "reaching the candidate cap must fall back without changing recall or rank"
+        );
+        assert_eq!(
+            titles(&capped),
+            vec![
+                "eligible-a".to_string(),
+                "eligible-b".to_string(),
+                "eligible-c".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_stale_ft_falls_back_to_fresh_corpus() {
+        let _cap = CapEnvGuard::set(64);
+        let docs = vec![
+            ("old-a", "other", "alpha alpha"),
+            ("old-b", "other", "alpha beta"),
+        ];
+        let (mut writer, _, probe) = indexed_corpus("hybrid-ft-stale", &docs).await;
+        assert_eq!(authoritative_hits(&writer, "alpha", 8).await.len(), 2);
+
+        let mut properties = BTreeMap::new();
+        properties.insert("title".into(), CoreValue::Str("fresh".into()));
+        properties.insert("tenant".into(), CoreValue::Str("acme".into()));
+        properties.insert("body".into(), CoreValue::Str("zebra".into()));
+        writer
+            .upsert_node(
+                "Doc",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert!(
+            writer
+                .snapshot()
+                .text_search(INDEX_NAME, "Doc", &parse_query("zebra"), Some(8))
+                .await
+                .unwrap()
+                .is_none(),
+            "a same-label delta must make the persisted .ft non-authoritative"
+        );
+
+        let before = probe.text_gets();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'zebra', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title",
+            vec![],
+        )
+        .await;
+        assert_eq!(titles(&rows), vec!["fresh".to_string()]);
+        assert_eq!(
+            probe.text_gets() - before,
+            0,
+            "the freshness gate must reject stale .ft before fetching its body"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_corrupt_or_missing_ft_uses_exact_fallback() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(12);
+        docs.push((
+            "target".into(),
+            "acme".into(),
+            "alpha w1 w2 w3 w4 w5 w6 w7 w8".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, _, probe) = indexed_corpus("hybrid-ft-missing", &borrowed).await;
+        assert_eq!(
+            authoritative_hits(&writer, "alpha", 32).await.len(),
+            docs.len(),
+            "sanity: the authoritative .ft initially serves the whole corpus"
+        );
+
+        let relative = writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.kind == namidb_storage::manifest::SstKind::TextIndex)
+            .expect("compaction builds .ft")
+            .path
+            .clone();
+        let absolute = Path::from(format!(
+            "{}/{}",
+            paths("hybrid-ft-missing").namespace_prefix().as_ref(),
+            relative
+        ));
+        let cypher = "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title";
+
+        probe
+            .inner
+            .put(
+                &absolute,
+                object_store::PutPayload::from_static(b"NAMIFT02corrupt"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&run(&writer, cypher, vec![]).await),
+            vec!["target".to_string()],
+            "an undecodable .ft must flat-score the filtered corpus"
+        );
+
+        probe.inner.delete(&absolute).await.unwrap();
+        assert_eq!(
+            titles(&run(&writer, cypher, vec![]).await),
+            vec!["target".to_string()],
+            "a swept .ft must use the same exact filtered fallback"
+        );
+    }
 }

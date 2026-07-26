@@ -3,13 +3,210 @@
 All notable changes to NamiDB will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project loosely follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and the released CLI/server binaries, HTTP/Bolt and Cypher surfaces, PyPI
+package, official container images, and durable on-disk formats follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Breaking changes to
+those released surfaces bump the major version and are called out in the
+**Breaking** section and release notes.
 
-As of 1.0.0 the public API is stable: breaking changes bump the major
-version and are always called out in the **Breaking** section below and in
-the release notes.
+The Rust workspace crates are not published to crates.io. Their low-level
+`pub` implementation types are not yet a stable package API; a future
+crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
+
+## [2.0.5] - 2026-07-26: Indexed incremental graph reads and native vector filters
+
+This patch removes corpus-sized work from existing-key node `MERGE`, filtered
+listings, label counts and metadata-filtered vector search. It also adds an
+RSS-aware admission rail for long-running loaders. Existing Parquet, manifest,
+property-sidecar and search-index data remain readable; the new accelerators
+are optional and fall back to the 2.0.4 paths if they are absent or swept
+during a rollback.
+
+**Compatibility scope.** 2.0.5 reads 2.0.4 stores and preserves the released
+HTTP/Bolt, CLI, container and Python surfaces. The workspace-only Rust crates
+remain unpublished; git/path consumers constructing low-level `Manifest`,
+`SstDescriptor`, property-index descriptors, `VectorGraphBody` or
+`SharedAppState`, or exhaustively matching storage `Error`, must update for the
+new accelerator and memory metadata.
+
+### Changed — graph and listing performance
+
+- **Existing-key node `MERGE` is page-addressed end to end.** Batched unique
+  probes use fixed-page equality B+trees to resolve `key -> NodeId`, then a
+  companion `NodeId -> physical ordinal` locator and Parquet offset indexes
+  hydrate only the matching rows. A 783k-id / 2k-interleaved regression asserts
+  sublinear index reads; unrelated labels no longer determine the cost of
+  re-merging a small label such as `Materia`.
+- **Correlated existing-node updates use one lookup per `UNWIND` batch.**
+  `UNWIND $rows ... MATCH (n:Label {key: row.key}) SET ...` seeds the requested
+  unique String keys from the same sidecar path, reconciles only the bounded
+  transaction overlay and applies every mutation to already-hydrated IDs.
+  Misses, duplicate keys, rollback and read-your-own-writes remain exact; a
+  node-mutating plan no longer populates its transactional map by scanning the
+  label before the first row.
+- **Committed-memtable claimants carry forward incrementally.** Once a
+  `(label, property)` equality map is warm, each auto-commit applies only the
+  final changed rows to persistent posting maps instead of rescanning every
+  node accumulated since the last flush. Unrelated cached pairs are untouched,
+  embedding payloads are not retained by the accelerator, and old snapshots
+  pin their physical memtable generation across commits, pressure clears and
+  flushes.
+- **Label-agnostic correlated anchors are batched too.**
+  `UNWIND ... MATCH (n {key: row.key})-[r]->(:Label) DELETE r` deduplicates all
+  keys into one multi-key equality probe per SST and one node hydration batch.
+  Direct global `MATCH (n {key: row.key}) SET/DELETE n` uses that same batch
+  path instead of scanning once per input row.
+  Input duplicates, misses, cross-label fan-out, tombstones, renames and
+  read-your-own-writes remain exact; an empty expand no longer pays thousands
+  of sequential point reads before discovering that no relationship exists.
+- **Bound relationship `MERGE` has a range-readable exact-point index.**
+  Current forward edge SSTs carry an optional checksummed
+  `(source, target) -> {LSN, tombstone, properties}` B+tree, and correlated
+  endpoint pairs are probed together rather than reopening the CSR for every
+  row. `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` and
+  `NAMIDB_EDGE_POINT_MAX_SST_BYTES` make admission all-or-nothing; oversized,
+  absent, stale or corrupt sidecars fall back to the authoritative CSR without
+  changing relationship identity or results.
+- **Compacted 2.0.4 stores migrate automatically.** A lone L1 node SST is
+  rewritten once to add paged property accelerators and the node locator.
+  Oversized keys, missing/corrupt optional objects and old-reader janitor
+  sweeps select the exact legacy fallback instead of failing the namespace or
+  looping maintenance.
+- **Rolling upgrades keep the unique-key fast path.** Completeness is decided
+  per SST, so a legacy label-scoped `unique` sidecar and a current id-primary
+  equality sidecar can jointly answer one lookup. The legacy single-owner map
+  is accepted only for its exact non-empty label scope; candidates from both
+  formats are last-write-wins confirmed without populating the scan fallback.
+- **Label counts avoid node materialisation.** Unfiltered `count(*)` and
+  `count(n)` over a node scan use manifest label cardinalities when physical
+  ranges prove them authoritative. Overlapping/write-active layouts reconcile
+  once, cache the exact total/per-label vector by logical generation, and
+  carry it across commits with checked old/new label deltas. Immutable
+  snapshots pin their generation's count cell, so a concurrent commit,
+  pressure clear, flush or DDL transition cannot make an older reader observe
+  a newer total or rescan the corpus.
+- **Secondary filters and pagination consume bounded prefixes.** String/Bool
+  equality postings support indexed `WHERE ... LIMIT`, while ascending
+  indexed String ordering reads only `SKIP + LIMIT` candidates. Global
+  id-primary postings widen geometrically when their first pages belong to
+  other labels, and rolling manifests merge legacy unique and current equality
+  cursors before last-write-wins confirmation instead of dropping to a label
+  scan. A conservative capped scan also stops early for unindexed predicates
+  only when disjoint immutable ranges prove that doing so is last-write-wins
+  exact.
+- **Global mixed-type sidecars are complete for supported scalar values.**
+  Reusing a property name as Bool and String across labels no longer lets the
+  synthetic schema omit one type and turn an existing unique key into a false
+  miss.
+
+### Changed — vector search
+
+- **`search.vector` and `db.index.vector.queryNodes` filter before `k`.**
+  Indexed String/Bool equality and `IN` groups are stored as bounded adaptive
+  ordinal postings inside the v4 `.vg` body and intersected during ANN
+  retrieval. Rejected vectors remain navigation waypoints but never consume a
+  result slot or require node hydration.
+- Sparse postings use sorted `u32` ordinals and dense values use bitmaps.
+  `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` and
+  `NAMIDB_VECTOR_FILTER_MAX_BYTES` bound each build; crossing either omits the
+  whole property, never a truncated posting. Legacy/high-cardinality bodies
+  retain bounded sidecar eligibility plus adaptive widening and the exact
+  fallback, so filters cannot silently under-fill `k`.
+- Search build markers include the indexed metadata schema. Creating,
+  dropping or recreating a filter property index therefore triggers exactly
+  one necessary vector rebuild, including empty and all-tombstoned corpora,
+  without repeated maintenance work. An authoritative deterministic vector or
+  FTS build rejection is also recorded for its exact catalog signature and
+  node-LSN generation: reads remain on the exact fallback, while unchanged
+  idle maintenance no longer rewrites the same L1 forever. A catalog or node
+  generation change retries the build.
+- **Filtered hybrid BM25 no longer under-fills its sparse leg.** Authoritative
+  FTS results widen geometrically under
+  `NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP` and evaluate the predicate before
+  sparse top-k. Reaching the cap selects an exact two-pass flat fallback, so
+  the setting bounds fast-path hydration without changing results.
+- Natural KNN preserves Cypher's filter boundary: a source `WHERE` runs before
+  embedding evaluation and before `k`, while a filter placed above
+  `ORDER BY ... LIMIT` remains post-k and may return a short page. The
+  optimizer no longer merges those two meanings or refills a filtered ranked
+  page from lower positions.
+
+### Changed — memory and operations
+
+- **`NAMIDB_MEMORY_MAX_BYTES` observes total process RSS/working set.** At 90%
+  the server clears shared caches plus weakly registered, reconstructible
+  property/constraint maps and asks glibc to release free arenas. At the
+  configured ceiling it rejects new HTTP/Bolt Cypher work with a retryable
+  error while leaving `COMMIT`/`ROLLBACK` available to release staged state.
+- **A valid search index that cannot fit no longer triggers an unbounded
+  corpus scan.** Decoded `.vg` and `.ft` bodies share one reserved pool; a
+  conservative footprint above its capacity returns retryable HTTP 503/Bolt
+  `DatabaseUnavailable` with the required and assigned bytes. Consequently
+  `NAMIDB_CACHE_MAX_BYTES=0` disables serving persisted vector/full-text
+  indexes as well as retention. Missing, stale or corrupt optional indexes
+  still use their exact correctness fallback.
+- **Pressure relief no longer waits for the next request.** A process-wide
+  500 ms watchdog runs the same single-flight cache reclamation. Both watchdog
+  and foreground pressure winners execute cache destruction and `malloc_trim`
+  on Tokio's blocking pool rather than an async serving worker. Authenticated
+  `/v0/admin/flush` remains available while Cypher admission is closed and is
+  serialized process-wide; multi-tenant hard pressure flushes only an
+  already-open namespace instead of allocating a cold writer. Maintenance
+  flushes are excluded from the ordinary HTTP timeout, and a storage-layer
+  cancellation guard restores a frozen memtable synchronously if the client
+  disconnects during an object-store PUT; the process-wide request cap still
+  bounds callers waiting for the flush gate.
+- **Evicted namespace cache guards are bounded without reopening a race.**
+  `SstCache` retains at most 4096 deny tombstones, looked up allocation-free
+  from the canonical `/sst/` path prefix, so a late decode for a retained
+  eviction cannot repopulate dead state and namespace churn cannot grow the
+  registry indefinitely. An authoritative empty manifest also retains an
+  empty live-set rule across pressure clears, closing the same late-decode race
+  after compaction removes the final immutable object.
+- The official Compose example exposes an optional
+  `NAMIDB_CONTAINER_MEMORY_LIMIT` cgroup limit. The RSS setting is an admission
+  rail, not a replacement for OS containment of an already-running query.
+- The official image now embeds the BSL license, OCI version/revision labels
+  and a TLS/listen-aware liveness probe. Release preflights exercise the full
+  native OS/architecture matrix before tagging, and GNU/Linux archives are
+  gated at a `GLIBC_2.35` baseline on both x86_64 and arm64. Its builder pins
+  Rust 1.85.1 instead of letting the workspace's local `stable` override
+  silently replace the declared container toolchain.
+- Paged sidecars are built by streaming borrowed maps/postings rather than
+  cloning the corpus. Sidecar-seeded transactional maps are dropped after
+  flush, and pressure reclamation no longer leaves writer-local fallback maps
+  resident indefinitely.
+- Documentation now distinguishes the exact retained-cache budget from total
+  RSS and explains why one manifest/pointer version per durable commit creates
+  temporary, janitor-reclaimable history during a bulk load.
+
+### Fixed
+
+- Repeated node or relationship `SET`/`REMOVE` operations now refresh the
+  writer-private last-write-wins value before evaluating the next mutation and
+  keep every alias of the same entity coherent. A materialised `UNWIND` batch
+  can no longer overwrite an earlier patch with its stale input row.
+- Memtable snapshots are checksummed and bound to the manifest's exact WAL
+  descriptor closure. Legacy, truncated, corrupt or stale snapshots are cache
+  misses followed by authoritative WAL replay; the v2 wire retains the public
+  bincode prefix so a 2.0.4 rollback also falls back cleanly.
+- Offline SST attachment carries a stable complete label dictionary and
+  rejects conflicting id/name maps before the first object-store PUT.
+- Vector graph decode validates dimensions, finite numeric state, graph
+  ordinals, unique IDs and metadata postings before constructing the ANN
+  search space. Corrupt optional bodies select the exact flat fallback.
+- Optional `.vg`, `.ft` and equality-index objects removed by a rollback or
+  older-reader janitor are treated as unavailable accelerators, including
+  filtered vector, BM25, hybrid, label-scoped singular/batch property lookups
+  and capped-posting paths. Missing/corrupt objects fall back to the
+  authoritative exact scan; a valid index that exceeds its decoded-cache
+  allocation still returns `CacheCapacity`, while network, authentication and
+  timeout errors remain visible.
+- Cache-pressure clearing removes tracked Foyer entries individually so both
+  resident values and byte accounting reach zero while stale-path admission
+  guards remain active.
 
 ## [2.0.4] - 2026-07-25: Batched relationship loading and bounded caches
 
@@ -2130,7 +2327,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.4...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.5...HEAD
+[2.0.5]: https://github.com/namidb/namidb/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/namidb/namidb/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/namidb/namidb/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/namidb/namidb/compare/v2.0.1...v2.0.2

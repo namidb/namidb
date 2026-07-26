@@ -45,7 +45,8 @@
 //! single-writer model it's correct.
 //! - Background flush / compaction. The caller drives them manually.
 
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
 use object_store::ObjectStore;
@@ -69,12 +70,13 @@ use crate::manifest::{
     LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, TextIndexDescriptor,
     VectorIndexDescriptor, WalSegmentDescriptor,
 };
-use crate::memtable::{MemKey, MemOp, Memtable, MemtableSnapshot};
+use crate::memtable::{FrozenMemtable, MemKey, MemOp, Memtable, MemtableSnapshot};
 use crate::node_cache::{shared_node_cache, NodeViewCache};
 use crate::paths::NamespacePaths;
-use crate::read::Snapshot;
+use crate::read::{EdgeView, NodeView, Snapshot};
 use crate::recovery::{
-    recover_memtable_with_snapshot, write_memtable_snapshot, MemtableSnapshotFile, WalEntry, WalOp,
+    recover_memtable_with_snapshot, write_memtable_snapshot_for_manifest, MemtableSnapshotFile,
+    WalEntry, WalOp,
 };
 use crate::wal::{WalRecord, WalSegment, WalStore};
 
@@ -138,6 +140,110 @@ impl SessionCaches {
     }
 }
 
+/// Weak registry of the reconstructible caches owned by live writer sessions.
+///
+/// These maps deliberately remain outside `NAMIDB_CACHE_MAX_BYTES`: they are
+/// transactional/query-planning state rather than immutable shared-cache
+/// entries, and evicting one at its own byte threshold would require
+/// coordinating with an in-flight write. The process RSS governor can still
+/// reclaim them safely at a pressure boundary. Weak handles ensure this
+/// registry never extends a writer or snapshot lifetime.
+#[derive(Debug)]
+struct WriterLocalCacheHandles {
+    property: Weak<crate::property_index::PropertyIndexCache>,
+    unique: Weak<crate::unique_index::UniqueConstraintIndex>,
+}
+
+#[derive(Debug, Default)]
+struct WriterLocalCacheRegistry {
+    entries: Mutex<Vec<WriterLocalCacheHandles>>,
+}
+
+impl WriterLocalCacheRegistry {
+    fn register(
+        &self,
+        property: &Arc<crate::property_index::PropertyIndexCache>,
+        unique: &Arc<crate::unique_index::UniqueConstraintIndex>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Namespace churn must not turn the weak registry itself into an
+        // unbounded allocation between memory-pressure passes.
+        entries
+            .retain(|entry| entry.property.strong_count() > 0 || entry.unique.strong_count() > 0);
+        entries.push(WriterLocalCacheHandles {
+            property: Arc::downgrade(property),
+            unique: Arc::downgrade(unique),
+        });
+    }
+
+    fn clear(&self) {
+        // Upgrade and prune under the registry lock, then release it before
+        // potentially deallocating million-entry maps. Opening an unrelated
+        // namespace must not wait on allocator work from this pressure pass.
+        let live = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let registered = std::mem::take(&mut *entries);
+            let mut retained = Vec::new();
+            let mut live = Vec::with_capacity(registered.len());
+            for entry in registered {
+                let property = entry.property.upgrade();
+                let unique = entry.unique.upgrade();
+                let keep = property.is_some() || unique.is_some();
+                if keep {
+                    live.push((property, unique));
+                    retained.push(entry);
+                }
+            }
+            retained.shrink_to_fit();
+            *entries = retained;
+            live
+        };
+        for (property, unique) in live {
+            if let Some(property) = property {
+                // Pressure evicts corpus-sized maps and advances their logical
+                // generation, but keeps the O(labels) exact-count vector hot.
+                // Pinned snapshots may retain an already-cloned old map; the
+                // generation bump prevents them from repopulating it.
+                property.reset_preserving_node_counts();
+            }
+            if let Some(unique) = unique {
+                // Safe with or without a staged overlay: the next probe
+                // reconstructs from that exact overlay, while rollback over
+                // an empty map is a no-op. Diagnostic counters intentionally
+                // live outside `reset` and remain monotonic.
+                unique.reset();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity()
+    }
+}
+
+fn writer_local_cache_registry() -> &'static WriterLocalCacheRegistry {
+    static REGISTRY: OnceLock<WriterLocalCacheRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(WriterLocalCacheRegistry::default)
+}
+
 /// Outcome of [`WriterSession::commit_batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitOutcome {
@@ -150,6 +256,18 @@ pub enum CommitOutcome {
         records: usize,
         manifest_version: u64,
     },
+}
+
+/// Last-write-wins state of one key in the writer-private, uncommitted batch.
+///
+/// `Untouched` is distinct from `Tombstone`: query execution uses that
+/// distinction to refresh a materialized row from staged state without
+/// falling through to immutable storage after a delete.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StagedValue<T> {
+    Untouched,
+    Tombstone,
+    Upsert(T),
 }
 
 /// Single-writer ingest session.
@@ -212,7 +330,7 @@ pub struct WriterSession {
     /// flushes preserve it: they change durability/representation but the
     /// staged chokepoints have already applied the exact logical mutations.
     /// Discard/reopen and external content attachment reset it.
-    unique_index: crate::unique_index::UniqueConstraintIndex,
+    unique_index: Arc<crate::unique_index::UniqueConstraintIndex>,
     /// Object store handle kept around so [`Self::commit_batch`] can
     /// fire the auto-snapshot path without re-deriving it from the
     /// manifest store. Same `Arc` we hand `Snapshot::new`.
@@ -246,6 +364,62 @@ impl std::fmt::Debug for WriterSession {
             .field("pending_records", &self.pending.records.len())
             .field("memtable_entries", &self.memtable.len())
             .finish()
+    }
+}
+
+/// Cancellation guard for the destructive [`Memtable::freeze`] transition.
+///
+/// An async flush can be dropped without returning `Err` (HTTP timeout,
+/// disconnected caller, aborted task). In that case ordinary error handling
+/// never runs, so the frozen rows must be restored from [`Drop`] before the
+/// writer mutex becomes available to another operation. The durable manifest
+/// remains authoritative; restoring is safe even if cancellation raced an
+/// ambiguous remote commit, because the next CAS/recovery reconciles the
+/// session with the latest committed manifest.
+struct FrozenMemtableRestoreGuard<'a> {
+    memtable: &'a mut Memtable,
+    published_memtable: &'a mut Arc<MemtableSnapshot>,
+    frozen: Option<FrozenMemtable>,
+}
+
+impl<'a> FrozenMemtableRestoreGuard<'a> {
+    fn new(
+        memtable: &'a mut Memtable,
+        published_memtable: &'a mut Arc<MemtableSnapshot>,
+        frozen: FrozenMemtable,
+    ) -> Self {
+        Self {
+            memtable,
+            published_memtable,
+            frozen: Some(frozen),
+        }
+    }
+
+    fn frozen(&self) -> &FrozenMemtable {
+        self.frozen
+            .as_ref()
+            .expect("flush guard is armed until success or explicit restore")
+    }
+
+    /// Preserve the existing explicit `Err` path while sharing its mechanics
+    /// with cancellation cleanup.
+    fn restore_now(&mut self) {
+        if let Some(frozen) = self.frozen.take() {
+            self.memtable.restore(frozen);
+            *self.published_memtable = Arc::new(self.memtable.snapshot_view());
+        }
+    }
+
+    /// The committed manifest now references the generated SSTs; dropping the
+    /// frozen rows is the successful transition rather than a cancellation.
+    fn disarm(&mut self) {
+        self.frozen = None;
+    }
+}
+
+impl Drop for FrozenMemtableRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.restore_now();
     }
 }
 
@@ -351,17 +525,20 @@ impl WriterSession {
                     property_index_generation,
                 ),
             ),
-            unique_index: crate::unique_index::UniqueConstraintIndex::new(),
+            unique_index: Arc::new(crate::unique_index::UniqueConstraintIndex::new()),
             store,
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
             poisoned: false,
         };
+        session.seed_exact_node_counts_from_metadata();
         // Publish this namespace's current immutable-object set to the shared
         // cache before handing out any snapshot. Besides reclaiming stale
         // entries after a reopen, this re-enables admission after registry
         // eviction called `prune_namespace` with an empty live set.
         session.prune_sst_cache();
+        writer_local_cache_registry()
+            .register(&session.property_index_cache, &session.unique_index);
         Ok(session)
     }
 
@@ -371,6 +548,37 @@ impl WriterSession {
     /// records. O(memtable_size) for the BTreeMap clone.
     fn refresh_published(&mut self) {
         self.published_memtable = Arc::new(self.memtable.snapshot_view());
+    }
+
+    /// Seed exact total/per-label cardinalities from manifest metadata without
+    /// a corpus reconciliation on cold open.
+    ///
+    /// This is safe only when recovery produced no committed memtable entries
+    /// and the snapshot proves its node SST key ranges are disjoint. The public
+    /// `metadata_node_count` proof also rejects overlapping/legacy descriptor
+    /// shapes; every observed label must be answerable before the all-or-nothing
+    /// count vector is published. Subsequent node commits can then carry these
+    /// O(labels) counts forward by exact old/new-label deltas.
+    fn seed_exact_node_counts_from_metadata(&self) {
+        if !self.published_memtable.is_empty() {
+            return;
+        }
+        let snapshot = self.snapshot();
+        let Some(total) = snapshot.metadata_node_count(None) else {
+            return;
+        };
+        let mut by_label = std::collections::HashMap::new();
+        for label in snapshot.observed_labels() {
+            let Some(count) = snapshot.metadata_node_count(Some(&label)) else {
+                return;
+            };
+            if count > 0 {
+                by_label.insert(label, count);
+            }
+        }
+        let generation = self.property_index_cache.generation();
+        self.property_index_cache
+            .insert_node_counts_at(generation, total, by_label);
     }
 
     /// Cross-snapshot lazy property index. Hand it to every `Snapshot`
@@ -438,11 +646,148 @@ impl WriterSession {
             .unwrap_or(UniqueProbe::Unindexable))
     }
 
+    /// Seed single-String unique probes from the same immutable point-index
+    /// path used by MATCH, without a label scan.
+    ///
+    /// The returned views align with `values` and are already batch-hydrated.
+    /// Misses are seeded too, making the subsequent per-row MERGE re-probe
+    /// O(1). The transactional map remains explicitly partial: any key not in
+    /// this batch still falls back to the authoritative population path.
+    ///
+    /// When a prior clause/statement has staged node writes, the immutable
+    /// batch lookup remains the exact base and only the final LWW node entries
+    /// in `staged_memtable` are overlaid. This is bounded by the transaction's
+    /// distinct node mutations and never scans the stored label. The resulting
+    /// point answers use staged-aware rollback journalling in the writer-local
+    /// unique index.
+    pub async fn seed_unique_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Option<Vec<Option<crate::read::NodeView>>>> {
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let committed = self
+            .snapshot()
+            .batch_lookup_nodes_by_property(label, property, values)
+            .await?;
+        let staged = self.pending_has_node_mutations();
+        let views = if !staged {
+            committed
+        } else {
+            let requested: HashSet<&str> = values.iter().map(String::as_str).collect();
+            let mut candidates: HashMap<String, Option<NodeView>> =
+                HashMap::with_capacity(requested.len());
+            for (value, view) in values.iter().zip(committed) {
+                candidates.insert(value.clone(), view);
+            }
+
+            // A staged mutation shadows its committed row even when it is a
+            // tombstone, loses the target label, or changes the unique value.
+            // Remember only committed candidates relevant to this point batch;
+            // no corpus-sized overlay index is built.
+            let committed_value_by_id: HashMap<NodeId, String> = candidates
+                .iter()
+                .filter_map(|(value, view)| view.as_ref().map(|view| (view.id, value.clone())))
+                .collect();
+            let target_label_id = self.label_dict.id(label).map(|id| id.get());
+
+            for (key, entry) in self.staged_memtable.iter_nodes() {
+                let MemKey::Node { id } = key else {
+                    continue;
+                };
+                if let Some(value) = committed_value_by_id.get(id) {
+                    // Do not erase a newer staged claimant installed earlier
+                    // in this id-ordered walk; shadow only this base row.
+                    if candidates
+                        .get(value)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|view| view.id == *id)
+                    {
+                        candidates.insert(value.clone(), None);
+                    }
+                }
+
+                let MemOp::Upsert(payload) = &entry.op else {
+                    continue;
+                };
+                let record = NodeWriteRecord::decode(payload)?;
+                let carries_label = if label.is_empty() {
+                    true
+                } else {
+                    target_label_id
+                        .is_some_and(|target| record.labels.binary_search(&target).is_ok())
+                };
+                if !carries_label {
+                    continue;
+                }
+                let Some(Value::Str(value)) = record.properties.get(property) else {
+                    continue;
+                };
+                let value = value.clone();
+                if !requested.contains(value.as_str()) {
+                    continue;
+                }
+
+                let mut labels = BTreeSet::new();
+                for &raw in &record.labels {
+                    let name = self
+                        .label_dict
+                        .name(namidb_core::LabelId::new(raw))
+                        .ok_or_else(|| {
+                            Error::invariant(format!(
+                                "staged node {id} references unknown label id {raw}"
+                            ))
+                        })?;
+                    labels.insert(name.to_string());
+                }
+                let candidate = NodeView {
+                    id: *id,
+                    labels,
+                    properties: record.properties,
+                    lsn: entry.lsn,
+                    schema_version: record.schema_version,
+                };
+                let replace = candidates
+                    .get(&value)
+                    .and_then(Option::as_ref)
+                    .is_none_or(|old| {
+                        candidate.lsn > old.lsn
+                            || (candidate.lsn == old.lsn && candidate.id < old.id)
+                    });
+                if replace {
+                    candidates.insert(value, Some(candidate));
+                }
+            }
+
+            values
+                .iter()
+                .map(|value| candidates.get(value).cloned().flatten())
+                .collect()
+        };
+        let names = vec![property.to_string()];
+        let entries = values.iter().zip(&views).map(|(value, view)| {
+            let scalar = Value::Str(value.clone());
+            let key = crate::unique_index::encode_probe_key(&[&scalar])
+                .expect("String unique keys are indexable");
+            (key, view.as_ref().map(|node| node.id))
+        });
+        if staged {
+            self.unique_index.seed_staged_keys(label, &names, entries);
+        } else {
+            self.unique_index
+                .seed_committed_keys(label, &names, entries);
+        }
+        Ok(Some(views))
+    }
+
     /// The per-writer unique-value index (RFC-026 constraint fast path).
     /// Exposed so tests can assert the probe path actually ran (populate
     /// scans / probe counters) instead of a per-row label scan.
     pub fn unique_index(&self) -> &crate::unique_index::UniqueConstraintIndex {
-        &self.unique_index
+        self.unique_index.as_ref()
     }
 
     /// Whether the pending transaction changes the node view. Edge-only
@@ -450,6 +795,216 @@ impl WriterSession {
     /// unique-index population over `scan_label` into staged state.
     fn pending_has_node_mutations(&self) -> bool {
         self.pending_node_mutations
+    }
+
+    /// Build exact old/new label deltas for the final staged mutation of each
+    /// node, but only when a count cache is already warm. The old side is one
+    /// id-primary batch read over the committed snapshot; the new side comes
+    /// directly from the staged last-write-wins memtable.
+    ///
+    /// This is computed before durability but published only after the WAL +
+    /// manifest commit succeeds. A rollback or failed CAS therefore cannot
+    /// expose speculative cardinalities.
+    async fn pending_node_count_changes(
+        &self,
+    ) -> Result<Option<Vec<(Option<BTreeSet<String>>, Option<BTreeSet<String>>)>>> {
+        let generation = self.property_index_cache.generation();
+        if !self
+            .property_index_cache
+            .node_counts_initialized_at(generation)
+        {
+            return Ok(None);
+        }
+
+        let mut ids = Vec::new();
+        let mut new_labels = Vec::new();
+        for (key, entry) in self.staged_memtable.iter_nodes() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            ids.push(*id);
+            let labels = match &entry.op {
+                MemOp::Tombstone => None,
+                MemOp::Upsert(payload) => {
+                    let record = NodeWriteRecord::decode(payload)?;
+                    let mut resolved = BTreeSet::new();
+                    for &raw in &record.labels {
+                        let name = self
+                            .label_dict
+                            .name(namidb_core::LabelId::new(raw))
+                            .ok_or_else(|| {
+                                Error::invariant(format!(
+                                    "staged node {id} references unknown label id {raw}"
+                                ))
+                            })?;
+                        resolved.insert(name.to_string());
+                    }
+                    Some(resolved)
+                }
+            };
+            new_labels.push(labels);
+        }
+
+        // This internal read computes a delta for the generation that is
+        // ABOUT to commit. Routing it through `self.snapshot()` would publish
+        // its point results into the shared NodeViewCache under the still-old
+        // generation, immediately making those entries dead and charging an
+        // extra miss/entry per commit. Keep immutable SST bytes shared, but
+        // deliberately omit both semantic cross-snapshot caches.
+        let mut committed = Snapshot::new(
+            self.current.clone(),
+            &self.published_memtable,
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths().clone(),
+        );
+        if let Some(cache) = &self.sst_cache {
+            committed = committed.with_cache(cache.clone());
+        }
+        let old = committed.batch_lookup_nodes("", &ids).await?;
+        Ok(Some(
+            old.into_iter()
+                .zip(new_labels)
+                .map(|(view, new)| (view.map(|view| view.labels), new))
+                .collect(),
+        ))
+    }
+
+    /// Build the exact delta for every lazily populated committed-memtable
+    /// claimant map. Unlike node cardinalities this never consults SSTs: the
+    /// old side is the current row for the id in `self.memtable`, and the new
+    /// side is the final LWW row in `staged_memtable`.
+    ///
+    /// Only scalar equality encodings are retained. In particular, embedding
+    /// vectors are decoded as part of the node record but are not cloned into
+    /// this transient delta.
+    fn pending_memtable_claimant_changes(
+        &self,
+        cached_pairs: &BTreeSet<(String, String)>,
+    ) -> Result<crate::property_index::MemtableClaimantDelta> {
+        let indexed_properties: BTreeSet<String> = cached_pairs
+            .iter()
+            .map(|(_, property)| property.clone())
+            .collect();
+        let mut cached_labels_by_property: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (label, property) in cached_pairs {
+            cached_labels_by_property
+                .entry(property.clone())
+                .or_default()
+                .insert(label.clone());
+        }
+
+        fn decode_state(
+            entry: Option<&crate::memtable::MemEntry>,
+            id: NodeId,
+            labels: &LabelDictionary,
+            indexed_properties: &BTreeSet<String>,
+        ) -> Result<Option<crate::property_index::MemtableClaimantNode>> {
+            let Some(entry) = entry else {
+                return Ok(None);
+            };
+            let MemOp::Upsert(payload) = &entry.op else {
+                return Ok(None);
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            let mut resolved_labels = BTreeSet::new();
+            for raw in record.labels {
+                let label = labels.name(namidb_core::LabelId::new(raw)).ok_or_else(|| {
+                    Error::invariant(format!(
+                        "memtable claimant delta for node {id} references unknown label id {raw}"
+                    ))
+                })?;
+                resolved_labels.insert(label.to_string());
+            }
+            let properties = record
+                .properties
+                .iter()
+                .filter(|(name, _)| indexed_properties.contains(*name))
+                .filter_map(|(name, value)| {
+                    crate::cache::encode_equality_property_value(value)
+                        .map(|encoded| (name.clone(), encoded))
+                })
+                .collect();
+            Ok(Some(crate::property_index::MemtableClaimantNode {
+                labels: resolved_labels,
+                properties,
+            }))
+        }
+
+        let mut changes_by_pair: HashMap<
+            (String, String),
+            Vec<crate::property_index::MemtableClaimantPairChange>,
+        > = HashMap::new();
+        let mut rows = 0usize;
+        for (key, new_entry) in self.staged_memtable.iter_nodes() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            rows = rows.saturating_add(1);
+            let old = decode_state(
+                self.memtable.get(key),
+                *id,
+                &self.label_dict,
+                &indexed_properties,
+            )?;
+            let new = decode_state(Some(new_entry), *id, &self.label_dict, &indexed_properties)?;
+
+            let mut properties = BTreeSet::new();
+            if let Some(old) = &old {
+                properties.extend(old.properties.keys().map(String::as_str));
+            }
+            if let Some(new) = &new {
+                properties.extend(new.properties.keys().map(String::as_str));
+            }
+
+            for property in properties {
+                let Some(cached_labels) = cached_labels_by_property.get(property) else {
+                    continue;
+                };
+                let mut relevant_labels = BTreeSet::new();
+                if cached_labels.contains("") {
+                    relevant_labels.insert("");
+                }
+                if let Some(old) = &old {
+                    relevant_labels.extend(
+                        old.labels
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|label| cached_labels.contains(*label)),
+                    );
+                }
+                if let Some(new) = &new {
+                    relevant_labels.extend(
+                        new.labels
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|label| cached_labels.contains(*label)),
+                    );
+                }
+
+                for label in relevant_labels {
+                    let old_value = old
+                        .as_ref()
+                        .and_then(|node| node.value_for(label, property))
+                        .cloned();
+                    let new_value = new
+                        .as_ref()
+                        .and_then(|node| node.value_for(label, property))
+                        .cloned();
+                    if old_value == new_value {
+                        continue;
+                    }
+                    changes_by_pair
+                        .entry((label.to_string(), property.to_string()))
+                        .or_default()
+                        .push((*id, old_value, new_value));
+                }
+            }
+        }
+        Ok(crate::property_index::MemtableClaimantDelta {
+            changes_by_pair,
+            captured_pairs: cached_pairs.clone(),
+            rows,
+        })
     }
 
     /// Adjacency cache attached to this writer (RFC-018) — the shared
@@ -523,6 +1078,75 @@ impl WriterSession {
     /// same key. Exposed for observability/regressions around overlay growth.
     pub fn staged_memtable_len(&self) -> usize {
         self.staged_memtable.len()
+    }
+
+    /// Return the uncommitted last-write-wins state for `id` without touching
+    /// the committed memtable or SSTs.
+    ///
+    /// This is the cheap point primitive used by the query writer to keep
+    /// repeated `SET` rows coherent: a staged hit is O(log pending distinct
+    /// keys), while [`StagedValue::Untouched`] tells the caller its already
+    /// materialized committed value remains authoritative.
+    pub fn staged_node(&self, id: NodeId) -> Result<StagedValue<NodeView>> {
+        let Some(entry) = self.staged_memtable.get(&MemKey::Node { id }) else {
+            return Ok(StagedValue::Untouched);
+        };
+        match &entry.op {
+            MemOp::Tombstone => Ok(StagedValue::Tombstone),
+            MemOp::Upsert(payload) => {
+                let record = NodeWriteRecord::decode(payload)?;
+                let mut labels = BTreeSet::new();
+                for raw in record.labels {
+                    let name = self
+                        .label_dict
+                        .name(namidb_core::LabelId::new(raw))
+                        .ok_or_else(|| {
+                            Error::invariant(format!(
+                                "staged node {id} references unknown label id {raw}"
+                            ))
+                        })?;
+                    labels.insert(name.to_string());
+                }
+                Ok(StagedValue::Upsert(NodeView {
+                    id,
+                    labels,
+                    properties: record.properties,
+                    lsn: entry.lsn,
+                    schema_version: record.schema_version,
+                }))
+            }
+        }
+    }
+
+    /// Return the uncommitted last-write-wins state for one relationship key
+    /// without probing the committed adjacency/SST path.
+    pub fn staged_edge(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        dst: NodeId,
+    ) -> Result<StagedValue<EdgeView>> {
+        let key = MemKey::Edge {
+            edge_type: edge_type.to_string(),
+            src,
+            dst,
+        };
+        let Some(entry) = self.staged_memtable.get(&key) else {
+            return Ok(StagedValue::Untouched);
+        };
+        match &entry.op {
+            MemOp::Tombstone => Ok(StagedValue::Tombstone),
+            MemOp::Upsert(payload) => {
+                let record = EdgeWriteRecord::decode(payload)?;
+                Ok(StagedValue::Upsert(EdgeView {
+                    edge_type: edge_type.to_string(),
+                    src,
+                    dst,
+                    properties: record.properties,
+                    lsn: entry.lsn,
+                }))
+            }
+        }
     }
 
     /// Whether the pending transaction changes node labels/properties.
@@ -637,6 +1261,8 @@ impl WriterSession {
     /// [`SnapshotCell`] so concurrent readers consume it without
     /// holding the writer mutex (RFC-021).
     pub fn owned_snapshot(&self) -> Arc<crate::read::OwnedSnapshot> {
+        let (property_index_generation, exact_node_counts, memtable_claimant_cell) =
+            self.property_index_cache.snapshot_generation_and_cells();
         Arc::new(crate::read::OwnedSnapshot {
             manifest: self.current.clone(),
             memtable: Arc::clone(&self.published_memtable),
@@ -648,7 +1274,9 @@ impl WriterSession {
             adjacency_cache: self.adjacency_cache.clone(),
             shared_node_cache: self.node_cache.clone(),
             property_index_cache: Some(self.property_index_cache.clone()),
-            property_index_generation: Some(self.property_index_cache.generation()),
+            property_index_generation: Some(property_index_generation),
+            exact_node_counts: Some(exact_node_counts),
+            memtable_claimant_cell: Some(memtable_claimant_cell),
         })
     }
 
@@ -727,7 +1355,7 @@ impl WriterSession {
         if staged_node_mutations {
             // Node values differ from the published generation: only the
             // writer-private transactional postings index is safe.
-            snap.with_transactional_property_index(&self.unique_index, true)
+            snap.with_transactional_property_index(self.unique_index.as_ref(), true)
         } else {
             // Edge-only RYOW leaves every node/cache entry exact.
             if let Some(cache) = &self.node_cache {
@@ -749,7 +1377,7 @@ impl WriterSession {
     pub fn transactional_overlay_snapshot(&self) -> Snapshot<'_> {
         let staged_node_mutations = self.pending_has_node_mutations();
         self.overlay_snapshot()
-            .with_transactional_property_index(&self.unique_index, staged_node_mutations)
+            .with_transactional_property_index(self.unique_index.as_ref(), staged_node_mutations)
     }
 
     /// Schema of the current manifest version. The write path consults it to
@@ -963,6 +1591,48 @@ impl WriterSession {
         let last_lsn = self.pending.last_lsn();
         let records = self.pending.records.len();
         let committed_node_mutations = self.pending_has_node_mutations();
+        let node_count_changes = if committed_node_mutations {
+            match self.pending_node_count_changes().await {
+                Ok(changes) => changes,
+                Err(error) => {
+                    // Cardinality caching is an optimisation. A transient read
+                    // failure must not turn a valid durable write into a
+                    // failed commit; invalidate and lazily reconcile instead.
+                    tracing::warn!(
+                        error = %error,
+                        "could not prepare node-count delta; cache will be invalidated"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let memtable_claimant_pairs = if committed_node_mutations {
+            self.property_index_cache.memtable_claimant_pairs()
+        } else {
+            BTreeSet::new()
+        };
+        let memtable_claimant_delta = if !memtable_claimant_pairs.is_empty() {
+            match self.pending_memtable_claimant_changes(&memtable_claimant_pairs) {
+                Ok(delta) => Some(delta),
+                Err(error) => {
+                    // Claimant maps are accelerators. If an old buffered row
+                    // cannot be decoded, discard the tier after durability and
+                    // let the next lookup rebuild from the exact snapshot.
+                    tracing::warn!(
+                        error = %error,
+                        "could not prepare memtable claimant delta; cache will be invalidated"
+                    );
+                    None
+                }
+            }
+        } else {
+            // No claimant pair has ever been queried in this physical
+            // memtable generation. Avoid decoding large staged records (most
+            // notably embeddings) purely to carry an empty accelerator.
+            None
+        };
 
         // The WAL segment path is fully determined by `seq`, so we can
         // build the next manifest body before the WAL PUT lands and
@@ -1042,7 +1712,10 @@ impl WriterSession {
         // node state with an old negative-answer cache. Edge-only commits do
         // not change those maps and should leave them hot.
         if committed_node_mutations {
-            self.property_index_cache.reset();
+            self.property_index_cache.advance_with_node_changes(
+                node_count_changes.as_deref(),
+                memtable_claimant_delta.as_ref(),
+            );
         }
         // Publish the new memtable snapshot so subsequent reads (HTTP,
         // Bolt, embedded) pick up the just-committed records without
@@ -1060,7 +1733,7 @@ impl WriterSession {
         // that just completed.
         self.commits_since_snapshot = self.commits_since_snapshot.saturating_add(1);
         if self.auto_snapshot_every > 0 && self.commits_since_snapshot >= self.auto_snapshot_every {
-            match self.write_memtable_snapshot_inner(last_lsn).await {
+            match self.write_memtable_snapshot_inner().await {
                 Ok(()) => {
                     self.commits_since_snapshot = 0;
                 }
@@ -1132,19 +1805,24 @@ impl WriterSession {
     /// themselves (cloud worker policies, CLI maintenance commands)
     /// can request a snapshot independently of the auto-tick.
     pub async fn write_memtable_snapshot_now(&mut self) -> Result<()> {
-        let last_lsn = self.next_lsn.saturating_sub(1);
-        self.write_memtable_snapshot_inner(last_lsn).await?;
+        self.write_memtable_snapshot_inner().await?;
         self.commits_since_snapshot = 0;
         Ok(())
     }
 
-    async fn write_memtable_snapshot_inner(&self, last_lsn: u64) -> Result<()> {
+    async fn write_memtable_snapshot_inner(&self) -> Result<()> {
         let entries = self
             .memtable
             .iter()
             .map(|(key, entry)| (key.clone(), entry.lsn, entry.op.clone()));
-        let snapshot = MemtableSnapshotFile::from_iter(last_lsn, entries);
-        write_memtable_snapshot(&self.store, self.manifest_store.paths(), &snapshot).await
+        let snapshot = MemtableSnapshotFile::from_manifest(&self.current.manifest, entries);
+        write_memtable_snapshot_for_manifest(
+            &self.store,
+            self.manifest_store.paths(),
+            &self.current.manifest,
+            &snapshot,
+        )
+        .await
     }
 
     /// Compact every `(kind, scope)` bucket in L0 that holds more than
@@ -1225,12 +1903,21 @@ impl WriterSession {
             }
             for index in &descriptor.unique_property_indices {
                 live.insert(format!("{prefix}/{}", index.path));
+                if let Some(paged) = &index.paged {
+                    live.insert(format!("{prefix}/{}", paged.path));
+                }
             }
             for index in &descriptor.equality_property_indices {
                 live.insert(format!("{prefix}/{}", index.path));
+                if let Some(paged) = &index.paged {
+                    live.insert(format!("{prefix}/{}", paged.path));
+                }
             }
             if let Some(index) = &descriptor.label_index {
                 live.insert(format!("{prefix}/{}", index.path));
+            }
+            if let Some(locator) = &descriptor.node_locator {
+                live.insert(format!("{prefix}/{}", locator.path));
             }
         }
         cache.retain_paths(prefix, &live);
@@ -1274,16 +1961,24 @@ impl WriterSession {
     pub async fn flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
         let _ = self.commit_batch().await?;
         let frozen = self.memtable.freeze();
+        let mut restore = FrozenMemtableRestoreGuard::new(
+            &mut self.memtable,
+            &mut self.published_memtable,
+            frozen,
+        );
         let outcome = match flush(
             &self.manifest_store,
             &self.fence,
             &self.current,
-            &frozen,
+            restore.frozen(),
             schema,
         )
         .await
         {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                restore.disarm();
+                outcome
+            }
             Err(e) => {
                 // The flush failed before the manifest CAS committed the SSTs,
                 // so `frozen` is durable in nothing but its WAL segments (still
@@ -1294,11 +1989,13 @@ impl WriterSession {
                 // segment references — would lose them permanently. Put them
                 // back and re-publish so the rows stay visible and the next
                 // flush retries them.
-                self.memtable.restore(frozen);
-                self.refresh_published();
+                restore.restore_now();
                 return Err(e);
             }
         };
+        // Release the guard's disjoint mutable field borrows before publishing
+        // the newly committed manifest through the rest of the session.
+        drop(restore);
         self.current = outcome.committed.clone();
         // Drop cache side-map entries for SSTs this flush superseded, so the
         // (formerly insert-only) metadata/edge-stream/edge-reader maps do not
@@ -1310,6 +2007,18 @@ impl WriterSession {
         // A flush only moves the same logical rows from memtable/WAL into
         // immutable SSTs. Both logical property caches remain exact and must
         // stay warm across periodic loader flushes.
+        //
+        // The claimant tier is physical rather than logical: the fresh SST
+        // sidecars now cover these rows and the live memtable is empty. Replace
+        // only that snapshot-pinned cell so its memory is released while
+        // unique/global logical caches and the NodeView generation stay hot.
+        self.property_index_cache.reset_memtable_claimants();
+        //
+        // Partial UNIQUE maps are different: they duplicate the point answers
+        // now present in the freshly committed sidecars. Reclaim them at this
+        // generation boundary so incremental MERGE memory is bounded by the
+        // rows touched between flushes, not by the lifetime of the writer.
+        self.unique_index.drop_partial_maps();
         Ok(outcome)
     }
 
@@ -1348,6 +2057,64 @@ impl WriterSession {
             });
         }
 
+        // Preflight every raw LabelId baked into the opaque node bodies before
+        // issuing a single PUT. Independently-built SSTs used to carry
+        // singleton dictionaries, so A and B both encoded label id 0 and the
+        // second label was silently read back as the first. The builder now
+        // uses the schema's stable complete mapping; this guard also rejects
+        // legacy/conflicting BuiltSst values explicitly instead of committing
+        // corrupt label authority.
+        let mut names_by_id: std::collections::BTreeMap<u32, String> = self
+            .current
+            .manifest
+            .label_dict
+            .iter()
+            .map(|(id, name)| (id.get(), name.to_string()))
+            .collect();
+        let mut ids_by_name: std::collections::BTreeMap<String, u32> = names_by_id
+            .iter()
+            .map(|(id, name)| (name.clone(), *id))
+            .collect();
+        for sst in &built {
+            for (raw_id, name) in sst.label_entries() {
+                if let Some(existing) = names_by_id.get(&raw_id) {
+                    if existing != &name {
+                        return Err(Error::precondition(format!(
+                            "offline SST label dictionary conflict: id {raw_id} means \
+                             '{existing}' in one input and '{name}' in another"
+                        )));
+                    }
+                }
+                if let Some(existing) = ids_by_name.get(&name) {
+                    if *existing != raw_id {
+                        return Err(Error::precondition(format!(
+                            "offline SST label dictionary conflict: label '{name}' uses \
+                             ids {existing} and {raw_id}"
+                        )));
+                    }
+                }
+                names_by_id.insert(raw_id, name.clone());
+                ids_by_name.insert(name, raw_id);
+            }
+        }
+        let mut attached_label_dict = LabelDictionary::new();
+        for (expected, (raw_id, name)) in names_by_id.into_iter().enumerate() {
+            let expected = u32::try_from(expected)
+                .map_err(|_| Error::invariant("offline label dictionary exceeds u32 ids"))?;
+            if raw_id != expected {
+                return Err(Error::precondition(format!(
+                    "offline SST label dictionary is not contiguous: expected id {expected}, \
+                     found {raw_id}"
+                )));
+            }
+            let installed = attached_label_dict.intern(&name).get();
+            if installed != raw_id {
+                return Err(Error::invariant(
+                    "offline label dictionary reconstruction changed a raw id",
+                ));
+            }
+        }
+
         // 1. Decompose every BuiltSst into its PUT bodies + manifest
         //    descriptor. `into_parts` is the in-crate accessor that reads
         //    PendingSst's private fields (defined inside flush::builder).
@@ -1357,13 +2124,6 @@ impl WriterSession {
         let mut bloom_count = 0usize;
         let mut attached_max_lsn = 0u64;
         for b in built {
-            // Install the SST's label names into the namespace dictionary so the
-            // on-row LabelIds (baked at build time) resolve. Fresh-namespace
-            // attach starts from an empty dict, so a single-label-per-SST batch
-            // keeps id 0 == that label, matching the baked `__labels`.
-            for name in b.label_names() {
-                self.label_dict.intern(&name);
-            }
             let (body_path, body, bloom, sidecars, descriptor) = b.into_parts();
             attached_max_lsn = attached_max_lsn.max(descriptor.max_lsn);
             let store_ref = store.clone();
@@ -1396,7 +2156,7 @@ impl WriterSession {
         // 3. Commit phase — one new manifest version (mirrors flush()).
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema; // REPLACE (fresh-namespace-only)
-        next.label_dict = self.label_dict.clone();
+        next.label_dict = attached_label_dict.clone();
         next.ssts.extend(descriptors); // extend == set on a fresh base
         next.wal_segments.clear();
         let committed = self
@@ -1408,6 +2168,7 @@ impl WriterSession {
         //    seed past the attached SST high-water so a later online write
         //    cannot be silently shadowed by an attached row.
         self.current = committed.clone();
+        self.label_dict = attached_label_dict;
         self.next_lsn = self.next_lsn.max(attached_max_lsn.saturating_add(1)).max(1);
         self.refresh_published();
         self.property_index_cache.reset();
@@ -1494,6 +2255,8 @@ impl WriterSession {
         // refresh the published view so subsequent reads plan against the new
         // catalog.
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.search_index_builds
+            .retain(|state| state.kind != SstKind::VectorGraph || state.name != desc.name);
         next.vector_indexes.push(desc);
         let committed = self
             .manifest_store
@@ -1502,7 +2265,7 @@ impl WriterSession {
         let version = committed.manifest.version;
         self.current = committed;
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         self.unique_index.reset();
         Ok(version)
     }
@@ -1545,6 +2308,8 @@ impl WriterSession {
         }
 
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.search_index_builds
+            .retain(|state| state.kind != SstKind::TextIndex || state.name != desc.name);
         next.text_indexes.push(desc);
         let committed = self
             .manifest_store
@@ -1553,7 +2318,7 @@ impl WriterSession {
         let version = committed.manifest.version;
         self.current = committed;
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         self.unique_index.reset();
         Ok(version)
     }
@@ -1594,6 +2359,8 @@ impl WriterSession {
 
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.vector_indexes.retain(|d| d.name != name);
+        next.search_index_builds
+            .retain(|state| state.kind != SstKind::VectorGraph || state.name != name);
         next.ssts
             .retain(|d| !(d.kind == SstKind::VectorGraph && d.scope == name));
         let committed = self
@@ -1608,7 +2375,7 @@ impl WriterSession {
         // pressure.
         self.prune_sst_cache();
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         Ok(version)
     }
 
@@ -1641,6 +2408,8 @@ impl WriterSession {
 
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.text_indexes.retain(|d| d.name != name);
+        next.search_index_builds
+            .retain(|state| state.kind != SstKind::TextIndex || state.name != name);
         next.ssts
             .retain(|d| !(d.kind == SstKind::TextIndex && d.scope == name));
         let committed = self
@@ -1653,7 +2422,7 @@ impl WriterSession {
         // part of the successful metadata transition.
         self.prune_sst_cache();
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         Ok(version)
     }
 
@@ -1818,7 +2587,7 @@ impl WriterSession {
         let version = committed.manifest.version;
         self.current = committed;
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         self.unique_index.reset();
         Ok(version)
     }
@@ -1915,7 +2684,7 @@ impl WriterSession {
         let version = committed.manifest.version;
         self.current = committed;
         self.refresh_published();
-        self.property_index_cache.reset();
+        self.property_index_cache.reset_preserving_node_counts();
         self.unique_index.reset();
         Ok(version)
     }
@@ -1988,6 +2757,27 @@ pub fn prune_shared_caches(paths: &NamespacePaths) {
     if let Some(cache) = shared_adjacency_cache() {
         cache.prune_namespace(prefix);
     }
+}
+
+/// Eagerly clear every retained process-wide cache tier.
+///
+/// Used by the server's total-memory governor when RSS approaches its
+/// configured ceiling. This never drops memtables, writer state, or durable
+/// data; it only trades subsequent cache/index misses for immediate
+/// reclaimability. Writer-local property/constraint maps are included through
+/// weak registrations: they are reconstructible from the exact committed or
+/// staged snapshot and clearing them never retains a dead writer session.
+pub fn clear_shared_caches() {
+    if let Some(cache) = shared_sst_cache() {
+        cache.clear();
+    }
+    if let Some(cache) = shared_node_cache() {
+        cache.clear();
+    }
+    if let Some(cache) = shared_adjacency_cache() {
+        cache.clear();
+    }
+    writer_local_cache_registry().clear();
 }
 
 /// Mark `(label, property)` unique and/or indexed in `schema`, creating the
@@ -2200,6 +2990,362 @@ mod tests {
         assert_eq!(session.manifest_version(), 0);
         assert_eq!(session.next_lsn(), 1);
         assert_eq!(session.pending_len(), 0);
+        let generation = session.property_index_cache().generation();
+        assert!(
+            session
+                .property_index_cache()
+                .node_counts_initialized_at(generation),
+            "an empty namespace has an authoritative metadata count of zero"
+        );
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_at(None, generation),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn open_seeds_exact_counts_from_disjoint_sst_metadata() {
+        let store = make_store();
+        let paths = make_paths("ingest-open-counts-disjoint");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        assert_eq!(session.snapshot().metadata_node_count(None), Some(2));
+        drop(session);
+
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        let generation = reopened.property_index_cache().generation();
+        assert!(
+            reopened
+                .property_index_cache()
+                .node_counts_initialized_at(generation),
+            "pairwise-disjoint SST ranges are authoritative at open"
+        );
+        assert_eq!(
+            reopened
+                .property_index_cache()
+                .node_count_at(None, generation),
+            Some(2)
+        );
+        assert_eq!(
+            reopened
+                .property_index_cache()
+                .node_count_at(Some("Person"), generation),
+            Some(2)
+        );
+        assert_eq!(
+            reopened
+                .property_index_cache()
+                .node_count_reconciliation_scans(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn open_does_not_seed_counts_from_overlapping_ssts() {
+        let store = make_store();
+        let paths = make_paths("ingest-open-counts-overlap");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let id = sorted_node_id(1);
+        session
+            .upsert_node("Person", id, &node_record("old", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        session
+            .upsert_node("Person", id, &node_record("new", None))
+            .unwrap();
+        session.flush(schema()).await.unwrap();
+        assert!(
+            session.snapshot().metadata_node_count(None).is_none(),
+            "duplicate-version key ranges must overlap"
+        );
+        drop(session);
+
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        let generation = reopened.property_index_cache().generation();
+        assert!(
+            !reopened
+                .property_index_cache()
+                .node_counts_initialized_at(generation),
+            "overlapping SST row counts are not additive"
+        );
+
+        let published = reopened.owned_snapshot();
+        let scans = reopened
+            .property_index_cache()
+            .node_count_reconciliation_scans();
+        {
+            let snapshot = published.borrow();
+            assert_eq!(snapshot.count_nodes(Some("Person")).await.unwrap(), 1);
+        }
+        assert_eq!(
+            reopened
+                .property_index_cache()
+                .node_count_reconciliation_scans()
+                - scans,
+            1,
+            "an overlapping generation reconciles exactly once"
+        );
+
+        reopened
+            .property_index_cache()
+            .reset_preserving_node_counts();
+        {
+            let snapshot = published.borrow();
+            assert_eq!(
+                snapshot.count_nodes(Some("Person")).await.unwrap(),
+                1,
+                "the published snapshot retains its lazily populated exact cell"
+            );
+        }
+        assert_eq!(
+            reopened
+                .property_index_cache()
+                .node_count_reconciliation_scans()
+                - scans,
+            1,
+            "cache pressure must not make the pinned overlap snapshot rescan"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_does_not_seed_counts_when_wal_recovery_populates_memtable() {
+        let store = make_store();
+        let paths = make_paths("ingest-open-counts-recovery");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("wal", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        drop(session);
+
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        assert!(
+            !reopened.published_memtable.is_empty(),
+            "fixture must reopen with a recovered committed memtable"
+        );
+        let generation = reopened.property_index_cache().generation();
+        assert!(
+            !reopened
+                .property_index_cache()
+                .node_counts_initialized_at(generation),
+            "manifest-only counts cannot ignore recovered WAL rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_count_seed_survives_ddl_and_tracks_first_writes() {
+        let mut session = WriterSession::open(make_store(), make_paths("ingest-counts-ddl"))
+            .await
+            .unwrap();
+        let opened_generation = session.property_index_cache().generation();
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_at(None, opened_generation),
+            Some(0)
+        );
+
+        session
+            .create_property_index("Person", "name")
+            .await
+            .unwrap();
+        let ddl_generation = session.property_index_cache().generation();
+        assert!(ddl_generation > opened_generation);
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_at(None, ddl_generation),
+            Some(0),
+            "metadata-only DDL must carry the exact empty count"
+        );
+
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", None))
+            .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.count_nodes(None).await.unwrap(), 2);
+        assert_eq!(snapshot.count_nodes(Some("Person")).await.unwrap(), 2);
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_reconciliation_scans(),
+            0,
+            "the first node commit must apply deltas to the seed, not reconcile the corpus"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_snapshot_pins_exact_counts_across_pressure_and_commit() {
+        let mut session =
+            WriterSession::open(make_store(), make_paths("ingest-counts-owned-snapshot"))
+                .await
+                .unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("Alice", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        let old = session.owned_snapshot();
+        let scans = session
+            .property_index_cache()
+            .node_count_reconciliation_scans();
+
+        // The RSS governor advances/clears reconstructible property maps
+        // without republishing SnapshotCell. Exact counts must stay attached
+        // to the already-published OwnedSnapshot.
+        session
+            .property_index_cache()
+            .reset_preserving_node_counts();
+        {
+            let snapshot = old.borrow();
+            assert_eq!(snapshot.count_nodes(Some("Person")).await.unwrap(), 1);
+        }
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_reconciliation_scans(),
+            scans
+        );
+
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("Bob", None))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        let new = session.owned_snapshot();
+
+        {
+            let snapshot = old.borrow();
+            assert_eq!(
+                snapshot.count_nodes(Some("Person")).await.unwrap(),
+                1,
+                "a pinned reader must not observe a later generation's count"
+            );
+        }
+        {
+            let snapshot = new.borrow();
+            assert_eq!(snapshot.count_nodes(Some("Person")).await.unwrap(), 2);
+        }
+        assert_eq!(
+            session
+                .property_index_cache()
+                .node_count_reconciliation_scans(),
+            scans,
+            "both generations must answer from their pinned exact cells"
+        );
+    }
+
+    #[test]
+    fn memory_pressure_registry_clears_local_maps_without_resetting_counters() {
+        use crate::unique_index::{encode_probe_key, UniqueProbe};
+        use std::collections::HashMap;
+
+        // Use an isolated registry: invoking the process-global pressure hook
+        // from a parallel unit test could legitimately evict another test's
+        // performance cache while it is asserting a warm-path counter.
+        let registry = WriterLocalCacheRegistry::default();
+        let property = Arc::new(crate::property_index::PropertyIndexCache::new_at_generation(7));
+        let unique = Arc::new(crate::unique_index::UniqueConstraintIndex::new());
+        registry.register(&property, &unique);
+
+        let node = sorted_node_id(1);
+        property.insert(
+            "Doc".into(),
+            "key".into(),
+            Arc::new(HashMap::from([("existing".into(), node)])),
+        );
+        property.record_unique_lookup();
+        let property_lookups = property.unique_lookup_calls();
+        let property_generation = property.generation();
+        property.insert_node_counts_at(
+            property_generation,
+            2,
+            HashMap::from([("Doc".to_string(), 2)]),
+        );
+
+        let names = vec!["key".to_string()];
+        let props = BTreeMap::from([("key".to_string(), Value::Str("existing".into()))]);
+        unique.populate("Doc", &names, std::iter::once((node, &props)));
+        let key_value = Value::Str("existing".into());
+        let key = encode_probe_key(&[&key_value]).unwrap();
+        assert_eq!(
+            unique.probe("Doc", &names, &key, None),
+            Some(UniqueProbe::Conflict(node))
+        );
+        let unique_scans = unique.populate_scans();
+        let unique_probes = unique.probes();
+
+        registry.clear();
+
+        assert_eq!(property.get("Doc", "key"), None);
+        assert!(
+            property.generation() > property_generation,
+            "eviction must advance the cache generation"
+        );
+        let pressure_generation = property.generation();
+        assert_eq!(
+            property.node_count_at(None, pressure_generation),
+            Some(2),
+            "pressure eviction must preserve the O(labels) exact-count cache"
+        );
+        assert_eq!(
+            property.node_count_at(Some("Doc"), pressure_generation),
+            Some(2)
+        );
+        property.insert_at(
+            "Doc".into(),
+            "key".into(),
+            Arc::new(HashMap::from([("stale".into(), sorted_node_id(2))])),
+            property_generation,
+        );
+        assert!(
+            property.get_at("Doc", "key", pressure_generation).is_none(),
+            "a pinned pre-pressure generation cannot repopulate an evicted map"
+        );
+        assert_eq!(
+            property.unique_lookup_calls(),
+            property_lookups,
+            "diagnostic counters remain monotonic across pressure eviction"
+        );
+        assert_eq!(
+            unique.probe("Doc", &names, &key, None),
+            None,
+            "the transactional map must be reconstructed on its next probe"
+        );
+        assert_eq!(unique.populate_scans(), unique_scans);
+        assert_eq!(unique.probes(), unique_probes);
+
+        drop(property);
+        drop(unique);
+        registry.clear();
+        assert_eq!(
+            registry.len(),
+            0,
+            "weak registrations must not retain dead sessions"
+        );
+        assert_eq!(
+            registry.capacity(),
+            0,
+            "clearing the last weak registration must release Vec capacity"
+        );
     }
 
     #[tokio::test]
@@ -2391,6 +3537,15 @@ mod tests {
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session.compact_l0(&doc_schema).await.unwrap();
+        assert!(
+            session
+                .current
+                .manifest
+                .search_index_builds
+                .iter()
+                .any(|state| state.kind == SstKind::VectorGraph && state.name == "doc_emb"),
+            "authoritative build must record its catalog generation"
+        );
         let vg_relative = session
             .current
             .manifest
@@ -2431,7 +3586,7 @@ mod tests {
         let corrected = VectorIndexDescriptor {
             name: "doc_emb_v2".into(),
             dim: 8,
-            ..desc
+            ..desc.clone()
         };
         let err = session
             .register_vector_index(corrected.clone(), false)
@@ -2458,6 +3613,12 @@ mod tests {
             "the .vg SST refs are gone from the same manifest version"
         );
         assert!(
+            !m.search_index_builds
+                .iter()
+                .any(|state| state.kind == SstKind::VectorGraph && state.name == "doc_emb"),
+            "DROP must remove the durable build marker too"
+        );
+        assert!(
             cache.get_vector_index(&vg_absolute).is_none(),
             "DROP must eagerly prune the decoded graph"
         );
@@ -2470,6 +3631,16 @@ mod tests {
         let snap = session.snapshot();
         assert_eq!(snap.scan_label("Doc").await.unwrap().len(), 3);
         drop(snap);
+
+        // Recreating the exact same name+descriptor without another write
+        // must not inherit the dropped generation marker: the lone L1 node
+        // body needs one authoritative maintenance rewrite to rebuild `.vg`.
+        session.register_vector_index(desc, false).await.unwrap();
+        assert!(
+            session.compaction_basis().needs_compaction(),
+            "exact DROP+CREATE must schedule a fresh graph build"
+        );
+        session.drop_vector_index("doc_emb", false).await.unwrap();
 
         // The slot is free: the corrected re-create (dim 8) is now accepted.
         session
@@ -2520,11 +3691,10 @@ mod tests {
                 ..Default::default()
             }
         }
+        let text_desc =
+            TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]);
         session
-            .register_text_index(
-                TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
-                false,
-            )
+            .register_text_index(text_desc.clone(), false)
             .await
             .unwrap();
 
@@ -2539,6 +3709,12 @@ mod tests {
             .unwrap();
         session.flush(note_schema.clone()).await.unwrap();
         session.compact_l0(&note_schema).await.unwrap();
+        assert!(session
+            .current
+            .manifest
+            .search_index_builds
+            .iter()
+            .any(|state| state.kind == SstKind::TextIndex && state.name == "note_ft"));
         let ft_relative = session
             .current
             .manifest
@@ -2596,6 +3772,12 @@ mod tests {
             "the .ft SST refs are gone from the same manifest version"
         );
         assert!(
+            !m.search_index_builds
+                .iter()
+                .any(|state| state.kind == SstKind::TextIndex && state.name == "note_ft"),
+            "DROP must remove the durable text build marker"
+        );
+        assert!(
             cache.get_text_index(&ft_absolute).is_none(),
             "DROP must eagerly prune the decoded text index"
         );
@@ -2621,6 +3803,13 @@ mod tests {
         );
         assert_eq!(snap.scan_label("Note").await.unwrap().len(), 2);
         drop(snap);
+
+        session.register_text_index(text_desc, false).await.unwrap();
+        assert!(
+            session.compaction_basis().needs_compaction(),
+            "exact text DROP+CREATE must schedule a fresh body build"
+        );
+        session.drop_text_index("note_ft", false).await.unwrap();
 
         // The (label, properties) slot is free: a corrected re-create works.
         session
@@ -3462,6 +4651,280 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memtable_claimants_carry_incrementally_across_existing_node_auto_commits() {
+        const NODE_COUNT: u64 = 2_000;
+        const BATCHES: u64 = 20;
+        const BATCH_SIZE: u64 = 20;
+
+        let store = make_store();
+        let paths = make_paths("ingest-memtable-claimant-carry");
+        let mut session = WriterSession::open_with_caches(store, paths, SessionCaches::none())
+            .await
+            .unwrap();
+        let indexed_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Article".into(),
+                properties: vec![
+                    PropertyDef::new("key", DataType::Utf8, false)
+                        .unwrap()
+                        .with_unique(true),
+                    PropertyDef::new("title", DataType::Utf8, false).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+
+        let id = |ordinal: u64| {
+            let mut bytes = [0u8; 16];
+            bytes[8..].copy_from_slice(&ordinal.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        };
+        let article = |key: String, title: String, seed: f32| NodeWriteRecord {
+            properties: BTreeMap::from([
+                ("key".into(), Value::Str(key)),
+                ("title".into(), Value::Str(title)),
+                ("embedding".into(), Value::Vec(vec![seed; 16])),
+            ]),
+            schema_version: 1,
+            ..Default::default()
+        };
+
+        // A loader commit with no queried claimant pair must not decode every
+        // embedding merely to carry an empty accelerator.
+        for ordinal in 0..NODE_COUNT {
+            session
+                .upsert_node(
+                    "Article",
+                    id(ordinal),
+                    &article(
+                        format!("key-{ordinal:04}"),
+                        format!("initial-{ordinal:04}"),
+                        ordinal as f32,
+                    ),
+                )
+                .unwrap();
+        }
+        session.commit_batch().await.unwrap();
+        assert_eq!(
+            session.property_index_cache().memtable_incremental_rows(),
+            0
+        );
+
+        // One cold population examines the accumulated memtable once.
+        let probes = vec![
+            "key-0000".to_string(),
+            "missing".to_string(),
+            "key-1999".to_string(),
+        ];
+        let initial = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Article", "key", &probes)
+            .await
+            .unwrap();
+        assert_eq!(
+            initial
+                .iter()
+                .map(|view| view.as_ref().map(|view| view.id))
+                .collect::<Vec<_>>(),
+            vec![Some(id(0)), None, Some(id(1_999))]
+        );
+        let base_scans = session.property_index_cache().memtable_population_scans();
+        let base_rows = session.property_index_cache().memtable_population_rows();
+        assert_eq!(base_scans, 1);
+        assert_eq!(base_rows, NODE_COUNT);
+
+        // Pin both the old memtable and its claimant cell before subsequent
+        // auto-commits advance the writer.
+        let old = session.owned_snapshot();
+
+        for batch in 0..BATCHES {
+            for offset in 0..BATCH_SIZE {
+                let ordinal = batch * BATCH_SIZE + offset;
+                let key = if ordinal == 0 {
+                    "renamed-0000".to_string()
+                } else {
+                    format!("key-{ordinal:04}")
+                };
+                session
+                    .upsert_node(
+                        "Article",
+                        id(ordinal),
+                        &article(key, format!("updated-{ordinal:04}"), ordinal as f32 + 0.5),
+                    )
+                    .unwrap();
+            }
+            session.commit_batch().await.unwrap();
+        }
+
+        assert_eq!(
+            session.property_index_cache().memtable_population_scans(),
+            base_scans,
+            "auto-commits must carry the populated map, not rebuild it"
+        );
+        assert_eq!(
+            session.property_index_cache().memtable_population_rows(),
+            base_rows,
+            "no auto-commit may rescan the accumulated memtable"
+        );
+        assert_eq!(
+            session.property_index_cache().memtable_incremental_rows(),
+            BATCHES * BATCH_SIZE,
+            "maintenance work must grow only with final staged rows"
+        );
+
+        let current_keys = vec!["key-0000".to_string(), "renamed-0000".to_string()];
+        let current = session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Article", "key", &current_keys)
+            .await
+            .unwrap();
+        assert!(current[0].is_none());
+        let renamed = current[1]
+            .as_ref()
+            .expect("the carried map must add the replacement value");
+        assert_eq!(renamed.id, id(0));
+        assert_eq!(
+            renamed.properties.get("title"),
+            Some(&Value::Str("updated-0000".into()))
+        );
+
+        let old_keys = vec!["key-0000".to_string()];
+        let old_views = old
+            .borrow()
+            .batch_lookup_nodes_by_property("Article", "key", &old_keys)
+            .await
+            .unwrap();
+        let old_view = old_views[0]
+            .as_ref()
+            .expect("the pinned pre-commit snapshot keeps its old cell");
+        assert_eq!(old_view.id, id(0));
+        assert_eq!(
+            old_view.properties.get("title"),
+            Some(&Value::Str("initial-0000".into()))
+        );
+
+        // Memory pressure replaces only the writer's current cell. A fresh
+        // lookup rebuilds it once; the pinned old snapshot remains exact.
+        session
+            .property_index_cache()
+            .reset_preserving_node_counts();
+        assert!(!session
+            .property_index_cache()
+            .has_memtable_claimant_indices());
+        assert!(session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Article", "key", &["renamed-0000".to_string()],)
+            .await
+            .unwrap()[0]
+            .is_some());
+        assert_eq!(
+            session.property_index_cache().memtable_population_scans(),
+            base_scans + 1
+        );
+        assert!(old
+            .borrow()
+            .batch_lookup_nodes_by_property("Article", "key", &old_keys)
+            .await
+            .unwrap()[0]
+            .is_some());
+
+        // A physical flush transfers coverage to immutable sidecars and
+        // releases the current claimant cell without changing logical data.
+        session.flush(indexed_schema).await.unwrap();
+        assert!(!session
+            .property_index_cache()
+            .has_memtable_claimant_indices());
+        assert!(session
+            .snapshot()
+            .batch_lookup_nodes_by_property("Article", "key", &["renamed-0000".to_string()],)
+            .await
+            .unwrap()[0]
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn memtable_claimant_delta_groups_only_relevant_cached_pairs() {
+        let mut session = WriterSession::open_with_caches(
+            make_store(),
+            make_paths("ingest-memtable-claimant-relevant-pairs"),
+            SessionCaches::none(),
+        )
+        .await
+        .unwrap();
+        let article = sorted_node_id(1);
+        let record = |key: &str, title: &str| NodeWriteRecord {
+            properties: BTreeMap::from([
+                ("key".into(), Value::Str(key.into())),
+                ("title".into(), Value::Str(title.into())),
+            ]),
+            schema_version: 1,
+            ..Default::default()
+        };
+
+        session
+            .upsert_node("Article", article, &record("old-key", "old-title"))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+
+        // Populate two real label-scoped pairs from the committed memtable.
+        for (property, value) in [("key", "old-key"), ("title", "old-title")] {
+            assert!(session
+                .snapshot()
+                .batch_lookup_nodes_by_property("Article", property, &[value.to_string()],)
+                .await
+                .unwrap()[0]
+                .is_some());
+        }
+        let cache = Arc::clone(session.property_index_cache());
+        let cell = cache.current_memtable_claimant_cell();
+        let article_key = cache
+            .get_memtable_claimants(&cell, "Article", "key")
+            .unwrap();
+        // The global key pair is relevant to every label. The Other pairs are
+        // deliberately cached but irrelevant to an Article-only mutation.
+        cache.insert_memtable_claimants(&cell, "".into(), "key".into(), Arc::clone(&article_key));
+        for (label, property) in [("Other", "key"), ("Other", "title"), ("Other", "unused")] {
+            cache.insert_memtable_claimants(
+                &cell,
+                label.into(),
+                property.into(),
+                Arc::new(Default::default()),
+            );
+        }
+
+        session
+            .upsert_node("Article", article, &record("new-key", "new-title"))
+            .unwrap();
+        let pairs = cache.memtable_claimant_pairs();
+        let delta = session.pending_memtable_claimant_changes(&pairs).unwrap();
+        assert_eq!(delta.rows, 1);
+        assert_eq!(
+            delta
+                .changes_by_pair
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("".into(), "key".into()),
+                ("Article".into(), "key".into()),
+                ("Article".into(), "title".into()),
+            ]),
+            "label-disjoint and missing-property pairs must not receive row deltas"
+        );
+
+        session.commit_batch().await.unwrap();
+        assert_eq!(cache.memtable_incremental_rows(), 1);
+        assert_eq!(
+            cache.memtable_incremental_associations(),
+            3,
+            "maintenance must count only the three affected pair/row associations"
+        );
+        assert!(cache
+            .get_memtable_claimants(&cache.current_memtable_claimant_cell(), "Other", "unused",)
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn batch_unique_lookup_legacy_store_scans_once_then_reuses_complete_map() {
         let store = make_store();
         let paths = make_paths("ingest-batch-unique-legacy");
@@ -3785,6 +5248,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_flush_restores_visibility_and_retries_without_loss() {
+        let fault = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let store: Arc<dyn ObjectStore> = fault.clone();
+        let paths = make_paths("ingest-cancelled-flush");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+
+        let alice = sorted_node_id(1);
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        let before_version = session.manifest_version();
+        let before_bytes = session.memtable_bytes();
+        assert!(before_bytes > 0);
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+
+        // Stop the first immutable-body PUT. Reaching this hook proves
+        // WriterSession::flush already drained the live memtable with freeze().
+        fault.block_next_put_containing("sst/level0/");
+        let mut flush = Box::pin(session.flush(schema()));
+        tokio::select! {
+            blocked = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fault.wait_for_blocked_put(),
+            ) => {
+                blocked.expect("flush must reach the blocked SST PUT");
+            }
+            outcome = &mut flush => {
+                panic!("flush completed before the injected cancellation point: {outcome:?}");
+            }
+        }
+
+        // Model TimeoutLayer/client disconnect/task abort. Dropping the future
+        // must synchronously run the restore guard before the session can be
+        // used again.
+        drop(flush);
+        assert_eq!(session.manifest_version(), before_version);
+        assert_eq!(session.memtable_bytes(), before_bytes);
+        assert_eq!(session.current.manifest.wal_segments.len(), 1);
+        let visible = session
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .expect("cancelled flush must leave committed WAL data visible");
+        assert_eq!(
+            visible.properties.get("name"),
+            Some(&Value::Str("Alice".into()))
+        );
+
+        // The blocking rule was one-shot. A normal retry must promote the
+        // restored rows into an SST and clear their WAL reference exactly once.
+        let retry = session.flush(schema()).await.unwrap();
+        assert_eq!(retry.ssts_written, 1);
+        assert!(retry.committed.manifest.wal_segments.is_empty());
+        assert_eq!(session.memtable_bytes(), 0);
+        drop(session);
+
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        let durable = reopened
+            .snapshot()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .expect("retried flush must survive a cold reopen");
+        assert_eq!(
+            durable.properties.get("name"),
+            Some(&Value::Str("Alice".into()))
+        );
+    }
+
+    #[tokio::test]
     async fn reopen_after_flush_rebases_next_lsn_and_online_write_wins() {
         // Regression for the silent-shadow bug: after a namespace flushes
         // all its WAL into SSTs and is cold-reopened, the LSN counter must
@@ -3917,14 +5454,16 @@ mod tests {
         }
     }
 
-    /// `ObjectStore` wrapper that fails the next `put_opts` whose key
-    /// contains a configured substring, exactly once, with a transient
-    /// (non-`AlreadyExists`) error. Used to simulate a crash in the
-    /// narrow window between the WAL PUT and the manifest body PUT.
+    /// `ObjectStore` wrapper that can fail or block the next matching
+    /// `put_opts` exactly once. Used to simulate both transient commit faults
+    /// and cancellation while an immutable flush body is in flight.
     #[derive(Debug)]
     struct FaultStore {
         inner: Arc<dyn ObjectStore>,
         fail_next_put_on: std::sync::Mutex<Option<String>>,
+        block_next_put_on: std::sync::Mutex<Option<String>>,
+        blocked_put: tokio::sync::Notify,
+        release_put: tokio::sync::Notify,
     }
 
     impl FaultStore {
@@ -3932,10 +5471,21 @@ mod tests {
             Self {
                 inner,
                 fail_next_put_on: std::sync::Mutex::new(None),
+                block_next_put_on: std::sync::Mutex::new(None),
+                blocked_put: tokio::sync::Notify::new(),
+                release_put: tokio::sync::Notify::new(),
             }
         }
         fn fail_next_put_containing(&self, needle: &str) {
             *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
+        }
+
+        fn block_next_put_containing(&self, needle: &str) {
+            *self.block_next_put_on.lock().unwrap() = Some(needle.to_string());
+        }
+
+        async fn wait_for_blocked_put(&self) {
+            self.blocked_put.notified().await;
         }
     }
 
@@ -3968,6 +5518,23 @@ mod tests {
                     store: "FaultStore",
                     source: "injected transient put failure".into(),
                 });
+            }
+            let block = {
+                let mut guard = self.block_next_put_on.lock().unwrap();
+                match guard.as_deref() {
+                    Some(needle) if location.as_ref().contains(needle) => {
+                        *guard = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if block {
+                // `notify_one` retains a permit if the test has not started
+                // waiting yet. The matching PUT then stays pending until the
+                // flush future is deliberately dropped.
+                self.blocked_put.notify_one();
+                self.release_put.notified().await;
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -4731,6 +6298,54 @@ mod tests {
         assert!(session2.next_lsn() > 1);
     }
 
+    #[tokio::test]
+    async fn stale_snapshot_cannot_resurrect_node_after_full_bucket_tombstone_gc() {
+        let store = make_store();
+        let paths = make_paths("ingest-snapshot-gc-hwm");
+        let alice = sorted_node_id(1);
+        let graph_schema = schema();
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        session
+            .upsert_node("Person", alice, &node_record("Alice", Some(30)))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        // This v2 snapshot is valid now and contains Alice, but remains at the
+        // overwritten cache path after the following flush.
+        session.write_memtable_snapshot_now().await.unwrap();
+        session.flush(graph_schema.clone()).await.unwrap();
+
+        // Do not write another snapshot: preserve the dangerous pre-delete
+        // body, then fully reconcile and GC Alice's upsert+tombstone.
+        session.tombstone_node("Person", alice).unwrap();
+        session.commit_batch().await.unwrap();
+        session.flush(graph_schema.clone()).await.unwrap();
+        session.compact_l0(&graph_schema).await.unwrap();
+        assert!(
+            session
+                .current
+                .manifest
+                .ssts
+                .iter()
+                .all(|sst| sst.kind != SstKind::Nodes),
+            "the fixture must lower the node SST high-water to zero"
+        );
+        drop(session);
+
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        assert!(
+            reopened
+                .snapshot()
+                .lookup_node("Person", alice)
+                .await
+                .unwrap()
+                .is_none(),
+            "the pre-delete snapshot must not resurrect a fully GC'd node"
+        );
+    }
+
     // ── Offline SST builder + attach (RFC-023) ──────────────────────────
 
     #[tokio::test]
@@ -4775,6 +6390,135 @@ mod tests {
             view.properties.get("name"),
             Some(&Value::Str("Alice".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn attach_independently_built_labels_preserves_each_label_id() {
+        use crate::flush::builder::{build_node_sst, NodeInput};
+
+        let store = make_store();
+        let paths = make_paths("attach-two-labels");
+        let attached_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Alpha".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+            })
+            .unwrap()
+            .label(LabelDef {
+                name: "Beta".into(),
+                properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let row = |id: u8, name: &str| NodeInput {
+            id: *sorted_node_id(id).as_bytes(),
+            properties: BTreeMap::from([("name".into(), Value::Str(name.into()))]),
+            tombstone: false,
+        };
+
+        // Build independently and attach in reverse catalog order. Both
+        // builders must still bake Alpha=0/Beta=1 from the shared schema.
+        let beta = build_node_sst(&paths, &attached_schema, "Beta", vec![row(2, "beta")])
+            .unwrap()
+            .unwrap();
+        let alpha = build_node_sst(&paths, &attached_schema, "Alpha", vec![row(1, "alpha")])
+            .unwrap()
+            .unwrap();
+
+        let mut session = WriterSession::open(store, paths).await.unwrap();
+        session
+            .attach_ssts(vec![beta, alpha], attached_schema)
+            .await
+            .unwrap();
+
+        let snapshot = session.snapshot();
+        let alpha_rows = snapshot.scan_label("Alpha").await.unwrap();
+        let beta_rows = snapshot.scan_label("Beta").await.unwrap();
+        assert_eq!(
+            alpha_rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(1)]
+        );
+        assert_eq!(
+            beta_rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(2)]
+        );
+        assert!(alpha_rows[0].labels.contains("Alpha"));
+        assert!(!alpha_rows[0].labels.contains("Beta"));
+        assert!(beta_rows[0].labels.contains("Beta"));
+        assert!(!beta_rows[0].labels.contains("Alpha"));
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_conflicting_legacy_label_maps_before_io() {
+        use crate::flush::builder::{build_node_sst, NodeInput};
+
+        let store = make_store();
+        let paths = make_paths("attach-label-conflict");
+        let one_label_schema = |name: &str| {
+            SchemaBuilder::new()
+                .label(LabelDef {
+                    name: name.into(),
+                    properties: Vec::new(),
+                })
+                .unwrap()
+                .build()
+        };
+        let alpha_schema = one_label_schema("Alpha");
+        let beta_schema = one_label_schema("Beta");
+        let alpha = build_node_sst(
+            &paths,
+            &alpha_schema,
+            "Alpha",
+            vec![NodeInput {
+                id: *sorted_node_id(1).as_bytes(),
+                properties: BTreeMap::new(),
+                tombstone: false,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let beta = build_node_sst(
+            &paths,
+            &beta_schema,
+            "Beta",
+            vec![NodeInput {
+                id: *sorted_node_id(2).as_bytes(),
+                properties: BTreeMap::new(),
+                tombstone: false,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let alpha_body = alpha.relative_path().to_string();
+        let beta_body = beta.relative_path().to_string();
+        let combined_schema = SchemaBuilder::new()
+            .label(alpha_schema.label("Alpha").unwrap().clone())
+            .unwrap()
+            .label(beta_schema.label("Beta").unwrap().clone())
+            .unwrap()
+            .build();
+
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let error = session
+            .attach_ssts(vec![alpha, beta], combined_schema)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("dictionary conflict"),
+            "unexpected error: {error:?}"
+        );
+        let prefix = paths.namespace_prefix();
+        for relative in [alpha_body, beta_body] {
+            let absolute =
+                object_store::path::Path::from(format!("{}/{}", prefix.as_ref(), relative));
+            assert!(
+                store.head(&absolute).await.is_err(),
+                "preflight must reject before PUT {absolute}"
+            );
+        }
+        assert!(session.current.manifest.ssts.is_empty());
     }
 
     #[tokio::test]

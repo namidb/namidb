@@ -42,7 +42,7 @@ jobs:
       # `--all-targets` is intentionally NOT passed: it would pull
       # criterion and the other bench-only dev-deps into the lint gate.
       # Benches are exercised on demand via `cargo bench`, not in CI.
-      - run: cargo clippy --workspace --lib --tests -- -D warnings -A clippy::doc_lazy_continuation
+      - run: cargo clippy --locked --workspace --lib --tests -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
     name: test (${{ matrix.os }})
@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --exclude namidb-py --no-fail-fast
+        run: cargo test --locked --workspace --exclude namidb-py --no-fail-fast
 
   # The default `test` job builds with all optional features OFF, so the
   # `#[cfg(feature = "vector-index")]` / `text-index` code — the server DDL
@@ -71,7 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --features vector-index,text-index
         run: |
-          cargo test -p namidb-storage -p namidb-query -p namidb-server \
+          cargo test --locked -p namidb-storage -p namidb-query -p namidb-server \
             --features vector-index,text-index --no-fail-fast
 
   msrv:
@@ -81,4 +81,4 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --exclude namidb-py
+      - run: cargo check --locked --workspace --exclude namidb-py

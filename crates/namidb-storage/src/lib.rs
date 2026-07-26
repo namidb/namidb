@@ -50,8 +50,9 @@ pub use cache::{
     DEFAULT_SST_CACHE_BUDGET_MIB,
 };
 pub use cache_budget::{
-    cache_max_bytes, shared_cache_capacities, shared_cache_capacity_bytes,
-    shared_cache_usage_bytes, CacheCapacities, DEFAULT_CACHE_MAX_BYTES,
+    cache_max_bytes, search_index_cache_max_bytes, shared_cache_capacities,
+    shared_cache_capacity_bytes, shared_cache_usage_bytes, CacheCapacities,
+    DEFAULT_CACHE_MAX_BYTES,
 };
 pub use compact::{
     compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
@@ -60,7 +61,10 @@ pub use compact::{
 pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
-pub use ingest::{prune_shared_caches, CommitOutcome, SessionCaches, WriterSession};
+pub use ingest::{
+    clear_shared_caches, prune_shared_caches, CommitOutcome, SessionCaches, StagedValue,
+    WriterSession,
+};
 pub use janitor::{sweep_orphans, JanitorReport};
 pub use local::LocalFileObjectStore;
 pub use manifest::{
@@ -77,6 +81,8 @@ pub use parquet_loader::{
 };
 pub use paths::NamespacePaths;
 pub use pin::{PinLease, RetentionPin, DEFAULT_PIN_TTL};
+#[cfg(feature = "vector-index")]
+pub use read::VectorFilterSearch;
 pub use read::{
     EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
 };
@@ -84,6 +90,8 @@ pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
 };
+#[cfg(feature = "vector-index")]
+pub use sst::vector::vector_filter_bitmap_searches;
 pub use sst::{
     BloomDescriptor, BloomFilter, DegreeHistogram, EdgeDirection, EdgePointLookup, EdgeRecord,
     EdgeSstFinish, EdgeSstReader, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions, NodeSstReader,

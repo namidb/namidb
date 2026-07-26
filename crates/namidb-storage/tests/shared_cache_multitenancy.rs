@@ -95,7 +95,12 @@ async fn open_defaults_to_process_wide_shared_caches() {
     // observation: a body inserted through A's handle is readable via B's.
     let sa = a.sst_cache().expect("sst cache on by default");
     let sb = b.sst_cache().expect("sst cache on by default");
-    let probe = "tenants/shared-default-a/sst/level0/probe.parquet".to_string();
+    // Opening an empty namespace deliberately installs an empty live-path
+    // rule, so a made-up SST below either opened prefix must be rejected as a
+    // possible late decode. Use an otherwise-unregistered namespace here:
+    // the purpose of this assertion is handle sharing, while empty-live-set
+    // rejection has its own cache regressions.
+    let probe = "tenants/shared-default-probe/sst/level0/probe.parquet".to_string();
     sa.insert(probe.clone(), Bytes::from_static(b"shared"));
     assert_eq!(
         sb.get(&probe),

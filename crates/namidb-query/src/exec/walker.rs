@@ -15,6 +15,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use namidb_core::id::NodeId;
+use namidb_core::value::Value as CoreValue;
 use namidb_storage::sst::predicates::eval_against_value;
 use namidb_storage::{EdgeDirection, EdgeView, Snapshot};
 
@@ -120,6 +121,27 @@ pub(crate) fn resolve_row_count(
             ))),
         },
     }
+}
+
+/// Do not eagerly reserve memory proportional to a query-controlled
+/// `LIMIT`/`SKIP`/`k`. The collection may still grow to the number of rows
+/// actually produced, but an enormous bound cannot trigger an allocation
+/// before the first candidate exists.
+const MAX_EAGER_QUERY_CAPACITY: usize = 64;
+
+#[inline]
+fn query_initial_capacity(requested: usize, available: usize) -> usize {
+    requested.min(available).min(MAX_EAGER_QUERY_CAPACITY)
+}
+
+#[inline]
+fn row_count_as_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn row_window_bound(skip: u64, limit: u64) -> usize {
+    row_count_as_usize(skip).saturating_add(row_count_as_usize(limit))
 }
 
 /// Execute `plan` against `snapshot`, returning all result rows.
@@ -421,6 +443,71 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
 
+                if *multi && label.is_empty() {
+                    // A label-agnostic correlated lookup may fan out across
+                    // equal values held by different labels. Evaluate the
+                    // complete input first, then resolve every String value in
+                    // one storage batch. The storage result is aligned to the
+                    // String subsequence (including duplicate values/misses);
+                    // NULL and unsupported runtime types retain their exact
+                    // existing semantics below without disturbing alignment.
+                    let evaluated_rows = input_rows
+                        .into_iter()
+                        .map(|row| {
+                            let lookup_value = evaluate(value, &row, params)?;
+                            Ok::<_, ExecError>((row, lookup_value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let string_values = evaluated_rows
+                        .iter()
+                        .filter_map(|(_, lookup_value)| match lookup_value {
+                            RuntimeValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let batch_results = if string_values.is_empty() {
+                        Vec::new()
+                    } else {
+                        snapshot
+                            .batch_lookup_nodes_by_property_any_label(property, &string_values)
+                            .await
+                            .map_err(ExecError::Storage)?
+                    };
+                    if batch_results.len() != string_values.len() {
+                        return Err(ExecError::Runtime(format!(
+                            "batch property lookup returned {} results for {} values",
+                            batch_results.len(),
+                            string_values.len()
+                        )));
+                    }
+
+                    let mut batch_results = batch_results.into_iter();
+                    let mut out = Vec::new();
+                    for (row, lookup_value) in evaluated_rows {
+                        let matches = match lookup_value {
+                            RuntimeValue::String(_) => batch_results.next().ok_or_else(|| {
+                                ExecError::Runtime(
+                                    "batch property lookup result alignment was lost".into(),
+                                )
+                            })?,
+                            RuntimeValue::Null => Vec::new(),
+                            other => {
+                                lookup_nodes_by_property_via_scan(snapshot, label, property, &other)
+                                    .await?
+                            }
+                        };
+                        for view in matches {
+                            let mut new_row = row.clone();
+                            new_row.set(
+                                alias.clone(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                            out.push(new_row);
+                        }
+                    }
+                    return Ok(out);
+                }
+
                 if !*multi {
                     // Correlated unique String probes share one storage pass.
                     // Evaluate every RHS before I/O so an expression error
@@ -569,8 +656,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 // `execute_capped`, so the worst case equals today's
                 // behaviour. The sort/skip/take below are unchanged — they
                 // still truncate the (possibly over-shooting) result exactly.
-                let mut rows = if keys.is_empty() && limit != u64::MAX {
-                    let cap = (skip as usize).saturating_add(limit as usize);
+                let indexed_rows = if !keys.is_empty() && limit != u64::MAX {
+                    let bound = row_window_bound(skip, limit);
+                    try_indexed_ordered_node_prefix(input, keys, snapshot, bound).await?
+                } else {
+                    None
+                };
+                let mut rows = if let Some(rows) = indexed_rows {
+                    rows
+                } else if keys.is_empty() && limit != u64::MAX {
+                    let cap = row_window_bound(skip, limit);
                     execute_capped(input, snapshot, params, outer, routing, cap).await?
                 } else {
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?
@@ -579,10 +674,10 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     // Bounded top-k when a finite LIMIT keeps fewer rows than the
                     // input has: O(n log k) heap instead of a full O(n log n)
                     // sort of every row (identical result — same stable order).
-                    let bound = (skip as usize).saturating_add(if limit == u64::MAX {
+                    let bound = row_count_as_usize(skip).saturating_add(if limit == u64::MAX {
                         usize::MAX
                     } else {
-                        limit as usize
+                        row_count_as_usize(limit)
                     });
                     if bound != usize::MAX && bound < rows.len() {
                         rows = bounded_topk(rows, keys, params, bound)?;
@@ -590,7 +685,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                         sort_rows(&mut rows, keys, params)?;
                     }
                 }
-                let skip = skip as usize;
+                let skip = row_count_as_usize(skip);
                 if skip >= rows.len() {
                     return Ok(Vec::new());
                 }
@@ -598,7 +693,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let take = if limit == u64::MAX {
                     usize::MAX
                 } else {
-                    limit as usize
+                    row_count_as_usize(limit)
                 };
                 let mut out = Vec::with_capacity(take.min(64));
                 for _ in 0..take {
@@ -874,9 +969,15 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 group_by,
                 aggregations,
             } => {
-                let rows =
-                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                execute_aggregate(rows, group_by, aggregations, params)
+                if let Some(rows) =
+                    try_metadata_node_count(input, group_by, aggregations, snapshot).await?
+                {
+                    Ok(rows)
+                } else {
+                    let rows =
+                        execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                    execute_aggregate(rows, group_by, aggregations, params)
+                }
             }
 
             LogicalPlan::EdgeTypeCount { edge_types, output } => {
@@ -996,6 +1097,46 @@ fn execute_capped<'a>(
                 .await
             }
 
+            LogicalPlan::NodeByPropertyValue {
+                input,
+                label,
+                alias,
+                property,
+                value,
+                multi: true,
+            } => {
+                // Keep the input uncapped because an outer row may have no
+                // matches. The equality posting itself can safely confirm
+                // only the remaining prefix requested by the enclosing LIMIT.
+                let input_rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::with_capacity(cap.min(input_rows.len()));
+                for row in input_rows {
+                    if out.len() >= cap {
+                        break;
+                    }
+                    let lookup_value = evaluate(value, &row, params)?;
+                    let remaining = cap - out.len();
+                    let views = lookup_nodes_by_property_via_scan_limited(
+                        snapshot,
+                        label,
+                        property,
+                        &lookup_value,
+                        remaining,
+                    )
+                    .await?;
+                    for view in views {
+                        let mut new_row = row.clone();
+                        new_row.set(
+                            alias.clone(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
+
             LogicalPlan::NodeScan {
                 label,
                 alias,
@@ -1006,23 +1147,25 @@ fn execute_capped<'a>(
                 let nodes = match label.as_deref() {
                     Some(label_name) => {
                         snapshot
-                            .scan_label_with_predicates_and_projection(
+                            .scan_label_with_predicates_and_projection_limited(
                                 label_name,
                                 predicates,
                                 projection.as_deref(),
+                                cap,
                             )
                             .await?
                     }
                     None => {
                         snapshot
-                            .scan_all_nodes_with_predicates_and_projection(
+                            .scan_all_nodes_with_predicates_and_projection_limited(
                                 predicates,
                                 projection.as_deref(),
+                                cap,
                             )
                             .await?
                     }
                 };
-                for n in nodes.into_iter().take(cap) {
+                for n in nodes {
                     let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
                     rows.push(Row::new().with(alias.clone(), value));
                 }
@@ -1954,11 +2097,7 @@ async fn bm25_ranked(
     query: &str,
     k: Option<usize>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
-    use crate::exec::text_scoring::{
-        bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize, PREFIX_EXPANSION_LIMIT,
-    };
-    use std::collections::{BTreeMap, HashMap};
-    use std::ops::Bound;
+    use crate::exec::text_scoring::parse_query;
 
     // TextIndexDescriptor canonicalises its property set (sorted + deduped)
     // before compaction concatenates the document fields. Apply the identical
@@ -1995,72 +2134,86 @@ async fn bm25_ranked(
         }
     }
 
-    // Ranking needs only the configured text columns. Winner hydration happens
-    // in `bm25_search`, so avoid decoding every unrelated property in the flat
-    // fallback (the common path while a fresh delta makes the FTS SST stale).
+    bm25_ranked_flat(snapshot, label, &props, &parsed, k, None).await
+}
+
+/// Exact flat BM25 fallback with an optional procedure filter.
+///
+/// Corpus statistics are always computed from every searchable document:
+/// filtering must not change BM25's `N`, average length, or term document
+/// frequencies. Candidate filtering and scoring happen in a second pass. When
+/// `k` is finite, periodic pruning keeps the ranking workspace at `O(k)`
+/// rather than retaining every match; the snapshot scan itself remains the
+/// existing exact fallback cost.
+async fn bm25_ranked_flat(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    parsed: &crate::exec::text_scoring::TextQuery,
+    k: Option<usize>,
+    filter: Option<(&Expression, &Params, &[String])>,
+) -> Result<Vec<(NodeId, f64)>, ExecError> {
+    use crate::exec::text_scoring::{
+        bm25_idf, bm25_term_score, contains_phrase, tokenize, PREFIX_EXPANSION_LIMIT,
+    };
+    use std::collections::{BTreeMap, HashMap};
+    use std::ops::Bound;
+
+    if k == Some(0) || parsed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Decode only text + filter properties. The procedure filter is a map of
+    // node-property conditions, so this is sufficient for exact evaluation and
+    // avoids pulling unrelated embeddings/blobs into the corpus fallback.
+    let mut projection: BTreeSet<String> = props.iter().cloned().collect();
+    if let Some((_, _, filter_properties)) = filter {
+        projection.extend(filter_properties.iter().cloned());
+    }
+    let projection: Vec<String> = projection.into_iter().collect();
     let views = snapshot
-        .scan_label_with_predicates_and_projection(label, &[], Some(&props))
+        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
         .await?;
 
-    // Fixed scored terms (plain + phrase tokens), distinct and sorted; prefix
-    // expansions join after the pass discovers the corpus vocabulary.
     let fixed: Vec<String> = parsed.base_terms().into_iter().map(String::from).collect();
-
-    // One pass: corpus stats over every document (a node with the text field),
-    // per-fixed-term frequencies, prefix-matched term frequencies, and the
-    // phrase constraint of the candidate documents. df is corpus-wide (counted
-    // for every document, candidate or not) — exactly the index's postings df.
     let mut n_docs = 0usize;
     let mut total_len = 0usize;
     let mut df = vec![0usize; fixed.len()];
     let mut expanded_df: BTreeMap<String, usize> = BTreeMap::new();
-    // (view idx, tf per fixed term, prefix-matched term → tf, len)
-    type Candidate = (usize, Vec<u32>, HashMap<String, u32>, usize);
-    let mut candidates: Vec<Candidate> = Vec::new();
     let mut since_check = 0usize;
-    for (vi, view) in views.iter().enumerate() {
-        let Some(text) = doc_text(view, &props) else {
-            continue; // not part of the searchable corpus
-        };
-        let tokens = tokenize(&text);
-        let len = tokens.len();
-        n_docs += 1;
-        total_len += len;
-        let mut counts: HashMap<&str, u32> = HashMap::new();
-        for t in &tokens {
-            *counts.entry(t.as_str()).or_insert(0) += 1;
-        }
-        let mut tfs = vec![0u32; fixed.len()];
-        let mut any = false;
-        for (i, qt) in fixed.iter().enumerate() {
-            let tf = counts.get(qt.as_str()).copied().unwrap_or(0);
-            tfs[i] = tf;
-            if tf > 0 {
-                df[i] += 1;
-                any = true;
-            }
-        }
-        let mut ptfs: HashMap<String, u32> = HashMap::new();
-        if !parsed.prefixes.is_empty() {
-            for (t, &tf) in &counts {
-                if parsed.prefixes.iter().any(|p| t.starts_with(p.as_str())) {
-                    *expanded_df.entry((*t).to_string()).or_insert(0) += 1;
-                    ptfs.insert((*t).to_string(), tf);
-                    any = true;
-                }
-            }
-        }
-        // Phrase hard constraint: every phrase must occur at adjacent token
-        // positions, else the document is not a candidate even when it
-        // matches other query terms (same rule the index applies).
-        if any && parsed.phrases.iter().all(|ph| contains_phrase(&tokens, ph)) {
-            candidates.push((vi, tfs, ptfs, len));
-        }
+
+    // Pass one: corpus-wide statistics, deliberately before applying `filter`.
+    for view in &views {
         since_check += 1;
         if since_check >= 4096 {
             since_check = 0;
-            if namidb_storage::cancel::deadline_exceeded() {
-                return Err(ExecError::Timeout);
+            crate::exec::limits::check_deadline()?;
+        }
+        let Some(text) = doc_text(view, props) else {
+            continue;
+        };
+        let tokens = tokenize(&text);
+        n_docs = n_docs.saturating_add(1);
+        total_len = total_len.saturating_add(tokens.len());
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for term in &tokens {
+            *counts.entry(term.as_str()).or_insert(0) += 1;
+        }
+        for (index, term) in fixed.iter().enumerate() {
+            if counts.contains_key(term.as_str()) {
+                df[index] = df[index].saturating_add(1);
+            }
+        }
+        if !parsed.prefixes.is_empty() {
+            for term in counts.keys() {
+                if parsed
+                    .prefixes
+                    .iter()
+                    .any(|prefix| term.starts_with(prefix.as_str()))
+                {
+                    let entry = expanded_df.entry((*term).to_string()).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
             }
         }
     }
@@ -2071,56 +2224,226 @@ async fn bm25_ranked(
         1.0
     };
 
-    // Final scored term set: fixed terms plus, per prefix, the
-    // lexicographically-first PREFIX_EXPANSION_LIMIT vocabulary terms — the
-    // same deterministic pick the index makes over its postings range. The
-    // map is sorted so per-document score summation runs in the same term
-    // order as the index path (bit-identical floats).
-    let mut qmap: BTreeMap<&str, (f64, Option<usize>)> = BTreeMap::new(); // term → (idf, fixed idx)
-    for (i, t) in fixed.iter().enumerate() {
-        qmap.insert(t.as_str(), (bm25_idf(n_docs, df[i]), Some(i)));
+    // Deterministic scored-term order, identical to the persisted text index.
+    let mut scored_terms: BTreeMap<String, f64> = BTreeMap::new();
+    for (index, term) in fixed.iter().enumerate() {
+        scored_terms.insert(term.clone(), bm25_idf(n_docs, df[index]));
     }
     for prefix in &parsed.prefixes {
         let matched = expanded_df
             .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
-            .take_while(|(t, _)| t.starts_with(prefix.as_str()))
+            .take_while(|(term, _)| term.starts_with(prefix.as_str()))
             .take(PREFIX_EXPANSION_LIMIT);
-        for (t, &d) in matched {
-            qmap.entry(t.as_str())
-                .or_insert((bm25_idf(n_docs, d), None));
+        for (term, &term_df) in matched {
+            scored_terms
+                .entry(term.clone())
+                .or_insert_with(|| bm25_idf(n_docs, term_df));
         }
     }
 
-    let mut scored: Vec<(usize, f64)> = Vec::new();
-    for (vi, tfs, ptfs, len) in &candidates {
-        let mut s = 0.0;
-        for (term, (idf, fixed_ix)) in &qmap {
-            let tf = match fixed_ix {
-                Some(i) => tfs[*i],
-                None => ptfs.get(*term).copied().unwrap_or(0),
-            };
-            s += bm25_term_score(*idf, tf, *len, avg_len);
+    let initial_capacity = k
+        .map(|limit| query_initial_capacity(limit, views.len()))
+        .unwrap_or(0);
+    let mut ranked: Vec<(NodeId, f64)> = Vec::with_capacity(initial_capacity);
+    let prune_at = k.map(|limit| limit.saturating_mul(2).max(limit.saturating_add(1)));
+    since_check = 0;
+
+    // Pass two: apply the residual filter before selecting the sparse top-k.
+    for view in views {
+        since_check += 1;
+        if since_check >= 4096 {
+            since_check = 0;
+            crate::exec::limits::check_deadline()?;
         }
-        // A candidate whose only matches were expansion terms past the cap
-        // scores nothing — the index never surfaces it either.
-        if s > 0.0 {
-            scored.push((*vi, s));
+        let Some(text) = doc_text(&view, props) else {
+            continue;
+        };
+        let id = view.id;
+        if let Some((filter, params, _)) = filter {
+            let mut row = Row::new();
+            row.set(
+                "node".to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)?.as_bool() != Some(true) {
+                continue;
+            }
+        }
+
+        let tokens = tokenize(&text);
+        if !parsed
+            .phrases
+            .iter()
+            .all(|phrase| contains_phrase(&tokens, phrase))
+        {
+            continue;
+        }
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for term in &tokens {
+            *counts.entry(term.as_str()).or_insert(0) += 1;
+        }
+        let mut score = 0.0;
+        for (term, idf) in &scored_terms {
+            let tf = counts.get(term.as_str()).copied().unwrap_or(0);
+            score += bm25_term_score(*idf, tf, tokens.len(), avg_len);
+        }
+        if score > 0.0 {
+            ranked.push((id, score));
+            if prune_at.is_some_and(|threshold| ranked.len() >= threshold) {
+                sort_bm25_hits(&mut ranked);
+                ranked.truncate(k.expect("finite pruning has a finite k"));
+            }
         }
     }
-    // Score descending, node id ascending for a deterministic tie-break.
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| views[a.0].id.cmp(&views[b.0].id))
-    });
+
+    sort_bm25_hits(&mut ranked);
     if let Some(k) = k {
-        scored.truncate(k);
+        ranked.truncate(k);
+    }
+    Ok(ranked)
+}
+
+fn sort_bm25_hits(hits: &mut [(NodeId, f64)]) {
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+}
+
+#[cfg(feature = "text-index")]
+const DEFAULT_HYBRID_TEXT_FILTER_CANDIDATE_CAP: usize = 65_536;
+
+#[cfg(feature = "text-index")]
+fn hybrid_text_filter_candidate_cap() -> usize {
+    std::env::var("NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_HYBRID_TEXT_FILTER_CANDIDATE_CAP)
+}
+
+/// Filtered sparse retrieval for `search.hybrid`.
+///
+/// An authoritative text index is widened geometrically and each newly
+/// exposed prefix slice is hydrated exactly once. The configured cap bounds
+/// indexed candidates and object-store hydration; reaching it without `target`
+/// survivors falls back to the exact two-pass scorer instead of returning a
+/// short page. Thus the cap changes cost, never results.
+async fn bm25_ranked_filtered(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    query: &str,
+    target: usize,
+    filter: (&Expression, &Params, &[String]),
+) -> Result<Vec<(NodeId, f64)>, ExecError> {
+    use crate::exec::text_scoring::parse_query;
+
+    let (filter, params, filter_properties) = filter;
+    if target == 0 {
+        return Ok(Vec::new());
+    }
+    let mut props = props.to_vec();
+    props.sort();
+    props.dedup();
+    let parsed = parse_query(query);
+    if parsed.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(scored
-        .into_iter()
-        .map(|(vi, s)| (views[vi].id, s))
-        .collect())
+    #[cfg(feature = "text-index")]
+    {
+        let index_name = snapshot
+            .manifest()
+            .manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.matches(label, &props))
+            .map(|descriptor| descriptor.name.clone());
+        let candidate_cap = hybrid_text_filter_candidate_cap();
+        if let Some(index_name) = index_name.filter(|_| candidate_cap >= target) {
+            const OVERFETCH_BASE: usize = 8;
+            const WIDEN_GROWTH: usize = 4;
+            const HYDRATE_BATCH: usize = 256;
+
+            let mut fetch = target
+                .saturating_mul(OVERFETCH_BASE)
+                .max(target)
+                .min(candidate_cap);
+            let mut processed_prefix = 0usize;
+            let mut survivors = Vec::with_capacity(query_initial_capacity(target, candidate_cap));
+
+            loop {
+                let Some(hits) = snapshot
+                    .text_search(&index_name, label, &parsed, Some(fetch))
+                    .await?
+                else {
+                    break;
+                };
+                if hits.len() < processed_prefix {
+                    // An immutable index prefix cannot shrink between rounds.
+                    // Treat an anomalous body/cache transition as unavailable
+                    // and let the flat scorer remain the authority.
+                    break;
+                }
+                let exhausted = hits.len() < fetch;
+                for chunk in hits[processed_prefix..].chunks(HYDRATE_BATCH) {
+                    crate::exec::limits::check_deadline()?;
+                    let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+                    let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
+                    for ((id, score), view) in chunk.iter().zip(hydrated) {
+                        let Some(view) = view else {
+                            // The supposedly authoritative index references a
+                            // missing node. Recompute from the node corpus.
+                            return bm25_ranked_flat(
+                                snapshot,
+                                label,
+                                &props,
+                                &parsed,
+                                Some(target),
+                                Some((filter, params, filter_properties)),
+                            )
+                            .await;
+                        };
+                        let mut row = Row::new();
+                        row.set(
+                            "node".to_string(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        if evaluate(filter, &row, params)?.as_bool() == Some(true) {
+                            survivors.push((*id, *score));
+                            if survivors.len() == target {
+                                return Ok(survivors);
+                            }
+                        }
+                    }
+                }
+                processed_prefix = hits.len();
+                if exhausted {
+                    return Ok(survivors);
+                }
+                if fetch >= candidate_cap {
+                    break;
+                }
+                let widened = fetch.saturating_mul(WIDEN_GROWTH).min(candidate_cap);
+                if widened <= fetch {
+                    break;
+                }
+                fetch = widened;
+            }
+        }
+    }
+
+    bm25_ranked_flat(
+        snapshot,
+        label,
+        &props,
+        &parsed,
+        Some(target),
+        Some((filter, params, filter_properties)),
+    )
+    .await
 }
 
 /// The text of a document for BM25: the configured properties' string values
@@ -2558,12 +2881,260 @@ fn proc_opt_filter(v: Option<&RuntimeValue>) -> Result<Option<Expression>, ExecE
     }
 }
 
+/// Convert a procedure-filter scalar into the storage equality-index value.
+///
+/// Keep this intentionally narrower than the general runtime value conversion:
+/// the native prefilter currently accepts String/Bool only. Cypher numeric
+/// equality deliberately crosses I64/F64 (`1 = 1.0`), while the typed sidecar
+/// keeps those encodings distinct; using just one posting would be an unsafe
+/// subset. Numeric filters therefore retain the residual widening/fallback
+/// path until a dual-encoding probe is available.
+fn proc_filter_core_scalar(value: &RuntimeValue) -> Option<CoreValue> {
+    match value {
+        RuntimeValue::Bool(v) => Some(CoreValue::Bool(*v)),
+        RuntimeValue::String(v) => Some(CoreValue::Str(v.clone())),
+        _ => None,
+    }
+}
+
+/// Equality/IN groups extractable from one property condition.
+///
+/// The outer vector is conjunctive and each inner vector is an OR-list. Thus
+/// `{eq: 3, in: [2, 3]}` yields `[[3], [2, 3]]`. Range/negative operators stay
+/// as residual expressions; using any indexed equality conjunct still gives a
+/// safe eligibility *superset* for the complete predicate.
+fn proc_filter_index_groups(condition: &RuntimeValue) -> Vec<Vec<CoreValue>> {
+    let alternatives = |value: &RuntimeValue| match value {
+        RuntimeValue::List(items) => items
+            .iter()
+            .map(proc_filter_core_scalar)
+            .collect::<Option<Vec<_>>>(),
+        scalar => proc_filter_core_scalar(scalar).map(|v| vec![v]),
+    };
+    match condition {
+        RuntimeValue::Map(ops) => ops
+            .iter()
+            .filter_map(|(op, value)| {
+                if op.eq_ignore_ascii_case("eq") {
+                    // `eq` preserves ordinary Cypher value equality. In
+                    // particular, `{eq: ['a', 'b']}` compares a list-valued
+                    // property with that list; it is NOT membership. Treating
+                    // it as an OR posting would exclude a runtime List stored
+                    // under a schemaless/mixed String declaration before the
+                    // residual predicate can confirm it.
+                    proc_filter_core_scalar(value).map(|value| vec![value])
+                } else if op.eq_ignore_ascii_case("in") {
+                    alternatives(value)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        other => alternatives(other).into_iter().collect(),
+    }
+}
+
+#[cfg(feature = "vector-index")]
+const DEFAULT_VECTOR_FILTER_ID_CANDIDATE_CAP: usize = 8_192;
+
+#[cfg(feature = "vector-index")]
+fn vector_filter_id_candidate_cap() -> usize {
+    std::env::var("NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_VECTOR_FILTER_ID_CANDIDATE_CAP)
+}
+
+/// Native filter plan carried to the decoded `.vg`.
+///
+/// `groups` are compact typed values, never a corpus-sized NodeId set.
+#[derive(Debug, Default)]
+struct ProcVectorPrefilter {
+    groups: Vec<(String, Vec<CoreValue>)>,
+}
+
+/// Extract String/Bool equality/IN groups for ordinal postings.
+///
+/// This phase intentionally performs no storage read. The decoded `.vg` gets
+/// first refusal; only `Unsupported` lazily opens equality sidecars for a
+/// bounded legacy/high-cardinality fallback.
+fn proc_vector_prefilter(filter: Option<&RuntimeValue>) -> ProcVectorPrefilter {
+    let Some(RuntimeValue::Map(properties)) = filter else {
+        return ProcVectorPrefilter::default();
+    };
+    let mut plan = ProcVectorPrefilter::default();
+    for (property, condition) in properties {
+        for alternatives in proc_filter_index_groups(condition) {
+            plan.groups.push((property.clone(), alternatives.clone()));
+        }
+    }
+    plan
+}
+
+/// Extract native posting groups from a natural Cypher predicate.
+///
+/// Only conjunctions of `alias.property = <literal-or-param>` and
+/// `alias.property IN <literal-or-param-list>` participate. String/Bool are the
+/// only lossless sidecar encodings; mixed or numeric alternatives stay purely
+/// residual because Cypher numeric equality crosses integer/float encodings.
+/// The full predicate is always evaluated after hydration, so this plan is only
+/// an eligibility superset and cannot change query semantics.
+fn natural_vector_prefilter(
+    filter: &Expression,
+    alias: &str,
+    params: &Params,
+) -> ProcVectorPrefilter {
+    use crate::parser::ast::BinaryOp;
+
+    fn static_value(expr: &Expression, params: &Params) -> Option<RuntimeValue> {
+        let is_static = match &expr.kind {
+            ExpressionKind::Literal(_) | ExpressionKind::Parameter(_) => true,
+            ExpressionKind::List(items) => items.iter().all(|item| {
+                matches!(
+                    &item.kind,
+                    ExpressionKind::Literal(_) | ExpressionKind::Parameter(_)
+                )
+            }),
+            _ => false,
+        };
+        is_static
+            .then(|| evaluate(expr, &Row::new(), params).ok())
+            .flatten()
+    }
+
+    fn property_on_alias<'a>(expr: &'a Expression, alias: &str) -> Option<&'a str> {
+        let ExpressionKind::Property(access) = &expr.kind else {
+            return None;
+        };
+        let ExpressionKind::Variable(target) = &access.target.kind else {
+            return None;
+        };
+        (target.name == alias).then_some(access.key.name.as_str())
+    }
+
+    fn collect(
+        expr: &Expression,
+        alias: &str,
+        params: &Params,
+        groups: &mut Vec<(String, Vec<CoreValue>)>,
+    ) {
+        match &expr.kind {
+            ExpressionKind::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                collect(left, alias, params, groups);
+                collect(right, alias, params, groups);
+            }
+            ExpressionKind::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let candidate = property_on_alias(left, alias)
+                    .map(|property| (property, right.as_ref()))
+                    .or_else(|| {
+                        property_on_alias(right, alias).map(|property| (property, left.as_ref()))
+                    });
+                let Some((property, value_expr)) = candidate else {
+                    return;
+                };
+                let Some(value) = static_value(value_expr, params)
+                    .as_ref()
+                    .and_then(proc_filter_core_scalar)
+                else {
+                    return;
+                };
+                groups.push((property.to_string(), vec![value]));
+            }
+            ExpressionKind::In { item, list } => {
+                let Some(property) = property_on_alias(item, alias) else {
+                    return;
+                };
+                let Some(RuntimeValue::List(values)) = static_value(list, params) else {
+                    return;
+                };
+                let Some(alternatives) = values
+                    .iter()
+                    .map(proc_filter_core_scalar)
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return;
+                };
+                groups.push((property.to_string(), alternatives));
+            }
+            _ => {}
+        }
+    }
+
+    let mut plan = ProcVectorPrefilter::default();
+    collect(filter, alias, params, &mut plan.groups);
+    plan
+}
+
+/// Lazily resolve a small, complete sidecar eligibility set when `.vg` could
+/// apply none of the groups. The capped storage probe rejects an oversized
+/// posting before candidate hydration.
+#[cfg(feature = "vector-index")]
+async fn resolve_capped_filter_eligibility(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    groups: &[(String, Vec<CoreValue>)],
+) -> Result<Option<BTreeSet<NodeId>>, ExecError> {
+    let candidate_cap = vector_filter_id_candidate_cap();
+    if candidate_cap == 0 {
+        return Ok(None);
+    }
+    let mut eligibility: Option<BTreeSet<NodeId>> = None;
+    for (property, alternatives) in groups {
+        if alternatives.is_empty() {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let mut group = BTreeSet::new();
+        let mut complete = true;
+        for value in alternatives {
+            // A smaller remaining cap is conservative if alternatives overlap:
+            // declining this optimization is safe; a partial set is not.
+            let remaining = candidate_cap.saturating_sub(group.len());
+            match snapshot
+                .indexed_node_ids_by_property_value_capped(label, property, value, remaining)
+                .await?
+            {
+                Some(ids) => {
+                    group.extend(ids);
+                    if group.len() > candidate_cap {
+                        complete = false;
+                        break;
+                    }
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        eligibility = Some(match eligibility {
+            None => group,
+            Some(current) => current.intersection(&group).copied().collect(),
+        });
+        if eligibility.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Ok(eligibility);
+        }
+    }
+    Ok(eligibility)
+}
+
 /// `CALL search.vector({label, property, query, k?, ef?, metric?, filter?}) YIELD
 /// node, score` — vector KNN served from the Vamana index (or the exact flat
 /// scan), with a tunable `ef` beam width (recall vs latency) and an optional
-/// `filter` (index-side over-fetch + exact fallback, not a post-truncation
-/// filter). The ergonomic, EXPLAIN-free counterpart to the optimizer's KNN
-/// rewrite.
+/// `filter`. Indexed scalar equality/IN conjuncts become a native `.vg`
+/// eligibility set applied before `k`; residual predicates retain adaptive
+/// widening + the exact fallback. The ergonomic, EXPLAIN-free counterpart to
+/// the optimizer's KNN rewrite.
 async fn vector_search_procedure(
     args: &[Expression],
     yield_items: &[(String, String)],
@@ -2598,6 +3169,7 @@ async fn vector_search_procedure(
     };
     let distance = proc_metric(map.get("metric"))?;
     let pf = proc_opt_filter(map.get("filter"))?;
+    let prefilter = proc_vector_prefilter(map.get("filter"));
 
     let q = RuntimeValue::Vector(qv);
     let rows = vector_search_rows(
@@ -2611,6 +3183,7 @@ async fn vector_search_procedure(
         distance,
         "score",
         pf.as_ref(),
+        Some(&prefilter),
         ef,
         params,
     )
@@ -2631,7 +3204,7 @@ async fn vector_search_procedure(
 /// YIELD node, score` — Neo4j-compatible vector KNN. Resolves the index by NAME
 /// (its descriptor supplies the label, property, and metric), then serves it
 /// through the same path as `search.vector`. The optional 4th map may carry an
-/// `ef` beam width and/or a `filter` (index over-fetch + exact fallback).
+/// `ef` beam width and/or the same native/residual `filter`.
 async fn db_index_vector_procedure(
     name: &str,
     args: &[Expression],
@@ -2644,7 +3217,7 @@ async fn db_index_vector_procedure(
             "unknown procedure `db.index.vector.{name}` (supported: queryNodes)"
         )));
     }
-    if args.len() < 3 {
+    if !(3..=4).contains(&args.len()) {
         return Err(proc_unsupported(
             "db.index.vector.queryNodes(indexName, k, queryVector [, {ef: …, filter: {…}}])",
         ));
@@ -2657,18 +3230,29 @@ async fn db_index_vector_procedure(
         .ok_or_else(|| proc_unsupported("queryNodes `k` must be a non-negative integer"))?;
     let qv = runtime_to_f32_vec(&evaluate(&args[2], &Row::new(), params)?)
         .ok_or_else(|| proc_unsupported("queryNodes `queryVector` must be a list or vector()"))?;
-    // The optional 4th map carries `ef` (beam width) and/or `filter` (a
-    // post_filter compiled to the bound `node` binding → index over-fetch +
-    // exact fallback, the same as the natural form).
-    let (ef, pf) = match args.get(3) {
-        None => (None, None),
+    // The optional 4th map carries `ef` (beam width) and/or `filter`. Preserve
+    // the runtime map as well as its residual expression: equality/IN terms
+    // can be resolved through typed metadata postings after the index name
+    // supplies the label.
+    let (ef, pf, filter_value) = match args.get(3) {
+        None => (None, None, None),
         Some(a) => match evaluate(a, &Row::new(), params)? {
             RuntimeValue::Map(m) => {
-                let ef = m.get("ef").and_then(as_usize);
+                let ef = match m.get("ef") {
+                    Some(value) => Some(as_usize(value).ok_or_else(|| {
+                        proc_unsupported("queryNodes option `ef` must be a non-negative integer")
+                    })?),
+                    None => None,
+                };
                 let pf = proc_opt_filter(m.get("filter"))?;
-                (ef, pf)
+                let filter_value = m.get("filter").cloned();
+                (ef, pf, filter_value)
             }
-            _ => (None, None),
+            _ => {
+                return Err(proc_unsupported(
+                    "queryNodes optional fourth argument must be a map",
+                ));
+            }
         },
     };
 
@@ -2688,6 +3272,7 @@ async fn db_index_vector_procedure(
         });
     let (label, property, distance) = resolved
         .ok_or_else(|| proc_unsupported(format!("no vector index named `{index_name}`")))?;
+    let prefilter = proc_vector_prefilter(filter_value.as_ref());
 
     let q = RuntimeValue::Vector(qv);
     let rows = vector_search_rows(
@@ -2701,6 +3286,7 @@ async fn db_index_vector_procedure(
         distance,
         "score",
         pf.as_ref(),
+        Some(&prefilter),
         ef,
         params,
     )
@@ -2793,10 +3379,15 @@ async fn hybrid_search_procedure(
         })?),
     };
     let distance = proc_metric(map.get("metric"))?;
-    // Optional `filter`: applied to the dense leg as an index-side post_filter
-    // (over-fetch + exact fallback) AND to the fused output (so a sparse-only
-    // BM25 hit that fails the predicate is dropped too).
+    // Optional `filter`: applied to the dense leg as native typed eligibility
+    // where possible plus a residual expression, AND to the fused output (so a
+    // sparse-only BM25 hit that fails the predicate is dropped too).
     let pf = proc_opt_filter(map.get("filter"))?;
+    let filter_properties: Vec<String> = match map.get("filter") {
+        Some(RuntimeValue::Map(properties)) => properties.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let prefilter = proc_vector_prefilter(map.get("filter"));
     let fusion_mode = map
         .get("fusion")
         .and_then(proc_str)
@@ -2876,6 +3467,7 @@ async fn hybrid_search_procedure(
             distance,
             "score",
             pf.as_ref(),
+            Some(&prefilter),
             ef,
             params,
         )
@@ -2892,33 +3484,31 @@ async fn hybrid_search_procedure(
             .and_then(proc_str)
             .ok_or_else(|| proc_unsupported("search.hybrid `query_text` must be a string"))?;
         let props = hybrid_text_props(&map)?;
-        // BM25 has no filter pushdown, so a residual `filter` is applied only at
-        // the fused materialization below. Truncating the sparse leg to `k_sparse`
-        // BEFORE that filter would starve a selective filter (the matching docs
-        // can rank past `k_sparse` globally). When a filter is present, fetch a much
-        // DEEPER ranking so the post-filter sees enough candidates — `k * 512`,
-        // matching the dense leg's maximum widening depth (OVERFETCH_BASE ×
-        // WIDEN_GROWTH^(MAX_WIDEN_ROUNDS-1) = 8 × 4³). This bounds the sparse leg,
-        // the fusion structures, and the materialization probes to O(k·512) rather
-        // than O(corpus) (avoiding a resource cliff on a common query term), while
-        // still covering any filter that keeps ≳ 1/512 of the BM25-ranked docs.
-        const SPARSE_FILTER_DEPTH: usize = 512;
-        let sparse_k = if pf.is_some() {
-            Some(k.saturating_mul(SPARSE_FILTER_DEPTH).max(k_sparse))
+        // Apply the residual predicate before the sparse leg's own top-k.
+        // Indexed retrieval widens adaptively under a configurable candidate
+        // cap, then falls back to an exact filtered corpus scan if the cap
+        // cannot produce `k_sparse` survivors. A cap therefore changes the
+        // fast-path cost, never recall.
+        if let Some(filter) = pf.as_ref() {
+            bm25_ranked_filtered(
+                snapshot,
+                &label,
+                &props,
+                &qtext,
+                k_sparse,
+                (filter, params, &filter_properties),
+            )
+            .await?
         } else {
-            Some(k_sparse)
-        };
-        bm25_ranked(snapshot, &label, &props, &qtext, sparse_k).await?
+            bm25_ranked(snapshot, &label, &props, &qtext, Some(k_sparse)).await?
+        }
     } else {
         Vec::new()
     };
 
-    // RRF is rank-based, so the deeper filtered sparse leg does not change the
-    // fused order (only the ranks of the surviving docs matter). `linear`
-    // min-max-normalizes each leg over its own [worst, best] window, so a deeper
-    // (filtered) sparse leg shifts the normalization baseline and can reorder the
-    // blend — a known sensitivity of score-calibrated fusion. RRF (the default) is
-    // the robust choice when a `filter` is present.
+    // Both legs are filtered before fusion. RRF therefore uses ranks within the
+    // eligible population, and linear normalization is no longer skewed by
+    // high-scoring ineligible sparse documents.
     let fused = match fusion_mode.to_ascii_lowercase().as_str() {
         "rrf" => fusion::rrf(&[&dense, &sparse], rrf_k),
         "linear" => fusion::linear(&[&dense, &sparse], &[alpha, 1.0 - alpha]),
@@ -2929,10 +3519,9 @@ async fn hybrid_search_procedure(
         }
     };
 
-    // Materialise the fused candidates in rank order, applying the residual
-    // `filter` (if any) BEFORE truncating, so the top-k is taken among the rows
-    // that pass it (a node missing from the over-fetched window simply isn't
-    // returned — fusion already over-fetched ×8 per leg).
+    // Materialise the fused candidates in rank order. The residual filter is
+    // checked again defensively after hydration; normal candidates have already
+    // passed it in their respective retrieval leg.
     let mut raw = Vec::with_capacity(k.min(fused.len()));
     for (id, score) in fused.into_iter() {
         if raw.len() >= k {
@@ -3461,7 +4050,7 @@ async fn flat_vector_search(
     k: &RowCount,
     distance: crate::plan::logical::VectorDistance,
     score_alias: &str,
-    post_filter: Option<&Expression>,
+    source_filter: Option<&Expression>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     // The query expression carries no row bindings (literal vector or $param);
@@ -3472,7 +4061,7 @@ async fn flat_vector_search(
     // rewrite deletes the TopN that would otherwise have resolved the param, so
     // if this fell back to `unwrap_or(10)` a `LIMIT $k` silently returned 10
     // rows regardless of $k. Errors on a missing/invalid $k, exactly like TopN.
-    let limit = resolve_row_count(k, params, "LIMIT")? as usize;
+    let limit = row_count_as_usize(resolve_row_count(k, params, "LIMIT")?);
     // The natural/operator form has no syntax for the beam width, so it reads a
     // reserved, namespaced param `$__vector_ef` to tune recall vs latency on the
     // filtered-ANN path (the procedures take a first-class `ef`). It is the
@@ -3487,6 +4076,10 @@ async fn flat_vector_search(
     // default applies. NON-STABLE knob — superseded by a future `OPTIONS { ef }`
     // surface (RFC-036). Namespaced to avoid clashing with a user's own `$ef`.
     let ef_search = params.get("__vector_ef").and_then(as_usize);
+    // Extract safe String/Bool equality groups from natural Cypher. The full
+    // expression stays as the authoritative residual, while these groups let a
+    // v4 `.vg` intersect ordinal postings before ANN truncates to k.
+    let prefilter = source_filter.map(|filter| natural_vector_prefilter(filter, alias, params));
     vector_search_rows(
         snapshot,
         label,
@@ -3497,7 +4090,8 @@ async fn flat_vector_search(
         limit,
         distance,
         score_alias,
-        post_filter,
+        source_filter,
+        prefilter.as_ref(),
         ef_search,
         params,
     )
@@ -3507,9 +4101,11 @@ async fn flat_vector_search(
 /// Core of the vector KNN: serve a pre-evaluated query vector `q` from the
 /// Vamana index when one applies (freshness-equivalent to the flat scan), else
 /// the exact flat scan. `ef_search` overrides the index beam width (`None` =
-/// default). Shared by the `VectorSearch` operator and the `search.vector` /
-/// `search.hybrid` procedures. Emits rows binding the node to `alias` and the
-/// metric score to `score_alias`.
+/// default). `prefilter`, when present, carries compact String/Bool equality
+/// groups evaluated as ordinal postings inside `.vg`, plus an optional bounded
+/// ID fallback for legacy/high-cardinality bodies. Shared by the `VectorSearch`
+/// operator and the `search.vector` / `search.hybrid` procedures. Emits rows
+/// binding the node to `alias` and the metric score to `score_alias`.
 #[allow(clippy::too_many_arguments)]
 async fn vector_search_rows(
     snapshot: &Snapshot<'_>,
@@ -3521,7 +4117,8 @@ async fn vector_search_rows(
     limit: usize,
     distance: crate::plan::logical::VectorDistance,
     score_alias: &str,
-    post_filter: Option<&Expression>,
+    source_filter: Option<&Expression>,
+    prefilter: Option<&ProcVectorPrefilter>,
     ef_search: Option<usize>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
@@ -3541,7 +4138,8 @@ async fn vector_search_rows(
             limit,
             distance,
             score_alias,
-            post_filter,
+            source_filter,
+            prefilter,
             span,
             ef_search,
             params,
@@ -3552,18 +4150,18 @@ async fn vector_search_rows(
         }
     }
     #[cfg(not(feature = "vector-index"))]
-    let _ = ef_search;
+    let _ = (ef_search, prefilter.map(|plan| &plan.groups));
 
     // Materialise the WHOLE node: the result binds it to `alias`, and a
     // downstream projection (`RETURN d.title`) or a procedure's `YIELD node` may
-    // read any property — not just the embedding — and a `post_filter` may too.
+    // read any property — not just the embedding — and a source filter may too.
     // (The index path likewise returns full nodes via `lookup_node`.) Projecting
     // only the embedding column here would leave those properties null.
     let projection: Option<Vec<String>> = None;
 
-    // (sort_key, score_value, node) — sort_key is "lower is better" (higher-is-
+    // (sort_key, score_value, row) — sort_key is "lower is better" (higher-is-
     // better metrics are negated), so an ascending sort yields the top-k.
-    let mut scored: Vec<(f64, f64, NodeValue)> = Vec::new();
+    let mut scored: Vec<(f64, f64, Row)> = Vec::new();
     let nodes = match label {
         Some(label_name) => {
             snapshot
@@ -3579,6 +4177,20 @@ async fn vector_search_rows(
     for n in nodes {
         crate::exec::limits::check_deadline()?;
         let node = NodeValue::from(n);
+        let mut row = Row::new();
+        row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
+
+        // This predicate belongs to the source below TopN. Evaluate it before
+        // even reading/scoring the embedding: a row excluded by metadata must
+        // not make the KNN fail because its embedding is malformed.
+        if let Some(filter) = source_filter {
+            if evaluate(filter, &row, params)?.as_bool() != Some(true) {
+                continue;
+            }
+        }
+        let Some(RuntimeValue::Node(node)) = row.get(alias) else {
+            unreachable!("vector source row must bind its node")
+        };
         let Some(emb) = node.properties.get(property) else {
             continue;
         };
@@ -3586,26 +4198,19 @@ async fn vector_search_rows(
             continue;
         };
         let sort_key = if higher_is_better { -score } else { score };
-        scored.push((sort_key, score, node));
+        scored.push((sort_key, score, row));
     }
 
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-    // Build rows in rank order; apply the residual filter (if any) BEFORE
-    // truncating, so the top-k is taken among the rows that pass it.
-    let mut out = Vec::with_capacity(limit);
-    for (_sort_key, score, node) in scored {
+    // Build rows in rank order. The source filter already ran before scoring,
+    // so truncation takes the top-k of the filtered source.
+    let mut out = Vec::with_capacity(query_initial_capacity(limit, scored.len()));
+    for (_sort_key, score, mut row) in scored {
         if out.len() >= limit {
             break;
         }
-        let mut row = Row::new();
-        row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
         row.set(score_alias.to_string(), RuntimeValue::Float(score));
-        if let Some(pf) = post_filter {
-            if evaluate(pf, &row, params)?.as_bool() != Some(true) {
-                continue;
-            }
-        }
         out.push(row);
     }
     Ok(out)
@@ -3626,7 +4231,8 @@ async fn try_index_search(
     k: usize,
     distance: crate::plan::logical::VectorDistance,
     score_alias: &str,
-    post_filter: Option<&Expression>,
+    source_filter: Option<&Expression>,
+    prefilter: Option<&ProcVectorPrefilter>,
     span: SourceSpan,
     ef_search: Option<usize>,
     params: &Params,
@@ -3697,6 +4303,14 @@ async fn try_index_search(
     if metric == VectorMetric::Cosine && qv.iter().all(|x| *x == 0.0) {
         return Ok(None);
     }
+    let filter_groups = prefilter.map_or(&[][..], |plan| plan.groups.as_slice());
+    if filter_groups
+        .iter()
+        .any(|(_, alternatives)| alternatives.is_empty())
+    {
+        // `IN []` is identically false regardless of index/materialisation.
+        return Ok(Some(Vec::new()));
+    }
 
     // Fresh memtable/overlay delta the index has not absorbed: `Some(vec)` is a
     // live embedding to merge in, `None` suppresses a now-stale id (tombstoned,
@@ -3716,18 +4330,54 @@ async fn try_index_search(
     // both halves of the merge are exact — no quantize round-trip needed.
     let higher_is_better = !matches!(distance, VectorDistance::Euclidean);
     let q_rv = RuntimeValue::Vector(qv.clone());
+    let mut delta_candidates_materialized_completely = true;
     let mut delta_scored: Vec<(f64, NodeId)> = Vec::with_capacity(delta.len());
-    for (id, emb) in delta {
-        if let Some(v) = emb {
-            let emb_rv = RuntimeValue::Vector(v);
-            if let Some((s, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
-                delta_scored.push((s, id));
+    if let Some(filter) = source_filter {
+        // A fresh vector has not necessarily reached the persisted index and
+        // therefore cannot benefit from its metadata postings. Hydrate it
+        // first and apply the source predicate before vector_score, matching
+        // the exact fallback's error and filtering order.
+        const DELTA_FILTER_BATCH: usize = 64;
+        let live_delta: Vec<(NodeId, Vec<f32>)> = delta
+            .into_iter()
+            .filter_map(|(id, embedding)| embedding.map(|embedding| (id, embedding)))
+            .collect();
+        for chunk in live_delta.chunks(DELTA_FILTER_BATCH) {
+            crate::exec::limits::check_deadline()?;
+            let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+            let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
+            for ((id, embedding), view) in chunk.iter().zip(hydrated) {
+                let Some(view) = view else {
+                    delta_candidates_materialized_completely = false;
+                    continue;
+                };
+                let mut row = Row::new();
+                row.set(
+                    alias.to_string(),
+                    RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                );
+                if evaluate(filter, &row, params)?.as_bool() != Some(true) {
+                    continue;
+                }
+                let emb_rv = RuntimeValue::Vector(embedding.clone());
+                if let Some((score, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
+                    delta_scored.push((score, *id));
+                }
+            }
+        }
+    } else {
+        for (id, emb) in delta {
+            if let Some(v) = emb {
+                let emb_rv = RuntimeValue::Vector(v);
+                if let Some((score, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
+                    delta_scored.push((score, id));
+                }
             }
         }
     }
 
     // Adaptive iterative widening: start at the historical ×8 over-fetch, then grow
-    // `kprime`/`ef` geometrically (×4) whenever a residual `post_filter` leaves
+    // `kprime`/`ef` geometrically (×4) whenever a residual source filter leaves
     // fewer than k survivors, BEFORE the O(n) flat fallback — so a moderately
     // selective filter (the multi-tenant shared-index case) is served from the
     // index, not a flat scan every query. With no filter it is exactly one round at
@@ -3739,7 +4389,7 @@ async fn try_index_search(
                                        // fetch a wider pool than k even without a filter: membership then depends
                                        // on true scores, confining the quantization error to beam recall.
     const INT8_RESCORE_POOL: usize = 4;
-    let widen = post_filter.is_some();
+    let widen = source_filter.is_some();
     let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
     let mut mult = if widen {
         OVERFETCH_BASE
@@ -3748,6 +4398,12 @@ async fn try_index_search(
     } else {
         1
     };
+    // `None` means the first v4 posting probe has not happened; `Some(true)`
+    // means repeat it as `ef` widens; `Some(false)` skips straight to the lazy
+    // capped-sidecar/unfiltered fallback on later rounds.
+    let mut native_groups_supported = filter_groups.is_empty().then_some(false);
+    let mut capped_eligibility_resolved = false;
+    let mut capped_eligibility: Option<BTreeSet<NodeId>> = None;
 
     for _ in 0..max_rounds {
         let kprime = k
@@ -3764,18 +4420,90 @@ async fn try_index_search(
             Some(e) => e.max(kprime),
             None => kprime.max(64),
         };
-        let Some(raw_hits) = snapshot
-            .try_vector_search(&index_name, &qv, kprime, ef)
-            .await?
-        else {
-            // A missing, legacy, or corrupt `.vg` is not an empty persisted
-            // corpus. Preserve that distinction even when the fresh delta alone
-            // could fill `k`, otherwise persisted neighbours can be omitted.
-            return Ok(None);
+        // `search_k` is counted among posting-eligible members, before the
+        // residual expression. It grows with the widening round so a second,
+        // unsupported conjunct does not force an immediate flat scan.
+        let search_k = kprime;
+        let native = if native_groups_supported == Some(false) {
+            None
+        } else {
+            match snapshot
+                .try_vector_search_filter_groups(&index_name, &qv, search_k, ef, filter_groups)
+                .await?
+            {
+                None => return Ok(None),
+                Some(namidb_storage::VectorFilterSearch::Applied {
+                    hits,
+                    point_count,
+                    eligible_count,
+                }) => {
+                    native_groups_supported = Some(true);
+                    // Equality with `eligible_count` proves that every persisted
+                    // vector admitted by the native postings was enumerated.
+                    // Merely widening `ef` to the corpus size stops further ANN
+                    // work, but is not itself a completeness proof: a malformed
+                    // or disconnected graph may still return fewer candidates.
+                    let persisted_complete = eligible_count == 0
+                        || (eligible_count <= search_k && hits.len() == eligible_count);
+                    let exhausted =
+                        persisted_complete || u64::try_from(ef).unwrap_or(u64::MAX) >= point_count;
+                    Some((hits, exhausted, persisted_complete))
+                }
+                Some(namidb_storage::VectorFilterSearch::Unsupported) => {
+                    native_groups_supported = Some(false);
+                    None
+                }
+            }
         };
-        // Fewer hits than asked ⇒ `kprime ≥` the corpus the index can see, so a
-        // wider fetch cannot surface more (checked after using this round's hits).
-        let index_exhausted = raw_hits.len() < kprime;
+        if native.is_none()
+            && native_groups_supported == Some(false)
+            && !filter_groups.is_empty()
+            && !capped_eligibility_resolved
+        {
+            capped_eligibility =
+                resolve_capped_filter_eligibility(snapshot, label, filter_groups).await?;
+            capped_eligibility_resolved = true;
+            // This is a complete snapshot-wide sidecar result (including the
+            // fresh overlay), so empty proves there can be no residual match.
+            if capped_eligibility.as_ref().is_some_and(BTreeSet::is_empty) {
+                return Ok(Some(Vec::new()));
+            }
+        }
+        let (raw_hits, index_exhausted, persisted_candidates_complete) =
+            if let Some(applied) = native {
+                applied
+            } else if let Some(eligible) = capped_eligibility.as_ref() {
+                let Some((hits, point_count)) = snapshot
+                    .try_vector_search_filtered(&index_name, &qv, search_k, ef, eligible)
+                    .await?
+                else {
+                    // A missing or corrupt `.vg` is not an empty persisted corpus.
+                    return Ok(None);
+                };
+                // The sidecar set is complete for the snapshot, but it may include
+                // nodes without an indexable vector. Only seeing every sidecar id in
+                // the `.vg` proves the persisted candidate universe is complete.
+                let persisted_complete = eligible.is_empty()
+                    || (eligible.len() <= search_k && hits.len() == eligible.len());
+                let exhausted =
+                    persisted_complete || u64::try_from(ef).unwrap_or(u64::MAX) >= point_count;
+                (hits, exhausted, persisted_complete)
+            } else {
+                let Some((hits, point_count)) = snapshot
+                    .try_vector_search_with_point_count(&index_name, &qv, kprime, ef)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                // The decoded body, rather than fallible manifest metadata, supplies
+                // the exact cardinality. Returning every point proves that `k` simply
+                // exceeds the persisted vector corpus.
+                let persisted_complete =
+                    usize::try_from(point_count).is_ok_and(|count| hits.len() == count);
+                // Unfiltered: fewer hits than asked means the index is drained.
+                let exhausted = persisted_complete || hits.len() < kprime;
+                (hits, exhausted, persisted_complete)
+            };
 
         // int8 rescore (RFC-030): the index returned the QUANTIZED cosine, so
         // rescore every candidate with the true f32 metric from its stored
@@ -3783,6 +4511,7 @@ async fn try_index_search(
         // membership then match the flat scan, and a node scores identically
         // before vs after compaction folds it into the index. The materialise
         // loop below reuses the fetched views, so the lookups are not wasted.
+        let mut candidates_materialized_completely = delta_candidates_materialized_completely;
         let mut rescored_views: std::collections::HashMap<NodeId, NodeValue> =
             std::collections::HashMap::new();
         let hits: Vec<(NodeId, f64)> = if index_int8 {
@@ -3794,16 +4523,26 @@ async fn try_index_search(
                 let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
                 for ((id, _quantized), view) in raw_chunk.iter().zip(hydrated) {
                     crate::exec::limits::check_deadline()?;
+                    // A fresh upsert/tombstone deliberately supersedes this
+                    // persisted hit. Its current embedding (or suppression) is
+                    // already represented by `delta_scored`/`delta_ids`.
+                    if delta_ids.contains(id) {
+                        continue;
+                    }
                     let Some(view) = view else {
+                        candidates_materialized_completely = false;
                         continue;
                     };
                     let node = NodeValue::from(view);
                     let Some(emb) = node.properties.get(property) else {
+                        candidates_materialized_completely = false;
                         continue;
                     };
                     if let Some((s, _higher)) = vector_score(distance, emb, &q_rv, span)? {
                         exact.push((*id, s));
                         rescored_views.insert(*id, node);
+                    } else {
+                        candidates_materialized_completely = false;
                     }
                 }
             }
@@ -3834,7 +4573,7 @@ async fn try_index_search(
         // Materialise in rank order, applying the residual filter; take up to k.
         // Per-candidate deadline probe: a widened filtered ANN can do many cold
         // node lookups and must stay interruptible the way the flat scan is.
-        let mut out = Vec::with_capacity(k);
+        let mut out = Vec::with_capacity(query_initial_capacity(k, scored.len()));
         const HYDRATE_BATCH: usize = 64;
         'batches: for batch in scored.chunks(HYDRATE_BATCH) {
             crate::exec::limits::check_deadline()?;
@@ -3858,14 +4597,23 @@ async fn try_index_search(
                     Some(nv) => nv,
                     None => match hydrated_by_id.remove(&id) {
                         Some(view) => view,
-                        None => continue,
+                        None => {
+                            candidates_materialized_completely = false;
+                            continue;
+                        }
                     },
                 };
                 let mut row = Row::new();
                 row.set(alias.to_string(), RuntimeValue::Node(Box::new(node_value)));
                 row.set(score_alias.to_string(), RuntimeValue::Float(score));
-                if let Some(pf) = post_filter {
-                    if evaluate(pf, &row, params)?.as_bool() != Some(true) {
+                // Fresh-delta rows already passed the source predicate before
+                // scoring. Persisted hits still need the authoritative residual
+                // check after hydration (native postings may cover only part of
+                // the expression).
+                if let Some(filter) = source_filter {
+                    if !delta_ids.contains(&id)
+                        && evaluate(filter, &row, params)?.as_bool() != Some(true)
+                    {
                         continue;
                     }
                 }
@@ -3876,15 +4624,22 @@ async fn try_index_search(
         if out.len() >= k {
             return Ok(Some(out));
         }
-        // Once the index is drained, only the flat scan can reach k (it also covers
-        // ids whose node is gone, `lookup_node` → None, and is the ground truth).
+        // Every persisted eligible vector plus every fresh delta/tombstone was
+        // reconciled and hydrated successfully. Fewer than k rows now proves the
+        // snapshot itself has a short exact page; a corpus scan cannot add one.
+        if persisted_candidates_complete && candidates_materialized_completely {
+            return Ok(Some(out));
+        }
+        // ANN exhaustion without the proof above (limited/disconnected search,
+        // missing hydration, or a sidecar set containing non-vector nodes) still
+        // needs the flat ground truth. Widening cannot improve a drained beam.
         if index_exhausted {
             break;
         }
         mult = mult.saturating_mul(WIDEN_GROWTH);
     }
 
-    // Fewer than k survivors even after widening (a selective `post_filter`, or
+    // Fewer than k survivors even after widening (a selective source filter, or
     // index hits whose nodes vanished) — fall back to the exact flat scan: it
     // applies the same filter to every node and is the ground truth, never short.
     Ok(None)
@@ -4190,6 +4945,62 @@ pub(crate) fn project_rows(
 
 // ───────────────────────── Sort / Distinct ───────────────────────────
 
+/// Serve `TopN(NodeScan)` for one ascending String property from its equality
+/// sidecar. Returns `None` for every shape/storage state where the ordinary
+/// executor must retain control.
+async fn try_indexed_ordered_node_prefix(
+    input: &LogicalPlan,
+    keys: &[OrderKey],
+    snapshot: &Snapshot<'_>,
+    bound: usize,
+) -> Result<Option<Vec<Row>>, ExecError> {
+    if keys.len() != 1 || !matches!(keys[0].direction, crate::parser::OrderDirection::Asc) {
+        return Ok(None);
+    }
+    let LogicalPlan::NodeScan {
+        label: Some(label),
+        alias,
+        predicates,
+        ..
+    } = input
+    else {
+        return Ok(None);
+    };
+    if !predicates.is_empty() {
+        return Ok(None);
+    }
+    let ExpressionKind::Property(access) = &keys[0].expression.kind else {
+        return Ok(None);
+    };
+    let ExpressionKind::Variable(target) = &access.target.kind else {
+        return Ok(None);
+    };
+    if target.name != *alias {
+        return Ok(None);
+    }
+    let Some(ids) = snapshot
+        .ordered_node_ids_by_string_property(label, &access.key.name, bound)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let views = snapshot.batch_lookup_nodes(label, &ids).await?;
+    if views.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    let rows = views
+        .into_iter()
+        .flatten()
+        .map(|view| {
+            Row::new().with(
+                alias.clone(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            )
+        })
+        .collect();
+    Ok(Some(rows))
+}
+
 pub(crate) fn sort_rows(
     rows: &mut Vec<Row>,
     keys: &[OrderKey],
@@ -4308,22 +5119,26 @@ fn bounded_topk(
         .iter()
         .map(|k| matches!(k.direction, crate::parser::OrderDirection::Desc))
         .collect();
-    let mut heap: BinaryHeap<FlatTopNItem> = BinaryHeap::with_capacity(bound + 1);
+    let mut heap: BinaryHeap<FlatTopNItem> =
+        BinaryHeap::with_capacity(query_initial_capacity(bound, rows.len()));
     for (pos, row) in rows.into_iter().enumerate() {
         let mut vals = Vec::with_capacity(keys.len());
         for k in keys {
             vals.push(evaluate(&k.expression, &row, params)?);
         }
-        heap.push(FlatTopNItem {
+        let item = FlatTopNItem {
             vals,
             pos,
             row,
             descs: descs.clone(),
-        });
-        // Max-heap: the root is the worst kept row; evict it once over budget so
-        // only the `bound` best remain.
-        if heap.len() > bound {
+        };
+        // Max-heap: the root is the worst kept row. Avoid the old transient
+        // `bound + 1` element (and its overflow-prone eager reservation).
+        if heap.len() < bound {
+            heap.push(item);
+        } else if &item < heap.peek().expect("positive bound keeps a heap item") {
             heap.pop();
+            heap.push(item);
         }
     }
     let mut items = heap.into_vec();
@@ -4470,6 +5285,47 @@ fn fingerprint_into(out: &mut String, v: &RuntimeValue) {
 }
 
 // ───────────────────────── Aggregate ─────────────────────────────────
+
+/// Fast path for a global `count(*)` / `count(n)` directly over an
+/// unfiltered node scan. Storage serves a compacted/disjoint corpus from
+/// manifest label counts and falls back to exact LSM reconciliation whenever
+/// additive metadata could double-count overlapping versions.
+async fn try_metadata_node_count(
+    input: &LogicalPlan,
+    group_by: &[(Expression, String)],
+    aggregations: &[(String, AggregateExpr)],
+    snapshot: &Snapshot<'_>,
+) -> Result<Option<Vec<Row>>, ExecError> {
+    if !group_by.is_empty() || aggregations.len() != 1 {
+        return Ok(None);
+    }
+    let LogicalPlan::NodeScan {
+        label,
+        alias,
+        predicates,
+        ..
+    } = input
+    else {
+        return Ok(None);
+    };
+    if !predicates.is_empty() {
+        return Ok(None);
+    }
+    let (output, AggregateExpr::Count { arg, .. }) = &aggregations[0] else {
+        return Ok(None);
+    };
+    if let Some(arg) = arg {
+        if !matches!(&arg.kind, ExpressionKind::Variable(id) if id.name == *alias) {
+            return Ok(None);
+        }
+    }
+    let count = snapshot.count_nodes(label.as_deref()).await?;
+    let count = i64::try_from(count)
+        .map_err(|_| ExecError::Runtime("node count exceeds Cypher INTEGER range".into()))?;
+    Ok(Some(vec![
+        Row::new().with(output.clone(), RuntimeValue::Integer(count))
+    ]))
+}
 
 pub(crate) fn execute_aggregate(
     rows: Vec<Row>,
@@ -4691,8 +5547,8 @@ pub(crate) async fn lookup_node_by_property_via_scan(
         return Ok(None);
     }
 
-    // For v0 we only index String-valued properties (LDBC's `id`).
-    // Other value types fall back to the exact scan below.
+    // String values keep the specialised unique lookup path (including its
+    // cross-snapshot complete-index cache).
     if let RuntimeValue::String(s) = value {
         if label.is_empty() {
             return snapshot
@@ -4705,6 +5561,39 @@ pub(crate) async fn lookup_node_by_property_via_scan(
             .lookup_node_by_property(label, property, s)
             .await
             .map_err(ExecError::from);
+    }
+
+    // Scalar-v1 equality sidecars also cover the non-numeric scalar types.
+    // Numeric probes stay on the exact fallback for now because Cypher treats
+    // I64(1) and F64(1.0) as equal while the physical index deliberately keeps
+    // them distinct.
+    if let Some(core) = non_numeric_index_value(value) {
+        if let Some(ids) = snapshot
+            .indexed_node_ids_by_property_value(label, property, &core)
+            .await
+            .map_err(ExecError::from)?
+        {
+            if label.is_empty() {
+                for id in ids {
+                    if let Some(view) = snapshot
+                        .lookup_node_by_id(id)
+                        .await
+                        .map_err(ExecError::from)?
+                    {
+                        if node_property_equals(&view, property, value) {
+                            return Ok(Some(view));
+                        }
+                    }
+                }
+            } else {
+                let views = snapshot
+                    .batch_lookup_nodes(label, &ids)
+                    .await
+                    .map_err(ExecError::from)?;
+                return Ok(views.into_iter().flatten().next());
+            }
+            return Ok(None);
+        }
     }
 
     // Until typed equality sidecars exist, a strict storage predicate is not a
@@ -4750,6 +5639,32 @@ pub(crate) async fn lookup_nodes_by_property_via_scan(
             .await
             .map_err(ExecError::from);
     }
+    if let Some(core) = non_numeric_index_value(value) {
+        if let Some(ids) = snapshot
+            .indexed_node_ids_by_property_value(label, property, &core)
+            .await
+            .map_err(ExecError::from)?
+        {
+            if label.is_empty() {
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(view) = snapshot
+                        .lookup_node_by_id(id)
+                        .await
+                        .map_err(ExecError::from)?
+                    {
+                        out.push(view);
+                    }
+                }
+                return Ok(out);
+            }
+            return snapshot
+                .batch_lookup_nodes(label, &ids)
+                .await
+                .map(|views| views.into_iter().flatten().collect())
+                .map_err(ExecError::from);
+        }
+    }
     let all = if label.is_empty() {
         snapshot
             .scan_all_nodes_with_predicates_and_projection(&[], None)
@@ -4764,6 +5679,57 @@ pub(crate) async fn lookup_nodes_by_property_via_scan(
         .collect())
 }
 
+/// Bounded multi-match lookup used by bare `LIMIT` pushdown.
+///
+/// Indexed non-numeric scalar predicates confirm and hydrate at most `limit`
+/// live candidates. Unsupported or legacy cases retain the exact full-scan
+/// fallback and truncate only after evaluating Cypher equality.
+async fn lookup_nodes_by_property_via_scan_limited(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    property: &str,
+    value: &RuntimeValue,
+    limit: usize,
+) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    if limit == 0 || value.is_null() {
+        return Ok(Vec::new());
+    }
+    let core = match value {
+        RuntimeValue::String(value) => Some(namidb_core::Value::Str(value.clone())),
+        other => non_numeric_index_value(other),
+    };
+    if let Some(core) = core {
+        if let Some(ids) = snapshot
+            .indexed_node_ids_by_property_value_limited(label, property, &core, limit)
+            .await
+            .map_err(ExecError::from)?
+        {
+            if label.is_empty() {
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(view) = snapshot
+                        .lookup_node_by_id(id)
+                        .await
+                        .map_err(ExecError::from)?
+                    {
+                        out.push(view);
+                    }
+                }
+                return Ok(out);
+            }
+            return snapshot
+                .batch_lookup_nodes(label, &ids)
+                .await
+                .map(|views| views.into_iter().flatten().collect())
+                .map_err(ExecError::from);
+        }
+    }
+
+    let mut rows = lookup_nodes_by_property_via_scan(snapshot, label, property, value).await?;
+    rows.truncate(limit);
+    Ok(rows)
+}
+
 /// Compare one materialised property with a lookup value using the same
 /// equality relation as the Cypher expression evaluator.
 fn node_property_equals(
@@ -4775,6 +5741,19 @@ fn node_property_equals(
         .get(property)
         .map(|stored| is_equal(&RuntimeValue::from(stored.clone()), value))
         .unwrap_or(false)
+}
+
+/// Convert the scalar types whose physical equality is identical to Cypher's
+/// equality into a storage-index probe. Numeric values are excluded because
+/// Cypher intentionally compares integers and floats across physical types.
+fn non_numeric_index_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
+    match value {
+        RuntimeValue::Bool(value) => Some(namidb_core::Value::Bool(*value)),
+        RuntimeValue::Date(value) => Some(namidb_core::Value::Date(*value)),
+        RuntimeValue::DateTime(value) => Some(namidb_core::Value::DateTime(*value)),
+        RuntimeValue::Bytes(value) => Some(namidb_core::Value::Bytes(value.clone())),
+        _ => None,
+    }
 }
 
 // ────────────────────────── Factor path ────────────────────────
@@ -4950,9 +5929,66 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let mut out_leaves = Vec::new();
                 let arena_view = input_set.arena.clone();
                 let mut next_arena = input_set.arena;
-                for leaf in input_set.leaves {
-                    let row = arena_view.materialize(leaf, None);
-                    let lookup_val = evaluate(value, &row, params)?;
+                let evaluated_leaves = input_set
+                    .leaves
+                    .into_iter()
+                    .map(|leaf| {
+                        let row = arena_view.materialize(leaf, None);
+                        let lookup_val = evaluate(value, &row, params)?;
+                        Ok::<_, ExecError>((leaf, lookup_val))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let batch_results = if *multi && label.is_empty() {
+                    let string_values = evaluated_leaves
+                        .iter()
+                        .filter_map(|(_, lookup_value)| match lookup_value {
+                            RuntimeValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let results = if string_values.is_empty() {
+                        Vec::new()
+                    } else {
+                        snapshot
+                            .batch_lookup_nodes_by_property_any_label(property, &string_values)
+                            .await
+                            .map_err(ExecError::Storage)?
+                    };
+                    if results.len() != string_values.len() {
+                        return Err(ExecError::Runtime(format!(
+                            "batch property lookup returned {} results for {} values",
+                            results.len(),
+                            string_values.len()
+                        )));
+                    }
+                    Some(results.into_iter())
+                } else {
+                    None
+                };
+                let mut batch_results = batch_results;
+                for (leaf, lookup_val) in evaluated_leaves {
+                    if let Some(results) = &mut batch_results {
+                        let matches = match lookup_val {
+                            RuntimeValue::String(_) => results.next().ok_or_else(|| {
+                                ExecError::Runtime(
+                                    "batch property lookup result alignment was lost".into(),
+                                )
+                            })?,
+                            RuntimeValue::Null => Vec::new(),
+                            other => {
+                                lookup_nodes_by_property_via_scan(snapshot, label, property, &other)
+                                    .await?
+                            }
+                        };
+                        for view in matches {
+                            let slot = Slot {
+                                name: alias_arc.clone(),
+                                value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            };
+                            out_leaves.push(next_arena.push(leaf, vec![slot]));
+                        }
+                        continue;
+                    }
                     if *multi {
                         for view in lookup_nodes_by_property_via_scan(
                             snapshot,
@@ -4978,6 +6014,11 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         };
                         out_leaves.push(next_arena.push(leaf, vec![slot]));
                     }
+                }
+                if batch_results.is_some_and(|mut results| results.next().is_some()) {
+                    return Err(ExecError::Runtime(
+                        "batch property lookup returned extra results".into(),
+                    ));
                 }
                 Ok(FactorRowSet {
                     arena: next_arena,
@@ -5175,20 +6216,34 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // regardless of input cardinality.
                 let skip = resolve_row_count(skip, params, "SKIP")?;
                 let limit = resolve_row_count(limit, params, "LIMIT")?;
-                let input_set =
+                let indexed_rows = if !keys.is_empty() && limit != u64::MAX {
+                    let bound = row_window_bound(skip, limit);
+                    try_indexed_ordered_node_prefix(input, keys, snapshot, bound).await?
+                } else {
+                    None
+                };
+                let input_set = if let Some(rows) = indexed_rows {
+                    FactorRowSet::from_flat(rows)
+                } else if keys.is_empty() && limit != u64::MAX {
+                    let cap = row_window_bound(skip, limit);
+                    FactorRowSet::from_flat(
+                        execute_capped(input, snapshot, params, outer, routing, cap).await?,
+                    )
+                } else {
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
-                        .await?;
+                        .await?
+                };
 
                 // Empty keys: stable order, just skip+take + materialise.
                 if keys.is_empty() {
-                    let skip = skip as usize;
+                    let skip = row_count_as_usize(skip);
                     if skip >= input_set.cardinality() {
                         return Ok(FactorRowSet::from_flat(Vec::new()));
                     }
                     let take = if limit == u64::MAX {
                         usize::MAX
                     } else {
-                        limit as usize
+                        row_count_as_usize(limit)
                     };
                     let rows: Vec<Row> = input_set
                         .leaves
@@ -5214,7 +6269,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // (`ORDER BY cosine_similarity(...) DESC LIMIT k`). The position
                 // tiebreak makes the result identical to the full sort below.
                 if limit != u64::MAX {
-                    let k = (skip as usize).saturating_add(limit as usize);
+                    let k = row_window_bound(skip, limit);
                     if k > 0 && k < input_set.cardinality() {
                         let descs: std::sync::Arc<[bool]> = std::sync::Arc::from(
                             keys.iter()
@@ -5224,7 +6279,10 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                                 .collect::<Vec<bool>>(),
                         );
                         let mut heap: std::collections::BinaryHeap<TopNItem> =
-                            std::collections::BinaryHeap::with_capacity(k + 1);
+                            std::collections::BinaryHeap::with_capacity(query_initial_capacity(
+                                k,
+                                input_set.cardinality(),
+                            ));
                         for (pos, &leaf) in input_set.leaves.iter().enumerate() {
                             let mut thin_row = Row::new();
                             for var_name in &needed {
@@ -5254,8 +6312,8 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         kept.sort_unstable();
                         let rows: Vec<Row> = kept
                             .into_iter()
-                            .skip(skip as usize)
-                            .take(limit as usize)
+                            .skip(row_count_as_usize(skip))
+                            .take(row_count_as_usize(limit))
                             .map(|it| input_set.arena.materialize(it.leaf, None))
                             .collect();
                         return Ok(FactorRowSet::from_flat(rows));
@@ -5281,14 +6339,14 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
 
                 keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
 
-                let skip = skip as usize;
+                let skip = row_count_as_usize(skip);
                 if skip >= keyed.len() {
                     return Ok(FactorRowSet::from_flat(Vec::new()));
                 }
                 let take = if limit == u64::MAX {
                     usize::MAX
                 } else {
-                    limit as usize
+                    row_count_as_usize(limit)
                 };
                 let rows: Vec<Row> = keyed
                     .into_iter()
@@ -5354,12 +6412,18 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 group_by,
                 aggregations,
             } => {
-                let input_set =
-                    execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
-                        .await?;
-                let rows = input_set.materialize_all(None);
-                let agg_rows = execute_aggregate(rows, group_by, aggregations, params)?;
-                Ok(FactorRowSet::from_flat(agg_rows))
+                if let Some(rows) =
+                    try_metadata_node_count(input, group_by, aggregations, snapshot).await?
+                {
+                    Ok(FactorRowSet::from_flat(rows))
+                } else {
+                    let input_set =
+                        execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                            .await?;
+                    let rows = input_set.materialize_all(None);
+                    let agg_rows = execute_aggregate(rows, group_by, aggregations, params)?;
+                    Ok(FactorRowSet::from_flat(agg_rows))
+                }
             }
 
             // Correlated subplan operators: the outer row is threaded into
@@ -6985,11 +8049,74 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn query_controlled_bounds_do_not_drive_eager_allocations() {
+        assert_eq!(
+            query_initial_capacity(usize::MAX, usize::MAX),
+            MAX_EAGER_QUERY_CAPACITY
+        );
+        assert_eq!(query_initial_capacity(usize::MAX, 3), 3);
+        assert_eq!(query_initial_capacity(2, usize::MAX), 2);
+        assert_eq!(row_window_bound(u64::MAX, u64::MAX), usize::MAX);
+    }
+
+    #[test]
     fn node_id_from_string_value() {
         let id = NodeId::new();
         let v = RuntimeValue::String(id.to_string());
         let parsed = node_id_from_value(&v, SourceSpan::point(0)).unwrap();
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn vector_prefilter_never_narrows_cross_typed_numeric_equality() {
+        // Runtime equality treats I64(1) and F64(1.0) as equal, while ScalarV1
+        // postings intentionally retain their physical type. Until the
+        // prefilter probes every numerically-equivalent encoding, it must leave
+        // numbers to the residual path rather than form an incomplete id set.
+        assert!(proc_filter_core_scalar(&RuntimeValue::Integer(1)).is_none());
+        assert!(proc_filter_core_scalar(&RuntimeValue::Float(1.0)).is_none());
+        assert_eq!(
+            proc_filter_core_scalar(&RuntimeValue::Bool(true)),
+            Some(CoreValue::Bool(true))
+        );
+        assert_eq!(
+            proc_filter_core_scalar(&RuntimeValue::String("live".into())),
+            Some(CoreValue::Str("live".into()))
+        );
+    }
+
+    #[test]
+    fn natural_vector_prefilter_extracts_only_lossless_static_groups() {
+        fn find_filter(plan: &LogicalPlan) -> Option<&Expression> {
+            if let LogicalPlan::Filter { predicate, .. } = plan {
+                return Some(predicate);
+            }
+            plan.children().into_iter().find_map(find_filter)
+        }
+
+        let query = crate::parser::parse(
+            "MATCH (d:Doc) \
+             WHERE d.kind = $kind AND d.vigente IN [true, false] AND d.year = 2024 \
+             RETURN d",
+        )
+        .unwrap();
+        let plan = crate::plan::lower(&query).unwrap();
+        let filter = find_filter(&plan).expect("lowered MATCH keeps its predicate");
+        let mut params = Params::new();
+        params.insert("kind".into(), RuntimeValue::String("laboral".into()));
+
+        let prefilter = natural_vector_prefilter(filter, "d", &params);
+        assert_eq!(
+            prefilter.groups,
+            vec![
+                ("kind".to_string(), vec![CoreValue::Str("laboral".into())]),
+                (
+                    "vigente".to_string(),
+                    vec![CoreValue::Bool(true), CoreValue::Bool(false)]
+                ),
+            ],
+            "numeric equality stays residual because Cypher equates integer and float"
+        );
     }
 
     #[test]

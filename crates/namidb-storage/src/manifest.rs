@@ -90,6 +90,14 @@ pub struct Manifest {
     /// `serde(default)` keeps pre-feature manifests loading unchanged.
     #[serde(default)]
     pub text_indexes: Vec<TextIndexDescriptor>,
+    /// Durable record that an authoritative compaction attempted a registered
+    /// search-index build at a node generation. Empty/one-point corpora and
+    /// deterministic build rejection legitimately emit no `.vg`/`.ft`; this
+    /// marker prevents every idle maintenance tick from rewriting the lone L1
+    /// forever. Physical index availability is represented only by an SST
+    /// descriptor, never by this marker.
+    #[serde(default)]
+    pub search_index_builds: Vec<SearchIndexBuildState>,
 }
 
 impl Manifest {
@@ -106,6 +114,7 @@ impl Manifest {
             label_dict: LabelDictionary::new(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         }
     }
 
@@ -124,8 +133,21 @@ impl Manifest {
             label_dict: self.label_dict.clone(),
             vector_indexes: self.vector_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
+            search_index_builds: self.search_index_builds.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchIndexBuildState {
+    /// Attempted index kind. This is a maintenance-generation fence, not proof
+    /// that a corresponding physical SST was produced successfully.
+    pub kind: SstKind,
+    pub name: String,
+    /// JSON signature of the catalog descriptor, so DROP+CREATE under the
+    /// same name cannot inherit an old build marker.
+    pub catalog_signature: String,
+    pub max_node_lsn: u64,
 }
 
 /// What sits in `manifest/current.json`. Tiny on purpose: every read path
@@ -311,6 +333,9 @@ pub struct SstDescriptor {
     // older manifests loading unchanged.
     #[serde(default)]
     pub label_index: Option<LabelIndexDescriptor>,
+    /// Exact physical-row locator emitted by current node SST writers.
+    #[serde(default)]
+    pub node_locator: Option<NodeLocatorDescriptor>,
 
     // Per-(label, property) statistics for id-primary node SSTs (RFC 025).
     // Because one node SST spans many labels and every property rides in a
@@ -322,6 +347,23 @@ pub struct SstDescriptor {
     // for manifests written before this field existed (`serde(default)`).
     #[serde(default)]
     pub per_label_property_stats: Vec<PerLabelPropertyStat>,
+}
+
+/// Deterministic exact-edge accelerator path for current forward CSR names.
+///
+/// The `.ep.csr` marker avoids adding a field to the public manifest structs
+/// (which would break downstream Rust literals). Older readers still consume
+/// the unchanged CSR body. If their janitor sweeps the unrecognised `.epidx`,
+/// a newer reader treats its absence as an optional-accelerator miss and falls
+/// back to that CSR.
+pub(crate) fn edge_point_sidecar_path(descriptor: &SstDescriptor) -> Option<String> {
+    if descriptor.kind != SstKind::EdgesFwd {
+        return None;
+    }
+    descriptor
+        .path
+        .strip_suffix(".ep.csr")
+        .map(|base| format!("{base}.epidx"))
 }
 
 /// One `(label, property)` statistics entry for an id-primary node SST
@@ -363,6 +405,20 @@ pub struct UniquePropertyIndexDescriptor {
     /// non-tombstone row count modulo nulls; surfaced for diagnostics
     /// and the cache prewarm decision.
     pub entry_count: u64,
+    /// Physical encoding. `BincodeV0` is the monolithic legacy map;
+    /// `PagedV1` is range-readable and probes one B+tree search path.
+    #[serde(default)]
+    pub format: PropertyIndexFormat,
+    /// Optional range-readable mirror. `path` deliberately remains the
+    /// bincode-v0 object so a 2.0.4 reader can consume manifests written
+    /// during a rolling upgrade.
+    #[serde(default)]
+    pub paged: Option<PagedPropertyIndexDescriptor>,
+    /// The authoritative legacy sidecar contains a key that cannot fit in a
+    /// PagedV1 leaf. This is a durable, non-error omission marker: maintenance
+    /// must not rewrite the same SST forever trying to add the accelerator.
+    #[serde(default)]
+    pub paged_build_unsupported: bool,
 }
 
 /// Side-car pointer for a single `(SST, indexed non-unique property)` pair.
@@ -381,6 +437,57 @@ pub struct EqualityIndexDescriptor {
     pub size_bytes: u64,
     /// Number of distinct values in the sidecar (posting-list keys).
     pub distinct_values: u64,
+    /// Encoding used by the posting-list keys. The default keeps manifests
+    /// written before scalar equality indexes readable.
+    #[serde(default)]
+    pub key_encoding: EqualityKeyEncoding,
+    /// The collector harvested every ScalarV1-compatible runtime value for
+    /// this property name, including heterogeneous declarations across labels
+    /// in an id-primary SST. Descriptors written before that invariant was
+    /// enforced default to `false` and are rebuilt once by maintenance rather
+    /// than being trusted as an authoritative (but potentially incomplete)
+    /// negative-answer index.
+    #[serde(default)]
+    pub mixed_type_complete: bool,
+    /// Physical encoding of the immutable posting map.
+    #[serde(default)]
+    pub format: PropertyIndexFormat,
+    /// Optional range-readable mirror; see
+    /// [`UniquePropertyIndexDescriptor::paged`].
+    #[serde(default)]
+    pub paged: Option<PagedPropertyIndexDescriptor>,
+    /// See [`UniquePropertyIndexDescriptor::paged_build_unsupported`].
+    #[serde(default)]
+    pub paged_build_unsupported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PagedPropertyIndexDescriptor {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// Physical property-sidecar encoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyIndexFormat {
+    /// Legacy bincode `BTreeMap`; a cold point probe decodes the whole object.
+    #[default]
+    BincodeV0,
+    /// Fixed-page B+tree with range-readable leaves/postings.
+    PagedV1,
+}
+
+/// Equality-sidecar key format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EqualityKeyEncoding {
+    /// Legacy raw UTF-8 key. Only String values can be probed.
+    #[default]
+    StringV0,
+    /// Scalar key encoded by `cache::encode_equality_property_value`.
+    /// Strings remain raw/legacy-compatible; other scalar types are tagged.
+    ScalarV1,
 }
 
 /// Side-car pointer for a node SST's label index. The sidecar body is a
@@ -412,6 +519,19 @@ pub struct LabelIndexDescriptor {
     /// (`serde(default)` round-trips them unchanged).
     #[serde(default)]
     pub per_label_counts: Vec<(u32, u64)>,
+}
+
+/// Range-readable `NodeId -> physical row ordinal` index for one node SST.
+///
+/// The row ordinal feeds Parquet's `RowSelection`, which skips unselected
+/// data pages using the offset index instead of evaluating `node_id` for
+/// every row. `None` on legacy SSTs, whose reader retains the conservative
+/// row-group/RowFilter fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeLocatorDescriptor {
+    pub path: String,
+    pub size_bytes: u64,
+    pub entry_count: u64,
 }
 
 /// Distance metric a vector index is built for. The build and search must use
@@ -2580,6 +2700,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            node_locator: None,
             per_label_property_stats: Vec::new(),
         }
     }
@@ -2614,6 +2735,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            node_locator: None,
             per_label_property_stats: Vec::new(),
         }
     }
@@ -2951,6 +3073,38 @@ mod tests {
             back.ssts[0].label_index.is_none(),
             "missing label_index must default to None"
         );
+    }
+
+    #[test]
+    fn equality_descriptor_without_key_encoding_loads_as_legacy_string() {
+        let descriptor = EqualityIndexDescriptor {
+            property: "key".into(),
+            path: "sst/L0/key.eqidx.bin".into(),
+            size_bytes: 42,
+            distinct_values: 2,
+            key_encoding: EqualityKeyEncoding::ScalarV1,
+            mixed_type_complete: true,
+            format: PropertyIndexFormat::PagedV1,
+            paged: None,
+            paged_build_unsupported: false,
+        };
+        let mut value = serde_json::to_value(descriptor).unwrap();
+        value.as_object_mut().unwrap().remove("key_encoding");
+        value.as_object_mut().unwrap().remove("mixed_type_complete");
+        value.as_object_mut().unwrap().remove("format");
+        value.as_object_mut().unwrap().remove("paged");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("paged_build_unsupported");
+        let legacy: EqualityIndexDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.key_encoding, EqualityKeyEncoding::StringV0);
+        assert!(
+            !legacy.mixed_type_complete,
+            "pre-fix descriptors must schedule one coverage rebuild"
+        );
+        assert_eq!(legacy.format, PropertyIndexFormat::BincodeV0);
+        assert!(!legacy.paged_build_unsupported);
     }
 
     #[test]

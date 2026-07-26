@@ -690,6 +690,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            node_locator: None,
             per_label_property_stats: Vec::new(),
         }
     }
@@ -727,6 +728,7 @@ mod tests {
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
             label_index: None,
+            node_locator: None,
             per_label_property_stats: Vec::new(),
         }
     }
@@ -764,6 +766,7 @@ mod tests {
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").expect("Person seeded");
@@ -808,6 +811,7 @@ mod tests {
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").unwrap();
@@ -863,6 +867,7 @@ mod tests {
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let k = cat.edge_type("KNOWS").unwrap();
@@ -896,6 +901,7 @@ mod tests {
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let u = cat.label("Unknown").unwrap();
@@ -924,6 +930,7 @@ mod tests {
             label_dict: Default::default(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            search_index_builds: Vec::new(),
         };
         let cat = StatsCatalog::from_manifest(&m);
         let names: Vec<_> = cat.label_names().collect();

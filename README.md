@@ -97,7 +97,7 @@ process or host termination while S3/R2 still owns uploaded parts.
 | `s3://<bucket>[/<prefix>]?ns=<ns>` | AWS S3, Cloudflare R2, MinIO, Tigris, LocalStack — anything S3-compatible |
 | `gs://<bucket>?ns=<ns>` | Google Cloud Storage |
 | `az://<account>/<container>?ns=<ns>` | Azure Blob Storage |
-| `file:///abs/dir?ns=<ns>` | Local filesystem (CAS via `flock` + atomic rename) |
+| `file:///abs/dir?ns=<ns>` | Local filesystem (Create-only pointer CAS via `O_CREAT\|O_EXCL`) |
 | `memory://<ns>` | In-process, ephemeral — for tests and demos |
 
 <br />
@@ -259,6 +259,10 @@ CALL db.index.vector.queryNodes('doc_emb', 5, $q) YIELD node, score;
 `search.vector`, `search.hybrid`, and `db.index.vector.queryNodes` all take an optional `filter` map for metadata-scoped KNN — the right tool when many tenants share one index:
 
 ```cypher
+-- Optional but recommended: equality/IN metadata indexes become native
+-- pre-filters for vector retrieval (typed scalars include BOOLEAN).
+CREATE INDEX IF NOT EXISTS FOR (d:Doc) ON (d.tenant_id);
+
 CALL search.vector({
   label: 'Doc', property: 'embedding', query: $q, k: 5,
   filter: { tenant_id: $t }
@@ -268,9 +272,22 @@ CALL search.vector({
 CALL db.index.vector.queryNodes('doc_emb', 5, $q, { ef: 200, filter: { tenant_id: $t } }) YIELD node, score;
 ```
 
-A scalar value means equality (`tenant_id = $t`), a list means `IN` (`{ tier: [1, 2, 3] }` → `tier IN [1, 2, 3]`), and a `{ gte, gt, lte, lt, eq, ne }` map is a range (`{ score: { gte: 0.5 } }`) — keys AND-combine. The filter runs *index-side*: the ANN over-fetches and adaptively widens its candidate set, then falls back to an exact flat scan, so a selective predicate returns the true top-k for that slice instead of post-truncating a shared top-k down to zero rows for a sparse tenant.
+A scalar value means equality (`tenant_id = $t`), a list means `IN` (`{ tier: [1, 2, 3] }` → `tier IN [1, 2, 3]`), and a `{ gte, gt, lte, lt, eq, ne }` map is a range (`{ score: { gte: 0.5 } }`) — keys AND-combine. On `search.vector` and `db.index.vector.queryNodes`, the filter is applied before the returned `k`, so a selective predicate does not merely truncate a shared unfiltered top-k.
 
-Recall is tunable. The procedures take a first-class `ef` beam width (shown above); the natural `MATCH … ORDER BY cosine_similarity(…)` form has no syntax for it, so it reads a reserved `$__vector_ef` param. `$__vector_ef` only ever *raises* the beam (never corrupts the answer) and is a **non-stable** knob — expect it to be superseded by an `OPTIONS { ef }` clause.
+Idiomatic KNN receives the same pre-`k` treatment: `MATCH (d:Doc) WHERE
+d.vigente = true AND d.ambito IN $ambitos RETURN d ORDER BY
+cosine_similarity(d.embedding, $q) DESC LIMIT 50` carries lossless String/Bool
+equality groups into the `.vg` postings. Unique-property and `elementId`
+predicates remain cheaper exact point seeks; unsupported conjuncts stay as
+residual checks with adaptive widening and exact fallback.
+
+For indexed string and boolean equality/`IN` conjuncts, authoritative compaction embeds complete postings directly in the `.vg` as vector ordinals: sparse values use sorted `u32`s and high-frequency/dense postings use bitmaps. A query ORs alternatives and ANDs properties inside the decoded vector body, before metric reranking and before `k`; rejected nodes can still guide ANN navigation, but their full records and a corpus-sized NodeId set are never hydrated. An absent value under a materialised property is an exact empty slice; an absent property means “unsupported” and retains the residual path.
+
+The posting build is bounded and never truncates: a property is omitted atomically after `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` (default `4096`) or the per-body `NAMIDB_VECTOR_FILTER_MAX_BYTES` budget (default `64 MiB`). Legacy v3 bodies and omitted/high-cardinality properties first try a complete equality-sidecar result capped by `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` (default `8192` IDs), then use adaptive widening plus the exact scan fallback. Unindexed, numeric, and range predicates follow that residual path too, so an index changes cost, not results. (`1 = 1.0` is valid Cypher, so numeric prefiltering cannot safely probe only one typed posting.) `YIELD node WHERE …` is not the procedure-filter syntax—put `filter: {...}` in the argument map as above (a later `WITH node WHERE …` remains an ordinary post-filter).
+
+Recall is tunable. The procedures take a first-class `ef` beam width (shown above); the natural `MATCH … ORDER BY cosine_similarity(…)` form has no syntax for it, so it reads a reserved `$__vector_ef` param. An explicit value replaces the default beam and is clamped to at least the requested candidate count; values below the default `64` can trade recall for latency. `$__vector_ef` is a **non-stable** knob — expect it to be superseded by an `OPTIONS { ef }` clause.
+
+`search.hybrid` applies the same native eligibility logic on its dense leg and filters BM25 before the sparse top-k. The FTS path widens its ranked prefix geometrically up to `NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP`; if that is not enough, an exact two-pass scorer takes over. Selective filters therefore cannot shorten a hybrid page merely because ineligible documents ranked first, and the cap bounds fast-path hydration rather than recall.
 
 Two correctness details worth knowing. When a vector index covers a property, embeddings are dimension-checked on write: a wrong-dimension value is rejected, and a correct-dimension bare `list[float]` is coerced to a dense vector so it actually enters the index (otherwise a bare list reads back fine via flat scan yet is silently skipped at build time). And cosine is undefined for a zero-magnitude vector — `cosine_similarity` returns NULL and that row drops out of a KNN — a contract the index enforces too, so the indexed result equals the flat scan's row-for-row.
 
@@ -403,6 +420,10 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 > Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`), `text-index` (`CREATE FULLTEXT INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
 >
 > **Prebuilt server binary.** Each GitHub Release ships a `namidb-server-<tag>-<target>` archive built with `--features vector-index,text-index`, so `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX` work out of the box — the [official Docker image](https://hub.docker.com/r/namidb/namidb-server) is the same configuration. The `namidb` and `namidb-mcp` archives are feature-light — no optional features — so build the server from source with your own `--features` set when you also want `jwt`/`pdp` or a slimmer binary.
+>
+> Linux GNU archives are built natively on Ubuntu 22.04 for both x86_64 and
+> arm64, and the release gate rejects symbols newer than `GLIBC_2.35`. Use the
+> official container or build from source when targeting an older libc.
 
 <br />
 
@@ -427,7 +448,11 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The umbrella crate [`crates/namidb/`](./crates/namidb/) re-exports the stable surface, so a downstream `Cargo.toml` needs only one line.
+The embedded Rust API is currently an unpublished, low-level workspace
+surface. The example above uses `namidb-query` and `namidb-storage` directly;
+git/path consumers should pin an exact revision and expect those APIs to evolve.
+The [`namidb`](./crates/namidb/) façade currently re-exports only
+`namidb-core`; it is not yet the complete embedded-engine API.
 
 <br />
 
@@ -479,24 +504,57 @@ Design proposals live in [`docs/rfc/`](./docs/rfc/) — start with [RFC-001](./d
 
 ## Configuration
 
-The defaults are fine for almost everything; reach for these when chasing a performance or memory problem.
+The defaults cover ordinary graph workloads. Size search-index memory
+explicitly for large vector or full-text corpora.
 
 | Env var | Default | What it does |
 |---|---|---|
-| `NAMIDB_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Exact-byte process-wide ceiling shared by SST, decoded, node-view, and adjacency caches. `0` disables all shared caches. |
+| `NAMIDB_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Process-wide admission ceiling for cache-accounted payloads shared by SST, decoded, node-view, and adjacency caches. `0` disables all shared caches. |
+| `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` | unset (proportional) | Exact-byte reservation, carved out of `NAMIDB_CACHE_MAX_BYTES`, for one shared decoded `.vg`/`.ft` eviction pool. |
+| `NAMIDB_MEMORY_MAX_BYTES` | `0` (disabled) | Server-only total RSS/working-set admission ceiling. A 500 ms watchdog clears reconstructible caches at 90% even without incoming work; at the ceiling new Cypher receives a retryable 503/Bolt transient error until memory falls. |
 | `NAMIDB_ADJACENCY` | ON | CSR adjacency in RAM, shared across snapshots. |
 | `NAMIDB_NODE_CACHE` | ON | Cross-snapshot `NodeView` lookup cache. |
 | `NAMIDB_SST_CACHE` | ON | Raw SST body and decoded SST cache tiers. |
 | `NAMIDB_FACTORIZE` | OFF | Factorized intermediate results in the executor. |
+| `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` | `4096` | Maximum distinct String/Bool values materialised per property in one `.vg`; crossing omits that property atomically. |
+| `NAMIDB_VECTOR_FILTER_MAX_BYTES` | `67108864` (64 MiB) | Per-`.vg` budget for adaptive ordinal filter postings. |
+| `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` | `8192` | Maximum complete sidecar IDs used lazily when a `.vg` cannot apply any filter group; `0` disables this fallback. |
+| `NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP` | `65536` | Maximum authoritative FTS candidates hydrated while refilling a filtered hybrid sparse leg; reaching it switches to the exact flat fallback. |
+| `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` | `65536` (64 KiB) | Largest complete relationship record admitted to an exact `(source,target)` point sidecar. Exceeding it omits that SST's whole accelerator. |
+| `NAMIDB_EDGE_POINT_MAX_SST_BYTES` | `536870912` (512 MiB) | Maximum complete exact-edge sidecar per forward SST. `0` disables the accelerator; the CSR remains authoritative. |
 | `NAMIDB_EMBED_PROVIDER` | unset | Remote embedder for `load-vault --embed` (`openai`/`voyage`/`cohere`/`gemini`/`jina`; needs `--features remote-embedder`). |
 
 The caches are **process-wide** — one shared set across every namespace, so a
 busy tenant cannot multiply the memory limit. `NAMIDB_CACHE_MAX_BYTES` is the
-aggregate hard-admission ceiling in exact bytes. The legacy per-tier knobs
-remain compatible ceilings; when their sum is larger than the aggregate
-maximum, NamiDB scales every active ceiling proportionally and deterministically.
-No single cache entry is admitted when its deep estimated weight exceeds its
-assigned tier. The legacy knobs are
+aggregate hard-admission ceiling for cache-accounted entry weights. Allocator
+and hash-table metadata, plus values retained by an active query after cache
+eviction, are not literal RSS bytes. The legacy per-tier knobs remain
+compatible ceilings; when their sum is larger than the aggregate maximum,
+NamiDB scales every active ceiling proportionally and deterministically. No
+single cache entry is admitted when its deep estimated weight exceeds its
+assigned tier.
+
+Decoded vector and full-text indexes share one pool, so unused `.ft` capacity
+is immediately usable by `.vg` and vice versa. For a large corpus, set
+`NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` to reserve enough of the aggregate before
+the remaining tiers are proportionally fitted into what is left. The
+reservation never increases `NAMIDB_CACHE_MAX_BYTES`. Admission uses the same
+conservative deep-size estimate before GET/decode and after decode (serialized
+body expansion plus manifest point/dimension or document counts), preventing a
+successful preflight from becoming a repeated decode that cannot be cached.
+If a valid authoritative index does not fit, NamiDB returns HTTP 503 with
+`code: "search_index_cache_capacity"` or a retryable Bolt storage error. The
+message reports estimated required bytes and assigned pool bytes and points to
+both settings; it does **not** silently turn a production search into an
+O(corpus) flat scan. Missing, stale, legacy, or corrupt optional indexes retain
+their correctness-preserving exact fallback.
+
+For example, a process with an 8 GiB accounted-cache budget can reserve 6 GiB
+for search indexes with
+`NAMIDB_CACHE_MAX_BYTES=8589934592` and
+`NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES=6442450944`. Keep additional headroom for
+memtables, active queries, compaction, allocator metadata, and the RSS admission
+rail described below. The legacy knobs are
 `NAMIDB_SST_CACHE_BUDGET_MIB` (256), `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB`
 (256), `NAMIDB_SST_METADATA_CACHE_BUDGET_MIB` (64),
 `NAMIDB_EDGE_STREAM_CACHE_BUDGET_MIB` (256),
@@ -506,12 +564,49 @@ assigned tier. The legacy knobs are
 `NAMIDB_TEXT_INDEX_CACHE_BUDGET_MIB` (512), and
 `NAMIDB_VECTOR_INDEX_CACHE_BUDGET_MIB` (512), plus the existing
 `NAMIDB_NODE_CACHE_*` and `NAMIDB_ADJACENCY_*` pools. Legacy values are MiB;
-only `NAMIDB_CACHE_MAX_BYTES` is expressed as exact bytes.
-This ceiling covers retained cache entries; memtables, active query rows, the
-writer's mandatory uniqueness index, and transient flush/compaction work are
-separate. The official image also bounds glibc allocation arenas so dropped
-large-index working sets are returned instead of accumulating per-thread
-arenas.
+the two search-index requests are combined into the shared pool when no
+explicit reservation is set. `NAMIDB_CACHE_MAX_BYTES` and
+`NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` are expressed as exact bytes.
+This ceiling covers retained cache entries; memtables, active query rows,
+transient flush/compaction work, and writer-local reconstructible
+property/uniqueness maps are separate. Those writer-local maps are not charged
+to `NAMIDB_CACHE_MAX_BYTES`; an RSS pressure pass clears them
+through weak registrations, without extending a namespace's lifetime. The
+official image also bounds glibc allocation arenas so dropped large-index
+working sets are returned instead of accumulating per-thread arenas.
+For a process-wide server safety rail, set `NAMIDB_MEMORY_MAX_BYTES` above the
+cache budget and expected memtable/compaction headroom. It measures RSS on
+Linux/macOS and working set on Windows, reclaims shared caches and writer-local
+reconstructible maps at 90%, and stops admitting new Cypher work at the
+configured byte ceiling. A process-wide 500 ms watchdog performs the same
+single-flight reclamation while the server is idle or a background
+flush/compaction is running; reclamation no longer waits for the next request.
+Authenticated `POST /v0/admin/flush` remains available as a pressure-relief
+operation and is serialized process-wide. The route is outside the ordinary
+HTTP timeout and the storage task survives client disconnection, so an
+operator cannot strand a memtable halfway through a relief flush; the global
+request cap still bounds callers waiting for it. In multi-tenant mode, a
+hard-pressure flush may target an already-open namespace, but will not recover
+a cold namespace that has no live memtable to release. Flush and compaction
+can temporarily amplify memory, so this rail does not replace an OS-enforced
+container/cgroup limit or correctly-sized headroom for an already-running
+operation. The setting belongs to `namidb-server`; embedded Rust and Python
+clients do not install this admission governor. For example, pair
+`NAMIDB_MEMORY_MAX_BYTES=3758096384` (3.5 GiB admission) with
+`docker run --memory=4g ...` (4 GiB hard containment).
+
+One immutable manifest body and one versioned pointer are intentionally
+written per durable commit. During a long load, hundreds of small versions
+(for example, 345 versions / 36 MiB) are therefore normal temporary history,
+not an unbounded leak. The background janitor removes manifest and pointer
+versions below the oldest live-reader horizon once
+`NAMIDB_SWEEP_MIN_AGE` has elapsed (24 h by default), provided periodic
+maintenance is enabled (`NAMIDB_COMPACTION_INTERVAL` is non-zero) and
+`NAMIDB_SWEEP_DELETE=true`. With deletion disabled the same pass is dry-run
+only. The horizon protects readers exactly; the age window protects a body
+uploaded just before its CAS, so lower it only when that object-store race
+window is well understood.
+
 The server also takes durability/backpressure knobs for critical workloads:
 
 | Flag (env var) | Default | What it does |
@@ -571,7 +666,9 @@ We develop in the open. Read [`CONTRIBUTING.md`](./CONTRIBUTING.md) and the RFCs
 NamiDB is licensed under the [**Business Source License 1.1**](LICENSE).
 
 - Free for development, testing, internal production use, and anything that doesn't compete with a hosted NamiDB offering from the Licensor.
-- Converts automatically to the **Apache License 2.0** three years after each release.
+- The Change License is **Apache License 2.0**. Conversion occurs on
+  **May 18, 2029**, or on the fourth anniversary of a specific version's first
+  public distribution if that is earlier, exactly as stated in [`LICENSE`](LICENSE).
 - A separate commercial license is available if you need to embed or redistribute NamiDB outside what BSL allows, including running it as a hosted database service. Reach us at [`info@namidb.com`](mailto:info@namidb.com).
 
 <br />

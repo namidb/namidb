@@ -640,6 +640,196 @@ async fn two_sets_to_same_node_via_different_aliases_both_persist() {
 }
 
 #[tokio::test]
+async fn unwind_repeated_node_set_reads_latest_staged_value() {
+    let mut writer = WriterSession::open(store(), paths("w-set-unwind-ryow"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {key: 'same', counter: 0})").await;
+
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (n:Account {key: 'same'}) \
+         UNWIND range(1, 3) AS i \
+         SET n.counter = n.counter + 1 \
+         RETURN n",
+    )
+    .await;
+    let observed: Vec<i64> = outcome
+        .rows
+        .iter()
+        .map(|row| match row.get("n") {
+            Some(RuntimeValue::Node(node)) => match node.properties.get("counter") {
+                Some(RuntimeValue::Integer(value)) => *value,
+                other => panic!("expected integer counter, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(observed, vec![1, 2, 3]);
+    let stored = writer.snapshot().scan_label("Account").await.unwrap();
+    assert_eq!(
+        stored[0].properties.get("counter"),
+        Some(&CoreValue::I64(3))
+    );
+}
+
+#[tokio::test]
+async fn unwind_repeated_node_map_merge_keeps_prior_patches() {
+    let mut writer = WriterSession::open(store(), paths("w-set-map-unwind-ryow"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {key: 'same', base: 1})").await;
+
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (n:Account {key: 'same'}) \
+         UNWIND [{left: 2}, {right: 3}] AS patch \
+         SET n += patch \
+         RETURN n",
+    )
+    .await;
+    let final_node = match outcome.rows.last().and_then(|row| row.get("n")) {
+        Some(RuntimeValue::Node(node)) => node,
+        other => panic!("expected final node, got {other:?}"),
+    };
+    assert_eq!(
+        final_node.properties.get("left"),
+        Some(&RuntimeValue::Integer(2))
+    );
+    assert_eq!(
+        final_node.properties.get("right"),
+        Some(&RuntimeValue::Integer(3))
+    );
+    let stored = writer.snapshot().scan_label("Account").await.unwrap();
+    assert_eq!(stored[0].properties.get("base"), Some(&CoreValue::I64(1)));
+    assert_eq!(stored[0].properties.get("left"), Some(&CoreValue::I64(2)));
+    assert_eq!(stored[0].properties.get("right"), Some(&CoreValue::I64(3)));
+}
+
+#[tokio::test]
+async fn remove_through_two_aliases_does_not_resurrect_prior_removal() {
+    let mut writer = WriterSession::open(store(), paths("w-remove-alias-ryow"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Account {key: 'same', left: 1, right: 2, keep: 3})",
+    )
+    .await;
+
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (n:Account {key: 'same'}) \
+         MATCH (m:Account {key: 'same'}) \
+         REMOVE n.left, m.right \
+         RETURN n, m",
+    )
+    .await;
+    let node = match outcome.rows[0].get("n") {
+        Some(RuntimeValue::Node(node)) => node,
+        other => panic!("expected node alias n, got {other:?}"),
+    };
+    assert!(!node.properties.contains_key("left"));
+    assert!(!node.properties.contains_key("right"));
+    assert_eq!(node.properties.get("keep"), Some(&RuntimeValue::Integer(3)));
+    assert_eq!(
+        outcome.rows[0].get("n"),
+        outcome.rows[0].get("m"),
+        "aliases of one physical node must remain coherent"
+    );
+
+    let stored = writer.snapshot().scan_label("Account").await.unwrap();
+    assert!(!stored[0].properties.contains_key("left"));
+    assert!(!stored[0].properties.contains_key("right"));
+    assert_eq!(stored[0].properties.get("keep"), Some(&CoreValue::I64(3)));
+}
+
+#[tokio::test]
+async fn unwind_relationship_merge_set_refreshes_outer_alias() {
+    let mut writer = WriterSession::open(store(), paths("w-rel-merge-outer-alias-ryow"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Person {key: 'a'})-[:KNOWS {counter: 0}]->(:Person {key: 'b'})",
+    )
+    .await;
+
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'a'})-[z:KNOWS]->(b:Person {key: 'b'}) \
+         UNWIND range(1, 2) AS i \
+         MERGE (a)-[r:KNOWS]->(b) \
+         ON MATCH SET z.counter = z.counter + 1 \
+         RETURN r, z",
+    )
+    .await;
+    assert_eq!(outcome.edges_created, 0);
+    let counters: Vec<(i64, i64)> = outcome
+        .rows
+        .iter()
+        .map(|row| {
+            let counter = |alias: &str| match row.get(alias) {
+                Some(RuntimeValue::Rel(rel)) => match rel.properties.get("counter") {
+                    Some(RuntimeValue::Integer(value)) => *value,
+                    other => panic!("expected integer counter on {alias}, got {other:?}"),
+                },
+                other => panic!("expected relationship alias {alias}, got {other:?}"),
+            };
+            (counter("r"), counter("z"))
+        })
+        .collect();
+    assert_eq!(counters, vec![(1, 1), (2, 2)]);
+
+    let people = writer.snapshot().scan_label("Person").await.unwrap();
+    let src = people
+        .iter()
+        .find(|node| node.properties.get("key") == Some(&CoreValue::Str("a".into())))
+        .unwrap()
+        .id;
+    let edges = writer
+        .snapshot()
+        .out_edges("KNOWS", src)
+        .await
+        .unwrap()
+        .edges;
+    assert_eq!(edges[0].properties.get("counter"), Some(&CoreValue::I64(2)));
+}
+
+#[tokio::test]
+async fn unwind_repeated_relationship_map_merge_keeps_prior_patches() {
+    let mut writer = WriterSession::open(store(), paths("w-rel-set-map-unwind-ryow"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Person {key: 'a'})-[:KNOWS {base: 1}]->(:Person {key: 'b'})",
+    )
+    .await;
+
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (:Person {key: 'a'})-[r:KNOWS]->(:Person {key: 'b'}) \
+         UNWIND [{left: 2}, {right: 3}] AS patch \
+         SET r += patch \
+         RETURN r",
+    )
+    .await;
+    let final_rel = match outcome.rows.last().and_then(|row| row.get("r")) {
+        Some(RuntimeValue::Rel(rel)) => rel,
+        other => panic!("expected final relationship, got {other:?}"),
+    };
+    assert_eq!(
+        final_rel.properties.get("left"),
+        Some(&RuntimeValue::Integer(2))
+    );
+    assert_eq!(
+        final_rel.properties.get("right"),
+        Some(&RuntimeValue::Integer(3))
+    );
+}
+
+#[tokio::test]
 async fn create_with_colliding_explicit_id_errors() {
     // CREATE must create a NEW node: an explicit `_id` that already exists must
     // fail, not silently overwrite the existing node (a data-integrity /
@@ -955,8 +1145,17 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
     );
     assert_eq!(
         sst_cache.edge_streams_inserts(),
-        stream_inserts_before_miss + 1,
-        "the matching exact edge decodes only its winning SST's property bundle"
+        stream_inserts_before_miss,
+        "the matching exact point carries its bounded property map without decoding CSR streams"
+    );
+    assert_eq!(
+        sst_cache.edge_readers_inserts(),
+        0,
+        "bound relationship MERGE must not open the persisted CSR"
+    );
+    assert!(
+        sst_cache.edge_point_probes() >= 3,
+        "miss, propertyless hit and property match should all use exact sidecar probes"
     );
 
     let edge = writer
@@ -975,6 +1174,242 @@ async fn persisted_relationship_merge_is_sparse_and_preserves_properties_on_matc
         "ON MATCH SET must extend the persisted relationship property map"
     );
     assert_eq!(edge.properties.get("touched"), Some(&CoreValue::Bool(true)));
+}
+
+#[tokio::test]
+async fn unwind_bound_relationship_merge_batches_exact_probes_and_preserves_ryow() {
+    let sst_cache = SstCache::new(1);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer =
+        WriterSession::open_with_caches(store(), paths("w-merge-rel-batch-point"), caches)
+            .await
+            .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "KNOWS".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            properties: vec![
+                PropertyDef::new("code", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("retained", DataType::Utf8, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    let alice = NodeId::new();
+    let bob = NodeId::new();
+    let carol = NodeId::new();
+    for (id, key) in [(alice, "alice"), (bob, "bob"), (carol, "carol")] {
+        writer
+            .upsert_node(
+                "Person",
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([("key".into(), CoreValue::Str(key.into()))]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_edge(
+            "KNOWS",
+            alice,
+            bob,
+            &EdgeWriteRecord {
+                properties: BTreeMap::from([
+                    ("code".into(), CoreValue::Str("A".into())),
+                    ("retained".into(), CoreValue::Str("keep".into())),
+                ]),
+                schema_version: 1,
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+    assert!(writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .ssts
+        .iter()
+        .any(|sst| sst.kind == namidb_storage::SstKind::EdgesFwd && sst.path.ends_with(".ep.csr")));
+
+    let probes_before = sst_cache.edge_point_probes();
+    let replay = write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'alice'}), (b:Person {key: 'bob'}) \
+         UNWIND range(1, 2000) AS i \
+         MERGE (a)-[r:KNOWS {code: 'A'}]->(b) \
+         RETURN r",
+    )
+    .await;
+    assert_eq!(replay.rows.len(), 2000);
+    assert_eq!(replay.edges_created, 0);
+    assert_eq!(
+        sst_cache.edge_point_probes() - probes_before,
+        1,
+        "one UNWIND batch must issue one shared exact-index probe, not one CSR walk per row"
+    );
+    assert_eq!(sst_cache.edge_readers_inserts(), 0);
+    let last = match replay.rows.last().and_then(|row| row.get("r")) {
+        Some(RuntimeValue::Rel(rel)) => rel,
+        other => panic!("expected relationship result, got {other:?}"),
+    };
+    assert_eq!(
+        last.properties.get("retained"),
+        Some(&RuntimeValue::String("keep".into()))
+    );
+
+    // A duplicated miss creates once. The prefetched miss is refreshed from
+    // the staged edge after row one, so every later row matches it without
+    // another storage probe or a duplicate physical relationship.
+    let probes_before = sst_cache.edge_point_probes();
+    let fresh = write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'alice'}), (c:Person {key: 'carol'}) \
+         UNWIND range(1, 256) AS i \
+         MERGE (a)-[:KNOWS {code: 'B'}]->(c)",
+    )
+    .await;
+    assert_eq!(fresh.edges_created, 1);
+    assert_eq!(
+        sst_cache.edge_point_probes() - probes_before,
+        1,
+        "a batched miss is probed once and then served from RYOW state"
+    );
+}
+
+#[tokio::test]
+async fn loader_shape_batches_varied_existing_relationships_after_correlated_matches() {
+    const ROWS: usize = 128;
+    let sst_cache = SstCache::new(1);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer =
+        WriterSession::open_with_caches(store(), paths("w-merge-rel-loader-batch"), caches)
+            .await
+            .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Entidad".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "CITA".into(),
+            src_label: "Entidad".into(),
+            dst_label: "Entidad".into(),
+            properties: vec![
+                PropertyDef::new("codigo", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("retained", DataType::Utf8, true).unwrap(),
+                PropertyDef::new("seen", DataType::Bool, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+
+    let mut param_rows = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        let src = NodeId::new();
+        let dst = NodeId::new();
+        let src_key = format!("src-{i:04}");
+        let dst_key = format!("dst-{i:04}");
+        let codigo = format!("BOE-{i:04}");
+        for (id, key) in [(src, &src_key), (dst, &dst_key)] {
+            writer
+                .upsert_node(
+                    "Entidad",
+                    id,
+                    &NodeWriteRecord {
+                        properties: BTreeMap::from([(
+                            "key".into(),
+                            CoreValue::Str((*key).clone()),
+                        )]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        writer
+            .upsert_edge(
+                "CITA",
+                src,
+                dst,
+                &EdgeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("codigo".into(), CoreValue::Str(codigo.clone())),
+                        (
+                            "retained".into(),
+                            CoreValue::Str(format!("retained-{i:04}")),
+                        ),
+                    ]),
+                    schema_version: 1,
+                },
+            )
+            .unwrap();
+        param_rows.push(RuntimeValue::Map(BTreeMap::from([
+            ("src".into(), RuntimeValue::String(src_key)),
+            ("dst".into(), RuntimeValue::String(dst_key)),
+            ("codigo".into(), RuntimeValue::String(codigo)),
+        ])));
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse(
+        "UNWIND $rows AS row \
+         MATCH (a:Entidad {key: row.src}) \
+         MATCH (b:Entidad {key: row.dst}) \
+         MERGE (a)-[r:CITA {codigo: row.codigo}]->(b) \
+         ON MATCH SET r.seen = true \
+         RETURN r.codigo AS codigo, r.retained AS retained, r.seen AS seen",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let params = Params::from([("rows".into(), RuntimeValue::List(param_rows))]);
+
+    let probes_before = sst_cache.edge_point_probes();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.rows.len(), ROWS);
+    assert_eq!(outcome.edges_created, 0);
+    assert_eq!(outcome.properties_set, ROWS as u64);
+    assert_eq!(
+        sst_cache.edge_point_probes() - probes_before,
+        1,
+        "the real loader operator must batch all varied EdgeKeys into one sidecar probe"
+    );
+    assert_eq!(
+        sst_cache.edge_readers_inserts(),
+        0,
+        "correlated MATCH after UNWIND must not reopen the CSR per relationship"
+    );
+    for (i, row) in outcome.rows.iter().enumerate() {
+        assert_eq!(
+            row.get("codigo"),
+            Some(&RuntimeValue::String(format!("BOE-{i:04}")))
+        );
+        assert_eq!(
+            row.get("retained"),
+            Some(&RuntimeValue::String(format!("retained-{i:04}")))
+        );
+        assert_eq!(row.get("seen"), Some(&RuntimeValue::Bool(true)));
+    }
 }
 
 #[tokio::test]
@@ -1625,6 +2060,39 @@ fn int_unique_schema() -> namidb_core::schema::Schema {
         })
         .unwrap()
         .build()
+}
+
+fn string_unique_schema() -> namidb_core::schema::Schema {
+    SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build()
+}
+
+async fn writer_with_committed_string_unique_account(namespace: &str) -> (WriterSession, NodeId) {
+    let mut writer = WriterSession::open(store(), paths(namespace))
+        .await
+        .unwrap();
+    let id = NodeId::new();
+    writer
+        .upsert_node(
+            "Account",
+            id,
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::Str("existing".into()))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(string_unique_schema()).await.unwrap();
+    (writer, id)
 }
 
 #[tokio::test]
@@ -2356,20 +2824,6 @@ async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
     let mut params = Params::new();
     params.insert("keys".into(), RuntimeValue::List(keys));
     let lookups_before = writer.property_index_cache().equality_lookup_calls();
-    let expected_sidecar_inserts = writer
-        .snapshot()
-        .manifest()
-        .manifest
-        .ssts
-        .iter()
-        .filter(|sst| {
-            sst.kind == namidb_storage::SstKind::Nodes
-                && sst
-                    .equality_property_indices
-                    .iter()
-                    .any(|index| index.property == "key")
-        })
-        .count() as u64;
     let sidecar_inserts_before = writer
         .sst_cache()
         .map(|cache| cache.property_sidecar_inserts())
@@ -2387,8 +2841,8 @@ async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
     );
     assert_eq!(
         writer.property_index_cache().equality_lookup_calls() - lookups_before,
-        2_000,
-        "each batch key must route through the global equality posting index"
+        1,
+        "the complete UNWIND must route through one batched global equality posting lookup"
     );
     assert_eq!(
         writer
@@ -2396,8 +2850,8 @@ async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
             .map(|cache| cache.property_sidecar_inserts())
             .unwrap_or(0)
             - sidecar_inserts_before,
-        expected_sidecar_inserts,
-        "the 2,000 lookups must decode each key sidecar exactly once"
+        0,
+        "native paged equality lookups must not decode/insert the legacy key sidecar"
     );
     assert_eq!(
         adjacency.builds(),
@@ -2437,6 +2891,257 @@ async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
             .len(),
         1,
         "a NULL correlated key must not match/delete the first Source node's edge"
+    );
+}
+
+#[tokio::test]
+async fn global_correlated_match_batches_direct_set_and_delete_with_rollback() {
+    let mut writer = WriterSession::open(store(), paths("w-global-match-direct-write-batch"))
+        .await
+        .unwrap();
+    let doc_shared = NodeId::new();
+    let stub_shared = NodeId::new();
+    let doc_only = NodeId::new();
+    let numeric = NodeId::new();
+    for (label, id, key, kind) in [
+        ("Doc", doc_shared, CoreValue::Str("shared".into()), "doc"),
+        ("Stub", stub_shared, CoreValue::Str("shared".into()), "stub"),
+        ("Doc", doc_only, CoreValue::Str("only".into()), "only"),
+        ("Numeric", numeric, CoreValue::I64(7), "numeric"),
+    ] {
+        writer
+            .upsert_node(
+                label,
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), key),
+                        ("kind".into(), CoreValue::Str(kind.into())),
+                        ("hits".into(), CoreValue::I64(0)),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let string_key = || {
+        PropertyDef::new("key", DataType::Utf8, false)
+            .unwrap()
+            .with_indexed(true)
+    };
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Doc".into(),
+            properties: vec![string_key()],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Stub".into(),
+            properties: vec![string_key()],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Fresh".into(),
+            properties: vec![string_key()],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Numeric".into(),
+            properties: vec![PropertyDef::new("key", DataType::Int64, false)
+                .unwrap()
+                .with_indexed(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let set_query = parse(
+        "UNWIND $keys AS key \
+         MATCH (n {key: key}) \
+         SET n.hits = n.hits + 1 \
+         RETURN n.key AS key, n.kind AS kind, n.hits AS hits",
+    )
+    .unwrap();
+    let set_plan = optimize(lower(&set_query).unwrap(), &catalog);
+
+    fn count_global_multi_lookups(plan: &namidb_query::LogicalPlan) -> usize {
+        usize::from(matches!(
+            plan,
+            namidb_query::LogicalPlan::NodeByPropertyValue {
+                label,
+                property,
+                multi: true,
+                ..
+            } if label.is_empty() && property == "key"
+        )) + plan
+            .children()
+            .iter()
+            .map(|child| count_global_multi_lookups(child))
+            .sum::<usize>()
+    }
+    assert_eq!(
+        count_global_multi_lookups(&set_plan),
+        1,
+        "direct global MATCH+SET must retain one correlated posting lookup: {set_plan:?}"
+    );
+
+    let set_params = Params::from([(
+        "keys".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::String("shared".into()),
+            RuntimeValue::String("missing".into()),
+            RuntimeValue::Integer(7),
+            RuntimeValue::Null,
+            RuntimeValue::String("shared".into()),
+            RuntimeValue::String("only".into()),
+        ]),
+    )]);
+    let lookups_before = writer.property_index_cache().equality_lookup_calls();
+    let set_outcome = execute_write_staged(&set_plan, &mut writer, &set_params)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.property_index_cache().equality_lookup_calls() - lookups_before,
+        1,
+        "all correlated String values must share one global storage batch"
+    );
+    assert_eq!(set_outcome.rows.len(), 6);
+    assert_eq!(set_outcome.properties_set, 6);
+    assert_eq!(
+        set_outcome
+            .rows
+            .iter()
+            .map(|row| match row.get("key") {
+                Some(RuntimeValue::String(key)) => key.clone(),
+                Some(RuntimeValue::Integer(value)) => value.to_string(),
+                other => panic!("expected matched key, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec!["shared", "shared", "7", "shared", "shared", "only"],
+        "the batch must preserve row order, fan-out, duplicates, misses, NULL and typed fallback"
+    );
+
+    let staged = writer.overlay_snapshot();
+    assert_eq!(
+        staged
+            .lookup_node("Doc", doc_shared)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .get("hits"),
+        Some(&CoreValue::I64(2))
+    );
+    drop(staged);
+
+    writer.discard_batch();
+    let rolled_back = writer.snapshot();
+    assert_eq!(
+        rolled_back
+            .lookup_node("Doc", doc_shared)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .get("hits"),
+        Some(&CoreValue::I64(0))
+    );
+    drop(rolled_back);
+
+    // Leave a node staged before MATCH so a second execution must use the
+    // transactional global overlay, not only committed sidecars.
+    let create_fresh =
+        lower(&parse("CREATE (:Fresh {key: 'staged', kind: 'fresh', hits: 0})").unwrap()).unwrap();
+    execute_write_staged(&create_fresh, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    let staged_params = Params::from([(
+        "keys".into(),
+        RuntimeValue::List(vec![RuntimeValue::String("staged".into())]),
+    )]);
+    let staged_outcome = execute_write_staged(&set_plan, &mut writer, &staged_params)
+        .await
+        .unwrap();
+    assert_eq!(staged_outcome.rows.len(), 1);
+    assert_eq!(staged_outcome.properties_set, 1);
+    let staged = writer.overlay_snapshot();
+    assert_eq!(
+        staged
+            .scan_label("Fresh")
+            .await
+            .unwrap()
+            .first()
+            .and_then(|node| node.properties.get("hits")),
+        Some(&CoreValue::I64(1)),
+        "global batch lookup must see and update a node staged before MATCH"
+    );
+    drop(staged);
+    writer.discard_batch();
+    assert!(
+        writer
+            .snapshot()
+            .scan_label("Fresh")
+            .await
+            .unwrap()
+            .is_empty(),
+        "discard must remove both the staged node and its batched SET"
+    );
+
+    let delete_query = parse("UNWIND $keys AS key MATCH (n {key: key}) DELETE n").unwrap();
+    let delete_plan = optimize(lower(&delete_query).unwrap(), &catalog);
+    assert_eq!(
+        count_global_multi_lookups(&delete_plan),
+        1,
+        "direct global MATCH+DELETE must retain one correlated posting lookup: {delete_plan:?}"
+    );
+    let delete_params = Params::from([(
+        "keys".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::String("shared".into()),
+            RuntimeValue::String("missing".into()),
+            RuntimeValue::Integer(7),
+            RuntimeValue::Null,
+            RuntimeValue::String("only".into()),
+        ]),
+    )]);
+    let lookups_before = writer.property_index_cache().equality_lookup_calls();
+    let delete_outcome = execute_write_staged(&delete_plan, &mut writer, &delete_params)
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.property_index_cache().equality_lookup_calls() - lookups_before,
+        1
+    );
+    assert_eq!(delete_outcome.rows.len(), 4);
+    assert_eq!(delete_outcome.nodes_deleted, 4);
+    let staged_delete = writer.overlay_snapshot();
+    assert!(staged_delete.scan_label("Doc").await.unwrap().is_empty());
+    assert!(staged_delete.scan_label("Stub").await.unwrap().is_empty());
+    assert!(staged_delete
+        .scan_label("Numeric")
+        .await
+        .unwrap()
+        .is_empty());
+    drop(staged_delete);
+    writer.discard_batch();
+    let rolled_back_delete = writer.snapshot();
+    assert_eq!(rolled_back_delete.scan_label("Doc").await.unwrap().len(), 2);
+    assert_eq!(
+        rolled_back_delete.scan_label("Stub").await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        rolled_back_delete
+            .scan_label("Numeric")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "discard must restore every node deleted through the batched lookup"
     );
 }
 
@@ -2494,6 +3199,510 @@ async fn merge_unique_unwind_500_uses_one_index_population_across_commit_and_flu
         1,
         "successful commit + flush must not trigger another population scan"
     );
+}
+
+#[tokio::test]
+async fn merge_existing_unique_keys_batch_hydrates_compacted_node_sst_once() {
+    const EXISTING: usize = 256;
+    const OTHER: usize = 8_192;
+
+    // Reproduce the incremental legal-loader shape: a small :Materia label
+    // lives in one id-primary SST with a much larger unrelated corpus. The
+    // unique probe itself is O(1), but its hit returns a NodeId that MERGE
+    // historically hydrated through one cold point walk per input row. Misses
+    // skipped hydration, explaining the existing/new-key asymmetry.
+    let cache = SstCache::new(64 * 1024 * 1024);
+    let mut writer = WriterSession::open_with_caches(
+        store(),
+        paths("w-merge-existing-batch-hydration"),
+        SessionCaches {
+            sst_cache: Some(cache.clone()),
+            node_cache: None,
+            adjacency_cache: None,
+        },
+    )
+    .await
+    .unwrap();
+    for i in 0..EXISTING {
+        writer
+            .upsert_node(
+                "Materia",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([(
+                        "key".into(),
+                        CoreValue::Str(format!("materia-{i:08}")),
+                    )]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    for i in 0..OTHER {
+        writer
+            .upsert_node(
+                "Other",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([(
+                        "key".into(),
+                        CoreValue::Str(format!("other-{i:08}")),
+                    )]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Materia".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Other".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false).unwrap()],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let plan = lower(&parse("UNWIND $keys AS key MERGE (m:Materia {key: key}) RETURN m").unwrap())
+        .unwrap();
+    let keys = (0..EXISTING)
+        .map(|i| RuntimeValue::String(format!("materia-{i:08}")))
+        .collect();
+    let params = Params::from([("keys".into(), RuntimeValue::List(keys))]);
+    let row_group_inserts = cache.decoded_node_row_group_inserts();
+    let sparse_scans = cache.sparse_node_filter_scans();
+    let locator_probes = cache.node_locator_probes();
+    let locator_entries = cache.node_locator_entries_examined();
+    let locator_bytes = cache.node_locator_bytes();
+    let population_scans = writer.unique_index().populate_scans();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(outcome.rows.len(), EXISTING);
+    assert_eq!(
+        cache.decoded_node_row_group_inserts() - row_group_inserts,
+        0,
+        "a sparse MERGE batch must not cache/decode the corpus-wide complete row group"
+    );
+    assert_eq!(
+        cache.sparse_node_filter_scans() - sparse_scans,
+        0,
+        "the NodeId locator must avoid a corpus-wide sparse Parquet filter"
+    );
+    assert!(
+        cache.node_locator_probes() > locator_probes,
+        "existing-key hydration must probe the NodeId locator"
+    );
+    assert!(
+        cache.node_locator_entries_examined() - locator_entries < OTHER as u64,
+        "the locator must examine fewer entries than the unrelated corpus"
+    );
+    assert!(
+        cache.node_locator_bytes() > locator_bytes,
+        "the locator must account for bounded page reads"
+    );
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        population_scans,
+        "String MERGE must seed exact sidecar hits/misses instead of scanning the label"
+    );
+
+    // A fresh execution remains idempotent and reuses the decoded property
+    // sidecar + partial transactional keys. It may run one new sparse payload
+    // filter, but it must never populate by scanning the label.
+    let scans = writer.unique_index().populate_scans();
+    let replay = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(replay.nodes_created, 0);
+    assert_eq!(replay.rows.len(), EXISTING);
+    assert_eq!(writer.unique_index().populate_scans(), scans);
+    assert_eq!(
+        cache.decoded_node_row_group_inserts(),
+        row_group_inserts,
+        "replay must not admit a complete corpus row group either"
+    );
+}
+
+#[tokio::test]
+async fn merge_unique_string_after_staged_create_uses_point_seed_not_label_scan() {
+    let (mut writer, _) =
+        writer_with_committed_string_unique_account("w-merge-seed-after-create").await;
+    let scans = writer.unique_index().populate_scans();
+
+    // The CREATE and MERGE share one statement. The unrelated node mutation
+    // used to disable the committed sidecar seed globally, making MERGE
+    // populate :Account through scan_label even though its exact key is
+    // already indexed.
+    let plan = lower(
+        &parse(
+            "CREATE (:Other {value: 1}) \
+             MERGE (a:Account {key: 'existing'}) \
+             ON MATCH SET a.seen = true \
+             RETURN a",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let outcome = execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1, "only :Other should be created");
+    assert_eq!(outcome.rows.len(), 1);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "a staged CREATE must not force MERGE to scan the stored :Account label"
+    );
+    writer.discard_batch();
+}
+
+#[tokio::test]
+async fn merge_unique_string_reconciles_staged_set_without_label_scan() {
+    let (mut writer, account) =
+        writer_with_committed_string_unique_account("w-merge-seed-after-set").await;
+    let scans = writer.unique_index().populate_scans();
+
+    // Explicit transaction statement 1 rewrites the full record through SET,
+    // but reaches it by NodeId so no property map is incidentally populated.
+    let set = lower(&parse("MATCH (a:Account {_id: $id}) SET a.touch = true").unwrap()).unwrap();
+    let params = Params::from([("id".into(), RuntimeValue::String(account.to_string()))]);
+    execute_write_staged(&set, &mut writer, &params)
+        .await
+        .unwrap();
+    assert_eq!(writer.unique_index().populate_scans(), scans);
+
+    // Statement 2 must overlay the staged full-record upsert over the
+    // committed point candidate, preserving both identity and properties.
+    let merge = lower(
+        &parse(
+            "MERGE (a:Account {key: 'existing'}) \
+             ON MATCH SET a.seen = true \
+             RETURN a",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let outcome = execute_write_staged(&merge, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 0);
+    match outcome.rows[0].get("a") {
+        Some(RuntimeValue::Node(node)) => {
+            assert_eq!(node.id, account);
+            assert_eq!(
+                node.properties.get("touch"),
+                Some(&RuntimeValue::Bool(true))
+            );
+        }
+        other => panic!("expected merged Account, got {other:?}"),
+    }
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "a staged SET must be reconciled from the bounded overlay, not scan_label"
+    );
+    writer.discard_batch();
+}
+
+#[tokio::test]
+async fn merge_unique_string_reconciles_staged_delete_without_label_scan() {
+    let (mut writer, deleted) =
+        writer_with_committed_string_unique_account("w-merge-seed-after-delete").await;
+    let scans = writer.unique_index().populate_scans();
+
+    let delete = lower(&parse("MATCH (a:Account {_id: $id}) DELETE a").unwrap()).unwrap();
+    let params = Params::from([("id".into(), RuntimeValue::String(deleted.to_string()))]);
+    execute_write_staged(&delete, &mut writer, &params)
+        .await
+        .unwrap();
+    assert_eq!(writer.unique_index().populate_scans(), scans);
+
+    // The immutable sidecar still points at `deleted`; the staged tombstone
+    // must suppress that base hit so MERGE takes the create branch.
+    let merge = lower(&parse("MERGE (a:Account {key: 'existing'}) RETURN a").unwrap()).unwrap();
+    let outcome = execute_write_staged(&merge, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 1);
+    match outcome.rows[0].get("a") {
+        Some(RuntimeValue::Node(node)) => assert_ne!(node.id, deleted),
+        other => panic!("expected replacement Account, got {other:?}"),
+    }
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "a staged DELETE must suppress the base hit without scanning :Account"
+    );
+    writer.discard_batch();
+}
+
+#[tokio::test]
+async fn merge_existing_string_key_survives_global_mixed_type_sidecar() {
+    // Id-primary SSTs harvest one global equality sidecar per property name.
+    // Keep the Bool label lexically first so the schema union historically
+    // chose Bool as the synthetic declaration and silently omitted the String
+    // value carried by the second label. The resulting incomplete sidecar was
+    // still advertised as authoritative: MERGE seeded a false miss and created
+    // a duplicate despite B.key being unique.
+    let mut writer = WriterSession::open(store(), paths("w-merge-global-mixed-key-type"))
+        .await
+        .unwrap();
+    writer
+        .upsert_node(
+            "A",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::Bool(true))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer
+        .upsert_node(
+            "B",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::Str("existing".into()))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "A".into(),
+            properties: vec![PropertyDef::new("key", DataType::Bool, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "B".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let scans = writer.unique_index().populate_scans();
+    let outcome = write_q(
+        &mut writer,
+        "MERGE (b:B {key: 'existing'}) \
+         ON MATCH SET b.seen = true \
+         RETURN b",
+    )
+    .await;
+    assert_eq!(
+        outcome.nodes_created, 0,
+        "the global sidecar must not turn an existing mixed-type key into a miss"
+    );
+    assert_eq!(outcome.rows.len(), 1);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "mixed-type global postings must answer the existing key without a label scan"
+    );
+
+    let snapshot = writer.snapshot();
+    let a = snapshot.scan_label("A").await.unwrap();
+    let b = snapshot.scan_label("B").await.unwrap();
+    assert_eq!(a.len(), 1, "the Bool claimant must remain visible");
+    assert_eq!(b.len(), 1, "MERGE must not duplicate the String claimant");
+    assert_eq!(
+        b[0].properties.get("seen"),
+        Some(&CoreValue::Bool(true)),
+        "the existing node must take ON MATCH"
+    );
+}
+
+#[tokio::test]
+async fn merge_existing_string_key_uses_global_sidecar_when_first_type_is_unsupported() {
+    // A synthetic global property used to inherit the lexically first
+    // declaration's type. If that declaration was not encodable by ScalarV1,
+    // the collector omitted the entire property even when another label had a
+    // String unique key. Correctness survived through the scan fallback, but
+    // existing-key MERGE remained O(total nodes).
+    let mut writer = WriterSession::open(store(), paths("w-merge-global-int-first-key"))
+        .await
+        .unwrap();
+    writer
+        .upsert_node(
+            "A",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::I64(7))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer
+        .upsert_node(
+            "B",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::Str("existing".into()))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "A".into(),
+            properties: vec![PropertyDef::new("key", DataType::Int64, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "B".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let scans = writer.unique_index().populate_scans();
+    let outcome = write_q(
+        &mut writer,
+        "MERGE (b:B {key: 'existing'}) \
+         ON MATCH SET b.seen = true \
+         RETURN b",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(outcome.rows.len(), 1);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "a later String declaration must enable the global sidecar"
+    );
+
+    let snapshot = writer.snapshot();
+    let a = snapshot.scan_label("A").await.unwrap();
+    let b = snapshot.scan_label("B").await.unwrap();
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].properties.get("seen"), Some(&CoreValue::Bool(true)));
+}
+
+#[tokio::test]
+async fn merge_existing_unique_batch_refreshes_on_match_state_between_duplicate_rows() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-existing-batch-ryow"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {key: 'same', counter: 0})").await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![
+                PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true),
+                PropertyDef::new("counter", DataType::Int64, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    // Both rows prefetch the same committed node. The second row must see the
+    // first row's ON MATCH mutation, not the original prefetched NodeValue.
+    let outcome = write_q(
+        &mut writer,
+        "UNWIND range(1, 2) AS i \
+         MERGE (a:Account {key: 'same'}) \
+         ON MATCH SET a.counter = a.counter + 1 \
+         RETURN a",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(outcome.rows.len(), 2);
+    let observed: Vec<i64> = outcome
+        .rows
+        .iter()
+        .map(|row| match row.get("a") {
+            Some(RuntimeValue::Node(node)) => match node.properties.get("counter") {
+                Some(RuntimeValue::Integer(value)) => *value,
+                other => panic!("expected integer counter, got {other:?}"),
+            },
+            other => panic!("expected merged node, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(observed, vec![1, 2]);
+    let nodes = writer.snapshot().scan_label("Account").await.unwrap();
+    assert_eq!(nodes[0].properties.get("counter"), Some(&CoreValue::I64(2)));
+}
+
+#[tokio::test]
+async fn merge_existing_unique_batch_keeps_outer_alias_of_same_node_coherent() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-existing-batch-alias-ryow"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (:Account {key: 'same', counter: 0})").await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![
+                PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true),
+                PropertyDef::new("counter", DataType::Int64, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    // `z` and `a` are two aliases for the same physical node. Historically,
+    // the batch-prefetch refresh walked every BTreeMap binding; because `z`
+    // sorts after `a`, its stale clone overwrote the ON MATCH value and every
+    // duplicate input row observed counter=1.
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (z:Account {key: 'same'}) \
+         UNWIND range(1, 2) AS i \
+         MERGE (a:Account {key: 'same'}) \
+         ON MATCH SET a.counter = a.counter + 1 \
+         RETURN a, z",
+    )
+    .await;
+    assert_eq!(outcome.nodes_created, 0);
+    assert_eq!(outcome.rows.len(), 2);
+    let counters: Vec<(i64, i64)> = outcome
+        .rows
+        .iter()
+        .map(|row| {
+            let counter = |alias: &str| match row.get(alias) {
+                Some(RuntimeValue::Node(node)) => match node.properties.get("counter") {
+                    Some(RuntimeValue::Integer(value)) => *value,
+                    other => panic!("expected integer counter on {alias}, got {other:?}"),
+                },
+                other => panic!("expected node alias {alias}, got {other:?}"),
+            };
+            (counter("a"), counter("z"))
+        })
+        .collect();
+    assert_eq!(counters, vec![(1, 1), (2, 2)]);
+    let nodes = writer.snapshot().scan_label("Account").await.unwrap();
+    assert_eq!(nodes[0].properties.get("counter"), Some(&CoreValue::I64(2)));
 }
 
 #[tokio::test]
@@ -2761,6 +3970,197 @@ async fn unique_endpoint_matches_batch_for_relationship_merge_loader() {
 }
 
 #[tokio::test]
+async fn correlated_unique_match_set_batches_existing_node_updates() {
+    const ROWS: usize = 200;
+    let mut writer = WriterSession::open(store(), paths("w-match-set-existing-batch"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 2000) AS i \
+         CREATE (:Articulo {key: toString(i), titulo: 'old'})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Articulo".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse(
+        "UNWIND $rows AS row \
+         MATCH (a:Articulo {key: row.key}) \
+         SET a.embedding = row.embedding, a.titulo = row.titulo \
+         RETURN a.key AS key",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+
+    let rows = (1..=ROWS)
+        .map(|i| {
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String(i.to_string())),
+                (
+                    "embedding".into(),
+                    RuntimeValue::Vector(vec![i as f32, 1.0, -1.0]),
+                ),
+                (
+                    "titulo".into(),
+                    RuntimeValue::String(format!("articulo-{i}")),
+                ),
+            ]))
+        })
+        .collect();
+    let mut params = Params::new();
+    params.insert("rows".into(), RuntimeValue::List(rows));
+
+    let scans_before = writer.unique_index().populate_scans();
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.rows.len(), ROWS);
+    assert_eq!(outcome.properties_set, (ROWS * 2) as u64);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "UNWIND MATCH+SET must not populate the transactional index by scanning :Articulo"
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        1,
+        "all existing keys in a correlated node update must use one storage batch"
+    );
+
+    let snapshot = writer.snapshot();
+    let updated = snapshot
+        .lookup_node_by_property("Articulo", "key", "200")
+        .await
+        .unwrap()
+        .expect("updated article");
+    assert_eq!(
+        updated.properties.get("titulo"),
+        Some(&namidb_core::Value::Str("articulo-200".into()))
+    );
+    assert_eq!(
+        updated.properties.get("embedding"),
+        Some(&namidb_core::Value::Vec(vec![200.0, 1.0, -1.0]))
+    );
+}
+
+#[tokio::test]
+async fn correlated_unique_match_set_preserves_duplicates_misses_and_rollback() {
+    let mut writer = WriterSession::open(store(), paths("w-match-set-batch-rollback"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND ['a', 'b'] AS key \
+         CREATE (:Articulo {key: key, titulo: 'original', revision: 0})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Articulo".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse(
+        "UNWIND $rows AS row \
+         MATCH (a:Articulo {key: row.key}) \
+         SET a.titulo = row.titulo, a.revision = a.revision + 1 \
+         RETURN a.key AS key, a.titulo AS titulo, a.revision AS revision",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    let row = |key: &str, titulo: &str| {
+        RuntimeValue::Map(BTreeMap::from([
+            ("key".into(), RuntimeValue::String(key.into())),
+            ("titulo".into(), RuntimeValue::String(titulo.into())),
+        ]))
+    };
+    let params = Params::from([(
+        "rows".into(),
+        RuntimeValue::List(vec![
+            row("a", "first"),
+            row("missing", "ignored"),
+            row("a", "second"),
+            row("b", "third"),
+        ]),
+    )]);
+
+    let scans_before = writer.unique_index().populate_scans();
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let outcome = execute_write_staged(&plan, &mut writer, &params)
+        .await
+        .unwrap();
+    assert_eq!(outcome.rows.len(), 3, "the missing key must not reach SET");
+    assert_eq!(outcome.properties_set, 6);
+    assert_eq!(
+        outcome
+            .rows
+            .iter()
+            .map(
+                |row| match (row.get("key"), row.get("titulo"), row.get("revision"),) {
+                    (
+                        Some(RuntimeValue::String(key)),
+                        Some(RuntimeValue::String(titulo)),
+                        Some(RuntimeValue::Integer(revision)),
+                    ) => (key.as_str(), titulo.as_str(), *revision),
+                    other => panic!("expected key/title strings, got {other:?}"),
+                }
+            )
+            .collect::<Vec<_>>(),
+        vec![("a", "first", 1), ("a", "second", 2), ("b", "third", 1)],
+        "duplicate hits must retain input order and see the prior staged update"
+    );
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "String hit/miss/duplicate seeding must not populate by label scan"
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        1,
+        "the whole correlated input must issue one sidecar-backed storage batch"
+    );
+
+    writer.discard_batch();
+    let snapshot = writer.snapshot();
+    for key in ["a", "b"] {
+        let node = snapshot
+            .lookup_node_by_property("Articulo", "key", key)
+            .await
+            .unwrap()
+            .expect("committed article survives rollback");
+        assert_eq!(
+            node.properties.get("titulo"),
+            Some(&namidb_core::Value::Str("original".into())),
+            "discard must restore the pre-batch record for {key}"
+        );
+        assert_eq!(
+            node.properties.get("revision"),
+            Some(&namidb_core::Value::I64(0)),
+            "discard must restore the pre-batch revision for {key}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unique_string_match_set_stays_transactional_across_auto_commits() {
     const ROWS: i64 = 128;
     let mut writer = WriterSession::open(store(), paths("w-match-unique-string-auto-commits"))
@@ -2788,7 +4188,7 @@ async fn unique_string_match_set_stays_transactional_across_auto_commits() {
     drop(snapshot);
     let plan = optimize(lower(&query).unwrap(), &catalog);
     let scans_before = writer.unique_index().populate_scans();
-    let probes_before = writer.unique_index().probes();
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
     for i in 1..=ROWS {
         let mut params = Params::new();
         params.insert("key".into(), RuntimeValue::String(i.to_string()));
@@ -2797,13 +4197,14 @@ async fn unique_string_match_set_stays_transactional_across_auto_commits() {
         assert_eq!(outcome.rows.len(), 1);
     }
     assert_eq!(
-        writer.unique_index().populate_scans() - scans_before,
-        1,
-        "MATCH(unique String)+SET auto-commits must populate the tx map once"
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "MATCH(unique String)+SET must seed exact keys without a label scan"
     );
-    assert!(
-        writer.unique_index().probes() >= probes_before + ROWS as u64,
-        "every auto-commit must probe the preserved transactional unique map"
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        ROWS as u64,
+        "each one-row statement should issue one sidecar-backed point batch"
     );
 }
 
@@ -2835,7 +4236,7 @@ async fn unique_string_match_delete_stays_transactional_across_auto_commits() {
     drop(snapshot);
     let plan = optimize(lower(&query).unwrap(), &catalog);
     let scans_before = writer.unique_index().populate_scans();
-    let probes_before = writer.unique_index().probes();
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
     for i in 1..=ROWS {
         let mut params = Params::new();
         params.insert("key".into(), RuntimeValue::String(i.to_string()));
@@ -2843,13 +4244,14 @@ async fn unique_string_match_delete_stays_transactional_across_auto_commits() {
         assert_eq!(outcome.nodes_deleted, 1);
     }
     assert_eq!(
-        writer.unique_index().populate_scans() - scans_before,
-        1,
-        "MATCH(unique String)+DELETE auto-commits must populate the tx map once"
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "MATCH(unique String)+DELETE must seed exact keys without a label scan"
     );
-    assert!(
-        writer.unique_index().probes() >= probes_before + ROWS as u64,
-        "every node DELETE auto-commit must probe the preserved tx map"
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        ROWS as u64,
+        "each one-row DELETE should issue one sidecar-backed point batch"
     );
 }
 
@@ -2937,6 +4339,52 @@ async fn merge_uses_fully_covered_composite_key_on_secondary_label() {
     assert!(
         writer.unique_index().probes() > probes_before,
         "composite MERGE lookup must probe the transactional index"
+    );
+}
+
+#[tokio::test]
+async fn merge_prefers_preseeded_string_unique_key_over_composite_scan() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-preseed-before-composite"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Account {key: 'k1', tenant: 't1', part: 'p1'})",
+    )
+    .await;
+    let mut schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Account".into(),
+            properties: vec![
+                PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true),
+                PropertyDef::new("tenant", DataType::Utf8, false).unwrap(),
+                PropertyDef::new("part", DataType::Utf8, false).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+    schema.constraints.push(Constraint {
+        name: "uniq_account_tenant_part".into(),
+        label: "Account".into(),
+        properties: vec!["tenant".into(), "part".into()],
+        kind: ConstraintKind::Unique,
+    });
+    writer.flush(schema).await.unwrap();
+
+    let scans_before = writer.unique_index().populate_scans();
+    let matched = write_q(
+        &mut writer,
+        "MERGE (n:Account {key: 'k1', tenant: 't1', part: 'p1'}) \
+         ON MATCH SET n.seen = true RETURN n",
+    )
+    .await;
+    assert_eq!(matched.nodes_created, 0);
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans_before,
+        "the batch-seeded String key must answer before the composite key can populate by scan"
     );
 }
 

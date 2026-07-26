@@ -388,6 +388,25 @@ impl AdjacencyCache {
         }
     }
 
+    /// Drop every retained CSR while preserving counters and capacity.
+    ///
+    /// The next graph expansion rebuilds immutable adjacency on demand; this
+    /// lets a process-level memory governor reclaim the largest cache tier
+    /// before it has to reject new work.
+    pub fn clear(&self) {
+        // Keep the map and its accounting atomic with respect to insertions.
+        // `get_or_build` and `prune_namespace` take these locks in the same
+        // order, so a concurrent builder cannot insert between clearing the
+        // map and resetting its byte counter.
+        let mut map = self.inner.lock().unwrap();
+        let mut used = self.used_bytes.lock().unwrap();
+        // `clear()` keeps HashMap buckets proportional to the historical
+        // high-water mark. Replace the table so RSS pressure can reclaim that
+        // allocation as well as the CSR values.
+        *map = HashMap::new();
+        *used = 0;
+    }
+
     /// Count of CSR entries whose key belongs to `namespace`. Observability
     /// + test probe: with the process-wide shared cache, the global
     /// [`Self::builds`] counter can no longer prove "this namespace built
@@ -813,6 +832,48 @@ mod tests {
             cache.used_bytes() < used_before,
             "pruning must release budget bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_releases_entries_and_accounting_but_cache_remains_usable() {
+        let cache = AdjacencyCache::new(1024 * 1024);
+        let key = AdjacencyKey::new("tenants/acme", 1, "KNOWS", EdgeDirection::Forward);
+        cache
+            .get_or_build(key.clone(), || async {
+                Ok(build_adj_manual(
+                    "KNOWS",
+                    EdgeDirection::Forward,
+                    1,
+                    &[(nid(1), nid(2), 1, false)],
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cache.entries(), 1);
+        assert!(cache.used_bytes() > 0);
+        assert!(cache.inner.lock().unwrap().capacity() > 0);
+
+        cache.clear();
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.used_bytes(), 0);
+        assert_eq!(
+            cache.inner.lock().unwrap().capacity(),
+            0,
+            "clear must release the HashMap bucket allocation"
+        );
+
+        cache
+            .get_or_build(key, || async {
+                Ok(EdgeAdjacency::empty(
+                    "KNOWS".into(),
+                    EdgeDirection::Forward,
+                    1,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cache.entries(), 1);
+        assert!(cache.used_bytes() > 0);
     }
 
     #[test]

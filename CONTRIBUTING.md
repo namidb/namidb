@@ -62,10 +62,12 @@ tolerated.
 
 ## Licensing
 
-NamiDB is licensed under the Business Source License 1.1 (BSL 1.1),
-with automatic conversion to Apache License 2.0 three years after each
-release. A separate commercial license is available for teams that want
-to embed or redistribute NamiDB outside the bounds of BSL.
+NamiDB is licensed under the Business Source License 1.1 (BSL 1.1).
+The Change License is Apache License 2.0, effective on May 18, 2029 or
+on the fourth anniversary of a specific version's first public distribution
+if that is earlier, exactly as stated in [`LICENSE`](./LICENSE). A separate
+commercial license is available for teams that want to embed or redistribute
+NamiDB outside the bounds of BSL.
 
 By contributing you agree to license your contribution under the same
 BSL 1.1 the rest of the project uses, and to dual-license it under the

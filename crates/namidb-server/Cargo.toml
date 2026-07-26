@@ -1,5 +1,6 @@
 [package]
 name = "namidb-server"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -61,6 +62,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 humantime = "2"
+memory-stats = { workspace = true }
+libc = { workspace = true }
 # TLS on the serving path (rustls, aligned with the versions already in the
 # lock via reqwest/object_store). `ring` avoids the aws-lc-rs C toolchain.
 axum-server = { version = "0.7", features = ["tls-rustls"] }

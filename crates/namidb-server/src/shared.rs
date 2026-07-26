@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::auth::AuthConfig;
 use crate::authz::{AuthzHook, NoOpAuthz};
+use crate::memory::MemoryGovernor;
 use crate::metrics::Metrics;
 use crate::registry::NamespaceRegistry;
 
@@ -42,6 +43,8 @@ pub struct SharedAppState {
     pub memtable_flush_bytes: usize,
     /// Memtable bytes above which writes are softly stalled (backpressure).
     pub memtable_stall_bytes: usize,
+    /// Process-wide total resident-memory admission.
+    pub memory: Arc<MemoryGovernor>,
     /// Foreground writer-lock acquisition bound (`ZERO` disables); see the
     /// single-tenant twin on `AppState`.
     pub writer_lock_timeout: Duration,
@@ -55,7 +58,10 @@ pub struct SharedAppState {
 }
 
 impl SharedAppState {
-    /// Create a new shared state for multi-tenant mode.
+    /// Create shared state with memory admission disabled.
+    ///
+    /// This keeps the 2.0 public constructor source-compatible. Server boot
+    /// uses [`Self::new_with_memory`] to attach its process-wide governor.
     #[allow(clippy::too_many_arguments)] // process-wide config assembled once at boot
     pub fn new(
         registry: Arc<NamespaceRegistry>,
@@ -71,6 +77,40 @@ impl SharedAppState {
         writer_lock_timeout: Duration,
         default_namespace: String,
     ) -> Self {
+        Self::new_with_memory(
+            registry,
+            auth,
+            metrics,
+            query_timeout,
+            write_timeout,
+            query_row_cap,
+            write_stall_l0,
+            write_stall_delay,
+            memtable_flush_bytes,
+            memtable_stall_bytes,
+            Arc::new(MemoryGovernor::new(crate::memory::DEFAULT_MEMORY_MAX_BYTES)),
+            writer_lock_timeout,
+            default_namespace,
+        )
+    }
+
+    /// Create shared state with an explicit process-wide memory governor.
+    #[allow(clippy::too_many_arguments)] // process-wide config assembled once at boot
+    pub fn new_with_memory(
+        registry: Arc<NamespaceRegistry>,
+        auth: Arc<AuthConfig>,
+        metrics: Arc<Metrics>,
+        query_timeout: Duration,
+        write_timeout: Duration,
+        query_row_cap: usize,
+        write_stall_l0: usize,
+        write_stall_delay: Duration,
+        memtable_flush_bytes: usize,
+        memtable_stall_bytes: usize,
+        memory: Arc<MemoryGovernor>,
+        writer_lock_timeout: Duration,
+        default_namespace: String,
+    ) -> Self {
         Self {
             registry,
             auth,
@@ -82,6 +122,7 @@ impl SharedAppState {
             write_stall_delay,
             memtable_flush_bytes,
             memtable_stall_bytes,
+            memory,
             writer_lock_timeout,
             default_namespace,
             authz: Arc::new(NoOpAuthz),
