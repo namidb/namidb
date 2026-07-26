@@ -15,6 +15,99 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.0.6] - 2026-07-26: Bounded existing-node vector updates
+
+This patch removes the retained multi-megabyte working set behind
+`MATCH/MERGE ... SET` updates of existing vector-bearing nodes and bounds the
+remaining compaction and object-store paths for long legal-corpus loads.
+
+**Compatibility scope.** 2.0.6 reads 2.0.5 stores and migrates settled node
+SSTs online. The `.nloc2` exact-record extension keeps the 2.0.5 node-locator
+body as its prefix, so a rollback reader continues to use the ordinal locator
+and safely ignores the appended accelerator. HTTP, Bolt, CLI, Python and
+existing vector/full-text index definitions remain compatible.
+
+### Fixed — existing-node updates and memory
+
+- **Point updates no longer hydrate a wide Parquet page.** Current node SSTs
+  append a checksummed, range-readable `NodeId -> compressed exact record`
+  B+tree to the compatible locator body. Existing-node updates fetch only the
+  requested records and do not open the Parquet footer or decompress the
+  unrelated 1 MiB `__overflow_json` page.
+- **Write-only Cypher no longer retains internal result rows.** An explicit
+  execution-only result sink consumes every write but does not accumulate the
+  matched nodes, `UNWIND` maps or 1,024d embeddings for Bolt/HTTP to discard.
+  `WITH`, `UNWIND`, filters, ordering and aggregations are still evaluated, so
+  expression errors retain atomic rollback semantics.
+- **Flushes return free allocator arenas to the OS.** Admin flush drops the
+  writer lock before running `malloc_trim` on glibc and keeps a process-wide
+  owned permit through the blocking trim even if the HTTP request disconnects.
+  Empty flushes skip the trim.
+- **Exact-record construction is disk-backed.** Variable-size locator values
+  and node Parquet output stream through anonymous files in
+  `NAMIDB_SPOOL_DIR`; completed Parquet output is exposed through an immutable
+  mmap, while B+tree pages, Arrow batches and multipart windows stay bounded
+  instead of coexisting with a corpus-sized heap buffer. Flush encoding,
+  compression and spool writeback run on the blocking pool. A process-wide
+  single-flight permit remains owned by that blocking task after request
+  cancellation, so repeated retries cannot accumulate detached corpus-sized
+  builds. `sync_data` on Parquet and exact-record spools surfaces
+  delayed-allocation failures and makes their pages reclaimable before object
+  upload.
+
+### Changed — compaction and object storage
+
+- Every compaction input is file-mapped. Remote objects, including a large
+  fan-in of individually small L0 files, first stream to disk, synchronise
+  writeback and then mmap; local file-store bodies map directly.
+- Node merge cursors are lazy, retain at most 64 decoded rows per active
+  source, and activate sources only when their manifest `min_key` reaches the
+  heap frontier. The complete L0 backlog still drains in one pass and winner
+  order remains `(NodeId asc, LSN desc, source order)`.
+- A settled 2.0.5 L1 migrates by attaching a fresh `.nloc2` sidecar without
+  rewriting its Parquet body. Physical-only node migrations preserve fresh
+  vector/FTS bodies, IDs and durable build generations rather than cloning and
+  rebuilding the search corpus.
+- Flush and offline attach admit at most four independent object uploads, with
+  at most eight 5 MiB multipart parts per object. All siblings drain after an
+  error, and a cancellation-safe multipart guard aborts unfinished uploads on
+  task eviction; complete unreferenced objects remain janitor-reclaimable.
+- The official image creates a writable disk-backed
+  `/var/tmp/namidb-spool`, and the example Compose deployment mounts a
+  dedicated volume there. Bare deployments can override
+  `NAMIDB_SPOOL_DIR`.
+
+### Changed — Bolt and release delivery
+
+- Authenticated Bolt messages now default to a configurable 64 MiB ceiling
+  (`NAMIDB_BOLT_MAX_MESSAGE_BYTES`), admitting 2,000-row batches of 1,024d
+  vectors that exceeded the previous fixed 16 MiB cap. The unauthenticated
+  path remains fixed at 64 KiB, and oversized authenticated frames receive an
+  explicit `FAILURE` diagnostic before their connection closes.
+- PackStream decoding now enforces a cumulative heap/cardinality budget across
+  nested lists, maps and structs, caps aggregate chunk prefetch, and transfers
+  RUN parameters without avoidable full-tree clones. Malicious container
+  lengths cannot turn one bounded wire message into an unbounded allocation.
+- Authenticated connections now share a process-wide, two-phase Bolt working
+  budget (`NAMIDB_BOLT_MEMORY_BUDGET_BYTES`). Partial frames reserve
+  `64 KiB + 2 × wire bytes` with fail-fast growth; only a complete data frame
+  upgrades atomically to `64 KiB + 16 × wire bytes` before decode. A stalled
+  client therefore retains only its bounded framing allocation and cannot
+  monopolise a global ingress lock. Temporary exhaustion is retryable, partial
+  frames have a configurable deadline
+  (`NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT`, default 120 s), and small
+  PULL/DISCARD/transaction-reset controls remain available under pressure.
+- With `NAMIDB_MEMORY_MAX_BYTES`, pre-decode admission now holds an RAII
+  reservation for the request's projected working set through execution.
+  Concurrent frames cannot all race through the same sampled RSS headroom.
+  Every transition to Bolt `FAILED` also rolls back an open transaction and
+  releases pending result rows before its writer and timeout protections could
+  be stranded.
+- Bolt results stay as runtime rows until demanded by `PULL`; each page is
+  converted with ownership transfer, while `DISCARD` drops rows without
+  expanding vectors into PackStream values. Duplicate projection names retain
+  their prior semantics, and stream completion/RESET returns the backing row
+  allocation immediately.
 - PyPI's post-publication integrity gate now treats an initial version-JSON
   `404` as propagation lag and keeps polling. A successful five-file OIDC
   upload no longer leaves the workflow red during the brief visibility window.
@@ -2337,7 +2430,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.5...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.6...HEAD
+[2.0.6]: https://github.com/namidb/namidb/compare/v2.0.5...v2.0.6
 [2.0.5]: https://github.com/namidb/namidb/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/namidb/namidb/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/namidb/namidb/compare/v2.0.2...v2.0.3

@@ -334,6 +334,11 @@ pub struct SstDescriptor {
     #[serde(default)]
     pub label_index: Option<LabelIndexDescriptor>,
     /// Exact physical-row locator emitted by current node SST writers.
+    ///
+    /// A path ending in `.nloc2` keeps the original locator as a compatible
+    /// prefix and appends a range-readable exact-node-record index. Older
+    /// readers ignore the suffix bytes; current point updates use them to
+    /// avoid materialising a wide Parquet data page for one node.
     #[serde(default)]
     pub node_locator: Option<NodeLocatorDescriptor>,
 
@@ -364,6 +369,20 @@ pub(crate) fn edge_point_sidecar_path(descriptor: &SstDescriptor) -> Option<Stri
         .path
         .strip_suffix(".ep.csr")
         .map(|base| format!("{base}.epidx"))
+}
+
+/// Whether a node locator also carries the exact-record extension introduced
+/// for point read-modify-write hydration.
+///
+/// The filename is the durable feature marker, mirroring `.epidx`: it avoids a
+/// new public manifest field while letting compaction rewrite legacy `.nloc`
+/// SSTs exactly once. The locator prefix itself stays readable by 2.0.4/2.0.5.
+pub(crate) fn node_locator_has_exact_records(descriptor: &SstDescriptor) -> bool {
+    descriptor.kind == SstKind::Nodes
+        && descriptor
+            .node_locator
+            .as_ref()
+            .is_some_and(|locator| locator.path.ends_with(".nloc2"))
 }
 
 /// One `(label, property)` statistics entry for an id-primary node SST
@@ -525,8 +544,9 @@ pub struct LabelIndexDescriptor {
 ///
 /// The row ordinal feeds Parquet's `RowSelection`, which skips unselected
 /// data pages using the offset index instead of evaluating `node_id` for
-/// every row. `None` on legacy SSTs, whose reader retains the conservative
-/// row-group/RowFilter fallback.
+/// every row. Current `.nloc2` bodies append an exact-record B+tree after the
+/// compatible locator prefix. `None` on legacy SSTs, whose reader retains the
+/// conservative row-group/RowFilter fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeLocatorDescriptor {
     pub path: String,

@@ -55,6 +55,17 @@ work survives a disconnected client; the global request cap still bounds
 waiting callers. Under hard pressure
 multi-tenant mode refuses to open a cold namespace merely to flush it.
 
+Flush and compaction spool node Parquet outputs, corpus-sized exact-node values
+and remote compaction inputs to `NAMIDB_SPOOL_DIR` instead of retaining them in
+RSS. The bare binary defaults to disk-backed `/var/tmp` on Unix (the native
+temp directory elsewhere); the official image uses
+`/var/tmp/namidb-spool`. During full-backlog node compaction, provision
+`sum(inputs) + parquet_output + exact_record_output` — roughly 3× the
+compacted live node bytes (about 12–15 GiB for one million 1024d nodes), plus
+headroom for superseded versions. Spools are synced before mmap/upload, and
+flush builds remain process-wide single-flight after caller cancellation.
+Avoid a RAM-backed `/tmp`/`tmpfs`.
+
 Large `.vg` and `.ft` bodies use one shared decoded-index eviction pool.
 `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` optionally reserves exact bytes for that
 pool inside `NAMIDB_CACHE_MAX_BYTES`; the remaining cache tiers are fitted into
@@ -294,6 +305,29 @@ Pass `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`) to expose
 a Bolt 4.4 / 5.0 / 5.4 listener alongside the HTTP API. Both protocols
 share the same `WriterSession`, the same auth token, and the same
 single-writer-per-namespace invariant.
+
+Authenticated Bolt messages are capped at 64 MiB by default. Override the
+exact-byte ceiling with `--bolt-max-message-bytes` or
+`NAMIDB_BOLT_MAX_MESSAGE_BYTES`; the unauthenticated handshake and LOGON path
+always remains capped at 64 KiB. An oversized authenticated request receives a
+`Neo.ClientError.Request.Invalid` diagnostic and its connection closes cleanly,
+so clients should split very large parameter sets into batches.
+
+Authenticated data frames also share one process-wide working-set admission
+budget before allocation and PackStream decode. It defaults to half of
+`NAMIDB_MEMORY_MAX_BYTES` when that RSS governor is enabled, otherwise
+`1073807360` bytes (~1 GiB), and can be set explicitly with
+`NAMIDB_BOLT_MEMORY_BUDGET_BYTES`. An incomplete frame holds
+`64 KiB + 2 × wire body bytes`; after its terminator, a data frame atomically
+upgrades the same fail-fast lease to `64 KiB + 16 × wire body bytes` through
+decode, parameter conversion, execution and any RUN prefetch. The server also
+atomically reserves measured RSS headroom, including concurrent reservations,
+before decode and retains that RAII guard through request handling; normal
+admission repeats at execution time. `NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT`
+(default `120s`, `0s` disables) bounds a frame from its first byte; completely
+idle authenticated connections hold no message permit. Small PULL, DISCARD,
+COMMIT, ROLLBACK, RESET, GOODBYE and LOGOFF frames remain available under
+pressure.
 
 ```bash
 namidb-server \

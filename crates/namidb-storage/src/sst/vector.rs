@@ -47,6 +47,8 @@ const MAGIC: &[u8; 8] = b"NAMIVG04";
 /// the existing adaptive widening/exact fallback until compaction emits v4.
 const LEGACY_MAGIC_V3: &[u8; 8] = b"NAMIVG03";
 
+type VectorSearchResults = Vec<([u8; 16], f32)>;
+
 /// Default maximum number of distinct values retained for one vector-filter
 /// property. High-cardinality keys (document ids, URLs) are deliberately left
 /// to the equality sidecar/residual path rather than bloating every `.vg`.
@@ -1045,7 +1047,7 @@ impl VectorGraphIndex {
         k: usize,
         ef: usize,
         groups: &[(String, Vec<Value>)],
-    ) -> Option<(Vec<([u8; 16], f32)>, usize)> {
+    ) -> Option<(VectorSearchResults, usize)> {
         let word_count = self.body.ids.len().div_ceil(64);
         let mut eligible: Option<Vec<u64>> = None;
         for (property, alternatives) in groups {

@@ -3,9 +3,9 @@
 //! Defined by [RFC-002](../../../../docs/rfc/002-sst-format.md) §2.
 //!
 //! The writer takes a stream of `RecordBatch`es matching the canonical
-//! node-SST schema and emits a Parquet body in memory; the caller is
-//! responsible for PUTting the body to object_store and for committing the
-//! resulting `NodeSstStats` to a new manifest version.
+//! node-SST schema and emits a Parquet body through a disk-backed spool; the
+//! caller is responsible for PUTting the body to object_store and for
+//! committing the resulting `NodeSstStats` to a new manifest version.
 //!
 //! ## Schema
 //!
@@ -27,6 +27,8 @@
 //! - The batch's schema is exactly the canonical schema built from `LabelDef`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
+use std::io::Write;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ use arrow_schema::{
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
+use memmap2::MmapOptions;
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore};
 use parquet::arrow::arrow_reader::{
@@ -181,11 +184,11 @@ pub struct NodeSstStats {
     pub schema_version_max: u64,
 }
 
-/// In-memory streaming writer for a node SST.
+/// Disk-backed streaming writer for a node SST.
 pub struct NodeSstWriter {
     label: LabelDef,
     schema: SchemaRef,
-    inner: ArrowWriter<Vec<u8>>,
+    inner: ArrowWriter<File>,
     bloom: BloomFilter,
     // running stats
     row_count: u64,
@@ -228,7 +231,9 @@ impl NodeSstWriter {
 
         let schema = node_arrow_schema(&label);
         let writer_props = build_writer_properties(&options);
-        let inner = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(writer_props))
+        let spool = crate::sst::paged_index::create_spool_file()
+            .map_err(|e| Error::invariant(format!("node SST spool create: {e}")))?;
+        let inner = ArrowWriter::try_new(spool, schema.clone(), Some(writer_props))
             .map_err(|e| Error::invariant(format!("parquet writer init: {e}")))?;
 
         let bloom =
@@ -366,11 +371,49 @@ impl NodeSstWriter {
             self.schema_version_min = 0;
         }
 
-        let body = self
+        let mut spool = self
             .inner
             .into_inner()
             .map_err(|e| Error::invariant(format!("parquet close: {e}")))?;
-        let body = Bytes::from(body);
+        spool
+            .flush()
+            .map_err(|e| Error::invariant(format!("node SST spool flush: {e}")))?;
+        // Make the spool reclaimable before the immutable mapping is read by
+        // property-stat collection and object upload. Merely flushing the
+        // `File` exposes the bytes but may leave a corpus-sized dirty page
+        // cache charged to the process cgroup on a slow disk. It also defers
+        // delayed-allocation failures until after the SST is being published.
+        spool
+            .sync_data()
+            .map_err(|e| Error::invariant(format!("node SST spool sync: {e}")))?;
+        let body_len_u64 = spool
+            .metadata()
+            .map_err(|e| Error::invariant(format!("node SST spool metadata: {e}")))?
+            .len();
+        if body_len_u64 == 0 {
+            return Err(Error::invariant(
+                "parquet close produced an empty node SST spool",
+            ));
+        }
+        let body_len = usize::try_from(body_len_u64)
+            .map_err(|_| Error::invariant("node SST spool exceeds addressable memory"))?;
+        // SAFETY: `into_inner` has closed the Parquet writer, `flush` has
+        // completed, and metadata above proves that the immutable anonymous
+        // file owns at least `body_len` bytes. `Mmap` owns the mapping after
+        // the file handle is dropped, and `Bytes::from_owner` keeps it alive
+        // for every clone sent through the existing upload/read APIs.
+        let mapped = unsafe {
+            MmapOptions::new()
+                .len(body_len)
+                .map(&spool)
+                .map_err(|e| Error::invariant(format!("node SST spool mmap: {e}")))?
+        };
+        if mapped.len() != body_len {
+            return Err(Error::invariant(
+                "node SST mmap length disagrees with spool metadata",
+            ));
+        }
+        let body = Bytes::from_owner(mapped);
 
         let property_stats = compute_property_stats(&self.label, &body, &self.property_hlls)?;
 
@@ -1941,6 +1984,45 @@ mod tests {
         let scanned = reader.scan().unwrap();
         let total_rows: usize = scanned.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+
+    #[test]
+    fn spooled_writer_is_wire_identical_to_in_memory_arrow_writer() {
+        let label = person_label();
+        let options = NodeSstWriterOptions {
+            row_group_target_rows: 2,
+            ..NodeSstWriterOptions::default()
+        };
+        let batch = build_batch(&[
+            (1, false, 10, Some("Alice"), Some(30), 1, None),
+            (
+                2,
+                false,
+                11,
+                Some("Bob"),
+                None,
+                1,
+                Some(r#"{"city":"Quito"}"#),
+            ),
+            (3, true, 12, None, None, 1, None),
+        ]);
+
+        // Reconstruct the former Vec-backed implementation as a wire oracle.
+        // The backing sink must not affect a single Parquet byte.
+        let mut in_memory = ArrowWriter::try_new(
+            Vec::new(),
+            node_arrow_schema(&label),
+            Some(build_writer_properties(&options)),
+        )
+        .unwrap();
+        in_memory.write(&batch).unwrap();
+        let expected = in_memory.into_inner().unwrap();
+
+        let mut spooled = NodeSstWriter::new(label, options).unwrap();
+        spooled.write_batch(&batch).unwrap();
+        let actual = spooled.finish().unwrap().body;
+
+        assert_eq!(actual.as_ref(), expected.as_slice());
     }
 
     #[test]

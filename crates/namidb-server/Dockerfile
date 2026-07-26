@@ -44,7 +44,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 65532 --user-group --no-create-home namidb
+    && useradd --system --uid 65532 --user-group --no-create-home namidb \
+    && install -d -o namidb -g namidb -m 0700 /var/tmp/namidb-spool
 
 COPY --from=builder /build/target/release/namidb-server /usr/local/bin/namidb-server
 COPY --chmod=0555 crates/namidb-server/docker-healthcheck.sh /usr/local/bin/namidb-healthcheck
@@ -58,6 +59,7 @@ EXPOSE 8080
 # temporary working set is dropped, obscuring the engine cache budget and
 # increasing OOM risk during long-running bulk loads.
 ENV NAMIDB_LISTEN=0.0.0.0:8080 \
+    NAMIDB_SPOOL_DIR=/var/tmp/namidb-spool \
     RUST_LOG=info \
     MALLOC_ARENA_MAX=2 \
     MALLOC_TRIM_THRESHOLD_=131072

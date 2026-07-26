@@ -69,7 +69,7 @@ use crate::cache::{
     UniquePropertySidecar,
 };
 use crate::error::{Error, Result};
-use crate::flush::{EdgeWriteRecord, NodeWriteRecord};
+use crate::flush::{decode_exact_node_record, EdgeWriteRecord, NodeWriteRecord};
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 use crate::manifest::KindSpecificStats;
 use crate::manifest::{
@@ -2703,6 +2703,96 @@ impl<'mt> Snapshot<'mt> {
                 continue;
             }
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+
+            // Current `.nloc2` objects append an exact NodeId -> record B+tree
+            // after the backward-compatible ordinal locator. Prefer it before
+            // even opening the Parquet footer: a random existing-node update
+            // then fetches only that node's compressed JSON payload instead of
+            // decoding the 1 MiB `__overflow_json` page that happens to contain
+            // its row. At legal-corpus scale this is the difference between a
+            // few KiB and ~MiB of allocator high-water per updated node.
+            if crate::manifest::node_locator_has_exact_records(desc) {
+                if let Some(locator) = desc
+                    .node_locator
+                    .as_ref()
+                    .filter(|locator| locator.entry_count == desc.row_count)
+                {
+                    let locator_absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        locator.path
+                    );
+                    let probed = crate::sst::paged_index::probe_node_records(
+                        self.store.clone(),
+                        Path::from(locator_absolute),
+                        &sorted_pending,
+                    )
+                    .await;
+                    match probed {
+                        Ok((records, stats)) if stats.index_entries == locator.entry_count => {
+                            let decoded = records
+                                .into_iter()
+                                .map(|(id_bytes, encoded)| {
+                                    let (lsn, op) = decode_exact_node_record(&encoded)?;
+                                    let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                                    let view = match op {
+                                        MemOp::Tombstone => None,
+                                        MemOp::Upsert(payload) => Some(node_view_from_payload(
+                                            id,
+                                            lsn,
+                                            &payload,
+                                            &self.manifest.manifest.label_dict,
+                                            &desc.scope,
+                                        )?),
+                                    };
+                                    Ok((id_bytes, lsn, view))
+                                })
+                                .collect::<Result<Vec<_>>>();
+                            match decoded {
+                                Ok(decoded) => {
+                                    if let Some(cache) = &self.cache {
+                                        cache.record_node_locator_probe(stats);
+                                    }
+                                    for (id_bytes, lsn, view) in decoded {
+                                        match winners.get(&id_bytes) {
+                                            Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
+                                            _ => {
+                                                winners.insert(id_bytes, (lsn, view));
+                                            }
+                                        }
+                                    }
+                                    // Matching keys were returned and checked;
+                                    // all other requested keys are authoritative
+                                    // misses because both sidecar trees cover
+                                    // exactly `row_count` entries.
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        path = %locator.path,
+                                        error = %error,
+                                        "exact node-record index is corrupt; falling back to Parquet"
+                                    );
+                                }
+                            }
+                        }
+                        Ok((_records, _stats)) => {
+                            // Count disagreement means the extension cannot be
+                            // authoritative for absence. Retain the compatible
+                            // ordinal/Parquet fallback below.
+                        }
+                        Err(error) if optional_accelerator_fallback(&error) => {
+                            tracing::warn!(
+                                path = %locator.path,
+                                error = %error,
+                                "exact node-record index unavailable; falling back to Parquet"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
             let label_def = self.label_def_for_node_sst(desc);
             let md = self.node_sst_metadata(desc, &absolute).await?;
             if let Some(locator) = desc
@@ -11364,7 +11454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locator_and_offset_index_skip_the_id_column_for_interleaved_rows() {
+    async fn exact_record_locator_skips_parquet_for_interleaved_rows() {
         let store = make_store();
         let paths = make_paths("batch-node-locator");
         let ms = ManifestStore::new(store.clone(), paths.clone());
@@ -11429,11 +11519,16 @@ mod tests {
         assert_eq!(
             cache.decoded_node_row_group_inserts(),
             0,
-            "partial ordinal results must not masquerade as complete row groups"
+            "exact-record results must not decode or cache Parquet row groups"
+        );
+        assert_eq!(
+            cache.metadata_usage_bytes(),
+            0,
+            "an exact-record hit must not even open the Parquet footer"
         );
         assert!(
             cache.get(&absolute).is_none(),
-            "offset-index path must not fetch the complete node SST"
+            "exact-record path must not fetch the complete node SST"
         );
     }
 

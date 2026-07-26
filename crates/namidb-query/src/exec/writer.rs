@@ -152,38 +152,75 @@ fn execute_write_inner<'a>(
     outcome: &'a mut WriteOutcome,
     routing: &'a PlanRouting,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
+    execute_write_inner_mode(plan, writer, params, outcome, routing, true)
+}
+
+/// Execute one operator, optionally retaining the rows it produces.
+///
+/// Children still run in normal row-producing mode because their parent may
+/// need those bindings to perform its write. The terminal
+/// [`LogicalPlan::DiscardResult`] invokes its direct child with
+/// `retain_output = false`, which lets the final write consume and release each
+/// updated row instead of accumulating a batch of duplicate embeddings merely
+/// to throw it away at the result boundary.
+fn execute_write_inner_mode<'a>(
+    plan: &'a LogicalPlan,
+    writer: &'a mut WriterSession,
+    params: &'a Params,
+    outcome: &'a mut WriteOutcome,
+    routing: &'a PlanRouting,
+    retain_output: bool,
+) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
     async move {
         match plan {
             // ─── Write operators ────────────────────────────────────
             LogicalPlan::Create { input, elements } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
                     let new_row = apply_create(elements, row, writer, params, outcome).await?;
-                    out.push(new_row);
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
 
             LogicalPlan::Set { input, items } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
                     let new_row = apply_sets(items, row, writer, params, outcome).await?;
-                    out.push(new_row);
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
 
             LogicalPlan::Remove { input, items } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
                     let new_row = apply_removes(items, row, writer, outcome)?;
-                    out.push(new_row);
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
@@ -194,11 +231,17 @@ fn execute_write_inner<'a>(
                 detach,
             } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
                     apply_delete(targets, *detach, &row, writer, params, outcome).await?;
-                    out.push(row);
+                    if retain_output {
+                        out.push(row);
+                    }
                 }
                 Ok(out)
             }
@@ -210,7 +253,11 @@ fn execute_write_inner<'a>(
                 on_create_sets,
             } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len().max(1));
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len().max(1))
+                } else {
+                    Vec::new()
+                };
                 if let Some(PreparedSingleNodeMergeBatch {
                     rows: prepared,
                     mut prefetched_nodes,
@@ -233,7 +280,9 @@ fn execute_write_inner<'a>(
                             None,
                         )
                         .await?;
-                        out.extend(merged);
+                        if retain_output {
+                            out.extend(merged);
+                        }
                     }
                 } else if let Some(PreparedBoundRelationshipMergeBatch {
                     rows: prepared,
@@ -258,7 +307,9 @@ fn execute_write_inner<'a>(
                             Some(&mut prefetched_edges),
                         )
                         .await?;
-                        out.extend(merged);
+                        if retain_output {
+                            out.extend(merged);
+                        }
                     }
                 } else {
                     for row in rows {
@@ -277,7 +328,9 @@ fn execute_write_inner<'a>(
                             None,
                         )
                         .await?;
-                        out.extend(merged);
+                        if retain_output {
+                            out.extend(merged);
+                        }
                     }
                 }
                 Ok(out)
@@ -290,23 +343,24 @@ fn execute_write_inner<'a>(
                 body,
             } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                for row in &rows {
-                    crate::exec::limits::check_deadline()?;
-                    let items = match evaluate(list, row, params)? {
-                        RuntimeValue::List(items) => items,
-                        RuntimeValue::Null => continue,
-                        v => {
-                            return Err(ExecError::Runtime(format!(
-                                "FOREACH requires a list; got {}",
-                                v.type_name()
-                            )));
-                        }
-                    };
-                    foreach_iterations(variable, items, body, row, writer, params, outcome).await?;
-                }
                 // FOREACH is side-effect only: the input rows pass through
                 // unchanged so any following clause keeps the same cardinality.
-                Ok(rows)
+                if retain_output {
+                    for row in &rows {
+                        execute_foreach_row(variable, list, body, row, writer, params, outcome)
+                            .await?;
+                    }
+                    Ok(rows)
+                } else {
+                    // At a terminal result sink, consume owned rows one at a
+                    // time. This releases wide UNWIND bindings (notably
+                    // embeddings) as soon as their side effects complete.
+                    for row in rows {
+                        execute_foreach_row(variable, list, body, &row, writer, params, outcome)
+                            .await?;
+                    }
+                    Ok(Vec::new())
+                }
             }
 
             // Correlated CALL subquery whose body writes: for each outer row,
@@ -316,16 +370,30 @@ fn execute_write_inner<'a>(
             // delegation below.
             LogicalPlan::Apply { input, subplan } if subplan.contains_write() => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
-                for row in &rows {
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
+                for row in rows {
                     crate::exec::limits::check_deadline()?;
-                    let sub_rows = exec_foreach_body(subplan, writer, params, outcome, row).await?;
-                    for s in sub_rows {
-                        let mut merged = row.clone();
-                        for (k, v) in &s.bindings {
-                            merged.set(k.clone(), v.clone());
+                    let sub_rows = exec_foreach_body_mode(
+                        subplan,
+                        writer,
+                        params,
+                        outcome,
+                        &row,
+                        retain_output,
+                    )
+                    .await?;
+                    if retain_output {
+                        for s in sub_rows {
+                            let mut merged = row.clone();
+                            for (k, v) in &s.bindings {
+                                merged.set(k.clone(), v.clone());
+                            }
+                            out.push(merged);
                         }
-                        out.push(merged);
                     }
                 }
                 Ok(out)
@@ -349,14 +417,23 @@ fn execute_write_inner<'a>(
                 if *distinct {
                     projected = crate::exec::walker::dedup_rows(projected);
                 }
-                Ok(projected)
+                Ok(if retain_output { projected } else { Vec::new() })
+            }
+            LogicalPlan::DiscardResult { input } => {
+                // Consume the child completely so every write is staged, then
+                // ask the terminal operator not to retain its output batch.
+                // This prevents updated embeddings from escaping in
+                // `WriteOutcome` (and being cloned/expanded by a wire adapter).
+                let _ = execute_write_inner_mode(input, writer, params, outcome, routing, false)
+                    .await?;
+                Ok(Vec::new())
             }
             LogicalPlan::Filter { input, predicate } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     let v = evaluate(predicate, &row, params)?;
-                    if v.as_bool() == Some(true) {
+                    if retain_output && v.as_bool() == Some(true) {
                         out.push(row);
                     }
                 }
@@ -373,6 +450,9 @@ fn execute_write_inner<'a>(
                 let mut rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 if !keys.is_empty() {
                     crate::exec::walker::sort_rows(&mut rows, keys, params)?;
+                }
+                if !retain_output {
+                    return Ok(Vec::new());
                 }
                 let skip = skip as usize;
                 if skip >= rows.len() {
@@ -394,6 +474,12 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
             LogicalPlan::Distinct { input } => {
+                if !retain_output {
+                    let _ =
+                        execute_write_inner_mode(input, writer, params, outcome, routing, false)
+                            .await?;
+                    return Ok(Vec::new());
+                }
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 Ok(crate::exec::walker::dedup_rows(rows))
             }
@@ -403,7 +489,13 @@ fn execute_write_inner<'a>(
                 aggregations,
             } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                crate::exec::walker::execute_aggregate(rows, group_by, aggregations, params)
+                let aggregated =
+                    crate::exec::walker::execute_aggregate(rows, group_by, aggregations, params)?;
+                Ok(if retain_output {
+                    aggregated
+                } else {
+                    Vec::new()
+                })
             }
             LogicalPlan::Unwind { input, list, alias } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
@@ -411,13 +503,14 @@ fn execute_write_inner<'a>(
                 for row in rows {
                     let v = evaluate(list, &row, params)?;
                     match v {
-                        RuntimeValue::List(items) => {
+                        RuntimeValue::List(items) if retain_output => {
                             for item in items {
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
                             }
                         }
+                        RuntimeValue::List(_) => {}
                         RuntimeValue::Null => {}
                         _ => {
                             return Err(ExecError::Runtime(format!(
@@ -430,6 +523,17 @@ fn execute_write_inner<'a>(
                 Ok(out)
             }
             LogicalPlan::Union { left, right, all } => {
+                if !retain_output {
+                    // UNION's combination/deduplication is observable only in
+                    // its result stream. Both branches must still run, but
+                    // neither branch needs to retain wide write rows.
+                    let _ = execute_write_inner_mode(left, writer, params, outcome, routing, false)
+                        .await?;
+                    let _ =
+                        execute_write_inner_mode(right, writer, params, outcome, routing, false)
+                            .await?;
+                    return Ok(Vec::new());
+                }
                 let mut l = execute_write_inner(left, writer, params, outcome, routing).await?;
                 let r = execute_write_inner(right, writer, params, outcome, routing).await?;
                 l.extend(r);
@@ -440,6 +544,18 @@ fn execute_write_inner<'a>(
                 }
             }
             LogicalPlan::CrossProduct { left, right } => {
+                if !retain_output {
+                    // An uncorrelated unit subquery executes its right side
+                    // once, independently of the left cardinality. With no
+                    // consumer above this root, constructing the Cartesian
+                    // output would only retain duplicate bindings.
+                    let _ = execute_write_inner_mode(left, writer, params, outcome, routing, false)
+                        .await?;
+                    let _ =
+                        execute_write_inner_mode(right, writer, params, outcome, routing, false)
+                            .await?;
+                    return Ok(Vec::new());
+                }
                 let l = execute_write_inner(left, writer, params, outcome, routing).await?;
                 let r = execute_write_inner(right, writer, params, outcome, routing).await?;
                 Ok(crate::exec::walker::cross_product(l, r))
@@ -955,32 +1071,78 @@ fn exec_foreach_body<'a>(
     outcome: &'a mut WriteOutcome,
     seed: &'a Row,
 ) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
+    exec_foreach_body_mode(plan, writer, params, outcome, seed, true)
+}
+
+/// Execute a seeded write-subquery/body and optionally retain its terminal
+/// rows.
+///
+/// Intermediate rows are preserved because they carry bindings/cardinality to
+/// the next updating clause. Only the root result may be discarded. This is
+/// what lets a terminal correlated unit subquery execute once per outer row
+/// without retaining a second copy of each wide row, while the same subquery
+/// under an outer `RETURN` still produces one row per invocation.
+fn exec_foreach_body_mode<'a>(
+    plan: &'a LogicalPlan,
+    writer: &'a mut WriterSession,
+    params: &'a Params,
+    outcome: &'a mut WriteOutcome,
+    seed: &'a Row,
+    retain_output: bool,
+) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
     async move {
         match plan {
             // The leaf: the per-element seed row.
-            LogicalPlan::Empty | LogicalPlan::Argument { .. } => Ok(vec![seed.clone()]),
+            LogicalPlan::Empty | LogicalPlan::Argument { .. } => {
+                if retain_output {
+                    Ok(vec![seed.clone()])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             LogicalPlan::Create { input, elements } => {
                 let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
                     crate::exec::limits::check_deadline()?;
-                    out.push(apply_create(elements, row, writer, params, outcome).await?);
+                    let new_row = apply_create(elements, row, writer, params, outcome).await?;
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
             LogicalPlan::Set { input, items } => {
                 let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
-                    out.push(apply_sets(items, row, writer, params, outcome).await?);
+                    let new_row = apply_sets(items, row, writer, params, outcome).await?;
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
             LogicalPlan::Remove { input, items } => {
                 let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
-                let mut out = Vec::with_capacity(rows.len());
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len())
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
-                    out.push(apply_removes(items, row, writer, outcome)?);
+                    let new_row = apply_removes(items, row, writer, outcome)?;
+                    if retain_output {
+                        out.push(new_row);
+                    }
                 }
                 Ok(out)
             }
@@ -993,7 +1155,11 @@ fn exec_foreach_body<'a>(
                 for row in &rows {
                     apply_delete(targets, *detach, row, writer, params, outcome).await?;
                 }
-                Ok(rows)
+                if retain_output {
+                    Ok(rows)
+                } else {
+                    Ok(Vec::new())
+                }
             }
             LogicalPlan::Merge {
                 input,
@@ -1002,24 +1168,29 @@ fn exec_foreach_body<'a>(
                 on_create_sets,
             } => {
                 let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
-                let mut out = Vec::new();
+                let mut out = if retain_output {
+                    Vec::with_capacity(rows.len().max(1))
+                } else {
+                    Vec::new()
+                };
                 for row in rows {
-                    out.extend(
-                        apply_merge(
-                            pattern,
-                            on_match_sets,
-                            on_create_sets,
-                            row,
-                            writer,
-                            params,
-                            outcome,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await?,
-                    );
+                    let merged = apply_merge(
+                        pattern,
+                        on_match_sets,
+                        on_create_sets,
+                        row,
+                        writer,
+                        params,
+                        outcome,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    if retain_output {
+                        out.extend(merged);
+                    }
                 }
                 Ok(out)
             }
@@ -1030,20 +1201,19 @@ fn exec_foreach_body<'a>(
                 body,
             } => {
                 let rows = exec_foreach_body(input, writer, params, outcome, seed).await?;
-                for row in &rows {
-                    let items = match evaluate(list, row, params)? {
-                        RuntimeValue::List(items) => items,
-                        RuntimeValue::Null => continue,
-                        v => {
-                            return Err(ExecError::Runtime(format!(
-                                "FOREACH requires a list; got {}",
-                                v.type_name()
-                            )));
-                        }
-                    };
-                    foreach_iterations(variable, items, body, row, writer, params, outcome).await?;
+                if retain_output {
+                    for row in &rows {
+                        execute_foreach_row(variable, list, body, row, writer, params, outcome)
+                            .await?;
+                    }
+                    Ok(rows)
+                } else {
+                    for row in rows {
+                        execute_foreach_row(variable, list, body, &row, writer, params, outcome)
+                            .await?;
+                    }
+                    Ok(Vec::new())
                 }
-                Ok(rows)
             }
             other => Err(ExecError::Runtime(format!(
                 "operator `{}` is not allowed in a FOREACH body",
@@ -1052,6 +1222,29 @@ fn exec_foreach_body<'a>(
         }
     }
     .boxed()
+}
+
+async fn execute_foreach_row(
+    variable: &str,
+    list: &Expression,
+    body: &LogicalPlan,
+    row: &Row,
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<(), ExecError> {
+    crate::exec::limits::check_deadline()?;
+    let items = match evaluate(list, row, params)? {
+        RuntimeValue::List(items) => items,
+        RuntimeValue::Null => return Ok(()),
+        v => {
+            return Err(ExecError::Runtime(format!(
+                "FOREACH requires a list; got {}",
+                v.type_name()
+            )));
+        }
+    };
+    foreach_iterations(variable, items, body, row, writer, params, outcome).await
 }
 
 /// Run a FOREACH's body once per list element. Read-modify-write mutations to

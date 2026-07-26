@@ -2834,10 +2834,9 @@ async fn unwind_2000_delete_edges_uses_correlated_unique_lookups() {
         outcome.edges_deleted, 1,
         "the global posting lookup must bind the real source and delete its edge"
     );
-    assert_eq!(
-        outcome.rows.len(),
-        1,
-        "the delete pipeline must carry the one matched relationship row"
+    assert!(
+        outcome.rows.is_empty(),
+        "a terminal write-only delete must discard its internal relationship row"
     );
     assert_eq!(
         writer.property_index_cache().equality_lookup_calls() - lookups_before,
@@ -3116,7 +3115,10 @@ async fn global_correlated_match_batches_direct_set_and_delete_with_rollback() {
         writer.property_index_cache().equality_lookup_calls() - lookups_before,
         1
     );
-    assert_eq!(delete_outcome.rows.len(), 4);
+    assert!(
+        delete_outcome.rows.is_empty(),
+        "terminal write-only deletes must not retain matched node rows"
+    );
     assert_eq!(delete_outcome.nodes_deleted, 4);
     let staged_delete = writer.overlay_snapshot();
     assert!(staged_delete.scan_label("Doc").await.unwrap().is_empty());
@@ -3774,7 +3776,8 @@ async fn unique_indexed_match_unwind_uses_numeric_transactional_probes() {
     let query = parse(
         "UNWIND range(1, 500) AS i \
          MATCH (a:Account {account_no: toFloat(i)}) \
-         SET a.seen = true",
+         SET a.seen = true \
+         RETURN a",
     )
     .unwrap();
     let snapshot = writer.snapshot();
@@ -4055,6 +4058,279 @@ async fn correlated_unique_match_set_batches_existing_node_updates() {
 }
 
 #[tokio::test]
+async fn write_only_vector_update_discards_rows_and_embedding_results() {
+    const ROWS: usize = 12;
+    const DIMENSIONS: usize = 1024;
+
+    let mut writer = WriterSession::open(store(), paths("w-match-set-vector-discard"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "UNWIND range(1, 24) AS i \
+         CREATE (:Articulo {key: toString(i), titulo: 'old'})",
+    )
+    .await;
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Articulo".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let query = parse(
+        "UNWIND $rows AS row \
+         MATCH (a:Articulo {key: row.key}) \
+         SET a.embedding = row.embedding, a.titulo = row.titulo",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    assert!(
+        matches!(plan, namidb_query::LogicalPlan::DiscardResult { .. }),
+        "write-only statement must keep its explicit result sink after optimization: {plan:?}"
+    );
+
+    let rows = (1..=ROWS)
+        .map(|i| {
+            let embedding = (0..DIMENSIONS)
+                .map(|dimension| i as f32 + dimension as f32 / 1024.0)
+                .collect();
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String(i.to_string())),
+                ("embedding".into(), RuntimeValue::Vector(embedding)),
+                (
+                    "titulo".into(),
+                    RuntimeValue::String(format!("articulo-{i}")),
+                ),
+            ]))
+        })
+        .collect();
+    let mut params = Params::new();
+    params.insert("rows".into(), RuntimeValue::List(rows));
+
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert!(
+        outcome.rows.is_empty(),
+        "a write without RETURN must not expose its internal matched rows"
+    );
+    assert_eq!(
+        outcome.rows.capacity(),
+        0,
+        "the sink must not allocate an output batch that retains cloned embeddings"
+    );
+    assert_eq!(outcome.properties_set, (ROWS * 2) as u64);
+
+    let snapshot = writer.snapshot();
+    let updated = snapshot
+        .lookup_node_by_property("Articulo", "key", &ROWS.to_string())
+        .await
+        .unwrap()
+        .expect("updated article");
+    let expected_embedding = (0..DIMENSIONS)
+        .map(|dimension| ROWS as f32 + dimension as f32 / 1024.0)
+        .collect();
+    assert_eq!(
+        updated.properties.get("embedding"),
+        Some(&namidb_core::Value::Vec(expected_embedding))
+    );
+    assert_eq!(
+        updated.properties.get("titulo"),
+        Some(&namidb_core::Value::Str(format!("articulo-{ROWS}")))
+    );
+}
+
+#[tokio::test]
+async fn write_only_union_discards_each_wide_branch_without_losing_effects() {
+    const DIMENSIONS: usize = 1024;
+
+    let mut writer = WriterSession::open(store(), paths("w-union-vector-discard"))
+        .await
+        .unwrap();
+    let query = parse(
+        "UNWIND $left AS row \
+         CREATE (:Articulo {key: row.key, embedding: row.embedding}) \
+         UNION \
+         UNWIND $right AS row \
+         CREATE (:Articulo {key: row.key, embedding: row.embedding})",
+    )
+    .unwrap();
+    let plan = lower(&query).unwrap();
+    assert!(
+        matches!(plan, namidb_query::LogicalPlan::DiscardResult { .. }),
+        "a write-only UNION must have one terminal sink: {plan:?}"
+    );
+
+    let wide_row = |key: &str, offset: f32| {
+        RuntimeValue::Map(BTreeMap::from([
+            ("key".into(), RuntimeValue::String(key.into())),
+            (
+                "embedding".into(),
+                RuntimeValue::Vector(
+                    (0..DIMENSIONS)
+                        .map(|dimension| offset + dimension as f32)
+                        .collect(),
+                ),
+            ),
+        ]))
+    };
+    let mut params = Params::new();
+    params.insert(
+        "left".into(),
+        RuntimeValue::List(vec![wide_row("left", 1.0)]),
+    );
+    params.insert(
+        "right".into(),
+        RuntimeValue::List(vec![wide_row("right", 2.0)]),
+    );
+
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(outcome.nodes_created, 2);
+    assert!(outcome.rows.is_empty());
+    assert_eq!(
+        outcome.rows.capacity(),
+        0,
+        "UNION/DISTINCT must not rebuild a terminal result batch"
+    );
+    let snapshot = writer.snapshot();
+    assert_eq!(snapshot.scan_label("Articulo").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn result_sink_evaluates_terminal_projection_errors_and_rolls_back() {
+    let mut writer = WriterSession::open(store(), paths("w-discard-project-error"))
+        .await
+        .unwrap();
+    let plan = lower(&parse("CREATE (:Audit {key: 'must-rollback'}) WITH 1 / 0 AS boom").unwrap())
+        .unwrap();
+    assert!(matches!(
+        plan,
+        namidb_query::LogicalPlan::DiscardResult { .. }
+    ));
+
+    let error = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("discarding rows must not discard expression errors");
+    assert!(
+        error.to_string().contains("division by zero"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        writer
+            .snapshot()
+            .scan_label("Audit")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a terminal projection error must roll back the staged CREATE"
+    );
+}
+
+#[tokio::test]
+async fn result_sink_evaluates_cross_product_inputs_before_unit_subquery_writes() {
+    let mut writer = WriterSession::open(store(), paths("w-discard-cross-error"))
+        .await
+        .unwrap();
+    let plan =
+        lower(&parse("UNWIND 1 AS i CALL { CREATE (:Audit {key: 'must-not-run'}) }").unwrap())
+            .unwrap();
+    assert!(matches!(
+        plan,
+        namidb_query::LogicalPlan::DiscardResult { .. }
+    ));
+
+    let error = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .expect_err("invalid UNWIND must fail before the unit subquery write");
+    assert!(
+        error.to_string().contains("UNWIND requires a list"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        writer
+            .snapshot()
+            .scan_label("Audit")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the right side must not commit after the left side fails"
+    );
+}
+
+#[tokio::test]
+async fn terminal_correlated_unit_subquery_discards_rows_but_runs_once_per_outer_row() {
+    let mut writer = WriterSession::open(store(), paths("w-unit-call-discard"))
+        .await
+        .unwrap();
+    let plan = lower(
+        &parse(
+            "UNWIND [1, 2, 3] AS i \
+             CALL { WITH i CREATE (:Audit {key: toString(i)}) }",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        matches!(plan, namidb_query::LogicalPlan::DiscardResult { .. }),
+        "terminal unit CALL must be wrapped only at the outer result boundary: {plan:?}"
+    );
+
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 3);
+    assert!(outcome.rows.is_empty());
+    assert_eq!(outcome.rows.capacity(), 0);
+    assert_eq!(
+        writer.snapshot().scan_label("Audit").await.unwrap().len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn unit_subquery_under_return_preserves_outer_cardinality() {
+    let mut writer = WriterSession::open(store(), paths("w-unit-call-cardinality"))
+        .await
+        .unwrap();
+    let plan = lower(
+        &parse(
+            "UNWIND [1, 2, 3] AS i \
+             CALL { WITH i CREATE (:Audit {key: toString(i)}) } \
+             RETURN i",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !matches!(plan, namidb_query::LogicalPlan::DiscardResult { .. }),
+        "an outer RETURN must remain row-producing: {plan:?}"
+    );
+
+    let outcome = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.nodes_created, 3);
+    assert_eq!(outcome.rows.len(), 3);
+    assert_eq!(
+        outcome
+            .rows
+            .iter()
+            .filter_map(|row| match row.get("i") {
+                Some(RuntimeValue::Integer(value)) => Some(*value),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[tokio::test]
 async fn correlated_unique_match_set_preserves_duplicates_misses_and_rollback() {
     let mut writer = WriterSession::open(store(), paths("w-match-set-batch-rollback"))
         .await
@@ -4194,7 +4470,8 @@ async fn unique_string_match_set_stays_transactional_across_auto_commits() {
         params.insert("key".into(), RuntimeValue::String(i.to_string()));
         params.insert("touch".into(), RuntimeValue::Integer(i));
         let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
-        assert_eq!(outcome.rows.len(), 1);
+        assert!(outcome.rows.is_empty());
+        assert_eq!(outcome.properties_set, 1);
     }
     assert_eq!(
         writer.unique_index().populate_scans(),
@@ -4613,7 +4890,8 @@ async fn non_unique_index_stays_transactional_across_one_row_auto_commits() {
         let outcome = execute_write(&match_plan, &mut match_writer, &params)
             .await
             .unwrap();
-        assert_eq!(outcome.rows.len(), 1);
+        assert!(outcome.rows.is_empty());
+        assert_eq!(outcome.properties_set, 1);
     }
     assert_eq!(
         match_writer.unique_index().populate_scans() - match_scans_before,
@@ -4648,7 +4926,8 @@ async fn indexed_match_unwind_after_staged_state_populates_once() {
     let query = parse(
         "UNWIND range(1, 500) AS i \
          MATCH (d:Doc {key: toString(i)}) \
-         SET d.seen = true",
+         SET d.seen = true \
+         RETURN d",
     )
     .unwrap();
     let snapshot = writer.snapshot();

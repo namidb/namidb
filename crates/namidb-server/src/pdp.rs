@@ -169,7 +169,13 @@ fn operator_names(plan: &LogicalPlan) -> Vec<&'static str> {
 }
 
 fn collect_ops(plan: &LogicalPlan, out: &mut Vec<&'static str>) {
-    out.push(plan.operator_name());
+    // DiscardResult is an execution-only result boundary introduced after
+    // parsing. It carries no data access or mutation capability of its own,
+    // and exposing it would silently break existing OPA policies that
+    // allow-list the stable public operator vocabulary.
+    if !matches!(plan, LogicalPlan::DiscardResult { .. }) {
+        out.push(plan.operator_name());
+    }
     for child in plan.children() {
         collect_ops(child, out);
     }
@@ -374,5 +380,28 @@ mod tests {
         assert!(ops.contains(&"CrossProduct"));
         // deduped: NodeScan appears once.
         assert_eq!(ops.iter().filter(|o| **o == "NodeScan").count(), 1);
+    }
+
+    #[test]
+    fn execution_only_result_sink_is_invisible_to_existing_pdp_policies() {
+        let wrapped = namidb_query::lower(
+            &namidb_query::parse("MATCH (d:Doc) DELETE d").expect("parse write plan"),
+        )
+        .expect("lower write plan");
+        let LogicalPlan::DiscardResult { input: write } = &wrapped else {
+            panic!("write without RETURN must have an internal result sink: {wrapped:?}");
+        };
+        let legacy_input = plan_input(&principal(), write);
+        let current_input = plan_input(&principal(), &wrapped);
+
+        assert_eq!(
+            current_input, legacy_input,
+            "adding an internal result sink must not change the OPA document"
+        );
+        assert_eq!(
+            current_input["operators"],
+            serde_json::json!(["Delete", "NodeScan"])
+        );
+        assert_eq!(current_input["action"], "write");
     }
 }

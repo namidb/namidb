@@ -443,6 +443,15 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
                 pending,
             )
         }
+        LogicalPlan::DiscardResult { input } => {
+            let new_input = pushdown_at(*input, Vec::new());
+            apply_filters(
+                LogicalPlan::DiscardResult {
+                    input: Box::new(new_input),
+                },
+                pending,
+            )
+        }
 
         // ─── write ops: barriers — pending stays above, recurse input ─
         LogicalPlan::Create { input, elements } => {

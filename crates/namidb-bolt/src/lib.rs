@@ -15,6 +15,7 @@
 
 #![warn(rust_2018_idioms)]
 
+pub mod budget;
 pub mod chunk;
 pub mod codec;
 pub mod error;
@@ -25,13 +26,17 @@ pub mod session;
 pub mod state;
 pub mod value;
 
+pub use budget::{
+    MessageMemoryBudget, DEFAULT_MESSAGE_MEMORY_BUDGET_BYTES, MESSAGE_MEMORY_BASE_BYTES,
+    MESSAGE_MEMORY_BYTES_PER_WIRE_BYTE, MIN_MESSAGE_MEMORY_BUDGET_BYTES,
+};
 pub use error::{BoltError, Result};
 pub use handshake::{Version, SUPPORTED_VERSIONS};
 pub use mapping::{bolt_to_runtime, params_from_bolt_map, runtime_to_bolt, ElementIdMode};
 pub use message::{Request, Response};
 pub use session::{
-    AuthPolicy, Authenticator, Backend, BackendError, RunCancellation, RunOutcome, ServerInfo,
-    Session, StatementType,
+    AuthPolicy, Authenticator, Backend, BackendError, DecodeAdmissionGuard, RunCancellation,
+    RunOutcome, ServerInfo, Session, StatementType,
 };
 pub use state::State;
 pub use value::{struct_tag, Node, Relationship, Value};

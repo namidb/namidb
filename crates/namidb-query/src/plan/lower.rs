@@ -63,11 +63,28 @@ impl std::error::Error for LowerError {}
 
 /// Lower a parsed Query into a `LogicalPlan` tree.
 pub fn lower(query: &Query) -> Result<LogicalPlan, LowerError> {
-    let head = lower_single_query(&query.head)?;
-    if query.tail.is_empty() {
-        return Ok(head);
+    lower_query(query, true)
+}
+
+/// Lower a query and optionally expose its top-level result stream.
+///
+/// `lower` passes `true`. An uncorrelated `CALL { ... }` body passes `false`
+/// because unit-subquery cardinality is consumed by its enclosing Apply /
+/// CrossProduct rather than being a Bolt/HTTP result boundary.
+fn lower_query(query: &Query, expose_result: bool) -> Result<LogicalPlan, LowerError> {
+    let exposes_rows = single_query_exposes_rows(&query.head);
+    if query
+        .tail
+        .iter()
+        .any(|part| single_query_exposes_rows(&part.query) != exposes_rows)
+    {
+        return Err(LowerError::new(
+            LowerErrorKind::InvalidUnion,
+            "UNION branches must either all expose result rows or all be write-only",
+            query.span,
+        ));
     }
-    let mut acc = head;
+    let mut acc = lower_single_query(&query.head)?;
     for part in &query.tail {
         let right = lower_single_query(&part.query)?;
         acc = LogicalPlan::Union {
@@ -82,7 +99,32 @@ pub fn lower(query: &Query) -> Result<LogicalPlan, LowerError> {
             input: Box::new(acc),
         };
     }
-    Ok(acc)
+    // Standalone read procedures intentionally expose their YIELD stream
+    // without requiring a trailing RETURN. Only a statement that actually
+    // contains a write needs the side-effect-only result boundary.
+    if expose_result && !exposes_rows && acc.contains_write() {
+        Ok(LogicalPlan::DiscardResult {
+            input: Box::new(acc),
+        })
+    } else {
+        Ok(acc)
+    }
+}
+
+fn query_exposes_rows(query: &Query) -> bool {
+    single_query_exposes_rows(&query.head)
+        && query
+            .tail
+            .iter()
+            .all(|part| single_query_exposes_rows(&part.query))
+}
+
+fn single_query_exposes_rows(query: &SingleQuery) -> bool {
+    match query.clauses.last() {
+        Some(Clause::Return(_) | Clause::Call(_)) => true,
+        Some(Clause::CallSubquery(call)) => query_exposes_rows(&call.query),
+        _ => false,
+    }
 }
 
 fn lower_single_query(query: &SingleQuery) -> Result<LogicalPlan, LowerError> {
@@ -343,7 +385,7 @@ fn lower_call_subquery(
         }
     }
     // Uncorrelated: lower the (possibly UNION) body as a self-contained query.
-    let subplan = lower(&cs.query)?;
+    let subplan = lower_query(&cs.query, false)?;
     let produced = subquery_produced(&cs.query.head, &subplan);
     Ok((subplan, produced, false))
 }
@@ -2544,6 +2586,13 @@ mod tests {
         lower(&q).expect("lower")
     }
 
+    fn result_input(plan: &LogicalPlan) -> &LogicalPlan {
+        match plan {
+            LogicalPlan::DiscardResult { input } => input,
+            other => other,
+        }
+    }
+
     fn err(src: &str) -> LowerErrorKind {
         let q = parse(src).expect("parse");
         lower(&q).expect_err("expected error").kind
@@ -2560,6 +2609,81 @@ mod tests {
             }
             other => panic!("expected Project, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn write_without_return_lowers_to_explicit_result_sink() {
+        let p = lp("UNWIND $rows AS row \
+             MATCH (a:Articulo {key: row.key}) \
+             SET a.embedding = row.embedding, a.titulo = row.titulo");
+        match p {
+            LogicalPlan::DiscardResult { input } => {
+                assert!(
+                    matches!(*input, LogicalPlan::Set { .. }),
+                    "expected terminal SET under DiscardResult, got {input:?}"
+                );
+            }
+            other => panic!("expected DiscardResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_query_does_not_get_a_result_sink() {
+        let p = lp("UNWIND $rows AS row \
+             MATCH (a:Articulo {key: row.key}) \
+             SET a.embedding = row.embedding \
+             RETURN a.key AS key");
+        assert!(
+            matches!(p, LogicalPlan::Project { .. }),
+            "RETURN must stay the result-producing boundary, got {p:?}"
+        );
+        assert!(
+            !p.children()
+                .iter()
+                .any(|child| matches!(child, LogicalPlan::DiscardResult { .. })),
+            "RETURN plan must not contain a top-level result sink: {p:?}"
+        );
+    }
+
+    #[test]
+    fn write_only_call_body_keeps_unit_subquery_cardinality() {
+        let p = lp("CALL { CREATE (:Audit {key: 'x'}) } RETURN 1 AS ok");
+
+        fn contains_discard(plan: &LogicalPlan) -> bool {
+            matches!(plan, LogicalPlan::DiscardResult { .. })
+                || plan.children().iter().any(|child| contains_discard(child))
+        }
+
+        assert!(
+            !contains_discard(&p),
+            "a write-only CALL body is a unit subquery, not a result boundary: {p:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_write_only_call_gets_a_result_sink() {
+        let p = lp("CALL { CREATE (:Audit {key: 'x'}) }");
+        assert!(
+            matches!(p, LogicalPlan::DiscardResult { .. }),
+            "a top-level unit subquery with only side effects must not leak its unit row: {p:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_read_procedure_still_exposes_yield_rows() {
+        let p = lp("CALL algo.pagerank() YIELD node_id, score");
+        assert!(
+            matches!(p, LogicalPlan::CallProcedure { .. }),
+            "a standalone read procedure exposes YIELD without RETURN: {p:?}"
+        );
+    }
+
+    #[test]
+    fn union_cannot_mix_result_producing_and_write_only_branches() {
+        assert_eq!(
+            err("RETURN 1 AS value UNION CREATE (:Audit {key: 'x'})"),
+            LowerErrorKind::InvalidUnion
+        );
     }
 
     #[test]
@@ -2734,7 +2858,7 @@ mod tests {
     #[test]
     fn set_clause_lowers_to_set_op() {
         let p = lp("MATCH (a:Person) SET a.age = 36");
-        match &p {
+        match result_input(&p) {
             LogicalPlan::Set { items, .. } => {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
@@ -2754,7 +2878,7 @@ mod tests {
     #[test]
     fn detach_delete_clause_lowers_with_flag() {
         let p = lp("MATCH (a:Person) DETACH DELETE a");
-        match &p {
+        match result_input(&p) {
             LogicalPlan::Delete {
                 detach, targets, ..
             } => {
@@ -2768,7 +2892,7 @@ mod tests {
     #[test]
     fn remove_clause_lowers_to_remove_op() {
         let p = lp("MATCH (a:Person) REMOVE a.age");
-        match &p {
+        match result_input(&p) {
             LogicalPlan::Remove { items, .. } => {
                 assert_eq!(items.len(), 1);
                 assert!(matches!(items[0], RemoveOp::Property { .. }));
@@ -2782,7 +2906,7 @@ mod tests {
         let p = lp("MERGE (a:Person {id: $id}) \
  ON CREATE SET a.firstSeen = 1 \
  ON MATCH SET a.lastSeen = 1");
-        match &p {
+        match result_input(&p) {
             LogicalPlan::Merge {
                 pattern,
                 on_create_sets,
@@ -2805,7 +2929,7 @@ mod tests {
             "MERGE (a:Person {externalId: 1})-[r1:KNOWS]->(b:Person {externalId: 2})\
              -[r2:KNOWS]->(c:Person {externalId: 3})",
         );
-        let pattern = match &p {
+        let pattern = match result_input(&p) {
             LogicalPlan::Merge { pattern, .. } => pattern,
             other => panic!("expected Merge, got {:?}", other),
         };
@@ -2837,7 +2961,7 @@ mod tests {
         // (so apply_create can resolve endpoints sequentially); the
         // MERGE executor reads by alias, not by position.
         let p = lp("MERGE (a:Person {externalId: 1})-[r:KNOWS]->(b:Person {externalId: 2})");
-        let pattern = match &p {
+        let pattern = match result_input(&p) {
             LogicalPlan::Merge { pattern, .. } => pattern,
             other => panic!("expected Merge, got {:?}", other),
         };

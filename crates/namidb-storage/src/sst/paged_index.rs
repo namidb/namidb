@@ -9,6 +9,7 @@
 //! keys.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -49,6 +50,9 @@ pub enum PagedIndexKind {
     Equality = 2,
     NodeLocator = 3,
     EdgePoint = 4,
+    /// Exact binary node records appended after a compatible
+    /// [`Self::NodeLocator`] body.
+    NodeRecord = 5,
 }
 
 impl PagedIndexKind {
@@ -58,6 +62,7 @@ impl PagedIndexKind {
             2 => Ok(Self::Equality),
             3 => Ok(Self::NodeLocator),
             4 => Ok(Self::EdgePoint),
+            5 => Ok(Self::NodeRecord),
             _ => Err(Error::invariant(format!(
                 "paged index has unknown kind {value}"
             ))),
@@ -65,7 +70,7 @@ impl PagedIndexKind {
     }
 
     fn external_values(self) -> bool {
-        matches!(self, Self::Equality | Self::EdgePoint)
+        matches!(self, Self::Equality | Self::EdgePoint | Self::NodeRecord)
     }
 }
 
@@ -124,6 +129,10 @@ impl Header {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::invariant("invalid paged-index header"));
         }
+        // Callers that already hold a complete sidecar may pass the whole
+        // body. The checksum envelope covers exactly the fixed header, not
+        // pages or external values (those carry their own CRCs).
+        let bytes = &bytes[..HEADER_SIZE];
         let format = match &bytes[..8] {
             magic if magic == MAGIC_V1 => PagedFormat::V1,
             magic if magic == MAGIC_V2 => PagedFormat::V2,
@@ -215,6 +224,11 @@ pub fn equality_keys_fit(index: &BTreeMap<String, Vec<[u8; 16]>>) -> bool {
 }
 
 /// Build a range-readable `NodeId -> physical row ordinal` locator.
+///
+/// Kept as the compatibility builder for standalone `.nloc` tooling and
+/// wire-format tests. Production node SSTs use
+/// [`NodeLocatorRecordBuilder::finish_upload`].
+#[allow(dead_code)]
 pub fn build_node_locator(ids: impl IntoIterator<Item = [u8; 16]>) -> Result<Bytes> {
     let mut builder = PagedIndexBuilder::new(PagedIndexKind::NodeLocator);
     for (row, id) in ids.into_iter().enumerate() {
@@ -224,6 +238,162 @@ pub fn build_node_locator(ids: impl IntoIterator<Item = [u8; 16]>) -> Result<Byt
         builder.push_inline(&id, &ordinal)?;
     }
     builder.finish()
+}
+
+/// Streaming builder for a combined node-locator + exact-record sidecar.
+///
+/// The resulting body is deliberately concatenated in this order:
+///
+/// ```text
+/// [ordinary NodeLocator V2 body][NodeRecord V2 body]
+/// ```
+///
+/// A node locator has only inline values, so its `values_offset` is also its
+/// exact body length and therefore the start of the appended record index.
+/// Existing readers can keep probing the prefix with [`probe_node_locator`]
+/// and ignore the appended bytes. New readers use [`probe_node_records`] to
+/// range-read only the requested binary records, avoiding wide Parquet page
+/// hydration for read-modify-write updates.
+#[derive(Debug)]
+pub struct NodeLocatorRecordBuilder {
+    locator: PagedIndexBuilder,
+    records: PagedIndexBuilder,
+    next_ordinal: u64,
+}
+
+/// Bounded-memory upload product for one combined `.nloc2` sidecar.
+///
+/// The two B+tree page regions remain in memory (tens of bytes per node), but
+/// the potentially multi-gigabyte exact-record value region is written to an
+/// anonymous temporary file while rows stream through flush/compaction. The
+/// upload path consumes that file in fixed multipart chunks and dropping this
+/// value removes it automatically.
+#[derive(Debug)]
+pub(crate) struct NodeLocatorRecordUpload {
+    prefix: Vec<Bytes>,
+    values: SpooledValueRegion,
+    size_bytes: u64,
+    entry_count: u64,
+}
+
+impl NodeLocatorRecordUpload {
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<Bytes>, Option<std::fs::File>, u64) {
+        (self.prefix, self.values.file, self.values.len)
+    }
+}
+
+#[derive(Debug)]
+struct SpooledValueRegion {
+    file: Option<std::fs::File>,
+    len: u64,
+}
+
+impl NodeLocatorRecordBuilder {
+    pub fn new() -> Self {
+        Self {
+            locator: PagedIndexBuilder::new(PagedIndexKind::NodeLocator),
+            records: PagedIndexBuilder::new(PagedIndexKind::NodeRecord),
+            next_ordinal: 0,
+        }
+    }
+
+    /// Append one node in physical SST row order.
+    ///
+    /// `record` is opaque to the sidecar. Callers may choose the storage
+    /// engine's compact binary record encoding without coupling this index
+    /// module to node schema or WAL types.
+    pub fn push(&mut self, id: &[u8; 16], record: &[u8]) -> Result<()> {
+        let ordinal = self.next_ordinal.to_le_bytes();
+        // Validate and append the variable-width value first. Once that
+        // succeeds, the fixed eight-byte locator append for the same key
+        // cannot fail for a record-specific size reason and both trees stay
+        // aligned.
+        self.records.push_external(id, record)?;
+        self.locator.push_inline(id, &ordinal)?;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("node locator exceeds u64 row ordinals"))?;
+        Ok(())
+    }
+
+    /// Flattened compatibility/test form. Production upload uses
+    /// [`Self::finish_upload`] so the external value region stays on disk.
+    #[allow(dead_code)]
+    pub fn finish(self) -> Result<Bytes> {
+        let chunks = self.finish_chunks()?;
+        let len = chunks
+            .iter()
+            .fold(0usize, |total, chunk| total.saturating_add(chunk.len()));
+        let mut out = BytesMut::with_capacity(len);
+        for chunk in chunks {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out.freeze())
+    }
+
+    /// Finalise as bounded-memory upload parts in exact wire order.
+    ///
+    /// Production flush/compaction streams the returned anonymous spool file
+    /// into multipart PUTs. This avoids retaining (or duplicating) the complete
+    /// exact-record corpus while Parquet and search-index builders are live.
+    pub(crate) fn finish_upload(self) -> Result<NodeLocatorRecordUpload> {
+        if self.locator.entry_count != self.records.entry_count
+            || self.locator.entry_count != self.next_ordinal
+        {
+            return Err(Error::invariant(
+                "node locator and exact-record builders are misaligned",
+            ));
+        }
+        let (locator_pages, locator_values) = self.locator.finish_parts()?;
+        let (record_pages, record_values) = self.records.finish_spooled_parts()?;
+        debug_assert!(locator_values.is_empty());
+        let prefix: Vec<Bytes> = [locator_pages, locator_values, record_pages]
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .collect();
+        let prefix_bytes = prefix
+            .iter()
+            .try_fold(0_u64, |total, chunk| total.checked_add(chunk.len() as u64));
+        let size_bytes = prefix_bytes
+            .and_then(|total| total.checked_add(record_values.len))
+            .ok_or_else(|| Error::invariant("node locator sidecar size exceeds u64"))?;
+        Ok(NodeLocatorRecordUpload {
+            prefix,
+            values: record_values,
+            size_bytes,
+            entry_count: self.next_ordinal,
+        })
+    }
+
+    /// In-memory compatibility/test form. Production must use
+    /// [`Self::finish_upload`] so the exact-record corpus remains spooled.
+    pub fn finish_chunks(self) -> Result<Vec<Bytes>> {
+        let upload = self.finish_upload()?;
+        let (mut chunks, file, _) = upload.into_parts();
+        if let Some(mut file) = file {
+            let mut values = Vec::new();
+            file.read_to_end(&mut values)?;
+            if !values.is_empty() {
+                chunks.push(Bytes::from(values));
+            }
+        }
+        Ok(chunks)
+    }
+}
+
+impl Default for NodeLocatorRecordBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Streaming range-readable `(key_id, partner_id) -> edge point value`
@@ -280,6 +450,11 @@ struct PagedIndexBuilder {
     pages: BytesMut,
     leaf_max_keys: Vec<Vec<u8>>,
     value_region: BytesMut,
+    /// Exact node records are large (notably 1024d embeddings) and coexist
+    /// with the Parquet output during flush/compaction. Spool only that value
+    /// region to anonymous local storage; other, historically small paged
+    /// sidecars retain their existing in-memory representation.
+    spooled_value_region: Option<SpooledValueRegion>,
     payload: BytesMut,
     current_count: u32,
     entry_count: u64,
@@ -296,6 +471,8 @@ impl PagedIndexBuilder {
             pages,
             leaf_max_keys: Vec::new(),
             value_region: BytesMut::new(),
+            spooled_value_region: (kind == PagedIndexKind::NodeRecord)
+                .then_some(SpooledValueRegion { file: None, len: 0 }),
             payload: BytesMut::with_capacity(PAGE_PAYLOAD_SIZE),
             current_count: 0,
             entry_count: 0,
@@ -339,7 +516,7 @@ impl PagedIndexBuilder {
         }
         self.payload.put_u16_le(key_len);
         self.payload.extend_from_slice(key);
-        self.payload.put_u64_le(self.value_region.len() as u64);
+        self.payload.put_u64_le(self.external_value_len());
         self.payload.put_u32_le(posting_len);
         self.payload.put_u32_le(value_checksum.finalize());
         for id in ids {
@@ -357,12 +534,36 @@ impl PagedIndexBuilder {
         let value_len = u32::try_from(value.len())
             .map_err(|_| Error::invariant("paged-index value exceeds 4 GiB"))?;
         let key_len = self.prepare_entry(key, EQUALITY_LEAF_OVERHEAD + key.len())?;
+        let value_offset = self.external_value_len();
         self.payload.put_u16_le(key_len);
         self.payload.extend_from_slice(key);
-        self.payload.put_u64_le(self.value_region.len() as u64);
+        self.payload.put_u64_le(value_offset);
         self.payload.put_u32_le(value_len);
         self.payload.put_u32_le(crc32fast::hash(value));
-        self.value_region.extend_from_slice(value);
+        self.append_external_value(value)?;
+        Ok(())
+    }
+
+    fn external_value_len(&self) -> u64 {
+        self.spooled_value_region
+            .as_ref()
+            .map_or(self.value_region.len() as u64, |values| values.len)
+    }
+
+    fn append_external_value(&mut self, value: &[u8]) -> Result<()> {
+        let Some(values) = &mut self.spooled_value_region else {
+            self.value_region.extend_from_slice(value);
+            return Ok(());
+        };
+        let file = match &mut values.file {
+            Some(file) => file,
+            None => values.file.insert(create_spool_file()?),
+        };
+        file.write_all(value)?;
+        values.len = values
+            .len
+            .checked_add(value.len() as u64)
+            .ok_or_else(|| Error::invariant("paged-index value region exceeds u64"))?;
         Ok(())
     }
 
@@ -432,7 +633,76 @@ impl PagedIndexBuilder {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Bytes> {
+    fn finish(self) -> Result<Bytes> {
+        if self.spooled_value_region.is_some() {
+            let (pages, values) = self.finish_spooled_parts()?;
+            let total_len = usize::try_from(values.len)
+                .ok()
+                .and_then(|values_len| pages.len().checked_add(values_len))
+                .ok_or_else(|| Error::invariant("paged-index body exceeds addressable memory"))?;
+            let mut out = BytesMut::with_capacity(total_len);
+            out.extend_from_slice(&pages);
+            if let Some(mut file) = values.file {
+                let mut chunk = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut chunk)?;
+                    if read == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&chunk[..read]);
+                }
+            }
+            return Ok(out.freeze());
+        }
+
+        let (pages, values) = self.finish_parts()?;
+        if values.is_empty() {
+            return Ok(pages);
+        }
+        let mut out = BytesMut::with_capacity(pages.len().saturating_add(values.len()));
+        out.extend_from_slice(&pages);
+        out.extend_from_slice(&values);
+        Ok(out.freeze())
+    }
+
+    fn finish_parts(mut self) -> Result<(Bytes, Bytes)> {
+        if self.spooled_value_region.is_some() {
+            return Err(Error::invariant(
+                "spooled paged-index values require finish_spooled_parts",
+            ));
+        }
+        self.finish_pages()?;
+        Ok((self.pages.freeze(), self.value_region.freeze()))
+    }
+
+    fn finish_spooled_parts(mut self) -> Result<(Bytes, SpooledValueRegion)> {
+        if self.spooled_value_region.is_none() {
+            return Err(Error::invariant(
+                "in-memory paged-index values require finish_parts",
+            ));
+        }
+        self.finish_pages()?;
+        let mut values = self
+            .spooled_value_region
+            .take()
+            .expect("spooled value region checked above");
+        if let Some(file) = &mut values.file {
+            if file.metadata()?.len() != values.len {
+                return Err(Error::invariant(
+                    "node-record spool length changed while building sidecar",
+                ));
+            }
+            // The exact-record region can be several GiB for vector-bearing
+            // corpora. Surface delayed-allocation/writeback failures before
+            // multipart upload and keep those pages reclaimable while the
+            // Parquet body and B+tree pages are still live.
+            file.sync_data()?;
+            file.rewind()?;
+        }
+        Ok((self.pages.freeze(), values))
+    }
+
+    fn finish_pages(&mut self) -> Result<()> {
         self.flush_leaf()?;
         if self.leaf_max_keys.is_empty() {
             self.leaf_max_keys.push(Vec::new());
@@ -455,8 +725,7 @@ impl PagedIndexBuilder {
         }
 
         let leaf_count = self.leaf_max_keys.len() as u32;
-        let mut level: Vec<(Vec<u8>, u32)> = self
-            .leaf_max_keys
+        let mut level: Vec<(Vec<u8>, u32)> = std::mem::take(&mut self.leaf_max_keys)
             .into_iter()
             .enumerate()
             .map(|(id, max_key)| (max_key, id as u32))
@@ -510,8 +779,28 @@ impl PagedIndexBuilder {
             values_offset: self.pages.len() as u64,
         };
         self.pages[..HEADER_SIZE].copy_from_slice(&header.encode());
-        self.pages.extend_from_slice(&self.value_region);
-        Ok(self.pages.freeze())
+        Ok(())
+    }
+}
+
+pub(crate) fn create_spool_file() -> std::io::Result<std::fs::File> {
+    match std::env::var_os("NAMIDB_SPOOL_DIR").filter(|path| !path.is_empty()) {
+        Some(directory) => tempfile::tempfile_in(directory),
+        None => {
+            // `/tmp` is commonly a RAM-backed tmpfs on Linux hosts. Falling
+            // back there for a multi-gigabyte vector sidecar would merely move
+            // the original OOM out of the allocator. `/var/tmp` is the
+            // conventional disk-backed temporary location on Unix; other
+            // platforms keep their native temporary-directory behavior.
+            #[cfg(unix)]
+            {
+                tempfile::tempfile_in("/var/tmp")
+            }
+            #[cfg(not(unix))]
+            {
+                tempfile::tempfile()
+            }
+        }
     }
 }
 
@@ -553,8 +842,25 @@ fn page_checksum(page: &[u8], format: PagedFormat) -> u32 {
 }
 
 fn page_range(page: u32) -> Range<u64> {
-    let start = HEADER_SIZE as u64 + page as u64 * PAGE_SIZE as u64;
-    start..start + PAGE_SIZE as u64
+    page_range_at(0, page).expect("u32 page offsets fit in u64")
+}
+
+fn page_range_at(base_offset: u64, page: u32) -> Result<Range<u64>> {
+    let start = base_offset
+        .checked_add(HEADER_SIZE as u64)
+        .and_then(|offset| offset.checked_add(page as u64 * PAGE_SIZE as u64))
+        .ok_or_else(|| Error::invariant("paged-index page offset overflow"))?;
+    let end = start
+        .checked_add(PAGE_SIZE as u64)
+        .ok_or_else(|| Error::invariant("paged-index page end overflow"))?;
+    Ok(start..end)
+}
+
+fn header_range_at(base_offset: u64) -> Result<Range<u64>> {
+    let end = base_offset
+        .checked_add(HEADER_SIZE as u64)
+        .ok_or_else(|| Error::invariant("paged-index header offset overflow"))?;
+    Ok(base_offset..end)
 }
 
 fn external_value_range(values_offset: u64, offset: u64, len: usize) -> Result<Range<u64>> {
@@ -681,6 +987,55 @@ pub async fn probe_node_locator(
         let mut ordinal = [0; 8];
         ordinal.copy_from_slice(&value);
         out.insert(id, u64::from_le_bytes(ordinal));
+    }
+    Ok((out, stats))
+}
+
+/// Fetch exact binary node records from a combined
+/// [`NodeLocatorRecordBuilder`] sidecar.
+///
+/// The ordinary locator header at byte zero remains the compatibility and
+/// integrity envelope for the prefix. Because node-locator values are inline,
+/// its `values_offset` points at the appended `NodeRecord` B+tree. Both trees
+/// must advertise the same entry count before the record index is accepted as
+/// authoritative.
+pub async fn probe_node_records(
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    ids: &[[u8; 16]],
+) -> Result<(BTreeMap<[u8; 16], Vec<u8>>, PagedProbeStats)> {
+    crate::cancel::check()?;
+    let locator_header_bytes = read_range(&store, &path, header_range_at(0)?).await?;
+    let locator_header = Header::decode(&locator_header_bytes, PagedIndexKind::NodeLocator)?;
+    locator_header.require_authoritative_integrity()?;
+
+    let keys: Vec<Vec<u8>> = ids.iter().map(|id| id.to_vec()).collect();
+    let (found, mut stats) = probe_at(
+        store,
+        path,
+        PagedIndexKind::NodeRecord,
+        &keys,
+        None,
+        locator_header.values_offset,
+    )
+    .await?;
+    stats.bytes_read = stats.bytes_read.saturating_add(locator_header_bytes.len());
+    if stats.index_entries != locator_header.entry_count {
+        return Err(Error::invariant(
+            "node-record index entry count differs from locator prefix",
+        ));
+    }
+
+    let mut out = BTreeMap::new();
+    for (key, value) in found {
+        if key.len() != 16 {
+            return Err(Error::invariant(
+                "node-record paged-index key is not 16 bytes",
+            ));
+        }
+        let mut id = [0; 16];
+        id.copy_from_slice(&key);
+        out.insert(id, value);
     }
     Ok((out, stats))
 }
@@ -896,8 +1251,19 @@ async fn probe(
     keys: &[Vec<u8>],
     external_value_limit: Option<usize>,
 ) -> Result<(BTreeMap<Vec<u8>, Vec<u8>>, PagedProbeStats)> {
+    probe_at(store, path, expected, keys, external_value_limit, 0).await
+}
+
+async fn probe_at(
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    expected: PagedIndexKind,
+    keys: &[Vec<u8>],
+    external_value_limit: Option<usize>,
+    base_offset: u64,
+) -> Result<(BTreeMap<Vec<u8>, Vec<u8>>, PagedProbeStats)> {
     crate::cancel::check()?;
-    let header_bytes = read_range(&store, &path, 0..HEADER_SIZE as u64).await?;
+    let header_bytes = read_range(&store, &path, header_range_at(base_offset)?).await?;
     let header = Header::decode(&header_bytes, expected)?;
     header.require_authoritative_integrity()?;
     let mut stats = PagedProbeStats {
@@ -921,7 +1287,10 @@ async fn probe(
     loop {
         crate::cancel::check()?;
         let page_ids: Vec<u32> = assignments.keys().copied().collect();
-        let ranges: Vec<_> = page_ids.iter().map(|id| page_range(*id)).collect();
+        let ranges: Vec<_> = page_ids
+            .iter()
+            .map(|id| page_range_at(base_offset, *id))
+            .collect::<Result<Vec<_>>>()?;
         let pages = read_ranges(&store, &path, &ranges).await?;
         stats.pages_read += pages.len();
         stats.bytes_read += pages.iter().map(Bytes::len).sum::<usize>();
@@ -979,6 +1348,9 @@ async fn probe(
         }
     }
 
+    let values_offset = base_offset
+        .checked_add(header.values_offset)
+        .ok_or_else(|| Error::invariant("paged-index values offset overflow"))?;
     let mut external: Vec<(usize, Range<u64>, Option<u32>)> = Vec::new();
     for (idx, (_, value, external_meta)) in found_meta.iter_mut().enumerate() {
         let Some((offset, len, checksum)) = *external_meta else {
@@ -998,7 +1370,7 @@ async fn probe(
         }
         external.push((
             idx,
-            external_value_range(header.values_offset, offset, read_len)?,
+            external_value_range(values_offset, offset, read_len)?,
             (read_len == len as usize).then_some(checksum).flatten(),
         ));
     }
@@ -1308,6 +1680,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(build_equality(&equality).unwrap(), equality_reference);
+        assert_eq!(
+            decode_all_equality(&build_equality(&equality).unwrap()).unwrap(),
+            equality,
+            "whole-body header decode must checksum only the fixed header"
+        );
 
         let locator_ids: Vec<_> = (0..2_000u128).map(id).collect();
         let locator_reference = reference_build(
@@ -1343,6 +1720,197 @@ mod tests {
     #[test]
     fn node_locator_rejects_unsorted_ids() {
         let error = build_node_locator([id(2), id(1)]).unwrap_err();
+        assert!(matches!(error, Error::Invariant(_)));
+    }
+
+    #[test]
+    fn spooled_node_record_builder_is_wire_identical_and_keeps_values_off_heap() {
+        let entries: Vec<([u8; 16], Vec<u8>)> = (0..512_u128)
+            .map(|n| (id(n), vec![(n % 251) as u8; 16 * 1024 + n as usize % 97]))
+            .collect();
+
+        let mut builder = NodeLocatorRecordBuilder::new();
+        for (node_id, record) in &entries {
+            builder.push(node_id, record).unwrap();
+        }
+        let actual = builder.finish().unwrap();
+
+        let mut expected = BytesMut::new();
+        expected.extend_from_slice(
+            &build_node_locator(entries.iter().map(|(node_id, _)| *node_id)).unwrap(),
+        );
+        expected.extend_from_slice(
+            &reference_build(
+                PagedIndexKind::NodeRecord,
+                entries
+                    .iter()
+                    .map(|(node_id, record)| (node_id.to_vec(), record.clone()))
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(actual, expected.freeze());
+
+        let mut builder = NodeLocatorRecordBuilder::new();
+        for (node_id, record) in &entries {
+            builder.push(node_id, record).unwrap();
+        }
+        let upload = builder.finish_upload().unwrap();
+        assert_eq!(upload.entry_count(), entries.len() as u64);
+        assert!(
+            upload.prefix.iter().map(Bytes::len).sum::<usize>() < 128 * 1024,
+            "only locator/index pages should remain resident"
+        );
+        let file = upload
+            .values
+            .file
+            .as_ref()
+            .expect("non-empty exact records use an anonymous spool file");
+        assert_eq!(file.metadata().unwrap().len(), upload.values.len);
+        assert_eq!(upload.size_bytes(), actual.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn combined_node_records_keep_locator_prefix_compatible_and_probe_exact_values() {
+        let mut builder = NodeLocatorRecordBuilder::new();
+        let mut expected = BTreeMap::new();
+        for n in 0..10_000u128 {
+            let mut record = vec![(n % 251) as u8; 1_024 + (n as usize % 31)];
+            record[..16].copy_from_slice(&id(n));
+            builder.push(&id(n), &record).unwrap();
+            if matches!(n, 1 | 5_001 | 9_999) {
+                expected.insert(id(n), record);
+            }
+        }
+        let body = builder.finish().unwrap();
+
+        // The first body is an ordinary locator. Its values_offset marks its
+        // exact end because locator values are inline; the appended body starts
+        // with its own V2 header.
+        let locator_header =
+            Header::decode(&body[..HEADER_SIZE], PagedIndexKind::NodeLocator).unwrap();
+        let record_start = locator_header.values_offset as usize;
+        assert_eq!(&body[record_start..record_start + 8], MAGIC_V2);
+        Header::decode(
+            &body[record_start..record_start + HEADER_SIZE],
+            PagedIndexKind::NodeRecord,
+        )
+        .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("nodes.nloc2");
+        store
+            .put(&path, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+
+        // An old reader sees only the compatible locator prefix.
+        let probes = vec![id(1), id(5_001), id(9_999), id(20_000)];
+        let (located, _) = probe_node_locator(store.clone(), path.clone(), &probes)
+            .await
+            .unwrap();
+        assert_eq!(located.get(&id(1)), Some(&1));
+        assert_eq!(located.get(&id(5_001)), Some(&5_001));
+        assert_eq!(located.get(&id(9_999)), Some(&9_999));
+        assert!(!located.contains_key(&id(20_000)));
+
+        // A new reader range-fetches only requested opaque records. Duplicate
+        // probes and misses do not duplicate output or trigger a full body read.
+        let record_probes = vec![id(1), id(5_001), id(9_999), id(20_000), id(1)];
+        let (records, stats) = probe_node_records(store, path, &record_probes)
+            .await
+            .unwrap();
+        assert_eq!(records, expected);
+        assert_eq!(stats.index_entries, 10_000);
+        assert!(stats.leaf_entries_examined < 1_000);
+        assert!(stats.bytes_read < body.len() / 20);
+    }
+
+    #[tokio::test]
+    async fn combined_node_record_chunks_upload_without_flattening() {
+        let mut builder = NodeLocatorRecordBuilder::new();
+        builder.push(&id(1), b"one").unwrap();
+        builder.push(&id(2), b"two").unwrap();
+        let chunks = builder.finish_chunks().unwrap();
+
+        // Locator pages, record-index pages, record-value region. The locator
+        // has no external value chunk.
+        assert_eq!(chunks.len(), 3);
+        let locator_header = Header::decode(&chunks[0], PagedIndexKind::NodeLocator).unwrap();
+        assert_eq!(locator_header.values_offset as usize, chunks[0].len());
+        let record_header = Header::decode(&chunks[1], PagedIndexKind::NodeRecord).unwrap();
+        assert_eq!(record_header.values_offset as usize, chunks[1].len());
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("chunked.nloc2");
+        let payload: PutPayload = chunks.into_iter().collect();
+        store.put(&path, payload).await.unwrap();
+        let (records, _) = probe_node_records(store, path, &[id(2)]).await.unwrap();
+        assert_eq!(
+            records.get(&id(2)).map(Vec::as_slice),
+            Some(b"two".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn node_record_probe_rejects_missing_misaligned_or_corrupt_extension() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let locator_only = build_node_locator([id(1)]).unwrap();
+        let locator_only_path = Path::from("locator-only.nloc");
+        store
+            .put(&locator_only_path, PutPayload::from(locator_only.clone()))
+            .await
+            .unwrap();
+        assert!(
+            probe_node_records(store.clone(), locator_only_path, &[id(1)])
+                .await
+                .is_err()
+        );
+
+        let mut one_record = PagedIndexBuilder::new(PagedIndexKind::NodeRecord);
+        one_record.push_external(&id(1), b"one").unwrap();
+        let one_record = one_record.finish().unwrap();
+        let mut misaligned = BytesMut::new();
+        misaligned.extend_from_slice(&build_node_locator([id(1), id(2)]).unwrap());
+        misaligned.extend_from_slice(&one_record);
+        let misaligned_path = Path::from("misaligned.nloc2");
+        store
+            .put(&misaligned_path, PutPayload::from(misaligned.freeze()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            probe_node_records(store.clone(), misaligned_path, &[id(1)]).await,
+            Err(Error::Invariant(_))
+        ));
+
+        let mut builder = NodeLocatorRecordBuilder::new();
+        builder.push(&id(1), b"one").unwrap();
+        builder.push(&id(2), b"two").unwrap();
+        let mut corrupt = builder.finish().unwrap().to_vec();
+        *corrupt.last_mut().unwrap() ^= 0x01;
+        let corrupt_path = Path::from("corrupt.nloc2");
+        store
+            .put(&corrupt_path, PutPayload::from(corrupt))
+            .await
+            .unwrap();
+        assert!(matches!(
+            probe_node_records(store.clone(), corrupt_path.clone(), &[id(2)]).await,
+            Err(Error::Invariant(_))
+        ));
+        // Corruption in the appended record value cannot poison the compatible
+        // locator prefix used by old readers.
+        let (located, _) = probe_node_locator(store, corrupt_path, &[id(2)])
+            .await
+            .unwrap();
+        assert_eq!(located.get(&id(2)), Some(&1));
+    }
+
+    #[test]
+    fn combined_node_record_builder_rejects_unsorted_ids() {
+        let mut builder = NodeLocatorRecordBuilder::new();
+        builder.push(&id(2), b"two").unwrap();
+        let error = builder.push(&id(1), b"one").unwrap_err();
         assert!(matches!(error, Error::Invariant(_)));
     }
 

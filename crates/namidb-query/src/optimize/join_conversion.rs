@@ -104,6 +104,9 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         },
+        LogicalPlan::DiscardResult { input } => LogicalPlan::DiscardResult {
+            input: Box::new(convert_cross_to_hash(*input, catalog)),
+        },
         LogicalPlan::Aggregate {
             input,
             group_by,

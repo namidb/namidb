@@ -174,6 +174,15 @@ pub enum LogicalPlan {
         discard_input_bindings: bool,
     },
 
+    /// Terminal result sink for a top-level statement without `RETURN`.
+    ///
+    /// The child is still consumed completely so every write side effect runs,
+    /// but none of its internal bindings/cardinality becomes a user-visible
+    /// result row. Keeping this as an explicit operator prevents the executor
+    /// and Bolt adapter from retaining and serialising large bound values (most
+    /// notably embeddings) for write-only statements.
+    DiscardResult { input: Box<LogicalPlan> },
+
     /// Aggregate (group_by + aggregation expressions).
     Aggregate {
         input: Box<LogicalPlan>,
@@ -507,6 +516,7 @@ impl LogicalPlan {
             | LogicalPlan::Expand { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
+            | LogicalPlan::DiscardResult { input }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::TopN { input, .. }
             | LogicalPlan::Distinct { input }
@@ -575,6 +585,7 @@ impl LogicalPlan {
                     "Project"
                 }
             }
+            LogicalPlan::DiscardResult { .. } => "DiscardResult",
             LogicalPlan::Aggregate { .. } => "Aggregate",
             LogicalPlan::TopN { .. } => "TopN",
             LogicalPlan::Distinct { .. } => "Distinct",

@@ -65,7 +65,10 @@ use crate::compact::{
 };
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
-use crate::flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
+use crate::flush::{
+    await_all_object_uploads, flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord,
+    ObjectUploadFuture,
+};
 use crate::manifest::{
     LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, TextIndexDescriptor,
     VectorIndexDescriptor, WalSegmentDescriptor,
@@ -2120,7 +2123,7 @@ impl WriterSession {
         //    PendingSst's private fields (defined inside flush::builder).
         let store = self.manifest_store.store().clone();
         let mut descriptors = Vec::with_capacity(built.len());
-        let mut put_futures: Vec<_> = Vec::with_capacity(built.len() * 2);
+        let mut put_futures: Vec<ObjectUploadFuture> = Vec::with_capacity(built.len() * 2);
         let mut bloom_count = 0usize;
         let mut attached_max_lsn = 0u64;
         for b in built {
@@ -2129,10 +2132,7 @@ impl WriterSession {
             let store_ref = store.clone();
             put_futures.push(Box::pin(async move {
                 crate::flush::put_object(store_ref, &body_path, body).await
-            })
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                >);
+            }));
             if let Some((bloom_path, bloom_body)) = bloom {
                 bloom_count += 1;
                 let store_ref = store.clone();
@@ -2143,15 +2143,18 @@ impl WriterSession {
             for (sidecar_path, sidecar_body) in sidecars {
                 let store_ref = store.clone();
                 put_futures.push(Box::pin(async move {
-                    crate::flush::put_object(store_ref, &sidecar_path, sidecar_body).await
+                    crate::flush::put_sidecar_payload(store_ref, &sidecar_path, sidecar_body).await
                 }));
             }
             descriptors.push(descriptor);
         }
         let ssts_written = descriptors.len();
 
-        // 2. I/O phase — concurrent PUTs; first error short-circuits.
-        futures::future::try_join_all(put_futures).await?;
+        // 2. I/O phase — bounded concurrent PUTs. Await every sibling even
+        // after one fails so each multipart uploader can run its abort path;
+        // queued objects are admitted gradually instead of opening every
+        // object upload in the import at once.
+        await_all_object_uploads(put_futures).await?;
 
         // 3. Commit phase — one new manifest version (mirrors flush()).
         let mut next = self.current.manifest.next_version(self.fence.writer_id);

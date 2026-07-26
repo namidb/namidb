@@ -18,10 +18,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use namidb_bolt::chunk::{read_message, write_message};
 use namidb_bolt::codec::{decode, encode};
-use namidb_bolt::message::POST_AUTH_MESSAGE_BYTES;
+use namidb_bolt::message::{DEFAULT_POST_AUTH_MESSAGE_BYTES, POST_AUTH_MESSAGE_BYTES};
 use namidb_bolt::value::{struct_tag, Value};
 use namidb_bolt::Response;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +30,55 @@ use tokio::net::TcpStream;
 fn pack(v: &Value) -> Vec<u8> {
     let mut buf = BytesMut::new();
     encode(&mut buf, v).expect("encode");
+    buf.to_vec()
+}
+
+fn put_tiny_string(buf: &mut BytesMut, value: &str) {
+    assert!(value.len() <= 15, "test helper only accepts tiny strings");
+    buf.put_u8(0x80 | value.len() as u8);
+    buf.extend_from_slice(value.as_bytes());
+}
+
+/// Encode the real transport shape of a vector-ingest RUN without first
+/// allocating two million `Value` enums on the test-client side.
+///
+/// PackStream represents every f64 as marker 0xC1 + eight big-endian bytes, so
+/// 2,000 × 1,024 dimensions intentionally exceeds the historical 16 MiB cap.
+/// The query ignores the parameter: this integration test isolates framing,
+/// decoding and Config→Session wiring from storage/write-path memory.
+fn pack_vector_batch_run(row_count: usize, dimensions: usize) -> Vec<u8> {
+    assert!(row_count <= u16::MAX as usize);
+    assert!(dimensions <= u16::MAX as usize);
+    let estimated = row_count
+        .saturating_mul(dimensions)
+        .saturating_mul(9)
+        .saturating_add(64 * 1024);
+    let mut buf = BytesMut::with_capacity(estimated);
+
+    // RUN is a three-field tiny struct, tag 0x10.
+    buf.put_u8(0xB3);
+    buf.put_u8(struct_tag::RUN);
+    put_tiny_string(&mut buf, "RETURN 1 AS ok");
+
+    // params = {rows: [{key: ..., embedding: [f64; dimensions]}, ...]}
+    buf.put_u8(0xA1);
+    put_tiny_string(&mut buf, "rows");
+    buf.put_u8(0xD5); // List16
+    buf.put_u16(row_count as u16);
+    for row in 0..row_count {
+        buf.put_u8(0xA2); // tiny Map(2)
+        put_tiny_string(&mut buf, "key");
+        put_tiny_string(&mut buf, &format!("k{row}"));
+        put_tiny_string(&mut buf, "embedding");
+        buf.put_u8(0xD5); // List16
+        buf.put_u16(dimensions as u16);
+        for _ in 0..dimensions {
+            buf.put_u8(0xC1);
+            buf.put_f64(0.25);
+        }
+    }
+
+    buf.put_u8(0xA0); // empty RUN extras map
     buf.to_vec()
 }
 
@@ -263,6 +312,25 @@ async fn boot_bolt_full(
     tx_timeout: Duration,
     query_timeout: Duration,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_with_message_limit(
+        ns,
+        tx_timeout,
+        query_timeout,
+        DEFAULT_POST_AUTH_MESSAGE_BYTES,
+    )
+    .await
+}
+
+/// Like [`boot_bolt_full`] with an explicit authenticated-message ceiling.
+/// Keeping the limit in `Config` makes the test deterministic without mutating
+/// process-global environment variables while the integration suite runs in
+/// parallel.
+async fn boot_bolt_with_message_limit(
+    ns: &str,
+    tx_timeout: Duration,
+    query_timeout: Duration,
+    bolt_max_message_bytes: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bolt_addr = listener.local_addr().unwrap();
     drop(listener);
@@ -284,6 +352,7 @@ async fn boot_bolt_full(
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes,
         bolt_tx_timeout: tx_timeout,
         query_timeout,
         write_timeout: query_timeout,
@@ -346,6 +415,7 @@ async fn boot_bolt_tokens(
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,
@@ -376,6 +446,120 @@ async fn boot_bolt_tokens(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     (bolt_addr, task)
+}
+
+#[tokio::test]
+async fn configured_bolt_limit_returns_failure_without_stopping_listener() {
+    let max_bytes = 1024;
+    let (bolt_addr, task) = boot_bolt_with_message_limit(
+        "bolt-message-limit",
+        Duration::ZERO,
+        Duration::ZERO,
+        max_bytes,
+    )
+    .await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("RETURN 1 AS ok".into()),
+            Value::Map(BTreeMap::from([(
+                "oversized".into(),
+                Value::String("x".repeat(max_bytes * 2)),
+            )])),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    let body = pack(&run);
+    assert!(body.len() > max_bytes);
+    send_msg(&mut stream, &body).await;
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), recv_msg(&mut stream))
+        .await
+        .expect("server did not return oversized-message diagnostic");
+    let meta = match failure {
+        Response::Failure(meta) => meta,
+        other => panic!("oversized authenticated RUN must return FAILURE, got {other:?}"),
+    };
+    assert_eq!(
+        meta.get("code"),
+        Some(&Value::String(
+            "Neo.ClientError.Request.Invalid".to_string()
+        ))
+    );
+    let message = match meta.get("message") {
+        Some(Value::String(message)) => message,
+        other => panic!("FAILURE missing diagnostic message: {other:?}"),
+    };
+    assert!(message.contains("NAMIDB_BOLT_MAX_MESSAGE_BYTES"));
+    assert!(message.contains(&max_bytes.to_string()));
+    assert!(message.contains("smaller batches"));
+
+    // The rejected frame cannot be resumed, so its connection closes after
+    // the flushed FAILURE. The listener itself must remain available.
+    let mut one = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut one))
+        .await
+        .expect("oversized connection was not closed")
+        .expect("read after FAILURE");
+    assert_eq!(read, 0);
+    assert!(
+        TcpStream::connect(bolt_addr).await.is_ok(),
+        "one oversized client must not stop the Bolt listener"
+    );
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn default_bolt_limit_accepts_2000_rows_of_1024d_vectors() {
+    let (bolt_addr, task) = boot_bolt("bolt-vector-batch-2000", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let body = pack_vector_batch_run(2_000, 1_024);
+    assert!(
+        body.len() > 16 * 1024 * 1024,
+        "regression payload must exceed the historical 16 MiB cap; got {}",
+        body.len()
+    );
+    assert!(
+        body.len() < DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        "regression payload must fit the production default; got {}",
+        body.len()
+    );
+    send_msg(&mut stream, &body).await;
+
+    let fields = match tokio::time::timeout(Duration::from_secs(20), recv_msg(&mut stream))
+        .await
+        .expect("2,000×1,024 RUN timed out")
+    {
+        Response::Success(meta) => match meta.get("fields") {
+            Some(Value::List(fields)) => fields.clone(),
+            other => panic!("RUN SUCCESS missing fields: {other:?}"),
+        },
+        other => panic!("2,000×1,024 RUN must be accepted, got {other:?}"),
+    };
+    assert_eq!(fields, vec![Value::String("ok".into())]);
+
+    let pull = Value::Struct {
+        tag: struct_tag::PULL,
+        fields: vec![Value::Map(BTreeMap::from([("n".into(), Value::Int(-1))]))],
+    };
+    send_msg(&mut stream, &pack(&pull)).await;
+    assert_eq!(
+        recv_msg(&mut stream).await,
+        Response::Record(vec![Value::Int(1)])
+    );
+    assert!(matches!(recv_msg(&mut stream).await, Response::Success(_)));
+
+    goodbye(&mut stream).await;
+    stream.shutdown().await.ok();
+    task.abort();
 }
 
 #[tokio::test]
@@ -483,6 +667,7 @@ async fn bolt_create_then_match_roundtrip() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,
@@ -572,6 +757,7 @@ async fn bolt_bad_token_yields_failure() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,
@@ -725,6 +911,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,

@@ -144,6 +144,7 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             }
             collect_from_plan(input, req);
         }
+        LogicalPlan::DiscardResult { input } => collect_from_plan(input, req),
         LogicalPlan::Aggregate {
             input,
             group_by,
@@ -626,6 +627,9 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             items,
             distinct,
             discard_input_bindings,
+        },
+        LogicalPlan::DiscardResult { input } => LogicalPlan::DiscardResult {
+            input: Box::new(rewrite(*input, req)),
         },
         LogicalPlan::Aggregate {
             input,

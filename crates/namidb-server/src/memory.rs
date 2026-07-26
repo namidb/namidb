@@ -24,10 +24,12 @@ struct ReclaimState {
     last_started: Option<Instant>,
 }
 
-/// A rejected admission with the current measured resident set.
+/// A rejected admission with the current measured resident set and any
+/// conservative working-set headroom requested before allocating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPressure {
     pub resident_bytes: usize,
+    pub requested_headroom_bytes: usize,
     pub max_bytes: usize,
 }
 
@@ -52,7 +54,32 @@ pub struct MemoryGovernor {
     reclaim_state: Mutex<ReclaimState>,
     reclaim_events: AtomicU64,
     rejected_queries: AtomicU64,
-    admin_flush_gate: tokio::sync::Semaphore,
+    /// Working-set headroom promised to authenticated Bolt requests that have
+    /// passed RSS admission but have not finished decode/execution yet.
+    reserved_headroom_bytes: AtomicUsize,
+    admin_flush_gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// RAII reservation against [`MemoryGovernor`]'s total-memory ceiling.
+///
+/// The session retains this from pre-decode admission through request
+/// handling. Cancellation and every error path release it automatically.
+#[derive(Debug)]
+pub struct MemoryHeadroomReservation {
+    governor: Arc<MemoryGovernor>,
+    bytes: usize,
+}
+
+impl Drop for MemoryHeadroomReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let previous = self
+                .governor
+                .reserved_headroom_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+            debug_assert!(previous >= self.bytes);
+        }
+    }
 }
 
 impl MemoryGovernor {
@@ -69,7 +96,8 @@ impl MemoryGovernor {
             reclaim_state: Mutex::new(ReclaimState::default()),
             reclaim_events: AtomicU64::new(0),
             rejected_queries: AtomicU64::new(0),
-            admin_flush_gate: tokio::sync::Semaphore::new(1),
+            reserved_headroom_bytes: AtomicUsize::new(0),
+            admin_flush_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -96,14 +124,89 @@ impl MemoryGovernor {
         };
         let resident = self.reclaim_off_worker(initial).await;
 
-        if resident >= self.max_bytes {
+        if let Some(pressure) = Self::projected_pressure(resident, 0, self.max_bytes) {
             self.rejected_queries.fetch_add(1, Ordering::Relaxed);
-            return Err(MemoryPressure {
-                resident_bytes: resident,
-                max_bytes: self.max_bytes,
-            });
+            return Err(pressure);
         }
         Ok(())
+    }
+
+    /// Atomically reserve projected decode/runtime headroom after normal RSS
+    /// sampling and reclaim.
+    ///
+    /// The compare/exchange includes reservations held by every concurrent
+    /// request, so multiple individually admissible frames cannot all race
+    /// past the same remaining process headroom.
+    pub async fn reserve_query_headroom(
+        self: &Arc<Self>,
+        additional_bytes: usize,
+    ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
+        if self.max_bytes == 0 {
+            return Ok(MemoryHeadroomReservation {
+                governor: Arc::clone(self),
+                bytes: 0,
+            });
+        }
+        let Some(initial) = self.observe_resident() else {
+            return Ok(MemoryHeadroomReservation {
+                governor: Arc::clone(self),
+                bytes: 0,
+            });
+        };
+        let resident = self.reclaim_off_worker(initial).await;
+        self.try_reserve_observed(resident, additional_bytes)
+    }
+
+    fn try_reserve_observed(
+        self: &Arc<Self>,
+        resident_bytes: usize,
+        additional_bytes: usize,
+    ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
+        loop {
+            let reserved = self.reserved_headroom_bytes.load(Ordering::Acquire);
+            let projected_headroom = reserved.saturating_add(additional_bytes);
+            if let Some(pressure) =
+                Self::projected_pressure(resident_bytes, projected_headroom, self.max_bytes)
+            {
+                self.rejected_queries.fetch_add(1, Ordering::Relaxed);
+                return Err(pressure);
+            }
+            let next = reserved.checked_add(additional_bytes).ok_or_else(|| {
+                self.rejected_queries.fetch_add(1, Ordering::Relaxed);
+                MemoryPressure {
+                    resident_bytes,
+                    requested_headroom_bytes: usize::MAX,
+                    max_bytes: self.max_bytes,
+                }
+            })?;
+            match self.reserved_headroom_bytes.compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(MemoryHeadroomReservation {
+                        governor: Arc::clone(self),
+                        bytes: additional_bytes,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn projected_pressure(
+        resident_bytes: usize,
+        requested_headroom_bytes: usize,
+        max_bytes: usize,
+    ) -> Option<MemoryPressure> {
+        (max_bytes > 0 && resident_bytes.saturating_add(requested_headroom_bytes) >= max_bytes)
+            .then_some(MemoryPressure {
+                resident_bytes,
+                requested_headroom_bytes,
+                max_bytes,
+            })
     }
 
     fn observe_resident(&self) -> Option<usize> {
@@ -281,10 +384,12 @@ impl MemoryGovernor {
     /// A flush is deliberately allowed while Cypher admission is closed
     /// because it can release a large memtable. Its SST build temporarily
     /// amplifies memory, though, so multi-tenant callers must never run several
-    /// relief flushes concurrently.
-    pub(crate) async fn admin_flush_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.admin_flush_gate
-            .acquire()
+    /// relief flushes concurrently. The owned permit can move into a
+    /// post-flush blocking allocator trim, keeping the gate closed even if the
+    /// HTTP request waiting on that trim is cancelled.
+    pub(crate) async fn admin_flush_permit(self: &Arc<Self>) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.admin_flush_gate)
+            .acquire_owned()
             .await
             .expect("admin flush semaphore is never closed")
     }
@@ -368,6 +473,7 @@ impl MemoryGovernor {
         if resident >= self.max_bytes {
             return Err(MemoryPressure {
                 resident_bytes: resident,
+                requested_headroom_bytes: 0,
                 max_bytes: self.max_bytes,
             });
         }
@@ -396,7 +502,7 @@ fn sample_resident_bytes() -> Option<usize> {
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_allocator() {
+pub(crate) fn trim_allocator() {
     // SAFETY: `malloc_trim(0)` has no pointer preconditions and only asks the
     // process-global glibc allocator to release wholly free pages.
     unsafe {
@@ -405,7 +511,7 @@ fn trim_allocator() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn trim_allocator() {}
+pub(crate) fn trim_allocator() {}
 
 #[cfg(test)]
 mod tests {
@@ -433,11 +539,89 @@ mod tests {
             governor.observe_for_test(1_000),
             Err(MemoryPressure {
                 resident_bytes: 1_000,
+                requested_headroom_bytes: 0,
                 max_bytes: 1_000,
             })
         );
         assert_eq!(governor.observe_for_test(800), Ok(false));
         assert_eq!(governor.observe_for_test(900), Ok(true));
+    }
+
+    #[test]
+    fn projected_headroom_rejects_before_allocation_and_saturates() {
+        assert_eq!(
+            MemoryGovernor::projected_pressure(800, 200, 1_000),
+            Some(MemoryPressure {
+                resident_bytes: 800,
+                requested_headroom_bytes: 200,
+                max_bytes: 1_000,
+            }),
+            "reaching the ceiling with the projected decode working set must reject"
+        );
+        assert!(
+            MemoryGovernor::projected_pressure(800, 199, 1_000).is_none(),
+            "one byte below the projected ceiling remains admissible"
+        );
+        assert_eq!(
+            MemoryGovernor::projected_pressure(1, usize::MAX, usize::MAX),
+            Some(MemoryPressure {
+                resident_bytes: 1,
+                requested_headroom_bytes: usize::MAX,
+                max_bytes: usize::MAX,
+            }),
+            "overflow must conservatively saturate instead of wrapping"
+        );
+        assert!(
+            MemoryGovernor::projected_pressure(usize::MAX, usize::MAX, 0).is_none(),
+            "a disabled governor remains disabled regardless of headroom"
+        );
+    }
+
+    #[test]
+    fn headroom_reservations_are_atomic_and_drop_readmits() {
+        let governor = Arc::new(MemoryGovernor::new(1_000));
+        let first = governor
+            .try_reserve_observed(100, 400)
+            .expect("first projected working set fits");
+        assert_eq!(
+            governor.reserved_headroom_bytes.load(Ordering::Acquire),
+            400
+        );
+
+        let rejected = governor
+            .try_reserve_observed(100, 500)
+            .expect_err("concurrent reservations must be included in projection");
+        assert_eq!(rejected.resident_bytes, 100);
+        assert_eq!(rejected.requested_headroom_bytes, 900);
+
+        drop(first);
+        assert_eq!(governor.reserved_headroom_bytes.load(Ordering::Acquire), 0);
+        let second = governor
+            .try_reserve_observed(100, 500)
+            .expect("dropping the first guard must readmit the second");
+        assert_eq!(
+            governor.reserved_headroom_bytes.load(Ordering::Acquire),
+            500
+        );
+        drop(second);
+
+        assert!(governor.try_reserve_observed(1, usize::MAX).is_err());
+        assert_eq!(
+            governor.reserved_headroom_bytes.load(Ordering::Acquire),
+            0,
+            "overflow rejection must not leak a reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_headroom_reservation_is_a_zero_byte_guard() {
+        let governor = Arc::new(MemoryGovernor::new(0));
+        let guard = governor
+            .reserve_query_headroom(usize::MAX)
+            .await
+            .expect("disabled governor never rejects");
+        assert_eq!(guard.bytes, 0);
+        assert_eq!(governor.reserved_headroom_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -541,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_flush_gate_is_process_wide_single_flight() {
-        let governor = MemoryGovernor::new(0);
+        let governor = Arc::new(MemoryGovernor::new(0));
         let first = governor.admin_flush_permit().await;
         assert!(
             tokio::time::timeout(Duration::from_millis(10), governor.admin_flush_permit())
@@ -553,5 +737,36 @@ mod tests {
         let _second = tokio::time::timeout(Duration::from_secs(1), governor.admin_flush_permit())
             .await
             .expect("dropping the first permit must unblock the next flush");
+    }
+
+    #[tokio::test]
+    async fn owned_admin_flush_permit_survives_cancelled_trim_waiter() {
+        let governor = Arc::new(MemoryGovernor::new(0));
+        let first = governor.admin_flush_permit().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let trim = tokio::task::spawn_blocking(move || {
+            let _first = first;
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .expect("test must release the simulated trim");
+        });
+        started_rx.await.expect("simulated trim must start");
+
+        // Dropping/aborting a waiter does not cancel spawn_blocking. The owned
+        // permit lives in the closure, so a disconnected admin request cannot
+        // admit a second flush while its allocator trim is still running.
+        trim.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), governor.admin_flush_permit())
+                .await
+                .is_err(),
+            "the detached blocking trim must retain the process-wide gate"
+        );
+        release_tx.send(()).unwrap();
+        let _second = tokio::time::timeout(Duration::from_secs(1), governor.admin_flush_permit())
+            .await
+            .expect("finishing the detached trim must release the gate");
     }
 }

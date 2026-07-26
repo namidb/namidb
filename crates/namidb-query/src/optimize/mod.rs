@@ -327,6 +327,9 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         | LogicalPlan::TopN { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::SemiApply { input, .. } => collect_produced(input, out),
+        // A result sink deliberately exposes none of its child's internal
+        // bindings at the statement boundary.
+        LogicalPlan::DiscardResult { .. } => {}
         // Apply emits the outer row combined with each subplan row, so it
         // produces both sides' bindings.
         LogicalPlan::Apply { input, subplan } => {

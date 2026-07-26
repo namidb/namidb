@@ -90,6 +90,10 @@ pub struct Config {
     pub sweep_delete: bool,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
+    /// Maximum body size for one authenticated Bolt message. The
+    /// unauthenticated handshake/LOGON path always keeps its strict 64 KiB
+    /// ceiling. Must be non-zero.
+    pub bolt_max_message_bytes: usize,
     /// Idle timeout for an open Bolt explicit transaction. While a
     /// transaction is open the writer lock is held, so an idle client would
     /// pin it; after this long without a message the transaction is rolled
@@ -675,6 +679,9 @@ pub async fn run_with_memory_max_bytes(
     config: Config,
     memory_max_bytes: usize,
 ) -> anyhow::Result<()> {
+    if config.bolt_max_message_bytes == 0 {
+        anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
+    }
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
@@ -1047,12 +1054,14 @@ pub async fn run_with_memory_max_bytes(
         let tx_timeout = config.bolt_tx_timeout;
         let bolt_shutdown = shutdown_rx.clone();
         let bolt_tls = tls_config.clone().map(tls::acceptor);
+        let bolt_max_message_bytes = config.bolt_max_message_bytes;
         tokio::spawn(async move {
             if let Err(e) = bolt::serve(
                 bolt_state,
                 bolt_addr,
                 bolt_auth,
                 tx_timeout,
+                bolt_max_message_bytes,
                 bolt_shutdown,
                 bolt_tls,
             )
@@ -2584,7 +2593,7 @@ async fn admin_flush(
 }
 
 async fn run_admin_flush(state: AppState) -> Response {
-    let _flush_permit = state.memory.admin_flush_permit().await;
+    let flush_permit = state.memory.admin_flush_permit().await;
     let mut w = state.writer.lock().await;
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
@@ -2593,12 +2602,21 @@ async fn run_admin_flush(state: AppState) -> Response {
             state
                 .memtable_bytes_gauge
                 .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
-            Json(FlushResponse {
+            let response = FlushResponse {
                 ssts_written: outcome.ssts_written,
                 bloom_sidecars_written: outcome.bloom_sidecars_written,
                 manifest_version: outcome.committed.manifest.version,
-            })
-            .into_response()
+            };
+            // A flush releases the memtable and its transient Arrow/Parquet
+            // allocations, but glibc can retain their now-free arenas in the
+            // process RSS indefinitely. Drop the writer lock before asking the
+            // allocator to return wholly free pages, and keep that potentially
+            // expensive operation off the async serving workers.
+            drop(w);
+            if flush_needs_allocator_trim(outcome.ssts_written) {
+                trim_allocator_after_flush(Arc::clone(&state.memory), flush_permit).await;
+            }
+            Json(response).into_response()
         }
         Err(e) => {
             recovery::recover_writer_if_needed(
@@ -2617,6 +2635,28 @@ async fn run_admin_flush(state: AppState) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+fn flush_needs_allocator_trim(ssts_written: usize) -> bool {
+    ssts_written != 0
+}
+
+async fn trim_allocator_after_flush(
+    memory: Arc<memory::MemoryGovernor>,
+    flush_permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    // Move the process-wide flush permit into the blocking closure. If the
+    // client disconnects while this JoinHandle is awaited, Tokio detaches the
+    // already-running blocking job; ownership here keeps a second flush/trim
+    // from overlapping it until malloc_trim has really completed.
+    let trim = tokio::task::spawn_blocking(move || {
+        let _flush_permit = flush_permit;
+        memory::trim_allocator();
+        let _ = memory.sample();
+    });
+    if let Err(error) = trim.await {
+        tracing::warn!(%error, "post-flush allocator trim task failed");
     }
 }
 
@@ -3122,7 +3162,7 @@ async fn dispatch_admin_flush_multi(
 }
 
 async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Response {
-    let _flush_permit = shared.memory.admin_flush_permit().await;
+    let flush_permit = shared.memory.admin_flush_permit().await;
     // Refresh the gauge because this route intentionally bypasses query
     // admission. At the hard limit, only an already-open namespace can own a
     // memtable worth flushing; recovering a cold one would allocate memory
@@ -3168,12 +3208,16 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
     match w.flush(schema).await {
         Ok(outcome) => {
             ns_state.snapshot.store(w.owned_snapshot());
-            Json(FlushResponse {
+            let response = FlushResponse {
                 ssts_written: outcome.ssts_written,
                 bloom_sidecars_written: outcome.bloom_sidecars_written,
                 manifest_version: outcome.committed.manifest.version,
-            })
-            .into_response()
+            };
+            drop(w);
+            if flush_needs_allocator_trim(outcome.ssts_written) {
+                trim_allocator_after_flush(Arc::clone(&shared.memory), flush_permit).await;
+            }
+            Json(response).into_response()
         }
         Err(e) => {
             if !ns_state.is_retired() {
@@ -3368,6 +3412,13 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, auth_token.map(|s| s.to_string()), "test".into());
         build_router(state)
+    }
+
+    #[test]
+    fn allocator_trim_is_reserved_for_flushes_that_wrote_an_sst() {
+        assert!(!flush_needs_allocator_trim(0));
+        assert!(flush_needs_allocator_trim(1));
+        assert!(flush_needs_allocator_trim(2));
     }
 
     #[test]

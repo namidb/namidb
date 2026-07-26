@@ -55,6 +55,9 @@ services:
       # decoded .vg/.ft pool. Empty keeps proportional legacy allocation.
       NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES: "${NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES:-}"
       NAMIDB_MEMORY_MAX_BYTES: "${NAMIDB_MEMORY_MAX_BYTES:-0}"
+      # Exact-record sidecars spool large value regions to disk during
+      # flush/compaction instead of retaining several GiB in process RSS.
+      NAMIDB_SPOOL_DIR: "/var/tmp/namidb-spool"
       NAMIDB_VECTOR_FILTER_MAX_DISTINCT: "${NAMIDB_VECTOR_FILTER_MAX_DISTINCT:-4096}"
       NAMIDB_VECTOR_FILTER_MAX_BYTES: "${NAMIDB_VECTOR_FILTER_MAX_BYTES:-67108864}"
       NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP: "${NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP:-8192}"
@@ -70,6 +73,9 @@ services:
     # NAMIDB_CONTAINER_MEMORY_LIMIT=4g together with a lower
     # NAMIDB_MEMORY_MAX_BYTES admission threshold. Zero leaves it unlimited.
     mem_limit: "${NAMIDB_CONTAINER_MEMORY_LIMIT:-0}"
+    volumes:
+      - namidb-spool:/var/tmp/namidb-spool
 
 volumes:
   minio-data: {}
+  namidb-spool: {}

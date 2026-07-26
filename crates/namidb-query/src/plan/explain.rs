@@ -461,6 +461,7 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 out.push_str(" (keep)");
             }
         }
+        LogicalPlan::DiscardResult { .. } => out.push_str("DiscardResult"),
         LogicalPlan::Aggregate {
             group_by,
             aggregations,

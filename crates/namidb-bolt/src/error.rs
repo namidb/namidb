@@ -29,6 +29,17 @@ pub enum BoltError {
         max: usize,
     },
 
+    #[error(
+        "temporary memory pressure: {what} needs {requested} bytes, \
+         but only {available} of {capacity} bytes are available"
+    )]
+    MemoryBudgetExhausted {
+        what: &'static str,
+        requested: usize,
+        available: usize,
+        capacity: usize,
+    },
+
     #[error("value nesting too deep: exceeds maximum depth {max}")]
     NestingTooDeep { max: usize },
 

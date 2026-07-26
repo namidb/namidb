@@ -2121,6 +2121,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2190,7 +2199,7 @@ dependencies = [
 
 [[package]]
 name = "namidb"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "namidb-core",
  "namidb-graph",
@@ -2200,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-ann"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "namidb-core",
  "rand 0.8.6",
@@ -2213,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bench"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -2232,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bolt"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2252,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-cli"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -2272,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-core"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2288,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-graph"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2310,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-markdown"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2333,7 +2342,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-mcp"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -2353,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-py"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "bytes",
  "chrono",
@@ -2371,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-query"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2395,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-server"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2435,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-storage"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2455,6 +2464,7 @@ dependencies = [
  "fs2",
  "futures",
  "imbl",
+ "memmap2",
  "namidb-ann",
  "namidb-core",
  "object_store 0.13.1",

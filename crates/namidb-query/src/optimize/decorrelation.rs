@@ -386,6 +386,9 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         },
+        LogicalPlan::DiscardResult { input } => LogicalPlan::DiscardResult {
+            input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
+        },
         LogicalPlan::Aggregate {
             input,
             group_by,

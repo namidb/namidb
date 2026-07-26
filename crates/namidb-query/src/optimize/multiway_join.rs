@@ -443,6 +443,9 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         },
+        LogicalPlan::DiscardResult { input } => LogicalPlan::DiscardResult {
+            input: Box::new(rewrite(*input)),
+        },
         LogicalPlan::Aggregate {
             input,
             group_by,

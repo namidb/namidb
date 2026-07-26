@@ -5,7 +5,7 @@
 //! This crate is not published to crates.io yet.
 //!
 //! ```toml
-//! namidb = { git = "https://github.com/namidb/namidb", tag = "v2.0.5" }
+//! namidb = { git = "https://github.com/namidb/namidb", tag = "v2.0.6" }
 //! ```
 //!
 //! Git/path consumers should pin an exact revision and treat this low-level

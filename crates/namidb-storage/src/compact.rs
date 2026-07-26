@@ -58,8 +58,8 @@
 //!
 //! The prepare phase merges each bucket with a k-way streaming merge
 //! instead of materialising every decoded source row. Per-source cursors
-//! decode one row group (nodes) / one partner block + property-stream
-//! mini-batch (edges) at a time; a binary heap keyed by
+//! decode one bounded record batch (nodes) / one partner block +
+//! property-stream mini-batch (edges) at a time; a binary heap keyed by
 //! `(key asc, lsn desc, source order)` picks the winner per key, shadowed
 //! duplicates are skipped without ever being converted, and only winners
 //! pay the row materialisation (for nodes, the JSON property-map
@@ -68,15 +68,15 @@
 //! sidecar/stat harvesters and the vector/text index member collectors
 //! observe the same winner stream, so nothing retains the merged bucket.
 //!
-//! Residual memory per bucket, by design: the **compressed** source bodies
-//! (all sources must be open simultaneously; their sum is bounded by the
-//! level budget), one decoded row group per node source, one chunk of
+//! Residual memory per bucket, by design: file-backed mappings of the
+//! compressed source bodies, one small decoded batch per activated node
+//! source, one chunk of
 //! winner rows, the sidecar maps, and — the true lower bound — the
 //! embeddings / documents collected for a vector/text index rebuild, which
 //! the Vamana/BM25 builders inherently need in full.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -86,9 +86,14 @@ use arrow_array::{
 use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
+use memmap2::MmapOptions;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
-use parquet::file::metadata::ParquetMetaData;
+use object_store::{GetResultPayload, ObjectStore, ObjectStoreExt};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
@@ -97,8 +102,9 @@ use namidb_core::{DataType, EdgeTypeDef, LabelDef, LabelDictionary, Schema, Valu
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{
-    EqualitySidecarCollector, IncrementalNodeSstWriter, LabelIndexCollector, NodeRow,
-    NodeWriteRecord, PerLabelStatsCollector, UniqueSidecarCollector, NODE_SST_BATCH_ROWS,
+    encode_exact_node_record, EqualitySidecarCollector, IncrementalNodeSstWriter,
+    LabelIndexCollector, NodeRow, NodeWriteRecord, PerLabelStatsCollector, UniqueSidecarCollector,
+    NODE_SST_BATCH_ROWS,
 };
 #[cfg(feature = "vector-index")]
 use crate::manifest::VectorIndexDescriptor;
@@ -119,9 +125,11 @@ use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::writer::{EdgeRecord, EdgeSstBuild, EdgeSstWriter, EdgeSstWriterOptions};
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::{
-    parse_node_sst_metadata, prop_column_name, NodeSstFinish, NodeSstReader, NodeSstWriterOptions,
-    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    node_arrow_schema, prop_column_name, NodeSstFinish, NodeSstWriterOptions, COL_LABELS, COL_LSN,
+    COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
+#[cfg(test)]
+use crate::sst::nodes::{parse_node_sst_metadata, NodeSstReader};
 
 /// Outcome of [`compact_l0_to_l1`].
 #[derive(Debug, Clone)]
@@ -432,37 +440,10 @@ fn plan_node_bucket<'a>(
     if let Some(plan) = plan_bucket_merge(sources, base, ratio) {
         return Some(plan);
     }
-    let required_equality: Vec<&str> = required
-        .properties
-        .iter()
-        .filter(|property| {
-            property.indexed
-                && matches!(
-                    property.data_type,
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
-                )
-        })
-        .map(|property| property.name.as_str())
-        .collect();
     let needs_migration = force_search_rebuild
-        || sources.iter().any(|desc| {
-            desc.node_locator.is_none()
-                || desc
-                    .unique_property_indices
-                    .iter()
-                    .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
-                || desc
-                    .equality_property_indices
-                    .iter()
-                    .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
-                || required_equality.iter().any(|property| {
-                    !desc.equality_property_indices.iter().any(|index| {
-                        index.property == *property
-                            && index.mixed_type_complete
-                            && (index.paged.is_some() || index.paged_build_unsupported)
-                    })
-                })
-        });
+        || sources
+            .iter()
+            .any(|desc| node_descriptor_needs_migration(desc, required));
     if !needs_migration || sources.is_empty() {
         return None;
     }
@@ -477,6 +458,40 @@ fn plan_node_bucket<'a>(
         target_level,
         is_deepest: true,
     })
+}
+
+fn node_descriptor_needs_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
+    !crate::manifest::node_locator_has_exact_records(desc)
+        || node_descriptor_needs_non_record_migration(desc, required)
+}
+
+fn node_descriptor_needs_non_record_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
+    let required_equality: Vec<&str> = required
+        .properties
+        .iter()
+        .filter(|property| {
+            property.indexed
+                && matches!(
+                    property.data_type,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                )
+        })
+        .map(|property| property.name.as_str())
+        .collect();
+    desc.unique_property_indices
+        .iter()
+        .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
+        || desc
+            .equality_property_indices
+            .iter()
+            .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
+        || required_equality.iter().any(|property| {
+            !desc.equality_property_indices.iter().any(|index| {
+                index.property == *property
+                    && index.mixed_type_complete
+                    && (index.paged.is_some() || index.paged_build_unsupported)
+            })
+        })
 }
 
 fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
@@ -766,37 +781,84 @@ async fn prepare_leveled(
         else {
             continue;
         };
+        // A lone, otherwise-current SST from 2.0.5 needs only the appended
+        // exact-record accelerator. Rewriting its complete Parquet body would
+        // retain another multi-gigabyte vector corpus and double disk/network
+        // I/O for no logical data change. Build the new sidecar directly from
+        // the source rows, preserve every existing descriptor/search body, and
+        // replace only the locator marker in the next manifest.
+        if plan.inputs.len() == 1
+            && !crate::manifest::node_locator_has_exact_records(plan.inputs[0])
+            && !node_descriptor_needs_non_record_migration(plan.inputs[0], &sidecar_def)
+            && !rebuild_search
+        {
+            let source = (*plan.inputs[0]).clone();
+            let body = get_sst_body(store.as_ref(), paths, &source).await?;
+            let locator_label = label_def.clone();
+            let locator_upload = run_cpu(move || {
+                build_exact_node_locator_from_source(body, &locator_label)?.finish_upload()
+            })
+            .await??;
+            // Use a fresh sidecar UUID even though the authoritative Parquet
+            // descriptor keeps its id. A failed pre-manifest upload can then be
+            // retried without colliding with a complete orphan from the prior
+            // attempt.
+            let sidecar_id = Uuid::now_v7();
+            let (node_locator, (sidecar_path, sidecar_body)) =
+                crate::flush::prepare_node_locator_upload_sidecar(
+                    paths,
+                    source.level.as_u32(),
+                    &sidecar_id,
+                    locator_upload,
+                )?;
+            crate::flush::put_sidecar_payload(store.clone(), &sidecar_path, sidecar_body).await?;
+            let mut migrated = source.clone();
+            migrated.node_locator = Some(node_locator);
+            removed_ids.push(source.id);
+            new_descs.push(migrated);
+            continue;
+        }
         // GC tombstones only when this merge is authoritative: a single node
         // scope (no other scope can hold the key) AND the output is the
         // bucket's deepest level (no older un-merged level below it).
         let gc = node_gc_safe && plan.is_deepest;
-        // GET every input body up front: the k-way merge needs each source
-        // open simultaneously, but only as COMPRESSED bytes — the level
-        // budget bounds their sum. Decoded rows never accumulate; the merge
-        // streams them row-group by row-group.
-        let mut bodies: Vec<Bytes> = Vec::with_capacity(plan.inputs.len());
+        // GET every input body up front as a file-backed mapping. Even small
+        // L0 files avoid heap residency because their aggregate fan-in can be
+        // large; decoded rows remain bounded by the merge cursor batch size.
+        let mut bodies: Vec<NodeMergeInput> = Vec::with_capacity(plan.inputs.len());
         for desc in &plan.inputs {
-            bodies.push(get_sst_body(store.as_ref(), paths, desc).await?);
+            bodies.push(NodeMergeInput {
+                body: get_sst_body(store.as_ref(), paths, desc).await?,
+                min_key: desc.min_key,
+            });
         }
         // Vector/text member collection happens during the winner stream, and
-        // is gated on the merge being authoritative for the FULL corpus:
-        // deepest level AND a single node scope (`gc`). `plan.is_deepest`
-        // alone treated a per-bucket deepest merge in a mixed-scope namespace
-        // (legacy per-label + id-primary "" scopes) as corpus-complete,
-        // rebuilding the index from one bucket and permanently truncating it
-        // — the same rule node-tombstone GC uses. On a partial merge the
-        // spec list stays empty: the existing `.vg`/`.ft` is left untouched
-        // and the freshness gate (`index_outrun_by_nodes`) routes reads to
-        // the exact flat scan until an authoritative merge rebuilds it.
+        // is gated on both a stale search generation and an authoritative
+        // merge of the FULL corpus: deepest level AND a single node scope
+        // (`gc`). `plan.is_deepest` alone treated a per-bucket deepest merge in
+        // a mixed-scope namespace (legacy per-label + id-primary "" scopes)
+        // as corpus-complete, rebuilding the index from one bucket and
+        // permanently truncating it — the same rule node-tombstone GC uses.
+        // On a partial merge, or a physical-only migration whose durable build
+        // markers are already fresh, the spec list stays empty and the
+        // existing `.vg`/`.ft` remains untouched.
+        // A sidecar-only migration rewrites the physical node SST without
+        // changing the logical search corpus. If the durable build markers
+        // already cover this node generation, retain the existing `.vg` /
+        // `.ft` descriptors instead of cloning every embedding/document and
+        // rebuilding corpus-sized indexes just to attach a new node sidecar.
+        // `gc` is still required: a stale search generation may only rebuild
+        // from an authoritative, full-corpus merge.
+        let rebuild_search_for_bucket = gc && rebuild_search;
         let index_specs = NodeMergeIndexSpecs {
             #[cfg(feature = "vector-index")]
-            vector: if gc {
+            vector: if rebuild_search_for_bucket {
                 base.manifest.vector_indexes.clone()
             } else {
                 Vec::new()
             },
             #[cfg(feature = "text-index")]
-            text: if gc {
+            text: if rebuild_search_for_bucket {
                 base.manifest.text_indexes.clone()
             } else {
                 Vec::new()
@@ -845,7 +907,7 @@ async fn prepare_leveled(
         let mut attempted_search_builds: HashSet<(SstKind, String)> = HashSet::new();
 
         #[cfg(feature = "vector-index")]
-        {
+        if rebuild_search_for_bucket {
             let (new_vg, old_vg_ids, attempted) = build_vector_indexes_from_members(
                 store.clone(),
                 paths,
@@ -865,7 +927,7 @@ async fn prepare_leveled(
         }
 
         #[cfg(feature = "text-index")]
-        {
+        if rebuild_search_for_bucket {
             let (new_ft, old_ft_ids, attempted) = build_text_indexes_from_members(
                 store.clone(),
                 paths,
@@ -881,7 +943,7 @@ async fn prepare_leveled(
                 .extend(attempted.into_iter().map(|name| (SstKind::TextIndex, name)));
         }
 
-        if gc {
+        if rebuild_search_for_bucket {
             search_build_states =
                 catalog_build_states(&base.manifest, finish_max_lsn, &attempted_search_builds);
         }
@@ -1108,10 +1170,9 @@ async fn compact_and_write_edges(
         .as_ref()
         .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default();
-    // GET every source body up front (compressed bytes only; the level
-    // budget bounds their sum), then k-way stream the merge on the blocking
-    // pool — decoded partner blocks and property strings never accumulate
-    // beyond the per-source cursor positions.
+    // GET every source body up front as a file-backed mapping, then k-way
+    // stream the merge on the blocking pool — decoded partner blocks and
+    // property strings never accumulate beyond the per-source cursor positions.
     let mut bodies: Vec<Bytes> = Vec::with_capacity(sources.len());
     for desc in sources {
         bodies.push(get_sst_body(store.as_ref(), paths, desc).await?);
@@ -1239,77 +1300,125 @@ impl NodeBatchView {
     }
 }
 
-/// Sorted row cursor over one node source SST. Decodes ON DEMAND, one row
-/// group at a time (the writer keeps `node_id` strictly ascending across
-/// the SST, so cursor order is key order); at any moment only the current
-/// row group's batches are resident. `row_groups_decoded` is the probe the
-/// laziness tests assert on.
+/// One immutable node source and its manifest lower bound.
+///
+/// `min_key` lets the k-way merge defer decoding this source until its first
+/// row can actually compete with the active heap minimum. The descriptor is
+/// checked against the first decoded row before any result can commit.
+struct NodeMergeInput {
+    body: Bytes,
+    min_key: [u8; 16],
+}
+
+/// Keep an activated source to at most one small decoded Arrow batch.
+///
+/// A vector-bearing row can be tens of KiB once `__overflow_json` is decoded.
+/// The Parquet default of 1,024 rows multiplied by a large L0 fan-in is still
+/// enough to exhaust a small host, even though the compressed inputs are
+/// mmap-backed. Sixty-four rows bounds that fan-in term while preserving
+/// sequential page decode.
+const NODE_MERGE_INPUT_BATCH_ROWS: usize = 64;
+
+/// Sorted row cursor over one node source SST.
+///
+/// Opening the cursor parses metadata and constructs a lazy Parquet reader but
+/// does not decode its first batch. Activation happens only when the source's
+/// manifest `min_key` reaches the active heap frontier. Once activated, at most
+/// one `NODE_MERGE_INPUT_BATCH_ROWS` batch is retained; a complete row group is
+/// never collected into memory.
 struct NodeSourceCursor {
-    reader: NodeSstReader,
-    md: Arc<ParquetMetaData>,
-    next_row_group: usize,
-    row_group_count: usize,
-    /// Decoded batches of the CURRENT row group, front-first.
-    views: VecDeque<NodeBatchView>,
-    /// Row index into `views.front()`.
+    batches: ParquetRecordBatchReader,
+    /// Decoded CURRENT batch only.
+    view: Option<NodeBatchView>,
+    /// Row index into `view`.
     row: usize,
     /// `(id, lsn)` of the current row; `None` once exhausted.
     current: Option<([u8; 16], u64)>,
-    /// Row groups decoded so far (test probe).
-    row_groups_decoded: usize,
+    /// Whether the lazy reader has been activated.
+    started: bool,
+    /// Batches decoded so far (test probe).
+    batches_decoded: usize,
     /// Total row count per the Parquet footer (bloom sizing upper bound).
     total_rows: u64,
 }
 
 impl NodeSourceCursor {
     fn open(label_def: &LabelDef, body: Bytes) -> Result<Self> {
-        let md = parse_node_sst_metadata(&body)?;
-        let reader = NodeSstReader::open(label_def.clone(), body)?;
-        let row_group_count = md.num_row_groups();
-        let total_rows = md.file_metadata().num_rows().max(0) as u64;
-        let mut cursor = Self {
-            reader,
-            md,
-            next_row_group: 0,
-            row_group_count,
-            views: VecDeque::new(),
-            row: 0,
-            current: None,
-            row_groups_decoded: 0,
-            total_rows,
-        };
-        cursor.position()?;
-        Ok(cursor)
+        Self::open_with_batch_rows(label_def, body, NODE_MERGE_INPUT_BATCH_ROWS)
     }
 
-    /// Advance `views`/`row` to the next available row (decoding further row
-    /// groups as needed) and cache its key in `current`.
+    fn open_with_batch_rows(label_def: &LabelDef, body: Bytes, batch_rows: usize) -> Result<Self> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            body,
+            ArrowReaderOptions::new().with_page_index(true),
+        )
+        .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
+        let expected = node_arrow_schema(label_def);
+        let got = builder.schema();
+        if got.fields().len() != expected.fields().len()
+            || got
+                .fields()
+                .iter()
+                .zip(expected.fields())
+                .any(|(got, want)| got.name() != want.name() || got.data_type() != want.data_type())
+        {
+            return Err(Error::Corrupted {
+                path: "<compaction-input>".into(),
+                detail: "node SST schema does not match the declared node schema".into(),
+            });
+        }
+        let total_rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
+        let batches = builder
+            .with_batch_size(batch_rows.max(1))
+            .build()
+            .map_err(|e| Error::invariant(format!("parquet build: {e}")))?;
+        Ok(Self {
+            batches,
+            view: None,
+            row: 0,
+            current: None,
+            started: false,
+            batches_decoded: 0,
+            total_rows,
+        })
+    }
+
+    /// Activate this source and decode only its first bounded batch.
+    fn ensure_positioned(&mut self) -> Result<()> {
+        if !self.started {
+            self.started = true;
+            self.position()?;
+        }
+        Ok(())
+    }
+
+    /// Advance `view`/`row` to the next available row (decoding one further
+    /// bounded batch as needed) and cache its key in `current`.
     fn position(&mut self) -> Result<()> {
         loop {
-            if let Some(front) = self.views.front() {
-                if self.row < front.len() {
-                    self.current = Some(front.key(self.row)?);
+            if let Some(view) = &self.view {
+                if self.row < view.len() {
+                    self.current = Some(view.key(self.row)?);
                     return Ok(());
                 }
-                self.views.pop_front();
+                self.view = None;
                 self.row = 0;
-                continue;
             }
-            if self.next_row_group >= self.row_group_count {
-                self.current = None;
-                return Ok(());
-            }
-            let rg = self.next_row_group;
-            self.next_row_group += 1;
-            self.row_groups_decoded += 1;
-            for (_, batches) in self.reader.scan_row_groups_each(&self.md, &[rg])? {
-                for batch in batches {
+            match self.batches.next() {
+                Some(Ok(batch)) => {
+                    self.batches_decoded += 1;
                     if batch.num_rows() > 0 {
-                        self.views.push_back(NodeBatchView::new(batch)?);
+                        self.view = Some(NodeBatchView::new(batch)?);
                     }
                 }
+                Some(Err(error)) => {
+                    return Err(Error::invariant(format!("parquet read: {error}")));
+                }
+                None => {
+                    self.current = None;
+                    return Ok(());
+                }
             }
-            self.row = 0;
         }
     }
 
@@ -1325,16 +1434,37 @@ impl NodeSourceCursor {
         label_def: &LabelDef,
     ) -> Result<(NodeRow, Option<NodeWriteRecord>)> {
         let view = self
-            .views
-            .front()
+            .view
+            .as_ref()
             .ok_or_else(|| Error::invariant("node merge cursor materialised past its end"))?;
         view.materialize(self.row, label_def)
     }
 
     fn advance(&mut self) -> Result<()> {
+        if !self.started {
+            return Err(Error::invariant(
+                "node merge cursor advanced before activation",
+            ));
+        }
         self.row += 1;
         self.position()
     }
+}
+
+fn build_exact_node_locator_from_source(
+    body: Bytes,
+    label_def: &LabelDef,
+) -> Result<crate::sst::paged_index::NodeLocatorRecordBuilder> {
+    let mut cursor = NodeSourceCursor::open(label_def, body)?;
+    cursor.ensure_positioned()?;
+    let mut builder = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+    while cursor.peek().is_some() {
+        let (row, _) = cursor.materialize_current(label_def)?;
+        let exact_record = encode_exact_node_record(&row)?;
+        builder.push(&row.id, &exact_record)?;
+        cursor.advance()?;
+    }
+    Ok(builder)
 }
 
 /// Heap key for the node k-way merge: id ascending, then LSN **descending**
@@ -1381,7 +1511,7 @@ struct NodeSidecarHarvest {
     unique: UniqueSidecarCollector,
     equality: EqualitySidecarCollector,
     label_index: LabelIndexCollector,
-    node_locator_ids: Vec<[u8; 16]>,
+    node_locator_upload: crate::sst::paged_index::NodeLocatorRecordUpload,
     per_label_property_stats: Vec<PerLabelPropertyStat>,
 }
 
@@ -1434,7 +1564,7 @@ fn merge_chunk_rows() -> usize {
 /// pass; shadowed duplicates are skipped without ever being materialised.
 #[allow(clippy::too_many_arguments)]
 fn merge_node_sources(
-    bodies: Vec<Bytes>,
+    inputs: Vec<NodeMergeInput>,
     label_def: &LabelDef,
     sidecar_def: &LabelDef,
     gc_tombstones: bool,
@@ -1443,12 +1573,15 @@ fn merge_node_sources(
     bucket_scope: &str,
     index_specs: NodeMergeIndexSpecs,
 ) -> Result<NodeMergeOutput> {
-    let mut cursors: Vec<NodeSourceCursor> = Vec::with_capacity(bodies.len());
+    let mut cursors: Vec<NodeSourceCursor> = Vec::with_capacity(inputs.len());
+    let mut unopened: BinaryHeap<Reverse<([u8; 16], usize)>> =
+        BinaryHeap::with_capacity(inputs.len());
     let mut total_rows: u64 = 0;
-    for body in bodies {
-        let cursor = NodeSourceCursor::open(label_def, body)?;
+    for (src, input) in inputs.into_iter().enumerate() {
+        let cursor = NodeSourceCursor::open(label_def, input.body)?;
         total_rows = total_rows.saturating_add(cursor.total_rows);
         cursors.push(cursor);
+        unopened.push(Reverse((input.min_key, src)));
     }
 
     // `expected_keys` sizes the bloom from the pre-dedup input total — an
@@ -1463,7 +1596,7 @@ fn merge_node_sources(
     let mut unique = UniqueSidecarCollector::new(sidecar_def);
     let mut equality = EqualitySidecarCollector::new(sidecar_def);
     let mut label_index = LabelIndexCollector::new();
-    let mut node_locator_ids = Vec::new();
+    let mut node_locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
     let mut stats = PerLabelStatsCollector::new();
     #[cfg(feature = "vector-index")]
     let mut vector_collectors: Vec<VectorMemberCollector> = index_specs
@@ -1481,21 +1614,46 @@ fn merge_node_sources(
     let _ = &index_specs;
 
     let mut heap: BinaryHeap<Reverse<NodeHeapEntry>> = BinaryHeap::with_capacity(cursors.len());
-    for (src, cursor) in cursors.iter().enumerate() {
-        if let Some((id, lsn)) = cursor.peek() {
-            heap.push(Reverse(NodeHeapEntry { id, lsn, src }));
-        }
-    }
 
     let mut last_id: Option<[u8; 16]> = None;
-    while let Some(Reverse(entry)) = heap.pop() {
+    loop {
+        // A source whose manifest minimum is above the active heap minimum
+        // cannot affect the next winner, so leave its Parquet batches entirely
+        // undecoded. Activate every source at or below the frontier (including
+        // equal minima, whose LSNs must participate in tie-breaking).
+        while let Some(Reverse((hinted_min, src))) = unopened.peek().copied() {
+            let active_min = heap.peek().map(|entry| entry.0.id);
+            if active_min.is_some_and(|active| hinted_min > active) {
+                break;
+            }
+            unopened.pop();
+            let cursor = &mut cursors[src];
+            cursor.ensure_positioned()?;
+            let Some((id, lsn)) = cursor.peek() else {
+                return Err(Error::invariant(
+                    "manifest references an empty node compaction input",
+                ));
+            };
+            if id != hinted_min {
+                return Err(Error::Corrupted {
+                    path: "<compaction-input>".into(),
+                    detail: "node SST first key disagrees with manifest min_key".into(),
+                });
+            }
+            heap.push(Reverse(NodeHeapEntry { id, lsn, src }));
+        }
+
+        let Some(Reverse(entry)) = heap.pop() else {
+            break;
+        };
         let cursor = &mut cursors[entry.src];
         if last_id != Some(entry.id) {
             // First (highest-LSN) observation of this id: the winner.
             last_id = Some(entry.id);
             let (row, rec) = cursor.materialize_current(label_def)?;
             if !(gc_tombstones && matches!(row.op, MemOp::Tombstone)) {
-                node_locator_ids.push(row.id);
+                let exact_record = encode_exact_node_record(&row)?;
+                node_locator_records.push(&row.id, &exact_record)?;
                 if let Some(rec) = &rec {
                     unique.observe(row.id, rec);
                     equality.observe(row.id, rec);
@@ -1527,14 +1685,17 @@ fn merge_node_sources(
     #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
     let _ = bucket_scope;
 
+    let finish = writer.finish()?;
+    let node_locator_upload = node_locator_records.finish_upload()?;
+    let per_label_property_stats = stats.finish(schema, label_dict)?;
     Ok(NodeMergeOutput {
-        finish: writer.finish()?,
+        finish,
         sidecars: NodeSidecarHarvest {
             unique,
             equality,
             label_index,
-            node_locator_ids,
-            per_label_property_stats: stats.finish(schema, label_dict)?,
+            node_locator_upload,
+            per_label_property_stats,
         },
         #[cfg(feature = "vector-index")]
         vector_members: vector_collectors
@@ -2091,8 +2252,12 @@ async fn put_node_sst_leveled(
     // path after compaction. Without this, every compaction silently
     // demotes affected queries back to the legacy full label scan
     // (P4.19 only emitted sidecars on flush).
-    let (unique_property_indices, mut index_sidecars) =
+    let (unique_property_indices, index_sidecars) =
         sidecars.unique.finish(paths, level.as_u32(), &id, label)?;
+    let mut index_sidecars: Vec<(Path, crate::flush::SidecarPayload)> = index_sidecars
+        .into_iter()
+        .map(|(path, body)| (path, body.into()))
+        .collect();
     // Re-emit equality-index posting-list sidecars too, harvested from the
     // already-reconciled winner stream (tombstones dropped, highest-lsn per
     // id), so the L1 sidecar supersedes all the L0 partials.
@@ -2100,7 +2265,11 @@ async fn put_node_sst_leveled(
         sidecars
             .equality
             .finish(paths, level.as_u32(), &id, label)?;
-    index_sidecars.extend(equality_sidecars);
+    index_sidecars.extend(
+        equality_sidecars
+            .into_iter()
+            .map(|(path, body)| (path, body.into())),
+    );
     // Rebuild the label-index sidecar from the reconciled rows. id-primary
     // buckets (scope == "") carry per-row label sets, so this re-emits the
     // `LabelId -> [NodeId]` postings (with per-label counts) the cost model
@@ -2109,18 +2278,18 @@ async fn put_node_sst_leveled(
     // again. Legacy per-label buckets have empty label sets and yield
     // `None` here, falling back to `scope`-based counting downstream.
     let (label_index, label_sidecar) = sidecars.label_index.finish(paths, level.as_u32(), &id)?;
-    if let Some(sidecar) = label_sidecar {
-        index_sidecars.push(sidecar);
+    if let Some((path, body)) = label_sidecar {
+        index_sidecars.push((path, body.into()));
     }
-    let (node_locator, locator_sidecar) = crate::flush::prepare_node_locator_sidecar(
+    let (node_locator, locator_sidecar) = crate::flush::prepare_node_locator_upload_sidecar(
         paths,
         level.as_u32(),
         &id,
-        sidecars.node_locator_ids.iter().copied(),
+        sidecars.node_locator_upload,
     )?;
     index_sidecars.push(locator_sidecar);
-    for (path, body) in &index_sidecars {
-        crate::flush::put_object(store.clone(), path, body.clone()).await?;
+    for (path, body) in index_sidecars {
+        crate::flush::put_sidecar_payload(store.clone(), &path, body).await?;
     }
 
     let stats = finish.stats;
@@ -2643,8 +2812,65 @@ async fn get_sst_body(
     let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
     let path = Path::from(absolute);
     let res = store.get(&path).await?;
-    let body = res.bytes().await?;
-    Ok(body)
+    let body_len = res
+        .range
+        .end
+        .checked_sub(res.range.start)
+        .ok_or_else(|| Error::invariant("compaction GET returned an inverted range"))?;
+    if res.range.start != 0 || res.range.end != res.meta.size {
+        return Err(Error::invariant(
+            "full compaction GET unexpectedly returned a partial range",
+        ));
+    }
+    if res.meta.size != desc.size_bytes {
+        return Err(Error::Corrupted {
+            path: desc.path.clone(),
+            detail: format!(
+                "SST object size {} disagrees with manifest size {}",
+                res.meta.size, desc.size_bytes
+            ),
+        });
+    }
+    if body_len == 0 {
+        return Err(Error::Corrupted {
+            path: desc.path.clone(),
+            detail: "SST body is empty".into(),
+        });
+    }
+    let body_len = usize::try_from(body_len)
+        .map_err(|_| Error::invariant("compaction SST body exceeds addressable memory"))?;
+
+    let file = match res.payload {
+        GetResultPayload::File(file, _) => file,
+        GetResultPayload::Stream(mut stream) => {
+            // Every remote SST, including individually small L0 files, is
+            // streamed to the disk-backed spool. Compaction deliberately drains
+            // the complete L0 backlog, so a per-object heap threshold turns
+            // hundreds of "small" bodies into a multi-GiB aggregate.
+            let file = crate::sst::paged_index::create_spool_file()?;
+            let mut file = tokio::fs::File::from_std(file);
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?).await?;
+            }
+            file.flush().await?;
+            // Force delayed allocation/writeback before retaining the mmap
+            // for the whole compaction pass. Otherwise a full remote L0
+            // backlog can leave `sum(inputs)` as dirty page cache and surface
+            // ENOSPC only after substantial merge work has already run.
+            file.sync_data().await?;
+            file.into_std().await
+        }
+    };
+    if file.metadata()?.len() != body_len as u64 {
+        return Err(Error::invariant(
+            "compaction SST spool length disagrees with object metadata",
+        ));
+    }
+    // SAFETY: the immutable file owns at least `body_len` bytes (checked
+    // above), remains unchanged for the mapping's lifetime, and `Mmap` owns
+    // the mapping after the file handle is dropped.
+    let mapped = unsafe { MmapOptions::new().len(body_len).map(&file)? };
+    Ok(Bytes::from_owner(mapped))
 }
 
 fn uuid_path_id(u: &Uuid) -> String {
@@ -5057,7 +5283,7 @@ mod tests {
     }
 
     #[test]
-    fn node_cursor_decodes_row_groups_lazily() {
+    fn node_cursor_defers_decode_and_bounds_resident_batch() {
         let label = LabelDef {
             name: String::new(),
             properties: Vec::new(),
@@ -5079,30 +5305,40 @@ mod tests {
                 .unwrap();
         }
         let finish = writer.finish().unwrap();
-
-        let mut cursor = NodeSourceCursor::open(&label, finish.body).unwrap();
-        assert_eq!(cursor.row_group_count, 4, "fixture must be multi-row-group");
         assert_eq!(
-            cursor.row_groups_decoded, 1,
-            "open decodes only the first row group, not the whole body"
+            parse_node_sst_metadata(&finish.body)
+                .unwrap()
+                .num_row_groups(),
+            4,
+            "fixture must be multi-row-group"
         );
+
+        let mut cursor = NodeSourceCursor::open_with_batch_rows(&label, finish.body, 3).unwrap();
+        assert_eq!(
+            cursor.batches_decoded, 0,
+            "opening every fan-in source must not decode its first row group"
+        );
+        assert!(
+            cursor.peek().is_none(),
+            "unactivated cursor has no resident row"
+        );
+        cursor.ensure_positioned().unwrap();
+        assert_eq!(cursor.batches_decoded, 1);
         let mut seen = 0u8;
         while let Some((id, lsn)) = cursor.peek() {
             seen += 1;
             assert_eq!(id, *sorted_node_id(seen).as_bytes());
             assert_eq!(lsn, seen as u64);
-            if seen <= 4 {
-                assert_eq!(
-                    cursor.row_groups_decoded, 1,
-                    "rows of the first group must not trigger further decodes"
-                );
-            }
+            assert!(
+                cursor.view.as_ref().unwrap().len() <= 3,
+                "one cursor may retain only its configured bounded batch"
+            );
             cursor.advance().unwrap();
         }
         assert_eq!(seen, 16);
-        assert_eq!(
-            cursor.row_groups_decoded, 4,
-            "all groups decoded exactly on demand"
+        assert!(
+            (6..=8).contains(&cursor.batches_decoded),
+            "16 rows require at least six bounded batches; row-group boundaries may split more"
         );
     }
 
@@ -5136,7 +5372,16 @@ mod tests {
         let body_b = build(11..=30, 200, "b");
 
         let out = merge_node_sources(
-            vec![body_a, body_b],
+            vec![
+                NodeMergeInput {
+                    body: body_a,
+                    min_key: *sorted_node_id(1).as_bytes(),
+                },
+                NodeMergeInput {
+                    body: body_b,
+                    min_key: *sorted_node_id(11).as_bytes(),
+                },
+            ],
             &label,
             &label,
             true,
@@ -5505,5 +5750,283 @@ mod tests {
         assert_eq!(ids.len(), 10);
         assert!(!ids.contains(&idx_id(3)), "doc 3's old body must be gone");
         assert!(!ids.contains(&idx_id(5)), "the deleted doc must be gone");
+    }
+
+    /// Upgrading a settled 2.0.5 node SST to the exact-record locator is a
+    /// physical-only rewrite. Fresh vector/FTS generations already cover the
+    /// same logical node high-water mark, so rebuilding either index would
+    /// merely clone the complete embedding/document corpus and can exhaust
+    /// memory on a legal-scale store.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn sidecar_only_migration_preserves_fresh_vector_and_text_generations() {
+        use crate::manifest::{
+            NodeLocatorDescriptor, TextIndexDescriptor, VectorIndexDescriptor, VectorMetric,
+            VectorQuantization,
+        };
+        use crate::text::parse_query;
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+
+        fn doc_payload(embedding: Vec<f32>, body: &str, label_id: u32) -> Bytes {
+            NodeWriteRecord {
+                properties: BTreeMap::from([
+                    ("emb".into(), Value::Vec(embedding)),
+                    ("body".into(), Value::Str(body.into())),
+                ]),
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-sidecar-only-keeps-search");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let doc_label = base.manifest.label_dict.intern("Doc");
+        base.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_emb".into(),
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 16,
+            l_build: 32,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "doc_text".into(),
+            "Doc".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("emb", DataType::FloatVector { dim: 2 }, false).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, false)
+                        .unwrap()
+                        .with_indexed(true),
+                ],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let docs = [
+            (vec![1.0, 0.0], "alpha one"),
+            (vec![0.9, 0.1], "alpha two"),
+            (vec![0.0, 1.0], "beta three"),
+            (vec![0.1, 0.9], "gamma four"),
+        ];
+        let mut current = base;
+        for (chunk_index, chunk) in docs.chunks(2).enumerate() {
+            let mut mt = Memtable::new();
+            for (row_index, (embedding, body)) in chunk.iter().enumerate() {
+                let ordinal = (chunk_index * 2 + row_index + 1) as u64;
+                mt.apply(
+                    MemKey::Node {
+                        id: idx_id(ordinal),
+                    },
+                    ordinal,
+                    MemOp::Upsert(doc_payload(embedding.clone(), body, doc_label.0)),
+                );
+            }
+            current = flush(&ms, &fence, &current, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+
+        // Build real, serving `.vg` and `.ft` generations first.
+        let settled = compact_l0_to_l1(&ms, &fence, &current, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert!(
+            !search_indexes_need_rebuild(&settled.manifest),
+            "the first authoritative compaction must stamp both generations fresh"
+        );
+        let vector_id = settled
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::VectorGraph)
+            .expect("real vector graph")
+            .id;
+        let text_id = settled
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::TextIndex)
+            .expect("real text index")
+            .id;
+        let build_states = settled.manifest.search_index_builds.clone();
+
+        // Model a valid 2.0.5 locator-only sidecar on the settled L1. The
+        // source Parquet and search bodies are the real objects emitted above.
+        let legacy_locator =
+            crate::sst::paged_index::build_node_locator((1..=4).map(|i| *idx_id(i).as_bytes()))
+                .unwrap();
+        let legacy_relative = {
+            let node = settled
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::Nodes)
+                .unwrap();
+            let current = node.node_locator.as_ref().unwrap();
+            format!(
+                "{}.nloc",
+                current
+                    .path
+                    .strip_suffix(".nloc2")
+                    .expect("current locator suffix")
+            )
+        };
+        let legacy_absolute = format!("{}/{}", p.namespace_prefix().as_ref(), legacy_relative);
+        s.put(
+            &Path::from(legacy_absolute),
+            PutPayload::from(legacy_locator.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut legacy = settled.clone();
+        let node = legacy
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        node.node_locator = Some(NodeLocatorDescriptor {
+            path: legacy_relative,
+            size_bytes: legacy_locator.len() as u64,
+            entry_count: node.row_count,
+        });
+        assert!(
+            !search_indexes_need_rebuild(&legacy.manifest),
+            "changing only locator format must not stale search generations"
+        );
+
+        let migrated = compact_leveled(&ms, &fence, &legacy, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert!(
+            migrated
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::Nodes)
+                .and_then(|sst| sst.node_locator.as_ref())
+                .is_some_and(|locator| locator.path.ends_with(".nloc2")),
+            "the legacy node locator must still migrate"
+        );
+        assert_eq!(
+            migrated
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::VectorGraph)
+                .unwrap()
+                .id,
+            vector_id,
+            "sidecar-only migration must retain the physical vector generation"
+        );
+        assert_eq!(
+            migrated
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::TextIndex)
+                .unwrap()
+                .id,
+            text_id,
+            "sidecar-only migration must retain the physical text generation"
+        );
+        assert_eq!(
+            migrated.manifest.search_index_builds, build_states,
+            "fresh durable generation markers must remain byte-for-byte stable"
+        );
+        assert!(!search_indexes_need_rebuild(&migrated.manifest));
+
+        // Exercise the general merge path too (the exact-locator-only case
+        // above has its own descriptor-preserving fast path). A legacy paged
+        // equality mirror requires rebuilding the node SST's property
+        // sidecars, but still does not change the logical search corpus.
+        let mut legacy_paged = migrated.clone();
+        let node = legacy_paged
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        let equality = node
+            .equality_property_indices
+            .iter_mut()
+            .find(|index| index.property == "body")
+            .expect("indexed body equality sidecar");
+        equality.paged = None;
+        equality.paged_build_unsupported = false;
+        let required = crate::flush::union_indexed_props(&schema);
+        assert!(node_descriptor_needs_non_record_migration(node, &required));
+
+        let migrated = compact_leveled(&ms, &fence, &legacy_paged, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(
+            migrated
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::VectorGraph)
+                .unwrap()
+                .id,
+            vector_id,
+            "a non-search node migration must also retain the vector generation"
+        );
+        assert_eq!(
+            migrated
+                .manifest
+                .ssts
+                .iter()
+                .find(|sst| sst.kind == SstKind::TextIndex)
+                .unwrap()
+                .id,
+            text_id,
+            "a non-search node migration must also retain the text generation"
+        );
+        assert_eq!(migrated.manifest.search_index_builds, build_states);
+        assert!(!search_indexes_need_rebuild(&migrated.manifest));
+
+        // The preserved bodies remain discoverable and serving through the
+        // rewritten node generation, proving the freshness fence is intact.
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let snap = Snapshot::new(migrated, &view, s, p);
+        assert_eq!(
+            snap.vector_search("doc_emb", &[1.0, 0.0], 2, 16)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            snap.text_search("doc_text", "Doc", &parse_query("alpha"), Some(5))
+                .await
+                .unwrap()
+                .expect("preserved text generation must serve")
+                .len(),
+            2
+        );
     }
 }

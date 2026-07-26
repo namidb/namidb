@@ -6,6 +6,16 @@ use std::time::Duration;
 
 use clap::Parser;
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("expected a positive byte count: {error}"))?;
+    if parsed == 0 {
+        return Err("expected a positive byte count, got zero".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "namidb-server",
@@ -135,6 +145,18 @@ struct Cli {
     /// server is HTTP-only. The canonical Bolt port is 7687.
     #[arg(long, env = "NAMIDB_BOLT_LISTEN")]
     bolt_listen: Option<std::net::SocketAddr>,
+
+    /// Maximum body size in bytes for one authenticated Bolt message.
+    /// Vector parameters use nine wire bytes per float, so the 64 MiB default
+    /// admits batches such as 2,000 1024-dimensional embeddings. The
+    /// unauthenticated path remains capped at 64 KiB regardless of this value.
+    #[arg(
+        long,
+        env = "NAMIDB_BOLT_MAX_MESSAGE_BYTES",
+        default_value_t = namidb_bolt::message::DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        value_parser = parse_positive_usize
+    )]
+    bolt_max_message_bytes: usize,
 
     /// Idle timeout for an open Bolt explicit transaction. The writer lock
     /// is held for the life of a transaction, so an idle client would pin
@@ -336,6 +358,7 @@ fn main() -> anyhow::Result<()> {
         sweep_min_age: cli.sweep_min_age,
         sweep_delete: cli.sweep_delete,
         bolt_listen: cli.bolt_listen,
+        bolt_max_message_bytes: cli.bolt_max_message_bytes,
         bolt_tx_timeout: cli.bolt_tx_timeout,
         query_timeout: cli.query_timeout,
         // Writes inherit the read budget unless given their own; `0s` opts out.

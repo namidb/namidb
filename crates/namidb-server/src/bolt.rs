@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use namidb_bolt::{
-    AuthPolicy, Authenticator, Backend, BackendError, RunCancellation, RunOutcome, ServerInfo,
-    Session, StatementType, Value,
+    AuthPolicy, Authenticator, Backend, BackendError, BoltError, DecodeAdmissionGuard,
+    MessageMemoryBudget, RunCancellation, RunOutcome, ServerInfo, Session, StatementType, Value,
+    DEFAULT_MESSAGE_MEMORY_BUDGET_BYTES, MESSAGE_MEMORY_BYTES_PER_WIRE_BYTE,
 };
 use namidb_query::{
     execute_with_limits, execute_write_staged_with_deadline, parse as cypher_parse,
@@ -42,11 +43,26 @@ fn writer_busy_error() -> BackendError {
 }
 
 fn memory_pressure_error(pressure: crate::memory::MemoryPressure) -> BackendError {
-    BackendError::Storage(format!(
-        "process memory pressure: resident {} bytes reached configured maximum {} bytes; \
-         reconstructible caches were reclaimed, retry after memory falls",
-        pressure.resident_bytes, pressure.max_bytes
-    ))
+    let projected = pressure
+        .resident_bytes
+        .saturating_add(pressure.requested_headroom_bytes);
+    BackendError::Storage(if pressure.requested_headroom_bytes == 0 {
+        format!(
+            "process memory pressure: resident {} bytes reached configured maximum {} bytes; \
+             reconstructible caches were reclaimed, retry after memory falls",
+            pressure.resident_bytes, pressure.max_bytes
+        )
+    } else {
+        format!(
+            "process memory pressure: resident {} bytes plus {} bytes of projected request \
+             headroom would reach {} bytes, at or above configured maximum {} bytes; split the \
+             request or retry after memory falls",
+            pressure.resident_bytes,
+            pressure.requested_headroom_bytes,
+            projected,
+            pressure.max_bytes
+        )
+    })
 }
 
 struct RunObservation {
@@ -1152,6 +1168,20 @@ impl ServerBackend {
 
 #[async_trait]
 impl Backend for ServerBackend {
+    async fn admit_request_decode(
+        &self,
+        wire_bytes: usize,
+    ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError> {
+        let projected = MessageMemoryBudget::estimated_bytes_for_wire(wire_bytes);
+        let reservation = self
+            .state
+            .memory
+            .reserve_query_headroom(projected)
+            .await
+            .map_err(memory_pressure_error)?;
+        Ok(Some(Box::new(reservation)))
+    }
+
     async fn run(
         &self,
         cypher: &str,
@@ -1457,14 +1487,67 @@ fn make_policy(
 }
 
 /// Bind the Bolt listener and serve sessions until the process exits.
+fn bolt_message_memory_budget_bytes(
+    memory_max_bytes: usize,
+    configured: Option<&str>,
+) -> anyhow::Result<usize> {
+    if let Some(raw) = configured {
+        let parsed = raw.parse::<usize>().map_err(|error| {
+            anyhow::anyhow!("NAMIDB_BOLT_MEMORY_BUDGET_BYTES must be a positive integer: {error}")
+        })?;
+        if parsed == 0 {
+            anyhow::bail!("NAMIDB_BOLT_MEMORY_BUDGET_BYTES must be greater than zero");
+        }
+        return Ok(parsed);
+    }
+    if memory_max_bytes > 0 {
+        // Leave the other half for memtables, caches, result rows, the
+        // allocator, and storage maintenance. The message budget itself
+        // charges decode/query amplification rather than raw wire bytes.
+        return Ok((memory_max_bytes / 2).max(1));
+    }
+    Ok(DEFAULT_MESSAGE_MEMORY_BUDGET_BYTES)
+}
+
+fn bolt_partial_message_timeout(
+    configured: Option<&str>,
+) -> anyhow::Result<Option<std::time::Duration>> {
+    let timeout = match configured {
+        Some(raw) => humantime::parse_duration(raw).map_err(|error| {
+            anyhow::anyhow!(
+                "NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT must be a duration such as 120s: {error}"
+            )
+        })?,
+        None => std::time::Duration::from_secs(120),
+    };
+    Ok((!timeout.is_zero()).then_some(timeout))
+}
+
 pub async fn serve(
     state: AppState,
     listen: std::net::SocketAddr,
     auth: Arc<AuthConfig>,
     tx_timeout: std::time::Duration,
+    post_auth_message_bytes: usize,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> anyhow::Result<()> {
+    if post_auth_message_bytes == 0 {
+        anyhow::bail!("Bolt post-auth message limit must be greater than zero");
+    }
+    let message_memory_budget_bytes = bolt_message_memory_budget_bytes(
+        state.memory.max_bytes(),
+        std::env::var("NAMIDB_BOLT_MEMORY_BUDGET_BYTES")
+            .ok()
+            .as_deref(),
+    )?;
+    let message_memory_budget =
+        Arc::new(MessageMemoryBudget::try_new(message_memory_budget_bytes)?);
+    let partial_message_timeout = bolt_partial_message_timeout(
+        std::env::var("NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT")
+            .ok()
+            .as_deref(),
+    )?;
     // `Duration::ZERO` disables the per-transaction idle timeout.
     let tx_idle_timeout = (!tx_timeout.is_zero()).then_some(tx_timeout);
     let listener = TcpListener::bind(listen).await?;
@@ -1494,6 +1577,19 @@ pub async fn serve(
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_conns));
     let handshake_timeout = Some(std::time::Duration::from_secs(10));
     info!(max_connections = max_conns, "bolt connection cap");
+    info!(
+        post_auth_message_bytes,
+        pre_auth_message_bytes = namidb_bolt::message::PRE_AUTH_MESSAGE_BYTES,
+        "bolt message limits"
+    );
+    info!(
+        message_memory_budget_bytes = message_memory_budget.capacity_bytes(),
+        estimated_bytes_per_wire_byte = MESSAGE_MEMORY_BYTES_PER_WIRE_BYTE,
+        partial_message_timeout_ms = partial_message_timeout
+            .map(|timeout| timeout.as_millis() as u64)
+            .unwrap_or(0),
+        "bolt authenticated-message memory admission"
+    );
     loop {
         let (socket, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -1525,6 +1621,7 @@ pub async fn serve(
             warn!(error = %e, %peer, "set_nodelay failed");
         }
         let state = state.clone();
+        let message_memory_budget = Arc::clone(&message_memory_budget);
         // One principal cell per connection, shared between the authenticator
         // (which sets it at LOGON) and the backend (which reads it on every
         // write). `None` until authenticated; open mode leaves it `None`.
@@ -1540,6 +1637,14 @@ pub async fn serve(
             // task (any exit path) releases it back to the semaphore.
             let _permit = permit;
             let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state, principal));
+            let run_config = SessionRunConfig {
+                tx_idle_timeout,
+                handshake_timeout,
+                post_auth_message_bytes,
+                message_memory_budget,
+                partial_message_timeout,
+                peer,
+            };
             // `Session` is generic over the transport, so the only fork is the
             // optional TLS handshake on the accepted socket.
             match tls {
@@ -1558,33 +1663,11 @@ pub async fn serve(
                         None => acceptor.accept(socket).await,
                     };
                     match accepted {
-                        Ok(stream) => {
-                            run_session(
-                                stream,
-                                info,
-                                policy,
-                                backend,
-                                tx_idle_timeout,
-                                handshake_timeout,
-                                peer,
-                            )
-                            .await
-                        }
+                        Ok(stream) => run_session(stream, info, policy, backend, run_config).await,
                         Err(e) => warn!(error = %e, %peer, "bolt TLS handshake failed"),
                     }
                 }
-                None => {
-                    run_session(
-                        socket,
-                        info,
-                        policy,
-                        backend,
-                        tx_idle_timeout,
-                        handshake_timeout,
-                        peer,
-                    )
-                    .await
-                }
+                None => run_session(socket, info, policy, backend, run_config).await,
             }
         });
     }
@@ -1594,14 +1677,21 @@ pub async fn serve(
 /// Build and run one Bolt session over any byte stream — a plain `TcpStream`
 /// or a TLS stream. `Session` is generic over the transport, so TLS adds only
 /// a handshake in front of the same session loop.
+struct SessionRunConfig {
+    tx_idle_timeout: Option<std::time::Duration>,
+    handshake_timeout: Option<std::time::Duration>,
+    post_auth_message_bytes: usize,
+    message_memory_budget: Arc<MessageMemoryBudget>,
+    partial_message_timeout: Option<std::time::Duration>,
+    peer: std::net::SocketAddr,
+}
+
 async fn run_session<S>(
     socket: S,
     info: ServerInfo,
     policy: AuthPolicy,
     backend: Arc<dyn Backend>,
-    tx_idle_timeout: Option<std::time::Duration>,
-    handshake_timeout: Option<std::time::Duration>,
-    peer: std::net::SocketAddr,
+    config: SessionRunConfig,
 ) where
     S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
 {
@@ -1612,11 +1702,36 @@ async fn run_session<S>(
         .and_then(|s| humantime::parse_duration(&s).ok())
         .or_else(|| Some(std::time::Duration::from_secs(300)));
     let session = Session::new(socket, info, policy, backend)
-        .with_tx_idle_timeout(tx_idle_timeout)
-        .with_handshake_timeout(handshake_timeout)
+        .with_tx_idle_timeout(config.tx_idle_timeout)
+        .with_handshake_timeout(config.handshake_timeout)
+        .with_post_auth_message_bytes(config.post_auth_message_bytes)
+        .with_message_memory_budget(config.message_memory_budget)
+        .with_partial_message_timeout(config.partial_message_timeout)
         .with_max_tx_lifetime(max_tx_lifetime);
-    if let Err(e) = session.run().await {
-        warn!(error = %e, %peer, "bolt session ended with error");
+    if let Err(error) = session.run().await {
+        match &error {
+            BoltError::TooLarge { what, len, max } => warn!(
+                peer = %config.peer,
+                what,
+                observed_bytes = len,
+                max_bytes = max,
+                "bolt session rejected oversized message"
+            ),
+            BoltError::MemoryBudgetExhausted {
+                what,
+                requested,
+                available,
+                capacity,
+            } => warn!(
+                peer = %config.peer,
+                what,
+                requested_bytes = requested,
+                available_bytes = available,
+                capacity_bytes = capacity,
+                "bolt session rejected message under temporary memory pressure"
+            ),
+            _ => warn!(error = %error, peer = %config.peer, "bolt session ended with error"),
+        }
     }
 }
 
@@ -1638,6 +1753,42 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::Notify;
+
+    #[test]
+    fn bolt_message_budget_derives_from_memory_ceiling_and_accepts_override() {
+        assert_eq!(
+            bolt_message_memory_budget_bytes(0, None).unwrap(),
+            DEFAULT_MESSAGE_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(
+            bolt_message_memory_budget_bytes(2 * 1024 * 1024 * 1024, None).unwrap(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            bolt_message_memory_budget_bytes(2 * 1024 * 1024 * 1024, Some("123456")).unwrap(),
+            123_456
+        );
+        assert!(bolt_message_memory_budget_bytes(0, Some("0")).is_err());
+        assert!(bolt_message_memory_budget_bytes(0, Some("not-a-number")).is_err());
+        assert!(
+            MessageMemoryBudget::try_new(namidb_bolt::MESSAGE_MEMORY_BASE_BYTES).is_err(),
+            "boot must reject a budget that cannot decode one data byte"
+        );
+    }
+
+    #[test]
+    fn bolt_partial_message_timeout_has_safe_default_and_explicit_disable() {
+        assert_eq!(
+            bolt_partial_message_timeout(None).unwrap(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(bolt_partial_message_timeout(Some("0s")).unwrap(), None);
+        assert_eq!(
+            bolt_partial_message_timeout(Some("750ms")).unwrap(),
+            Some(std::time::Duration::from_millis(750))
+        );
+        assert!(bolt_partial_message_timeout(Some("later")).is_err());
+    }
 
     /// Blocks exactly one cold SST read so a cancellation test can stop a
     /// write after it has acquired the global writer and staged an earlier

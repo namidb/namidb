@@ -17,9 +17,19 @@ use crate::value::{struct_tag, Value};
 
 /// Pre-auth message body cap. After LOGON the session may raise it.
 pub const PRE_AUTH_MESSAGE_BYTES: usize = 64 * 1024;
-/// Post-auth message body cap. 16 MiB is the same ceiling Memgraph
-/// applies; large `RUN` parameter maps stay under that comfortably.
-pub const POST_AUTH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Default post-auth message body cap.
+///
+/// Vector ingest sends every Bolt float as a PackStream `Float` (nine bytes),
+/// so a legitimate 2,000-row batch of 1,024-dimensional embeddings is already
+/// about 18 MiB before map/key overhead. 64 MiB leaves useful batch headroom
+/// while preserving a finite per-connection allocation bound.
+pub const DEFAULT_POST_AUTH_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Backward-compatible name for the default post-auth message cap.
+///
+/// A server session may override this value after authentication; callers
+/// that need the production default can continue using the original constant.
+pub const POST_AUTH_MESSAGE_BYTES: usize = DEFAULT_POST_AUTH_MESSAGE_BYTES;
 
 /// Request messages a client can send.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,7 +85,7 @@ impl Request {
     }
 
     fn from_value(value: Value) -> Result<Self> {
-        let (tag, fields) = match value {
+        let (tag, mut fields) = match value {
             Value::Struct { tag, fields } => (tag, fields),
             other => {
                 return Err(BoltError::Protocol(format!(
@@ -86,22 +96,20 @@ impl Request {
         };
         match tag {
             struct_tag::HELLO => {
-                let extra = take_map_field("HELLO", &fields, 0)?;
+                let extra = take_map_field("HELLO", &mut fields, 0)?;
                 Ok(Request::Hello(extra))
             }
             struct_tag::LOGON => {
-                let extra = take_map_field("LOGON", &fields, 0)?;
+                let extra = take_map_field("LOGON", &mut fields, 0)?;
                 Ok(Request::Logon(extra))
             }
             struct_tag::LOGOFF => Ok(Request::Logoff),
             struct_tag::GOODBYE => Ok(Request::Goodbye),
             struct_tag::RESET => Ok(Request::Reset),
             struct_tag::RUN => {
-                let cypher = take_string_field("RUN", &fields, 0)?;
-                let params = take_map_field("RUN", &fields, 1)?;
-                let extra = fields
-                    .get(2)
-                    .cloned()
+                let cypher = take_string_field("RUN", &mut fields, 0)?;
+                let params = take_map_field("RUN", &mut fields, 1)?;
+                let extra = take_optional_field(&mut fields, 2)
                     .map(|v| match v {
                         Value::Map(m) => Ok(m),
                         other => Err(BoltError::MalformedStruct {
@@ -118,23 +126,23 @@ impl Request {
                 })
             }
             struct_tag::PULL => {
-                let extra = take_map_field("PULL", &fields, 0)?;
+                let extra = take_map_field("PULL", &mut fields, 0)?;
                 Ok(Request::Pull { extra })
             }
             struct_tag::DISCARD => {
-                let extra = take_map_field("DISCARD", &fields, 0)?;
+                let extra = take_map_field("DISCARD", &mut fields, 0)?;
                 Ok(Request::Discard { extra })
             }
             struct_tag::BEGIN => {
-                let extra = take_map_field("BEGIN", &fields, 0)?;
+                let extra = take_map_field("BEGIN", &mut fields, 0)?;
                 Ok(Request::Begin(extra))
             }
             struct_tag::COMMIT => Ok(Request::Commit),
             struct_tag::ROLLBACK => Ok(Request::Rollback),
             struct_tag::ROUTE => {
-                let routing = take_map_field("ROUTE", &fields, 0)?;
-                let bookmarks = match fields.get(1) {
-                    Some(Value::List(items)) => items.clone(),
+                let routing = take_map_field("ROUTE", &mut fields, 0)?;
+                let bookmarks = match take_optional_field(&mut fields, 1) {
+                    Some(Value::List(items)) => items,
                     Some(Value::Null) | None => Vec::new(),
                     Some(other) => {
                         return Err(BoltError::MalformedStruct {
@@ -143,7 +151,7 @@ impl Request {
                         });
                     }
                 };
-                let extra = fields.get(2).cloned().unwrap_or(Value::Null);
+                let extra = take_optional_field(&mut fields, 2).unwrap_or(Value::Null);
                 Ok(Request::Route {
                     routing,
                     bookmarks,
@@ -151,7 +159,7 @@ impl Request {
                 })
             }
             struct_tag::TELEMETRY => {
-                let extra = take_map_field("TELEMETRY", &fields, 0)?;
+                let extra = take_map_field("TELEMETRY", &mut fields, 0)?;
                 Ok(Request::Telemetry(extra))
             }
             other => Ok(Request::Unknown { tag: other, fields }),
@@ -182,11 +190,11 @@ impl Request {
 
 fn take_map_field(
     struct_name: &'static str,
-    fields: &[Value],
+    fields: &mut [Value],
     idx: usize,
 ) -> Result<BTreeMap<String, Value>> {
-    match fields.get(idx) {
-        Some(Value::Map(m)) => Ok(m.clone()),
+    match take_optional_field(fields, idx) {
+        Some(Value::Map(m)) => Ok(m),
         Some(other) => Err(BoltError::MalformedStruct {
             struct_name,
             detail: format!("field {idx} must be Map, got {}", other.type_name()),
@@ -198,9 +206,13 @@ fn take_map_field(
     }
 }
 
-fn take_string_field(struct_name: &'static str, fields: &[Value], idx: usize) -> Result<String> {
-    match fields.get(idx) {
-        Some(Value::String(s)) => Ok(s.clone()),
+fn take_string_field(
+    struct_name: &'static str,
+    fields: &mut [Value],
+    idx: usize,
+) -> Result<String> {
+    match take_optional_field(fields, idx) {
+        Some(Value::String(s)) => Ok(s),
         Some(other) => Err(BoltError::MalformedStruct {
             struct_name,
             detail: format!("field {idx} must be String, got {}", other.type_name()),
@@ -210,6 +222,12 @@ fn take_string_field(struct_name: &'static str, fields: &[Value], idx: usize) ->
             detail: format!("missing field at index {idx}"),
         }),
     }
+}
+
+fn take_optional_field(fields: &mut [Value], idx: usize) -> Option<Value> {
+    fields
+        .get_mut(idx)
+        .map(|value| std::mem::replace(value, Value::Null))
 }
 
 /// Response messages a server sends.

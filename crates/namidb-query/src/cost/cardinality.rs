@@ -629,6 +629,15 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
+        LogicalPlan::DiscardResult { input } => {
+            let child = estimate_inner(input, catalog);
+            Cardinality {
+                rows: 0.0,
+                bindings: BTreeMap::new(),
+                children: vec![child],
+                operator: plan.operator_name(),
+            }
+        }
         LogicalPlan::Delete { input, .. } => {
             let child = estimate_inner(input, catalog);
             let bindings = child.bindings.clone();

@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.5"
+version = "2.0.6"
 edition = "2021"
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -103,6 +103,7 @@ opentelemetry = "0.27"
 proptest = "1.5"
 tokio-test = "0.4"
 tempfile = "3.13"
+memmap2 = "0.9"
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 
 # Markdown / vault ingest (isolated to namidb-markdown so the core
@@ -122,13 +123,13 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 
 # Local workspace crates
-namidb-core = { path = "crates/namidb-core", version = "2.0.5" }
-namidb-storage = { path = "crates/namidb-storage", version = "2.0.5" }
-namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.5" }
-namidb-graph = { path = "crates/namidb-graph", version = "2.0.5" }
-namidb-ann = { path = "crates/namidb-ann", version = "2.0.5" }
-namidb-query = { path = "crates/namidb-query", version = "2.0.5" }
-namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.5" }
+namidb-core = { path = "crates/namidb-core", version = "2.0.6" }
+namidb-storage = { path = "crates/namidb-storage", version = "2.0.6" }
+namidb-markdown = { path = "crates/namidb-markdown", version = "2.0.6" }
+namidb-graph = { path = "crates/namidb-graph", version = "2.0.6" }
+namidb-ann = { path = "crates/namidb-ann", version = "2.0.6" }
+namidb-query = { path = "crates/namidb-query", version = "2.0.6" }
+namidb-bolt = { path = "crates/namidb-bolt", version = "2.0.6" }
 
 [profile.release]
 opt-level = 3

@@ -72,6 +72,7 @@ async fn serves_https_and_bolt_over_tls() {
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
         bolt_listen: Some(bolt),
+        bolt_max_message_bytes: namidb_bolt::message::DEFAULT_POST_AUTH_MESSAGE_BYTES,
         bolt_tx_timeout: Duration::ZERO,
         query_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,

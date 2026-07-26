@@ -93,6 +93,57 @@ pub fn runtime_to_bolt(v: &RuntimeValue, mode: ElementIdMode) -> Value {
     }
 }
 
+/// Ownership-preserving counterpart used when a queued runtime row is pulled.
+///
+/// Result rows can contain large vectors and nested graph values. Consuming
+/// the runtime tree avoids cloning those allocations merely to serialize one
+/// Bolt RECORD; each allocation is moved or released as that record is built.
+pub(crate) fn runtime_to_bolt_owned(v: RuntimeValue, mode: ElementIdMode) -> Value {
+    match v {
+        RuntimeValue::Null => Value::Null,
+        RuntimeValue::Bool(b) => Value::Bool(b),
+        RuntimeValue::Integer(n) => Value::Int(n),
+        RuntimeValue::Float(f) => Value::Float(f),
+        RuntimeValue::String(s) => Value::String(s),
+        RuntimeValue::Bytes(b) => Value::Bytes(b),
+        RuntimeValue::Vector(v) => {
+            Value::List(v.into_iter().map(|x| Value::Float(x as f64)).collect())
+        }
+        RuntimeValue::Vector8 { codes, scale } => Value::List(
+            codes
+                .into_iter()
+                .map(|c| Value::Float(c as f64 * scale as f64))
+                .collect(),
+        ),
+        RuntimeValue::List(items) => Value::List(
+            items
+                .into_iter()
+                .map(|v| runtime_to_bolt_owned(v, mode))
+                .collect(),
+        ),
+        RuntimeValue::Map(m) => Value::Map(
+            m.into_iter()
+                .map(|(k, v)| (k, runtime_to_bolt_owned(v, mode)))
+                .collect(),
+        ),
+        RuntimeValue::Date(days) => Value::Struct {
+            tag: struct_tag::DATE,
+            fields: vec![Value::Int(days as i64)],
+        },
+        RuntimeValue::DateTime(micros) => {
+            let seconds = micros.div_euclid(1_000_000);
+            let nanos = micros.rem_euclid(1_000_000) * 1_000;
+            Value::Struct {
+                tag: struct_tag::LOCAL_DATETIME,
+                fields: vec![Value::Int(seconds), Value::Int(nanos)],
+            }
+        }
+        RuntimeValue::Node(n) => node_to_bolt_owned(*n, mode),
+        RuntimeValue::Rel(r) => rel_to_bolt_owned(*r, mode),
+        RuntimeValue::Path(items) => path_to_bolt_owned(items, mode),
+    }
+}
+
 fn node_to_bolt(n: &NodeValue, mode: ElementIdMode) -> Value {
     let (legacy_id, element_id) = uuid_to_bolt_ids(n.id.0);
     let properties: BTreeMap<String, Value> = n
@@ -108,6 +159,22 @@ fn node_to_bolt(n: &NodeValue, mode: ElementIdMode) -> Value {
         element_id: Some(element_id),
     };
     node.to_struct(mode.is_include())
+}
+
+fn node_to_bolt_owned(n: NodeValue, mode: ElementIdMode) -> Value {
+    let (legacy_id, element_id) = uuid_to_bolt_ids(n.id.0);
+    let properties = n
+        .properties
+        .into_iter()
+        .map(|(k, v)| (k, runtime_to_bolt_owned(v, mode)))
+        .collect();
+    Node {
+        id: legacy_id,
+        labels: n.labels.into_iter().collect(),
+        properties,
+        element_id: Some(element_id),
+    }
+    .to_struct(mode.is_include())
 }
 
 fn rel_to_bolt(r: &RelValue, mode: ElementIdMode) -> Value {
@@ -130,6 +197,28 @@ fn rel_to_bolt(r: &RelValue, mode: ElementIdMode) -> Value {
         end_element_id: Some(end_element_id),
     };
     rel.to_struct(mode.is_include())
+}
+
+fn rel_to_bolt_owned(r: RelValue, mode: ElementIdMode) -> Value {
+    let (id, element_id) = synthetic_edge_id(&r.src, &r.dst, &r.edge_type);
+    let (start_id, start_element_id) = uuid_to_bolt_ids(r.src.0);
+    let (end_id, end_element_id) = uuid_to_bolt_ids(r.dst.0);
+    let properties = r
+        .properties
+        .into_iter()
+        .map(|(k, v)| (k, runtime_to_bolt_owned(v, mode)))
+        .collect();
+    Relationship {
+        id,
+        start_id,
+        end_id,
+        rel_type: r.edge_type,
+        properties,
+        element_id: Some(element_id),
+        start_element_id: Some(start_element_id),
+        end_element_id: Some(end_element_id),
+    }
+    .to_struct(mode.is_include())
 }
 
 fn path_to_bolt(items: &[RuntimeValue], mode: ElementIdMode) -> Value {
@@ -194,6 +283,77 @@ fn path_to_bolt(items: &[RuntimeValue], mode: ElementIdMode) -> Value {
     }
 }
 
+fn path_to_bolt_owned(items: Vec<RuntimeValue>, mode: ElementIdMode) -> Value {
+    use std::collections::HashMap;
+
+    // Preserve the borrowed converter's malformed-path fallback without
+    // cloning the valid prefix before discovering a scalar later in the path.
+    if items
+        .iter()
+        .any(|v| !matches!(v, RuntimeValue::Node(_) | RuntimeValue::Rel(_)))
+    {
+        return Value::List(
+            items
+                .into_iter()
+                .map(|v| runtime_to_bolt_owned(v, mode))
+                .collect(),
+        );
+    }
+
+    let mut nodes: Vec<NodeValue> = Vec::new();
+    let mut node_index: HashMap<namidb_core::id::NodeId, i64> = HashMap::new();
+    let mut rels: Vec<RelValue> = Vec::new();
+    let mut indices: Vec<i64> = Vec::new();
+
+    let mut prev_node_id: Option<namidb_core::id::NodeId> = None;
+    let mut pending_rel: Option<RelValue> = None;
+    for v in items {
+        match v {
+            RuntimeValue::Node(boxed) => {
+                let node = *boxed;
+                let node_id = node.id;
+                let idx = match node_index.get(&node_id) {
+                    Some(&i) => i,
+                    None => {
+                        let i = nodes.len() as i64;
+                        node_index.insert(node_id, i);
+                        nodes.push(node);
+                        i
+                    }
+                };
+                if let Some(rel) = pending_rel.take() {
+                    let rel_idx = rels.len() as i64 + 1;
+                    let forward = prev_node_id == Some(rel.src);
+                    rels.push(rel);
+                    indices.push(if forward { rel_idx } else { -rel_idx });
+                    indices.push(idx);
+                }
+                prev_node_id = Some(node_id);
+            }
+            RuntimeValue::Rel(boxed) => pending_rel = Some(*boxed),
+            _ => unreachable!("path shape was validated before ownership conversion"),
+        }
+    }
+
+    Value::Struct {
+        tag: struct_tag::PATH,
+        fields: vec![
+            Value::List(
+                nodes
+                    .into_iter()
+                    .map(|n| node_to_bolt_owned(n, mode))
+                    .collect(),
+            ),
+            Value::List(
+                rels.into_iter()
+                    .map(|r| unbound_rel_owned(r, mode))
+                    .collect(),
+            ),
+            Value::List(indices.into_iter().map(Value::Int).collect()),
+        ],
+    }
+}
+
 fn unbound_rel(r: &RelValue, mode: ElementIdMode) -> Value {
     // UnboundRelationship struct tag 0x72, v5 layout:
     //   { id, type, properties, element_id }
@@ -205,6 +365,27 @@ fn unbound_rel(r: &RelValue, mode: ElementIdMode) -> Value {
             r.properties
                 .iter()
                 .map(|(k, v)| (k.clone(), runtime_to_bolt(v, mode)))
+                .collect(),
+        ),
+    ];
+    if mode.is_include() {
+        fields.push(Value::String(element_id));
+    }
+    Value::Struct {
+        tag: struct_tag::UNBOUND_RELATIONSHIP,
+        fields,
+    }
+}
+
+fn unbound_rel_owned(r: RelValue, mode: ElementIdMode) -> Value {
+    let (id, element_id) = synthetic_edge_id(&r.src, &r.dst, &r.edge_type);
+    let mut fields = vec![
+        Value::Int(id),
+        Value::String(r.edge_type),
+        Value::Map(
+            r.properties
+                .into_iter()
+                .map(|(k, v)| (k, runtime_to_bolt_owned(v, mode)))
                 .collect(),
         ),
     ];
@@ -238,6 +419,10 @@ pub fn bolt_to_runtime(v: &Value) -> RuntimeValue {
 }
 
 fn decode_struct_param(tag: u8, fields: &[Value]) -> RuntimeValue {
+    decode_known_struct_param(tag, fields).unwrap_or_else(|| fallback_struct_map(tag, fields))
+}
+
+fn decode_known_struct_param(tag: u8, fields: &[Value]) -> Option<RuntimeValue> {
     let seconds_nanos = || -> Option<(i64, i64)> {
         let seconds = match fields.first()? {
             Value::Int(n) => *n,
@@ -251,36 +436,33 @@ fn decode_struct_param(tag: u8, fields: &[Value]) -> RuntimeValue {
     };
     match tag {
         struct_tag::DATE => match fields.first() {
-            Some(Value::Int(days)) => RuntimeValue::Date(*days as i32),
-            _ => fallback_struct_map(tag, fields),
+            Some(Value::Int(days)) => Some(RuntimeValue::Date(*days as i32)),
+            _ => None,
         },
-        struct_tag::LOCAL_DATETIME => match seconds_nanos() {
-            Some((s, n)) => RuntimeValue::DateTime(s * 1_000_000 + n / 1_000),
-            None => fallback_struct_map(tag, fields),
-        },
+        struct_tag::LOCAL_DATETIME => {
+            seconds_nanos().map(|(s, n)| RuntimeValue::DateTime(s * 1_000_000 + n / 1_000))
+        }
         // DateTime (v5+, UTC seconds + nanos + tz_offset_seconds).
         // RuntimeValue::DateTime is UTC micros, so the offset is
         // informational only — we keep the UTC seconds verbatim.
-        struct_tag::DATETIME => match seconds_nanos() {
-            Some((s, n)) => RuntimeValue::DateTime(s * 1_000_000 + n / 1_000),
-            None => fallback_struct_map(tag, fields),
-        },
+        struct_tag::DATETIME => {
+            seconds_nanos().map(|(s, n)| RuntimeValue::DateTime(s * 1_000_000 + n / 1_000))
+        }
         // DateTime (v4 legacy, wall-clock seconds at the offset).
         // Convert to UTC by subtracting the offset.
         struct_tag::DATETIME_LEGACY => match (seconds_nanos(), fields.get(2)) {
             (Some((s, n)), Some(Value::Int(off))) => {
-                RuntimeValue::DateTime((s - off) * 1_000_000 + n / 1_000)
+                Some(RuntimeValue::DateTime((s - off) * 1_000_000 + n / 1_000))
             }
-            (Some((s, n)), _) => RuntimeValue::DateTime(s * 1_000_000 + n / 1_000),
-            _ => fallback_struct_map(tag, fields),
+            (Some((s, n)), _) => Some(RuntimeValue::DateTime(s * 1_000_000 + n / 1_000)),
+            _ => None,
         },
         // DateTimeZoneId carries a zone-id string; we currently
         // collapse to UTC like the offset form.
-        struct_tag::DATETIME_ZONE_ID => match seconds_nanos() {
-            Some((s, n)) => RuntimeValue::DateTime(s * 1_000_000 + n / 1_000),
-            None => fallback_struct_map(tag, fields),
-        },
-        _ => fallback_struct_map(tag, fields),
+        struct_tag::DATETIME_ZONE_ID => {
+            seconds_nanos().map(|(s, n)| RuntimeValue::DateTime(s * 1_000_000 + n / 1_000))
+        }
+        _ => None,
     }
 }
 
@@ -301,6 +483,50 @@ pub fn params_from_bolt_map(m: &BTreeMap<String, Value>) -> namidb_query::Params
         params.insert(k.clone(), bolt_to_runtime(v));
     }
     params
+}
+
+/// Ownership-preserving counterpart used by the session's RUN path.
+///
+/// Large vector batches contain millions of scalar `Value`s. Consuming the
+/// decoded parameter tree lets each String/Bytes/container allocation move or
+/// be released as it is converted instead of retaining a complete Bolt tree
+/// beside the complete runtime tree for the duration of query execution.
+pub(crate) fn params_from_bolt_map_owned(m: BTreeMap<String, Value>) -> namidb_query::Params {
+    m.into_iter()
+        .map(|(key, value)| (key, bolt_to_runtime_owned(value)))
+        .collect()
+}
+
+fn bolt_to_runtime_owned(value: Value) -> RuntimeValue {
+    match value {
+        Value::Null => RuntimeValue::Null,
+        Value::Bool(value) => RuntimeValue::Bool(value),
+        Value::Int(value) => RuntimeValue::Integer(value),
+        Value::Float(value) => RuntimeValue::Float(value),
+        Value::String(value) => RuntimeValue::String(value),
+        Value::Bytes(value) => RuntimeValue::Bytes(value),
+        Value::List(items) => {
+            RuntimeValue::List(items.into_iter().map(bolt_to_runtime_owned).collect())
+        }
+        Value::Map(map) => RuntimeValue::Map(
+            map.into_iter()
+                .map(|(key, value)| (key, bolt_to_runtime_owned(value)))
+                .collect(),
+        ),
+        Value::Struct { tag, fields } => {
+            if let Some(value) = decode_known_struct_param(tag, &fields) {
+                value
+            } else {
+                let mut map = BTreeMap::new();
+                map.insert("_bolt_struct_tag".into(), RuntimeValue::Integer(tag as i64));
+                map.insert(
+                    "_bolt_struct_fields".into(),
+                    RuntimeValue::List(fields.into_iter().map(bolt_to_runtime_owned).collect()),
+                );
+                RuntimeValue::Map(map)
+            }
+        }
+    }
 }
 
 /// Pack the low 64 bits of a UUIDv7 into an `i64` and the full UUID
@@ -438,5 +664,105 @@ mod tests {
         let params = params_from_bolt_map(&m);
         assert_eq!(params.get("k"), Some(&RuntimeValue::Integer(7)));
         assert_eq!(params.get("s"), Some(&RuntimeValue::String("hi".into())));
+    }
+
+    #[test]
+    fn owned_param_conversion_matches_borrowed_conversion() {
+        let mut nested = BTreeMap::new();
+        nested.insert("bytes".into(), Value::Bytes(vec![1, 2, 3]));
+        nested.insert(
+            "unknown".into(),
+            Value::Struct {
+                tag: 0x7F,
+                fields: vec![Value::String("opaque".into())],
+            },
+        );
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "rows".into(),
+            Value::List(vec![
+                Value::String("owned".into()),
+                Value::Map(nested),
+                Value::Struct {
+                    tag: struct_tag::LOCAL_DATETIME,
+                    fields: vec![Value::Int(1_700_000_000), Value::Int(123_000)],
+                },
+            ]),
+        );
+
+        let borrowed = params_from_bolt_map(&params);
+        let owned = params_from_bolt_map_owned(params);
+        assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn owned_runtime_conversion_matches_graph_and_nested_semantics() {
+        let a = NodeValue {
+            id: NodeId::from_uuid(Uuid::from_u128(1)),
+            labels: ["Articulo".to_string()].into_iter().collect(),
+            properties: [(
+                "embedding".to_string(),
+                RuntimeValue::Vector(vec![0.25, 0.5]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let b = NodeValue {
+            id: NodeId::from_uuid(Uuid::from_u128(2)),
+            labels: ["Norma".to_string()].into_iter().collect(),
+            properties: [(
+                "title".to_string(),
+                RuntimeValue::String("owned".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let rel = RelValue {
+            edge_type: "PERTENECE_A".to_string(),
+            src: a.id,
+            dst: b.id,
+            properties: [(
+                "weight".to_string(),
+                RuntimeValue::Vector8 {
+                    codes: vec![2, -4],
+                    scale: 0.5,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let cases = vec![
+            RuntimeValue::Node(Box::new(a.clone())),
+            RuntimeValue::Rel(Box::new(rel.clone())),
+            RuntimeValue::Path(vec![
+                RuntimeValue::Node(Box::new(a.clone())),
+                RuntimeValue::Rel(Box::new(rel.clone())),
+                RuntimeValue::Node(Box::new(b.clone())),
+            ]),
+            RuntimeValue::List(vec![
+                RuntimeValue::Map(
+                    [("node".to_string(), RuntimeValue::Node(Box::new(b.clone())))]
+                        .into_iter()
+                        .collect(),
+                ),
+                RuntimeValue::Vector(vec![1.0, 2.0, 3.0]),
+            ]),
+            // Malformed executor paths retain the borrowed converter's plain
+            // list fallback rather than changing wire semantics.
+            RuntimeValue::Path(vec![
+                RuntimeValue::Node(Box::new(a)),
+                RuntimeValue::String("not-a-rel".to_string()),
+            ]),
+        ];
+
+        for mode in [ElementIdMode::None, ElementIdMode::Include] {
+            for value in cases.clone() {
+                let borrowed = runtime_to_bolt(&value, mode);
+                let owned = runtime_to_bolt_owned(value, mode);
+                assert_eq!(owned, borrowed);
+            }
+        }
     }
 }

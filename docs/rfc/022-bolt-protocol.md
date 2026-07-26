@@ -308,6 +308,8 @@ the dotted code to bucket retryable vs fatal.
 --bolt-listen 0.0.0.0:7687   (default off — opt-in for v0)
 --bolt-disabled              (kill switch for the rare HTTP-only deployment)
 NAMIDB_BOLT_LISTEN=...       (env var equivalent)
+NAMIDB_BOLT_MAX_MESSAGE_BYTES=67108864
+                              (authenticated message cap; pre-auth stays 64 KiB)
 ```
 
 When bolt is enabled the server spawns a second `TcpListener` and

@@ -59,6 +59,70 @@ pub const DEFAULT_MAX_LEN: usize = 1 << 24; // 16 MiB
 /// stack. Exceeding it yields a clean `NestingTooDeep` FAILURE.
 pub const MAX_NESTING_DEPTH: usize = 128;
 
+/// Fixed decoded-heap allowance for small, structurally dense messages.
+///
+/// A tiny PackStream map can have substantially more allocator overhead than
+/// wire bytes. The fixed allowance keeps ordinary HELLO/RUN metadata working
+/// while the proportional budget below prevents a short, malicious frame from
+/// declaring a corpus-sized container.
+const DECODE_HEAP_BASE_BYTES: usize = 64 * 1024;
+
+/// Maximum decoded heap growth per byte present in the message body.
+///
+/// Vector batches encode every float in nine bytes and store it in one
+/// `Value` slot while decoding, so eight heap bytes per wire byte leaves ample
+/// headroom for legitimate nested maps/lists. Importantly, the budget is based
+/// on the bytes actually present, not merely the configured framing ceiling.
+const DECODE_HEAP_BYTES_PER_WIRE_BYTE: usize = 8;
+
+/// Conservative fixed-node charge for one `BTreeMap<String, Value>` entry.
+///
+/// String payload bytes and nested value allocations are charged separately.
+/// This covers the key/value objects, tree links, node occupancy slack, and
+/// allocator bookkeeping without depending on std's private B-tree layout.
+const MAP_ENTRY_HEAP_BYTES: usize = 128;
+
+#[derive(Debug)]
+struct DecodeBudget {
+    used: usize,
+    max: usize,
+}
+
+impl DecodeBudget {
+    fn for_message(wire_bytes: usize, max_len: usize) -> Self {
+        let bounded_wire = wire_bytes.min(max_len);
+        let proportional = bounded_wire.saturating_mul(DECODE_HEAP_BYTES_PER_WIRE_BYTE);
+        Self {
+            used: 0,
+            max: DECODE_HEAP_BASE_BYTES.saturating_add(proportional),
+        }
+    }
+
+    fn charge(&mut self, what: &'static str, bytes: usize) -> Result<()> {
+        let next = self.used.saturating_add(bytes);
+        if next > self.max {
+            return Err(BoltError::TooLarge {
+                what,
+                len: next,
+                max: self.max,
+            });
+        }
+        self.used = next;
+        Ok(())
+    }
+
+    fn charge_array<T>(&mut self, what: &'static str, len: usize) -> Result<()> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(BoltError::TooLarge {
+                what,
+                len: usize::MAX,
+                max: self.max,
+            })?;
+        self.charge(what, bytes)
+    }
+}
+
 /// Encode `value` into `out`.
 pub fn encode(out: &mut BytesMut, value: &Value) -> Result<()> {
     match value {
@@ -214,16 +278,22 @@ fn encode_struct_header(out: &mut BytesMut, fields: usize, tag: u8) -> Result<()
 
 /// Decode one value from `buf`, advancing it past the consumed bytes.
 pub fn decode(buf: &mut &[u8]) -> Result<Value> {
-    decode_inner(buf, DEFAULT_MAX_LEN, 0)
+    decode_with_limit(buf, DEFAULT_MAX_LEN)
 }
 
 /// Decode one value with a custom max-container-length bound. The
 /// session uses a lower bound pre-auth.
 pub fn decode_with_limit(buf: &mut &[u8], max_len: usize) -> Result<Value> {
-    decode_inner(buf, max_len, 0)
+    let mut budget = DecodeBudget::for_message(buf.len(), max_len);
+    decode_inner(buf, max_len, 0, &mut budget)
 }
 
-fn decode_inner(buf: &mut &[u8], max_len: usize, depth: usize) -> Result<Value> {
+fn decode_inner(
+    buf: &mut &[u8],
+    max_len: usize,
+    depth: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Value> {
     if depth > MAX_NESTING_DEPTH {
         return Err(BoltError::NestingTooDeep {
             max: MAX_NESTING_DEPTH,
@@ -253,82 +323,82 @@ fn decode_inner(buf: &mut &[u8], max_len: usize, depth: usize) -> Result<Value> 
         // TinyString
         0x80..=0x8F => {
             let len = (marker & 0x0F) as usize;
-            decode_string_body(buf, len, max_len)
+            decode_string_body(buf, len, max_len, budget)
         }
         0xD0 => {
             let len = read_u8(buf, "String8 length")? as usize;
-            decode_string_body(buf, len, max_len)
+            decode_string_body(buf, len, max_len, budget)
         }
         0xD1 => {
             let len = read_u16(buf, "String16 length")? as usize;
-            decode_string_body(buf, len, max_len)
+            decode_string_body(buf, len, max_len, budget)
         }
         0xD2 => {
             let len = read_u32(buf, "String32 length")? as usize;
-            decode_string_body(buf, len, max_len)
+            decode_string_body(buf, len, max_len, budget)
         }
 
         0xCC => {
             let len = read_u8(buf, "Bytes8 length")? as usize;
-            decode_bytes_body(buf, len, max_len)
+            decode_bytes_body(buf, len, max_len, budget)
         }
         0xCD => {
             let len = read_u16(buf, "Bytes16 length")? as usize;
-            decode_bytes_body(buf, len, max_len)
+            decode_bytes_body(buf, len, max_len, budget)
         }
         0xCE => {
             let len = read_u32(buf, "Bytes32 length")? as usize;
-            decode_bytes_body(buf, len, max_len)
+            decode_bytes_body(buf, len, max_len, budget)
         }
 
         // TinyList
         0x90..=0x9F => {
             let len = (marker & 0x0F) as usize;
-            decode_list_body(buf, len, max_len, depth)
+            decode_list_body(buf, len, max_len, depth, budget)
         }
         0xD4 => {
             let len = read_u8(buf, "List8 length")? as usize;
-            decode_list_body(buf, len, max_len, depth)
+            decode_list_body(buf, len, max_len, depth, budget)
         }
         0xD5 => {
             let len = read_u16(buf, "List16 length")? as usize;
-            decode_list_body(buf, len, max_len, depth)
+            decode_list_body(buf, len, max_len, depth, budget)
         }
         0xD6 => {
             let len = read_u32(buf, "List32 length")? as usize;
-            decode_list_body(buf, len, max_len, depth)
+            decode_list_body(buf, len, max_len, depth, budget)
         }
 
         // TinyMap
         0xA0..=0xAF => {
             let len = (marker & 0x0F) as usize;
-            decode_map_body(buf, len, max_len, depth)
+            decode_map_body(buf, len, max_len, depth, budget)
         }
         0xD8 => {
             let len = read_u8(buf, "Map8 length")? as usize;
-            decode_map_body(buf, len, max_len, depth)
+            decode_map_body(buf, len, max_len, depth, budget)
         }
         0xD9 => {
             let len = read_u16(buf, "Map16 length")? as usize;
-            decode_map_body(buf, len, max_len, depth)
+            decode_map_body(buf, len, max_len, depth, budget)
         }
         0xDA => {
             let len = read_u32(buf, "Map32 length")? as usize;
-            decode_map_body(buf, len, max_len, depth)
+            decode_map_body(buf, len, max_len, depth, budget)
         }
 
         // TinyStruct
         0xB0..=0xBF => {
             let fields = (marker & 0x0F) as usize;
-            decode_struct_body(buf, fields, max_len, depth)
+            decode_struct_body(buf, fields, max_len, depth, budget)
         }
         0xDC => {
             let fields = read_u8(buf, "Struct8 size")? as usize;
-            decode_struct_body(buf, fields, max_len, depth)
+            decode_struct_body(buf, fields, max_len, depth, budget)
         }
         0xDD => {
             let fields = read_u16(buf, "Struct16 size")? as usize;
-            decode_struct_body(buf, fields, max_len, depth)
+            decode_struct_body(buf, fields, max_len, depth, budget)
         }
 
         other => Err(BoltError::InvalidMarker {
@@ -338,40 +408,76 @@ fn decode_inner(buf: &mut &[u8], max_len: usize, depth: usize) -> Result<Value> 
     }
 }
 
-fn decode_string_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Value> {
+fn decode_string_body(
+    buf: &mut &[u8],
+    len: usize,
+    max_len: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Value> {
     bound_check("String", len, max_len)?;
     if buf.len() < len {
         return Err(BoltError::UnexpectedEof { what: "String" });
     }
+    budget.charge("decoded String heap", len)?;
     let s = std::str::from_utf8(&buf[..len])?.to_string();
     buf.advance(len);
     Ok(Value::String(s))
 }
 
-fn decode_bytes_body(buf: &mut &[u8], len: usize, max_len: usize) -> Result<Value> {
+fn decode_bytes_body(
+    buf: &mut &[u8],
+    len: usize,
+    max_len: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Value> {
     bound_check("Bytes", len, max_len)?;
     if buf.len() < len {
         return Err(BoltError::UnexpectedEof { what: "Bytes" });
     }
+    budget.charge("decoded Bytes heap", len)?;
     let out = buf[..len].to_vec();
     buf.advance(len);
     Ok(Value::Bytes(out))
 }
 
-fn decode_list_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) -> Result<Value> {
+fn decode_list_body(
+    buf: &mut &[u8],
+    len: usize,
+    max_len: usize,
+    depth: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Value> {
     bound_check("List", len, max_len)?;
+    require_minimum_wire(buf, len, 1, "List items")?;
+    budget.charge_array::<Value>("decoded List heap", len)?;
     let mut items = Vec::with_capacity(len);
     for _ in 0..len {
-        items.push(decode_inner(buf, max_len, depth + 1)?);
+        items.push(decode_inner(buf, max_len, depth + 1, budget)?);
     }
     Ok(Value::List(items))
 }
 
-fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) -> Result<Value> {
+fn decode_map_body(
+    buf: &mut &[u8],
+    len: usize,
+    max_len: usize,
+    depth: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Value> {
     bound_check("Map", len, max_len)?;
+    // Every pair requires at least one key marker and one value marker.
+    require_minimum_wire(buf, len, 2, "Map entries")?;
+    let entry_bytes = len
+        .checked_mul(MAP_ENTRY_HEAP_BYTES)
+        .ok_or(BoltError::TooLarge {
+            what: "decoded Map heap",
+            len: usize::MAX,
+            max: budget.max,
+        })?;
+    budget.charge("decoded Map heap", entry_bytes)?;
     let mut out = BTreeMap::new();
     for _ in 0..len {
-        let k = decode_inner(buf, max_len, depth + 1)?;
+        let k = decode_inner(buf, max_len, depth + 1, budget)?;
         let key = match k {
             Value::String(s) => s,
             other => {
@@ -381,7 +487,7 @@ fn decode_map_body(buf: &mut &[u8], len: usize, max_len: usize, depth: usize) ->
                 })
             }
         };
-        let value = decode_inner(buf, max_len, depth + 1)?;
+        let value = decode_inner(buf, max_len, depth + 1, budget)?;
         out.insert(key, value);
     }
     Ok(Value::Map(out))
@@ -392,14 +498,34 @@ fn decode_struct_body(
     fields: usize,
     max_len: usize,
     depth: usize,
+    budget: &mut DecodeBudget,
 ) -> Result<Value> {
     let tag = read_u8(buf, "Struct tag")?;
     bound_check("Struct", fields, max_len)?;
+    require_minimum_wire(buf, fields, 1, "Struct fields")?;
+    budget.charge_array::<Value>("decoded Struct heap", fields)?;
     let mut out = Vec::with_capacity(fields);
     for _ in 0..fields {
-        out.push(decode_inner(buf, max_len, depth + 1)?);
+        out.push(decode_inner(buf, max_len, depth + 1, budget)?);
     }
     Ok(Value::Struct { tag, fields: out })
+}
+
+fn require_minimum_wire(
+    buf: &[u8],
+    len: usize,
+    bytes_per_item: usize,
+    what: &'static str,
+) -> Result<()> {
+    let required = len.checked_mul(bytes_per_item).ok_or(BoltError::TooLarge {
+        what,
+        len: usize::MAX,
+        max: buf.len(),
+    })?;
+    if required > buf.len() {
+        return Err(BoltError::UnexpectedEof { what });
+    }
+    Ok(())
 }
 
 fn bound_check(what: &'static str, len: usize, max: usize) -> Result<()> {
@@ -516,6 +642,142 @@ mod tests {
         }
         assert_eq!(cur, &Value::Null);
         assert_eq!(depth, MAX_NESTING_DEPTH);
+    }
+
+    #[test]
+    fn truncated_list32_cardinality_is_rejected_before_reserving() {
+        // The historical decoder compared an element count with a byte limit
+        // and immediately called Vec::with_capacity. A five-byte body could
+        // therefore declare 16M Value slots and force a process-aborting
+        // allocation before the first missing item was noticed.
+        let declared = DEFAULT_MAX_LEN as u32;
+        let body = [
+            0xD6,
+            (declared >> 24) as u8,
+            (declared >> 16) as u8,
+            (declared >> 8) as u8,
+            declared as u8,
+        ];
+        let mut slice: &[u8] = &body;
+        let err = decode_with_limit(&mut slice, DEFAULT_MAX_LEN)
+            .expect_err("declared List32 cannot exceed the bytes that remain");
+        assert!(
+            matches!(err, BoltError::UnexpectedEof { what: "List items" }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_map32_and_struct16_cardinalities_are_rejected_before_work() {
+        let declared_map = 1_000_000_u32;
+        let map = [
+            0xDA,
+            (declared_map >> 24) as u8,
+            (declared_map >> 16) as u8,
+            (declared_map >> 8) as u8,
+            declared_map as u8,
+        ];
+        let mut map_slice: &[u8] = &map;
+        let map_err = decode_with_limit(&mut map_slice, DEFAULT_MAX_LEN)
+            .expect_err("truncated Map32 must fail before allocating tree nodes");
+        assert!(
+            matches!(
+                map_err,
+                BoltError::UnexpectedEof {
+                    what: "Map entries"
+                }
+            ),
+            "unexpected map error: {map_err:?}"
+        );
+
+        // Struct headers carry the tag before their fields.
+        let strukt = [0xDD, 0xFF, 0xFF, 0x42];
+        let mut struct_slice: &[u8] = &strukt;
+        let struct_err = decode_with_limit(&mut struct_slice, DEFAULT_MAX_LEN)
+            .expect_err("truncated Struct16 must fail before allocating field slots");
+        assert!(
+            matches!(
+                struct_err,
+                BoltError::UnexpectedEof {
+                    what: "Struct fields"
+                }
+            ),
+            "unexpected struct error: {struct_err:?}"
+        );
+    }
+
+    #[test]
+    fn decoded_heap_budget_rejects_dense_tiny_value_amplification() {
+        // This body is complete (not merely a lying length header), but each
+        // one-byte Null would occupy a full Value slot. The cumulative decoded
+        // heap budget must reject the amplification before Vec reserves it.
+        const ITEMS: usize = 100_000;
+        let mut body = Vec::with_capacity(5 + ITEMS);
+        body.push(0xD6);
+        body.extend_from_slice(&(ITEMS as u32).to_be_bytes());
+        body.resize(5 + ITEMS, 0xC0);
+
+        let mut slice: &[u8] = &body;
+        let err = decode_with_limit(&mut slice, DEFAULT_MAX_LEN)
+            .expect_err("dense tiny values must obey the decoded heap budget");
+        assert!(
+            matches!(
+                err,
+                BoltError::TooLarge {
+                    what: "decoded List heap",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn decoded_heap_budget_covers_dense_maps_and_structs() {
+        // A complete map with tiny duplicate keys is cheap on the wire but
+        // still asks the decoder to construct/replace thousands of tree
+        // entries. Charge the declared entry work before entering that loop.
+        const ENTRIES: usize = 10_000;
+        let mut map = Vec::with_capacity(5 + ENTRIES * 2);
+        map.push(0xDA);
+        map.extend_from_slice(&(ENTRIES as u32).to_be_bytes());
+        for _ in 0..ENTRIES {
+            map.extend_from_slice(&[0x80, 0xC0]); // empty String key, Null
+        }
+        let mut map_slice: &[u8] = &map;
+        let map_err = decode_with_limit(&mut map_slice, DEFAULT_MAX_LEN)
+            .expect_err("dense map must obey the decoded heap budget");
+        assert!(
+            matches!(
+                map_err,
+                BoltError::TooLarge {
+                    what: "decoded Map heap",
+                    ..
+                }
+            ),
+            "unexpected map error: {map_err:?}"
+        );
+
+        // Struct16 has the same amplification vector through its field Vec.
+        const FIELDS: usize = 30_000;
+        let mut strukt = Vec::with_capacity(4 + FIELDS);
+        strukt.push(0xDD);
+        strukt.extend_from_slice(&(FIELDS as u16).to_be_bytes());
+        strukt.push(0x42);
+        strukt.resize(4 + FIELDS, 0xC0);
+        let mut struct_slice: &[u8] = &strukt;
+        let struct_err = decode_with_limit(&mut struct_slice, DEFAULT_MAX_LEN)
+            .expect_err("dense struct must obey the decoded heap budget");
+        assert!(
+            matches!(
+                struct_err,
+                BoltError::TooLarge {
+                    what: "decoded Struct heap",
+                    ..
+                }
+            ),
+            "unexpected struct error: {struct_err:?}"
+        );
     }
 
     #[test]

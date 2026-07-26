@@ -637,6 +637,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 }
             }
 
+            LogicalPlan::DiscardResult { input } => {
+                let _ = execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                Ok(Vec::new())
+            }
+
             LogicalPlan::TopN {
                 input,
                 keys,
@@ -6196,6 +6201,12 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 Ok(FactorRowSet::from_flat(rows))
             }
 
+            LogicalPlan::DiscardResult { input } => {
+                let _ = execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
+                    .await?;
+                Ok(FactorRowSet::from_flat(Vec::new()))
+            }
+
             LogicalPlan::TopN {
                 input,
                 keys,
@@ -7995,6 +8006,7 @@ fn collect_plan_references(
             }
         }
         LogicalPlan::Expand { .. }
+        | LogicalPlan::DiscardResult { .. }
         | LogicalPlan::Distinct { .. }
         | LogicalPlan::Union { .. }
         | LogicalPlan::CrossProduct { .. }

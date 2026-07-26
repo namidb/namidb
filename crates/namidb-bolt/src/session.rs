@@ -15,15 +15,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use crate::budget::{MessageMemoryBudget, MessageMemoryLease, CONTROL_FRAME_MAX_BYTES};
 use crate::chunk::write_message;
 use crate::error::{BoltError, Result};
 use crate::handshake::{negotiate, read_offers, write_response, Version};
-use crate::mapping::{params_from_bolt_map, runtime_to_bolt, ElementIdMode};
-use crate::message::{Request, Response, POST_AUTH_MESSAGE_BYTES, PRE_AUTH_MESSAGE_BYTES};
+use crate::mapping::{
+    params_from_bolt_map_owned, runtime_to_bolt, runtime_to_bolt_owned, ElementIdMode,
+};
+use crate::message::{Request, Response, DEFAULT_POST_AUTH_MESSAGE_BYTES, PRE_AUTH_MESSAGE_BYTES};
 use crate::state::State;
 use crate::value::Value;
 
-use namidb_query::{Params, Row, RuntimeValue};
+use namidb_query::{Params, Row};
 
 /// Cooperative cancellation signal for one in-flight `RUN`.
 ///
@@ -88,13 +91,47 @@ impl RunCancellation {
 /// cancellation-safe `read` operation for each increment. If RUN completes
 /// halfway through a pipelined PULL frame, the next loop iteration resumes at
 /// the exact byte offset.
+#[derive(Debug)]
+struct BudgetedMessage {
+    body: Vec<u8>,
+    /// Retained through decode, parameter conversion, backend execution, or
+    /// RUN prefetch. Dropping the envelope releases the shared byte budget.
+    _lease: Option<MessageMemoryLease>,
+}
+
+impl BudgetedMessage {
+    #[cfg(test)]
+    fn unbudgeted(body: Vec<u8>) -> Self {
+        Self { body, _lease: None }
+    }
+
+    fn len(&self) -> usize {
+        self.body.len()
+    }
+}
+
 #[derive(Debug, Default)]
 struct StatefulMessageReader {
     header: [u8; 2],
     header_read: usize,
+    /// A chunk header has been consumed, but its body has not yet been
+    /// allocated/read. This explicit state keeps budget acquisition
+    /// cancellation-safe inside RUN's `select!`.
+    pending_chunk_len: Option<usize>,
     chunk: Vec<u8>,
     chunk_read: usize,
     message: Vec<u8>,
+    message_complete: bool,
+    /// Fixed deadline from the first byte of a frame. Idle authenticated
+    /// connections have no deadline and hold no budget; a partial slowloris
+    /// cannot retain its bounded raw-memory lease indefinitely.
+    message_deadline: Option<tokio::time::Instant>,
+    budget_lease: Option<MessageMemoryLease>,
+    /// When a chunk header crosses the configured message ceiling, its body
+    /// has not been consumed yet. Retain that exact remainder so an
+    /// authenticated session can bounded-time drain through the terminator,
+    /// emit a reliable FAILURE (without TCP RST from unread input), and close.
+    oversized_chunk_remaining: usize,
 }
 
 impl StatefulMessageReader {
@@ -102,26 +139,69 @@ impl StatefulMessageReader {
         &mut self,
         reader: &mut R,
         max_message_bytes: usize,
-    ) -> Result<Vec<u8>> {
+        budget: Option<&Arc<MessageMemoryBudget>>,
+        partial_message_timeout: Option<std::time::Duration>,
+    ) -> Result<BudgetedMessage> {
         loop {
+            if self.message_complete {
+                let control_bypass = self.message.len() <= CONTROL_FRAME_MAX_BYTES
+                    && is_pressure_relief_frame(&self.message);
+                if !control_bypass {
+                    if let Some(budget) = budget {
+                        // Upgrade the raw framing charge to the conservative
+                        // decoded/runtime working-set charge atomically while
+                        // retaining the raw lease. Failure is immediate, so no
+                        // task waits while holding partial permits.
+                        self.ensure_budget(budget, self.message.len(), true)?;
+                    }
+                }
+
+                self.message_complete = false;
+                self.message_deadline = None;
+                return Ok(BudgetedMessage {
+                    body: std::mem::take(&mut self.message),
+                    _lease: self.budget_lease.take(),
+                });
+            }
+
             // An in-progress chunk is the decoder's explicit "body" phase.
             // Do not read a fresh header until its full body has arrived: the
             // future may have been dropped by `select!` after consuming only
             // part of that body while a concurrent RUN completed.
             if self.chunk.is_empty() {
-                while self.header_read < self.header.len() {
-                    let read = reader.read(&mut self.header[self.header_read..]).await?;
-                    if read == 0 {
-                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                if self.pending_chunk_len.is_none() {
+                    while self.header_read < self.header.len() {
+                        let deadline = self.message_deadline;
+                        let read = await_message_step(
+                            deadline,
+                            reader.read(&mut self.header[self.header_read..]),
+                        )
+                        .await??;
+                        if read == 0 {
+                            return Err(
+                                std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()
+                            );
+                        }
+                        if self.message_deadline.is_none() {
+                            self.message_deadline = partial_message_timeout
+                                .map(|timeout| tokio::time::Instant::now() + timeout);
+                        }
+                        self.header_read += read;
                     }
-                    self.header_read += read;
+
+                    let chunk_len = u16::from_be_bytes(self.header) as usize;
+                    self.header_read = 0;
+                    self.pending_chunk_len = Some(chunk_len);
                 }
 
-                let chunk_len = u16::from_be_bytes(self.header) as usize;
-                self.header_read = 0;
+                let chunk_len = self
+                    .pending_chunk_len
+                    .expect("chunk length is retained across cancellation");
                 if chunk_len == 0 {
+                    self.pending_chunk_len = None;
                     self.chunk_read = 0;
-                    return Ok(std::mem::take(&mut self.message));
+                    self.message_complete = true;
+                    continue;
                 }
 
                 let next_len =
@@ -134,6 +214,8 @@ impl StatefulMessageReader {
                             max: max_message_bytes,
                         })?;
                 if next_len > max_message_bytes {
+                    self.pending_chunk_len = None;
+                    self.oversized_chunk_remaining = chunk_len;
                     return Err(BoltError::TooLarge {
                         what: "Bolt message",
                         len: next_len,
@@ -141,12 +223,30 @@ impl StatefulMessageReader {
                     });
                 }
 
+                if next_len > CONTROL_FRAME_MAX_BYTES {
+                    if let Some(budget) = budget {
+                        if let Err(error) = self.ensure_budget(budget, next_len, false) {
+                            // The chunk header is already off the transport but
+                            // its body is untouched. Reuse the ordinary
+                            // oversized-frame drain path before closing.
+                            self.pending_chunk_len = None;
+                            self.oversized_chunk_remaining = chunk_len;
+                            return Err(error);
+                        }
+                    }
+                }
+
+                self.pending_chunk_len = None;
                 self.chunk.resize(chunk_len, 0);
                 self.chunk_read = 0;
             }
 
             while self.chunk_read < self.chunk.len() {
-                let read = reader.read(&mut self.chunk[self.chunk_read..]).await?;
+                let read = await_message_step(
+                    self.message_deadline,
+                    reader.read(&mut self.chunk[self.chunk_read..]),
+                )
+                .await??;
                 if read == 0 {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                 }
@@ -157,6 +257,149 @@ impl StatefulMessageReader {
             self.chunk_read = 0;
         }
     }
+
+    fn ensure_budget(
+        &mut self,
+        budget: &Arc<MessageMemoryBudget>,
+        wire_bytes: usize,
+        decoded_working_set: bool,
+    ) -> Result<()> {
+        let desired = if decoded_working_set {
+            budget.decoded_units_for_wire(wire_bytes)?
+        } else {
+            budget.framing_units_for_wire(wire_bytes)?
+        };
+        let current = self
+            .budget_lease
+            .as_ref()
+            .map(MessageMemoryLease::units)
+            .unwrap_or(0);
+        if desired <= current {
+            return Ok(());
+        }
+        let additional = budget.try_acquire_units(desired - current)?;
+        match &mut self.budget_lease {
+            Some(lease) => lease.merge(additional),
+            None => self.budget_lease = Some(MessageMemoryLease::new(additional)),
+        }
+        Ok(())
+    }
+
+    /// Release every retained allocation/permit while preserving the framing
+    /// cursor needed by [`Self::discard_oversized_message`].
+    fn release_buffered_allocations(&mut self) {
+        drop(std::mem::take(&mut self.message));
+        drop(std::mem::take(&mut self.chunk));
+        self.chunk_read = 0;
+        self.budget_lease = None;
+    }
+
+    /// Discard the rest of a frame whose next chunk crossed the size limit.
+    ///
+    /// Bolt chunks are at most 65,535 bytes, so this uses fixed scratch memory
+    /// no matter how large the rejected message is. Callers impose a wall
+    /// clock timeout, preventing an authenticated slowloris from pinning the
+    /// connection merely to obtain a diagnostic.
+    async fn discard_oversized_message<R: AsyncReadExt + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<()> {
+        // A sub-4-KiB data frame is buffered before its tag can be classified.
+        // If its completed body cannot fit the shared budget, the terminating
+        // zero chunk is already consumed. Do not mistake the next frame for a
+        // remainder and drain it.
+        let already_complete = std::mem::take(&mut self.message_complete);
+        let mut scratch = [0_u8; 8 * 1024];
+        // `clear()` would retain the rejected frame's potentially very large
+        // allocation until the connection task finally exits. Release it
+        // before spending up to the drain timeout reading the rest of the
+        // frame.
+        self.release_buffered_allocations();
+        if already_complete {
+            self.header_read = 0;
+            self.pending_chunk_len = None;
+            self.oversized_chunk_remaining = 0;
+            self.message_deadline = None;
+            return Ok(());
+        }
+
+        let mut remaining = std::mem::take(&mut self.oversized_chunk_remaining);
+        loop {
+            while remaining > 0 {
+                let take = remaining.min(scratch.len());
+                reader.read_exact(&mut scratch[..take]).await?;
+                remaining -= take;
+            }
+
+            let mut header = [0_u8; 2];
+            reader.read_exact(&mut header).await?;
+            let chunk_len = u16::from_be_bytes(header) as usize;
+            if chunk_len == 0 {
+                self.header_read = 0;
+                self.pending_chunk_len = None;
+                self.message_complete = false;
+                self.message_deadline = None;
+                return Ok(());
+            }
+            remaining = chunk_len;
+        }
+    }
+}
+
+async fn await_message_step<F, T>(deadline: Option<tokio::time::Instant>, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authenticated Bolt frame exceeded its partial-message deadline",
+                )
+            })
+            .map_err(BoltError::Io),
+        None => Ok(future.await),
+    }
+}
+
+fn raw_request_tag(body: &[u8]) -> Option<u8> {
+    match body {
+        [marker @ 0xB0..=0xBF, tag, ..] => {
+            let _fields = marker & 0x0F;
+            Some(*tag)
+        }
+        [0xDC, _fields, tag, ..] => Some(*tag),
+        [0xDD, _fields_hi, _fields_lo, tag, ..] => Some(*tag),
+        _ => None,
+    }
+}
+
+fn is_pressure_relief_frame(body: &[u8]) -> bool {
+    matches!(
+        raw_request_tag(body),
+        Some(
+            crate::value::struct_tag::PULL
+                | crate::value::struct_tag::DISCARD
+                | crate::value::struct_tag::COMMIT
+                | crate::value::struct_tag::ROLLBACK
+                | crate::value::struct_tag::RESET
+                | crate::value::struct_tag::GOODBYE
+                | crate::value::struct_tag::LOGOFF
+        )
+    )
+}
+
+fn requires_decode_admission(body: &[u8]) -> bool {
+    body.len() > CONTROL_FRAME_MAX_BYTES || !is_pressure_relief_frame(body)
+}
+
+fn is_frame_memory_rejection(error: &BoltError) -> bool {
+    matches!(
+        error,
+        BoltError::TooLarge { .. } | BoltError::MemoryBudgetExhausted { .. }
+    )
 }
 
 /// Server-side identity returned in `SUCCESS` after HELLO.
@@ -306,8 +549,28 @@ impl BackendError {
 
 /// Pluggable Cypher executor. The server crate implements this on top
 /// of `WriterSession`; tests implement it with hand-canned rows.
+pub trait DecodeAdmissionGuard: Send {}
+
+impl<T: Send> DecodeAdmissionGuard for T {}
+
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Admit a potentially allocation-heavy request before PackStream decode
+    /// and parameter conversion. After authentication the session invokes
+    /// this for every frame except bounded pressure-relief controls (small
+    /// `PULL`/`DISCARD`/`COMMIT`/`ROLLBACK`/`RESET`/`GOODBYE`/`LOGOFF`).
+    /// The default is a no-op for embedders without a process RSS governor.
+    ///
+    /// A production backend may return an opaque RAII reservation, which the
+    /// session retains through handling. It should still keep ordinary
+    /// execution-time admission to close races with non-Bolt allocations.
+    async fn admit_request_decode(
+        &self,
+        _wire_bytes: usize,
+    ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError> {
+        Ok(None)
+    }
+
     /// Execute one Cypher statement in auto-commit mode.
     async fn run(
         &self,
@@ -398,7 +661,7 @@ pub trait Backend: Send + Sync {
 /// RESET/telemetry without allowing an executing query to become an
 /// unbounded per-connection message queue.
 const MAX_PREFETCHED_MESSAGES: usize = 16;
-const MAX_PREFETCHED_BYTES: usize = POST_AUTH_MESSAGE_BYTES;
+const OVERSIZED_MESSAGE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One Bolt connection. Created once per `accept()` and driven to
 /// completion in a single task.
@@ -414,10 +677,15 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// closing `SUCCESS` after PULL/DISCARD. `None` while no stream
     /// is active.
     pending_statement_type: Option<StatementType>,
-    /// Rows buffered by the last RUN, already converted to Bolt values,
-    /// drained by PULL in client-demanded batches (`n` per PULL). DISCARD
-    /// drops them without emitting. Cleared on RESET.
-    pending_rows: std::collections::VecDeque<Vec<Value>>,
+    /// Projection order for runtime rows buffered by the last RUN.
+    pending_fields: Vec<String>,
+    /// Parallel to `pending_fields`: true only for the final occurrence of a
+    /// name, where consuming the row binding cannot affect a later column.
+    pending_field_is_last_occurrence: Vec<bool>,
+    /// Runtime rows moved from the last RUN and drained lazily by PULL in
+    /// client-demanded batches (`n` per PULL). DISCARD drops rows without
+    /// expanding their values to Bolt containers. Cleared on RESET.
+    pending_rows: std::collections::VecDeque<Row>,
     /// Write counters of the in-flight stream, emitted as `stats` in the
     /// closing `SUCCESS` after PULL/DISCARD. Empty for reads.
     pending_counters: BTreeMap<String, i64>,
@@ -425,8 +693,19 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// transport concurrently with the backend is what lets us notice EOF and
     /// cancel a runaway statement; valid early PULL/DISCARD messages are kept
     /// in order and consumed by the normal state machine afterwards.
-    prefetched_messages: std::collections::VecDeque<Vec<u8>>,
+    prefetched_messages: std::collections::VecDeque<BudgetedMessage>,
     prefetched_bytes: usize,
+    /// Maximum body size for one authenticated Bolt message. The strict
+    /// pre-authentication cap remains [`PRE_AUTH_MESSAGE_BYTES`] regardless
+    /// of this setting.
+    post_auth_message_bytes: usize,
+    /// Process-wide authenticated-message working-set budget. `None` preserves
+    /// standalone library compatibility; the production server always injects
+    /// one shared instance across every accepted connection.
+    message_memory_budget: Option<Arc<MessageMemoryBudget>>,
+    /// Deadline for a frame once its first byte arrives. It does not close a
+    /// completely idle authenticated socket, which owns no budget.
+    partial_message_timeout: Option<std::time::Duration>,
     /// While an explicit transaction is open the backend holds the writer
     /// lock, so an idle client would pin it indefinitely. When set, a read
     /// that blocks longer than this with a transaction open rolls the
@@ -468,9 +747,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             version: None,
             pending_statement_type: None,
             pending_counters: BTreeMap::new(),
+            pending_fields: Vec::new(),
+            pending_field_is_last_occurrence: Vec::new(),
             pending_rows: std::collections::VecDeque::new(),
             prefetched_messages: std::collections::VecDeque::new(),
             prefetched_bytes: 0,
+            post_auth_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
+            message_memory_budget: None,
+            partial_message_timeout: None,
             tx_idle_timeout: None,
             handshake_timeout: None,
             max_tx_lifetime: None,
@@ -502,6 +786,57 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         self
     }
 
+    /// Set the maximum body size for one authenticated Bolt message.
+    ///
+    /// This does not relax the fixed 64 KiB pre-authentication ceiling. The
+    /// server validates that the configured value is non-zero before creating
+    /// sessions; the defensive clamp keeps direct library callers from
+    /// accidentally constructing a session that rejects every message.
+    pub fn with_post_auth_message_bytes(mut self, max_bytes: usize) -> Self {
+        self.post_auth_message_bytes = max_bytes.max(1);
+        self
+    }
+
+    /// Attach the process-wide authenticated Bolt message working-set budget.
+    ///
+    /// The lease is acquired by the framer, before it grows a data message
+    /// beyond the bounded control prefix, and follows complete messages through
+    /// decode, RUN execution, and prefetch.
+    pub fn with_message_memory_budget(mut self, budget: Arc<MessageMemoryBudget>) -> Self {
+        self.message_memory_budget = Some(budget);
+        self
+    }
+
+    /// Bound a partially-sent authenticated frame without timing out a fully
+    /// idle connection. This prevents a slowloris from retaining the shared
+    /// raw-message byte permits indefinitely.
+    pub fn with_partial_message_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.partial_message_timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
+    }
+
+    fn current_message_limit(&self) -> usize {
+        if self.authenticated {
+            self.post_auth_message_bytes
+        } else {
+            PRE_AUTH_MESSAGE_BYTES
+        }
+    }
+
+    /// Remaining aggregate body budget while RUN executes.
+    ///
+    /// The stateful reader may already hold a partial frame in addition to
+    /// complete queued frames, so each read must be bounded by the bytes left,
+    /// not by the full per-message ceiling again.
+    fn prefetch_read_limit(&self) -> usize {
+        if self.prefetched_messages.len() >= MAX_PREFETCHED_MESSAGES {
+            0
+        } else {
+            self.post_auth_message_bytes
+                .saturating_sub(self.prefetched_bytes)
+        }
+    }
+
     /// Run the session to completion. Returns once the client sends
     /// GOODBYE, the socket closes, or a fatal protocol error fires.
     pub async fn run(mut self) -> Result<()> {
@@ -511,11 +846,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         }
         let element_mode = ElementIdMode::from_major(self.version.unwrap().major);
         loop {
-            let max = if self.state == State::Connected || self.state == State::Authentication {
-                PRE_AUTH_MESSAGE_BYTES
-            } else {
-                POST_AUTH_MESSAGE_BYTES
-            };
+            let max = self.current_message_limit();
             // Bound how long the writer lock is pinned by an open
             // transaction: if the client idles past `tx_idle_timeout` while
             // in a transaction, roll it back to release the writer and fail
@@ -530,10 +861,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     .get_or_insert_with(tokio::time::Instant::now);
                 if let Some(max) = self.max_tx_lifetime {
                     if started.elapsed() >= max {
-                        let _ = self.backend.rollback_tx().await;
-                        self.state = State::Failed;
-                        self.tx_started = None;
-                        self.write_failure(
+                        self.fail_request(
                             "Neo.TransientError.Transaction.LockClientStopped",
                             "transaction exceeded maximum lifetime; rolled back to release \
                              the writer"
@@ -551,15 +879,26 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 self.prefetched_bytes = self.prefetched_bytes.saturating_sub(body.len());
                 Ok(body)
             } else {
-                let read = self.message_reader.read_message(&mut self.socket, max);
+                let message_budget = if pre_auth {
+                    None
+                } else {
+                    self.message_memory_budget.as_ref()
+                };
+                let partial_timeout = (!pre_auth)
+                    .then_some(self.partial_message_timeout)
+                    .flatten();
+                let read = self.message_reader.read_message(
+                    &mut self.socket,
+                    max,
+                    message_budget,
+                    partial_timeout,
+                );
                 if in_tx {
                     match self.tx_idle_timeout {
                         Some(t) => match tokio::time::timeout(t, read).await {
                             Ok(r) => r,
                             Err(_elapsed) => {
-                                let _ = self.backend.rollback_tx().await;
-                                self.state = State::Failed;
-                                self.write_failure(
+                                self.fail_request(
                                     "Neo.TransientError.Transaction.LockClientStopped",
                                     "transaction idle timeout; rolled back to release the writer"
                                         .to_string(),
@@ -588,10 +927,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     read.await
                 }
             };
-            let body = match read_result {
+            let message = match read_result {
                 Ok(b) => b,
                 Err(BoltError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("bolt connection closed by client");
+                    self.message_reader.release_buffered_allocations();
                     // A client that drops mid-transaction (crash, kill, network
                     // partition) never sends ROLLBACK/GOODBYE; without this the
                     // staged batch would linger in the shared writer and be
@@ -599,20 +939,62 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     self.rollback_if_open_tx().await;
                     return Ok(());
                 }
+                Err(e) if is_frame_memory_rejection(&e) => {
+                    // Rollback/recovery may wait on the single writer. The
+                    // framing cursor is enough to drain later; return the
+                    // rejected body's memory permits immediately.
+                    self.message_reader.release_buffered_allocations();
+                    self.rollback_if_open_tx().await;
+                    // The rejected message has not been drained, so this
+                    // connection cannot safely continue at the next Bolt
+                    // frame. After authentication, however, the transport is
+                    // full-duplex: emit one explicit FAILURE and flush it
+                    // before closing instead of making the driver diagnose an
+                    // unexplained EOF/defunct connection.
+                    self.write_oversized_message_failure(&e, true).await;
+                    return Err(e);
+                }
                 Err(e) => {
+                    self.message_reader.release_buffered_allocations();
                     self.rollback_if_open_tx().await;
                     return Err(e);
                 }
             };
-            let request = match Request::decode(&body, max) {
+            let BudgetedMessage {
+                body,
+                _lease: message_lease,
+            } = message;
+            let decode_admission_guard = if self.authenticated && requires_decode_admission(&body) {
+                match self.backend.admit_request_decode(body.len()).await {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        // Do not retain the raw body/lease while rollback
+                        // and the pressure diagnostic run. RESET remains
+                        // budget-bypassed and can recover FAILED.
+                        drop(body);
+                        drop(message_lease);
+                        self.fail_request(error.code(), error.message().to_string())
+                            .await?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let decoded = Request::decode(&body, max);
+            // Request now owns every decoded allocation. Drop the contiguous
+            // wire copy before parameter conversion/query execution.
+            drop(body);
+            let request = match decoded {
                 Ok(r) => r,
                 Err(e) => {
-                    self.write_failure(
+                    drop(message_lease);
+                    drop(decode_admission_guard);
+                    self.fail_request(
                         "Neo.ClientError.Request.Invalid",
                         format!("malformed Bolt message: {e}"),
                     )
                     .await?;
-                    self.state = State::Failed;
                     continue;
                 }
             };
@@ -620,12 +1002,18 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             let goodbye = matches!(request, Request::Goodbye);
             if let Err(e) = self.handle(request, element_mode).await {
                 warn!(error = %e, "bolt session error");
+                drop(message_lease);
+                drop(decode_admission_guard);
                 // A transport/protocol error tears the connection down; roll
                 // back any open transaction so its staged writes are discarded
                 // rather than left in the shared writer for the next commit.
                 self.rollback_if_open_tx().await;
                 return Err(e);
             }
+            // Keep the shared message charge through parameter conversion and
+            // backend execution; only a fully-consumed request releases it.
+            drop(message_lease);
+            drop(decode_admission_guard);
             if goodbye || self.state == State::Defunct {
                 return Ok(());
             }
@@ -693,7 +1081,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             ) {
                 let _ = self.backend.rollback_tx().await;
             }
-            self.pending_rows.clear();
+            drop(std::mem::take(&mut self.pending_rows));
+            drop(std::mem::take(&mut self.pending_fields));
+            drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
+            self.pending_statement_type = None;
+            self.pending_counters.clear();
             self.state = State::Ready;
             return self.write_response(Response::success_empty()).await;
         }
@@ -751,9 +1143,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         } else {
             // v4 HELLO carries scheme/principal/credentials.
             if let Err(e) = self.authenticate(&extra).await {
-                self.state = State::Failed;
                 return self
-                    .write_failure("Neo.ClientError.Security.Unauthorized", e)
+                    .fail_request("Neo.ClientError.Security.Unauthorized", e)
                     .await;
             }
             self.authenticated = true;
@@ -768,9 +1159,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             return self.invalid_state("LOGON required").await;
         };
         if let Err(e) = self.authenticate(&extra).await {
-            self.state = State::Failed;
             return self
-                .write_failure("Neo.ClientError.Security.Unauthorized", e)
+                .fail_request("Neo.ClientError.Security.Unauthorized", e)
                 .await;
         }
         self.authenticated = true;
@@ -790,10 +1180,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     self.state = State::TxReady;
                     self.write_response(Response::success_empty()).await
                 }
-                Err(e) => {
-                    self.state = State::Failed;
-                    self.write_failure(e.code(), e.message().to_string()).await
-                }
+                Err(e) => self.fail_request(e.code(), e.message().to_string()).await,
             },
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
@@ -835,10 +1222,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     self.state = State::Ready;
                     self.write_response(Response::success_empty()).await
                 }
-                Err(e) => {
-                    self.state = State::Failed;
-                    self.write_failure(e.code(), e.message().to_string()).await
-                }
+                Err(e) => self.fail_request(e.code(), e.message().to_string()).await,
             },
             _ => self.invalid_state("unexpected message in TX_READY").await,
         }
@@ -849,7 +1233,6 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         req: Request,
         element_mode: ElementIdMode,
     ) -> Result<()> {
-        let _ = element_mode;
         match req {
             Request::Pull { ref extra } | Request::Discard { ref extra } => {
                 // `n` is the batch size the client is ready for; -1 (or a
@@ -870,11 +1253,29 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     (n as usize).min(self.pending_rows.len())
                 };
                 for _ in 0..take {
-                    let values = self
+                    let mut row = self
                         .pending_rows
                         .pop_front()
                         .expect("take is bounded by len");
                     if is_pull {
+                        let values = self
+                            .pending_fields
+                            .iter()
+                            .zip(&self.pending_field_is_last_occurrence)
+                            .map(|(name, is_last_occurrence)| {
+                                if *is_last_occurrence {
+                                    row.bindings
+                                        .remove(name)
+                                        .map(|value| runtime_to_bolt_owned(value, element_mode))
+                                        .unwrap_or(Value::Null)
+                                } else {
+                                    row.bindings
+                                        .get(name)
+                                        .map(|value| runtime_to_bolt(value, element_mode))
+                                        .unwrap_or(Value::Null)
+                                }
+                            })
+                            .collect();
                         self.write_response(Response::Record(values)).await?;
                     }
                 }
@@ -904,6 +1305,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 } else {
                     self.state = State::Ready;
                 }
+                // Popping every row leaves VecDeque's peak allocation behind.
+                // Release it and the projection fields when the stream closes.
+                drop(std::mem::take(&mut self.pending_rows));
+                drop(std::mem::take(&mut self.pending_fields));
+                drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
                 self.write_response(Response::Success(meta)).await
             }
             _ => {
@@ -917,10 +1323,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         &mut self,
         cypher: &str,
         bolt_params: BTreeMap<String, Value>,
-        element_mode: ElementIdMode,
+        _element_mode: ElementIdMode,
         inside_tx: bool,
     ) -> Result<()> {
-        let params = params_from_bolt_map(&bolt_params);
+        let params = params_from_bolt_map_owned(bolt_params);
         // Inside an explicit transaction the statement stages into the open
         // tx (committed at COMMIT, discarded at ROLLBACK); a bare RUN
         // auto-commits.
@@ -939,42 +1345,63 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         };
         tokio::pin!(run);
         let run_result = loop {
+            let prefetch_read_limit = self.prefetch_read_limit();
             tokio::select! {
                 // Prefer a ready EOF over a simultaneously-ready backend so a
                 // closed client never receives (or appears to receive) an ACK.
                 biased;
                 read = self
                     .message_reader
-                    .read_message(&mut self.socket, POST_AUTH_MESSAGE_BYTES) => {
+                    .read_message(
+                        &mut self.socket,
+                        prefetch_read_limit,
+                        self.message_memory_budget.as_ref(),
+                        self.partial_message_timeout,
+                    ) => {
                     match read {
                         Ok(body) => {
                             let next_bytes = self.prefetched_bytes.saturating_add(body.len());
                             if self.prefetched_messages.len() >= MAX_PREFETCHED_MESSAGES
-                                || next_bytes > MAX_PREFETCHED_BYTES
+                                || next_bytes > self.post_auth_message_bytes
                             {
                                 cancellation.cancel();
+                                // This connection is closing. Release the body
+                                // that crossed the aggregate cap and all
+                                // already-prefetched leases before awaiting a
+                                // potentially non-cancellable durability tail.
+                                drop(body);
+                                self.prefetched_messages.clear();
+                                self.prefetched_bytes = 0;
                                 // The backend owns cleanup semantics. Await it
                                 // before unwinding so staged mutations and the
                                 // single-writer guard cannot escape this
                                 // connection task.
                                 let _ = run.as_mut().await;
-                                return Err(BoltError::TooLarge {
+                                let error = BoltError::TooLarge {
                                     what: "pipelined messages during RUN",
                                     len: next_bytes,
-                                    max: MAX_PREFETCHED_BYTES,
-                                });
+                                    max: self.post_auth_message_bytes,
+                                };
+                                self.write_oversized_message_failure(&error, false).await;
+                                return Err(error);
                             }
                             self.prefetched_bytes = next_bytes;
                             self.prefetched_messages.push_back(body);
                         }
                         Err(error) => {
                             cancellation.cancel();
+                            self.prefetched_messages.clear();
+                            self.prefetched_bytes = 0;
+                            self.message_reader.release_buffered_allocations();
                             // Never drop the backend future at an arbitrary
                             // durability boundary. A cancellation-aware backend
                             // stops its apply phase, rolls staged state back,
                             // or completes an already-started commit, then
                             // returns and releases the writer.
                             let _ = run.as_mut().await;
+                            if is_frame_memory_rejection(&error) {
+                                self.write_oversized_message_failure(&error, true).await;
+                            }
                             return Err(error);
                         }
                     }
@@ -994,45 +1421,43 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 // pin the single writer, wedging every other writer on the
                 // server, until it disconnects. `rollback_tx` is a no-op when
                 // no transaction is open, so the auto-commit path is unaffected.
-                if inside_tx {
-                    let _ = self.backend.rollback_tx().await;
-                }
-                self.state = State::Failed;
-                return self.write_failure(e.code(), e.message().to_string()).await;
+                return self.fail_request(e.code(), e.message().to_string()).await;
             }
         };
 
         // 1) SUCCESS { fields } announcing the field list. RECORDs are NOT
         //    emitted here: the Bolt contract is demand-driven — the client
         //    asks for batches with PULL {n}, and a driver's fetch_size must
-        //    actually bound what is in flight. The rows are buffered as Bolt
-        //    values and drained by handle_in_streaming.
+        //    actually bound what is in flight. Runtime rows are moved into the
+        //    session unchanged and converted only when PULL demands them.
+        let RunOutcome {
+            fields,
+            rows,
+            statement_type,
+            counters,
+        } = outcome;
         let mut head_meta = BTreeMap::new();
         head_meta.insert(
             "fields".into(),
-            Value::List(outcome.fields.iter().cloned().map(Value::String).collect()),
+            Value::List(fields.iter().cloned().map(Value::String).collect()),
         );
         head_meta.insert("t_first".into(), Value::Int(0));
         self.write_response(Response::Success(head_meta)).await?;
 
-        self.pending_rows = outcome
-            .rows
-            .iter()
-            .map(|row| {
-                outcome
-                    .fields
-                    .iter()
-                    .map(|name| {
-                        let v = row
-                            .bindings
-                            .get(name)
-                            .cloned()
-                            .unwrap_or(RuntimeValue::Null);
-                        runtime_to_bolt(&v, element_mode)
-                    })
-                    .collect()
-            })
-            .collect();
+        let field_is_last_occurrence = {
+            let mut last_occurrence = BTreeMap::new();
+            for (index, name) in fields.iter().enumerate() {
+                last_occurrence.insert(name.as_str(), index);
+            }
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, name)| last_occurrence.get(name.as_str()).copied() == Some(index))
+                .collect()
+        };
+        self.pending_fields = fields;
+        self.pending_field_is_last_occurrence = field_is_last_occurrence;
+        self.pending_rows = rows.into();
 
         // 2) Transition to STREAMING; PULL/DISCARD drain or drop the buffer.
         self.state = if inside_tx {
@@ -1040,8 +1465,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         } else {
             State::Streaming
         };
-        self.pending_statement_type = Some(outcome.statement_type);
-        self.pending_counters = outcome.counters;
+        self.pending_statement_type = Some(statement_type);
+        self.pending_counters = counters;
         Ok(())
     }
 
@@ -1050,8 +1475,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         // (e.g. a lost manifest CAS) is the abort surface; surface it as a
         // FAILURE and the client retries.
         if let Err(e) = self.backend.commit_tx().await {
-            self.state = State::Failed;
-            return self.write_failure(e.code(), e.message().to_string()).await;
+            return self.fail_request(e.code(), e.message().to_string()).await;
         }
         let mut meta = BTreeMap::new();
         if let Some(bm) = self.backend.current_bookmark().await {
@@ -1126,12 +1550,107 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn invalid_state(&mut self, why: &str) -> Result<()> {
-        self.state = State::Failed;
-        self.write_failure(
+        let prior_state = self.state;
+        self.fail_request(
             "Neo.ClientError.Request.Invalid",
-            format!("invalid request in state {:?}: {}", self.state, why),
+            format!("invalid request in state {prior_state:?}: {why}"),
         )
         .await
+    }
+
+    /// Enter FAILED without ever leaving an explicit transaction's writer
+    /// pinned behind disabled idle/lifetime checks.
+    async fn fail_request(&mut self, code: &str, message: String) -> Result<()> {
+        let was_in_tx = matches!(self.state, State::TxReady | State::TxStreaming);
+
+        // Release potentially corpus-sized result memory before waiting on
+        // rollback or socket I/O.
+        drop(std::mem::take(&mut self.pending_rows));
+        drop(std::mem::take(&mut self.pending_fields));
+        drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
+        self.pending_statement_type = None;
+        self.pending_counters.clear();
+
+        if was_in_tx {
+            let _ = self.backend.rollback_tx().await;
+        }
+        self.tx_started = None;
+        self.state = State::Failed;
+        self.write_failure(code, message).await
+    }
+
+    /// Send a client-visible diagnostic before closing an authenticated
+    /// connection whose current frame cannot be drained safely.
+    ///
+    /// The pre-auth path deliberately remains silent: it is both
+    /// unauthenticated and subject to the separate fixed 64 KiB defense.
+    async fn write_oversized_message_failure(
+        &mut self,
+        error: &BoltError,
+        drain_current_frame: bool,
+    ) {
+        if !self.authenticated {
+            return;
+        }
+        if drain_current_frame {
+            match tokio::time::timeout(
+                OVERSIZED_MESSAGE_DRAIN_TIMEOUT,
+                self.message_reader
+                    .discard_oversized_message(&mut self.socket),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(drain_error)) => {
+                    warn!(
+                        error = %drain_error,
+                        "could not drain oversized Bolt message before diagnostic"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_ms = OVERSIZED_MESSAGE_DRAIN_TIMEOUT.as_millis(),
+                        "timed out draining oversized Bolt message before diagnostic"
+                    );
+                    return;
+                }
+            }
+        }
+        let (code, message) = match error {
+            BoltError::MemoryBudgetExhausted { .. } => (
+                "Neo.TransientError.General.DatabaseUnavailable",
+                format!(
+                    "{error}; authenticated Bolt working-set capacity is temporarily busy; \
+                     retry with a smaller batch"
+                ),
+            ),
+            BoltError::TooLarge {
+                what: "Bolt in-flight message memory" | "Bolt framed message",
+                ..
+            } => (
+                "Neo.ClientError.Request.Invalid",
+                format!(
+                    "{error}; split the request into smaller batches or raise \
+                     NAMIDB_BOLT_MEMORY_BUDGET_BYTES with matching process/cgroup headroom"
+                ),
+            ),
+            _ => (
+                "Neo.ClientError.Request.Invalid",
+                format!(
+                    "{error}; authenticated Bolt messages are limited to {} bytes by \
+                     NAMIDB_BOLT_MAX_MESSAGE_BYTES; split the request into smaller batches or \
+                     raise the server limit",
+                    self.post_auth_message_bytes
+                ),
+            ),
+        };
+        if let Err(write_error) = self.write_failure(code, message).await {
+            warn!(
+                error = %write_error,
+                "failed to send Bolt oversized-message diagnostic"
+            );
+        }
     }
 
     async fn write_failure(&mut self, code: &str, message: impl Into<String>) -> Result<()> {
@@ -1160,9 +1679,10 @@ mod tests {
     use super::*;
     use crate::codec::encode;
     use crate::handshake::MAGIC;
+    use crate::message::POST_AUTH_MESSAGE_BYTES;
     use bytes::BytesMut;
     use namidb_query::exec::NodeValue;
-    use namidb_query::Row;
+    use namidb_query::{Row, RuntimeValue};
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use std::task::{Context, Poll};
@@ -1256,6 +1776,884 @@ mod tests {
             auth,
             backend,
         )
+    }
+
+    #[test]
+    fn configured_post_auth_limit_never_relaxes_strict_pre_auth_cap() {
+        let (_client, server) = duplex(1024);
+        let mut session = fixture_session(server, RunOutcome::default(), AuthPolicy::Open)
+            .with_post_auth_message_bytes(128 * 1024 * 1024);
+
+        session.state = State::Connected;
+        assert_eq!(session.current_message_limit(), PRE_AUTH_MESSAGE_BYTES);
+        session.state = State::Authentication;
+        assert_eq!(session.current_message_limit(), PRE_AUTH_MESSAGE_BYTES);
+        session.state = State::Failed;
+        assert_eq!(
+            session.current_message_limit(),
+            PRE_AUTH_MESSAGE_BYTES,
+            "FAILED before LOGON must not bypass the pre-authentication cap"
+        );
+
+        session.state = State::Ready;
+        session.authenticated = true;
+        assert_eq!(session.current_message_limit(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn session_defaults_to_production_post_auth_limit_and_defends_zero() {
+        let (_client, server) = duplex(1024);
+        let session = fixture_session(server, RunOutcome::default(), AuthPolicy::Open);
+        assert_eq!(
+            session.post_auth_message_bytes,
+            DEFAULT_POST_AUTH_MESSAGE_BYTES
+        );
+
+        let (_client, server) = duplex(1024);
+        let session = fixture_session(server, RunOutcome::default(), AuthPolicy::Open)
+            .with_post_auth_message_bytes(0);
+        assert_eq!(session.post_auth_message_bytes, 1);
+    }
+
+    #[test]
+    fn only_small_pressure_relief_controls_bypass_decode_admission() {
+        for tag in [
+            crate::value::struct_tag::PULL,
+            crate::value::struct_tag::DISCARD,
+            crate::value::struct_tag::COMMIT,
+            crate::value::struct_tag::ROLLBACK,
+            crate::value::struct_tag::RESET,
+            crate::value::struct_tag::GOODBYE,
+            crate::value::struct_tag::LOGOFF,
+        ] {
+            let small = [0xB0, tag];
+            assert!(
+                !requires_decode_admission(&small),
+                "small pressure-relief tag 0x{tag:02X} must remain available"
+            );
+
+            let mut large = vec![0; CONTROL_FRAME_MAX_BYTES + 1];
+            large[0] = 0xB0;
+            large[1] = tag;
+            assert!(
+                requires_decode_admission(&large),
+                "an oversized control-shaped frame can amplify decode memory"
+            );
+        }
+
+        for tag in [
+            crate::value::struct_tag::RUN,
+            crate::value::struct_tag::BEGIN,
+            crate::value::struct_tag::ROUTE,
+            crate::value::struct_tag::TELEMETRY,
+            0xEE,
+        ] {
+            assert!(
+                requires_decode_admission(&[0xB0, tag]),
+                "data/unknown tag 0x{tag:02X} must consult decode admission"
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_limit_is_aggregate_and_stops_at_message_count_cap() {
+        let (_client, server) = duplex(1024);
+        let mut session = fixture_session(server, RunOutcome::default(), AuthPolicy::Open)
+            .with_post_auth_message_bytes(1024);
+
+        assert_eq!(session.prefetch_read_limit(), 1024);
+        session
+            .prefetched_messages
+            .push_back(BudgetedMessage::unbudgeted(vec![0; 900]));
+        session.prefetched_bytes = 900;
+        assert_eq!(session.prefetch_read_limit(), 124);
+
+        for _ in session.prefetched_messages.len()..MAX_PREFETCHED_MESSAGES {
+            session
+                .prefetched_messages
+                .push_back(BudgetedMessage::unbudgeted(Vec::new()));
+        }
+        assert_eq!(session.prefetch_read_limit(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_remaining_budget_also_bounds_an_in_progress_frame() {
+        let (mut client, mut server) = duplex(64);
+        // Simulate 900 queued bytes plus 100 bytes already retained for the
+        // next frame. A further 30-byte chunk would cross the 1,024-byte
+        // aggregate even though that chunk alone is tiny.
+        client.write_all(&30_u16.to_be_bytes()).await.unwrap();
+
+        let mut reader = StatefulMessageReader {
+            message: vec![0; 100],
+            ..StatefulMessageReader::default()
+        };
+        let error = reader
+            .read_message(&mut server, 124, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BoltError::TooLarge {
+                what: "Bolt message",
+                len: 130,
+                max: 124,
+            }
+        ));
+        assert_eq!(reader.oversized_chunk_remaining, 30);
+    }
+
+    #[tokio::test]
+    async fn oversized_reader_can_drain_to_the_next_frame_without_buffering_it() {
+        let (mut client, mut server) = duplex(8 * 1024);
+        let sender = tokio::spawn(async move {
+            // Force several complete writer chunks into the retained message
+            // Vec before the next chunk crosses the limit.
+            let oversized = vec![0xAB; 130 * 1024];
+            write_message(&mut client, &oversized).await.unwrap();
+            write_message(&mut client, b"next").await.unwrap();
+        });
+
+        let mut reader = StatefulMessageReader::default();
+        let max = 70 * 1024;
+        let error = reader
+            .read_message(&mut server, max, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BoltError::TooLarge {
+                what: "Bolt message",
+                max: 71_680,
+                ..
+            }
+        ));
+        assert!(reader.message.capacity() >= 64 * 1024);
+        assert!(reader.chunk.capacity() >= crate::chunk::DEFAULT_CHUNK_SIZE);
+        reader.discard_oversized_message(&mut server).await.unwrap();
+        assert_eq!(reader.message.capacity(), 0);
+        assert_eq!(reader.chunk.capacity(), 0);
+        assert_eq!(
+            reader
+                .read_message(&mut server, max, None, None)
+                .await
+                .unwrap()
+                .body,
+            b"next"
+        );
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_frame_upgrade_contention_does_not_drain_the_next_frame() {
+        let mut data = vec![0; 300];
+        data[0] = 0xB0;
+        data[1] = crate::value::struct_tag::RUN;
+        let budget = Arc::new(
+            MessageMemoryBudget::try_new(MessageMemoryBudget::estimated_bytes_for_wire(data.len()))
+                .unwrap(),
+        );
+
+        let (mut first_client, mut first_server) = duplex(1024);
+        write_msg(&mut first_client, &data).await;
+        let mut first_reader = StatefulMessageReader::default();
+        let first = first_reader
+            .read_message(
+                &mut first_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (mut client, mut server) = duplex(1024);
+        write_msg(&mut client, &data).await;
+        write_msg(&mut client, b"next").await;
+
+        let mut reader = StatefulMessageReader::default();
+        let error = reader
+            .read_message(&mut server, POST_AUTH_MESSAGE_BYTES, Some(&budget), None)
+            .await
+            .expect_err("the completed frame upgrade must see temporary contention");
+        assert!(matches!(error, BoltError::MemoryBudgetExhausted { .. }));
+        assert!(
+            reader.message_complete,
+            "the frame terminator was consumed before budget rejection"
+        );
+
+        // Match the production error path: release retained allocations, then
+        // drain only if framing says bytes remain on the transport.
+        reader.release_buffered_allocations();
+        reader.discard_oversized_message(&mut server).await.unwrap();
+        assert_eq!(
+            reader
+                .read_message(&mut server, POST_AUTH_MESSAGE_BYTES, None, None)
+                .await
+                .unwrap()
+                .body,
+            b"next"
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn shared_message_budget_fails_fast_but_control_frames_bypass_pressure() {
+        let data = pack_request(&Value::Struct {
+            tag: crate::value::struct_tag::RUN,
+            fields: vec![
+                Value::String("RETURN $payload".into()),
+                Value::Map(BTreeMap::from([(
+                    "payload".into(),
+                    Value::String("x".repeat(512)),
+                )])),
+                Value::Map(BTreeMap::new()),
+            ],
+        });
+        assert!(data.len() < CONTROL_FRAME_MAX_BYTES);
+        let budget = Arc::new(
+            MessageMemoryBudget::try_new(MessageMemoryBudget::estimated_bytes_for_wire(data.len()))
+                .unwrap(),
+        );
+
+        let (mut first_client, mut first_server) = duplex(16 * 1024);
+        write_msg(&mut first_client, &data).await;
+        let mut first_reader = StatefulMessageReader::default();
+        let first = first_reader
+            .read_message(
+                &mut first_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.body, data);
+        assert!(
+            budget.available_bytes() < 4 * 1024,
+            "the first complete RUN must retain its exact shared lease"
+        );
+
+        let (mut second_client, mut second_server) = duplex(16 * 1024);
+        write_msg(&mut second_client, &data).await;
+        let mut second_reader = StatefulMessageReader::default();
+        let second_error = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            second_reader.read_message(
+                &mut second_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            ),
+        )
+        .await
+        .expect("budget contention must fail fast, never wait holding partial permits")
+        .expect_err("a second RUN unexpectedly exceeded the shared budget");
+        assert!(
+            matches!(second_error, BoltError::MemoryBudgetExhausted { .. }),
+            "unexpected contention error: {second_error:?}"
+        );
+
+        for tag in [
+            crate::value::struct_tag::PULL,
+            crate::value::struct_tag::DISCARD,
+            crate::value::struct_tag::COMMIT,
+            crate::value::struct_tag::ROLLBACK,
+            crate::value::struct_tag::RESET,
+            crate::value::struct_tag::GOODBYE,
+            crate::value::struct_tag::LOGOFF,
+        ] {
+            let control = pack_request(&Value::Struct {
+                tag,
+                fields: Vec::new(),
+            });
+            let (mut control_client, mut control_server) = duplex(1024);
+            write_msg(&mut control_client, &control).await;
+            let mut control_reader = StatefulMessageReader::default();
+            let admitted = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                control_reader.read_message(
+                    &mut control_server,
+                    POST_AUTH_MESSAGE_BYTES,
+                    Some(&budget),
+                    None,
+                ),
+            )
+            .await
+            .expect("pressure-relief control frame blocked behind data budget")
+            .unwrap();
+            assert_eq!(admitted.body, control);
+            assert!(
+                admitted._lease.is_none(),
+                "small control frame unexpectedly consumed the data budget"
+            );
+        }
+
+        drop(first);
+        let (mut third_client, mut third_server) = duplex(16 * 1024);
+        write_msg(&mut third_client, &data).await;
+        let mut third_reader = StatefulMessageReader::default();
+        let admitted = third_reader
+            .read_message(
+                &mut third_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            )
+            .await
+            .expect("a new RUN must be admitted after the first lease drops");
+        assert_eq!(admitted.body, data);
+    }
+
+    #[tokio::test]
+    async fn temporary_message_budget_pressure_returns_retryable_failure() {
+        let data = pack_request(&Value::Struct {
+            tag: crate::value::struct_tag::RUN,
+            fields: vec![
+                Value::String("RETURN $payload".into()),
+                Value::Map(BTreeMap::from([(
+                    "payload".into(),
+                    Value::String("x".repeat(512)),
+                )])),
+                Value::Map(BTreeMap::new()),
+            ],
+        });
+        let budget = Arc::new(
+            MessageMemoryBudget::try_new(MessageMemoryBudget::estimated_bytes_for_wire(data.len()))
+                .unwrap(),
+        );
+
+        let (mut holder_client, mut holder_server) = duplex(4096);
+        write_msg(&mut holder_client, &data).await;
+        let mut holder_reader = StatefulMessageReader::default();
+        let held = holder_reader
+            .read_message(
+                &mut holder_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (mut client, server) = duplex(64 * 1024);
+        let session = fixture_session(server, RunOutcome::default(), AuthPolicy::Open)
+            .with_message_memory_budget(Arc::clone(&budget));
+        let task = tokio::spawn(async move { session.run().await });
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(&mut client, &data).await;
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Failure(meta) => assert_eq!(
+                meta.get("code"),
+                Some(&Value::String(
+                    "Neo.TransientError.General.DatabaseUnavailable".into()
+                ))
+            ),
+            other => panic!("expected retryable memory FAILURE, got {other:?}"),
+        }
+        let error = task
+            .await
+            .expect("session task panicked")
+            .expect_err("memory contention must close the rejected connection");
+        assert!(matches!(error, BoltError::MemoryBudgetExhausted { .. }));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn partial_data_frame_does_not_block_other_data_and_releases_budget_at_deadline() {
+        let wire_bytes = CONTROL_FRAME_MAX_BYTES + 1024;
+        let budget = Arc::new(
+            MessageMemoryBudget::try_new(MessageMemoryBudget::estimated_bytes_for_wire(
+                wire_bytes * 2,
+            ))
+            .unwrap(),
+        );
+        let available_before = budget.available_bytes();
+        let (mut slow_client, slow_server) = duplex(16 * 1024);
+        slow_client
+            .write_all(&(wire_bytes as u16).to_be_bytes())
+            .await
+            .unwrap();
+        let slow_budget = Arc::clone(&budget);
+        let slow = tokio::spawn(async move {
+            let mut server = slow_server;
+            let mut reader = StatefulMessageReader::default();
+            reader
+                .read_message(
+                    &mut server,
+                    POST_AUTH_MESSAGE_BYTES,
+                    Some(&slow_budget),
+                    Some(std::time::Duration::from_millis(50)),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(40), async {
+            while budget.available_bytes() == available_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial data frame never acquired the shared budget");
+        let raw_charge = available_before - budget.available_bytes();
+        let expected_raw_charge =
+            (crate::MESSAGE_MEMORY_BASE_BYTES + 2 * wire_bytes).div_ceil(4096) * 4096;
+        assert_eq!(
+            raw_charge, expected_raw_charge,
+            "an incomplete frame must retain raw Vec headroom, not 16x decode amplification"
+        );
+
+        let other_data = pack_request(&Value::Struct {
+            tag: crate::value::struct_tag::RUN,
+            fields: vec![
+                Value::String("RETURN $v".into()),
+                Value::Map(BTreeMap::from([(
+                    "v".into(),
+                    Value::String("x".repeat(256)),
+                )])),
+                Value::Map(BTreeMap::new()),
+            ],
+        });
+        let (mut other_client, mut other_server) = duplex(4096);
+        write_msg(&mut other_client, &other_data).await;
+        let mut other_reader = StatefulMessageReader::default();
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(40),
+            other_reader.read_message(
+                &mut other_server,
+                POST_AUTH_MESSAGE_BYTES,
+                Some(&budget),
+                None,
+            ),
+        )
+        .await
+        .expect("a slow partial frame globally blocked unrelated data")
+        .expect("unrelated small RUN should fit beside the partial raw charge");
+        assert_eq!(other.body, other_data);
+        drop(other);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), slow)
+            .await
+            .expect("partial-frame deadline did not fire")
+            .expect("slow reader task panicked")
+            .expect_err("slow partial frame unexpectedly completed");
+        assert!(
+            matches!(error, BoltError::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut),
+            "unexpected partial-frame error: {error:?}"
+        );
+        assert_eq!(
+            budget.available_bytes(),
+            available_before,
+            "dropping the timed-out reader must release its byte permits"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_can_reject_run_before_decode_and_reset_still_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RejectDecodeBackend {
+            admitted_wire_bytes: AtomicUsize,
+            runs: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Backend for RejectDecodeBackend {
+            async fn admit_request_decode(
+                &self,
+                wire_bytes: usize,
+            ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError>
+            {
+                self.admitted_wire_bytes.store(wire_bytes, Ordering::SeqCst);
+                Err(BackendError::Storage(
+                    "decode admission rejected projected memory".into(),
+                ))
+            }
+
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                Ok(RunOutcome::default())
+            }
+        }
+
+        let backend = Arc::new(RejectDecodeBackend {
+            admitted_wire_bytes: AtomicUsize::new(0),
+            runs: AtomicUsize::new(0),
+        });
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-pre-decode-admission".into(),
+            },
+            AuthPolicy::Open,
+            backend.clone(),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        // Struct(3), RUN tag, then a value marker lacking its payload. Decode
+        // would fail immediately, so receiving the backend message proves the
+        // hook ran before PackStream allocation/parameter conversion.
+        let malformed_run = [0xB3, crate::value::struct_tag::RUN, 0xD0];
+        write_msg(&mut client, &malformed_run).await;
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Failure(meta) => {
+                let message = meta.get("message").and_then(|value| match value {
+                    Value::String(message) => Some(message.as_str()),
+                    _ => None,
+                });
+                assert_eq!(message, Some("decode admission rejected projected memory"));
+            }
+            other => panic!("expected pre-decode FAILURE, got {other:?}"),
+        }
+        assert_eq!(
+            backend.admitted_wire_bytes.load(Ordering::SeqCst),
+            malformed_run.len()
+        );
+        assert_eq!(backend.runs.load(Ordering::SeqCst), 0);
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RESET,
+                fields: vec![],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        task.await
+            .expect("session task panicked")
+            .expect("session failed after RESET recovery");
+    }
+
+    #[tokio::test]
+    async fn decode_admission_guard_lives_through_backend_and_drops_after_handle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ProbeGuard {
+            alive: Arc<AtomicBool>,
+        }
+
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                self.alive.store(false, Ordering::Release);
+            }
+        }
+
+        struct GuardBackend {
+            guard_alive: Arc<AtomicBool>,
+            observed_in_run: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Backend for GuardBackend {
+            async fn admit_request_decode(
+                &self,
+                _wire_bytes: usize,
+            ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError>
+            {
+                self.guard_alive.store(true, Ordering::Release);
+                Ok(Some(Box::new(ProbeGuard {
+                    alive: Arc::clone(&self.guard_alive),
+                })))
+            }
+
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                assert!(
+                    self.guard_alive.load(Ordering::Acquire),
+                    "pre-decode reservation dropped before backend execution"
+                );
+                self.observed_in_run.store(true, Ordering::Release);
+                Ok(RunOutcome::default())
+            }
+        }
+
+        let guard_alive = Arc::new(AtomicBool::new(false));
+        let observed_in_run = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(GuardBackend {
+            guard_alive: Arc::clone(&guard_alive),
+            observed_in_run: Arc::clone(&observed_in_run),
+        });
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-decode-guard".into(),
+            },
+            AuthPolicy::Open,
+            backend,
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::RUN,
+                fields: vec![
+                    Value::String("RETURN 1".into()),
+                    Value::Map(BTreeMap::new()),
+                    Value::Map(BTreeMap::new()),
+                ],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert!(observed_in_run.load(Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while guard_alive.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("decode reservation guard leaked after handle");
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::PULL,
+                fields: vec![Value::Map(BTreeMap::from([("n".into(), Value::Int(-1))]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::GOODBYE,
+                fields: vec![],
+            }),
+        )
+        .await;
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn decode_admission_rejection_in_tx_rolls_back_before_failed() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct AdmissionTxBackend {
+            decode_admissions: AtomicUsize,
+            tx_open: AtomicBool,
+            rollbacks: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Backend for AdmissionTxBackend {
+            async fn admit_request_decode(
+                &self,
+                _wire_bytes: usize,
+            ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError>
+            {
+                let prior = self.decode_admissions.fetch_add(1, Ordering::SeqCst);
+                if prior == 0 {
+                    Ok(None) // BEGIN
+                } else {
+                    Err(BackendError::Storage(
+                        "projected decode memory rejected in transaction".into(),
+                    ))
+                }
+            }
+
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                panic!("rejected RUN must not reach the backend")
+            }
+
+            async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
+                self.tx_open.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
+                if self.tx_open.swap(false, Ordering::SeqCst) {
+                    self.rollbacks.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(AdmissionTxBackend {
+            decode_admissions: AtomicUsize::new(0),
+            tx_open: AtomicBool::new(false),
+            rollbacks: AtomicUsize::new(0),
+        });
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-tx-decode-admission".into(),
+            },
+            AuthPolicy::Open,
+            backend.clone(),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::BEGIN,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert!(backend.tx_open.load(Ordering::SeqCst));
+
+        let malformed_run = [0xB3, crate::value::struct_tag::RUN, 0xD0];
+        write_msg(&mut client, &malformed_run).await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Failure(_)
+        ));
+        assert!(
+            !backend.tx_open.load(Ordering::SeqCst),
+            "the writer-pinning transaction must be closed before FAILURE"
+        );
+        assert_eq!(
+            backend.rollbacks.load(Ordering::SeqCst),
+            1,
+            "decode admission must roll back the transaction immediately"
+        );
+
+        drop(client);
+        task.await
+            .expect("session task panicked")
+            .expect("session failed after rolling back rejected transaction");
     }
 
     /// LOGOFF must invoke `Backend::logoff()` so an embedder can drop the
@@ -1686,6 +3084,256 @@ mod tests {
             ),
             other => panic!("unexpected response tag 0x{:02X}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn run_moves_runtime_vectors_and_pull_converts_one_page_at_a_time() {
+        let first = vec![0.25_f32, 0.5];
+        let second = vec![0.75_f32, 1.0];
+        let first_allocation = first.as_ptr() as usize;
+        let second_allocation = second.as_ptr() as usize;
+        let rows = vec![
+            Row::new()
+                .with("embedding", RuntimeValue::Vector(first))
+                .with("ordinal", RuntimeValue::Integer(1)),
+            Row::new()
+                .with("embedding", RuntimeValue::Vector(second))
+                .with("ordinal", RuntimeValue::Integer(2)),
+        ];
+        let outcome = RunOutcome {
+            fields: vec!["embedding".into(), "ordinal".into(), "missing".into()],
+            rows,
+            ..Default::default()
+        };
+        let (mut client, server) = duplex(64 * 1024);
+        let mut session = fixture_session(server, outcome, AuthPolicy::Open);
+        session.state = State::Ready;
+        session.authenticated = true;
+
+        session
+            .execute_run(
+                "MATCH (n) RETURN n.embedding, n.ordinal",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+            )
+            .await
+            .unwrap();
+
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => assert_eq!(
+                meta.get("fields"),
+                Some(&Value::List(vec![
+                    Value::String("embedding".into()),
+                    Value::String("ordinal".into()),
+                    Value::String("missing".into()),
+                ]))
+            ),
+            other => panic!("expected RUN field SUCCESS, got {other:?}"),
+        }
+        assert_eq!(session.pending_rows.len(), 2);
+        assert_eq!(session.pending_fields.len(), 3);
+        match session.pending_rows[0].get("embedding") {
+            Some(RuntimeValue::Vector(values)) => {
+                assert_eq!(values.as_ptr() as usize, first_allocation);
+            }
+            other => panic!("RUN expanded the first runtime vector: {other:?}"),
+        }
+        match session.pending_rows[1].get("embedding") {
+            Some(RuntimeValue::Vector(values)) => {
+                assert_eq!(values.as_ptr() as usize, second_allocation);
+            }
+            other => panic!("RUN expanded the second runtime vector: {other:?}"),
+        }
+
+        let pull_one = || Request::Pull {
+            extra: [("n".into(), Value::Int(1))].into_iter().collect(),
+        };
+        session
+            .handle_in_streaming(pull_one(), ElementIdMode::Include)
+            .await
+            .unwrap();
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Record(values) => assert_eq!(
+                values,
+                vec![
+                    Value::List(vec![Value::Float(0.25), Value::Float(0.5)]),
+                    Value::Int(1),
+                    Value::Null,
+                ]
+            ),
+            other => panic!("expected first lazy RECORD, got {other:?}"),
+        }
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Success(meta) => {
+                assert_eq!(meta.get("has_more"), Some(&Value::Bool(true)))
+            }
+            other => panic!("expected paged SUCCESS, got {other:?}"),
+        }
+        assert_eq!(session.pending_rows.len(), 1);
+        match session.pending_rows[0].get("embedding") {
+            Some(RuntimeValue::Vector(values)) => {
+                assert_eq!(values.as_ptr() as usize, second_allocation);
+            }
+            other => panic!("PULL eagerly expanded the next page: {other:?}"),
+        }
+
+        session
+            .handle_in_streaming(pull_one(), ElementIdMode::Include)
+            .await
+            .unwrap();
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Record(values) => assert_eq!(
+                values,
+                vec![
+                    Value::List(vec![Value::Float(0.75), Value::Float(1.0)]),
+                    Value::Int(2),
+                    Value::Null,
+                ]
+            ),
+            other => panic!("expected second lazy RECORD, got {other:?}"),
+        }
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert_eq!(session.state, State::Ready);
+        assert!(session.pending_rows.is_empty());
+        assert!(session.pending_fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_repeats_duplicate_projection_columns_before_consuming_binding() {
+        let outcome = RunOutcome {
+            fields: vec!["x".into(), "x".into()],
+            rows: vec![Row::new().with("x", RuntimeValue::Vector(vec![0.25, 0.5]))],
+            ..Default::default()
+        };
+        let (mut client, server) = duplex(64 * 1024);
+        let mut session = fixture_session(server, outcome, AuthPolicy::Open);
+        session.state = State::Ready;
+        session.authenticated = true;
+
+        session
+            .execute_run(
+                "RETURN x, x",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+            )
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(session.pending_field_is_last_occurrence, vec![false, true]);
+
+        session
+            .handle_in_streaming(
+                Request::Pull {
+                    extra: [("n".into(), Value::Int(-1))].into_iter().collect(),
+                },
+                ElementIdMode::Include,
+            )
+            .await
+            .unwrap();
+        let expected = Value::List(vec![Value::Float(0.25), Value::Float(0.5)]);
+        match decode_response(&read_msg(&mut client).await) {
+            Response::Record(values) => {
+                assert_eq!(values, vec![expected.clone(), expected]);
+            }
+            other => panic!("expected duplicate-column RECORD, got {other:?}"),
+        }
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert!(session.pending_field_is_last_occurrence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_releases_pending_runtime_rows_and_stream_metadata() {
+        let outcome = RunOutcome {
+            fields: vec!["embedding".into()],
+            rows: vec![Row::new().with("embedding", RuntimeValue::Vector(vec![1.0; 1024]))],
+            statement_type: StatementType::Write,
+            counters: [("properties-set".into(), 1)].into_iter().collect(),
+        };
+        let (mut client, server) = duplex(64 * 1024);
+        let mut session = fixture_session(server, outcome, AuthPolicy::Open);
+        session.state = State::Ready;
+        session.authenticated = true;
+
+        session
+            .execute_run(
+                "RETURN $embedding",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+            )
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(session.state, State::Streaming);
+        assert_eq!(session.pending_rows.len(), 1);
+
+        session
+            .handle(Request::Reset, ElementIdMode::Include)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert_eq!(session.state, State::Ready);
+        assert!(session.pending_rows.is_empty());
+        assert!(session.pending_fields.is_empty());
+        assert!(session.pending_field_is_last_occurrence.is_empty());
+        assert!(session.pending_statement_type.is_none());
+        assert!(session.pending_counters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_tx_stream_message_rolls_back_and_releases_result_buffers() {
+        let outcome = RunOutcome {
+            fields: vec!["embedding".into()],
+            rows: vec![Row::new().with("embedding", RuntimeValue::Vector(vec![1.0; 16 * 1024]))],
+            statement_type: StatementType::Read,
+            counters: [("properties-set".into(), 1)].into_iter().collect(),
+        };
+        let (mut client, server) = duplex(64 * 1024);
+        let mut session = fixture_session(server, outcome, AuthPolicy::Open);
+        session.state = State::TxReady;
+        session.authenticated = true;
+
+        session
+            .execute_run(
+                "RETURN $embedding",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                true,
+            )
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(session.state, State::TxStreaming);
+        assert_eq!(session.pending_rows.len(), 1);
+
+        session
+            .handle(Request::Commit, ElementIdMode::Include)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Failure(_)
+        ));
+        assert_eq!(session.state, State::Failed);
+        assert!(session.pending_rows.is_empty());
+        assert_eq!(session.pending_rows.capacity(), 0);
+        assert!(session.pending_fields.is_empty());
+        assert_eq!(session.pending_fields.capacity(), 0);
+        assert!(session.pending_field_is_last_occurrence.is_empty());
+        assert_eq!(session.pending_field_is_last_occurrence.capacity(), 0);
+        assert!(session.pending_statement_type.is_none());
+        assert!(session.pending_counters.is_empty());
     }
 
     #[tokio::test]

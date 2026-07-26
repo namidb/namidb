@@ -54,12 +54,14 @@ use arrow_array::builder::{
     StringBuilder, TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
@@ -86,6 +88,14 @@ use crate::sst::nodes::{
     max_scalar, min_scalar, node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions,
 };
 use crate::sst::stats::StatScalar;
+
+/// Process-wide bound for CPU/local-disk flush builds.
+///
+/// `spawn_blocking` tasks cannot be stopped after they begin. The permit is
+/// therefore moved into the blocking closure, not held by the async waiter:
+/// cancelling a request detaches at most one build, and a retry cannot start a
+/// second corpus-sized encoder/spool until the first task has actually exited.
+static FLUSH_BUILD_GATE: Semaphore = Semaphore::const_new(1);
 
 // ── Wire-level records ─────────────────────────────────────────────────
 
@@ -116,6 +126,97 @@ impl NodeWriteRecord {
         let v = serde_json::from_slice(bytes)?;
         Ok(v)
     }
+}
+
+// ── Exact-node sidecar records ────────────────────────────────────────
+
+// A `.nloc2` object carries the ordinary NodeId -> row-ordinal tree first
+// (for 2.0.4/2.0.5 readers) and an exact NodeId -> record tree after it. The
+// latter deliberately stores the existing JSON wire payload: it is already
+// the WAL/memtable compatibility format, so the accelerator cannot acquire a
+// second property codec that drifts from recovery. Large JSON payloads (most
+// notably float vectors) are compressed independently so one point read can
+// fetch/decompress one node without inflating the sidecar to JSON size.
+const NODE_RECORD_TOMBSTONE: u8 = 0;
+const NODE_RECORD_RAW: u8 = 1;
+const NODE_RECORD_ZSTD: u8 = 2;
+const NODE_RECORD_HEADER_BYTES: usize = 1 + 8 + 4;
+
+pub(crate) fn encode_exact_node_record(row: &NodeRow) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    match &row.op {
+        MemOp::Tombstone => {
+            out.reserve_exact(NODE_RECORD_HEADER_BYTES);
+            out.push(NODE_RECORD_TOMBSTONE);
+            out.extend_from_slice(&row.lsn.to_le_bytes());
+            out.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        MemOp::Upsert(payload) => {
+            let raw_len = u32::try_from(payload.len())
+                .map_err(|_| Error::invariant("exact node record exceeds 4 GiB"))?;
+            let compressed = zstd::bulk::compress(payload, 1)
+                .map_err(|e| Error::invariant(format!("exact node record zstd encode: {e}")))?;
+            let (tag, body) = if compressed.len() < payload.len() {
+                (NODE_RECORD_ZSTD, compressed.as_slice())
+            } else {
+                (NODE_RECORD_RAW, payload.as_ref())
+            };
+            out.reserve_exact(NODE_RECORD_HEADER_BYTES.saturating_add(body.len()));
+            out.push(tag);
+            out.extend_from_slice(&row.lsn.to_le_bytes());
+            out.extend_from_slice(&raw_len.to_le_bytes());
+            out.extend_from_slice(body);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_exact_node_record(bytes: &[u8]) -> Result<(u64, MemOp)> {
+    if bytes.len() < NODE_RECORD_HEADER_BYTES {
+        return Err(Error::invariant("truncated exact node record"));
+    }
+    let tag = bytes[0];
+    let lsn = u64::from_le_bytes(
+        bytes[1..9]
+            .try_into()
+            .map_err(|_| Error::invariant("invalid exact node record LSN"))?,
+    );
+    let raw_len = u32::from_le_bytes(
+        bytes[9..13]
+            .try_into()
+            .map_err(|_| Error::invariant("invalid exact node record length"))?,
+    ) as usize;
+    let body = &bytes[NODE_RECORD_HEADER_BYTES..];
+    let op = match tag {
+        NODE_RECORD_TOMBSTONE if raw_len == 0 && body.is_empty() => MemOp::Tombstone,
+        NODE_RECORD_TOMBSTONE => {
+            return Err(Error::invariant(
+                "tombstone exact node record carries a payload",
+            ));
+        }
+        NODE_RECORD_RAW if body.len() == raw_len => MemOp::Upsert(Bytes::copy_from_slice(body)),
+        NODE_RECORD_RAW => {
+            return Err(Error::invariant(
+                "raw exact node record length does not match its header",
+            ));
+        }
+        NODE_RECORD_ZSTD => {
+            let decoded = zstd::bulk::decompress(body, raw_len)
+                .map_err(|e| Error::invariant(format!("exact node record zstd decode: {e}")))?;
+            if decoded.len() != raw_len {
+                return Err(Error::invariant(
+                    "decoded exact node record length does not match its header",
+                ));
+            }
+            MemOp::Upsert(Bytes::from(decoded))
+        }
+        _ => {
+            return Err(Error::invariant(format!(
+                "unknown exact node record encoding {tag}"
+            )));
+        }
+    };
+    Ok((lsn, op))
 }
 
 /// Decoded payload of a [`MemOp::Upsert`](crate::memtable::MemOp::Upsert) for
@@ -181,70 +282,22 @@ pub async fn flush(
 
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths();
-
-    // 1. CPU phase — build every SST + bloom body in RAM. Sequential
-    // because Arrow builders/encoders aren't cheap to spin up across
-    // threads here; this is the same work as before, just decoupled
-    // from the I/O.
-    let mut pendings: Vec<PendingSst> = Vec::new();
-    // Nodes: one identity-partitioned SST spanning every label, built with an
-    // empty LabelDef (fixed layout — no prop_* columns; every property rides in
-    // __overflow_json), plus a label->node-ids sidecar so `scan_label` resolves
-    // without per-label partitions.
-    if !node_rows.is_empty() {
-        // Columns: fixed layout, built from an empty LabelDef (no prop_*
-        // columns; every property rides in __overflow_json).
-        let column_label = LabelDef {
-            name: String::new(),
-            properties: Vec::new(),
-        };
-        // Equality-index sidecars are harvested from the record values keyed by
-        // the schema's `indexed` properties, so the secondary index (the
-        // non-unique equality index) survives the id-primary move.
-        let index_props = union_indexed_props(&schema);
-        let finish = build_node_sst(&column_label, &node_rows)?;
-        pendings.push(prepare_node_pending(
-            paths,
-            &index_props,
-            &node_rows,
-            finish,
-            &schema,
-            &base.manifest.label_dict,
-        )?);
-    }
-    for (edge_type, rows) in edge_buckets {
-        let edge_def = schema.edge_type(&edge_type).cloned();
-        let declared_property_names: Vec<String> = edge_def
-            .as_ref()
-            .map(|d| d.properties.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
-        let forward_rows = build_edge_stream_rows(&rows, &declared_property_names)?;
-        let inverse_rows = transpose_forward_to_inverse(&forward_rows);
-        let fwd = build_edge_sst(
-            &edge_type,
-            edge_def.as_ref(),
-            &forward_rows,
-            EdgeDirection::Forward,
-        )?;
-        let inv = build_edge_sst(
-            &edge_type,
-            edge_def.as_ref(),
-            &inverse_rows,
-            EdgeDirection::Inverse,
-        )?;
-        pendings.push(prepare_edge_pending(
-            paths,
-            &edge_type,
-            EdgeDirection::Forward,
-            fwd,
-        ));
-        pendings.push(prepare_edge_pending(
-            paths,
-            &edge_type,
-            EdgeDirection::Inverse,
-            inv,
-        ));
-    }
+    // 1. CPU/local-disk phase. Arrow/CSR encoding, Parquet compression and
+    // the node spool's `sync_data` are deliberately kept off Tokio workers.
+    // This also makes delayed-allocation errors surface before any object PUT.
+    let build_paths: NamespacePaths = paths.clone();
+    let build_schema = schema.clone();
+    let build_label_dict = base.manifest.label_dict.clone();
+    let pendings = run_flush_build(move || {
+        build_pending_ssts(
+            &build_paths,
+            node_rows,
+            edge_buckets,
+            &build_schema,
+            &build_label_dict,
+        )
+    })
+    .await?;
 
     // 2. I/O phase — issue body + bloom PUTs with bounded object-level
     // concurrency. The PUTs are independent (each targets a fresh UUIDv7
@@ -253,18 +306,25 @@ pub async fn flush(
     // instead of short-circuiting: dropping a multipart future on the first
     // sibling failure would bypass its explicit abort cleanup. Complete
     // orphan objects are harmless and reclaimed by the janitor.
-    let mut put_futures: Vec<_> = Vec::with_capacity(pendings.len() * 2);
-    for p in &pendings {
-        let body = p.body.clone();
-        let path = p.body_path.clone();
+    let mut put_futures: Vec<ObjectUploadFuture> = Vec::with_capacity(pendings.len() * 2);
+    let mut new_ssts = Vec::with_capacity(pendings.len());
+    let mut bloom_count = 0usize;
+    for p in pendings {
+        let PendingSst {
+            descriptor,
+            body_path,
+            body,
+            bloom_path,
+            bloom_body,
+            index_sidecars,
+        } = p;
+        let path = body_path;
         let store_ref = store.clone();
-        put_futures.push(
-            Box::pin(async move { put_object(store_ref, &path, body).await })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
-        );
-        if let (Some(bloom_path), Some(bloom_body)) = (&p.bloom_path, &p.bloom_body) {
-            let body = bloom_body.clone();
-            let path = bloom_path.clone();
+        put_futures.push(Box::pin(
+            async move { put_object(store_ref, &path, body).await },
+        ));
+        if let (Some(path), Some(body)) = (bloom_path, bloom_body) {
+            bloom_count += 1;
             let store_ref = store.clone();
             put_futures.push(Box::pin(
                 async move { put_object(store_ref, &path, body).await },
@@ -275,25 +335,16 @@ pub async fn flush(
         // structures land atomically from the writer's perspective; the
         // manifest CAS below makes the new descriptors visible only
         // when every sidecar has been durably persisted.
-        for (path, body) in &p.index_sidecars {
-            let body = body.clone();
-            let path = path.clone();
+        for (path, body) in index_sidecars {
             let store_ref = store.clone();
-            put_futures.push(Box::pin(
-                async move { put_object(store_ref, &path, body).await },
-            ));
+            put_futures.push(Box::pin(async move {
+                put_sidecar_payload(store_ref, &path, body).await
+            }));
         }
+        new_ssts.push(descriptor);
     }
-    let put_results: Vec<Result<()>> = futures::stream::iter(put_futures)
-        .buffer_unordered(OBJECT_UPLOAD_MAX_CONCURRENCY)
-        .collect()
-        .await;
-    if let Some(error) = put_results.into_iter().find_map(|result| result.err()) {
-        return Err(error);
-    }
+    await_all_object_uploads(put_futures).await?;
 
-    let bloom_count = pendings.iter().filter(|p| p.bloom_body.is_some()).count();
-    let new_ssts: Vec<SstDescriptor> = pendings.into_iter().map(|p| p.descriptor).collect();
     let ssts_written = new_ssts.len();
 
     let mut next = base.manifest.next_version(fence.writer_id);
@@ -310,6 +361,23 @@ pub async fn flush(
     })
 }
 
+async fn run_flush_build<T, F>(build: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let permit = FLUSH_BUILD_GATE
+        .acquire()
+        .await
+        .map_err(|_| Error::invariant("flush SST build gate closed"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_err(|error| Error::invariant(format!("flush SST build task failed: {error}")))?
+}
+
 /// Per-SST work product: descriptor + body bytes + their object-store paths,
 /// kept together so the parallel-PUT phase can issue them without re-touching
 /// the schema/Arrow builders. `index_sidecars` contains optional Node lookup
@@ -324,7 +392,30 @@ struct PendingSst {
     bloom_body: Option<Bytes>,
     /// `(path, body)` for each optional accelerator emitted alongside this
     /// SST. Every object lands before the manifest can expose its marker.
-    index_sidecars: Vec<(Path, Bytes)>,
+    index_sidecars: Vec<(Path, SidecarPayload)>,
+}
+
+/// Upload body for an immutable lookup accelerator.
+///
+/// Most sidecars are compact enough to remain scatter/gather memory payloads.
+/// Exact node records can be corpus-sized, so their value region is spooled
+/// while the B+tree is built and consumed incrementally during multipart PUT.
+#[derive(Debug)]
+pub(crate) enum SidecarPayload {
+    InMemory(PutPayload),
+    NodeLocator(crate::sst::paged_index::NodeLocatorRecordUpload),
+}
+
+impl From<Bytes> for SidecarPayload {
+    fn from(value: Bytes) -> Self {
+        Self::InMemory(value.into())
+    }
+}
+
+impl From<PutPayload> for SidecarPayload {
+    fn from(value: PutPayload) -> Self {
+        Self::InMemory(value)
+    }
 }
 
 // ── Bucketing ──────────────────────────────────────────────────────────
@@ -378,6 +469,81 @@ fn bucket_nodes_and_edges(
         }
     }
     (nodes, edges)
+}
+
+fn build_pending_ssts(
+    paths: &NamespacePaths,
+    node_rows: Vec<NodeRow>,
+    edge_buckets: BTreeMap<String, Vec<EdgeRow>>,
+    schema: &Schema,
+    label_dict: &LabelDictionary,
+) -> Result<Vec<PendingSst>> {
+    let mut pendings = Vec::new();
+
+    // Nodes: one identity-partitioned SST spanning every label, built with an
+    // empty LabelDef (fixed layout — no prop_* columns; every property rides in
+    // __overflow_json), plus a label->node-ids sidecar so `scan_label` resolves
+    // without per-label partitions.
+    if !node_rows.is_empty() {
+        let column_label = LabelDef {
+            name: String::new(),
+            properties: Vec::new(),
+        };
+        // Equality-index sidecars are harvested from the record values keyed by
+        // the schema's `indexed` properties, so the secondary index survives
+        // the id-primary move.
+        let index_props = union_indexed_props(schema);
+        let finish = build_node_sst(&column_label, &node_rows)?;
+        pendings.push(prepare_node_pending(
+            paths,
+            &index_props,
+            &node_rows,
+            finish,
+            schema,
+            label_dict,
+        )?);
+    }
+
+    for (edge_type, rows) in edge_buckets {
+        let edge_def = schema.edge_type(&edge_type).cloned();
+        let declared_property_names: Vec<String> = edge_def
+            .as_ref()
+            .map(|def| {
+                def.properties
+                    .iter()
+                    .map(|property| property.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let forward_rows = build_edge_stream_rows(&rows, &declared_property_names)?;
+        let inverse_rows = transpose_forward_to_inverse(&forward_rows);
+        let forward = build_edge_sst(
+            &edge_type,
+            edge_def.as_ref(),
+            &forward_rows,
+            EdgeDirection::Forward,
+        )?;
+        let inverse = build_edge_sst(
+            &edge_type,
+            edge_def.as_ref(),
+            &inverse_rows,
+            EdgeDirection::Inverse,
+        )?;
+        pendings.push(prepare_edge_pending(
+            paths,
+            &edge_type,
+            EdgeDirection::Forward,
+            forward,
+        ));
+        pendings.push(prepare_edge_pending(
+            paths,
+            &edge_type,
+            EdgeDirection::Inverse,
+            inverse,
+        ));
+    }
+
+    Ok(pendings)
 }
 
 /// Union of every `indexed` or `unique` property across all schema labels, as
@@ -720,21 +886,34 @@ fn prepare_node_pending(
     // Node SSTs are no longer partitioned by label and are built with an empty
     // LabelDef, so the declared-property sidecars harvest nothing; the calls
     // stay wired for symmetry and a future typed-column layout.
-    let (unique_property_indices, mut index_sidecars) =
+    let (unique_property_indices, index_sidecars) =
         prepare_unique_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
+    let mut index_sidecars: Vec<(Path, SidecarPayload)> = index_sidecars
+        .into_iter()
+        .map(|(path, body)| (path, body.into()))
+        .collect();
     let (equality_property_indices, equality_sidecars) =
         prepare_equality_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
-    index_sidecars.extend(equality_sidecars);
+    index_sidecars.extend(
+        equality_sidecars
+            .into_iter()
+            .map(|(path, body)| (path, body.into())),
+    );
 
     // The label index (`LabelId -> [NodeId, ...]`) replaces "the SST partition
     // IS the label index" now that one node SST spans every label.
     let (label_index, label_sidecar) =
         prepare_label_index_sidecar(paths, level.as_u32(), &id, rows)?;
-    if let Some(sidecar) = label_sidecar {
-        index_sidecars.push(sidecar);
+    if let Some((path, body)) = label_sidecar {
+        index_sidecars.push((path, body.into()));
+    }
+    let mut locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+    for row in rows {
+        let record = encode_exact_node_record(row)?;
+        locator_records.push(&row.id, &record)?;
     }
     let (node_locator, locator_sidecar) =
-        prepare_node_locator_sidecar(paths, level.as_u32(), &id, rows.iter().map(|row| row.id))?;
+        prepare_node_locator_sidecar(paths, level.as_u32(), &id, locator_records)?;
     index_sidecars.push(locator_sidecar);
 
     let stats = finish.stats;
@@ -784,29 +963,46 @@ pub(crate) fn prepare_node_locator_sidecar(
     paths: &NamespacePaths,
     level: u32,
     sst_id: &Uuid,
-    ids: impl IntoIterator<Item = [u8; 16]>,
-) -> Result<(crate::manifest::NodeLocatorDescriptor, (Path, Bytes))> {
-    let body = crate::sst::paged_index::build_node_locator(ids)?;
+    builder: crate::sst::paged_index::NodeLocatorRecordBuilder,
+) -> Result<(
+    crate::manifest::NodeLocatorDescriptor,
+    (Path, SidecarPayload),
+)> {
+    let upload = builder.finish_upload()?;
+    prepare_node_locator_upload_sidecar(paths, level, sst_id, upload)
+}
+
+/// Attach paths and manifest metadata to an already-finalised node locator.
+///
+/// Compaction finalises the corpus-sized exact-record spool inside its
+/// blocking merge task, before returning to Tokio or rebuilding search
+/// indexes. Flush uses [`prepare_node_locator_sidecar`] because its entire
+/// build phase already runs on the blocking pool.
+pub(crate) fn prepare_node_locator_upload_sidecar(
+    paths: &NamespacePaths,
+    level: u32,
+    sst_id: &Uuid,
+    upload: crate::sst::paged_index::NodeLocatorRecordUpload,
+) -> Result<(
+    crate::manifest::NodeLocatorDescriptor,
+    (Path, SidecarPayload),
+)> {
     let file_name = format!(
-        "{}-{}.nloc",
+        "{}-{}.nloc2",
         uuid_path_id(sst_id),
         SstKind::Nodes.path_tag()
     );
     let object_path = paths.sst_object(level, &file_name);
     let relative = relative_sst_path(level, &file_name);
-    let entry_count = {
-        // The paged header carries the count, but the manifest already knows
-        // the node SST row count. Read it from the fixed header to keep this
-        // helper independent from a second input traversal.
-        let raw: [u8; 8] = body[28..36].try_into().expect("paged header length");
-        u64::from_le_bytes(raw)
-    };
     let descriptor = crate::manifest::NodeLocatorDescriptor {
         path: relative,
-        size_bytes: body.len() as u64,
-        entry_count,
+        size_bytes: upload.size_bytes(),
+        entry_count: upload.entry_count(),
     };
-    Ok((descriptor, (object_path, body)))
+    Ok((
+        descriptor,
+        (object_path, SidecarPayload::NodeLocator(upload)),
+    ))
 }
 
 /// Build the per-SST label index sidecar: `LabelId -> [NodeId, ...]` posting
@@ -1418,7 +1614,7 @@ fn prepare_edge_pending(
     );
     let point_path = paths.sst_object(level.as_u32(), &point_file_name);
     let index_sidecars = point_index
-        .map(|point_body| vec![(point_path, point_body)])
+        .map(|point_body| vec![(point_path, point_body.into())])
         .unwrap_or_default();
 
     let (bloom_descriptor, bloom_path, bloom_body) = prepare_bloom_sidecar(
@@ -1490,10 +1686,10 @@ fn prepare_bloom_sidecar(
     (Some(descriptor), Some(object_path), Some(body))
 }
 
-async fn put_create(store: &dyn ObjectStore, path: &Path, body: Bytes) -> Result<()> {
+async fn put_create_payload(store: &dyn ObjectStore, path: &Path, body: PutPayload) -> Result<()> {
     let opts = PutOptions::from(PutMode::Create);
     store
-        .put_opts(path, PutPayload::from(body), opts)
+        .put_opts(path, body, opts)
         .await
         .map_err(Error::ObjectStore)?;
     Ok(())
@@ -1520,39 +1716,191 @@ const MULTIPART_MAX_CONCURRENCY: usize = 8;
 /// 32 in-flight part requests instead of multiplying by every label/sidecar.
 const OBJECT_UPLOAD_MAX_CONCURRENCY: usize = 4;
 
-/// Upload `body` to `path`. For small bodies, falls back to the single-PUT
+/// Type-erased immutable-object PUT used by flush and offline SST attach.
+pub(crate) type ObjectUploadFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+
+/// Await immutable-object PUTs with bounded concurrency, without
+/// short-circuiting on the first error.
+///
+/// Collecting every result is intentional: each active multipart future gets
+/// to finish its own error cleanup, while queued futures are still driven to a
+/// terminal result. The first error is returned only after the full set has
+/// drained.
+pub(crate) async fn await_all_object_uploads(uploads: Vec<ObjectUploadFuture>) -> Result<()> {
+    let results: Vec<Result<()>> = futures::stream::iter(uploads)
+        .buffer_unordered(OBJECT_UPLOAD_MAX_CONCURRENCY)
+        .collect()
+        .await;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+/// Owns an in-progress multipart upload until it is completed successfully.
+///
+/// Object-store multipart handles cannot perform asynchronous cleanup from
+/// their own `Drop`. This guard bridges that gap: dropping the enclosing
+/// upload future (including task cancellation/abort) detaches a cleanup task
+/// on the current Tokio runtime which calls `MultipartUpload::abort`. Explicit
+/// error paths call [`Self::abort_after_error`] synchronously; a failed abort
+/// leaves the guard armed so `Drop` makes one final cleanup attempt.
+///
+/// A process crash can still prevent cleanup, so deployments must retain the
+/// incomplete-multipart lifecycle rule documented at module level.
+struct MultipartUploadGuard {
+    upload: Option<Box<dyn object_store::MultipartUpload>>,
+    path: Path,
+}
+
+impl MultipartUploadGuard {
+    fn new(upload: Box<dyn object_store::MultipartUpload>, path: &Path) -> Self {
+        Self {
+            upload: Some(upload),
+            path: path.clone(),
+        }
+    }
+
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.upload
+            .as_mut()
+            .expect("multipart upload guard used after completion")
+            .put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        let result = self
+            .upload
+            .as_mut()
+            .expect("multipart upload guard used after completion")
+            .complete()
+            .await;
+        if result.is_ok() {
+            // A successful complete makes the object visible and disarms the
+            // cancellation cleanup.
+            self.upload = None;
+        }
+        result
+    }
+
+    async fn abort_after_error(&mut self, context: &'static str) {
+        let Some(upload) = self.upload.as_mut() else {
+            return;
+        };
+        match upload.abort().await {
+            Ok(()) => self.upload = None,
+            Err(error) => {
+                warn!(
+                    path = %self.path,
+                    error = %error,
+                    context,
+                    "failed to abort multipart upload"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for MultipartUploadGuard {
+    fn drop(&mut self) {
+        let Some(mut upload) = self.upload.take() else {
+            return;
+        };
+        let path = self.path.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                // Dropping the JoinHandle detaches, rather than cancels, the
+                // cleanup task. The upload handle stays owned by that task
+                // until abort reaches a terminal result.
+                let _cleanup = runtime.spawn(async move {
+                    if let Err(error) = upload.abort().await {
+                        warn!(
+                            path = %path,
+                            error = %error,
+                            "failed to abort multipart upload during cancellation cleanup"
+                        );
+                    }
+                });
+            }
+            Err(error) => {
+                // This is only reachable when an async upload future is
+                // manually polled outside Tokio or the runtime itself is
+                // already shutting down. The object-store lifecycle rule is
+                // the remaining crash-safety net in that situation.
+                warn!(
+                    path = %path,
+                    error = %error,
+                    "could not schedule multipart cancellation cleanup"
+                );
+            }
+        }
+    }
+}
+
+/// Split a scatter/gather object body into valid S3 multipart parts without
+/// coalescing its chunks. Every part except the last is exactly `part_size`;
+/// `Bytes::slice` keeps the underlying allocations shared.
+fn multipart_payloads(body: &PutPayload, part_size: usize) -> Vec<PutPayload> {
+    debug_assert!(part_size > 0);
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = 0usize;
+    for chunk in body {
+        let mut offset = 0usize;
+        while offset < chunk.len() {
+            let take = (part_size - current_len).min(chunk.len() - offset);
+            current.push(chunk.slice(offset..offset + take));
+            current_len += take;
+            offset += take;
+            if current_len == part_size {
+                parts.push(std::mem::take(&mut current).into_iter().collect());
+                current_len = 0;
+            }
+        }
+    }
+    if current_len > 0 {
+        parts.push(current.into_iter().collect());
+    }
+    parts
+}
+
+/// Upload a scatter/gather `body` to `path`. For small bodies, falls back to
+/// the single-PUT
 /// `PutMode::Create` path so the CAS-style "no overwrite" semantics still
 /// protect against a competing writer stomping on a UUIDv7 path. For
 /// bodies at or past [`MULTIPART_THRESHOLD`] (SST bodies in the LDBC SNB SF1
 /// range — 10–50 MiB), uploads fixed-size `MULTIPART_PART_SIZE` chunks with
 /// at most `MULTIPART_MAX_CONCURRENCY` requests in flight. Any part or
 /// completion error explicitly aborts the upload so S3/R2 do not retain
-/// orphan parts after a recoverable failure.
+/// orphan parts after a recoverable failure. Dropping/cancelling this future
+/// also schedules an abort through [`MultipartUploadGuard`].
 ///
 /// Why the split: S3 / R2 multipart uploads do NOT honour the `If-None-Match`
 /// header that backs `PutMode::Create`. SST paths embed a UUIDv7 per writer
 /// (see [`crate::flush`] §"PUT helpers") so collisions are impossible in
 /// practice; the small-PUT branch is kept for bloom side-cars and any
 /// future small body, where the CAS protection is cheap to keep.
-pub(crate) async fn put_object(
+pub(crate) async fn put_payload(
     store: std::sync::Arc<dyn ObjectStore>,
     path: &Path,
-    body: Bytes,
+    body: PutPayload,
 ) -> Result<()> {
-    if body.len() < MULTIPART_THRESHOLD {
-        return put_create(store.as_ref(), path, body).await;
+    let body_len = body.content_length();
+    if body_len < MULTIPART_THRESHOLD {
+        return put_create_payload(store.as_ref(), path, body).await;
     }
 
-    let mut upload = store
+    let upload = store
         .put_multipart(path)
         .await
         .map_err(Error::ObjectStore)?;
+    let mut upload = MultipartUploadGuard::new(upload, path);
     let mut pending = FuturesUnordered::new();
     let mut part_error = None;
 
-    for offset in (0..body.len()).step_by(MULTIPART_PART_SIZE) {
-        let end = (offset + MULTIPART_PART_SIZE).min(body.len());
-        pending.push(upload.put_part(PutPayload::from(body.slice(offset..end))));
+    for part in multipart_payloads(&body, MULTIPART_PART_SIZE) {
+        pending.push(upload.put_part(part));
         if pending.len() < MULTIPART_MAX_CONCURRENCY {
             continue;
         }
@@ -1570,27 +1918,201 @@ pub(crate) async fn put_object(
         }
     }
     if let Some(source) = part_error {
-        if let Err(abort_error) = upload.abort().await {
-            warn!(
-                path = %path,
-                error = %abort_error,
-                "failed to abort multipart upload after part failure"
-            );
-        }
+        upload.abort_after_error("part failure").await;
         return Err(Error::ObjectStore(source));
     }
 
     if let Err(source) = upload.complete().await {
-        if let Err(abort_error) = upload.abort().await {
-            warn!(
-                path = %path,
-                error = %abort_error,
-                "failed to abort multipart upload after completion failure"
-            );
-        }
+        upload.abort_after_error("completion failure").await;
         return Err(Error::ObjectStore(source));
     }
     Ok(())
+}
+
+struct SpooledPayloadReader {
+    prefix: std::vec::IntoIter<Bytes>,
+    current: Option<Bytes>,
+    current_offset: usize,
+    file: Option<tokio::fs::File>,
+    file_bytes_remaining: u64,
+}
+
+impl SpooledPayloadReader {
+    fn new(prefix: Vec<Bytes>, file: Option<std::fs::File>, file_bytes: u64) -> Self {
+        Self {
+            prefix: prefix.into_iter(),
+            current: None,
+            current_offset: 0,
+            file: file.map(tokio::fs::File::from_std),
+            file_bytes_remaining: file_bytes,
+        }
+    }
+
+    async fn next_part(&mut self, part_size: usize) -> Result<Option<PutPayload>> {
+        let mut part = BytesMut::with_capacity(part_size);
+        while part.len() < part_size {
+            if let Some(current) = &self.current {
+                let take = (part_size - part.len()).min(current.len() - self.current_offset);
+                part.extend_from_slice(
+                    &current[self.current_offset..self.current_offset.saturating_add(take)],
+                );
+                self.current_offset += take;
+                if self.current_offset == current.len() {
+                    self.current = None;
+                    self.current_offset = 0;
+                }
+                continue;
+            }
+            if let Some(next) = self.prefix.next() {
+                self.current = Some(next);
+                continue;
+            }
+            let Some(file) = &mut self.file else {
+                if self.file_bytes_remaining != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "node-record spool disappeared before all bytes were uploaded",
+                    )
+                    .into());
+                }
+                break;
+            };
+            if self.file_bytes_remaining == 0 {
+                self.file = None;
+                break;
+            }
+            let remaining_in_part = part_size - part.len();
+            part.reserve(remaining_in_part);
+            // `BytesMut` may have more spare capacity than requested. Limit
+            // the reader itself so an allocator growth policy can never make
+            // a non-final multipart part larger than the R2/S3 fixed size.
+            let read_limit = remaining_in_part
+                .min(usize::try_from(self.file_bytes_remaining).unwrap_or(usize::MAX));
+            let mut limited = (&mut *file).take(read_limit as u64);
+            let read = limited.read_buf(&mut part).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "node-record spool was truncated before upload",
+                )
+                .into());
+            }
+            self.file_bytes_remaining -= read as u64;
+        }
+        Ok((!part.is_empty()).then(|| PutPayload::from(part.freeze())))
+    }
+}
+
+/// Upload one optional accelerator, preserving create-only PUTs for ordinary
+/// in-memory bodies and streaming corpus-sized exact node records from their
+/// anonymous spool file.
+pub(crate) async fn put_sidecar_payload(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    body: SidecarPayload,
+) -> Result<()> {
+    match body {
+        SidecarPayload::InMemory(body) => put_payload(store, path, body).await,
+        SidecarPayload::NodeLocator(body) => put_node_locator_upload(store, path, body).await,
+    }
+}
+
+async fn put_node_locator_upload(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    body: crate::sst::paged_index::NodeLocatorRecordUpload,
+) -> Result<()> {
+    let body_len = body.size_bytes();
+    let (prefix, file, file_bytes) = body.into_parts();
+    let mut reader = SpooledPayloadReader::new(prefix, file, file_bytes);
+
+    if body_len < MULTIPART_THRESHOLD as u64 {
+        let payload = reader
+            .next_part(MULTIPART_THRESHOLD)
+            .await?
+            .unwrap_or_default();
+        if payload.content_length() as u64 != body_len {
+            return Err(Error::invariant(
+                "spooled sidecar length disagrees with its descriptor",
+            ));
+        }
+        debug_assert!(reader.next_part(1).await?.is_none());
+        return put_create_payload(store.as_ref(), path, payload).await;
+    }
+
+    let upload = store
+        .put_multipart(path)
+        .await
+        .map_err(Error::ObjectStore)?;
+    let mut upload = MultipartUploadGuard::new(upload, path);
+    let mut pending = FuturesUnordered::new();
+    let mut upload_error: Option<Error> = None;
+    let mut produced_bytes = 0_u64;
+
+    loop {
+        match reader.next_part(MULTIPART_PART_SIZE).await {
+            Ok(Some(part)) => {
+                let Some(next_produced) = produced_bytes.checked_add(part.content_length() as u64)
+                else {
+                    upload_error = Some(Error::invariant("spooled upload byte count exceeds u64"));
+                    break;
+                };
+                produced_bytes = next_produced;
+                pending.push(upload.put_part(part));
+            }
+            Ok(None) => break,
+            Err(error) => {
+                upload_error = Some(error);
+                break;
+            }
+        }
+        if pending.len() < MULTIPART_MAX_CONCURRENCY {
+            continue;
+        }
+        if let Some(Err(source)) = pending.next().await {
+            upload_error = Some(Error::ObjectStore(source));
+            break;
+        }
+    }
+
+    while let Some(result) = pending.next().await {
+        if upload_error.is_none() {
+            if let Err(source) = result {
+                upload_error = Some(Error::ObjectStore(source));
+            }
+        }
+    }
+    if let Some(error) = upload_error {
+        upload.abort_after_error("spooled upload failure").await;
+        return Err(error);
+    }
+    if produced_bytes != body_len {
+        upload
+            .abort_after_error("spooled upload length mismatch")
+            .await;
+        return Err(Error::invariant(
+            "spooled sidecar length disagrees with its descriptor",
+        ));
+    }
+
+    if let Err(source) = upload.complete().await {
+        upload
+            .abort_after_error("spooled upload completion failure")
+            .await;
+        return Err(Error::ObjectStore(source));
+    }
+    Ok(())
+}
+
+/// Contiguous-body convenience wrapper used by ordinary SSTs and existing
+/// sidecars. Large exact-node sidecars use [`put_sidecar_payload`] so their
+/// corpus-sized value region is never materialised in RAM.
+pub(crate) async fn put_object(
+    store: std::sync::Arc<dyn ObjectStore>,
+    path: &Path,
+    body: Bytes,
+) -> Result<()> {
+    put_payload(store, path, body.into()).await
 }
 
 /// Render a UUID in its lowercase simple (32-hex-char) form. RFC-002 §1
@@ -2012,7 +2534,7 @@ pub mod builder {
             Path,
             Bytes,
             Option<(Path, Bytes)>,
-            Vec<(Path, Bytes)>,
+            Vec<(Path, super::SidecarPayload)>,
             SstDescriptor,
         ) {
             let PendingSst {
@@ -2208,7 +2730,8 @@ pub mod builder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
 
     use namidb_core::{EdgeTypeDef, LabelDef, NamespaceId, NodeId, PropertyDef, SchemaBuilder};
     use object_store::memory::InMemory;
@@ -2223,6 +2746,32 @@ mod tests {
     use bytes::Bytes;
     use uuid::Uuid;
 
+    #[derive(Debug)]
+    struct AbortTrackingMultipart {
+        part_started: tokio::sync::mpsc::UnboundedSender<()>,
+        aborted: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for AbortTrackingMultipart {
+        fn put_part(&mut self, _data: PutPayload) -> object_store::UploadPart {
+            let _ = self.part_started.send(());
+            Box::pin(std::future::pending::<object_store::Result<()>>())
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            })
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            let _ = self.aborted.send(());
+            Ok(())
+        }
+    }
+
     fn person_label() -> LabelDef {
         LabelDef {
             name: "Person".into(),
@@ -2231,6 +2780,57 @@ mod tests {
                 PropertyDef::new("age", DataType::Int32, true).unwrap(),
             ],
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_keeps_build_gate_until_blocking_task_exits() {
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first = tokio::spawn(run_flush_build(move || {
+            let _ = first_started_tx.send(());
+            release_first_rx
+                .recv()
+                .map_err(|error| Error::invariant(format!("test release channel: {error}")))?;
+            Ok(())
+        }));
+        tokio::time::timeout(Duration::from_secs(5), first_started_rx)
+            .await
+            .expect("first blocking build must start")
+            .expect("first start signal must survive");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("aborted waiter must be cancelled")
+                .is_cancelled(),
+            "the async waiter, not the blocking task, should be cancelled"
+        );
+
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(run_flush_build(move || {
+            let _ = second_started_tx.send(());
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_started_rx)
+                .await
+                .is_err(),
+            "a retry must not start while the detached blocking build still owns the gate"
+        );
+
+        release_first_tx
+            .send(())
+            .expect("detached blocking build must still be waiting");
+        tokio::time::timeout(Duration::from_secs(5), second_started_rx)
+            .await
+            .expect("retry must start after the first build exits")
+            .expect("second start signal must survive");
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second build must finish")
+            .expect("second waiter must join")
+            .expect("second build must succeed");
     }
 
     #[tokio::test]
@@ -2250,6 +2850,131 @@ mod tests {
             let stored = store.get(&path).await.unwrap().bytes().await.unwrap();
             assert_eq!(stored, body, "{name} must survive its upload path");
         }
+    }
+
+    #[tokio::test]
+    async fn multipart_guard_aborts_when_the_owner_task_is_cancelled() {
+        let (part_started_tx, mut part_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (aborted_tx, mut aborted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let path = Path::from("cancelled-multipart.bin");
+        let task = tokio::spawn(async move {
+            let mut upload = MultipartUploadGuard::new(
+                Box::new(AbortTrackingMultipart {
+                    part_started: part_started_tx,
+                    aborted: aborted_tx,
+                }),
+                &path,
+            );
+            upload
+                .put_part(PutPayload::from(Bytes::from_static(b"pending part")))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), part_started_rx.recv())
+            .await
+            .expect("multipart part did not start")
+            .expect("multipart test channel closed");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), aborted_rx.recv())
+            .await
+            .expect("cancellation did not schedule multipart abort")
+            .expect("multipart abort channel closed");
+    }
+
+    #[tokio::test]
+    async fn object_upload_concurrency_is_bounded_and_errors_drain_all_siblings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let total = OBJECT_UPLOAD_MAX_CONCURRENCY * 3;
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let uploads: Vec<ObjectUploadFuture> = (0..total)
+            .map(|index| {
+                let active = active.clone();
+                let maximum = maximum.clone();
+                let completed = completed.clone();
+                let gate = gate.clone();
+                let started_tx = started_tx.clone();
+                Box::pin(async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    let _permit = gate.acquire().await.expect("test semaphore closed");
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    if index == 0 {
+                        Err(Error::invariant("injected object upload failure"))
+                    } else {
+                        Ok(())
+                    }
+                }) as ObjectUploadFuture
+            })
+            .collect();
+        drop(started_tx);
+
+        let uploads_task = tokio::spawn(await_all_object_uploads(uploads));
+        for _ in 0..OBJECT_UPLOAD_MAX_CONCURRENCY {
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("bounded object upload did not start")
+                .expect("object upload start channel closed");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(active.load(Ordering::SeqCst), OBJECT_UPLOAD_MAX_CONCURRENCY);
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            OBJECT_UPLOAD_MAX_CONCURRENCY
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "queued object uploads started above the concurrency cap"
+        );
+
+        gate.add_permits(total);
+        assert!(
+            uploads_task.await.unwrap().is_err(),
+            "the injected object failure must be returned"
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            total,
+            "all siblings must finish before the first error is returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn spooled_node_locator_upload_round_trips_across_multipart_boundaries() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("nodes-spooled.nloc2");
+        let mut builder = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+        let mut expected = None;
+        for n in 0..7_u128 {
+            let node_id = n.to_be_bytes();
+            let mut record = vec![(n as u8).wrapping_mul(31); 900 * 1024 + n as usize];
+            record[..16].copy_from_slice(&node_id);
+            if n == 6 {
+                expected = Some(record.clone());
+            }
+            builder.push(&node_id, &record).unwrap();
+        }
+        let upload = builder.finish_upload().unwrap();
+        assert!(upload.size_bytes() > MULTIPART_THRESHOLD as u64);
+        put_sidecar_payload(store.clone(), &path, SidecarPayload::NodeLocator(upload))
+            .await
+            .unwrap();
+
+        let (records, _) =
+            crate::sst::paged_index::probe_node_records(store, path, &[6_u128.to_be_bytes()])
+                .await
+                .unwrap();
+        assert_eq!(records.get(&6_u128.to_be_bytes()), expected.as_ref());
     }
 
     #[test]
@@ -2355,6 +3080,85 @@ mod tests {
         let bytes = r.encode().unwrap();
         let back = NodeWriteRecord::decode(&bytes).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn exact_node_record_round_trips_vector_and_tombstone() {
+        let record = NodeWriteRecord {
+            properties: BTreeMap::from([
+                ("key".into(), Value::Str("articulo-1".into())),
+                (
+                    "embedding".into(),
+                    Value::Vec((0..1024).map(|i| (i % 17) as f32 / 17.0).collect()),
+                ),
+            ]),
+            schema_version: 7,
+            labels: vec![3],
+        };
+        let payload = record.encode().unwrap();
+        let row = NodeRow {
+            id: *sorted_node_id(1).as_bytes(),
+            lsn: 99,
+            op: MemOp::Upsert(payload.clone()),
+        };
+        let encoded = encode_exact_node_record(&row).unwrap();
+        assert!(
+            encoded.len() < payload.len(),
+            "a 1024d JSON vector should use the per-record zstd representation"
+        );
+        let (lsn, op) = decode_exact_node_record(&encoded).unwrap();
+        assert_eq!(lsn, 99);
+        assert_eq!(op, MemOp::Upsert(payload));
+
+        let tombstone = NodeRow {
+            id: *sorted_node_id(2).as_bytes(),
+            lsn: 100,
+            op: MemOp::Tombstone,
+        };
+        let encoded = encode_exact_node_record(&tombstone).unwrap();
+        assert_eq!(
+            decode_exact_node_record(&encoded).unwrap(),
+            (100, MemOp::Tombstone)
+        );
+    }
+
+    #[test]
+    fn exact_node_record_rejects_corrupt_lengths_and_encoding() {
+        assert!(decode_exact_node_record(b"short").is_err());
+
+        let mut invalid = vec![NODE_RECORD_RAW];
+        invalid.extend_from_slice(&1_u64.to_le_bytes());
+        invalid.extend_from_slice(&100_u32.to_le_bytes());
+        invalid.extend_from_slice(b"tiny");
+        assert!(decode_exact_node_record(&invalid).is_err());
+
+        invalid[0] = u8::MAX;
+        assert!(decode_exact_node_record(&invalid).is_err());
+    }
+
+    #[test]
+    fn multipart_payload_split_preserves_order_without_coalescing() {
+        let body: PutPayload = [
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"defgh"),
+            Bytes::from_static(b"ijkl"),
+        ]
+        .into_iter()
+        .collect();
+        let parts = multipart_payloads(&body, 5);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts
+                .iter()
+                .map(PutPayload::content_length)
+                .collect::<Vec<_>>(),
+            vec![5, 5, 2]
+        );
+        let reconstructed: Vec<u8> = parts
+            .iter()
+            .flat_map(|part| part.iter().flat_map(|chunk| chunk.iter().copied()))
+            .collect();
+        assert_eq!(reconstructed, b"abcdefghijkl");
     }
 
     #[test]

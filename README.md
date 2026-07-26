@@ -393,7 +393,7 @@ curl -s localhost:8080/v0/cypher \
 # {"columns":["n"],"rows":[{"n":42}]}
 ```
 
-Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree.
+Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree. Bolt keeps a fixed 64 KiB pre-authentication ceiling and defaults authenticated messages to 64 MiB. Before growing or decoding a data frame, all connections share a weighted memory budget and the server checks current RSS plus the request's projected working set. Nested PackStream values also have one cumulative decoded-heap/cardinality budget, and result values are converted only as each `PULL` page demands them.
 
 **Auth and authorization**, all optional and off by default:
 
@@ -412,6 +412,7 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 | `--store` (`NAMIDB_STORE`) | Storage URI. Required. |
 | `--listen` (`NAMIDB_LISTEN`) | HTTP bind, default `0.0.0.0:8080`. |
 | `--bolt-listen` (`NAMIDB_BOLT_LISTEN`) | Enable the Bolt listener (e.g. `0.0.0.0:7687`). |
+| `--bolt-max-message-bytes` (`NAMIDB_BOLT_MAX_MESSAGE_BYTES`) | Authenticated Bolt message cap, default 64 MiB; the pre-auth cap stays fixed at 64 KiB. |
 | `--auth-token` / `--auth-tokens-file` | Static bearer token(s) with per-token roles + namespace scopes. |
 | `--jwt-*` *(feature `jwt`)* | Validate OIDC JWTs against a JWKS, map a group claim to a role, scope by a namespaces claim. |
 | `--pdp-url` *(feature `pdp`)* | Send each query to an OPA-style policy endpoint; deny unless it allows (fail-closed). |
@@ -512,6 +513,9 @@ explicitly for large vector or full-text corpora.
 | `NAMIDB_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Process-wide admission ceiling for cache-accounted payloads shared by SST, decoded, node-view, and adjacency caches. `0` disables all shared caches. |
 | `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` | unset (proportional) | Exact-byte reservation, carved out of `NAMIDB_CACHE_MAX_BYTES`, for one shared decoded `.vg`/`.ft` eviction pool. |
 | `NAMIDB_MEMORY_MAX_BYTES` | `0` (disabled) | Server-only total RSS/working-set admission ceiling. A 500 ms watchdog clears reconstructible caches at 90% even without incoming work; at the ceiling new Cypher receives a retryable 503/Bolt transient error until memory falls. |
+| `NAMIDB_BOLT_MEMORY_BUDGET_BYTES` | half of `NAMIDB_MEMORY_MAX_BYTES`, or `1073807360` (~1 GiB) when that governor is disabled | Process-wide admission budget shared by framed, decoded, converted and prefetched authenticated Bolt data. An incomplete frame holds `64 KiB + 2 × wire body bytes`; at its terminator a data frame must atomically upgrade to `64 KiB + 16 × wire body bytes` or fail retryably. Use smaller batches or raise this only with matching process/cgroup headroom. |
+| `NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT` | `120s` | Deadline from the first byte of an authenticated partial frame through framing/budget admission. `0s` disables it; a completely idle connection holds no message-memory permit and has no partial-frame deadline. |
+| `NAMIDB_SPOOL_DIR` | `/var/tmp` on Unix; native temp directory elsewhere; `/var/tmp/namidb-spool` in the official image | Disk directory for corpus-sized exact-node values and remote compaction inputs. Size it for all compacted inputs plus the new Parquet and exact-record outputs (roughly 3× the compacted live node bytes; commonly 12–15 GiB per million 1024d nodes, with extra headroom for superseded versions). |
 | `NAMIDB_ADJACENCY` | ON | CSR adjacency in RAM, shared across snapshots. |
 | `NAMIDB_NODE_CACHE` | ON | Cross-snapshot `NodeView` lookup cache. |
 | `NAMIDB_SST_CACHE` | ON | Raw SST body and decoded SST cache tiers. |
@@ -574,6 +578,43 @@ to `NAMIDB_CACHE_MAX_BYTES`; an RSS pressure pass clears them
 through weak registrations, without extending a namespace's lifetime. The
 official image also bounds glibc allocation arenas so dropped large-index
 working sets are returned instead of accumulating per-thread arenas.
+Authenticated Bolt framing is admitted before a large body allocation or
+PackStream decode. A partial frame grows a fail-fast raw-memory lease at
+`64 KiB + 2× wire bytes`; once its terminator arrives, a non-control frame must
+atomically upgrade that same lease to the `64 KiB + 16× wire bytes` decoded
+working set. The shared `NAMIDB_BOLT_MEMORY_BUDGET_BYTES` lease follows the
+message through parameter conversion, execution and RUN prefetch. An early
+RSS admission also takes a process-wide RAII reservation for that projected
+headroom through request handling, followed by the ordinary execution-time
+check to cover unrelated allocations.
+Small bounded pressure-relief controls (`PULL`, `DISCARD`, `COMMIT`,
+`ROLLBACK`, `RESET`, `GOODBYE`, `LOGOFF`) bypass data admission so clients can
+drain results, release a transaction or recover under pressure. No task waits
+while holding partial permits, and the partial-frame timeout releases a
+slowloris's bounded raw-memory lease.
+Node Parquet outputs, exact-record values and remote compaction inputs stream
+through anonymous files in `NAMIDB_SPOOL_DIR`; only bounded Arrow batches,
+compact B+tree pages and multipart windows remain in RAM. The files are
+synced before mmap/upload so delayed allocation errors surface early and dirty
+pages can be reclaimed, then unlinked/removed automatically on success,
+failure, or process exit. Corpus-sized flush builds are process-wide
+single-flight even if their caller disconnects. Do not
+point this at a RAM-backed `/tmp`/`tmpfs` for large vector corpora. During a
+full-backlog node compaction, every mapped input coexists with the new Parquet
+output and its exact-record value spool. Provision local disk for
+`sum(inputs) + parquet_output + exact_record_output` — roughly 3× the compacted
+live node bytes, plus headroom for superseded versions. The official image
+defaults to `/var/tmp/namidb-spool`, and the example Compose file mounts a
+dedicated volume there.
+Current node SSTs pair Parquet with a rollback-compatible `.nloc2` sidecar:
+the 2.0.5 `NodeId → row ordinal` tree remains its prefix, followed by a
+range-readable `NodeId → compressed exact record` tree. Point updates fetch
+that record instead of hydrating an unrelated wide Parquet page. Compaction
+maps both local inputs and remote spools, activates each source only when its
+manifest key range reaches the merge frontier, and retains at most 64 decoded
+rows per active node source. Upgrading a settled 2.0.5 SST can therefore attach
+only `.nloc2`; fresh `.vg` vector and `.ft` full-text generations, their object
+IDs and durable build markers remain unchanged.
 For a process-wide server safety rail, set `NAMIDB_MEMORY_MAX_BYTES` above the
 cache budget and expected memtable/compaction headroom. It measures RSS on
 Linux/macOS and working set on Windows, reclaims shared caches and writer-local
