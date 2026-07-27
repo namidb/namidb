@@ -49,7 +49,7 @@ url = { workspace = true }
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 memmap2 = { workspace = true }
-arrow-ipc = "55"
+arrow-ipc = "59"
 imbl = "3"
 
 [features]
