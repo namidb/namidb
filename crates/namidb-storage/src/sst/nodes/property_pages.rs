@@ -3403,7 +3403,14 @@ mod tests {
         config: NodePropertyPageConfig,
     ) -> Result<NodePropertyPageReader> {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from(format!("node-properties/{expected_id}.npp"));
+        // Fresh path per open: InMemory ETags are per-store counters, so
+        // rewriting different bytes at one path across fresh stores would
+        // collide in the process-global range cache if it is ever enabled.
+        // The reader validates the header's sst_id, not the path.
+        let path = Path::from(format!(
+            "node-properties/{}/{expected_id}.npp",
+            Uuid::now_v7()
+        ));
         store.put(&path, PutPayload::from(body)).await.unwrap();
         let meta = store.head(&path).await.unwrap();
         let source = Arc::new(

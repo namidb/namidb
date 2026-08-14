@@ -425,24 +425,19 @@ fn default_ram_page_cache_request() -> usize {
     // of `NAMIDB_CACHE_MAX_BYTES` rather than an addition to it, so enabling
     // it would not raise the process memory bound.
     //
-    // The runtime hazard that used to block this is fixed: a RAM-only tier is
-    // now a pure in-memory cache with no background workers and no runtime
-    // affinity (see `RangeCacheBackend`), so it no longer strands callers that
-    // cycle runtimes.
+    // Both correctness blockers that kept this tier off are fixed: a RAM-only
+    // tier is a pure in-memory cache with no background workers and no runtime
+    // affinity (see `RangeCacheBackend`), and an *inferred* immutability pin —
+    // a store exposing neither version nor ETag — now refuses the shared cache
+    // outright instead of colliding on a constant path+range token (see
+    // `PinnedObjectRangeSource::from_create_only_meta`).
     //
-    // One correctness gap remains. `PinnedObjectGeneration::ImmutablePath`
-    // hashes into the cache key as a *constant* token, so path + range alone
-    // identify an entry, and two different contents at one path are
-    // indistinguishable. That variant is meant to be an explicit caller
-    // guarantee, but `from_create_only_meta` also derives it whenever a store
-    // exposes neither version nor ETag — where nothing proves immutability.
-    // Enabling this default then breaks two fail-closed tests:
-    // `replacement_after_open_never_mixes_generations` (a pinned reader is
-    // served from cache instead of failing its ETag pin) and
-    // `corruption_truncation_and_uuid_mismatch_fail_closed`. Production SST
-    // paths are create-only UUIDs, so the guarantee does hold there — but the
-    // default must not depend on that. Refuse to cache an object whose
-    // immutability is only inferred, then flip this on.
+    // What still gates the flip is test debt, not a defect: several
+    // namidb-query integration tests (`exec_hybrid_search.rs`
+    // indexed_sparse_filter among them) pin *exact* object-store GET counts
+    // that a warm cache legitimately reduces. Audit and re-anchor those
+    // assertions to what they actually protect, then return
+    // `DEFAULT_RAM_PAGE_CACHE_MAX_BYTES` unconditionally here.
     let has_path = std::env::var("NAMIDB_NVME_CACHE_PATH")
         .ok()
         .is_some_and(|path| !path.trim().is_empty());

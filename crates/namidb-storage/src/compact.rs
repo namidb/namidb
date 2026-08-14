@@ -5300,6 +5300,14 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.search_compactions.len(), 1);
         let physical = &prepared.search_compactions[0];
+        assert!(physical.metrics.peak_resident_input_bytes > 0);
+        assert!(
+            physical.metrics.peak_resident_input_bytes < physical.metrics.input_bytes,
+            "disjoint-range Nodes SSTs must stream through the base build, \
+             not co-reside: peak {} vs total {}",
+            physical.metrics.peak_resident_input_bytes,
+            physical.metrics.input_bytes
+        );
         let selected_ids = physical.selection.selected_ids().collect::<Vec<_>>();
         let output = physical.output.as_ref().expect("non-empty V5 base");
         assert_eq!(

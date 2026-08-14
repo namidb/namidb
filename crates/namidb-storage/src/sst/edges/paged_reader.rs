@@ -1818,14 +1818,16 @@ mod tests {
         );
     }
 
+    /// Uncached mechanism: with no cache in front, every read hits the store
+    /// and a replaced object fails its ETag pin outright.
     #[tokio::test]
-    async fn replacement_after_open_never_mixes_generations() {
+    async fn replacement_after_open_fails_closed_without_cache() {
         let body_a = write_body(64, 2, 8);
         let body_b = write_body(65, 2, 8);
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("edge/replaced-after-open.sst");
-        put_body(&store, &path, body_a).await;
-        let reader = PagedEdgeReader::open(store.clone(), path.clone())
+        let path = Path::from("edge/replaced-after-open-uncached.sst");
+        let meta = put_body(&store, &path, body_a).await;
+        let reader = PagedEdgeReader::open_with_meta_and_cache(store.clone(), meta, None)
             .await
             .unwrap();
         put_body(&store, &path, body_b).await;
@@ -1834,6 +1836,59 @@ mod tests {
         assert!(
             matches!(error, Error::ObjectStore(_)),
             "a replaced object must fail its ETag pin, got {error:?}"
+        );
+    }
+
+    /// Cached semantics: the invariant is that a pinned reader never observes
+    /// bytes of another generation — not that every read hits the store. Warm
+    /// ranges keep serving the pinned generation; cold ranges fail the pin
+    /// instead of tearing in replacement bytes; a fresh reader pinned to the
+    /// replacement sees only the replacement.
+    #[tokio::test]
+    async fn replacement_after_open_never_mixes_generations() {
+        let body_a = write_body(64, 2, 8);
+        let body_b = write_body(65, 2, 8);
+        let oracle_a = EdgeSstReader::open(body_a.clone()).unwrap();
+        let oracle_b = EdgeSstReader::open(body_b.clone()).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("edge/replaced-after-open.sst");
+        let meta_a = put_body(&store, &path, body_a).await;
+
+        let mut config = RangeCacheConfig::memory_only(2 * 1024 * 1024);
+        config.max_entry_bytes = 4 * 1024;
+        config.page_size_bytes = 4 * 1024;
+        config.key_namespace = "paged-edge-reader-replacement".into();
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+
+        let reader =
+            PagedEdgeReader::open_with_meta_and_cache(store.clone(), meta_a, Some(cache.clone()))
+                .await
+                .unwrap();
+        let target = id(1, 10);
+        let pinned = reader.lookup(&target).await.unwrap();
+        assert_eq!(pinned, oracle_a.lookup(&target).unwrap());
+
+        let meta_b = put_body(&store, &path, body_b).await;
+        assert_eq!(
+            reader.lookup(&target).await.unwrap(),
+            pinned,
+            "warm ranges keep serving the pinned generation, never generation B"
+        );
+
+        cache.clear_memory();
+        let error = reader.lookup(&target).await.unwrap_err();
+        assert!(
+            matches!(error, Error::ObjectStore(_)),
+            "cold ranges must fail the ETag pin instead of tearing, got {error:?}"
+        );
+
+        let fresh = PagedEdgeReader::open_with_meta_and_cache(store, meta_b, Some(cache))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.lookup(&target).await.unwrap(),
+            oracle_b.lookup(&target).unwrap(),
+            "a generation-B reader sharing the cache sees only generation B"
         );
     }
 

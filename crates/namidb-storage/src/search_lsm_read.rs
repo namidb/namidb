@@ -624,11 +624,16 @@ async fn probe_winners<'a>(
 ) -> Result<WinnerBatch> {
     use futures::{StreamExt, TryStreamExt};
 
-    let readers = readers_newest_first.into_iter().collect::<Vec<_>>();
+    // Collected eagerly: a borrowing closure inside the opaque stream type
+    // would carry a higher-ranked `FnOnce` obligation that rustc rejects once
+    // this future crosses the executor's `Send` boundary (rust-lang/rust
+    // #102211). A `Vec` of already-constructed futures has no closure in its
+    // type at all.
     let probes = futures::stream::iter(
-        readers
-            .iter()
-            .map(|reader| reader.point_probe_many(node_ids)),
+        readers_newest_first
+            .into_iter()
+            .map(|reader| reader.point_probe_many(node_ids))
+            .collect::<Vec<_>>(),
     )
     .buffered(SEARCH_SEGMENT_FANOUT)
     .try_collect::<Vec<_>>()
@@ -1307,11 +1312,17 @@ async fn globally_expanded_text_query(
         use futures::{StreamExt, TryStreamExt};
 
         let mut prefix_terms = BTreeSet::new();
-        let per_segment = futures::stream::iter(generation.segments.iter().map(|segment| {
-            segment
-                .reader
-                .expand_prefix_terms(prefix, crate::text::PREFIX_EXPANSION_LIMIT)
-        }))
+        let per_segment = futures::stream::iter(
+            generation
+                .segments
+                .iter()
+                .map(|segment| {
+                    segment
+                        .reader
+                        .expand_prefix_terms(prefix, crate::text::PREFIX_EXPANSION_LIMIT)
+                })
+                .collect::<Vec<_>>(),
+        )
         .buffered(SEARCH_SEGMENT_FANOUT)
         .try_collect::<Vec<_>>()
         .await?;
@@ -1341,7 +1352,8 @@ async fn globally_expanded_text_query(
         let expanded_df = futures::stream::iter(
             selected
                 .iter()
-                .map(|term| reconciled_text_df(generation, term)),
+                .map(|term| reconciled_text_df(generation, term))
+                .collect::<Vec<_>>(),
         )
         .buffered(SEARCH_SEGMENT_FANOUT)
         .try_collect::<Vec<_>>()
@@ -1372,11 +1384,13 @@ async fn globally_expanded_text_query(
 async fn reconciled_text_df(generation: &OpenedTextGeneration, term: &str) -> Result<Option<u64>> {
     use futures::{StreamExt, TryStreamExt};
 
+    // Eager Vec for the same #102211 reason as `probe_winners`.
     let contributions = futures::stream::iter(
         generation
             .segments
             .iter()
-            .map(|segment| segment.reader.term_delta_df(term)),
+            .map(|segment| segment.reader.term_delta_df(term))
+            .collect::<Vec<_>>(),
     )
     .buffered(SEARCH_SEGMENT_FANOUT)
     .try_collect::<Vec<_>>()
@@ -1414,7 +1428,8 @@ async fn global_text_stats(
     let frequencies = futures::stream::iter(
         terms
             .iter()
-            .map(|term| reconciled_text_df(generation, term)),
+            .map(|term| reconciled_text_df(generation, term))
+            .collect::<Vec<_>>(),
     )
     .buffered(SEARCH_SEGMENT_FANOUT)
     .try_collect::<Vec<_>>()

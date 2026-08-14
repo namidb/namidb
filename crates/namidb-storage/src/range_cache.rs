@@ -1554,10 +1554,26 @@ impl PinnedObjectRangeSource {
         store: Arc<dyn ObjectStore>,
         meta: ObjectMeta,
     ) -> crate::error::Result<Self> {
-        let generation = PinnedObjectGeneration::from_meta(&meta)
-            .unwrap_or(PinnedObjectGeneration::ImmutablePath);
-        let range_cache = resolved_shared_range_cache(&meta).await?;
-        Self::from_meta_with_cache_and_generation(store, meta, generation, range_cache)
+        match PinnedObjectGeneration::from_meta(&meta) {
+            Ok(generation) => {
+                let range_cache = resolved_shared_range_cache(&meta).await?;
+                Self::from_meta_with_cache_and_generation(store, meta, generation, range_cache)
+            }
+            // Neither version nor ETag: immutability is inferred from NamiDB's
+            // create-only naming, not asserted by a backend generation. The
+            // shared cache would key these reads by path+range alone — a
+            // constant token — so two contents at one path would collide, and
+            // no remote precondition exists to catch a violated assumption.
+            // Read authoritatively and never touch the shared cache; callers
+            // that can genuinely assert path immutability use
+            // `from_immutable_meta` instead.
+            Err(_) => Self::from_meta_with_cache_and_generation(
+                store,
+                meta,
+                PinnedObjectGeneration::ImmutablePath,
+                None,
+            ),
+        }
     }
 
     /// Explicit cache injection for readers that already own cache policy and
@@ -1617,6 +1633,14 @@ impl PinnedObjectRangeSource {
 
     pub fn generation(&self) -> &PinnedObjectGeneration {
         &self.generation
+    }
+
+    /// Whether reads may consult the shared range cache. False for inferred
+    /// immutability, whose constructor refuses the cache by contract. A test
+    /// observability hook: production code never branches on it.
+    #[cfg(test)]
+    pub(crate) fn has_range_cache(&self) -> bool {
+        self.range_cache.is_some()
     }
 
     pub fn stats(&self) -> PinnedObjectRangeStats {
@@ -2122,6 +2146,44 @@ mod tests {
             .unwrap();
         assert_eq!(source.read_range(3..11).await.unwrap(), body.slice(3..11));
         assert_eq!(source.generation(), &PinnedObjectGeneration::ImmutablePath);
+    }
+
+    /// An inferred pin has no backend generation and no remote precondition,
+    /// so the shared cache — whose key would collapse to path+range — must
+    /// never be consulted. Pass-through reads make a violated create-only
+    /// assumption observable instead of serving a stale collision.
+    #[tokio::test]
+    async fn inferred_immutable_pin_is_never_cached() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from(format!("immutable/{}/inferred-pin", uuid::Uuid::now_v7()));
+        let first = Bytes::from_static(b"first-generation");
+        store
+            .put(&location, PutPayload::from_bytes(first.clone()))
+            .await
+            .unwrap();
+        let mut meta = store.head(&location).await.unwrap();
+        meta.e_tag = None;
+        meta.version = None;
+
+        let source = PinnedObjectRangeSource::from_create_only_meta(store.clone(), meta)
+            .await
+            .unwrap();
+        assert_eq!(source.generation(), &PinnedObjectGeneration::ImmutablePath);
+        assert!(
+            !source.has_range_cache(),
+            "inferred immutability must refuse the shared range cache"
+        );
+        assert_eq!(source.read_range(0..16).await.unwrap(), first);
+
+        // Same store, same path, same length: only pass-through reads can
+        // observe the replacement. A cached inferred pin would serve `first`.
+        let second = Bytes::from_static(b"other-generation");
+        assert_eq!(second.len(), first.len());
+        store
+            .put(&location, PutPayload::from_bytes(second.clone()))
+            .await
+            .unwrap();
+        assert_eq!(source.read_range(0..16).await.unwrap(), second);
     }
 
     #[tokio::test]

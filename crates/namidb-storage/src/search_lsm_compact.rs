@@ -62,6 +62,11 @@ const DEFAULT_SEARCH_LSM_MAX_SEGMENTS: usize = 8;
 const DEFAULT_SEARCH_LSM_BASE_COMPACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_SEARCH_LSM_BASE_STALE_PERCENT: u64 = 800;
 const MIN_SEARCH_LSM_SEGMENTS: usize = 2;
+/// Fetched-but-not-yet-activated Nodes bodies buffered ahead of the base
+/// merge. Matches the DeltaRun pipeline's channel depth: enough to overlap
+/// fetch latency with build CPU, small enough that lookahead residency stays
+/// a constant, not a corpus fraction.
+const SEARCH_BASE_FETCH_LOOKAHEAD: usize = 2;
 const EMPTY_BASE_CLASSIFIER_VERSION: u16 = 2;
 const EMPTY_DELTA_CLASSIFIER_VERSION: u16 = 3;
 
@@ -258,6 +263,10 @@ pub(super) struct SearchCompactionBuildMetrics {
     /// Accounted bytes written to bounded temporary artifacts/sort runs.
     pub(super) spill_bytes: u64,
     pub(super) prepare_millis: u64,
+    /// Peak bytes of simultaneously resident (activated, unexhausted) Nodes
+    /// SST input bodies during a BasePrefix merge; 0 for DeltaRun. This is the
+    /// bound that keeps a full-corpus rebuild from co-residing the corpus.
+    pub(super) peak_resident_input_bytes: u64,
 }
 
 /// An immutable full base already uploaded by the prepare phase, or an
@@ -934,9 +943,13 @@ pub(super) fn rebase_prepared_search_compaction(
     Ok(rebased)
 }
 
-struct SearchNodeInput {
-    body: Bytes,
+/// Metadata for one planned Nodes SST input. Bodies do not travel here: the
+/// producer fetches them in activation order and streams each over a bounded
+/// channel, so at most one unactivated body is ever in flight per lookahead
+/// slot instead of the corpus co-residing.
+struct SearchNodeSourcePlan {
     min_key: [u8; 16],
+    size_bytes: u64,
     label_def: LabelDef,
     scope: String,
 }
@@ -1313,7 +1326,8 @@ pub(super) async fn prepare_search_compactions(
     let mut built = Vec::with_capacity(base_selections.len() + delta_selections.len());
 
     if !base_selections.is_empty() {
-        let mut inputs = Vec::new();
+        let mut plan = Vec::new();
+        let mut descriptors = Vec::new();
         let mut input_bytes = 0u64;
         for descriptor in manifest
             .ssts
@@ -1338,33 +1352,70 @@ pub(super) async fn prepare_search_compactions(
                         properties: Vec::new(),
                     })
             };
-            inputs.push(SearchNodeInput {
-                body: super::get_sst_body(store.as_ref(), paths, descriptor).await?,
+            plan.push(SearchNodeSourcePlan {
                 min_key: descriptor.min_key,
+                size_bytes: descriptor.size_bytes,
                 label_def,
                 scope: descriptor.scope.clone(),
             });
+            descriptors.push(descriptor.clone());
         }
-        if inputs.is_empty() {
+        if plan.is_empty() {
             return Err(Error::invariant(
                 "active Search-LSM BasePrefix compaction has no Nodes SST inputs",
             ));
         }
 
+        // Producer/consumer pipeline. The merge activates sources in
+        // (min_key, ordinal) order, so fetching in that exact order lets the
+        // builder receive each body precisely when its heap entry activates.
+        // Residency is bounded by activated-unexhausted bodies plus the
+        // channel's lookahead — never the corpus.
+        let mut fetch_order: Vec<usize> = (0..plan.len()).collect();
+        fetch_order.sort_by_key(|&ordinal| (plan[ordinal].min_key, ordinal));
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<(usize, Bytes)>(SEARCH_BASE_FETCH_LOOKAHEAD);
         let build_manifest = manifest.clone();
         let started = Instant::now();
-        built.extend(
-            super::run_cpu(move || {
-                build_search_compactions_blocking(
-                    &build_manifest,
-                    base_selections,
-                    inputs,
-                    input_bytes,
-                    started,
-                )
-            })
-            .await??,
+        tracing::info!(
+            input_bytes,
+            sources = plan.len(),
+            "starting Search-LSM base build; spool scratch scales with input \
+             plus the external builders' bounded working sets"
         );
+        let builder_handle = tokio::task::spawn_blocking(move || {
+            build_search_compactions_blocking(
+                &build_manifest,
+                base_selections,
+                plan,
+                receiver,
+                input_bytes,
+                started,
+            )
+        });
+        let producer_result: Result<()> = async {
+            for ordinal in fetch_order {
+                let body =
+                    super::get_sst_body(store.as_ref(), paths, &descriptors[ordinal]).await?;
+                if sender.send((ordinal, body)).await.is_err() {
+                    // The builder hung up early; its own error surfaces below.
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+        .await;
+        drop(sender);
+        let build_result = builder_handle.await.map_err(|error| {
+            Error::invariant(format!(
+                "Search-LSM base compaction build panicked: {error}"
+            ))
+        })?;
+        // A genuine fetch error outranks the builder's derived channel-closed
+        // error; a builder error must not be masked by the send failure it
+        // caused.
+        producer_result?;
+        built.extend(build_result?);
     }
 
     for selection in delta_selections {
@@ -1406,6 +1457,7 @@ pub(super) async fn prepare_search_compactions(
             touched_rows = built.prepared.metrics.touched_rows,
             live_rows = built.prepared.metrics.live_rows,
             peak_workspace_bytes = built.prepared.metrics.peak_workspace_bytes,
+            peak_resident_input_bytes = built.prepared.metrics.peak_resident_input_bytes,
             scratch_bytes = built.prepared.metrics.scratch_bytes,
             spill_bytes = built.prepared.metrics.spill_bytes,
             prepare_millis = built.prepared.metrics.prepare_millis,
@@ -1802,6 +1854,7 @@ async fn build_vector_delta_run(
                 scratch_bytes: output_bytes,
                 spill_bytes: output_bytes,
                 prepare_millis: elapsed,
+                peak_resident_input_bytes: 0,
             },
         },
         file: Some(artifact.file),
@@ -2174,6 +2227,7 @@ async fn build_text_delta_run(
                 scratch_bytes,
                 spill_bytes: scratch_bytes,
                 prepare_millis: elapsed_millis(started),
+                peak_resident_input_bytes: 0,
             },
         },
         file: Some(artifact.file),
@@ -2543,6 +2597,8 @@ impl VectorBaseWork {
                     scratch_bytes: metrics.scratch_bytes_written,
                     spill_bytes: metrics.scratch_bytes_written,
                     prepare_millis: elapsed,
+                    // Stamped centrally once the whole merge's peak is known.
+                    peak_resident_input_bytes: 0,
                 },
             },
             file: Some(file),
@@ -2722,6 +2778,8 @@ impl TextBaseWork {
                     spill_bytes: metrics
                         .spool_bytes_written
                         .saturating_add(metrics.filter_spool_bytes),
+                    // Stamped centrally once the whole merge's peak is known.
+                    peak_resident_input_bytes: 0,
                     prepare_millis: elapsed,
                 },
             },
@@ -2738,7 +2796,8 @@ fn elapsed_millis(started: Instant) -> u64 {
 fn build_search_compactions_blocking(
     manifest: &Manifest,
     selections: Vec<SearchCompactionSelection>,
-    inputs: Vec<SearchNodeInput>,
+    plan: Vec<SearchNodeSourcePlan>,
+    mut bodies: tokio::sync::mpsc::Receiver<(usize, Bytes)>,
     input_bytes: u64,
     started: Instant,
 ) -> Result<Vec<BuiltSearchCompaction>> {
@@ -2841,19 +2900,19 @@ fn build_search_compactions_blocking(
         }
     }
 
-    let mut cursors = Vec::with_capacity(inputs.len());
-    let mut unopened = BinaryHeap::with_capacity(inputs.len());
-    for (source, input) in inputs.into_iter().enumerate() {
-        let cursor = super::NodeSourceCursor::open(&input.label_def, input.body)?;
-        cursors.push(SearchNodeCursor {
-            cursor,
-            label_def: input.label_def,
-            scope: input.scope,
-        });
-        unopened.push(Reverse((input.min_key, source)));
+    // Lazy activation, eager release. A cursor exists only between its heap
+    // entry activating and its last row being consumed; dropping it unmaps the
+    // body and frees its unlinked spool immediately. The comparator matches
+    // the producer's send order exactly, so each `blocking_recv` yields the
+    // body the activation loop is asking for.
+    let mut cursors: Vec<Option<SearchNodeCursor>> = (0..plan.len()).map(|_| None).collect();
+    let mut unopened = BinaryHeap::with_capacity(plan.len());
+    for (source, entry) in plan.iter().enumerate() {
+        unopened.push(Reverse((entry.min_key, source)));
     }
-    let mut heap: BinaryHeap<Reverse<super::NodeHeapEntry>> =
-        BinaryHeap::with_capacity(cursors.len());
+    let mut resident_input_bytes = 0u64;
+    let mut peak_resident_input_bytes = 0u64;
+    let mut heap: BinaryHeap<Reverse<super::NodeHeapEntry>> = BinaryHeap::with_capacity(plan.len());
     let mut last_id = None;
     loop {
         while let Some(Reverse((hinted_min, source))) = unopened.peek().copied() {
@@ -2862,9 +2921,27 @@ fn build_search_compactions_blocking(
                 break;
             }
             unopened.pop();
-            let source_cursor = &mut cursors[source].cursor;
-            source_cursor.ensure_positioned()?;
-            let Some((id, lsn)) = source_cursor.peek() else {
+            let (ordinal, body) = bodies.blocking_recv().ok_or_else(|| {
+                Error::invariant(
+                    "Search-LSM base fetch stream ended before all planned Nodes SSTs arrived",
+                )
+            })?;
+            if ordinal != source {
+                return Err(Error::invariant(
+                    "Search-LSM base fetch delivery disagrees with activation order",
+                ));
+            }
+            let entry = &plan[source];
+            let cursor = super::NodeSourceCursor::open(&entry.label_def, body)?;
+            let mut opened = SearchNodeCursor {
+                cursor,
+                label_def: entry.label_def.clone(),
+                scope: entry.scope.clone(),
+            };
+            resident_input_bytes = resident_input_bytes.saturating_add(entry.size_bytes);
+            peak_resident_input_bytes = peak_resident_input_bytes.max(resident_input_bytes);
+            opened.cursor.ensure_positioned()?;
+            let Some((id, lsn)) = opened.cursor.peek() else {
                 return Err(Error::invariant(
                     "manifest references an empty Nodes SST during Search-LSM compaction",
                 ));
@@ -2880,44 +2957,62 @@ fn build_search_compactions_blocking(
                 lsn,
                 src: source,
             }));
+            cursors[source] = Some(opened);
         }
         let Some(Reverse(entry)) = heap.pop() else {
             break;
         };
-        let source = &mut cursors[entry.src];
-        if last_id != Some(entry.id) {
-            last_id = Some(entry.id);
-            let (row, record) = source.cursor.materialize_current(&source.label_def)?;
-            let record = if matches!(row.op, MemOp::Tombstone) {
-                None
-            } else {
-                record.as_ref()
-            };
-            for work in &mut works {
-                work.observe(row.id, row.lsn, record, &source.scope)?;
+        let exhausted = {
+            let source = cursors[entry.src]
+                .as_mut()
+                .ok_or_else(|| Error::invariant("Search-LSM merge popped an inactive source"))?;
+            if last_id != Some(entry.id) {
+                last_id = Some(entry.id);
+                let (row, record) = source.cursor.materialize_current(&source.label_def)?;
+                let record = if matches!(row.op, MemOp::Tombstone) {
+                    None
+                } else {
+                    record.as_ref()
+                };
+                for work in &mut works {
+                    work.observe(row.id, row.lsn, record, &source.scope)?;
+                }
             }
-        }
-        source.cursor.advance()?;
-        if let Some((id, lsn)) = source.cursor.peek() {
-            heap.push(Reverse(super::NodeHeapEntry {
-                id,
-                lsn,
-                src: entry.src,
-            }));
+            source.cursor.advance()?;
+            match source.cursor.peek() {
+                Some((id, lsn)) => {
+                    heap.push(Reverse(super::NodeHeapEntry {
+                        id,
+                        lsn,
+                        src: entry.src,
+                    }));
+                    false
+                }
+                None => true,
+            }
+        };
+        if exhausted {
+            cursors[entry.src] = None;
+            resident_input_bytes = resident_input_bytes.saturating_sub(plan[entry.src].size_bytes);
         }
     }
 
-    works
+    let mut finished = works
         .into_iter()
         .filter_map(|work| work.finish(input_bytes, started).transpose())
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for built in &mut finished {
+        built.prepared.metrics.peak_resident_input_bytes = peak_resident_input_bytes;
+    }
+    Ok(finished)
 }
 
 #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
 fn build_search_compactions_blocking(
     _manifest: &Manifest,
     selections: Vec<SearchCompactionSelection>,
-    _inputs: Vec<SearchNodeInput>,
+    _plan: Vec<SearchNodeSourcePlan>,
+    _bodies: tokio::sync::mpsc::Receiver<(usize, Bytes)>,
     _input_bytes: u64,
     _started: Instant,
 ) -> Result<Vec<BuiltSearchCompaction>> {
