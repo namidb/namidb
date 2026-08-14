@@ -250,17 +250,14 @@ struct Cli {
     )]
     memtable_stall_bytes: usize,
 
-    /// Process resident-memory/working-set ceiling in exact bytes. At 90%
-    /// NamiDB clears reconstructible caches; at the ceiling new Cypher work
-    /// receives a retryable 503/Bolt transient error until RSS falls below
-    /// the limit. This complements (and is broader than)
+    /// Process resident-memory/working-set ceiling in exact bytes. `auto`
+    /// selects 90% of a finite container/cgroup memory limit. At 90% of the
+    /// resulting ceiling NamiDB clears reconstructible caches; at the ceiling
+    /// new Cypher work receives a retryable 503/Bolt transient error until RSS
+    /// falls below the limit. This complements (and is broader than)
     /// NAMIDB_CACHE_MAX_BYTES. `0` disables total-memory admission.
-    #[arg(
-        long,
-        env = "NAMIDB_MEMORY_MAX_BYTES",
-        default_value_t = namidb_server::memory::DEFAULT_MEMORY_MAX_BYTES
-    )]
-    memory_max_bytes: usize,
+    #[arg(long, env = "NAMIDB_MEMORY_MAX_BYTES", default_value = "0")]
+    memory_max_bytes: String,
 
     /// Bound on how long a foreground request (write, DDL, admin flush, Bolt
     /// BEGIN) may wait for the writer lock before failing fast with 503, so
@@ -379,11 +376,13 @@ fn main() -> anyhow::Result<()> {
         namespace_idle_timeout: cli.namespace_idle_timeout,
     };
 
+    let memory_max_bytes = namidb_server::memory::resolve_memory_max_bytes(&cli.memory_max_bytes)
+        .map_err(anyhow::Error::msg)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(namidb_server::run_with_memory_max_bytes(
         config,
-        cli.memory_max_bytes,
+        memory_max_bytes,
     ))
 }

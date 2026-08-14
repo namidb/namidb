@@ -500,6 +500,50 @@ async fn call_search_bm25_ranks_rare_terms_higher() {
 }
 
 #[tokio::test]
+async fn call_search_bm25_filter_is_applied_before_top_k() {
+    let mut writer = WriterSession::open(store(), paths("call-bm25-filter"))
+        .await
+        .unwrap();
+    let obsolete = NodeId::new();
+    let vigente = NodeId::new();
+    let mut obsolete_record = node_with_body("fox fox fox fox fox fox");
+    obsolete_record
+        .properties
+        .insert("vigente".into(), namidb_core::Value::Bool(false));
+    let mut vigente_record = node_with_body("fox");
+    vigente_record
+        .properties
+        .insert("vigente".into(), namidb_core::Value::Bool(true));
+    writer
+        .upsert_node("Note", obsolete, &obsolete_record)
+        .unwrap();
+    writer
+        .upsert_node("Note", vigente, &vigente_record)
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox', \
+         k: 1, filter: {vigente: true}}) YIELD node, score RETURN node, score",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "a selective filter must refill the sparse result to k"
+    );
+    let result = match rows[0].get("node") {
+        Some(RuntimeValue::Node(node)) => node.id,
+        other => panic!("node not a node: {other:?}"),
+    };
+    assert_eq!(
+        result, vigente,
+        "filtering must happen before top-k instead of discarding the stronger obsolete hit"
+    );
+}
+
+#[tokio::test]
 async fn call_search_bm25_mcp_query_shape_executes() {
     // Exactly the query shape the MCP lexical channel generates: a map arg with
     // a list value + a `$param`, then `id(node)` / property access in RETURN and

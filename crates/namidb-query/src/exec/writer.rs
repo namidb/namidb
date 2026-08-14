@@ -35,8 +35,17 @@ use super::expr::{evaluate, is_equal, Params};
 use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
 use super::walker::{execute_inner_with_routing, ExecError, PlanRouting};
-use crate::parser::{Expression, RelationshipDirection};
+use crate::parser::{Expression, ExpressionKind, RelationshipDirection};
 use crate::plan::logical::{CreateElement, LogicalPlan, RemoveOp, SetOp};
+
+/// Number of correlated point updates hydrated at once by the write-only fast
+/// path. 128 rows keeps even 1024d/large-document `NodeView`s bounded while
+/// still amortising object-store sidecar and Parquet range reads.
+const DEFAULT_CORRELATED_WRITE_CHUNK_ROWS: usize = 128;
+/// An operator setting the environment variable must not accidentally turn
+/// the bounded path back into a request-sized materialisation.
+const MAX_CORRELATED_WRITE_CHUNK_ROWS: usize = 1_024;
+const CORRELATED_WRITE_CHUNK_ROWS_ENV: &str = "NAMIDB_CORRELATED_WRITE_CHUNK_ROWS";
 
 /// Result of a write-path execution.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +58,23 @@ pub struct WriteOutcome {
     pub properties_set: u64,
     /// Labels added (`SET n:L`) or removed (`REMOVE n:L`).
     pub labels_set: u64,
+    /// Storage point-lookup batches issued by the bounded write-only
+    /// `UNWIND ... MATCH/MERGE ... SET` paths.
+    pub correlated_write_lookup_batches: u64,
+    /// Maximum number of complete pre-write `NodeView`s simultaneously owned
+    /// by those paths. This is an observable guard against retaining one old
+    /// embedding/document per request row.
+    pub correlated_write_peak_hydrated_rows: u64,
+    /// Maximum number of executor/materialised input rows simultaneously
+    /// retained by a bounded correlated SET/MERGE path. Wide request maps are
+    /// borrowed from the parameter list and cloned into at most one live row.
+    pub correlated_write_peak_materialized_rows: u64,
+    /// Effective hard row bound used by the correlated write path. Zero means
+    /// this statement did not use the specialised path.
+    pub correlated_write_chunk_rows: u64,
+    /// Repeated lookup keys resolved from the statement-local scalar overlay
+    /// instead of walking the writer's accumulated staged memtable.
+    pub correlated_write_local_overlay_hits: u64,
 }
 
 /// Execute `plan` against `writer`, staging its mutations into the
@@ -192,6 +218,36 @@ fn execute_write_inner_mode<'a>(
             }
 
             LogicalPlan::Set { input, items } => {
+                if !retain_output
+                    && execute_discarded_correlated_node_set(input, items, writer, params, outcome)
+                        .await?
+                {
+                    return Ok(Vec::new());
+                }
+                if !retain_output {
+                    if let LogicalPlan::Merge {
+                        input: merge_input,
+                        pattern,
+                        on_match_sets,
+                        on_create_sets,
+                    } = input.as_ref()
+                    {
+                        if execute_discarded_correlated_single_node_merge(
+                            merge_input,
+                            pattern,
+                            on_match_sets,
+                            on_create_sets,
+                            items,
+                            writer,
+                            params,
+                            outcome,
+                        )
+                        .await?
+                        {
+                            return Ok(Vec::new());
+                        }
+                    }
+                }
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = if retain_output {
                     Vec::with_capacity(rows.len())
@@ -252,6 +308,21 @@ fn execute_write_inner_mode<'a>(
                 on_match_sets,
                 on_create_sets,
             } => {
+                if !retain_output
+                    && execute_discarded_correlated_single_node_merge(
+                        input,
+                        pattern,
+                        on_match_sets,
+                        on_create_sets,
+                        &[],
+                        writer,
+                        params,
+                        outcome,
+                    )
+                    .await?
+                {
+                    return Ok(Vec::new());
+                }
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = if retain_output {
                     Vec::with_capacity(rows.len().max(1))
@@ -916,6 +987,563 @@ fn execute_write_inner_mode<'a>(
         }
     }
     .boxed()
+}
+
+/// Return the bounded correlated-update chunk size.
+///
+/// Parsing is deliberately forgiving (matching the other performance tuning
+/// knobs): absent, invalid and zero values use the safe default. A hard clamp
+/// prevents a deployment typo from restoring request-sized hydration.
+fn correlated_write_chunk_rows() -> usize {
+    std::env::var(CORRELATED_WRITE_CHUNK_ROWS_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&rows| rows > 0)
+        .unwrap_or(DEFAULT_CORRELATED_WRITE_CHUNK_ROWS)
+        .min(MAX_CORRELATED_WRITE_CHUNK_ROWS)
+}
+
+/// Whether the narrow correlated SET can keep lookup identity stable.
+///
+/// A property-only update of the matched alias is safe as long as it cannot
+/// change the lookup property. Map replacement/merge and label SETs are
+/// deliberately excluded: their key/label effects need the general
+/// staged-aware executor.
+fn correlated_set_preserves_lookup_identity(
+    items: &[SetOp],
+    matched_alias: &str,
+    lookup_property: &str,
+) -> bool {
+    !items.is_empty()
+        && correlated_sets_preserve_lookup_identity(items, matched_alias, lookup_property)
+}
+
+fn correlated_sets_preserve_lookup_identity(
+    items: &[SetOp],
+    matched_alias: &str,
+    lookup_property: &str,
+) -> bool {
+    items.iter().all(|item| {
+        matches!(
+            item,
+            SetOp::Property {
+                target_alias,
+                key,
+                ..
+            } if target_alias == matched_alias && key != lookup_property
+        )
+    })
+}
+
+fn is_direct_property_of(expr: &Expression, alias: &str) -> bool {
+    let ExpressionKind::Property(access) = &expr.kind else {
+        return false;
+    };
+    matches!(
+        &access.target.kind,
+        ExpressionKind::Variable(variable) if variable.name == alias
+    )
+}
+
+/// Execute the common vectorisation/update shape without materialising its
+/// complete intermediate rowset:
+///
+/// ```text
+/// UNWIND $rows AS row
+/// MATCH (a:Label {key: row.key})
+/// SET a.embedding = row.embedding, ...
+/// ```
+///
+/// The generic tree walker must first produce every UNWIND row, then every
+/// hydrated `NodeView`, before `SET` can consume the first row. For existing
+/// nodes with wide vectors this retained both the request vectors and the old
+/// node vectors for the entire batch. At 2,000 × 1024d that was sufficient to
+/// make a routine incremental update exhaust the process.
+///
+/// This path is intentionally narrow and semantics-preserving:
+///
+/// * it only handles a terminal/discarded `SET`;
+/// * the point lookup must be unique (`multi = false`);
+/// * the driver is exactly `Empty -> UNWIND $parameter`, so the parameter list
+///   can be borrowed instead of cloned by `evaluate`;
+/// * every lookup expression is preflighted as String/NULL before the first
+///   mutation, so an unsupported type can fall back without replaying writes;
+/// * candidates are point-probed/hydrated as one bounded storage batch, then
+///   moved into `SET` one row at a time and dropped immediately.
+///
+/// The path is admitted only from a clean transaction and only when SET cannot
+/// alter the matched alias's key or labels. Each chunk therefore starts from a
+/// committed index batch; a scalar `key -> NodeId` map records just the keys
+/// this statement already modified, and duplicate keys point-read their one
+/// staged node. Work is O(total rows), rather than rescanning and decoding the
+/// accumulated staged embeddings for every chunk. Errors still bubble to the
+/// existing statement boundary, whose auto-commit wrapper discards the whole
+/// pending batch.
+async fn execute_discarded_correlated_node_set(
+    input: &LogicalPlan,
+    items: &[SetOp],
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<bool, ExecError> {
+    let LogicalPlan::NodeByPropertyValue {
+        input,
+        label,
+        alias,
+        property,
+        value,
+        multi: false,
+    } = input
+    else {
+        return Ok(false);
+    };
+    let LogicalPlan::Unwind {
+        input,
+        list,
+        alias: unwind_alias,
+    } = input.as_ref()
+    else {
+        return Ok(false);
+    };
+    if !matches!(input.as_ref(), LogicalPlan::Empty) {
+        return Ok(false);
+    }
+    if !is_direct_property_of(value, unwind_alias) {
+        return Ok(false);
+    }
+    let ExpressionKind::Parameter(parameter) = &list.kind else {
+        return Ok(false);
+    };
+    let Some(RuntimeValue::List(parameter_rows)) = params.get(parameter) else {
+        // Let the generic evaluator retain its exact missing-parameter /
+        // UNWIND-type diagnostic.
+        return Ok(false);
+    };
+    if writer.has_staged_node_mutations()
+        || !correlated_set_preserves_lookup_identity(items, alias, property)
+    {
+        // An explicit transaction may carry prior writes, while map/label/key
+        // SETs can change which node a later row should match. The generic
+        // staged-aware path is authoritative for those cases.
+        return Ok(false);
+    }
+
+    // Preflight every lookup before staging anything. Retain only compact
+    // String keys (never the parameter maps/vectors), so discovering a
+    // non-String probe can still hand the untouched statement to the generic
+    // executor without replaying side effects.
+    let mut lookup_keys = Vec::with_capacity(parameter_rows.len());
+    for parameter_row in parameter_rows {
+        let row = Row::new().with(unwind_alias.clone(), parameter_row.clone());
+        outcome.correlated_write_peak_materialized_rows =
+            outcome.correlated_write_peak_materialized_rows.max(1);
+        match evaluate(value, &row, params)? {
+            RuntimeValue::String(value) => lookup_keys.push(Some(value)),
+            RuntimeValue::Null => lookup_keys.push(None),
+            _ => return Ok(false),
+        }
+    }
+
+    let chunk_rows = correlated_write_chunk_rows();
+    outcome.correlated_write_chunk_rows =
+        outcome.correlated_write_chunk_rows.max(chunk_rows as u64);
+    let mut local_overlay: HashMap<String, NodeId> = HashMap::new();
+
+    for (parameter_chunk, lookup_chunk) in parameter_rows
+        .chunks(chunk_rows)
+        .zip(lookup_keys.chunks(chunk_rows))
+    {
+        crate::exec::limits::check_deadline()?;
+
+        let string_values = lookup_chunk
+            .iter()
+            .filter_map(|lookup_key| lookup_key.clone())
+            .collect::<Vec<_>>();
+
+        // Read only immutable/committed point indexes. Repeated keys are
+        // reconciled below through `local_overlay`, so this never walks the
+        // growing staged memtable.
+        let string_results = if string_values.is_empty() {
+            Vec::new()
+        } else {
+            outcome.correlated_write_lookup_batches += 1;
+            writer
+                .batch_lookup_committed_unique_string_candidates(label, property, &string_values)
+                .await
+                .map_err(ExecError::Storage)?
+        };
+        if string_results.len() != string_values.len() {
+            return Err(ExecError::Runtime(format!(
+                "batch property lookup returned {} results for {} values",
+                string_results.len(),
+                string_values.len()
+            )));
+        }
+
+        // Align String point results and NULL misses to parameter rows. A key
+        // already touched by this statement resolves from exactly one staged
+        // point; untouched keys retain the committed batch result.
+        let mut string_results = string_results.into_iter();
+        let mut aligned_results = Vec::with_capacity(parameter_chunk.len());
+        for lookup_key in lookup_chunk {
+            let found = match lookup_key {
+                Some(key) => {
+                    let committed = string_results.next().ok_or_else(|| {
+                        ExecError::Runtime("batch property lookup result alignment was lost".into())
+                    })?;
+                    match local_overlay.get(key) {
+                        Some(id) => {
+                            outcome.correlated_write_local_overlay_hits += 1;
+                            match writer.staged_node(*id).map_err(ExecError::Storage)? {
+                                StagedValue::Upsert(view) => Some(view),
+                                StagedValue::Tombstone => None,
+                                StagedValue::Untouched => {
+                                    return Err(ExecError::Runtime(
+                                        "correlated SET local overlay lost its staged node".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        None => committed,
+                    }
+                }
+                None => None,
+            };
+            aligned_results.push(found);
+        }
+        if string_results.next().is_some() {
+            return Err(ExecError::Runtime(
+                "batch property lookup returned extra results".into(),
+            ));
+        }
+
+        let hydrated_rows = aligned_results.iter().filter(|view| view.is_some()).count() as u64;
+        outcome.correlated_write_peak_hydrated_rows = outcome
+            .correlated_write_peak_hydrated_rows
+            .max(hydrated_rows);
+        debug_assert!(aligned_results.len() <= chunk_rows);
+
+        // Move (do not clone) each old NodeView into the one live executor row.
+        // `apply_sets` may build the new staged record, but the old wide view
+        // and the cloned UNWIND map are released before the next row/chunk.
+        for ((parameter_row, lookup_key), found) in parameter_chunk
+            .iter()
+            .zip(lookup_chunk)
+            .zip(aligned_results)
+        {
+            crate::exec::limits::check_deadline()?;
+            let Some(view) = found else {
+                continue;
+            };
+            let node_id = view.id;
+            let mut row = Row::new().with(unwind_alias.clone(), parameter_row.clone());
+            row.set(
+                alias.clone(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            let _ = apply_sets(items, row, writer, params, outcome).await?;
+            if let Some(key) = lookup_key {
+                // Same rule as the MERGE fast path: only an actually staged
+                // mutation may shadow the committed image, otherwise a repeated
+                // key in a later chunk resolves to an `Untouched` id.
+                if !matches!(
+                    writer.staged_node(node_id).map_err(ExecError::Storage)?,
+                    StagedValue::Untouched
+                ) {
+                    local_overlay.insert(key.clone(), node_id);
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// Metadata for the deliberately narrow terminal single-node MERGE path.
+///
+/// Requiring exactly one explicit unique String key (and no spread) means a
+/// batch point lookup completely decides the match branch. More expressive
+/// patterns retain the canonical MERGE executor and its full residual logic.
+struct CorrelatedSingleNodeMergeShape<'a> {
+    alias: &'a str,
+    labels: &'a [String],
+    lookup_label: String,
+    lookup_property: &'a str,
+    lookup_expression: &'a Expression,
+}
+
+fn correlated_single_node_merge_shape<'a>(
+    pattern: &'a [CreateElement],
+    writer: &WriterSession,
+) -> Option<CorrelatedSingleNodeMergeShape<'a>> {
+    let [CreateElement::Node {
+        alias,
+        labels,
+        properties,
+        properties_spread: None,
+    }] = pattern
+    else {
+        return None;
+    };
+    let [(lookup_property, lookup_expression)] = properties.as_slice() else {
+        return None;
+    };
+    if lookup_property == "_id" {
+        return None;
+    }
+
+    let schema = writer.schema();
+    let lookup_label = labels.iter().find_map(|label| {
+        let property_unique = schema.label(label).is_some_and(|definition| {
+            definition.properties.iter().any(|property| {
+                property.name.as_str() == lookup_property.as_str() && property.unique
+            })
+        });
+        let constraint_unique = schema.constraints().iter().any(|constraint| {
+            constraint.kind == namidb_core::ConstraintKind::Unique
+                && constraint.label.as_str() == label.as_str()
+                && constraint.properties.len() == 1
+                && constraint.properties[0].as_str() == lookup_property.as_str()
+        });
+        (property_unique || constraint_unique).then(|| label.clone())
+    })?;
+
+    Some(CorrelatedSingleNodeMergeShape {
+        alias,
+        labels,
+        lookup_label,
+        lookup_property,
+        lookup_expression,
+    })
+}
+
+/// Bounded write-only path for the vector-upsert shape:
+///
+/// ```text
+/// UNWIND $rows AS row
+/// MERGE (a:Label {key: row.key})
+/// [ON MATCH SET ...] [ON CREATE SET ...]
+/// [SET a.embedding = row.embedding, ...]
+/// ```
+///
+/// The generic MERGE preparation retains a materialised pattern and hydrated
+/// pre-write `NodeValue` for the complete UNWIND. This implementation borrows
+/// the request list, preflights only compact String keys, and batches committed
+/// point reads. A scalar key-to-id overlay supplies exact RYOW for duplicates
+/// and newly-created keys without scanning the growing staged memtable.
+///
+/// Admission is intentionally conservative: clean transaction, exact
+/// `Empty -> UNWIND $parameter` driver, one node with one explicit
+/// single-property unique key, and property-only SETs that cannot change that
+/// key or the node's labels. Any richer shape falls back before the first
+/// mutation.
+#[allow(clippy::too_many_arguments)]
+async fn execute_discarded_correlated_single_node_merge(
+    input: &LogicalPlan,
+    pattern: &[CreateElement],
+    on_match_sets: &[SetOp],
+    on_create_sets: &[SetOp],
+    trailing_sets: &[SetOp],
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<bool, ExecError> {
+    let LogicalPlan::Unwind {
+        input,
+        list,
+        alias: unwind_alias,
+    } = input
+    else {
+        return Ok(false);
+    };
+    if !matches!(input.as_ref(), LogicalPlan::Empty) || writer.has_staged_node_mutations() {
+        return Ok(false);
+    }
+    let ExpressionKind::Parameter(parameter) = &list.kind else {
+        return Ok(false);
+    };
+    let Some(RuntimeValue::List(parameter_rows)) = params.get(parameter) else {
+        return Ok(false);
+    };
+    let Some(shape) = correlated_single_node_merge_shape(pattern, writer) else {
+        return Ok(false);
+    };
+    if !is_direct_property_of(shape.lookup_expression, unwind_alias) {
+        return Ok(false);
+    }
+    if !correlated_sets_preserve_lookup_identity(on_match_sets, shape.alias, shape.lookup_property)
+        || !correlated_sets_preserve_lookup_identity(
+            on_create_sets,
+            shape.alias,
+            shape.lookup_property,
+        )
+        || !correlated_sets_preserve_lookup_identity(
+            trailing_sets,
+            shape.alias,
+            shape.lookup_property,
+        )
+    {
+        return Ok(false);
+    }
+
+    // Match the generic batch preparer's error-before-effects behaviour:
+    // evaluate every MERGE key before staging the first row. Only the compact
+    // String keys survive this pass; request maps and vectors are dropped
+    // immediately after each expression evaluation.
+    let mut lookup_keys = Vec::with_capacity(parameter_rows.len());
+    for parameter_row in parameter_rows {
+        let row = Row::new().with(unwind_alias.clone(), parameter_row.clone());
+        outcome.correlated_write_peak_materialized_rows =
+            outcome.correlated_write_peak_materialized_rows.max(1);
+        match evaluate(shape.lookup_expression, &row, params)? {
+            RuntimeValue::String(value) => lookup_keys.push(value),
+            _ => return Ok(false),
+        }
+    }
+
+    let chunk_rows = correlated_write_chunk_rows();
+    outcome.correlated_write_chunk_rows =
+        outcome.correlated_write_chunk_rows.max(chunk_rows as u64);
+    let mut local_overlay: HashMap<String, NodeId> = HashMap::new();
+
+    for (parameter_chunk, lookup_chunk) in parameter_rows
+        .chunks(chunk_rows)
+        .zip(lookup_keys.chunks(chunk_rows))
+    {
+        crate::exec::limits::check_deadline()?;
+
+        // Keys touched by an earlier chunk are deliberately omitted: seeding
+        // their older committed answer would overwrite the newer
+        // transactional claimant. Duplicates first seen in this chunk may
+        // share the same committed answer; processing-time overlay checks make
+        // the second occurrence observe the first occurrence's mutation.
+        let batched_positions = lookup_chunk
+            .iter()
+            .map(|key| !local_overlay.contains_key(key))
+            .collect::<Vec<_>>();
+        let batched_values = lookup_chunk
+            .iter()
+            .zip(&batched_positions)
+            .filter(|(_, batched)| **batched)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let committed = if batched_values.is_empty() {
+            Vec::new()
+        } else {
+            outcome.correlated_write_lookup_batches += 1;
+            writer
+                .seed_unmodified_committed_unique_string_candidates(
+                    &shape.lookup_label,
+                    shape.lookup_property,
+                    &batched_values,
+                )
+                .await
+                .map_err(ExecError::Storage)?
+        };
+        if committed.len() != batched_values.len() {
+            return Err(ExecError::Runtime(format!(
+                "batch MERGE property lookup returned {} results for {} values",
+                committed.len(),
+                batched_values.len()
+            )));
+        }
+        let hydrated_rows = committed.iter().filter(|view| view.is_some()).count() as u64;
+        outcome.correlated_write_peak_hydrated_rows = outcome
+            .correlated_write_peak_hydrated_rows
+            .max(hydrated_rows);
+
+        let mut committed = committed.into_iter();
+        for (index, (parameter_row, lookup_key)) in
+            parameter_chunk.iter().zip(lookup_chunk).enumerate()
+        {
+            crate::exec::limits::check_deadline()?;
+            let was_batched = batched_positions[index];
+            let committed_candidate = if was_batched {
+                committed.next()
+            } else {
+                Some(None)
+            };
+            let committed_candidate = committed_candidate.ok_or_else(|| {
+                ExecError::Runtime("batch MERGE property lookup result alignment was lost".into())
+            })?;
+            let candidate = match local_overlay.get(lookup_key) {
+                Some(id) => {
+                    outcome.correlated_write_local_overlay_hits += 1;
+                    match writer.staged_node(*id).map_err(ExecError::Storage)? {
+                        StagedValue::Upsert(view) => Some(view),
+                        StagedValue::Tombstone => None,
+                        StagedValue::Untouched => {
+                            return Err(ExecError::Runtime(
+                                "correlated MERGE local overlay lost its staged node".into(),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    debug_assert!(was_batched);
+                    committed_candidate
+                }
+            };
+
+            let expected = MaterializedMergeNode {
+                properties: BTreeMap::from([(
+                    shape.lookup_property.to_string(),
+                    RuntimeValue::String(lookup_key.clone()),
+                )]),
+                core_properties: BTreeMap::from([(
+                    shape.lookup_property.to_string(),
+                    CoreValue::Str(lookup_key.clone()),
+                )]),
+                explicit_id: None,
+            };
+            outcome.correlated_write_peak_materialized_rows =
+                outcome.correlated_write_peak_materialized_rows.max(1);
+
+            let mut row = Row::new().with(unwind_alias.clone(), parameter_row.clone());
+            let mut merged = match candidate
+                .map(NodeValue::from)
+                .filter(|node| materialized_node_matches(node, shape.labels, &expected))
+            {
+                Some(node) => {
+                    row.set(shape.alias.to_string(), RuntimeValue::Node(Box::new(node)));
+                    apply_sets(on_match_sets, row, writer, params, outcome).await?
+                }
+                None => {
+                    let row = apply_create(pattern, row, writer, params, outcome).await?;
+                    apply_sets(on_create_sets, row, writer, params, outcome).await?
+                }
+            };
+            merged = apply_sets(trailing_sets, merged, writer, params, outcome).await?;
+            let id = match merged.get(shape.alias) {
+                Some(RuntimeValue::Node(node)) => node.id,
+                _ => {
+                    return Err(ExecError::Runtime(format!(
+                        "correlated MERGE did not bind node `{}`",
+                        shape.alias
+                    )));
+                }
+            };
+            // Only a row that actually staged a mutation has to shadow the
+            // committed image for a later duplicate key. A MERGE that matched an
+            // existing node with no ON MATCH and no trailing SET stages nothing,
+            // and recording it here would make the next occurrence of that key
+            // resolve to an `Untouched` id. Leaving it out keeps the key in the
+            // next chunk's committed lookup, which returns the same node.
+            if !matches!(
+                writer.staged_node(id).map_err(ExecError::Storage)?,
+                StagedValue::Untouched
+            ) {
+                local_overlay.insert(lookup_key.clone(), id);
+            }
+        }
+        if committed.next().is_some() {
+            return Err(ExecError::Runtime(
+                "batch MERGE property lookup returned extra results".into(),
+            ));
+        }
+    }
+
+    Ok(true)
 }
 
 fn snapshot_for_write_read<'a>(

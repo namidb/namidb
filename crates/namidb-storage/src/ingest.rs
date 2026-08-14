@@ -46,6 +46,7 @@
 //! - Background flush / compaction. The caller drives them manually.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
@@ -351,6 +352,15 @@ pub struct WriterSession {
     /// further object-store writes and mints no new orphan segments.
     /// Only a fresh [`Self::open`] clears it.
     poisoned: bool,
+    /// Node rows decoded while the generic staged-aware unique String lookup
+    /// reconciles an immutable point batch with the complete staged memtable.
+    ///
+    /// This is a diagnostic counter, not cache state. The query executor's
+    /// bounded terminal `UNWIND ... MATCH ... SET` path starts from a clean
+    /// transaction and must keep this flat while it updates thousands of wide
+    /// nodes: it uses committed point batches plus a scalar, statement-local
+    /// overlay instead of repeatedly walking all prior staged embeddings.
+    staged_unique_overlay_rows_scanned: AtomicU64,
     /// Namespace label dictionary. Seeded from the manifest at `open` and
     /// extended as `upsert_node*` interns new label names; stamped onto every
     /// committed manifest so a node's on-row `LabelId`s always resolve to names.
@@ -533,6 +543,7 @@ impl WriterSession {
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
             poisoned: false,
+            staged_unique_overlay_rows_scanned: AtomicU64::new(0),
         };
         session.seed_exact_node_counts_from_metadata();
         // Publish this namespace's current immutable-object set to the shared
@@ -698,6 +709,8 @@ impl WriterSession {
             let target_label_id = self.label_dict.id(label).map(|id| id.get());
 
             for (key, entry) in self.staged_memtable.iter_nodes() {
+                self.staged_unique_overlay_rows_scanned
+                    .fetch_add(1, Ordering::Relaxed);
                 let MemKey::Node { id } = key else {
                     continue;
                 };
@@ -784,6 +797,73 @@ impl WriterSession {
                 .seed_committed_keys(label, &names, entries);
         }
         Ok(Some(views))
+    }
+
+    /// Resolve a unique String-property batch against committed state only.
+    ///
+    /// This deliberately neither scans nor overlays `staged_memtable`. It is
+    /// safe for the query writer's narrow terminal correlated-SET path, which
+    /// admits it only when the statement starts without staged node mutations
+    /// and every SET is a property update on the matched alias that cannot
+    /// change the lookup key or labels. That caller reconciles repeated keys
+    /// from a scalar statement-local map and point-reads only the corresponding
+    /// staged node. General RYOW callers must continue to use
+    /// [`Self::seed_unique_string_candidates`].
+    pub async fn batch_lookup_committed_unique_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Option<crate::read::NodeView>>> {
+        self.snapshot()
+            .batch_lookup_nodes_by_property(label, property, values)
+            .await
+    }
+
+    /// Resolve and seed unique String-property keys from committed state only.
+    ///
+    /// Unlike [`Self::seed_unique_string_candidates`], this method never walks
+    /// `staged_memtable`. The caller must prove that none of `values` has been
+    /// modified in the current transaction; otherwise installing a committed
+    /// hit/miss could overwrite the transactional index's newer claimant.
+    ///
+    /// The query writer uses this for a narrow terminal single-node MERGE. It
+    /// filters every statement-local key through its scalar overlay before
+    /// calling here, then lets normal node upserts journal newer claimants in
+    /// the transactional unique index. Once another key has been staged, these
+    /// still-committed answers are installed through the staged journal so a
+    /// later rollback cannot retain transaction-dependent partial-map state.
+    pub async fn seed_unmodified_committed_unique_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Option<crate::read::NodeView>>> {
+        let views = self
+            .snapshot()
+            .batch_lookup_nodes_by_property(label, property, values)
+            .await?;
+        let names = vec![property.to_string()];
+        let entries = values.iter().zip(&views).map(|(value, view)| {
+            let scalar = Value::Str(value.clone());
+            let key = crate::unique_index::encode_probe_key(&[&scalar])
+                .expect("String unique keys are indexable");
+            (key, view.as_ref().map(|node| node.id))
+        });
+        if self.pending_has_node_mutations() {
+            self.unique_index.seed_staged_keys(label, &names, entries);
+        } else {
+            self.unique_index
+                .seed_committed_keys(label, &names, entries);
+        }
+        Ok(views)
+    }
+
+    /// Diagnostic count of staged node rows walked by generic unique batch
+    /// reconciliation. Monotonic for the lifetime of this writer session.
+    pub fn staged_unique_overlay_rows_scanned(&self) -> u64 {
+        self.staged_unique_overlay_rows_scanned
+            .load(Ordering::Relaxed)
     }
 
     /// The per-writer unique-value index (RFC-026 constraint fast path).
@@ -2131,7 +2211,7 @@ impl WriterSession {
             attached_max_lsn = attached_max_lsn.max(descriptor.max_lsn);
             let store_ref = store.clone();
             put_futures.push(Box::pin(async move {
-                crate::flush::put_object(store_ref, &body_path, body).await
+                crate::flush::put_sidecar_payload(store_ref, &body_path, body).await
             }));
             if let Some((bloom_path, bloom_body)) = bloom {
                 bloom_count += 1;
@@ -2364,6 +2444,9 @@ impl WriterSession {
         next.vector_indexes.retain(|d| d.name != name);
         next.search_index_builds
             .retain(|state| state.kind != SstKind::VectorGraph || state.name != name);
+        next.search_lsm.retain(|state| {
+            state.kind != crate::search_lsm::SearchLsmKind::Vector || state.index_name != name
+        });
         next.ssts
             .retain(|d| !(d.kind == SstKind::VectorGraph && d.scope == name));
         let committed = self
@@ -2413,6 +2496,9 @@ impl WriterSession {
         next.text_indexes.retain(|d| d.name != name);
         next.search_index_builds
             .retain(|state| state.kind != SstKind::TextIndex || state.name != name);
+        next.search_lsm.retain(|state| {
+            state.kind != crate::search_lsm::SearchLsmKind::Text || state.index_name != name
+        });
         next.ssts
             .retain(|d| !(d.kind == SstKind::TextIndex && d.scope == name));
         let committed = self
@@ -2780,6 +2866,7 @@ pub fn clear_shared_caches() {
     if let Some(cache) = shared_adjacency_cache() {
         cache.clear();
     }
+    crate::range_cache::clear_shared_range_cache_memory();
     writer_local_cache_registry().clear();
 }
 

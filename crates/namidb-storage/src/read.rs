@@ -44,6 +44,9 @@
 //! correctness.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
@@ -54,6 +57,8 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use object_store::path::Path;
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+use object_store::ObjectMeta;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::file::metadata::ParquetMetaData;
 use tracing::instrument;
@@ -79,9 +84,19 @@ use crate::manifest::{
 use crate::memtable::{MemEntry, MemKey, MemOp, MemtableSnapshot};
 use crate::node_cache::{NodeCacheKey, NodeViewCache};
 use crate::paths::NamespacePaths;
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+use crate::search_lsm::{
+    select_search_read_plan, validate_search_barrier, SearchLsmKind, SearchReadPlan,
+    SearchSegmentRef, SearchSegmentStats, SearchStatValue,
+};
 use crate::sst::bloom::BloomFilter;
+use crate::sst::edges::paged_reader::PagedEdgeReader;
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::EdgeDirection;
+use crate::sst::nodes::property_pages::{
+    NodePropertyPageConfig, NodePropertyPageReader, PropertyCell,
+    NODE_PROPERTY_PAGES_FORMAT_VERSION,
+};
 use crate::sst::nodes::{
     load_node_sst_metadata_async, parse_node_sst_metadata, prop_column_name, row_groups_for_keys,
     scan_row_groups_async as node_scan_row_groups_async,
@@ -92,6 +107,141 @@ use crate::sst::nodes::{
     COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
+
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[path = "search_lsm_read.rs"]
+mod search_lsm_read;
+
+const SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES_ENV: &str = "NAMIDB_SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES";
+const SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES_ENV: &str =
+    "NAMIDB_SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES";
+const SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV: &str =
+    "NAMIDB_SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES";
+const DEFAULT_SNAPSHOT_LOCAL_CACHE_MAX_BYTES: usize = 1024 * 1024;
+const SNAPSHOT_ROW_GROUP_CACHE_MAX_ENTRIES: usize = 2;
+const SNAPSHOT_EDGE_READER_CACHE_MAX_ENTRIES: usize = 32;
+const SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_ENTRIES: usize = 32;
+const SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES: usize = 256;
+
+/// Small byte- and count-bounded cache owned by one immutable query snapshot.
+///
+/// Process-wide caches use Foyer and richer admission. Snapshot-local caches
+/// only avoid repeating metadata/row-group work inside one query, but they
+/// still need hard ceilings: query concurrency otherwise multiplies an
+/// apparently harmless unbounded `HashMap`. The deliberately tiny entry caps
+/// also make the O(entries) LRU victim selection bounded.
+#[derive(Debug)]
+struct SnapshotByteCache<K, V> {
+    entries: HashMap<K, SnapshotByteCacheEntry<V>>,
+    used_bytes: usize,
+    capacity_bytes: usize,
+    max_entries: usize,
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct SnapshotByteCacheEntry<V> {
+    value: V,
+    weight: usize,
+    touched: u64,
+}
+
+impl<K, V> SnapshotByteCache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    fn new(capacity_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            used_bytes: 0,
+            capacity_bytes,
+            max_entries,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        let entry = self.entries.get_mut(key)?;
+        self.clock = self.clock.saturating_add(1);
+        entry.touched = self.clock;
+        Some(entry.value.clone())
+    }
+
+    fn insert(&mut self, key: K, value: V, estimated_bytes: usize) {
+        let weight = estimated_bytes.max(SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES);
+        if self.capacity_bytes == 0 || self.max_entries == 0 || weight > self.capacity_bytes {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(previous.weight);
+        }
+        while self.entries.len() >= self.max_entries
+            || self.used_bytes.saturating_add(weight) > self.capacity_bytes
+        {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(previous) = self.entries.remove(&victim) {
+                self.used_bytes = self.used_bytes.saturating_sub(previous.weight);
+            }
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.used_bytes = self.used_bytes.saturating_add(weight);
+        self.entries.insert(
+            key,
+            SnapshotByteCacheEntry {
+                value,
+                weight,
+                touched: self.clock,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn snapshot_local_cache_max_bytes(name: &str) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    name,
+                    value,
+                    %error,
+                    "disabling snapshot-local cache: setting must be an exact byte count"
+                );
+                0
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_SNAPSHOT_LOCAL_CACHE_MAX_BYTES.min(
+            crate::cache_budget::cache_max_bytes()
+                .checked_div(64)
+                .unwrap_or(0),
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                name,
+                "disabling snapshot-local cache: setting is not valid UTF-8"
+            );
+            0
+        }
+    }
+}
 
 /// Projection of a node row materialised by the read path.
 ///
@@ -124,6 +274,312 @@ pub enum VectorFilterSearch {
     Unsupported,
 }
 
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[derive(Debug)]
+struct SearchObjectRangeSource {
+    pinned: crate::range_cache::PinnedObjectRangeSource,
+}
+
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+impl SearchObjectRangeSource {
+    async fn new(store: Arc<dyn ObjectStore>, meta: ObjectMeta) -> Result<Self> {
+        // Search SST names are create-only UUID paths. Prefer a backend
+        // version/ETag precondition; local adapters that expose neither use
+        // the common source's explicit immutable-path contract.
+        let pinned =
+            crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(store, meta).await?;
+        Ok(Self { pinned })
+    }
+
+    fn file_len(&self) -> u64 {
+        self.pinned.object_size()
+    }
+
+    async fn read(&self, range: Range<u64>) -> Result<Bytes> {
+        self.pinned.read_range(range).await
+    }
+}
+
+#[cfg(feature = "text-index")]
+#[async_trait::async_trait]
+impl crate::sst::text::TextIndexRangeSource for SearchObjectRangeSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.read(range).await
+    }
+
+    async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned.read_ranges(ranges).await
+    }
+}
+
+#[cfg(feature = "vector-index")]
+#[async_trait::async_trait]
+impl crate::sst::vector::v5::VectorV5RangeSource for SearchObjectRangeSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.read(range).await
+    }
+
+    async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned.read_ranges(ranges).await
+    }
+}
+
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[async_trait::async_trait]
+impl crate::sst::search_delta::SearchVersionRangeSource for SearchObjectRangeSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.read(range).await
+    }
+
+    async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned.read_ranges(ranges).await
+    }
+}
+
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+enum TextSearchIndex {
+    Legacy(Arc<crate::sst::text::TextIndex>),
+    Ranged(Arc<crate::sst::text::TextIndexV3Reader>),
+}
+
+#[cfg(feature = "text-index")]
+impl TextSearchIndex {
+    async fn contains_any_doc(&self, ids: &[[u8; 16]]) -> Result<bool> {
+        match self {
+            Self::Legacy(index) => Ok(ids.iter().any(|id| index.contains_doc(id))),
+            Self::Ranged(index) => index.contains_any_doc(ids).await,
+        }
+    }
+
+    async fn search_query(
+        &self,
+        query: &crate::text::TextQuery,
+        k: Option<usize>,
+    ) -> Result<Vec<([u8; 16], f64)>> {
+        match self {
+            Self::Legacy(index) => {
+                use crate::search_workspace::{
+                    search_max_result_bytes, search_max_text_result_hits, shared_search_workspace,
+                    MATERIALISED_TEXT_RESULT_BYTES_PER_HIT,
+                };
+
+                // V2 is retained for in-place compatibility, but its postings
+                // are monolithic and scoring accumulates one map entry per
+                // potentially matching document. Admit that worst case
+                // explicitly so a legacy snapshot cannot bypass the same
+                // process-wide transient-memory ceiling as V3.
+                const SCORE_MAP_BYTES_PER_DOC: usize = 64;
+                // Phrase evaluation can briefly retain the prior allowed set,
+                // the current phrase set, and their intersection.
+                const PHRASE_SET_BYTES_PER_DOC: usize = 96;
+                let documents = usize::try_from(index.doc_count()).unwrap_or(usize::MAX);
+                let retained_hits = match k {
+                    Some(limit) => limit.min(documents),
+                    None => search_max_text_result_hits()
+                        .saturating_add(1)
+                        .min(documents),
+                };
+                let per_doc = SCORE_MAP_BYTES_PER_DOC.saturating_add(
+                    (!query.phrases.is_empty())
+                        .then_some(PHRASE_SET_BYTES_PER_DOC)
+                        .unwrap_or(0),
+                );
+                let required_bytes = documents.saturating_mul(per_doc).saturating_add(
+                    retained_hits.saturating_mul(MATERIALISED_TEXT_RESULT_BYTES_PER_HIT),
+                );
+                let _workspace = shared_search_workspace()
+                    .reserve("legacy full-text search", required_bytes)
+                    .await?;
+
+                let effective_k = k.or(Some(retained_hits));
+                let hits = index.search_query(query, effective_k);
+                if k.is_none() {
+                    let maximum_hits = search_max_text_result_hits();
+                    if hits.len() > maximum_hits {
+                        return Err(Error::SearchResultLimitExceeded {
+                            index_kind: "full-text",
+                            estimated_bytes: hits
+                                .len()
+                                .saturating_mul(MATERIALISED_TEXT_RESULT_BYTES_PER_HIT),
+                            limit_bytes: search_max_result_bytes(),
+                        });
+                    }
+                }
+                Ok(hits)
+            }
+            Self::Ranged(index) => index.search_query(query, k).await,
+        }
+    }
+
+    fn ranged_metadata(&self) -> Option<(u64, u64, u64, [u8; 16], [u8; 16])> {
+        let Self::Ranged(index) = self else {
+            return None;
+        };
+        let (min_node_id, max_node_id) = index.node_id_bounds();
+        Some((
+            index.doc_count(),
+            index.term_count(),
+            index.total_len(),
+            min_node_id,
+            max_node_id,
+        ))
+    }
+}
+
+#[cfg(feature = "vector-index")]
+#[derive(Debug)]
+enum VectorSearchIndex {
+    Legacy(Arc<crate::sst::vector::VectorGraphIndex>),
+    Ranged(Arc<crate::sst::vector::v5::VectorV5Reader>),
+}
+
+#[cfg(any(feature = "text-index", feature = "vector-index"))]
+#[derive(Debug)]
+struct SelectedSearchBase {
+    descriptor_index: usize,
+    active_segment: Option<SearchSegmentRef>,
+}
+
+#[cfg(feature = "vector-index")]
+impl VectorSearchIndex {
+    fn point_count(&self) -> u64 {
+        match self {
+            Self::Legacy(index) => index.point_count(),
+            Self::Ranged(index) => index.point_count(),
+        }
+    }
+
+    fn higher_is_better(&self) -> bool {
+        match self {
+            Self::Legacy(index) => index.higher_is_better(),
+            Self::Ranged(index) => {
+                !matches!(index.metric(), crate::manifest::VectorMetric::Euclidean)
+            }
+        }
+    }
+
+    async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<([u8; 16], f32)>> {
+        match self {
+            Self::Legacy(index) => Ok(index.search(query, k, ef)),
+            Self::Ranged(index) => {
+                index
+                    .search(query, k, vector_v5_search_options(index, ef))
+                    .await
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vector-index")]
+fn vector_v5_search_options(
+    index: &crate::sst::vector::v5::VectorV5Reader,
+    ef: usize,
+) -> crate::sst::vector::v5::VectorV5SearchOptions {
+    let page_count = index.page_count().max(1);
+    // `ef` remains the public accuracy knob. Four coarse leaves is the cold
+    // minimum; widening eventually reaches every page when `ef` approaches
+    // the corpus, preserving the executor's exact-fallback/exhaustion logic.
+    let nprobe = ef.div_ceil(64).max(4).min(page_count);
+    crate::sst::vector::v5::VectorV5SearchOptions {
+        nprobe,
+        max_nprobe: nprobe.saturating_mul(8).max(nprobe).min(page_count),
+        rerank_factor: 8,
+    }
+}
+
+#[cfg(feature = "vector-index")]
+fn active_vector_base_matches(
+    index: &VectorSearchIndex,
+    descriptor: &SstDescriptor,
+    segment: &SearchSegmentRef,
+) -> bool {
+    let VectorSearchIndex::Ranged(index) = index else {
+        return false;
+    };
+    let KindSpecificStats::VectorGraph {
+        dim,
+        metric,
+        point_count,
+        ..
+    } = &descriptor.kind_specific
+    else {
+        return false;
+    };
+    let expected_metric = match index.metric() {
+        crate::manifest::VectorMetric::Cosine => "cosine",
+        crate::manifest::VectorMetric::Dot => "dot",
+        crate::manifest::VectorMetric::Euclidean => "euclidean",
+    };
+    let (min_node_id, max_node_id) = index.node_id_bounds();
+    let stats_match = matches!(
+        segment.stats,
+        SearchSegmentStats::Vector {
+            live_count: SearchStatValue::Absolute(count)
+        } if count == index.point_count()
+    );
+    *dim == index.dim()
+        && metric == expected_metric
+        && *point_count == index.point_count()
+        && descriptor.row_count == index.point_count()
+        && descriptor.min_key == min_node_id
+        && descriptor.max_key == max_node_id
+        && stats_match
+        && segment
+            .complete_filter_properties
+            .iter()
+            .all(|property| index.supports_filter_property(property))
+        && segment.content_xxh3
+            == crate::search_lsm::legacy_base_content_fingerprint(
+                descriptor,
+                segment.format,
+                &segment.complete_filter_properties,
+            )
+}
+
+#[cfg(feature = "text-index")]
+fn active_text_base_matches(
+    index: &TextSearchIndex,
+    descriptor: &SstDescriptor,
+    segment: &SearchSegmentRef,
+) -> bool {
+    let Some((doc_count, term_count, total_len, min_node_id, max_node_id)) =
+        index.ranged_metadata()
+    else {
+        return false;
+    };
+    let KindSpecificStats::TextIndex {
+        doc_count: descriptor_docs,
+        term_count: descriptor_terms,
+        total_len: descriptor_len,
+    } = &descriptor.kind_specific
+    else {
+        return false;
+    };
+    let stats_match = matches!(
+        segment.stats,
+        SearchSegmentStats::Text {
+            doc_count: SearchStatValue::Absolute(docs),
+            total_len: SearchStatValue::Absolute(len),
+            term_df_violation_count: 0,
+        } if docs == doc_count && len == total_len
+    );
+    *descriptor_docs == doc_count
+        && *descriptor_terms == term_count
+        && *descriptor_len == total_len
+        && descriptor.row_count == doc_count
+        && descriptor.min_key == min_node_id
+        && descriptor.max_key == max_node_id
+        && segment.complete_filter_properties.is_empty()
+        && stats_match
+        && segment.content_xxh3
+            == crate::search_lsm::legacy_base_content_fingerprint(
+                descriptor,
+                segment.format,
+                &segment.complete_filter_properties,
+            )
+}
+
 /// Projection of an edge row materialised by the read path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeView {
@@ -146,7 +602,6 @@ enum EdgePointWinner {
     Materialized(BTreeMap<String, Value>),
     Persisted {
         absolute: String,
-        reader: Arc<EdgeSstReader>,
         edge_offset: usize,
     },
 }
@@ -180,7 +635,7 @@ pub struct Snapshot<'mt> {
     /// across namespaces. `Arc<str>` so per-key clones are pointer-cheap.
     cache_namespace: Arc<str>,
     cache: Option<SstCache>,
-    /// Per-snapshot NodeView cache. Many queries access the same node
+    /// Byte-bounded per-snapshot NodeView cache. Many queries access the same node
     /// from multiple sides (e.g., Join probe + reverse Expand, or the
     /// same friend reached through several paths in IC09). Caching the
     /// post-decode `Option<NodeView>` skips bloom probe + SST body
@@ -191,10 +646,10 @@ pub struct Snapshot<'mt> {
     /// so the cache fills during one query and drops when the query
     /// finishes — no cross-query staleness risk.
     ///
-    /// Mutex (not RefCell) because the snapshot is shared across the
-    /// tokio executor via `&Snapshot<'_>` and the tree-walking executor
-    /// drives multiple `lookup_node` calls in async tasks.
-    node_cache: Mutex<HashMap<(String, NodeId), Option<NodeView>>>,
+    /// [`NodeViewCache`] keeps both positive and negative entries under
+    /// `NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES`; every key includes namespace
+    /// and logical generation just like the shared L2.
+    node_cache: NodeViewCache,
     /// Cold node lookup routing (RFC-003):
     /// - `Force(false)` — always full-body GET (legacy, populates
     /// body cache). Used by `read_latency.cold_no_cache`.
@@ -260,10 +715,21 @@ pub struct Snapshot<'mt> {
     /// [`Self::batch_lookup_nodes`] ONLY when no process-wide [`SstCache`]
     /// is attached; with a cache attached, decoded row groups live in the
     /// byte-budgeted `SstCache` tier and are shared across snapshots.
-    /// Holding row groups (not whole SSTs) bounds this map by what one
-    /// query actually touches — an L1-compacted whole-dataset SST no
-    /// longer materialises in full per snapshot.
-    decoded_node_row_groups: Mutex<HashMap<NodeRowGroupKey, DecodedNodeRowGroup>>,
+    /// This fallback is additionally capped by
+    /// `NAMIDB_SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES` and two entries. An
+    /// oversized decoded group remains valid for the current operation but is
+    /// not retained.
+    decoded_node_row_groups: Mutex<SnapshotByteCache<NodeRowGroupKey, DecodedNodeRowGroup>>,
+    /// Metadata-only range readers opened during this snapshot. Immutable data
+    /// pages themselves are shared process-wide by the RAM/NVMe range cache;
+    /// this small cache only avoids repeating HEAD/footer parsing inside one
+    /// batched graph operation. It is capped by
+    /// `NAMIDB_SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES` and 32 readers.
+    paged_edge_readers: Mutex<SnapshotByteCache<String, Arc<PagedEdgeReader>>>,
+    /// Decoded node-property catalogs only; page indexes and value payloads
+    /// remain in the generation-pinned shared range cache. Both byte and entry
+    /// ceilings prevent high query concurrency from multiplying metadata RAM.
+    node_property_readers: Mutex<SnapshotByteCache<String, Arc<NodePropertyPageReader>>>,
     /// Read-your-own-writes overlay (RFC-026). A writer's staged-but-
     /// uncommitted batch, materialised as a second memtable and consulted
     /// alongside the committed `memtable`. The staged ops carry LSNs
@@ -336,7 +802,7 @@ impl<'mt> Snapshot<'mt> {
             paths,
             cache_namespace,
             cache: None,
-            node_cache: Mutex::new(HashMap::new()),
+            node_cache: NodeViewCache::new(crate::node_cache::snapshot_node_cache_max_bytes()),
             ranged_mode: RangedMode::Auto,
             ranged_threshold_bytes: DEFAULT_RANGED_THRESHOLD_BYTES,
             adjacency_cache: None,
@@ -347,7 +813,18 @@ impl<'mt> Snapshot<'mt> {
             memtable_claimant_cell: None,
             transactional_property_index: None,
             transactional_property_index_staged: false,
-            decoded_node_row_groups: Mutex::new(HashMap::new()),
+            decoded_node_row_groups: Mutex::new(SnapshotByteCache::new(
+                snapshot_local_cache_max_bytes(SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES_ENV),
+                SNAPSHOT_ROW_GROUP_CACHE_MAX_ENTRIES,
+            )),
+            paged_edge_readers: Mutex::new(SnapshotByteCache::new(
+                snapshot_local_cache_max_bytes(SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES_ENV),
+                SNAPSHOT_EDGE_READER_CACHE_MAX_ENTRIES,
+            )),
+            node_property_readers: Mutex::new(SnapshotByteCache::new(
+                snapshot_local_cache_max_bytes(SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV),
+                SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_ENTRIES,
+            )),
             overlay: None,
         }
     }
@@ -434,6 +911,15 @@ impl<'mt> Snapshot<'mt> {
     fn node_cache_generation(&self) -> u64 {
         self.property_index_generation
             .unwrap_or(self.manifest.manifest.version)
+    }
+
+    fn node_cache_key(&self, label: &str, node_id: NodeId) -> NodeCacheKey {
+        NodeCacheKey {
+            namespace: self.cache_namespace.clone(),
+            manifest_version: self.node_cache_generation(),
+            label: label.to_string(),
+            node_id,
+        }
     }
 
     /// Attach the writer-private committed+staged postings index.
@@ -2502,8 +2988,8 @@ impl<'mt> Snapshot<'mt> {
         // repeatedly within one query (~10× reuse for IC09 friends-of-
         // friends, more for highly-connected nodes). Clone is cheap
         // (~100 ns) vs the cold SST walk (~378 µs).
-        let intra_key = (label.to_string(), id);
-        if let Some(cached) = self.node_cache.lock().unwrap().get(&intra_key).cloned() {
+        let cache_key = self.node_cache_key(label, id);
+        if let Some(cached) = self.node_cache.get(&cache_key) {
             namidb_core::profile::record("Snapshot::lookup_node.l1_hit", 0);
             return Ok(cached);
         }
@@ -2512,19 +2998,10 @@ impl<'mt> Snapshot<'mt> {
         // Slot key uses the logical node generation: an edge-only commit can
         // reuse the view, while a node mutation advances the generation.
         if let Some(shared) = &self.shared_node_cache {
-            let shared_key = NodeCacheKey {
-                namespace: self.cache_namespace.clone(),
-                manifest_version: self.node_cache_generation(),
-                label: label.to_string(),
-                node_id: id,
-            };
-            if let Some(cached) = shared.get(&shared_key) {
+            if let Some(cached) = shared.get(&cache_key) {
                 namidb_core::profile::record("Snapshot::lookup_node.l2_hit", 0);
                 // Promote into L1 so subsequent intra-snap calls skip L2.
-                self.node_cache
-                    .lock()
-                    .unwrap()
-                    .insert(intra_key, cached.clone());
+                self.node_cache.insert(cache_key.clone(), cached.clone());
                 return Ok(cached);
             }
         }
@@ -2536,21 +3013,161 @@ impl<'mt> Snapshot<'mt> {
             .await?
             .filter(|v| v.labels.contains(label));
         // Insert into L1.
-        self.node_cache
-            .lock()
-            .unwrap()
-            .insert(intra_key, result.clone());
+        self.node_cache.insert(cache_key.clone(), result.clone());
         // Insert into L2 if attached.
         if let Some(shared) = &self.shared_node_cache {
-            let shared_key = NodeCacheKey {
-                namespace: self.cache_namespace.clone(),
-                manifest_version: self.node_cache_generation(),
-                label: label.to_string(),
-                node_id: id,
-            };
-            shared.insert(shared_key, result.clone());
+            shared.insert(cache_key, result.clone());
         }
         Ok(result)
+    }
+
+    /// Prove label membership for many node ids without materialising their
+    /// property maps.
+    ///
+    /// This accelerator is exact only when persisted node ranges are
+    /// disjoint and there is no node memtable: in that layout each id can
+    /// belong to at most one SST, and its SST-bound `(LabelId, NodeId)`
+    /// sidecar contains the complete live membership set. Missing/corrupt
+    /// sidecars, overlapping generations and an empty `labels` constraint
+    /// return `None`; callers must then use the ordinary node point reader.
+    ///
+    /// The result preserves input order and duplicates. `false` covers an
+    /// absent/tombstoned node as well as a live node missing any requested
+    /// label. B+tree probes are grouped by page and capped inside
+    /// `batch_label_contains_from_source`, so a high-degree graph expansion
+    /// does not issue one header/footer read or hydrate one embedding per
+    /// relationship endpoint.
+    pub async fn try_batch_nodes_have_labels(
+        &self,
+        labels: &[String],
+        ids: &[NodeId],
+    ) -> Result<Option<Vec<bool>>> {
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if labels.is_empty() {
+            // Membership in zero labels does not prove that the endpoint
+            // itself exists; retain the authoritative node point path.
+            if let Some(cache) = &self.cache {
+                cache.record_label_membership_fallback();
+            }
+            return Ok(None);
+        }
+        let Some(descriptors) = self.disjoint_node_descriptors() else {
+            if let Some(cache) = &self.cache {
+                cache.record_label_membership_fallback();
+            }
+            return Ok(None);
+        };
+        let mut label_ids = Vec::with_capacity(labels.len());
+        for label in labels {
+            let Some(label_id) = self.manifest.manifest.label_dict.id(label) else {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fast_path();
+                }
+                return Ok(Some(vec![false; ids.len()]));
+            };
+            label_ids.push(label_id);
+        }
+
+        let mut probes_by_descriptor = BTreeMap::<usize, Vec<(usize, [u8; 16])>>::new();
+        for (position, id) in ids.iter().enumerate() {
+            let id_bytes = *id.as_bytes();
+            let candidate = descriptors.partition_point(|descriptor_index| {
+                self.manifest.manifest.ssts[*descriptor_index].max_key < id_bytes
+            });
+            let Some(&descriptor_index) = descriptors.get(candidate) else {
+                continue;
+            };
+            let descriptor = &self.manifest.manifest.ssts[descriptor_index];
+            if descriptor.min_key <= id_bytes && id_bytes <= descriptor.max_key {
+                probes_by_descriptor
+                    .entry(descriptor_index)
+                    .or_default()
+                    .push((position, id_bytes));
+            }
+        }
+
+        let mut output = vec![false; ids.len()];
+        for (descriptor_index, probes) in probes_by_descriptor {
+            let descriptor = &self.manifest.manifest.ssts[descriptor_index];
+            let Some(index) = &descriptor.label_index else {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            };
+            if index.format != PropertyIndexFormat::PagedV1
+                || index.per_label_counts.is_empty()
+                || self
+                    .validated_node_descriptor_live_count(descriptor)
+                    .is_none()
+            {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            }
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
+            let source = match self
+                .pinned_sidecar_source(&absolute, Some(index.size_bytes))
+                .await
+            {
+                Ok(source) => source,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    if let Some(cache) = &self.cache {
+                        cache.record_label_membership_fallback();
+                    }
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let probe_ids = probes.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+            let mut descriptor_matches = vec![true; probes.len()];
+            for label_id in &label_ids {
+                let (matches, stats) =
+                    match crate::sst::paged_index::batch_label_contains_from_source(
+                        &source,
+                        label_id.get(),
+                        &probe_ids,
+                        *descriptor.id.as_bytes(),
+                        &index.per_label_counts,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if optional_accelerator_fallback(&error) => {
+                            if let Some(cache) = &self.cache {
+                                cache.record_label_membership_fallback();
+                            }
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_probe(probe_ids.len(), stats);
+                }
+                if matches.len() != probes.len() || stats.index_entries != index.posting_count {
+                    if let Some(cache) = &self.cache {
+                        cache.record_label_membership_fallback();
+                    }
+                    return Ok(None);
+                }
+                for (combined, one_label) in descriptor_matches.iter_mut().zip(matches) {
+                    *combined &= one_label;
+                }
+                if descriptor_matches.iter().all(|matched| !*matched) {
+                    break;
+                }
+            }
+            for ((position, _), matched) in probes.into_iter().zip(descriptor_matches) {
+                output[position] = matched;
+            }
+        }
+        if let Some(cache) = &self.cache {
+            cache.record_label_membership_fast_path();
+        }
+        Ok(Some(output))
     }
 
     /// Batched analogue of [`Self::lookup_node`]: probe many `ids` for
@@ -2606,46 +3223,49 @@ impl<'mt> Snapshot<'mt> {
         // L1 cache pass: drop any id that's already resolved.
         let mut pending: std::collections::HashSet<[u8; 16]> =
             id_to_outputs.keys().copied().collect();
+        let unique_ids = id_to_outputs.keys().copied().collect::<Vec<_>>();
+        let l1_keys = unique_ids
+            .iter()
+            .map(|id_bytes| {
+                self.node_cache_key(label, NodeId::from_uuid(Uuid::from_bytes(*id_bytes)))
+            })
+            .collect::<Vec<_>>();
+        for ((id_bytes, outputs), cached) in unique_ids
+            .iter()
+            .map(|id_bytes| (id_bytes, &id_to_outputs[id_bytes]))
+            .zip(self.node_cache.get_many(&l1_keys))
         {
-            let cache = self.node_cache.lock().unwrap();
-            for (id_bytes, outputs) in &id_to_outputs {
-                let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-                let intra_key = (label.to_string(), id);
-                if let Some(cached) = cache.get(&intra_key).cloned() {
-                    namidb_core::profile::record("Snapshot::batch_lookup_nodes.l1_hit", 0);
-                    for &i in outputs {
-                        out[i] = cached.clone();
-                    }
-                    pending.remove(id_bytes);
+            if let Some(cached) = cached {
+                namidb_core::profile::record("Snapshot::batch_lookup_nodes.l1_hit", 0);
+                for &i in outputs {
+                    out[i] = cached.clone();
                 }
+                pending.remove(id_bytes);
             }
         }
 
         // L2 cache pass: same logic against the cross-snapshot cache.
         if let Some(shared) = &self.shared_node_cache {
-            let node_generation = self.node_cache_generation();
-            let mut promote: Vec<(NodeCacheKey, Option<NodeView>)> = Vec::new();
-            for id_bytes in &pending {
-                let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-                let shared_key = NodeCacheKey {
-                    namespace: self.cache_namespace.clone(),
-                    manifest_version: node_generation,
-                    label: label.to_string(),
-                    node_id: id,
-                };
-                if let Some(cached) = shared.get(&shared_key) {
+            let pending_ids = pending.iter().copied().collect::<Vec<_>>();
+            let pending_keys = pending_ids
+                .iter()
+                .map(|id_bytes| {
+                    self.node_cache_key(label, NodeId::from_uuid(Uuid::from_bytes(*id_bytes)))
+                })
+                .collect::<Vec<_>>();
+            for ((id_bytes, key), cached) in pending_ids
+                .iter()
+                .zip(&pending_keys)
+                .zip(shared.get_many(&pending_keys))
+            {
+                if let Some(cached) = cached {
                     namidb_core::profile::record("Snapshot::batch_lookup_nodes.l2_hit", 0);
                     for &i in &id_to_outputs[id_bytes] {
                         out[i] = cached.clone();
                     }
-                    promote.push((shared_key.clone(), cached));
+                    self.node_cache.insert(key.clone(), cached);
+                    pending.remove(id_bytes);
                 }
-            }
-            let mut cache = self.node_cache.lock().unwrap();
-            for (key, view) in promote {
-                let id_bytes = *key.node_id.as_bytes();
-                pending.remove(&id_bytes);
-                cache.insert((key.label, key.node_id), view);
             }
         }
 
@@ -2722,12 +3342,19 @@ impl<'mt> Snapshot<'mt> {
                         self.paths.namespace_prefix().as_ref(),
                         locator.path
                     );
-                    let probed = crate::sst::paged_index::probe_node_records(
-                        self.store.clone(),
-                        Path::from(locator_absolute),
-                        &sorted_pending,
-                    )
-                    .await;
+                    let probed = match self
+                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
+                        .await
+                    {
+                        Ok(source) => {
+                            crate::sst::paged_index::probe_node_records_from_source(
+                                &source,
+                                &sorted_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     match probed {
                         Ok((records, stats)) if stats.index_entries == locator.entry_count => {
                             let decoded = records
@@ -2805,12 +3432,19 @@ impl<'mt> Snapshot<'mt> {
                     self.paths.namespace_prefix().as_ref(),
                     locator.path
                 );
-                let located = crate::sst::paged_index::probe_node_locator(
-                    self.store.clone(),
-                    Path::from(locator_absolute),
-                    &sorted_pending,
-                )
-                .await;
+                let located = match self
+                    .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
+                    .await
+                {
+                    Ok(source) => {
+                        crate::sst::paged_index::probe_node_locator_from_source(
+                            &source,
+                            &sorted_pending,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
                 match located {
                     Ok((located, locator_stats)) => {
                         if locator_stats.index_entries != locator.entry_count {
@@ -2894,8 +3528,7 @@ impl<'mt> Snapshot<'mt> {
                         .decoded_node_row_groups
                         .lock()
                         .unwrap()
-                        .get(&(absolute.clone(), rg))
-                        .cloned(),
+                        .get(&(absolute.clone(), rg)),
                 };
                 match hit {
                     Some(b) => decoded.push(b),
@@ -2951,10 +3584,14 @@ impl<'mt> Snapshot<'mt> {
                                 );
                             }
                             None => {
-                                self.decoded_node_row_groups
-                                    .lock()
-                                    .unwrap()
-                                    .insert((absolute.clone(), rg), batches.clone());
+                                let key = (absolute.clone(), rg);
+                                let weight =
+                                    crate::cache::decoded_node_row_group_weight(&key, &batches);
+                                self.decoded_node_row_groups.lock().unwrap().insert(
+                                    key,
+                                    batches.clone(),
+                                    weight,
+                                );
                             }
                         }
                         decoded.push(batches);
@@ -2976,8 +3613,6 @@ impl<'mt> Snapshot<'mt> {
         // 3. Push every (resolved or negative) outcome into the output
         // vector and populate the cache tiers.
         let shared = self.shared_node_cache.clone();
-        let node_generation = self.node_cache_generation();
-        let mut cache_l1 = self.node_cache.lock().unwrap();
         for id_bytes in &pending {
             let view = winners
                 .remove(id_bytes)
@@ -2988,15 +3623,10 @@ impl<'mt> Snapshot<'mt> {
                 out[i] = view.clone();
             }
             let id = NodeId::from_uuid(Uuid::from_bytes(*id_bytes));
-            cache_l1.insert((label.to_string(), id), view.clone());
+            let cache_key = self.node_cache_key(label, id);
+            self.node_cache.insert(cache_key.clone(), view.clone());
             if let Some(ref shared) = shared {
-                let shared_key = NodeCacheKey {
-                    namespace: self.cache_namespace.clone(),
-                    manifest_version: node_generation,
-                    label: label.to_string(),
-                    node_id: id,
-                };
-                shared.insert(shared_key, view);
+                shared.insert(cache_key, view);
             }
         }
 
@@ -3498,12 +4128,13 @@ impl<'mt> Snapshot<'mt> {
                     .iter()
                     .map(|(src, dst)| (*src.as_bytes(), *dst.as_bytes()))
                     .collect();
-                let probed = crate::sst::paged_index::probe_edge_points(
-                    self.store.clone(),
-                    Path::from(absolute.clone()),
-                    &raw_pairs,
-                )
-                .await;
+                let probed = match self.pinned_sidecar_source(&absolute, None).await {
+                    Ok(source) => {
+                        crate::sst::paged_index::probe_edge_points_from_source(&source, &raw_pairs)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
                 let decoded = match probed {
                     Ok((found, stats)) if stats.index_entries == desc.row_count => {
                         if let Some(cache) = &self.cache {
@@ -3591,12 +4222,15 @@ impl<'mt> Snapshot<'mt> {
                 continue;
             }
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
-            let reader = self.fetch_edge_reader(&absolute).await?;
+            let reader = self.fetch_paged_edge_reader(&absolute).await?;
             for (src, dst) in desc_pairs {
                 if !admitted_sources.contains(&src) {
                     continue;
                 }
-                let Some(point) = reader.lookup_partner(src.as_bytes(), dst.as_bytes())? else {
+                let Some(point) = reader
+                    .lookup_partner(src.as_bytes(), dst.as_bytes())
+                    .await?
+                else {
                     continue;
                 };
                 let source = if point.tombstone {
@@ -3604,7 +4238,6 @@ impl<'mt> Snapshot<'mt> {
                 } else {
                     EdgePointWinner::Persisted {
                         absolute: absolute.clone(),
-                        reader: reader.clone(),
                         edge_offset: point.edge_offset,
                     }
                 };
@@ -3627,15 +4260,18 @@ impl<'mt> Snapshot<'mt> {
                 EdgePointWinner::Materialized(properties) => properties,
                 EdgePointWinner::Persisted {
                     absolute,
-                    reader,
                     edge_offset,
                 } => {
                     if materialize_properties {
+                        // Property streams are still Arrow IPC streams in v1
+                        // and therefore eager. Delay this full-body path until
+                        // after LWW has selected a live winning point.
+                        let reader = self.fetch_edge_reader(&absolute).await?;
                         let streams = match local_streams.get(&absolute) {
                             Some(streams) => streams.clone(),
                             None => {
                                 let streams =
-                                    self.fetch_edge_streams(&absolute, edge_type, &reader)?;
+                                    self.fetch_edge_streams(&absolute, edge_type, reader.as_ref())?;
                                 local_streams.insert(absolute, streams.clone());
                                 streams
                             }
@@ -3724,6 +4360,193 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Vec<NodeView>> {
         self.scan_nodes_with_optional_label(Some(label), predicates, projection)
             .await
+    }
+
+    /// Visit one compacted label scan a bounded batch at a time.
+    ///
+    /// In the steady-state layout, node SST key ranges are disjoint and there
+    /// are no node memtable entries. This path then reads selected Parquet
+    /// columns lazily by row group and never materialises the corpus. During a
+    /// transient overlapping generation it preserves exact last-write-wins
+    /// semantics by falling back to ordinary reconciliation before invoking
+    /// the visitor. Callers that make multiple passes (for example exact BM25
+    /// corpus statistics followed by scoring) can therefore remain bounded in
+    /// the normal object-store-native case without changing snapshot results.
+    pub async fn visit_label_with_projection<F, E>(
+        &self,
+        label: &str,
+        projection: &[String],
+        mut visitor: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(NodeView) -> std::result::Result<(), E>,
+        E: From<Error>,
+    {
+        let Some(descriptors) = self.disjoint_node_descriptors() else {
+            for view in self
+                .scan_nodes_with_optional_label(Some(label), &[], Some(projection))
+                .await
+                .map_err(E::from)?
+            {
+                visitor(view)?;
+            }
+            return Ok(());
+        };
+
+        let dict = &self.manifest.manifest.label_dict;
+        let requested_projection: BTreeSet<&str> = projection.iter().map(String::as_str).collect();
+        for idx in descriptors {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+                continue;
+            }
+            let desc = &self.manifest.manifest.ssts[idx];
+            let sst_label_def = self.label_def_for_node_sst(desc);
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            if let Some(reader) = self.node_property_reader(desc).await.map_err(E::from)? {
+                match reader.verify_properties(projection).await {
+                    Ok(_) => {
+                        let cached_metadata = self
+                            .cache
+                            .as_ref()
+                            .and_then(|cache| cache.get_metadata(&absolute));
+                        let metadata_was_cached = cached_metadata.is_some();
+                        let (mut stream, metadata) = node_scan_limited_async(
+                            self.store.clone(),
+                            Path::from(absolute.clone()),
+                            desc.size_bytes,
+                            &sst_label_def,
+                            &[],
+                            Some(&[]),
+                            cached_metadata,
+                        )
+                        .await
+                        .map_err(E::from)?;
+                        if !metadata_was_cached {
+                            if let Some(cache) = &self.cache {
+                                cache.insert_metadata(absolute.clone(), metadata);
+                            }
+                        }
+                        let mut next_ordinal = 0_u64;
+                        while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
+                            for batch in batches {
+                                let batch = batch.map_err(|error| {
+                                    E::from(Error::invariant(format!(
+                                        "projected Parquet visitor read: {error}"
+                                    )))
+                                })?;
+                                let Some(candidates) = self
+                                    .project_node_property_batch(
+                                        reader.as_ref(),
+                                        desc,
+                                        projection,
+                                        &batch,
+                                        next_ordinal,
+                                    )
+                                    .await
+                                    .map_err(E::from)?
+                                else {
+                                    return Err(E::from(Error::invariant(
+                                        "validated node property pages became unreadable",
+                                    )));
+                                };
+                                next_ordinal = next_ordinal
+                                    .checked_add(batch.num_rows() as u64)
+                                    .ok_or_else(|| {
+                                        E::from(Error::invariant(
+                                            "node property ordinal exceeds u64",
+                                        ))
+                                    })?;
+                                for (_, _, view) in candidates {
+                                    let Some(view) = view else {
+                                        continue;
+                                    };
+                                    if view.labels.contains(label) {
+                                        visitor(view)?;
+                                    }
+                                }
+                            }
+                        }
+                        if next_ordinal != desc.row_count {
+                            return Err(E::from(Error::invariant(
+                                "node property/Parquet row-count mismatch",
+                            )));
+                        }
+                        continue;
+                    }
+                    Err(error) if optional_accelerator_fallback(&error) => {
+                        tracing::warn!(
+                            sst_id = %desc.id,
+                            %error,
+                            "node property projection scrub failed; using exact Parquet fallback"
+                        );
+                    }
+                    Err(error) => return Err(E::from(error)),
+                }
+            }
+            let context = LimitedNodeBatchContext {
+                sst_label_def: &sst_label_def,
+                desc,
+                dict,
+                label: Some(label),
+                predicates: &[],
+                decode_projection: Some(projection),
+                requested_projection: Some(&requested_projection),
+                limit: usize::MAX,
+            };
+
+            let cached_body = self.cache_get(&absolute);
+            if cached_body.is_some() || matches!(self.ranged_mode, RangedMode::Force(false)) {
+                let body = match cached_body {
+                    Some(body) => body,
+                    None => self.get_sst_body(desc).await.map_err(E::from)?,
+                };
+                let reader = NodeSstReader::open(sst_label_def.clone(), body).map_err(E::from)?;
+                let batches = reader
+                    .scan_iter_with_predicates_and_projection(&[], Some(projection))
+                    .map_err(E::from)?;
+                for batch in batches {
+                    let mut rows = Vec::new();
+                    consume_limited_node_batches(std::iter::once(batch), &context, &mut rows)
+                        .map_err(E::from)?;
+                    for row in rows {
+                        visitor(row)?;
+                    }
+                }
+            } else {
+                let cached_metadata = self
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.get_metadata(&absolute));
+                let metadata_was_cached = cached_metadata.is_some();
+                let (mut stream, metadata) = node_scan_limited_async(
+                    self.store.clone(),
+                    Path::from(absolute.clone()),
+                    desc.size_bytes,
+                    &sst_label_def,
+                    &[],
+                    Some(projection),
+                    cached_metadata,
+                )
+                .await
+                .map_err(E::from)?;
+                if !metadata_was_cached {
+                    if let Some(cache) = &self.cache {
+                        cache.insert_metadata(absolute.clone(), metadata);
+                    }
+                }
+                while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
+                    for batch in batches {
+                        let mut rows = Vec::new();
+                        consume_limited_node_batches(std::iter::once(batch), &context, &mut rows)
+                            .map_err(E::from)?;
+                        for row in rows {
+                            visitor(row)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Exact prefix scan used by an order-insensitive Cypher LIMIT.
@@ -4005,6 +4828,167 @@ impl<'mt> Snapshot<'mt> {
         Ok(rows.len() as u64)
     }
 
+    /// Resolve one label through current composite `(LabelId, NodeId)`
+    /// sidecars when the node SST ranges prove that every id has exactly one
+    /// persisted version.
+    ///
+    /// `None` means the accelerator cannot prove completeness and the caller
+    /// must retain its Parquet scan. `Some` is exact: every sidecar page is
+    /// bound to the manifest counts, every candidate is confirmed through the
+    /// ordinary batch point reader, and the total number of candidates must
+    /// equal the manifest's per-label count. A corrupt/missing optional
+    /// sidecar therefore never turns into a short result.
+    ///
+    /// Keeping this fast path on disjoint generations has two useful
+    /// properties. First, descriptors sorted by disjoint id range plus sorted
+    /// sidecar leaves already produce global NodeId order, so `LIMIT` can stop
+    /// without a corpus-sized merge heap. Second, a sidecar entry that fails
+    /// point confirmation is necessarily inconsistent rather than merely an
+    /// older LSM version, and can safely select the authoritative fallback.
+    async fn try_scan_disjoint_label_sidecars(
+        &self,
+        descriptors: &[usize],
+        label: &str,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<NodeView>>> {
+        const CANDIDATE_BATCH: usize = 512;
+
+        // Exact-record lookups materialise the complete encoded node payload.
+        // When projected property pages exist that would pull unrelated wide
+        // values (notably embeddings) merely to trim them afterwards. Let the
+        // structural-Parquet + property-page path below own projected scans;
+        // mixed/legacy generations still fall back per SST.
+        if projection.is_some()
+            && descriptors.iter().any(|idx| {
+                crate::manifest::node_property_pages_sidecar(&self.manifest.manifest.ssts[*idx])
+                    .is_some()
+            })
+        {
+            return Ok(None);
+        }
+
+        let Some(label_id) = self.manifest.manifest.label_dict.id(label) else {
+            return Ok(Some(Vec::new()));
+        };
+        let requested_projection: Option<BTreeSet<&str>> =
+            projection.map(|columns| columns.iter().map(String::as_str).collect());
+        let result_limit = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(result_limit.min(64));
+
+        for &idx in descriptors {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+                continue;
+            }
+            let desc = &self.manifest.manifest.ssts[idx];
+            let Some(index) = &desc.label_index else {
+                return Ok(None);
+            };
+            if index.format != PropertyIndexFormat::PagedV1
+                || index.per_label_counts.is_empty()
+                || self.validated_node_descriptor_live_count(desc).is_none()
+            {
+                return Ok(None);
+            }
+            let Some(expected_candidates) = index
+                .per_label_counts
+                .iter()
+                .find(|(candidate, _)| *candidate == label_id.get())
+                .map(|(_, count)| *count)
+            else {
+                // `node_sst_can_contain_label` admitted this descriptor, so a
+                // missing positive count contradicts its completeness proof.
+                return Ok(None);
+            };
+            if expected_candidates == 0 {
+                continue;
+            }
+
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
+            let source = match self
+                .pinned_sidecar_source(&absolute, Some(index.size_bytes))
+                .await
+            {
+                Ok(source) => source,
+                Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+
+            let mut cursor = None;
+            let mut observed_candidates = 0_u64;
+            loop {
+                let page_limit = CANDIDATE_BATCH;
+                let (page, stats) = match crate::sst::paged_index::page_label_ids_from_source(
+                    &source,
+                    label_id.get(),
+                    cursor,
+                    page_limit,
+                    *desc.id.as_bytes(),
+                    &index.per_label_counts,
+                )
+                .await
+                {
+                    Ok(page) => page,
+                    Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if stats.index_entries != index.posting_count {
+                    return Ok(None);
+                }
+                observed_candidates = observed_candidates
+                    .checked_add(page.ids.len() as u64)
+                    .ok_or_else(|| Error::invariant("label candidate count overflows"))?;
+                if observed_candidates > expected_candidates
+                    || (page.ids.is_empty() && page.next_after.is_some())
+                {
+                    return Ok(None);
+                }
+
+                let ids = page
+                    .ids
+                    .iter()
+                    .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id)))
+                    .collect::<Vec<_>>();
+                let resolved = self.batch_lookup_nodes(label, &ids).await?;
+                if resolved.len() != ids.len() {
+                    return Ok(None);
+                }
+                for view in resolved {
+                    let Some(mut view) = view else {
+                        return Ok(None);
+                    };
+                    if !view.labels.contains(label) {
+                        return Ok(None);
+                    }
+                    if !node_view_matches_predicates(&view, predicates) {
+                        continue;
+                    }
+                    if let Some(requested) = &requested_projection {
+                        view.properties
+                            .retain(|property, _| requested.contains(property.as_str()));
+                    }
+                    out.push(view);
+                    if out.len() == result_limit {
+                        return Ok(Some(out));
+                    }
+                }
+
+                let Some(next) = page.next_after else {
+                    break;
+                };
+                if cursor.is_some_and(|previous| previous >= next) {
+                    return Ok(None);
+                }
+                cursor = Some(next);
+            }
+            if observed_candidates != expected_candidates {
+                return Ok(None);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Shared exact implementation for the two public limited node scans.
     async fn scan_nodes_with_optional_label_limited(
         &self,
@@ -4051,6 +5035,24 @@ impl<'mt> Snapshot<'mt> {
             return Ok(rows);
         };
 
+        if let Some(label) = label {
+            if let Some(rows) = self
+                .try_scan_disjoint_label_sidecars(
+                    &descriptors,
+                    label,
+                    predicates,
+                    projection,
+                    Some(limit),
+                )
+                .await?
+            {
+                if let Some(cache) = &self.cache {
+                    cache.record_limited_node_scan_fast_path();
+                }
+                return Ok(rows);
+            }
+        }
+
         if let Some(cache) = &self.cache {
             cache.record_limited_node_scan_fast_path();
         }
@@ -4080,6 +5082,105 @@ impl<'mt> Snapshot<'mt> {
                 requested_projection: requested_projection.as_ref(),
                 limit,
             };
+
+            if let Some(projected_properties) = decode_projection {
+                if let Some(reader) = self.node_property_reader(desc).await? {
+                    let cached_metadata = self
+                        .cache
+                        .as_ref()
+                        .and_then(|cache| cache.get_metadata(&absolute));
+                    let metadata_was_cached = cached_metadata.is_some();
+                    let (mut stream, metadata) = node_scan_limited_async(
+                        self.store.clone(),
+                        Path::from(absolute.clone()),
+                        desc.size_bytes,
+                        &sst_label_def,
+                        &[],
+                        Some(&[]),
+                        cached_metadata,
+                    )
+                    .await?;
+                    if !metadata_was_cached {
+                        if let Some(cache) = &self.cache {
+                            cache.insert_metadata(absolute.clone(), metadata);
+                        }
+                    }
+                    let io_stats = stream.stats().clone();
+                    let out_before = out.len();
+                    let decoded_before = decoded_rows;
+                    let examined_before = examined_rows;
+                    let mut next_ordinal = 0_u64;
+                    let mut sidecar_failed = false;
+                    'property_rows: while out.len() < limit {
+                        let Some(batches) = stream.next_row_group().await? else {
+                            break;
+                        };
+                        row_groups = row_groups.saturating_add(1);
+                        for batch in batches {
+                            let batch = batch.map_err(|error| {
+                                Error::invariant(format!("projected Parquet limited read: {error}"))
+                            })?;
+                            decoded_rows = decoded_rows.saturating_add(batch.num_rows());
+                            let Some(candidates) = self
+                                .project_node_property_batch(
+                                    reader.as_ref(),
+                                    desc,
+                                    projected_properties,
+                                    &batch,
+                                    next_ordinal,
+                                )
+                                .await?
+                            else {
+                                sidecar_failed = true;
+                                break 'property_rows;
+                            };
+                            next_ordinal = next_ordinal
+                                .checked_add(batch.num_rows() as u64)
+                                .ok_or_else(|| {
+                                    Error::invariant("node property ordinal exceeds u64")
+                                })?;
+                            for (_, _, view) in candidates {
+                                if out.len() == limit {
+                                    break;
+                                }
+                                examined_rows = examined_rows.saturating_add(1);
+                                let Some(mut view) = view else {
+                                    continue;
+                                };
+                                if label.is_some_and(|label| !view.labels.contains(label))
+                                    || !node_view_matches_predicates(&view, predicates)
+                                {
+                                    continue;
+                                }
+                                if let Some(requested) = &requested_projection {
+                                    view.properties.retain(|property, _| {
+                                        requested.contains(property.as_str())
+                                    });
+                                }
+                                out.push(view);
+                            }
+                        }
+                    }
+                    drop(stream);
+                    range_bytes = range_bytes.saturating_add(io_stats.bytes_read());
+                    if !sidecar_failed {
+                        if out.len() == limit {
+                            break;
+                        }
+                        if next_ordinal != desc.row_count {
+                            return Err(Error::invariant(
+                                "node property/Parquet row-count mismatch",
+                            ));
+                        }
+                        continue;
+                    }
+                    // No rows escaped this internal buffer. Rewind only this SST's
+                    // contribution and restart through authoritative Parquet.
+                    out.truncate(out_before);
+                    decoded_rows = decoded_before;
+                    examined_rows = examined_before;
+                }
+            }
 
             // A cached immutable body is already resident, so consume its
             // synchronous Arrow iterator lazily. Force(false) remains the
@@ -4185,6 +5286,23 @@ impl<'mt> Snapshot<'mt> {
         let requested_projection: Option<BTreeSet<&str>> =
             projection.map(|columns| columns.iter().map(String::as_str).collect());
 
+        if let Some(label) = label {
+            if let Some(descriptors) = self.disjoint_node_descriptors() {
+                if let Some(rows) = self
+                    .try_scan_disjoint_label_sidecars(
+                        &descriptors,
+                        label,
+                        predicates,
+                        projection,
+                        None,
+                    )
+                    .await?
+                {
+                    return Ok(rows);
+                }
+            }
+        }
+
         // (node_id) → (winning lsn, materialised view or tombstone marker).
         // Nodes are id-primary: materialise every node across the label-agnostic
         // memtable + node SSTs and keep only those whose decoded label set
@@ -4212,6 +5330,17 @@ impl<'mt> Snapshot<'mt> {
         for idx in self.manifest.index.node_descriptors() {
             let desc = &self.manifest.manifest.ssts[idx];
             let sst_label_def = self.label_def_for_node_sst(desc);
+            if let Some(projected_properties) = decode_projection {
+                if let Some(candidates) = self
+                    .try_read_projected_node_sst(desc, &sst_label_def, projected_properties)
+                    .await?
+                {
+                    for (row_id, lsn, view) in candidates {
+                        update_node_winner(&mut latest, row_id, lsn, view);
+                    }
+                    continue;
+                }
+            }
             let body = self.get_sst_body(desc).await?;
             let reader = NodeSstReader::open(sst_label_def.clone(), body)?;
             // Build the projection set once per SST (declared properties
@@ -4249,8 +5378,7 @@ impl<'mt> Snapshot<'mt> {
                     .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
                 let ovf_col = batch
                     .column_by_name(OVERFLOW_JSON)
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                    .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                 for row in 0..batch.num_rows() {
                     let row_id_bytes: [u8; 16] = id_col
                         .value(row)
@@ -4287,19 +5415,19 @@ impl<'mt> Snapshot<'mt> {
                     // projection keeps nothing — an id-only scan was still
                     // paying a serde_json parse per row for values it threw
                     // away immediately.
-                    if !ovf_col.is_null(row)
-                        && projection_set.as_ref().is_none_or(|keep| !keep.is_empty())
-                    {
-                        let json_str = ovf_col.value(row);
-                        let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                        if let Some(keep) = &projection_set {
-                            for (k, v) in extra {
-                                if keep.contains(k.as_str()) {
-                                    properties.insert(k, v);
+                    if projection_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
+                        if let Some(ovf_col) = ovf_col.filter(|column| !column.is_null(row)) {
+                            let json_str = ovf_col.value(row);
+                            let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
+                            if let Some(keep) = &projection_set {
+                                for (k, v) in extra {
+                                    if keep.contains(k.as_str()) {
+                                        properties.insert(k, v);
+                                    }
                                 }
+                            } else {
+                                properties.extend(extra);
                             }
-                        } else {
-                            properties.extend(extra);
                         }
                     }
                     let view = NodeView {
@@ -4778,8 +5906,8 @@ impl<'mt> Snapshot<'mt> {
                 continue;
             }
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
-            let reader = self.fetch_edge_reader(&absolute).await?;
-            let Some(lookup) = reader.lookup(&key_bytes)? else {
+            let reader = self.fetch_paged_edge_reader(&absolute).await?;
+            let Some(lookup) = reader.lookup(&key_bytes).await? else {
                 continue;
             };
             for i in 0..lookup.partners.len() {
@@ -4895,8 +6023,8 @@ impl<'mt> Snapshot<'mt> {
             // `O(edge_count)` because it precomputes the cumulative-
             // edges prefix sum; caching makes warm `edge_lookup_via_sst`
             // O(deg) instead of O(edge_count) per call.
-            let reader = self.fetch_edge_reader(&absolute).await?;
-            let Some(lookup) = reader.lookup(&key_bytes)? else {
+            let paged_reader = self.fetch_paged_edge_reader(&absolute).await?;
+            let Some(lookup) = paged_reader.lookup(&key_bytes).await? else {
                 continue;
             };
             // S17.3: cache the decoded property streams per SST path.
@@ -4904,7 +6032,8 @@ impl<'mt> Snapshot<'mt> {
             // first call decodes O(edge_count) and every subsequent
             // call on this snapshot — or any other snapshot sharing
             // the cache — is a single map probe.
-            let streams = self.fetch_edge_streams(&absolute, edge_type, &reader)?;
+            let reader = self.fetch_edge_reader(&absolute).await?;
+            let streams = self.fetch_edge_streams(&absolute, edge_type, reader.as_ref())?;
             for (i, partner_id) in lookup.partners.iter().enumerate() {
                 let lsn = lookup.lsns[i];
                 let tomb = lookup.tombstones[i];
@@ -5222,6 +6351,101 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(idx))
     }
 
+    /// Select NAMIVG05 by its fixed prefix and keep only its centroid footer
+    /// resident. NAMIVG03/04 retain the bounded monolithic compatibility path.
+    #[cfg(feature = "vector-index")]
+    async fn fetch_vector_search_index(
+        &self,
+        desc: &crate::manifest::SstDescriptor,
+    ) -> Result<Option<VectorSearchIndex>> {
+        use crate::sst::vector::v5::{VectorV5RangeSource, VectorV5Reader, MAGIC_V5};
+
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(reader) = cache.get_vector_v5_reader(&absolute) {
+                return Ok(Some(VectorSearchIndex::Ranged(reader)));
+            }
+            if let Some(index) = cache.get_vector_index(&absolute) {
+                return Ok(Some(VectorSearchIndex::Legacy(index)));
+            }
+        }
+        if !matches!(&desc.kind_specific, KindSpecificStats::VectorGraph { .. }) {
+            return Ok(None);
+        }
+
+        crate::cancel::check()?;
+        let path = Path::from(absolute.as_str());
+        let meta = match self.store.head(&path).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                let error = Error::ObjectStore(error);
+                if optional_accelerator_fallback(&error) {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "range-readable vector index disappeared; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        if meta.size != desc.size_bytes {
+            tracing::warn!(
+                path = %desc.path,
+                manifest_size = desc.size_bytes,
+                object_size = meta.size,
+                "vector object size disagrees with its manifest; falling back to exact scan"
+            );
+            return Ok(None);
+        }
+        let source = Arc::new(SearchObjectRangeSource::new(self.store.clone(), meta).await?);
+        let magic = match VectorV5RangeSource::read_range(source.as_ref(), 0..MAGIC_V5.len() as u64)
+            .await
+        {
+            Ok(magic) => magic,
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %desc.path,
+                    error = %error,
+                    "vector header is unavailable; falling back to exact scan"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if magic.as_ref() == MAGIC_V5 {
+            let reader = match VectorV5Reader::open(source.clone(), source.file_len()).await {
+                Ok(reader) => Arc::new(reader),
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "range-readable vector index is corrupt; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(cache) = self.cache.as_ref() {
+                cache.insert_vector_v5_reader(absolute, reader.clone());
+            }
+            return Ok(Some(VectorSearchIndex::Ranged(reader)));
+        }
+        if crate::sst::vector::is_supported_monolithic_magic(&magic) {
+            return Ok(self
+                .fetch_vector_index(desc)
+                .await?
+                .map(VectorSearchIndex::Legacy));
+        }
+        tracing::warn!(
+            path = %desc.path,
+            magic = ?magic,
+            "vector index has an unknown format; falling back to exact scan"
+        );
+        Ok(None)
+    }
+
     /// Decoded `.ft` index for `desc`, via the process-wide [`SstCache`] (same
     /// once-per-SST story as [`Self::fetch_vector_index`]). Mirrors the `.vg`
     /// convention: a body that fails decode — a legacy magic after a format
@@ -5297,6 +6521,215 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(idx))
     }
 
+    /// Open the newest range-readable full-text format without applying the
+    /// monolithic decoded-index admission rule. Legacy NAMIFT02 objects retain
+    /// the old full-body cache path; NAMIFT03 keeps only its sparse
+    /// footer/directory resident and resolves postings/doc IDs through the
+    /// shared RAM/NVMe object-page cache.
+    #[cfg(feature = "text-index")]
+    async fn fetch_text_search_index(
+        &self,
+        desc: &crate::manifest::SstDescriptor,
+    ) -> Result<Option<TextSearchIndex>> {
+        use crate::sst::text::{
+            TextIndexRangeSource, TextIndexV3Reader, LEGACY_MONOLITHIC_MAGIC, RANGE_READABLE_MAGIC,
+        };
+
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(reader) = cache.get_text_v3_reader(&absolute) {
+                return Ok(Some(TextSearchIndex::Ranged(reader)));
+            }
+            if let Some(index) = cache.get_text_index(&absolute) {
+                return Ok(Some(TextSearchIndex::Legacy(index)));
+            }
+        }
+        if !matches!(&desc.kind_specific, KindSpecificStats::TextIndex { .. }) {
+            return Ok(None);
+        }
+
+        crate::cancel::check()?;
+        let path = Path::from(absolute.as_str());
+        let meta = match self.store.head(&path).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                let error = Error::ObjectStore(error);
+                if optional_accelerator_fallback(&error) {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "range-readable full-text index disappeared; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        if meta.size != desc.size_bytes {
+            tracing::warn!(
+                path = %desc.path,
+                manifest_size = desc.size_bytes,
+                object_size = meta.size,
+                "full-text object size disagrees with its manifest; falling back to exact scan"
+            );
+            return Ok(None);
+        }
+        let source = Arc::new(SearchObjectRangeSource::new(self.store.clone(), meta).await?);
+        let magic = match source
+            .read_range(0..RANGE_READABLE_MAGIC.len() as u64)
+            .await
+        {
+            Ok(magic) => magic,
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %desc.path,
+                    error = %error,
+                    "full-text header is unavailable; falling back to exact scan"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if magic.as_ref() == RANGE_READABLE_MAGIC {
+            let reader = match TextIndexV3Reader::open(source.clone(), source.file_len()).await {
+                Ok(reader) => Arc::new(reader),
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "range-readable full-text index is corrupt; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(cache) = self.cache.as_ref() {
+                cache.insert_text_v3_reader(absolute, reader.clone());
+            }
+            return Ok(Some(TextSearchIndex::Ranged(reader)));
+        }
+        if magic.as_ref() == LEGACY_MONOLITHIC_MAGIC {
+            return Ok(self
+                .fetch_text_index(desc)
+                .await?
+                .map(TextSearchIndex::Legacy));
+        }
+        tracing::warn!(
+            path = %desc.path,
+            magic = ?magic,
+            "full-text index has an unknown format; falling back to exact scan"
+        );
+        Ok(None)
+    }
+
+    #[cfg(any(feature = "text-index", feature = "vector-index"))]
+    async fn select_search_base(
+        &self,
+        kind: SearchLsmKind,
+        index_name: &str,
+    ) -> Result<Option<SelectedSearchBase>> {
+        let manifest = &self.manifest.manifest;
+        // Selection validates the Search-LSM invariants. Reuse that result:
+        // asking `index_outrun_by_nodes` first used to run the complete
+        // validator twice for every active query.
+        let plan = select_search_read_plan(manifest, kind, index_name);
+        if matches!(&plan, SearchReadPlan::Legacy { .. })
+            && self.legacy_index_outrun_by_nodes(index_name, kind.sst_kind())
+        {
+            return Ok(None);
+        }
+        match plan {
+            SearchReadPlan::Legacy { sst_id } => {
+                let Some(descriptor_index) = manifest
+                    .ssts
+                    .iter()
+                    .position(|descriptor| descriptor.id == sst_id)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(SelectedSearchBase {
+                    descriptor_index,
+                    active_segment: None,
+                }))
+            }
+            SearchReadPlan::ActiveLegacyBase {
+                state,
+                base_sst_id,
+                barrier_sst_id,
+            } => {
+                let Some(barrier) = manifest
+                    .ssts
+                    .iter()
+                    .find(|descriptor| descriptor.id == barrier_sst_id)
+                else {
+                    return Ok(None);
+                };
+                let Some(body) = self
+                    .get_optional_sst_body(barrier, "search-lsm-barrier")
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                if body.len() as u64 != barrier.size_bytes {
+                    tracing::warn!(
+                        path = %barrier.path,
+                        manifest_size = barrier.size_bytes,
+                        object_size = body.len(),
+                        "search LSM barrier size disagrees with its descriptor; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                if let Err(error) = validate_search_barrier(&state, &body) {
+                    tracing::warn!(
+                        path = %barrier.path,
+                        error = %error,
+                        "search LSM barrier is corrupt or belongs to another generation; \
+                         falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                let Some(descriptor_index) = manifest
+                    .ssts
+                    .iter()
+                    .position(|descriptor| descriptor.id == base_sst_id)
+                else {
+                    return Ok(None);
+                };
+                let Some(segment) = state
+                    .segments
+                    .iter()
+                    .find(|segment| segment.sst_id == base_sst_id)
+                    .cloned()
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(SelectedSearchBase {
+                    descriptor_index,
+                    active_segment: Some(segment),
+                }))
+            }
+            SearchReadPlan::ActiveSegments { state, .. } => {
+                tracing::debug!(
+                    index = index_name,
+                    ?kind,
+                    segments = state.segments.len(),
+                    "native search segments require the multi-segment coordinator; using exact scan"
+                );
+                Ok(None)
+            }
+            SearchReadPlan::FlatFallback(reason) => {
+                tracing::debug!(
+                    index = index_name,
+                    ?kind,
+                    ?reason,
+                    "search generation unavailable; using exact scan"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Search the persisted vector-graph SSTs for `index_name`, preserving the
     /// distinction between an empty result and an unusable index.
     ///
@@ -5336,34 +6769,65 @@ impl<'mt> Snapshot<'mt> {
         k: usize,
         ef: usize,
     ) -> Result<Option<(Vec<(NodeId, f32)>, u64)>> {
-        let mut best_by_id: HashMap<NodeId, f32> = HashMap::new();
-        let descriptor_ids = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::VectorGraph, index_name);
-        // Vector indexes are full-corpus, replace-at-commit artifacts. Serving
-        // multiple generations could resurrect a stale vector/document, so an
-        // anomalous or legacy manifest must use the exact fallback.
-        if descriptor_ids.len() != 1 {
-            return Ok(None);
+        match search_lsm_read::vector_search(self, index_name, query, k, ef, &[]).await? {
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Applied(result),
+            ) => return Ok(Some((result.hits, result.point_count))),
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Unsupported,
+            )
+            | search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
+            search_lsm_read::ActiveSearch::NotActive => {}
         }
+        let mut best_by_id: HashMap<NodeId, f32> = HashMap::new();
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Vector, index_name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let descriptor_ids = [selected.descriptor_index];
         // Score orientation is metric-dependent: cosine/dot are higher-is-closer,
         // euclidean is lower-is-closer. All `.vg` SSTs for one index share a
         // metric, so the last decoded one's orientation is authoritative.
         let mut higher_is_better = true;
         let mut point_count = 0;
-        for &desc_idx in descriptor_ids {
+        for &desc_idx in &descriptor_ids {
             let desc = &self.manifest.manifest.ssts[desc_idx];
             // A legacy (v1) or corrupt body makes the persisted answer
             // incomplete. Preserve "index unavailable" so the query layer can
             // fall back to the exact flat scan rather than accidentally serving
             // only a sufficiently-large fresh delta.
-            let Some(idx) = self.fetch_vector_index(desc).await? else {
+            let Some(idx) = self.fetch_vector_search_index(desc).await? else {
                 return Ok(None);
             };
+            if selected
+                .active_segment
+                .as_ref()
+                .is_some_and(|segment| !active_vector_base_matches(&idx, desc, segment))
+            {
+                tracing::warn!(
+                    path = %desc.path,
+                    "active vector base footer disagrees with its Search-LSM binding; \
+                     falling back to exact scan"
+                );
+                return Ok(None);
+            }
             higher_is_better = idx.higher_is_better();
             point_count = idx.point_count();
-            for (id, score) in idx.search(query, k, ef) {
+            let hits = match idx.search(query, k, ef).await {
+                Ok(hits) => hits,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "vector query page is corrupt; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            for (id, score) in hits {
                 let id = NodeId(Uuid::from_bytes(id));
                 best_by_id
                     .entry(id)
@@ -5414,20 +6878,39 @@ impl<'mt> Snapshot<'mt> {
         ef: usize,
         eligible: &BTreeSet<NodeId>,
     ) -> Result<Option<(Vec<(NodeId, f32)>, u64)>> {
-        let descriptor_ids = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::VectorGraph, index_name);
-        // Full-corpus vector generations are replace-at-commit. As in the
-        // unfiltered path, anything other than exactly one body is unsafe.
-        if descriptor_ids.len() != 1 {
+        if matches!(
+            select_search_read_plan(&self.manifest.manifest, SearchLsmKind::Vector, index_name),
+            SearchReadPlan::ActiveSegments { .. }
+        ) {
+            // Arbitrary NodeId sets have no ordinal bitmap in V5/VG6. Native
+            // property groups use the coordinator below; residual sets retain
+            // the exact node-scan fallback.
             return Ok(None);
         }
-        let desc = &self.manifest.manifest.ssts[descriptor_ids[0]];
-        let Some(idx) = self.fetch_vector_index(desc).await? else {
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Vector, index_name)
+            .await?
+        else {
             return Ok(None);
         };
+        let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
+        let Some(idx) = self.fetch_vector_search_index(desc).await? else {
+            return Ok(None);
+        };
+        if selected
+            .active_segment
+            .as_ref()
+            .is_some_and(|segment| !active_vector_base_matches(&idx, desc, segment))
+        {
+            return Ok(None);
+        }
         let point_count = idx.point_count();
+        let VectorSearchIndex::Legacy(idx) = idx else {
+            // NAMIVG05 applies its own persisted metadata bitmaps natively.
+            // An arbitrary caller-supplied NodeId set has no on-page bitmap
+            // yet, so preserve correctness through the exact fallback.
+            return Ok(None);
+        };
         let hits = idx
             .search_filtered(query, k, ef, |id| {
                 eligible.contains(&NodeId(Uuid::from_bytes(*id)))
@@ -5455,20 +6938,76 @@ impl<'mt> Snapshot<'mt> {
         ef: usize,
         groups: &[(String, Vec<Value>)],
     ) -> Result<Option<VectorFilterSearch>> {
-        let descriptor_ids = self
-            .manifest
-            .index
-            .scope_descriptors(SstKind::VectorGraph, index_name);
-        if descriptor_ids.len() != 1 {
-            return Ok(None);
+        match search_lsm_read::vector_search(self, index_name, query, k, ef, groups).await? {
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Applied(result),
+            ) => {
+                return Ok(Some(VectorFilterSearch::Applied {
+                    hits: result.hits,
+                    point_count: result.point_count,
+                    eligible_count: result.eligible_count,
+                }));
+            }
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Unsupported,
+            ) => return Ok(Some(VectorFilterSearch::Unsupported)),
+            search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
+            search_lsm_read::ActiveSearch::NotActive => {}
         }
-        let desc = &self.manifest.manifest.ssts[descriptor_ids[0]];
-        let Some(idx) = self.fetch_vector_index(desc).await? else {
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Vector, index_name)
+            .await?
+        else {
             return Ok(None);
         };
+        let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
+        let Some(idx) = self.fetch_vector_search_index(desc).await? else {
+            return Ok(None);
+        };
+        if selected
+            .active_segment
+            .as_ref()
+            .is_some_and(|segment| !active_vector_base_matches(&idx, desc, segment))
+        {
+            return Ok(None);
+        }
         let point_count = idx.point_count();
-        let Some((hits, eligible_count)) = idx.search_filter_groups(query, k, ef, groups) else {
-            return Ok(Some(VectorFilterSearch::Unsupported));
+        let (hits, eligible_count) = match idx {
+            VectorSearchIndex::Legacy(idx) => {
+                let Some(result) = idx.search_filter_groups(query, k, ef, groups) else {
+                    return Ok(Some(VectorFilterSearch::Unsupported));
+                };
+                result
+            }
+            VectorSearchIndex::Ranged(idx) => {
+                let result = match idx
+                    .search_filter_groups(query, k, vector_v5_search_options(&idx, ef), groups)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) if optional_accelerator_fallback(&error) => {
+                        tracing::warn!(
+                            path = %desc.path,
+                            error = %error,
+                            "filtered vector page is corrupt; falling back to exact scan"
+                        );
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if result.applied_filter_groups != groups.len() {
+                    return Ok(Some(VectorFilterSearch::Unsupported));
+                }
+                let eligible_count = if result.probed_pages == idx.page_count() {
+                    result.eligible_rows_seen
+                } else {
+                    // The executor treats a finite eligible_count as an
+                    // exhaustiveness proof. A partial IVF probe cannot make
+                    // that claim, so use a sentinel until every page was read.
+                    usize::MAX
+                };
+                (result.hits, eligible_count)
+            }
         };
         let hits = hits
             .into_iter()
@@ -5520,6 +7059,27 @@ impl<'mt> Snapshot<'mt> {
     /// `kind` is `VectorGraph` or `TextIndex`.
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
     pub fn index_outrun_by_nodes(&self, index_name: &str, kind: SstKind) -> bool {
+        let manifest = &self.manifest.manifest;
+        let lsm_kind = match kind {
+            SstKind::VectorGraph => SearchLsmKind::Vector,
+            SstKind::TextIndex => SearchLsmKind::Text,
+            _ => return true,
+        };
+        match select_search_read_plan(manifest, lsm_kind, index_name) {
+            SearchReadPlan::ActiveLegacyBase { .. } | SearchReadPlan::ActiveSegments { .. } => {
+                // Active coverage is exact per visible Nodes SST. Object/footer
+                // validation still happens before serving; failure there
+                // returns None and selects the exact fallback.
+                false
+            }
+            SearchReadPlan::FlatFallback(crate::search_lsm::SearchReadFallback::NoPhysicalBody)
+            | SearchReadPlan::Legacy { .. } => self.legacy_index_outrun_by_nodes(index_name, kind),
+            SearchReadPlan::FlatFallback(_) => true,
+        }
+    }
+
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    fn legacy_index_outrun_by_nodes(&self, index_name: &str, kind: SstKind) -> bool {
         let manifest = &self.manifest.manifest;
         let index_ssts: Vec<&SstDescriptor> = self
             .manifest
@@ -5656,19 +7216,13 @@ impl<'mt> Snapshot<'mt> {
         query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
-        // Authoritative only if a TextIndex SST exists for this index...
-        let index_descriptor_ids = self
+        if !self
             .manifest
-            .index
-            .scope_descriptors(SstKind::TextIndex, index_name);
-        if index_descriptor_ids.len() != 1 {
-            return Ok(None);
-        }
-        // ...and there is no un-compacted node delta the index has not absorbed:
-        // a persisted `Nodes` SST newer than the index (flushed/partially-merged
-        // but not yet folded in by an authoritative compaction — the LSN
-        // comparison catches both, see `index_outrun_by_nodes`)...
-        if self.index_outrun_by_nodes(index_name, SstKind::TextIndex) {
+            .manifest
+            .text_indexes
+            .iter()
+            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+        {
             return Ok(None);
         }
         // ...and no memtable/overlay entry that touches the indexed corpus. The
@@ -5699,22 +7253,67 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
+        match search_lsm_read::text_search(self, index_name, query, k, &[], &dirty).await? {
+            search_lsm_read::ActiveSearch::Ready(hits) => return Ok(Some(hits)),
+            search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
+            search_lsm_read::ActiveSearch::NotActive => {}
+        }
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Text, index_name)
+            .await?
+        else {
+            return Ok(None);
+        };
         let mut best_by_id: HashMap<NodeId, f64> = HashMap::new();
-        for &desc_idx in index_descriptor_ids {
+        for desc_idx in [selected.descriptor_index] {
             let desc = &self.manifest.manifest.ssts[desc_idx];
             // An undecodable body (legacy magic after a format bump, or
             // corruption): BM25 depends on whole-corpus stats, so a partial
             // serve would skew them — treat the index as absent and flat-scan.
-            let Some(idx) = self.fetch_text_index(desc).await? else {
+            let Some(idx) = self.fetch_text_search_index(desc).await? else {
                 return Ok(None);
             };
+            if selected
+                .active_segment
+                .as_ref()
+                .is_some_and(|segment| !active_text_base_matches(&idx, desc, segment))
+            {
+                tracing::warn!(
+                    path = %desc.path,
+                    "active full-text base footer disagrees with its Search-LSM binding; \
+                     falling back to exact scan"
+                );
+                return Ok(None);
+            }
             // A dirty id that IS an indexed document means a stale doc (delete/
             // relabel) the index would still serve, and its removal also shifts
             // the corpus stats — only the flat scan is exact then.
-            if dirty.iter().any(|id| idx.contains_doc(id)) {
-                return Ok(None);
+            match idx.contains_any_doc(&dirty).await {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "full-text membership page is corrupt; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
             }
-            for (id, score) in idx.search_query(query, k) {
+            let hits = match idx.search_query(query, k).await {
+                Ok(hits) => hits,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %desc.path,
+                        error = %error,
+                        "full-text query page is corrupt; falling back to exact scan"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            for (id, score) in hits {
                 let id = NodeId(Uuid::from_bytes(id));
                 best_by_id
                     .entry(id)
@@ -5738,6 +7337,55 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(all))
     }
 
+    /// Exact Search-LSM BM25 with native equality prefilters.
+    ///
+    /// Filter groups use OR within one property and AND across properties.
+    /// Every live FT4 segment must advertise and physically contain every
+    /// requested property; otherwise `None` selects the ordinary exact
+    /// node-scan fallback. Corpus BM25 statistics are reconstructed before
+    /// filtering, so selectivity never changes `N`, average length, or IDF.
+    #[cfg(feature = "text-index")]
+    pub async fn text_search_filter_groups(
+        &self,
+        index_name: &str,
+        label: &str,
+        query: &crate::text::TextQuery,
+        k: Option<usize>,
+        groups: &[(String, Vec<Value>)],
+    ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        if !self
+            .manifest
+            .manifest
+            .text_indexes
+            .iter()
+            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+        {
+            return Ok(None);
+        }
+        let dict = &self.manifest.manifest.label_dict;
+        let mut dirty = Vec::new();
+        for (key, entry) in self.node_entries() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            match &entry.op {
+                MemOp::Tombstone => dirty.push(*id.0.as_bytes()),
+                MemOp::Upsert(payload) => {
+                    let record = NodeWriteRecord::decode(payload)?;
+                    if record_carries_label(&record, label, dict) {
+                        return Ok(None);
+                    }
+                    dirty.push(*id.0.as_bytes());
+                }
+            }
+        }
+        match search_lsm_read::text_search(self, index_name, query, k, groups, &dirty).await? {
+            search_lsm_read::ActiveSearch::Ready(hits) => Ok(Some(hits)),
+            search_lsm_read::ActiveSearch::Unavailable
+            | search_lsm_read::ActiveSearch::NotActive => Ok(None),
+        }
+    }
+
     /// Return the decoded edge property streams for the SST identified by
     /// `absolute`, hitting [`SstCache::get_edge_streams`] first and
     /// decoding via the freshly-opened `reader` on miss.
@@ -5755,6 +7403,25 @@ impl<'mt> Snapshot<'mt> {
     /// `O(edge_count)`) and inserts it.: IC07 at
     /// SF10 surfaced that `EdgeSstReader::open` was the residual
     /// per-call cost not covered by the property stream cache.
+    async fn fetch_paged_edge_reader(&self, absolute: &str) -> Result<Arc<PagedEdgeReader>> {
+        namidb_core::profile_scope!("Snapshot::fetch_paged_edge_reader");
+        let cache_key = absolute.to_string();
+        if let Some(reader) = self.paged_edge_readers.lock().unwrap().get(&cache_key) {
+            return Ok(reader);
+        }
+        let reader =
+            Arc::new(PagedEdgeReader::open(self.store.clone(), Path::from(absolute)).await?);
+        let weight = absolute
+            .len()
+            .saturating_add(reader.resident_metadata_bytes())
+            .saturating_add(SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES);
+        self.paged_edge_readers
+            .lock()
+            .unwrap()
+            .insert(cache_key, reader.clone(), weight);
+        Ok(reader)
+    }
+
     async fn fetch_edge_reader(&self, absolute: &str) -> Result<Arc<EdgeSstReader>> {
         namidb_core::profile_scope!("Snapshot::fetch_edge_reader");
         if let Some(cache) = self.cache.as_ref() {
@@ -5833,12 +7500,15 @@ impl<'mt> Snapshot<'mt> {
         if let Some(paged) = &descriptor.paged {
             let paged_absolute =
                 format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
-            let found = crate::sst::paged_index::probe_unique(
-                self.store.clone(),
-                Path::from(paged_absolute),
-                values,
-            )
-            .await;
+            let found = match self
+                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .await
+            {
+                Ok(source) => {
+                    crate::sst::paged_index::probe_unique_from_source(&source, values).await
+                }
+                Err(error) => Err(error),
+            };
             match found {
                 Ok((found, stats)) if stats.index_entries == descriptor.entry_count => {
                     return Ok(Arc::new(found));
@@ -5872,12 +7542,11 @@ impl<'mt> Snapshot<'mt> {
                 ))
             }
             PropertyIndexFormat::PagedV1 => {
-                let (found, stats) = crate::sst::paged_index::probe_unique(
-                    self.store.clone(),
-                    Path::from(absolute),
-                    values,
-                )
-                .await?;
+                let source = self
+                    .pinned_sidecar_source(absolute, Some(descriptor.size_bytes))
+                    .await?;
+                let (found, stats) =
+                    crate::sst::paged_index::probe_unique_from_source(&source, values).await?;
                 if stats.index_entries != descriptor.entry_count {
                     return Err(Error::invariant(format!(
                         "paged unique entry count mismatch: manifest {}, header {}",
@@ -5917,12 +7586,15 @@ impl<'mt> Snapshot<'mt> {
         if let Some(paged) = &descriptor.paged {
             let paged_absolute =
                 format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
-            let found = crate::sst::paged_index::probe_equality(
-                self.store.clone(),
-                Path::from(paged_absolute),
-                values,
-            )
-            .await;
+            let found = match self
+                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .await
+            {
+                Ok(source) => {
+                    crate::sst::paged_index::probe_equality_from_source(&source, values).await
+                }
+                Err(error) => Err(error),
+            };
             match found {
                 Ok((found, stats)) if stats.index_entries == descriptor.distinct_values => {
                     return Ok(Arc::new(found));
@@ -5958,12 +7630,11 @@ impl<'mt> Snapshot<'mt> {
                 ))
             }
             PropertyIndexFormat::PagedV1 => {
-                let (found, stats) = crate::sst::paged_index::probe_equality(
-                    self.store.clone(),
-                    Path::from(absolute),
-                    values,
-                )
-                .await?;
+                let source = self
+                    .pinned_sidecar_source(absolute, Some(descriptor.size_bytes))
+                    .await?;
+                let (found, stats) =
+                    crate::sst::paged_index::probe_equality_from_source(&source, values).await?;
                 if stats.index_entries != descriptor.distinct_values {
                     return Err(Error::invariant(format!(
                         "paged equality entry count mismatch: manifest {}, header {}",
@@ -5988,14 +7659,21 @@ impl<'mt> Snapshot<'mt> {
         if let Some(paged) = &descriptor.paged {
             let paged_absolute =
                 format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
-            match crate::sst::paged_index::probe_equality_limited(
-                self.store.clone(),
-                Path::from(paged_absolute),
-                values,
-                max_ids_per_value,
-            )
-            .await
+            let probed = match self
+                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .await
             {
+                Ok(source) => {
+                    crate::sst::paged_index::probe_equality_limited_from_source(
+                        &source,
+                        values,
+                        max_ids_per_value,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match probed {
                 Ok((found, stats)) if stats.index_entries == descriptor.distinct_values => {
                     if let Some(cache) = &self.property_index_cache {
                         cache.record_equality_index_bytes_read(stats.bytes_read);
@@ -6062,13 +7740,17 @@ impl<'mt> Snapshot<'mt> {
         if let Some(paged) = &descriptor.paged {
             let paged_absolute =
                 format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
-            match crate::sst::paged_index::equality_prefix(
-                self.store.clone(),
-                Path::from(paged_absolute),
-                min_postings,
-            )
-            .await
+            let prefix = match self
+                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .await
             {
+                Ok(source) => {
+                    crate::sst::paged_index::equality_prefix_from_source(&source, min_postings)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match prefix {
                 Ok((map, stats)) if stats.index_entries == descriptor.distinct_values => {
                     if let Some(cache) = &self.property_index_cache {
                         cache.record_ordered_prefix_index_bytes_read(stats.bytes_read);
@@ -6092,6 +7774,23 @@ impl<'mt> Snapshot<'mt> {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if descriptor.format == PropertyIndexFormat::PagedV1 {
+            let source = self
+                .pinned_sidecar_source(absolute, Some(descriptor.size_bytes))
+                .await?;
+            let (map, stats) =
+                crate::sst::paged_index::equality_prefix_from_source(&source, min_postings).await?;
+            if stats.index_entries != descriptor.distinct_values {
+                return Err(Error::invariant(format!(
+                    "paged equality entry count mismatch: manifest {}, header {}",
+                    descriptor.distinct_values, stats.index_entries
+                )));
+            }
+            if let Some(cache) = &self.property_index_cache {
+                cache.record_ordered_prefix_index_bytes_read(stats.bytes_read);
+            }
+            return Ok((Arc::new(map), stats.values_truncated));
         }
         Ok((
             self.fetch_equality_property_sidecar_all(descriptor, absolute)
@@ -6134,6 +7833,297 @@ impl<'mt> Snapshot<'mt> {
         self.cache.as_ref().and_then(|c| c.get(absolute))
     }
 
+    /// Open and validate the independently ranged property object for one
+    /// Nodes SST. `None` selects the authoritative Parquet fallback.
+    async fn node_property_reader(
+        &self,
+        desc: &SstDescriptor,
+    ) -> Result<Option<Arc<NodePropertyPageReader>>> {
+        let Some(properties) = crate::manifest::node_property_pages_sidecar(desc) else {
+            return Ok(None);
+        };
+        if properties.format_version != NODE_PROPERTY_PAGES_FORMAT_VERSION
+            || !properties.is_bound_to(desc)
+        {
+            return Ok(None);
+        }
+        let absolute = format!(
+            "{}/{}",
+            self.paths.namespace_prefix().as_ref(),
+            properties.path
+        );
+        if let Some(reader) = self
+            .node_property_readers
+            .lock()
+            .expect("node property reader cache mutex poisoned")
+            .get(&absolute)
+        {
+            return Ok(Some(reader));
+        }
+
+        let source = match self
+            .pinned_sidecar_source(&absolute, Some(properties.size_bytes))
+            .await
+        {
+            Ok(source) => Arc::new(source),
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %absolute,
+                    %error,
+                    "node property pages unavailable; using exact Parquet fallback"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let config = NodePropertyPageConfig::from_env()?;
+        let reader = match NodePropertyPageReader::open(source, desc.id, config).await {
+            Ok(reader) => Arc::new(reader),
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %absolute,
+                    %error,
+                    "node property pages failed validation; using exact Parquet fallback"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if reader.sst_id() != properties.id
+            || reader.node_count() != properties.node_count
+            || reader.cell_count() != properties.cell_count
+            || reader.property_count() != properties.property_count
+            || reader.page_count() != properties.page_count
+            || reader.content_xxh3() != properties.content_xxh3
+            || !reader.is_complete()
+        {
+            tracing::warn!(
+                path = %absolute,
+                "node property descriptor does not match its authenticated footer; \
+                 using exact Parquet fallback"
+            );
+            return Ok(None);
+        }
+        self.node_property_readers
+            .lock()
+            .expect("node property reader cache mutex poisoned")
+            .insert(absolute, reader.clone(), reader.resident_metadata_bytes());
+        Ok(Some(reader))
+    }
+
+    async fn project_node_property_batch(
+        &self,
+        reader: &NodePropertyPageReader,
+        desc: &SstDescriptor,
+        projection: &[String],
+        batch: &RecordBatch,
+        first_ordinal: u64,
+    ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
+        let id_col = batch
+            .column_by_name(COL_NODE_ID)
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .ok_or_else(|| Error::invariant("node_id column missing"))?;
+        let tomb_col = batch
+            .column_by_name(COL_TOMBSTONE)
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+        let lsn_col = batch
+            .column_by_name(COL_LSN)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| Error::invariant("lsn column missing"))?;
+        let schema_version_col = batch
+            .column_by_name(SCHEMA_VERSION)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
+        let ids = (0..batch.num_rows())
+            .map(|row| {
+                id_col
+                    .value(row)
+                    .try_into()
+                    .map_err(|_| Error::invariant("node_id row length != 16"))
+            })
+            .collect::<Result<Vec<[u8; 16]>>>()?;
+        let projected = match reader.project_node_ids(projection, &ids).await {
+            Ok((projected, _)) => projected,
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    sst_id = %desc.id,
+                    %error,
+                    "node property page probe failed; using exact Parquet fallback"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if projected.len() != ids.len() {
+            return Ok(None);
+        }
+        let mut candidates = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let id = ids[row];
+            let ordinal = first_ordinal
+                .checked_add(row as u64)
+                .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
+            let property_row = &projected[row];
+            if property_row.node_id != id
+                || property_row.ordinal.is_some_and(|found| found != ordinal)
+            {
+                tracing::warn!(
+                    sst_id = %desc.id,
+                    "node property row binding mismatch; using exact Parquet fallback"
+                );
+                return Ok(None);
+            }
+            let node_id = NodeId::from_uuid(Uuid::from_bytes(id));
+            let lsn = lsn_col.value(row);
+            if tomb_col.value(row) {
+                candidates.push((node_id, lsn, None));
+                continue;
+            }
+            let mut properties = BTreeMap::new();
+            for (name, cell) in &property_row.properties {
+                match cell {
+                    PropertyCell::Absent => {}
+                    PropertyCell::Null => {
+                        properties.insert(name.clone(), Value::Null);
+                    }
+                    PropertyCell::Value(value) => {
+                        properties.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+            candidates.push((
+                node_id,
+                lsn,
+                Some(NodeView {
+                    id: node_id,
+                    labels: decode_node_labels(
+                        batch,
+                        row,
+                        &self.manifest.manifest.label_dict,
+                        &desc.scope,
+                    ),
+                    properties,
+                    lsn,
+                    schema_version: schema_version_col.value(row),
+                }),
+            ));
+        }
+        Ok(Some(candidates))
+    }
+
+    /// Read only structural Parquet columns plus the explicitly named
+    /// property pages. No property/overflow column from the Nodes SST is
+    /// fetched. The complete per-SST result is retained until every requested
+    /// page has validated, so an optional-sidecar failure can restart from
+    /// Parquet without exposing a partial answer.
+    async fn try_read_projected_node_sst(
+        &self,
+        desc: &SstDescriptor,
+        sst_label_def: &LabelDef,
+        projection: &[String],
+    ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
+        let Some(reader) = self.node_property_reader(desc).await? else {
+            return Ok(None);
+        };
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        let cached_metadata = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.get_metadata(&absolute));
+        let metadata_was_cached = cached_metadata.is_some();
+        let (mut stream, metadata) = node_scan_limited_async(
+            self.store.clone(),
+            Path::from(absolute.clone()),
+            desc.size_bytes,
+            sst_label_def,
+            &[],
+            Some(&[]),
+            cached_metadata,
+        )
+        .await?;
+        if !metadata_was_cached {
+            if let Some(cache) = &self.cache {
+                cache.insert_metadata(absolute, metadata);
+            }
+        }
+
+        let mut candidates = Vec::with_capacity(
+            usize::try_from(desc.row_count)
+                .unwrap_or(usize::MAX)
+                .min(4096),
+        );
+        let mut next_ordinal = 0_u64;
+        while let Some(batches) = stream.next_row_group().await? {
+            for batch in batches {
+                let batch = batch.map_err(|error| {
+                    Error::invariant(format!("projected Parquet scan read: {error}"))
+                })?;
+                crate::cancel::check()?;
+                let Some(mut batch_candidates) = self
+                    .project_node_property_batch(
+                        reader.as_ref(),
+                        desc,
+                        projection,
+                        &batch,
+                        next_ordinal,
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                candidates.append(&mut batch_candidates);
+                next_ordinal = next_ordinal
+                    .checked_add(batch.num_rows() as u64)
+                    .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
+            }
+        }
+        if next_ordinal != desc.row_count || candidates.len() as u64 != desc.row_count {
+            tracing::warn!(
+                sst_id = %desc.id,
+                expected = desc.row_count,
+                observed = next_ordinal,
+                "node property/Parquet row-count mismatch; using exact Parquet fallback"
+            );
+            return Ok(None);
+        }
+        Ok(Some(candidates))
+    }
+
+    /// Open one immutable UUID sidecar through the shared generation-pinned
+    /// RAM/NVMe page source. The manifest size, when available, is part of the
+    /// integrity envelope rather than merely a cache-accounting hint.
+    async fn pinned_sidecar_source(
+        &self,
+        absolute: &str,
+        expected_size: Option<u64>,
+    ) -> Result<crate::range_cache::PinnedObjectRangeSource> {
+        let path = Path::from(absolute);
+        let meta = self.store.head(&path).await?;
+        if meta.location != path {
+            return Err(Error::Corrupted {
+                path: absolute.to_string(),
+                detail: format!(
+                    "sidecar HEAD returned metadata for unexpected path {}",
+                    meta.location
+                ),
+            });
+        }
+        if let Some(expected) = expected_size {
+            if meta.size != expected {
+                return Err(Error::Corrupted {
+                    path: absolute.to_string(),
+                    detail: format!(
+                        "sidecar object size {} differs from manifest size {expected}",
+                        meta.size
+                    ),
+                });
+            }
+        }
+        crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(self.store.clone(), meta)
+            .await
+    }
+
     /// Cache-aware fetch by absolute path. On hit, returns the cached
     /// `Bytes` (a cheap `Arc::clone`). On miss, GETs the object store
     /// and inserts the bytes back into the cache so the next reader on
@@ -6174,6 +8164,8 @@ struct LimitedNodeBatchContext<'a> {
     requested_projection: Option<&'a BTreeSet<&'a str>>,
     limit: usize,
 }
+
+type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
 
 /// Consume lazy Parquet batches only until `out` contains `limit` exact live
 /// matches. The iterator itself remains unconsumed after that point, which is
@@ -6234,8 +8226,7 @@ fn append_limited_node_batch(
         .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
     let overflow_col = batch
         .column_by_name(OVERFLOW_JSON)
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>());
     let decode_set: Option<BTreeSet<&str>> =
         decode_projection.map(|columns| columns.iter().map(String::as_str).collect());
 
@@ -6273,16 +8264,18 @@ fn append_limited_node_batch(
                 properties.insert(property.name.clone(), value);
             }
         }
-        if !overflow_col.is_null(row) && decode_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
-            let extra: BTreeMap<String, Value> = serde_json::from_str(overflow_col.value(row))?;
-            if let Some(keep) = &decode_set {
-                properties.extend(
-                    extra
-                        .into_iter()
-                        .filter(|(property, _)| keep.contains(property.as_str())),
-                );
-            } else {
-                properties.extend(extra);
+        if decode_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
+            if let Some(overflow_col) = overflow_col.filter(|column| !column.is_null(row)) {
+                let extra: BTreeMap<String, Value> = serde_json::from_str(overflow_col.value(row))?;
+                if let Some(keep) = &decode_set {
+                    properties.extend(
+                        extra
+                            .into_iter()
+                            .filter(|(property, _)| keep.contains(property.as_str())),
+                    );
+                } else {
+                    properties.extend(extra);
+                }
             }
         }
 
@@ -7477,6 +9470,30 @@ mod tests {
 
     fn make_paths(name: &str) -> NamespacePaths {
         NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+    }
+
+    #[test]
+    fn snapshot_byte_cache_is_byte_and_count_bounded_lru() {
+        let mut cache = SnapshotByteCache::new(700, 2);
+        cache.insert("first".to_string(), 1_u64, 300);
+        cache.insert("second".to_string(), 2_u64, 300);
+        assert_eq!(cache.get(&"first".to_string()), Some(1));
+
+        // Touching first makes second the bounded LRU victim.
+        cache.insert("third".to_string(), 3_u64, 300);
+        assert_eq!(cache.get(&"second".to_string()), None);
+        assert_eq!(cache.get(&"first".to_string()), Some(1));
+        assert_eq!(cache.get(&"third".to_string()), Some(3));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.used_bytes() <= 700);
+
+        // One entry above the whole assignment is used by the caller but never
+        // retained, and overwrites cannot leak the old charge.
+        cache.insert("oversized".to_string(), 4_u64, 701);
+        assert_eq!(cache.get(&"oversized".to_string()), None);
+        cache.insert("first".to_string(), 10_u64, 256);
+        assert_eq!(cache.get(&"first".to_string()), Some(10));
+        assert!(cache.used_bytes() <= 700);
     }
 
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -9192,7 +11209,8 @@ mod tests {
         assert_eq!(fallback_cache.edge_streams_inserts(), 1);
 
         // A downgrade-era janitor may remove an unrecognised `.epidx`. The
-        // marker remains safe: NotFound takes the same exact legacy CSR path.
+        // marker remains safe: NotFound falls through to the authoritative CSR
+        // and still answers exactly.
         store.delete(&point_absolute).await.unwrap();
         let missing_cache = SstCache::with_uniform_budgets(1);
         let missing = Snapshot::new(
@@ -9206,7 +11224,12 @@ mod tests {
             .contains_edge_via_sst("KNOWS", src, target)
             .await
             .unwrap());
-        assert_eq!(missing_cache.edge_readers_inserts(), 1);
+        assert_eq!(
+            missing_cache.edge_readers_inserts(),
+            0,
+            "an existence probe resolves the CSR through ranged reads: a \
+             missing accelerator must never hydrate the whole edge body"
+        );
 
         // A staged tombstone must hide both the persisted row and any
         // committed-memtable version of the same physical relationship.
@@ -10933,6 +12956,280 @@ mod tests {
         }
     }
 
+    fn object_native_doc_label(embedding_dim: u32) -> LabelDef {
+        LabelDef {
+            name: "Doc".into(),
+            properties: vec![
+                PropertyDef::new("title", DataType::Utf8, false).unwrap(),
+                PropertyDef::new(
+                    "embedding",
+                    DataType::FloatVector { dim: embedding_dim },
+                    true,
+                )
+                .unwrap(),
+            ],
+        }
+    }
+
+    fn object_native_doc_payload(index: u8, embedding_dim: usize) -> Bytes {
+        let mut state = u64::from(index).saturating_add(1);
+        let embedding = (0..embedding_dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state as u32) as f32 / u32::MAX as f32
+            })
+            .collect();
+        NodeWriteRecord {
+            properties: BTreeMap::from([
+                ("title".into(), Value::Str(format!("title-{index:03}"))),
+                ("embedding".into(), Value::Vec(embedding)),
+            ]),
+            schema_version: 1,
+            labels: vec![0],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    async fn object_native_doc_fixture(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        count: u8,
+        embedding_dim: usize,
+    ) -> LoadedManifest {
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Doc");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new()
+            .label(object_native_doc_label(embedding_dim as u32))
+            .unwrap()
+            .build();
+        let rows = (1..=count)
+            .map(|index| {
+                (
+                    sorted_node_id(index),
+                    u64::from(index),
+                    MemOp::Upsert(object_native_doc_payload(index, embedding_dim)),
+                )
+            })
+            .collect();
+        flush_batch_with_row_group_rows(4, &ms, &fence, &base, &schema, rows).await
+    }
+
+    async fn projected_titles(
+        loaded: LoadedManifest,
+        memtable: &MemtableSnapshot,
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+    ) -> Vec<Value> {
+        Snapshot::new(loaded, memtable, store, paths)
+            .scan_label_with_predicates_and_projection("Doc", &[], Some(&["title".into()]))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.properties["title"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn snapshot_title_projection_never_fetches_embedding_pages() {
+        let store = make_store();
+        let paths = make_paths("node-property-title-not-embedding");
+        let committed = object_native_doc_fixture(&store, &paths, 16, 16_384).await;
+        let descriptor = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap()
+            .clone();
+        let property_descriptor = crate::manifest::node_property_pages_sidecar(&descriptor)
+            .unwrap()
+            .clone();
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+
+        let title_snapshot =
+            Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone());
+        let titles = title_snapshot
+            .scan_label_with_predicates_and_projection("Doc", &[], Some(&["title".into()]))
+            .await
+            .unwrap();
+        assert_eq!(titles.len(), 16);
+        assert!(titles
+            .iter()
+            .all(|row| { row.properties.len() == 1 && row.properties.contains_key("title") }));
+        let title_reader = title_snapshot
+            .node_property_reader(&descriptor)
+            .await
+            .unwrap()
+            .unwrap();
+        let title_io = title_reader.range_stats();
+        assert!(
+            title_io.logical_bytes < property_descriptor.size_bytes,
+            "title projection read the complete property object"
+        );
+
+        let embedding_snapshot = Snapshot::new(committed, &empty_view, store, paths);
+        let embeddings = embedding_snapshot
+            .scan_label_with_predicates_and_projection("Doc", &[], Some(&["embedding".into()]))
+            .await
+            .unwrap();
+        assert_eq!(embeddings.len(), 16);
+        let embedding_reader = embedding_snapshot
+            .node_property_reader(&descriptor)
+            .await
+            .unwrap()
+            .unwrap();
+        let embedding_io = embedding_reader.range_stats();
+        assert!(
+            embedding_io.logical_bytes > title_io.logical_bytes.saturating_mul(4),
+            "title bytes={} embedding bytes={}; title likely touched embedding pages",
+            title_io.logical_bytes,
+            embedding_io.logical_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_corrupt_and_incompatible_property_pages_fall_back_exactly() {
+        let store = make_store();
+        let paths = make_paths("node-property-fallback");
+        let committed = object_native_doc_fixture(&store, &paths, 8, 256).await;
+        let descriptor = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap();
+        let properties = crate::manifest::node_property_pages_sidecar(descriptor).unwrap();
+        let property_path = Path::from(format!(
+            "{}/{}",
+            paths.namespace_prefix().as_ref(),
+            properties.path
+        ));
+        let original = store
+            .get(&property_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let expected = (1..=8)
+            .map(|index| Value::Str(format!("title-{index:03}")))
+            .collect::<Vec<_>>();
+        store.delete(&property_path).await.unwrap();
+        assert_eq!(
+            projected_titles(committed.clone(), &empty_view, store.clone(), paths.clone(),).await,
+            expected
+        );
+        store
+            .put(&property_path, original.clone().into())
+            .await
+            .unwrap();
+
+        let mut corrupt = original.to_vec();
+        corrupt[0] ^= 0xFF;
+        store
+            .put(&property_path, Bytes::from(corrupt).into())
+            .await
+            .unwrap();
+        assert_eq!(
+            projected_titles(committed.clone(), &empty_view, store.clone(), paths.clone(),).await,
+            expected
+        );
+        store.put(&property_path, original.into()).await.unwrap();
+
+        let mut incompatible = committed.clone();
+        incompatible
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap()
+            .node_locator
+            .as_mut()
+            .unwrap()
+            .property_pages
+            .as_mut()
+            .unwrap()
+            .format_version += 1;
+        let incompatible = LoadedManifest::new(
+            incompatible.pointer,
+            incompatible.pointer_etag,
+            incompatible.pointer_version,
+            incompatible.manifest,
+        );
+        assert_eq!(
+            projected_titles(incompatible, &empty_view, store.clone(), paths.clone(),).await,
+            expected
+        );
+
+        let full_with_pages =
+            Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .scan_label("Doc")
+                .await
+                .unwrap();
+        let mut no_pages = committed.clone();
+        no_pages
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap()
+            .node_locator
+            .as_mut()
+            .unwrap()
+            .property_pages = None;
+        let no_pages = LoadedManifest::new(
+            no_pages.pointer,
+            no_pages.pointer_etag,
+            no_pages.pointer_version,
+            no_pages.manifest,
+        );
+        let full_without_pages = Snapshot::new(no_pages, &empty_view, store, paths)
+            .scan_label("Doc")
+            .await
+            .unwrap();
+        assert_eq!(full_with_pages, full_without_pages);
+    }
+
+    #[tokio::test]
+    async fn projected_visit_streams_rows_and_bounds_resident_catalog_cache() {
+        let store = make_store();
+        let paths = make_paths("node-property-visit-bounded");
+        let committed = object_native_doc_fixture(&store, &paths, 64, 2048).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snapshot = Snapshot::new(committed, &empty_view, store, paths);
+        let mut visited = 0usize;
+        snapshot
+            .visit_label_with_projection::<_, Error>("Doc", &["title".into()], |row| {
+                visited += 1;
+                assert_eq!(row.properties.len(), 1);
+                assert!(row.properties.contains_key("title"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(visited, 64);
+        let cache = snapshot
+            .node_property_readers
+            .lock()
+            .expect("node property reader cache mutex poisoned");
+        assert!(cache.len() <= SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_ENTRIES);
+        assert!(
+            cache.used_bytes()
+                <= snapshot_local_cache_max_bytes(
+                    SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV,
+                )
+        );
+    }
+
     #[tokio::test]
     async fn limited_disjoint_scan_stops_before_full_sst_and_keeps_predicate_column_internal() {
         let store = make_store();
@@ -10998,6 +13295,150 @@ mod tests {
             "ranged LIMIT read {} bytes from a {} byte SST",
             cache.limited_node_scan_range_bytes(),
             node_sst.size_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_label_membership_is_exact_ordered_and_fails_closed() {
+        let store = make_store();
+        let paths = make_paths("batched-label-membership");
+        let (_ms, _fence, _schema, committed) =
+            limited_doc_fixture(&store, &paths, 64, 8, true).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let ids = vec![
+            sorted_node_id(2),
+            sorted_node_id(5), // physical tombstone
+            sorted_node_id(200),
+            sorted_node_id(2), // duplicate/order preservation
+        ];
+        let doc = vec!["Doc".to_string()];
+        let cache = SstCache::new(4 * 1024 * 1024);
+        let snapshot = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        assert_eq!(
+            snapshot
+                .try_batch_nodes_have_labels(&doc, &ids)
+                .await
+                .unwrap(),
+            Some(vec![true, false, false, true])
+        );
+        assert_eq!(
+            snapshot
+                .try_batch_nodes_have_labels(&["NotInDictionary".into()], &ids)
+                .await
+                .unwrap(),
+            Some(vec![false; ids.len()])
+        );
+        assert_eq!(
+            snapshot
+                .try_batch_nodes_have_labels(&[], &ids)
+                .await
+                .unwrap(),
+            None,
+            "zero labels cannot prove endpoint existence"
+        );
+        assert_eq!(cache.label_membership_fast_paths(), 2);
+        assert_eq!(cache.label_membership_fallbacks(), 1);
+        assert_eq!(cache.label_membership_probes(), 1);
+        assert_eq!(
+            cache.label_membership_candidates(),
+            3,
+            "candidates counts probed work, not inputs: id 200 falls outside \
+             the only descriptor's key range and never reaches a probe, while \
+             the repeated id 2 still costs one each time"
+        );
+        assert_eq!(
+            cache.decoded_node_row_group_inserts(),
+            0,
+            "label membership must not hydrate complete node rows"
+        );
+
+        let descriptor = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap();
+        let label_index = descriptor
+            .label_index
+            .as_ref()
+            .expect("current node flush must emit a label sidecar");
+        assert_eq!(label_index.format, PropertyIndexFormat::PagedV1);
+        assert!(
+            cache.label_membership_pages() < 8,
+            "four endpoint probes touched too many B+tree pages: {}",
+            cache.label_membership_pages()
+        );
+        assert!(
+            cache.label_membership_entries_examined() <= label_index.posting_count,
+            "the batch probe examined more entries than the complete sidecar"
+        );
+        // This fixture's sidecar is a single page plus its header, so no probe
+        // can read strictly less than the object. What the batch must never do
+        // is read one page once per key: that is what pushes the total past the
+        // object size, and it is the regression this bound catches.
+        assert!(
+            cache.label_membership_bytes() <= label_index.size_bytes,
+            "the batch probe read {} bytes of a {}-byte sidecar; one shared \
+             descent must not re-read a page per key",
+            cache.label_membership_bytes(),
+            label_index.size_bytes
+        );
+        let absolute = Path::from(format!(
+            "{}/{}",
+            paths.namespace_prefix().as_ref(),
+            label_index.path
+        ));
+        let original = store.get(&absolute).await.unwrap().bytes().await.unwrap();
+        store.delete(&absolute).await.unwrap();
+        assert_eq!(
+            Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .try_batch_nodes_have_labels(&doc, &ids)
+                .await
+                .unwrap(),
+            None,
+            "a missing optional sidecar must select the authoritative point path"
+        );
+        store.put(&absolute, original.clone().into()).await.unwrap();
+        store
+            .put(
+                &absolute,
+                Bytes::from_static(b"corrupt label sidecar").into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .try_batch_nodes_have_labels(&doc, &ids)
+                .await
+                .unwrap(),
+            None
+        );
+        store.put(&absolute, original.into()).await.unwrap();
+
+        // Even a byte-valid body cannot be transplanted to another physical
+        // node SST: the footer/page CRC salt binds its exact SST UUID.
+        let mut transplanted = committed.clone();
+        transplanted
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|descriptor| descriptor.kind == SstKind::Nodes)
+            .unwrap()
+            .id = Uuid::now_v7();
+        let transplanted = LoadedManifest::new(
+            transplanted.pointer,
+            transplanted.pointer_etag,
+            transplanted.pointer_version,
+            transplanted.manifest,
+        );
+        assert_eq!(
+            Snapshot::new(transplanted, &empty_view, store, paths)
+                .try_batch_nodes_have_labels(&doc, &ids)
+                .await
+                .unwrap(),
+            None
         );
     }
 
@@ -12071,7 +14512,9 @@ mod tests {
         )
         .unwrap();
         for (path, body) in legacy_sidecars {
-            store.put(&path, body.into()).await.unwrap();
+            crate::flush::put_sidecar_payload(store.clone(), &path, body)
+                .await
+                .unwrap();
         }
         let stats = finish.stats;
         base.manifest.ssts.push(SstDescriptor {
@@ -12728,6 +15171,7 @@ mod tests {
                     size_bytes: 1,
                     label_count: per_label_counts.len() as u64,
                     posting_count: per_label_counts.iter().map(|(_, n)| *n).sum(),
+                    format: PropertyIndexFormat::BincodeV0,
                     per_label_counts,
                 }),
                 node_locator: None,

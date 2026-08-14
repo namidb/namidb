@@ -1,7 +1,10 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
+# Pin the multi-architecture manifest lists, not an architecture-specific child:
+# BuildKit still selects linux/amd64 or linux/arm64 while every release rebuild
+# consumes byte-identical base manifests.
 # ─── builder ───────────────────────────────────────────────────────────
-FROM rust:1.85.1-slim-bookworm AS builder
+FROM rust:1.85.1-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS builder
 
 WORKDIR /build
 
@@ -25,7 +28,7 @@ RUN cargo build --locked --release -p namidb-server --features vector-index,text
     && strip target/release/namidb-server
 
 # ─── runtime ───────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 ARG NAMIDB_VERSION=dev
 ARG NAMIDB_REVISION=unknown
@@ -45,7 +48,8 @@ RUN apt-get update \
         ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home namidb \
-    && install -d -o namidb -g namidb -m 0700 /var/tmp/namidb-spool
+    && install -d -o namidb -g namidb -m 0700 /var/tmp/namidb-spool \
+    && install -d -o namidb -g namidb -m 0700 /var/cache/namidb-ranges
 
 COPY --from=builder /build/target/release/namidb-server /usr/local/bin/namidb-server
 COPY --chmod=0555 crates/namidb-server/docker-healthcheck.sh /usr/local/bin/namidb-healthcheck
@@ -60,6 +64,11 @@ EXPOSE 8080
 # increasing OOM risk during long-running bulk loads.
 ENV NAMIDB_LISTEN=0.0.0.0:8080 \
     NAMIDB_SPOOL_DIR=/var/tmp/namidb-spool \
+    NAMIDB_INDEX_BUILD_SPOOL_DIR=/var/tmp/namidb-spool \
+    NAMIDB_SEARCH_WORKSPACE_MAX_BYTES=268435456 \
+    NAMIDB_SEARCH_MAX_RESULT_BYTES=67108864 \
+    NAMIDB_BM25_MAX_DOCUMENT_BYTES=1048576 \
+    NAMIDB_EDGE_DECODE_MAX_BYTES=67108864 \
     RUST_LOG=info \
     MALLOC_ARENA_MAX=2 \
     MALLOC_TRIM_THRESHOLD_=131072

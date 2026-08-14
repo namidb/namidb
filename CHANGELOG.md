@@ -15,6 +15,106 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-27: Incremental vector and full-text indexes
+
+Vector and full-text indexes are maintained as an immutable **base plus ordered
+delta segments** committed in the same manifest CAS as the `Nodes` SSTs they
+cover, replacing the full-corpus rebuild that previously ran only during a
+deepest single-scope merge. A search generation is usable only when the manifest
+proves that every visible `Nodes` SST is covered by a materialized segment or a
+`ProvenEmpty` marker; anything unproven selects the authoritative flat scan and
+is never read as an empty result. See `docs/architecture/search-lsm.md` for the
+full correctness contract.
+
+**Compatibility scope.** 2.1.0 reads 2.0.6 stores. A pre-existing full-corpus
+`.vg`/`.ft` body is adopted in place as the base of a new generation, so no
+reindex is required. HTTP, Bolt, CLI, Python and existing index definitions
+remain compatible.
+
+**Rolling back to 2.0.6 keeps answers correct but degrades search to an exact
+scan.** Once a 2.1.0 writer commits a delta it publishes a compatibility barrier
+over that index. A 2.0.6 reader cannot decode the barrier body and takes its
+existing optional-accelerator fallback, so vector and full-text queries continue
+to return correct results — computed by flat scan rather than served from the
+index, and therefore far slower — until the index is rebuilt under 2.0.6. This
+is deliberate: the base alone no longer reflects the committed deltas, so
+serving from it would return stale answers instead of slow ones.
+
+### Added — Search LSM
+
+- **Incremental delta segments.** Each flush prepares at most one VG6/FT4 delta
+  per registered index from the before/after images of that flush, so index
+  maintenance no longer scans the whole node corpus. Every non-empty delta
+  carries a sorted `NodeId -> version` table, letting updates, deletes,
+  relabels, removal of the indexed property and native-filter changes shadow
+  older payloads without mutating published objects.
+- **Globally exact BM25 across segments.** Delta segments store signed corpus
+  statistic changes, and every segment is scored with the same reconstructed
+  global `N`, `avgdl` and per-query-term `df`, rather than re-deriving
+  statistics per segment.
+- **Range-readable object-native formats.** Vector and text bodies, node
+  property pages and the paged adjacency index are fetched by byte range with
+  page-local native filters, so a query reads the pages it needs instead of a
+  whole body.
+- **`object-native acceptance` CI gate.** A deterministic corpus exercises the
+  physical formats with caching disabled, cold and warm, and fails on parity
+  loss, post-`k` filtering, unexpected body reads, or a warm cache that still
+  reaches the object store.
+
+### Fixed
+
+- **Zero-norm vectors under Cosine are no longer indexed inconsistently.** The
+  delta classifier and the base compaction winner stream now apply the same
+  membership rule as the flat scan and the V5 builders. Previously an all-zero
+  embedding was written as a live delta payload and served with score `0.0`,
+  displacing a legitimate neighbour the flat scan would have returned, and it
+  made base compaction fail its input-count invariant.
+- **Correlated `MERGE` accepts duplicate keys within one batch.** The per-chunk
+  overlay only records keys whose row actually staged a mutation, so a `MERGE`
+  that matched an existing node with no `ON MATCH` or trailing `SET` no longer
+  fails the statement when the same key recurs.
+- **Vector search through a search generation prunes again.** The coordinator
+  probed every page of a clustered V5 base, which built the IVF index and then
+  read past it — a KNN query cost the whole corpus. It now derives its probe
+  budget from `ef` through the same policy as the direct route, so the two
+  cannot drift. `eligible_rows_seen` is only accepted as an exhaustion proof
+  when the probe actually covered every page, and a segment that comes up short
+  widens its page budget rather than re-running an identical scan.
+- **BM25 across segments no longer materialises every match.** Each segment was
+  asked for its complete match set regardless of `LIMIT`, and a generation whose
+  matches exceeded the materialisation cap fell back to a full node scan. Scores
+  come from reconciled global statistics and are therefore comparable across
+  segments, so a bounded over-fetch with refill returns the same top `k`.
+- **Segment lookups within one query run concurrently.** Document-frequency
+  reconciliation, prefix expansion and version-table winner probes issued one
+  dependent object-store round trip per segment, per term, before anything could
+  be scored. They are now issued as ordered waves; every fold stays in segment
+  order, so results are unchanged.
+- **The `object-native acceptance` gate compiles and runs.** It referenced an
+  unbound identifier and no CI job built it, so the gate had never executed.
+  The workflow now type-checks the bench before running it, and enforces a
+  recall floor and a cold bytes-read ceiling instead of only structural
+  assertions that could not fail.
+- **The object-range page cache no longer strands callers across runtimes.**
+  A RAM-only cache was built as a Foyer *hybrid* cache with no device, and a
+  hybrid cache starts background workers on whichever runtime first builds it.
+  Because the tier is reached through a process-global cell, any host that
+  creates and drops runtimes — an embedded caller opening one per call, or a
+  test binary — left every later user awaiting workers that no longer existed.
+  A memory-only tier is now a pure in-memory cache with no workers and no
+  runtime affinity; the hybrid path is unchanged and still requires NVMe.
+
+### Changed — configuration
+
+- `validate_cache_configuration` rejects a malformed value on every exact-byte
+  memory rail it owns, so the official server fails to start instead of
+  silently selecting a much larger default. A malformed
+  `NAMIDB_RAM_PAGE_CACHE_MAX_BYTES` no longer resolves to zero, which had
+  disabled an explicitly requested cache tier.
+- `NAMIDB_INDEX_BUILD_MEMORY_BYTES` is documented with both of its defaults:
+  256 MiB on the compaction rebuild path and 64 MiB for per-flush delta
+  builders. One explicit setting overrides both.
+
 ## [2.0.6] - 2026-07-26: Bounded existing-node vector updates
 
 This patch removes the retained multi-megabyte working set behind
@@ -2430,7 +2530,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.0.6...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/namidb/namidb/compare/v2.0.6...v2.1.0
 [2.0.6]: https://github.com/namidb/namidb/compare/v2.0.5...v2.0.6
 [2.0.5]: https://github.com/namidb/namidb/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/namidb/namidb/compare/v2.0.3...v2.0.4

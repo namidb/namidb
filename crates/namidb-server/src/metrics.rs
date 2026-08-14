@@ -779,6 +779,201 @@ impl Metrics {
             "namidb_memory_rejected_queries_total {}",
             memory.rejected_queries()
         );
+
+        // Reading metrics must not be the operation that initializes an NVMe
+        // cache or locks its directory. The storage snapshot is deliberately
+        // synchronous and returns `None` until a real range read has sampled
+        // configuration.
+        let range_cache = namidb_storage::range_cache::shared_range_cache_snapshot();
+        let enabled = u8::from(range_cache.is_some());
+        let range_cache = range_cache.unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_enabled Whether the immutable object-range cache has been initialized and enabled."
+        );
+        let _ = writeln!(out, "# TYPE namidb_range_cache_enabled gauge");
+        let _ = writeln!(out, "namidb_range_cache_enabled {enabled}");
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_bytes Range-cache byte gauges by tier and kind."
+        );
+        let _ = writeln!(out, "# TYPE namidb_range_cache_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"budget\"}} {}",
+            range_cache.ram_budget_bytes
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"capacity\"}} {}",
+            range_cache.memory_capacity_bytes
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"usage\"}} {}",
+            range_cache.memory_usage_bytes
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"write_buffers\"}} {}",
+            range_cache.write_buffer_reservation_bytes
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"persistent_index_estimate\"}} {}",
+            range_cache.disk_index_estimate_bytes
+        );
+        let accounted = range_cache
+            .memory_capacity_bytes
+            .saturating_add(range_cache.write_buffer_reservation_bytes)
+            .saturating_add(range_cache.disk_index_estimate_bytes);
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"ram\",kind=\"accounted_total\"}} {accounted}"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_bytes{{tier=\"nvme\",kind=\"capacity\"}} {}",
+            range_cache.disk_capacity_bytes
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_lookups_total Immutable range-cache lookup outcomes."
+        );
+        let _ = writeln!(out, "# TYPE namidb_range_cache_lookups_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_lookups_total{{outcome=\"memory_hit\"}} {}",
+            range_cache.stats.memory_hits
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_lookups_total{{outcome=\"disk_hit\"}} {}",
+            range_cache.stats.disk_hits
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_lookups_total{{outcome=\"miss\"}} {}",
+            range_cache.stats.misses
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_remote_fetches_total Object-store fetches issued after range-cache misses."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE namidb_range_cache_remote_fetches_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_remote_fetches_total {}",
+            range_cache.stats.outer_fetches
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_events_total Range-cache insert, rejection, and corruption events."
+        );
+        let _ = writeln!(out, "# TYPE namidb_range_cache_events_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_events_total{{event=\"insert\"}} {}",
+            range_cache.stats.inserts
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_events_total{{event=\"admission_rejection\"}} {}",
+            range_cache.stats.admission_rejections
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_events_total{{event=\"corrupt_entry\"}} {}",
+            range_cache.stats.corrupt_entries
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_range_cache_nvme_io_bytes_total Bytes read from or written to the persistent NVMe tier."
+        );
+        let _ = writeln!(out, "# TYPE namidb_range_cache_nvme_io_bytes_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_nvme_io_bytes_total{{operation=\"read\"}} {}",
+            range_cache.disk_read_bytes
+        );
+        let _ = writeln!(
+            out,
+            "namidb_range_cache_nvme_io_bytes_total{{operation=\"write\"}} {}",
+            range_cache.disk_write_bytes
+        );
+
+        // As with the immutable range cache, a scrape must not initialise the
+        // process-wide semaphore or freeze its environment-derived capacity.
+        let search_workspace = namidb_storage::search_workspace::search_workspace_metrics();
+        let search_workspace_enabled = u8::from(search_workspace.is_some());
+        let (
+            workspace_capacity,
+            workspace_reserved,
+            workspace_peak,
+            workspace_successful,
+            workspace_contended,
+            workspace_rejected,
+        ) = search_workspace
+            .map(|metrics| {
+                (
+                    metrics.capacity_bytes,
+                    metrics.reserved_bytes,
+                    metrics.peak_reserved_bytes,
+                    metrics.successful_reservations,
+                    metrics.contended_reservations,
+                    metrics.rejected_reservations,
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_workspace_enabled Whether the process-wide object-native search workspace has been initialized."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_workspace_enabled gauge");
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_enabled {search_workspace_enabled}"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_workspace_bytes Search-workspace byte gauges by kind."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_workspace_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_bytes{{kind=\"capacity\"}} {workspace_capacity}"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_bytes{{kind=\"reserved\"}} {workspace_reserved}"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_bytes{{kind=\"peak_reserved\"}} {workspace_peak}"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_workspace_reservations_total Search-workspace reservation outcomes."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE namidb_search_workspace_reservations_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_reservations_total{{outcome=\"successful\"}} {workspace_successful}"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_reservations_total{{outcome=\"contended\"}} {workspace_contended}"
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_workspace_reservations_total{{outcome=\"rejected\"}} {workspace_rejected}"
+        );
         out
     }
 }
@@ -889,6 +1084,15 @@ mod tests {
         assert!(with_memory.contains("namidb_memory_resident_bytes "));
         assert!(with_memory.contains("namidb_memory_reclaims_total 0"));
         assert!(with_memory.contains("namidb_memory_rejected_queries_total 0"));
+        assert!(with_memory.contains("namidb_range_cache_enabled "));
+        assert!(with_memory.contains("namidb_range_cache_bytes{tier=\"ram\",kind=\"usage\"} "));
+        assert!(with_memory.contains("namidb_range_cache_lookups_total{outcome=\"memory_hit\"} "));
+        assert!(with_memory.contains("namidb_range_cache_remote_fetches_total "));
+        assert!(with_memory.contains("namidb_range_cache_nvme_io_bytes_total{operation=\"read\"} "));
+        assert!(with_memory.contains("namidb_search_workspace_enabled "));
+        assert!(with_memory.contains("namidb_search_workspace_bytes{kind=\"reserved\"} "));
+        assert!(with_memory
+            .contains("namidb_search_workspace_reservations_total{outcome=\"rejected\"} "));
     }
 
     #[test]

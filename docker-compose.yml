@@ -51,31 +51,62 @@ services:
       NAMIDB_AUTH_TOKEN: "${NAMIDB_AUTH_TOKEN:?set NAMIDB_AUTH_TOKEN in your env (e.g. openssl rand -hex 32)}"
       NAMIDB_FLUSH_INTERVAL: "30s"
       NAMIDB_CACHE_MAX_BYTES: "${NAMIDB_CACHE_MAX_BYTES:-1073741824}"
+      # One active query/snapshot may retain at most this many decoded node
+      # views outside the process-wide shared-cache pool.
+      NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES: "${NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES:-1048576}"
+      NAMIDB_SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES: "${NAMIDB_SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES:-1048576}"
+      NAMIDB_SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES: "${NAMIDB_SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES:-1048576}"
       # Optional exact-byte reservation carved out of CACHE_MAX for the shared
       # decoded .vg/.ft pool. Empty keeps proportional legacy allocation.
       NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES: "${NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES:-}"
-      NAMIDB_MEMORY_MAX_BYTES: "${NAMIDB_MEMORY_MAX_BYTES:-0}"
+      # Object-store-native graph/vector/FTS pages retain a small bounded RAM
+      # tier and a reconstructible persistent NVMe tier. The latter is cache,
+      # never the source of truth; deleting the volume only makes reads cold.
+      NAMIDB_RAM_PAGE_CACHE_MAX_BYTES: "${NAMIDB_RAM_PAGE_CACHE_MAX_BYTES:-67108864}"
+      NAMIDB_NVME_CACHE_PATH: "/var/cache/namidb-ranges"
+      NAMIDB_NVME_CACHE_MAX_BYTES: "${NAMIDB_NVME_CACHE_MAX_BYTES:-10737418240}"
+      NAMIDB_RANGE_CACHE_NAMESPACE: "${NAMIDB_RANGE_CACHE_NAMESPACE:-compose-minio-prod}"
+      NAMIDB_SEARCH_WORKSPACE_MAX_BYTES: "${NAMIDB_SEARCH_WORKSPACE_MAX_BYTES:-268435456}"
+      NAMIDB_SEARCH_MAX_RESULT_BYTES: "${NAMIDB_SEARCH_MAX_RESULT_BYTES:-67108864}"
+      NAMIDB_BM25_MAX_DOCUMENT_BYTES: "${NAMIDB_BM25_MAX_DOCUMENT_BYTES:-1048576}"
+      # `auto` admits work only up to 90% of the finite cgroup limit below,
+      # leaving kernel/OOM headroom for allocations already in flight.
+      NAMIDB_MEMORY_MAX_BYTES: "${NAMIDB_MEMORY_MAX_BYTES:-auto}"
       # Exact-record sidecars spool large value regions to disk during
       # flush/compaction instead of retaining several GiB in process RSS.
+      # Vector and FTS builders use the same volume and a separately bounded
+      # logical sort/partition buffer.
       NAMIDB_SPOOL_DIR: "/var/tmp/namidb-spool"
+      NAMIDB_INDEX_BUILD_SPOOL_DIR: "/var/tmp/namidb-spool"
+      NAMIDB_INDEX_BUILD_MEMORY_BYTES: "${NAMIDB_INDEX_BUILD_MEMORY_BYTES:-268435456}"
+      NAMIDB_SIDECAR_SORT_MEMORY_BYTES: "${NAMIDB_SIDECAR_SORT_MEMORY_BYTES:-8388608}"
+      # Disabled by default: current readers use PagedV2 directly. Set a
+      # positive bounded value only during an explicit old-reader migration.
+      NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES: "${NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES:-0}"
       NAMIDB_VECTOR_FILTER_MAX_DISTINCT: "${NAMIDB_VECTOR_FILTER_MAX_DISTINCT:-4096}"
       NAMIDB_VECTOR_FILTER_MAX_BYTES: "${NAMIDB_VECTOR_FILTER_MAX_BYTES:-67108864}"
       NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP: "${NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP:-8192}"
       NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP: "${NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP:-65536}"
-      NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES: "${NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES:-65536}"
-      NAMIDB_EDGE_POINT_MAX_SST_BYTES: "${NAMIDB_EDGE_POINT_MAX_SST_BYTES:-536870912}"
+      # Zero means "no artificial output cap". Positive operator caps fail
+      # flush/compaction explicitly; they never make an SST silently lose its
+      # exact-edge accelerator and regress MERGE back to an adjacency scan.
+      NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES: "${NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES:-0}"
+      NAMIDB_EDGE_POINT_MAX_SST_BYTES: "${NAMIDB_EDGE_POINT_MAX_SST_BYTES:-0}"
+      NAMIDB_EDGE_DECODE_MAX_BYTES: "${NAMIDB_EDGE_DECODE_MAX_BYTES:-67108864}"
       AWS_ACCESS_KEY_ID: "minioadmin"
       AWS_SECRET_ACCESS_KEY: "minioadmin"
       RUST_LOG: "info"
     ports:
       - "8080:8080"
-    # Optional OS-enforced containment for shared hosts. Set, for example,
-    # NAMIDB_CONTAINER_MEMORY_LIMIT=4g together with a lower
-    # NAMIDB_MEMORY_MAX_BYTES admission threshold. Zero leaves it unlimited.
-    mem_limit: "${NAMIDB_CONTAINER_MEMORY_LIMIT:-0}"
+    # Hard containment is enabled in the production example instead of
+    # relying on cache accounting alone. Override deliberately for larger
+    # search/build workspaces; `NAMIDB_MEMORY_MAX_BYTES=auto` follows it.
+    mem_limit: "${NAMIDB_CONTAINER_MEMORY_LIMIT:-4g}"
     volumes:
       - namidb-spool:/var/tmp/namidb-spool
+      - namidb-range-cache:/var/cache/namidb-ranges
 
 volumes:
   minio-data: {}
   namidb-spool: {}
+  namidb-range-cache: {}

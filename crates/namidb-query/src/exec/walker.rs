@@ -7,7 +7,7 @@
 //! See RFC-008 §"API del executor".
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use std::sync::Arc;
@@ -955,12 +955,10 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
-                        snapshot,
                         routing,
                         target_alias,
-                        edge_type.as_deref(),
-                        *direction,
                         target_labels,
+                        path_binding.as_deref(),
                         length,
                         *back_reference,
                     ),
@@ -1088,12 +1086,10 @@ fn execute_capped<'a>(
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
-                        snapshot,
                         routing,
                         target_alias,
-                        edge_type.as_deref(),
-                        *direction,
                         target_labels,
+                        path_binding.as_deref(),
                         length,
                         *back_reference,
                     ),
@@ -1432,7 +1428,7 @@ pub(crate) async fn execute_expand(
                     neighbours_of_any(snapshot, &edge_types, direction, step.tail, edge_read_mode)
                         .await?
                 };
-                if !back_reference && !skip_target_materialize {
+                if !back_reference {
                     for edge in &neighbours {
                         let tid = partner_id(edge, direction, step.tail);
                         if seen_targets.insert(tid) {
@@ -1442,15 +1438,18 @@ pub(crate) async fn execute_expand(
                 }
                 step_neighbours.push((step, neighbours));
             }
-            // Phase 2: batch prewarm. Populates L1 (and L2 if attached)
-            // so the per-edge `lookup_node` below hits the cache instead
-            // of decoding the SST again. We discard the returned `Vec`;
-            // the cache is the only side-effect we care about.
-            if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
-                if let Some(label) = target_labels.first() {
-                    let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
-                }
-            }
+            // Phase 2: either prove endpoint labels through the compact
+            // `(LabelId,NodeId)` sidecar (identity-only target), or prewarm
+            // the ordinary point cache once for the whole hop. This keeps
+            // work proportional to touched endpoints and avoids hydrating
+            // large vectors solely to evaluate `(:Label)`.
+            let target_membership = prepare_expand_targets(
+                snapshot,
+                target_labels,
+                &unique_targets,
+                skip_target_materialize,
+            )
+            .await?;
             for (step, neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, step.tail);
@@ -1504,10 +1503,14 @@ pub(crate) async fn execute_expand(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        // Reserved for a future store that persists endpoint
-                        // conformance. The current routing function keeps this
-                        // false because EdgeTypeDef alone is not proof for raw
-                        // writes; see `should_skip_target_materialize`.
+                        if !target_membership
+                            .as_ref()
+                            .and_then(|membership| membership.get(&target_id))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
                         None
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
@@ -2051,15 +2054,62 @@ async fn flat_search_procedure(
 /// flat scan.
 ///
 /// `CALL search.bm25({label: 'Note', text_properties: ['body','title'],
-/// query: $q, k: 10})`
+/// query: $q, k: 10, filter: {vigente: true}})`
 async fn bm25_search(
     args: &[Expression],
     yield_items: &[(String, String)],
     snapshot: &Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    let (label, props, query, k) = bm25_search_args(args, params)?;
-    let ranked = bm25_ranked(snapshot, &label, &props, &query, k).await?;
+    let options = bm25_search_args(args, params)?;
+    let filter = proc_opt_filter(options.filter.as_ref())?;
+    let native_prefilter = proc_vector_prefilter(options.filter.as_ref());
+    let filter_properties = options
+        .filter
+        .as_ref()
+        .and_then(|filter| match filter {
+            RuntimeValue::Map(properties) => Some(properties.keys().cloned().collect::<Vec<_>>()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let ranked = match (filter.as_ref(), options.k) {
+        (None, k) => {
+            bm25_ranked(snapshot, &options.label, &options.props, &options.query, k).await?
+        }
+        (Some(filter), Some(k)) => {
+            // The indexed path widens before applying the residual predicate,
+            // so a selective filter cannot starve a pre-truncated sparse top-k.
+            // Once FT4 native groups are available this same helper gives them
+            // first refusal and retains this exact path for unsupported terms.
+            bm25_ranked_filtered(
+                snapshot,
+                &options.label,
+                &options.props,
+                &options.query,
+                k,
+                (filter, params, &filter_properties),
+                &native_prefilter.groups,
+            )
+            .await?
+        }
+        (Some(filter), None) => {
+            // An unbounded filtered result has no finite widening target. Use
+            // the exact two-pass scorer; corpus statistics remain unfiltered.
+            let mut props = options.props.clone();
+            props.sort();
+            props.dedup();
+            let parsed = crate::exec::text_scoring::parse_query(&options.query);
+            bm25_ranked_flat(
+                snapshot,
+                &options.label,
+                &props,
+                &parsed,
+                None,
+                Some((filter, params, &filter_properties)),
+            )
+            .await?
+        }
+    };
 
     // Hydrate each ranked id to its full node so `YIELD node` carries the
     // document's properties. Hydrate bounded chunks directly so cold
@@ -2070,7 +2120,7 @@ async fn bm25_search(
     for chunk in ranked.chunks(HYDRATE_BATCH) {
         crate::exec::limits::check_deadline()?;
         let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
-        let hydrated = snapshot.batch_lookup_nodes(&label, &ids).await?;
+        let hydrated = snapshot.batch_lookup_nodes(&options.label, &ids).await?;
         for ((_, score), view) in chunk.iter().zip(hydrated) {
             if let Some(view) = view {
                 let node = RuntimeValue::Node(Box::new(NodeValue::from(view)));
@@ -2147,9 +2197,13 @@ async fn bm25_ranked(
 /// Corpus statistics are always computed from every searchable document:
 /// filtering must not change BM25's `N`, average length, or term document
 /// frequencies. Candidate filtering and scoring happen in a second pass. When
-/// `k` is finite, periodic pruning keeps the ranking workspace at `O(k)`
-/// rather than retaining every match; the snapshot scan itself remains the
-/// existing exact fallback cost.
+/// `k` is finite, periodic pruning keeps the ranking workspace at `O(k)`.
+/// Compacted snapshots are visited twice by projected Parquet row group, so
+/// neither pass materialises the corpus; transient overlapping snapshots use
+/// the storage layer's exact reconciliation fallback. Each document is
+/// tokenized field-by-field into one unique-term map under the configured
+/// document ceiling, and one process-wide reservation covers that workspace
+/// together with the retained result ranking.
 async fn bm25_ranked_flat(
     snapshot: &Snapshot<'_>,
     label: &str,
@@ -2158,15 +2212,29 @@ async fn bm25_ranked_flat(
     k: Option<usize>,
     filter: Option<(&Expression, &Params, &[String])>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
-    use crate::exec::text_scoring::{
-        bm25_idf, bm25_term_score, contains_phrase, tokenize, PREFIX_EXPANSION_LIMIT,
+    use crate::exec::text_scoring::{bm25_idf, bm25_term_score, PREFIX_EXPANSION_LIMIT};
+    use namidb_storage::search_workspace::{
+        bm25_max_document_bytes, estimated_bm25_document_workspace_bytes,
+        estimated_text_result_bytes, reserve_search_workspace, search_max_result_bytes,
+        search_max_text_result_hits,
     };
     use std::collections::{BTreeMap, HashMap};
-    use std::ops::Bound;
 
     if k == Some(0) || parsed.is_empty() {
         return Ok(Vec::new());
     }
+
+    let maximum_unbounded_hits = search_max_text_result_hits();
+    let retained_limit = k.unwrap_or_else(|| maximum_unbounded_hits.saturating_add(1));
+    let max_document_bytes = bm25_max_document_bytes();
+    let result_workspace_bytes = estimated_text_result_bytes(retained_limit);
+    let document_workspace_bytes = estimated_bm25_document_workspace_bytes(max_document_bytes);
+    // Acquire one permit for the result ranking plus the largest admitted
+    // document. Reserving them independently can deadlock a query against its
+    // own first permit when each request fits but their sum does not.
+    let combined_workspace_bytes = result_workspace_bytes.saturating_add(document_workspace_bytes);
+    let _query_workspace =
+        reserve_search_workspace("exact full-text fallback", combined_workspace_bytes).await?;
 
     // Decode only text + filter properties. The procedure filter is a map of
     // node-property conditions, so this is sufficient for exact evaluation and
@@ -2176,52 +2244,70 @@ async fn bm25_ranked_flat(
         projection.extend(filter_properties.iter().cloned());
     }
     let projection: Vec<String> = projection.into_iter().collect();
-    let views = snapshot
-        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
-        .await?;
-
     let fixed: Vec<String> = parsed.base_terms().into_iter().map(String::from).collect();
     let mut n_docs = 0usize;
     let mut total_len = 0usize;
     let mut df = vec![0usize; fixed.len()];
-    let mut expanded_df: BTreeMap<String, usize> = BTreeMap::new();
+    // Keep only the lexicographically-first expansion terms for each prefix
+    // while counting document frequency. The previous global map retained
+    // every matching corpus term even though only PREFIX_EXPANSION_LIMIT can
+    // affect the query plan.
+    let mut expanded_df = vec![BTreeMap::<String, usize>::new(); parsed.prefixes.len()];
     let mut since_check = 0usize;
 
     // Pass one: corpus-wide statistics, deliberately before applying `filter`.
-    for view in &views {
-        since_check += 1;
-        if since_check >= 4096 {
-            since_check = 0;
-            crate::exec::limits::check_deadline()?;
-        }
-        let Some(text) = doc_text(view, props) else {
-            continue;
-        };
-        let tokens = tokenize(&text);
-        n_docs = n_docs.saturating_add(1);
-        total_len = total_len.saturating_add(tokens.len());
-        let mut counts: HashMap<&str, u32> = HashMap::new();
-        for term in &tokens {
-            *counts.entry(term.as_str()).or_insert(0) += 1;
-        }
-        for (index, term) in fixed.iter().enumerate() {
-            if counts.contains_key(term.as_str()) {
-                df[index] = df[index].saturating_add(1);
+    snapshot
+        .visit_label_with_projection(label, &projection, |view| -> Result<(), ExecError> {
+            since_check += 1;
+            if since_check >= 4096 {
+                since_check = 0;
+                crate::exec::limits::check_deadline()?;
             }
-        }
-        if !parsed.prefixes.is_empty() {
-            for term in counts.keys() {
-                if parsed
-                    .prefixes
-                    .iter()
-                    .any(|prefix| term.starts_with(prefix.as_str()))
-                {
-                    let entry = expanded_df.entry((*term).to_string()).or_insert(0);
-                    *entry = entry.saturating_add(1);
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            let Some(document_len) =
+                visit_bm25_document(&view, props, max_document_bytes, |term| {
+                    increment_bm25_term(&mut counts, term);
+                    Ok::<(), ExecError>(())
+                })?
+            else {
+                return Ok(());
+            };
+            n_docs = n_docs.saturating_add(1);
+            total_len = total_len.saturating_add(document_len);
+            for (index, term) in fixed.iter().enumerate() {
+                if counts.contains_key(term.as_str()) {
+                    df[index] = df[index].saturating_add(1);
                 }
             }
-        }
-    }
+            for term in counts.keys().map(String::as_str) {
+                for (prefix, selected) in parsed.prefixes.iter().zip(&mut expanded_df) {
+                    if !term.starts_with(prefix.as_str()) {
+                        continue;
+                    }
+                    if let Some(term_df) = selected.get_mut(term) {
+                        *term_df = term_df.saturating_add(1);
+                        continue;
+                    }
+                    if selected.len() < PREFIX_EXPANSION_LIMIT {
+                        selected.insert(term.to_string(), 1);
+                        continue;
+                    }
+                    let displaces_last = selected
+                        .last_key_value()
+                        .is_some_and(|(last, _)| term < last.as_str());
+                    if displaces_last {
+                        let last = selected
+                            .last_key_value()
+                            .map(|(last, _)| last.clone())
+                            .expect("full prefix expansion has a last term");
+                        selected.remove(&last);
+                        selected.insert(term.to_string(), 1);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
 
     let avg_len = if n_docs > 0 {
         total_len as f64 / n_docs as f64
@@ -2234,76 +2320,87 @@ async fn bm25_ranked_flat(
     for (index, term) in fixed.iter().enumerate() {
         scored_terms.insert(term.clone(), bm25_idf(n_docs, df[index]));
     }
-    for prefix in &parsed.prefixes {
-        let matched = expanded_df
-            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
-            .take_while(|(term, _)| term.starts_with(prefix.as_str()))
-            .take(PREFIX_EXPANSION_LIMIT);
-        for (term, &term_df) in matched {
+    for selected in expanded_df {
+        for (term, term_df) in selected {
             scored_terms
-                .entry(term.clone())
+                .entry(term)
                 .or_insert_with(|| bm25_idf(n_docs, term_df));
         }
     }
 
-    let initial_capacity = k
-        .map(|limit| query_initial_capacity(limit, views.len()))
-        .unwrap_or(0);
+    let rank_limit = retained_limit;
+    let initial_capacity = query_initial_capacity(retained_limit, retained_limit);
     let mut ranked: Vec<(NodeId, f64)> = Vec::with_capacity(initial_capacity);
-    let prune_at = k.map(|limit| limit.saturating_mul(2).max(limit.saturating_add(1)));
+    let prune_at = rank_limit
+        .saturating_mul(2)
+        .max(rank_limit.saturating_add(1));
+    let phrase_plan = Bm25PhrasePlan::new(&parsed.phrases);
     since_check = 0;
 
     // Pass two: apply the residual filter before selecting the sparse top-k.
-    for view in views {
-        since_check += 1;
-        if since_check >= 4096 {
-            since_check = 0;
-            crate::exec::limits::check_deadline()?;
-        }
-        let Some(text) = doc_text(&view, props) else {
-            continue;
-        };
-        let id = view.id;
-        if let Some((filter, params, _)) = filter {
-            let mut row = Row::new();
-            row.set(
-                "node".to_string(),
-                RuntimeValue::Node(Box::new(NodeValue::from(view))),
-            );
-            if evaluate(filter, &row, params)?.as_bool() != Some(true) {
-                continue;
+    snapshot
+        .visit_label_with_projection(label, &projection, |view| -> Result<(), ExecError> {
+            since_check += 1;
+            if since_check >= 4096 {
+                since_check = 0;
+                crate::exec::limits::check_deadline()?;
             }
-        }
-
-        let tokens = tokenize(&text);
-        if !parsed
-            .phrases
-            .iter()
-            .all(|phrase| contains_phrase(&tokens, phrase))
-        {
-            continue;
-        }
-        let mut counts: HashMap<&str, u32> = HashMap::new();
-        for term in &tokens {
-            *counts.entry(term.as_str()).or_insert(0) += 1;
-        }
-        let mut score = 0.0;
-        for (term, idf) in &scored_terms {
-            let tf = counts.get(term.as_str()).copied().unwrap_or(0);
-            score += bm25_term_score(*idf, tf, tokens.len(), avg_len);
-        }
-        if score > 0.0 {
-            ranked.push((id, score));
-            if prune_at.is_some_and(|threshold| ranked.len() >= threshold) {
-                sort_bm25_hits(&mut ranked);
-                ranked.truncate(k.expect("finite pruning has a finite k"));
+            let id = view.id;
+            let analysis = if let Some((filter, params, _)) = filter {
+                // Preserve the historical ordering: nodes with no searchable
+                // string fields never evaluate the residual filter. This
+                // preflight also rejects an oversized document before any
+                // token/count allocation.
+                if bm25_document_bytes(&view, props, max_document_bytes)?.is_none() {
+                    return Ok(());
+                }
+                let mut row = Row::new();
+                row.set(
+                    "node".to_string(),
+                    RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                );
+                if evaluate(filter, &row, params)?.as_bool() != Some(true) {
+                    return Ok(());
+                }
+                let node = match row.get("node") {
+                    Some(RuntimeValue::Node(node)) => node.as_ref(),
+                    _ => unreachable!("the residual-filter row always contains its node"),
+                };
+                analyse_bm25_document(node, props, max_document_bytes, &phrase_plan)?
+            } else {
+                analyse_bm25_document(&view, props, max_document_bytes, &phrase_plan)?
+            };
+            let Some(analysis) = analysis else {
+                return Ok(());
+            };
+            if !analysis.phrases_match {
+                return Ok(());
             }
-        }
-    }
+            let mut score = 0.0;
+            for (term, idf) in &scored_terms {
+                let tf = analysis.counts.get(term.as_str()).copied().unwrap_or(0);
+                score += bm25_term_score(*idf, tf, analysis.document_len, avg_len);
+            }
+            if score > 0.0 {
+                ranked.push((id, score));
+                if ranked.len() >= prune_at {
+                    sort_bm25_hits(&mut ranked);
+                    ranked.truncate(rank_limit);
+                }
+            }
+            Ok(())
+        })
+        .await?;
 
     sort_bm25_hits(&mut ranked);
-    if let Some(k) = k {
-        ranked.truncate(k);
+    ranked.truncate(retained_limit);
+    if k.is_none() && ranked.len() > maximum_unbounded_hits {
+        return Err(namidb_storage::Error::SearchResultLimitExceeded {
+            index_kind: "full-text",
+            estimated_bytes: estimated_text_result_bytes(ranked.len()),
+            limit_bytes: search_max_result_bytes(),
+        }
+        .into());
     }
     Ok(ranked)
 }
@@ -2330,11 +2427,16 @@ fn hybrid_text_filter_candidate_cap() -> usize {
 
 /// Filtered sparse retrieval for `search.hybrid`.
 ///
-/// An authoritative text index is widened geometrically and each newly
-/// exposed prefix slice is hydrated exactly once. The configured cap bounds
-/// indexed candidates and object-store hydration; reaching it without `target`
-/// survivors falls back to the exact two-pass scorer instead of returning a
-/// short page. Thus the cap changes cost, never results.
+/// FT4 first applies every complete String/Bool equality/IN group inside its
+/// postings. An authoritative text index is then widened geometrically and
+/// each newly exposed prefix slice is hydrated exactly once for any residual
+/// range/negative predicate. The configured cap bounds indexed candidates and
+/// object-store hydration; reaching it without `target` survivors falls back
+/// to the exact two-pass scorer instead of returning a short page. Thus the cap
+/// changes cost, never results.
+// Only the `text-index` path can push these groups into a native filter; the
+// exact fallback below re-derives them from the residual filter expression.
+#[cfg_attr(not(feature = "text-index"), allow(unused_variables))]
 async fn bm25_ranked_filtered(
     snapshot: &Snapshot<'_>,
     label: &str,
@@ -2342,6 +2444,7 @@ async fn bm25_ranked_filtered(
     query: &str,
     target: usize,
     filter: (&Expression, &Params, &[String]),
+    native_groups: &[(String, Vec<CoreValue>)],
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
     use crate::exec::text_scoring::parse_query;
 
@@ -2380,10 +2483,22 @@ async fn bm25_ranked_filtered(
             let mut survivors = Vec::with_capacity(query_initial_capacity(target, candidate_cap));
 
             loop {
-                let Some(hits) = snapshot
-                    .text_search(&index_name, label, &parsed, Some(fetch))
-                    .await?
-                else {
+                let hits = if native_groups.is_empty() {
+                    snapshot
+                        .text_search(&index_name, label, &parsed, Some(fetch))
+                        .await?
+                } else {
+                    snapshot
+                        .text_search_filter_groups(
+                            &index_name,
+                            label,
+                            &parsed,
+                            Some(fetch),
+                            native_groups,
+                        )
+                        .await?
+                };
+                let Some(hits) = hits else {
                     break;
                 };
                 if hits.len() < processed_prefix {
@@ -2451,30 +2566,314 @@ async fn bm25_ranked_filtered(
     .await
 }
 
-/// The text of a document for BM25: the configured properties' string values
-/// joined by a space. `None` when the node carries none of them as a string —
-/// such a node is not a member of the searchable corpus.
-fn doc_text(view: &namidb_storage::NodeView, props: &[String]) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    for p in props {
-        if let Some(namidb_core::Value::Str(s)) = view.properties.get(p) {
-            parts.push(s.as_str());
+/// Borrow the configured string fields from either the storage view used by
+/// an unfiltered scan or the executor node used while evaluating a residual
+/// filter.
+trait Bm25TextDocument {
+    fn bm25_text_field(&self, property: &str) -> Option<&str>;
+}
+
+impl Bm25TextDocument for namidb_storage::NodeView {
+    fn bm25_text_field(&self, property: &str) -> Option<&str> {
+        match self.properties.get(property) {
+            Some(namidb_core::Value::Str(text)) => Some(text),
+            _ => None,
         }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
     }
 }
 
+impl Bm25TextDocument for NodeValue {
+    fn bm25_text_field(&self, property: &str) -> Option<&str> {
+        match self.properties.get(property) {
+            Some(RuntimeValue::String(text)) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// Validate one logical BM25 document before tokenization. String properties
+/// are measured without concatenating them; separators inserted by the old
+/// `join(" ")` never contributed a token.
+fn bm25_document_bytes(
+    document: &impl Bm25TextDocument,
+    props: &[String],
+    max_document_bytes: usize,
+) -> Result<Option<usize>, ExecError> {
+    let mut found_string = false;
+    let mut document_bytes = 0usize;
+    for property in props {
+        if let Some(text) = document.bm25_text_field(property) {
+            found_string = true;
+            document_bytes = document_bytes.saturating_add(text.len());
+        }
+    }
+    if !found_string {
+        return Ok(None);
+    }
+    if document_bytes > max_document_bytes {
+        return Err(namidb_storage::Error::SearchDocumentLimitExceeded {
+            operation: "exact full-text fallback",
+            document_bytes,
+            limit_bytes: max_document_bytes,
+        }
+        .into());
+    }
+    Ok(Some(document_bytes))
+}
+
+/// Stream the configured properties as one logical token sequence. Calling the
+/// tokenizer once per field is exactly equivalent to the old space-join:
+/// alphanumeric runs cannot merge across fields, while phrase state held by the
+/// caller remains adjacent across the separator.
+fn visit_bm25_document(
+    document: &impl Bm25TextDocument,
+    props: &[String],
+    max_document_bytes: usize,
+    mut visitor: impl FnMut(&str) -> Result<(), ExecError>,
+) -> Result<Option<usize>, ExecError> {
+    if bm25_document_bytes(document, props, max_document_bytes)?.is_none() {
+        return Ok(None);
+    }
+
+    let mut document_len = 0usize;
+    let mut tokens_since_deadline_check = 0usize;
+    for property in props {
+        if let Some(text) = document.bm25_text_field(property) {
+            document_len = document_len.saturating_add(namidb_storage::text::try_visit_tokens(
+                text,
+                |token| {
+                    tokens_since_deadline_check += 1;
+                    if tokens_since_deadline_check >= 4_096 {
+                        tokens_since_deadline_check = 0;
+                        crate::exec::limits::check_deadline()?;
+                    }
+                    visitor(token)
+                },
+            )?);
+        }
+    }
+    Ok(Some(document_len))
+}
+
+fn increment_bm25_term(counts: &mut std::collections::HashMap<String, u32>, term: &str) {
+    if let Some(count) = counts.get_mut(term) {
+        *count = count.saturating_add(1);
+    } else {
+        counts.insert(term.to_owned(), 1);
+    }
+}
+
+/// KMP tables are query-sized and built once; each document then carries only
+/// one progress integer and one match bit per required phrase.
+struct Bm25PhrasePlan<'a> {
+    phrases: &'a [Vec<String>],
+    failures: Vec<Vec<usize>>,
+}
+
+impl<'a> Bm25PhrasePlan<'a> {
+    fn new(phrases: &'a [Vec<String>]) -> Self {
+        let failures = phrases
+            .iter()
+            .map(|phrase| {
+                let mut failure = vec![0usize; phrase.len()];
+                for index in 1..phrase.len() {
+                    let mut prefix_len = failure[index - 1];
+                    while prefix_len > 0 && phrase[index] != phrase[prefix_len] {
+                        prefix_len = failure[prefix_len - 1];
+                    }
+                    if phrase[index] == phrase[prefix_len] {
+                        prefix_len += 1;
+                    }
+                    failure[index] = prefix_len;
+                }
+                failure
+            })
+            .collect();
+        Self { phrases, failures }
+    }
+
+    fn start(&self) -> Bm25PhraseState<'_, 'a> {
+        Bm25PhraseState {
+            plan: self,
+            progress: vec![0usize; self.phrases.len()],
+            found: self
+                .phrases
+                .iter()
+                .map(|phrase| phrase.is_empty())
+                .collect(),
+        }
+    }
+}
+
+struct Bm25PhraseState<'plan, 'query> {
+    plan: &'plan Bm25PhrasePlan<'query>,
+    progress: Vec<usize>,
+    found: Vec<bool>,
+}
+
+impl Bm25PhraseState<'_, '_> {
+    fn observe(&mut self, token: &str) {
+        for index in 0..self.plan.phrases.len() {
+            if self.found[index] {
+                continue;
+            }
+            let phrase = &self.plan.phrases[index];
+            let failure = &self.plan.failures[index];
+            let mut matched = self.progress[index];
+            while matched > 0 && phrase[matched] != token {
+                matched = failure[matched - 1];
+            }
+            if phrase[matched] == token {
+                matched += 1;
+            }
+            if matched == phrase.len() {
+                self.found[index] = true;
+                matched = failure[matched - 1];
+            }
+            self.progress[index] = matched;
+        }
+    }
+
+    fn all_match(&self) -> bool {
+        self.found.iter().all(|found| *found)
+    }
+}
+
+struct Bm25DocumentAnalysis {
+    document_len: usize,
+    counts: std::collections::HashMap<String, u32>,
+    phrases_match: bool,
+}
+
+fn analyse_bm25_document(
+    document: &impl Bm25TextDocument,
+    props: &[String],
+    max_document_bytes: usize,
+    phrase_plan: &Bm25PhrasePlan<'_>,
+) -> Result<Option<Bm25DocumentAnalysis>, ExecError> {
+    let mut counts = std::collections::HashMap::new();
+    let mut phrase_state = phrase_plan.start();
+    let Some(document_len) = visit_bm25_document(document, props, max_document_bytes, |term| {
+        phrase_state.observe(term);
+        increment_bm25_term(&mut counts, term);
+        Ok(())
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Bm25DocumentAnalysis {
+        document_len,
+        counts,
+        phrases_match: phrase_state.all_match(),
+    }))
+}
+
+#[cfg(test)]
+mod bm25_document_streaming_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn document(body: &str, title: &str) -> namidb_storage::NodeView {
+        namidb_storage::NodeView {
+            id: NodeId::new(),
+            labels: BTreeSet::from(["Note".to_string()]),
+            properties: BTreeMap::from([
+                (
+                    "body".to_string(),
+                    namidb_core::Value::Str(body.to_string()),
+                ),
+                (
+                    "title".to_string(),
+                    namidb_core::Value::Str(title.to_string()),
+                ),
+            ]),
+            lsn: 1,
+            schema_version: 1,
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn streamed_fields_match_space_join_and_phrases_cross_fields() {
+        let document = document("alpha alpha 東京", "beta 大学");
+        let props = strings(&["body", "title"]);
+        let expected = crate::exec::text_scoring::tokenize("alpha alpha 東京 beta 大学");
+        let mut streamed = Vec::new();
+        let length = visit_bm25_document(&document, &props, usize::MAX, |token| {
+            streamed.push(token.to_owned());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(streamed, expected);
+        assert_eq!(length, expected.len());
+
+        let phrases = vec![
+            strings(&["alpha", "alpha", "東京"]),
+            strings(&["alpha", "東京", "beta"]),
+            strings(&["東京", "beta", "大学"]),
+        ];
+        let plan = Bm25PhrasePlan::new(&phrases);
+        let analysis = analyse_bm25_document(&document, &props, usize::MAX, &plan)
+            .unwrap()
+            .unwrap();
+        assert!(analysis.phrases_match);
+        assert_eq!(
+            analysis.phrases_match,
+            phrases
+                .iter()
+                .all(|phrase| { crate::exec::text_scoring::contains_phrase(&expected, phrase) })
+        );
+        assert_eq!(analysis.counts.get("alpha"), Some(&2));
+
+        // The old join inserts a separator, so it never manufactures the
+        // cross-field CJK bigram `京大`.
+        let contiguous_cjk = vec![strings(&["東京", "京大", "大学"])];
+        let plan = Bm25PhrasePlan::new(&contiguous_cjk);
+        assert!(
+            !analyse_bm25_document(&document, &props, usize::MAX, &plan)
+                .unwrap()
+                .unwrap()
+                .phrases_match
+        );
+    }
+
+    #[test]
+    fn document_limit_fails_before_tokenization() {
+        let document = document("1234", "5678");
+        let error = visit_bm25_document(
+            &document,
+            &strings(&["body", "title"]),
+            7,
+            |_| -> Result<(), ExecError> { panic!("an oversized document must not emit a token") },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecError::Storage(namidb_storage::Error::SearchDocumentLimitExceeded {
+                operation: "exact full-text fallback",
+                document_bytes: 8,
+                limit_bytes: 7,
+            })
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct Bm25SearchArgs {
+    label: String,
+    props: Vec<String>,
+    query: String,
+    k: Option<usize>,
+    filter: Option<RuntimeValue>,
+}
+
 /// Resolve `search.bm25` options from its single required map argument:
-/// `{label, query, text_property | text_properties, k?}`. Returns
-/// `(label, text_properties, query, k)`.
-fn bm25_search_args(
-    args: &[Expression],
-    params: &Params,
-) -> Result<(String, Vec<String>, String, Option<usize>), ExecError> {
+/// `{label, query, text_property | text_properties, k?, filter?}`.
+fn bm25_search_args(args: &[Expression], params: &Params) -> Result<Bm25SearchArgs, ExecError> {
     let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
             RuntimeValue::Map(m) => m,
@@ -2556,7 +2955,13 @@ fn bm25_search_args(
             })?),
         };
 
-    Ok((label, props, query, k))
+    Ok(Bm25SearchArgs {
+        label,
+        props,
+        query,
+        k,
+        filter: map.get("filter").cloned(),
+    })
 }
 
 /// Single required map argument for a procedure: `CALL proc({...})`.
@@ -3502,6 +3907,7 @@ async fn hybrid_search_procedure(
                 &qtext,
                 k_sparse,
                 (filter, params, &filter_properties),
+                &prefilter.groups,
             )
             .await?
         } else {
@@ -4164,9 +4570,10 @@ async fn vector_search_rows(
     // only the embedding column here would leave those properties null.
     let projection: Option<Vec<String>> = None;
 
-    // (sort_key, score_value, row) — sort_key is "lower is better" (higher-is-
-    // better metrics are negated), so an ascending sort yields the top-k.
-    let mut scored: Vec<(f64, f64, Row)> = Vec::new();
+    // (sort_key, NodeId, score_value, row) — sort_key is "lower is better"
+    // (higher-is-better metrics are negated), so an ascending sort yields the
+    // top-k. NodeId is the stable tie-break shared with the ANN path.
+    let mut scored: Vec<(f64, NodeId, f64, Row)> = Vec::new();
     let nodes = match label {
         Some(label_name) => {
             snapshot
@@ -4181,6 +4588,7 @@ async fn vector_search_rows(
     };
     for n in nodes {
         crate::exec::limits::check_deadline()?;
+        let id = n.id;
         let node = NodeValue::from(n);
         let mut row = Row::new();
         row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
@@ -4203,15 +4611,15 @@ async fn vector_search_rows(
             continue;
         };
         let sort_key = if higher_is_better { -score } else { score };
-        scored.push((sort_key, score, row));
+        scored.push((sort_key, id, score, row));
     }
 
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     // Build rows in rank order. The source filter already ran before scoring,
     // so truncation takes the top-k of the filtered source.
     let mut out = Vec::with_capacity(query_initial_capacity(limit, scored.len()));
-    for (_sort_key, score, mut row) in scored {
+    for (_sort_key, _id, score, mut row) in scored {
         if out.len() >= limit {
             break;
         }
@@ -4570,9 +4978,9 @@ async fn try_index_search(
         }
         scored.extend(delta_scored.iter().copied());
         if higher_is_better {
-            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         } else {
-            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         }
 
         // Materialise in rank order, applying the residual filter; take up to k.
@@ -4884,27 +5292,77 @@ fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId)
     }
 }
 
+/// Prepare one hop's endpoint checks.
+///
+/// For an identity-only labelled target, prefer the SST-bound label B+tree and
+/// retain only one boolean per distinct endpoint. If that optional accelerator
+/// cannot prove completeness, one batched ordinary point lookup preserves the
+/// exact dangling-node/label semantics. For value-consuming targets this
+/// merely prewarms the point cache, including typeless expansions that
+/// previously repeated one cold lookup per relationship.
+async fn prepare_expand_targets(
+    snapshot: &Snapshot<'_>,
+    target_labels: &[String],
+    unique_targets: &[NodeId],
+    skip_target_materialize: bool,
+) -> Result<Option<HashMap<NodeId, bool>>, ExecError> {
+    if unique_targets.is_empty() {
+        return Ok(skip_target_materialize.then(HashMap::new));
+    }
+    if skip_target_materialize {
+        let matches = match snapshot
+            .try_batch_nodes_have_labels(target_labels, unique_targets)
+            .await?
+        {
+            Some(matches) => matches,
+            None => {
+                let label = target_labels.first().map_or("", String::as_str);
+                snapshot
+                    .batch_lookup_nodes(label, unique_targets)
+                    .await?
+                    .into_iter()
+                    .map(|view| {
+                        view.is_some_and(|view| {
+                            target_labels
+                                .iter()
+                                .all(|label| view.labels.contains(label))
+                        })
+                    })
+                    .collect()
+            }
+        };
+        if matches.len() != unique_targets.len() {
+            return Err(ExecError::Runtime(
+                "batched endpoint membership returned a misaligned result".into(),
+            ));
+        }
+        return Ok(Some(unique_targets.iter().copied().zip(matches).collect()));
+    }
+
+    let label = target_labels.first().map_or("", String::as_str);
+    let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
+    Ok(None)
+}
+
 /// Decide whether an Expand target may be represented by an id-only stub.
 ///
-/// This remains deliberately disabled until endpoint conformance is a
-/// persisted storage invariant. `EdgeTypeDef::{src_label,dst_label}` describes
-/// the intended shape, but raw ingestion and the low-level writer currently do
-/// not reject dangling or differently-labelled endpoints. Treating that
-/// declaration as proof can therefore make `MATCH ()-[:R]->(:Expected)` emit a
-/// false positive. A candidate edge must keep its point lookup + live-label
-/// check; the lookup is proportional to matched degree and is cacheable.
-#[allow(clippy::too_many_arguments)]
+/// The decision never trusts `EdgeTypeDef` endpoint declarations. It is
+/// enabled only for an unconsumed, labelled, single-hop target, and
+/// [`prepare_expand_targets`] still proves every candidate against the
+/// immutable label-membership sidecar or the authoritative point reader.
 fn should_skip_target_materialize(
-    _snapshot: &Snapshot<'_>,
-    _routing: &PlanRouting,
-    _target_alias: &str,
-    _edge_type: Option<&[String]>,
-    _direction: RelationshipDirection,
-    _target_labels: &[String],
-    _length: Option<crate::parser::RelationshipLength>,
-    _back_reference: bool,
+    routing: &PlanRouting,
+    target_alias: &str,
+    target_labels: &[String],
+    path_binding: Option<&str>,
+    length: Option<crate::parser::RelationshipLength>,
+    back_reference: bool,
 ) -> bool {
-    false
+    !back_reference
+        && path_binding.is_none()
+        && !target_labels.is_empty()
+        && !routing.referenced_aliases.contains(target_alias)
+        && length.as_ref().is_none_or(|length| length.max == 1)
 }
 
 /// Resolve a node when the logical operator carries no label constraint.
@@ -6112,12 +6570,10 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
-                        snapshot,
                         routing,
                         target_alias,
-                        edge_type.as_deref(),
-                        *direction,
                         target_labels,
+                        path_binding.as_deref(),
                         length,
                         *back_reference,
                     ),
@@ -6753,7 +7209,7 @@ async fn execute_expand_factor(
                     neighbours_of_any(snapshot, &edge_types, direction, tail, edge_read_mode)
                         .await?
                 };
-                if !back_reference && !skip_target_materialize {
+                if !back_reference {
                     for edge in &neighbours {
                         let tid = partner_id(edge, direction, tail);
                         if seen_targets.insert(tid) {
@@ -6763,12 +7219,13 @@ async fn execute_expand_factor(
                 }
                 step_neighbours.push(((cur_parent, tail, rels), neighbours));
             }
-            // Phase 2: batch prewarm.
-            if !back_reference && !skip_target_materialize && !unique_targets.is_empty() {
-                if let Some(label) = target_labels.first() {
-                    let _ = snapshot.batch_lookup_nodes(label, &unique_targets).await?;
-                }
-            }
+            let target_membership = prepare_expand_targets(
+                snapshot,
+                target_labels,
+                &unique_targets,
+                skip_target_materialize,
+            )
+            .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, tail);
@@ -6792,8 +7249,14 @@ async fn execute_expand_factor(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        // Future endpoint-validated transit-only fast path; see
-                        // the flat-path comment.
+                        if !target_membership
+                            .as_ref()
+                            .and_then(|membership| membership.get(&target_id))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
                         None
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
@@ -6834,8 +7297,9 @@ async fn execute_expand_factor(
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
                         });
                     } else if skip_target_materialize && !back_reference {
-                        // Future endpoint-validated fast path: id-only stub
-                        // for the next Expand's `.id` read.
+                        // Membership/existence was proven in the batched
+                        // sidecar phase; retain only what a chained Expand
+                        // needs for its source-id read.
                         slots.push(Slot {
                             name: target_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue {
@@ -8257,7 +8721,7 @@ mod tests {
     #[test]
     fn delete_relationship_needs_identity_but_not_properties() {
         let query = crate::parser::parse(
-            "MATCH (n:Source)-[r:REL]->(:Target) \
+            "MATCH (n:Source)-[r:REL]->(t:Target) \
              DELETE r",
         )
         .unwrap();
@@ -8268,6 +8732,19 @@ mod tests {
             routing.edge_read_mode(Some("r"), None),
             EdgeReadMode::SparseIdentity,
             "DELETE r must use a source-keyed identity lookup, never a whole-type CSR rebuild"
+        );
+        assert!(
+            should_skip_target_materialize(&routing, "t", &["Target".into()], None, None, false,),
+            "an unconsumed labelled endpoint should use batched membership instead of hydration"
+        );
+
+        let consumed = routing_for(
+            "MATCH (n:Source)-[r:REL]->(t:Target) \
+             RETURN t",
+        );
+        assert!(
+            !should_skip_target_materialize(&consumed, "t", &["Target".into()], None, None, false,),
+            "returning the target requires its full property value"
         );
     }
 

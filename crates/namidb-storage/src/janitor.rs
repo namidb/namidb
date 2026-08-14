@@ -325,6 +325,9 @@ pub async fn sweep_orphans(
             }
             if let Some(locator) = &desc.node_locator {
                 referenced.insert(locator.path.clone());
+                if let Some(properties) = &locator.property_pages {
+                    referenced.insert(properties.path.clone());
+                }
             }
             if let Some(point) = crate::manifest::edge_point_sidecar_path(desc) {
                 referenced.insert(point);
@@ -729,12 +732,19 @@ mod tests {
             .iter()
             .find(|sst| sst.kind == crate::manifest::SstKind::Nodes)
             .unwrap();
-        assert!(nodes.node_locator.is_some());
         assert!(
             nodes
-                .equality_property_indices
-                .iter()
-                .any(|index| index.paged.is_some()),
+                .node_locator
+                .as_ref()
+                .and_then(|locator| locator.property_pages.as_ref())
+                .is_some(),
+            "fixture must publish locator-bound node property pages"
+        );
+        assert!(
+            nodes.equality_property_indices.iter().any(|index| {
+                index.format == crate::manifest::PropertyIndexFormat::PagedV1
+                    || index.paged.is_some()
+            }),
             "fixture must cover both new live sidecar classes"
         );
 

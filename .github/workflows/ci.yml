@@ -14,13 +14,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -29,11 +34,13 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # `doc_lazy_continuation` (Rust 1.95) flags ~120 multi-line
       # docstring bullets across the codebase — purely stylistic; the
       # tracking ticket reformats them in a dedicated change. Allow it
@@ -52,9 +59,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo test
         run: cargo test --locked --workspace --exclude namidb-py --no-fail-fast
 
@@ -66,19 +75,118 @@ jobs:
     name: test (vector-index + text-index)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo test --features vector-index,text-index
         run: |
           cargo test --locked -p namidb-storage -p namidb-query -p namidb-server \
             --features vector-index,text-index --no-fail-fast
 
+  object-native:
+    name: object-native acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # No other job compiles this crate: `clippy` omits `--all-targets`,
+      # `test` builds with every feature off, and `test-features` selects only
+      # storage/query/server. Without this step the gate can stop compiling —
+      # and its own unit tests stop running — without anything turning red.
+      - name: Type-check the gate and its tests
+        run: cargo check --locked -p namidb-bench --all-targets --features object-native
+      - name: Build and run the deterministic object-native gate
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: |
+          cargo run --locked --release -p namidb-bench \
+            --features object-native -- object-native \
+            --vectors 256 --documents 256 --dim 16 --queries 3 --k 5 \
+            --clusters 4 --filter-buckets 4 --page-rows 32 \
+            --branch-factor 4 --nprobe 4 --max-nprobe 16 --rerank-factor 8 \
+            --delta-segments 2 --graph-keys 64 --graph-high-degree 128 \
+            --cache-bytes 2097152 --build-memory-bytes 2097152 \
+            --max-fanout 32 --max-in-flight 16 --seed 42 \
+            --min-recall-at-k 0.95 \
+            --max-cold-bytes-ratio 0.5 \
+            > /tmp/namidb-object-native-v2-smoke.json
+      - name: Verify serving, exact-shadow, text, graph, and cache contracts
+        run: |
+          jq -e '
+            .format == "namidb-object-native-gate-v2" and
+            .gates.passed and
+            # Every parity assertion below asks the reader for exactly as many
+            # hits as the exact oracle produced, and an empty-vs-empty
+            # comparison is trivially equal. Require the oracle to have found
+            # something first, or a corpus regression would silently turn the
+            # whole contract into a tautology.
+            (.search_lsm.vector_serving_ann.unfiltered.parity.expected_hits > 0) and
+            (.search_lsm.vector_serving_ann.active_filter.parity.expected_hits > 0) and
+            (.search_lsm.vector_exact_shadow.unfiltered.expected_hits > 0) and
+            (.search_lsm.vector_exact_shadow.active_filter.expected_hits > 0) and
+            (.search_lsm.text.unfiltered.parity.expected_hits > 0) and
+            (.search_lsm.text.active_filter.parity.expected_hits > 0) and
+            (.search_lsm.vector_serving_ann.unfiltered.query_count > 0) and
+            (.search_lsm.text.unfiltered.query_count > 0) and
+            .search_lsm.vector_serving_ann.unfiltered.result_model == "serving_ann_vs_exact_oracle" and
+            .search_lsm.vector_serving_ann.unfiltered.returned_winners_valid and
+            .search_lsm.vector_serving_ann.unfiltered.returned_scores_exact and
+            .search_lsm.vector_serving_ann.unfiltered.cache_results_identical and
+            (.search_lsm.vector_serving_ann.unfiltered.recall_at_k >= 0 and
+             .search_lsm.vector_serving_ann.unfiltered.recall_at_k <= 1) and
+            .search_lsm.vector_serving_ann.active_filter.native_filter_applied and
+            .search_lsm.vector_serving_ann.active_filter.returned_winners_valid and
+            .search_lsm.vector_serving_ann.active_filter.returned_scores_exact and
+            .search_lsm.vector_serving_ann.active_filter.cache_results_identical and
+            (.search_lsm.vector_serving_ann.active_filter.recall_at_k >= 0 and
+             .search_lsm.vector_serving_ann.active_filter.recall_at_k <= 1) and
+            .search_lsm.vector_exact_shadow.unfiltered.node_ids_exact and
+            .search_lsm.vector_exact_shadow.unfiltered.scores_exact and
+            .search_lsm.vector_exact_shadow.active_filter.node_ids_exact and
+            .search_lsm.vector_exact_shadow.active_filter.scores_exact and
+            .search_lsm.v5_base_contract.role_is_base and
+            .search_lsm.v5_base_contract.format_is_v5 and
+            .search_lsm.v5_base_contract.live_count_is_absolute and
+            .search_lsm.v5_base_contract.suppress_count_is_zero and
+            .search_lsm.v5_base_contract.native_footer_validated and
+            .search_lsm.v5_base_contract.legacy_manifest_binding_nonzero and
+            .search_lsm.vector_segment_roles == ["base", "delta", "delta"] and
+            .search_lsm.vector_segment_stats == ["absolute", "delta", "delta"] and
+            .search_lsm.text_segment_stats == ["absolute", "delta", "delta"] and
+            .search_lsm.text.unfiltered.parity.node_ids_exact and
+            .search_lsm.text.active_filter.parity.node_ids_exact and
+            .search_lsm.text.active_filter.native_filter_applied and
+            .search_lsm.ft4_base_contract.role_is_base and
+            .search_lsm.ft4_base_contract.doc_count_is_absolute and
+            .search_lsm.ft4_base_contract.total_len_is_absolute and
+            (.search_lsm.api_limitations | length == 0) and
+            .graph.parity_exact and
+            .graph.cache_modes.explicit_zero_and_sized_available and
+            ([.graph.forward.operations[], .graph.inverse.operations[]]
+              | all(.sized_cache_warm.fetched_bytes == 0))
+          ' /tmp/namidb-object-native-v2-smoke.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: object-native-smoke-report
+          path: /tmp/namidb-object-native-v2-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo check --locked --workspace --exclude namidb-py

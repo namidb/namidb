@@ -14,16 +14,17 @@ use crate::adjacency::DEFAULT_ADJACENCY_BUDGET_MIB;
 use crate::cache::{
     DEFAULT_BLOOM_FILTER_CACHE_BUDGET_MIB, DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB,
     DEFAULT_EDGE_READER_CACHE_BUDGET_MIB, DEFAULT_EDGE_STREAM_CACHE_BUDGET_MIB,
-    DEFAULT_PROPERTY_SIDECAR_CACHE_BUDGET_MIB, DEFAULT_SST_CACHE_BUDGET_MIB,
-    DEFAULT_SST_METADATA_CACHE_BUDGET_MIB, DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB,
-    DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
+    DEFAULT_PATH_REGISTRY_CACHE_BUDGET_MIB, DEFAULT_PROPERTY_SIDECAR_CACHE_BUDGET_MIB,
+    DEFAULT_SST_CACHE_BUDGET_MIB, DEFAULT_SST_METADATA_CACHE_BUDGET_MIB,
+    DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB, DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB,
 };
 use crate::node_cache::DEFAULT_NODE_CACHE_BUDGET_MIB;
+use crate::range_cache::DEFAULT_RAM_PAGE_CACHE_MAX_BYTES;
 
 /// Default aggregate capacity of all process-wide caches: 1 GiB.
 pub const DEFAULT_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
-const CACHE_TIER_COUNT: usize = 10;
+const CACHE_TIER_COUNT: usize = 12;
 
 /// Effective capacities after applying the process-wide maximum.
 ///
@@ -44,6 +45,15 @@ pub struct CacheCapacities {
     /// mutually evictable so either workload can use the whole assignment
     /// instead of being rejected by an artificial per-kind split.
     pub(crate) search_index_bytes: usize,
+    /// Path/admission metadata used to keep every `SstCache` tier in sync with
+    /// manifests and natural Foyer evictions. This is a real cache tier: its
+    /// strings and hash-table nodes are retained independently from values and
+    /// therefore must be carved out of the process-wide maximum.
+    pub(crate) path_registry_bytes: usize,
+    /// RAM portion of the immutable object-range cache. This is kept inside
+    /// `NAMIDB_CACHE_MAX_BYTES`; the independently configured NVMe device
+    /// capacity is deliberately not part of the process memory budget.
+    pub(crate) range_page_bytes: usize,
     pub(crate) node_view_bytes: usize,
     pub(crate) adjacency_bytes: usize,
 }
@@ -52,7 +62,9 @@ impl CacheCapacities {
     fn requested_from_env(max_bytes: usize) -> Self {
         let sst_enabled = env_enabled("NAMIDB_SST_CACHE");
         let node_enabled = env_enabled("NAMIDB_NODE_CACHE");
-        let adjacency_enabled = env_enabled("NAMIDB_ADJACENCY");
+        // A complete CSR is O(edge_count) resident state. Unlike the small,
+        // bounded SST/node caches it is an explicit latency-for-memory opt-in.
+        let adjacency_enabled = env_opt_in("NAMIDB_ADJACENCY");
 
         let sst = |name, default_mib| {
             if sst_enabled {
@@ -105,6 +117,11 @@ impl CacheCapacities {
             } else {
                 0
             }),
+            path_registry_bytes: sst(
+                "NAMIDB_CACHE_PATH_REGISTRY_BUDGET_MIB",
+                DEFAULT_PATH_REGISTRY_CACHE_BUDGET_MIB,
+            ),
+            range_page_bytes: requested_ram_page_cache_bytes(),
             node_view_bytes: if node_enabled {
                 legacy_budget_bytes(
                     "NAMIDB_NODE_CACHE_BUDGET_MIB",
@@ -201,6 +218,8 @@ impl CacheCapacities {
             self.edge_reader_bytes,
             self.bloom_filter_bytes,
             self.search_index_bytes,
+            self.path_registry_bytes,
+            self.range_page_bytes,
             self.node_view_bytes,
             self.adjacency_bytes,
         ]
@@ -217,14 +236,17 @@ impl CacheCapacities {
             edge_reader_bytes: values[5],
             bloom_filter_bytes: values[6],
             search_index_bytes: values[7],
-            node_view_bytes: values[8],
-            adjacency_bytes: values[9],
+            path_registry_bytes: values[8],
+            range_page_bytes: values[9],
+            node_view_bytes: values[10],
+            adjacency_bytes: values[11],
         }
     }
 
-    /// Sum of the eight active `SstCache` tier ceilings.
+    /// Sum of the nine active `SstCache` tier ceilings, including the bounded
+    /// path/admission registry.
     pub fn sst_capacity_bytes(&self) -> usize {
-        self.as_array()[..8]
+        self.as_array()[..9]
             .iter()
             .fold(0usize, |sum, value| sum.saturating_add(*value))
     }
@@ -232,6 +254,20 @@ impl CacheCapacities {
     /// Effective shared decoded vector/full-text index ceiling.
     pub fn search_index_capacity_bytes(&self) -> usize {
         self.search_index_bytes
+    }
+
+    /// Effective ceiling for path/admission registry metadata.
+    pub fn path_registry_capacity_bytes(&self) -> usize {
+        self.path_registry_bytes
+    }
+
+    /// Effective RAM budget assigned to immutable object-range pages.
+    ///
+    /// For a hybrid cache this includes the Foyer write buffer as well as the
+    /// resident memory tier, so enabling NVMe never adds an unaccounted fixed
+    /// buffer on top of `NAMIDB_CACHE_MAX_BYTES`.
+    pub fn range_page_capacity_bytes(&self) -> usize {
+        self.range_page_bytes
     }
 
     /// Effective `NodeViewCache` ceiling.
@@ -252,15 +288,83 @@ impl CacheCapacities {
     }
 }
 
+fn parse_optional_exact_bytes(
+    name: &str,
+    raw: Option<std::ffi::OsString>,
+    empty_is_unset: bool,
+) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| format!("{name} is not valid UTF-8"))?;
+    let raw = raw.trim();
+    if raw.is_empty() && empty_is_unset {
+        return Ok(None);
+    }
+    raw.parse::<usize>()
+        .map(Some)
+        .map_err(|error| format!("{name} must be an exact non-negative byte count: {error}"))
+}
+
+/// Validate the aggregate cache configuration before any process-wide cache
+/// singleton samples it.
+///
+/// Storage remains usable as an embedded library when an application does not
+/// call this function, but the official server invokes it at startup and
+/// fails closed. That prevents a typo in a production memory rail from
+/// silently selecting the 1 GiB default.
+pub fn validate_cache_configuration() -> Result<(), String> {
+    parse_optional_exact_bytes(
+        "NAMIDB_CACHE_MAX_BYTES",
+        std::env::var_os("NAMIDB_CACHE_MAX_BYTES"),
+        false,
+    )?;
+    parse_optional_exact_bytes(
+        "NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES",
+        std::env::var_os("NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES"),
+        true,
+    )?;
+    // The remaining exact-byte memory rails resolve through their own lazily
+    // sampled parsers, each of which falls back to a much larger default on a
+    // malformed value. Validating them here keeps a typo in any one of them
+    // from silently widening the process memory plan.
+    for name in [
+        "NAMIDB_RAM_PAGE_CACHE_MAX_BYTES",
+        crate::search_workspace::SEARCH_WORKSPACE_MAX_BYTES_ENV,
+        crate::search_workspace::SEARCH_MAX_RESULT_BYTES_ENV,
+        crate::search_workspace::BM25_MAX_DOCUMENT_BYTES_ENV,
+    ] {
+        parse_optional_exact_bytes(name, std::env::var_os(name), true)?;
+    }
+    Ok(())
+}
+
 /// Read the exact-byte aggregate cache limit.
 ///
-/// An unset or malformed value uses [`DEFAULT_CACHE_MAX_BYTES`]. `0` disables
-/// all process-wide shared caches.
+/// An unset value uses [`DEFAULT_CACHE_MAX_BYTES`]. The official server
+/// validates malformed values before opening storage. Embedded callers that
+/// bypass startup validation retain the historical fallback, but receive an
+/// explicit error log instead of a silent, potentially surprising 1 GiB cap.
+/// `0` disables all process-wide shared caches.
 pub fn cache_max_bytes() -> usize {
-    std::env::var("NAMIDB_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CACHE_MAX_BYTES)
+    match parse_optional_exact_bytes(
+        "NAMIDB_CACHE_MAX_BYTES",
+        std::env::var_os("NAMIDB_CACHE_MAX_BYTES"),
+        false,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => DEFAULT_CACHE_MAX_BYTES,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                fallback_bytes = DEFAULT_CACHE_MAX_BYTES,
+                "invalid aggregate cache limit; embedded caller bypassed startup validation"
+            );
+            DEFAULT_CACHE_MAX_BYTES
+        }
+    }
 }
 
 /// Optional exact-byte reservation for the shared decoded vector/full-text
@@ -268,9 +372,89 @@ pub fn cache_max_bytes() -> usize {
 /// top of it. `None` retains proportional legacy allocation; `Some(0)`
 /// deliberately disables decoded search-index caching.
 pub fn search_index_cache_max_bytes() -> Option<usize> {
-    std::env::var("NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES")
+    match parse_optional_exact_bytes(
+        "NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES",
+        std::env::var_os("NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES"),
+        true,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "invalid search-index cache reservation; embedded caller bypassed startup validation"
+            );
+            None
+        }
+    }
+}
+
+/// Requested exact-byte RAM budget for immutable object-range pages.
+///
+/// An explicit `NAMIDB_RAM_PAGE_CACHE_MAX_BYTES` wins. When only the paired
+/// NVMe settings are present, a conservative 64 MiB request is supplied so
+/// the hybrid cache has a bounded memory/write-buffer tier. With no new
+/// settings this returns zero; see `default_ram_page_cache_request` for why
+/// that is still the default despite the paged read paths needing it.
+pub fn requested_ram_page_cache_bytes() -> usize {
+    match parse_optional_exact_bytes(
+        "NAMIDB_RAM_PAGE_CACHE_MAX_BYTES",
+        std::env::var_os("NAMIDB_RAM_PAGE_CACHE_MAX_BYTES"),
+        true,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => default_ram_page_cache_request(),
+        Err(error) => {
+            // Resolving to zero here would silently disable an explicitly
+            // requested memory tier, which is the opposite of the operator's
+            // intent. The official server rejects this at startup; an embedded
+            // caller that skipped validation gets the unset behaviour instead.
+            tracing::error!(
+                %error,
+                "invalid RAM page cache reservation; embedded caller bypassed startup validation"
+            );
+            default_ram_page_cache_request()
+        }
+    }
+}
+
+fn default_ram_page_cache_request() -> usize {
+    // This tier SHOULD be on by default: the paged readers — V5/VG6 vector
+    // bodies, FT4 postings, paged property indexes and the paged edge CSR —
+    // serve point lookups out of small authenticated ranges, and without it
+    // every one of those is a real object-store round trip. It is a carve-out
+    // of `NAMIDB_CACHE_MAX_BYTES` rather than an addition to it, so enabling
+    // it would not raise the process memory bound.
+    //
+    // The runtime hazard that used to block this is fixed: a RAM-only tier is
+    // now a pure in-memory cache with no background workers and no runtime
+    // affinity (see `RangeCacheBackend`), so it no longer strands callers that
+    // cycle runtimes.
+    //
+    // One correctness gap remains. `PinnedObjectGeneration::ImmutablePath`
+    // hashes into the cache key as a *constant* token, so path + range alone
+    // identify an entry, and two different contents at one path are
+    // indistinguishable. That variant is meant to be an explicit caller
+    // guarantee, but `from_create_only_meta` also derives it whenever a store
+    // exposes neither version nor ETag — where nothing proves immutability.
+    // Enabling this default then breaks two fail-closed tests:
+    // `replacement_after_open_never_mixes_generations` (a pinned reader is
+    // served from cache instead of failing its ETag pin) and
+    // `corruption_truncation_and_uuid_mismatch_fail_closed`. Production SST
+    // paths are create-only UUIDs, so the guarantee does hold there — but the
+    // default must not depend on that. Refuse to cache an object whose
+    // immutability is only inferred, then flip this on.
+    let has_path = std::env::var("NAMIDB_NVME_CACHE_PATH")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|path| !path.trim().is_empty());
+    let has_capacity = std::env::var("NAMIDB_NVME_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .is_some_and(|bytes| bytes > 0);
+    if has_path && has_capacity {
+        DEFAULT_RAM_PAGE_CACHE_MAX_BYTES
+    } else {
+        0
+    }
 }
 
 /// Process-wide effective capacity plan. Environment configuration is sampled
@@ -286,6 +470,8 @@ pub fn shared_cache_capacities() -> CacheCapacities {
             cache_assigned_bytes = capacities.total_capacity_bytes(),
             sst_cache_bytes = capacities.sst_capacity_bytes(),
             search_index_cache_bytes = capacities.search_index_capacity_bytes(),
+            cache_path_registry_bytes = capacities.path_registry_capacity_bytes(),
+            range_page_cache_bytes = capacities.range_page_capacity_bytes(),
             node_cache_bytes = capacities.node_view_capacity_bytes(),
             adjacency_cache_bytes = capacities.adjacency_capacity_bytes(),
             "resolved process-wide cache capacities"
@@ -313,7 +499,10 @@ pub fn shared_cache_usage_bytes() -> usize {
     let adjacency = crate::adjacency::shared_adjacency_cache()
         .as_ref()
         .map_or(0, |cache| cache.used_bytes());
-    sst.saturating_add(nodes).saturating_add(adjacency)
+    let range_pages = crate::range_cache::shared_range_cache_usage_bytes();
+    sst.saturating_add(nodes)
+        .saturating_add(adjacency)
+        .saturating_add(range_pages)
 }
 
 pub(crate) fn legacy_budget_bytes(name: &str, default_mib: usize) -> usize {
@@ -328,6 +517,15 @@ fn env_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|value| value != "0")
         .unwrap_or(true)
+}
+
+fn env_opt_in(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +548,8 @@ mod tests {
             256 * mib,
             64 * mib,
             1024 * mib,
+            32 * mib,
+            0,
             256 * mib,
             512 * mib,
         ];
@@ -370,10 +570,15 @@ mod tests {
 
     #[test]
     fn ceilings_are_preserved_when_they_fit() {
-        let legacy = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
+        let legacy = [100, 90, 80, 70, 60, 50, 40, 30, 25, 0, 20, 10];
         let plan = requested(legacy).scaled_to(1024);
         assert_eq!(plan.as_array(), legacy);
         assert_eq!(plan.total_capacity_bytes(), legacy.iter().sum::<usize>());
+        assert_eq!(
+            plan.sst_capacity_bytes(),
+            legacy[..9].iter().sum::<usize>(),
+            "the path registry is part of the SST/global capacity plan"
+        );
     }
 
     #[test]
@@ -388,7 +593,7 @@ mod tests {
     #[test]
     fn sub_tier_byte_max_is_distributed_without_overflow() {
         let plan = requested([1; CACHE_TIER_COUNT]).scaled_to(4);
-        assert_eq!(plan.as_array(), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(plan.as_array(), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(plan.total_capacity_bytes(), 4);
     }
 
@@ -416,5 +621,33 @@ mod tests {
             requested([100; CACHE_TIER_COUNT]).scaled_with_search_reservation(512, Some(4_096));
         assert_eq!(plan.search_index_capacity_bytes(), 512);
         assert_eq!(plan.total_capacity_bytes(), 512);
+    }
+
+    #[test]
+    fn exact_byte_parser_is_strict_but_allows_empty_optional_reservation() {
+        assert_eq!(
+            parse_optional_exact_bytes(
+                "NAMIDB_CACHE_MAX_BYTES",
+                Some(" 1073741824 ".into()),
+                false,
+            ),
+            Ok(Some(1_073_741_824))
+        );
+        assert_eq!(
+            parse_optional_exact_bytes(
+                "NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES",
+                Some("".into()),
+                true,
+            ),
+            Ok(None)
+        );
+        assert!(
+            parse_optional_exact_bytes("NAMIDB_CACHE_MAX_BYTES", Some("2GiB".into()), false,)
+                .unwrap_err()
+                .contains("exact non-negative byte count")
+        );
+        assert!(
+            parse_optional_exact_bytes("NAMIDB_CACHE_MAX_BYTES", Some("".into()), false,).is_err()
+        );
     }
 }

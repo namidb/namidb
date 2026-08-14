@@ -2,14 +2,12 @@
 //!
 //! A `.ft` body is self-contained: it carries an inverted index (term →
 //! postings of document, term frequency and token positions) plus the corpus
-//! statistics BM25 needs (document count, per-document length, and —
-//! implicitly, as posting-list length — per-term document frequency), so a
-//! query answers a top-k by touching only the documents that contain the query
-//! terms, never re-scanning the whole label. The positions make quoted-phrase
-//! adjacency answerable from the index alone. The format is an 8-byte magic +
-//! a bincode-serialised [`TextIndexBody`]. Built during compaction from the
-//! merged node rows ([`build_body`]); searched by decoding into a [`TextIndex`]
-//! and calling [`TextIndex::search_query`].
+//! statistics BM25 needs. [`build_body`] emits `NAMIFT03`, whose footer,
+//! sparse dictionary, independently-compressed posting blocks and fixed-width
+//! document table can be queried through [`TextIndexV3Reader`] using byte-range
+//! GETs. The legacy [`TextIndex`] full-body API reads both `NAMIFT02` and
+//! `NAMIFT03`, which keeps existing snapshots and the engine integration
+//! backward-compatible while the query path migrates to ranged I/O.
 //!
 //! The scoring math and the query syntax ([`crate::text::parse_query`]) are
 //! shared with the query-time flat scan via [`crate::text`], so the index and
@@ -18,23 +16,33 @@
 //! compaction; documents written since are served by the flat-scan fallback,
 //! not this index.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::text::{
-    avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT,
+use crate::text::{avg_len, bm25_idf, bm25_term_score, TextQuery, PREFIX_EXPANSION_LIMIT};
+
+mod v3;
+pub mod v4;
+
+pub use v3::{
+    ExternalTextIndexBuildMetrics, ExternalTextIndexBuildOptions, TextIndexExternalBuilder,
+    TextIndexFileArtifact, TextIndexRangeSource, TextIndexV3Reader, COMPACTION_SPOOL_DIR_ENV,
+    INDEX_BUILD_MEMORY_ENV,
 };
 
-/// On-disk magic + format major version (`NAMI` `FT` `02`). Bumped on any
-/// incompatible layout change so a reader never silently misparses a file —
-/// v2 added token positions to the postings (phrase queries). A v1 body fails
-/// [`TextIndex::decode`]; the read path treats that as "index absent" and
-/// serves the flat scan until the next authoritative compaction rebuilds it.
-const MAGIC: &[u8; 8] = b"NAMIFT02";
+/// Magic prefix used to select the range-readable reader without downloading
+/// the complete optional accelerator.
+pub const RANGE_READABLE_MAGIC: &[u8; 8] = v3::MAGIC_V3;
+/// Legacy full-body magic retained only for backward-compatible reads.
+pub const LEGACY_MONOLITHIC_MAGIC: &[u8; 8] = MAGIC_V2;
+
+/// Legacy monolithic format. V2 added token positions to postings.
+const MAGIC_V2: &[u8; 8] = b"NAMIFT02";
 
 /// The body of a `SstKind::TextIndex` SST, bincode-serialised after [`MAGIC`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -75,50 +83,7 @@ pub struct TextIndexBuildStats {
 pub fn build_body(
     members: Vec<([u8; 16], String)>,
 ) -> Result<Option<(Bytes, TextIndexBuildStats)>, Error> {
-    if members.is_empty() {
-        return Ok(None);
-    }
-    let mut body = TextIndexBody::default();
-    for (id, text) in members {
-        let tokens = tokenize(&text);
-        let len = tokens.len();
-        // A document with no tokens still counts toward N and average length
-        // (it is a document); it simply contributes no postings.
-        let di = body.doc_ids.len() as u32;
-        body.doc_ids.push(id);
-        body.doc_lens.push(len as u32);
-        body.n_docs += 1;
-        body.total_len += len as u64;
-        let mut positions: HashMap<String, Vec<u32>> = HashMap::new();
-        for (pos, term) in tokens.into_iter().enumerate() {
-            positions.entry(term).or_default().push(pos as u32);
-        }
-        for (term, pos) in positions {
-            body.postings
-                .entry(term)
-                .or_default()
-                .push((di, pos.len() as u32, pos));
-        }
-    }
-    // We pushed postings in ascending document order, so each list is already
-    // sorted by document index — deterministic and ready for scoring.
-    let (Some(&min_node_id), Some(&max_node_id)) =
-        (body.doc_ids.iter().min(), body.doc_ids.iter().max())
-    else {
-        return Ok(None);
-    };
-    let stats = TextIndexBuildStats {
-        doc_count: body.n_docs as u64,
-        term_count: body.postings.len() as u64,
-        total_len: body.total_len,
-        min_node_id,
-        max_node_id,
-    };
-    let payload = bincode::serialize(&body)
-        .map_err(|e| Error::invariant(format!("text index encode failed: {e}")))?;
-    let mut bytes = MAGIC.to_vec();
-    bytes.extend_from_slice(&payload);
-    Ok(Some((Bytes::from(bytes), stats)))
+    v3::build(members)
 }
 
 /// A decoded, searchable text index.
@@ -131,24 +96,59 @@ pub struct TextIndex {
     sorted_ids: Vec<[u8; 16]>,
 }
 
+#[derive(Debug)]
+struct LegacyRankedHit {
+    id: [u8; 16],
+    score: f64,
+}
+
+impl PartialEq for LegacyRankedHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for LegacyRankedHit {}
+
+impl PartialOrd for LegacyRankedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The heap root is the worst retained hit: lower score, then larger id.
+impl Ord for LegacyRankedHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
 impl TextIndex {
-    /// Decode a `.ft` body (magic + bincode). Errors on a truncated/foreign
-    /// file or a magic mismatch — including a legacy `NAMIFT01` body, which
-    /// carries no positions. The read path maps that error to "index absent"
-    /// (flat-scan fallback, the `.vg` convention) so a format bump degrades
-    /// performance, never correctness, until recompaction rebuilds the SST.
+    /// Decode a complete v2 or v3 `.ft` body. This compatibility API
+    /// materializes the index; new object-store read paths should use
+    /// [`TextIndexV3Reader`] so only query-relevant ranges are decoded.
+    ///
+    /// A `NAMIFT01` body carries no positions and is rejected. The engine maps
+    /// unknown/corrupt formats to "index absent", preserving the flat-scan
+    /// correctness fallback.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() < MAGIC.len() {
+        if bytes.len() < MAGIC_V2.len() {
             return Err(Error::invariant("text index body too short for magic"));
         }
-        let (magic, rest) = bytes.split_at(MAGIC.len());
-        if magic != MAGIC {
+        let (magic, rest) = bytes.split_at(MAGIC_V2.len());
+        let body = if magic == MAGIC_V2 {
+            bincode::deserialize(rest)
+                .map_err(|e| Error::invariant(format!("text index v2 decode failed: {e}")))?
+        } else if magic == v3::MAGIC_V3 {
+            v3::decode_whole(bytes)?
+        } else {
             return Err(Error::invariant(format!(
                 "text index magic mismatch: {magic:?}"
             )));
-        }
-        let body: TextIndexBody = bincode::deserialize(rest)
-            .map_err(|e| Error::invariant(format!("text index decode failed: {e}")))?;
+        };
         let mut sorted_ids = body.doc_ids.clone();
         sorted_ids.sort_unstable();
         Ok(Self { body, sorted_ids })
@@ -233,18 +233,45 @@ impl TextIndex {
             }
         }
 
-        let mut scored: Vec<([u8; 16], f64)> = scores
-            .into_iter()
-            .map(|(di, s)| (self.body.doc_ids[di as usize], s))
-            .collect();
+        let mut scored: Vec<([u8; 16], f64)> = match k {
+            None => scores
+                .into_iter()
+                .map(|(di, score)| (self.body.doc_ids[di as usize], score))
+                .collect(),
+            Some(0) => Vec::new(),
+            Some(limit) => {
+                let limit = limit.min(scores.len());
+                let mut heap = BinaryHeap::<LegacyRankedHit>::with_capacity(limit);
+                for (di, score) in scores {
+                    let candidate = LegacyRankedHit {
+                        id: self.body.doc_ids[di as usize],
+                        score,
+                    };
+                    if heap.len() < limit {
+                        heap.push(candidate);
+                        continue;
+                    }
+                    let Some(worst) = heap.peek() else {
+                        continue;
+                    };
+                    let better = candidate
+                        .score
+                        .total_cmp(&worst.score)
+                        .then_with(|| worst.id.cmp(&candidate.id))
+                        == Ordering::Greater;
+                    if better {
+                        let _ = heap.pop();
+                        heap.push(candidate);
+                    }
+                }
+                heap.into_iter().map(|hit| (hit.id, hit.score)).collect()
+            }
+        };
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        if let Some(k) = k {
-            scored.truncate(k);
-        }
         scored
     }
 
@@ -289,6 +316,8 @@ impl TextIndex {
 mod tests {
     use super::*;
     use crate::text::{parse_query, tokenize_counts};
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
 
     fn id(b: u8) -> [u8; 16] {
         let mut a = [0u8; 16];
@@ -310,6 +339,20 @@ mod tests {
     #[test]
     fn empty_corpus_builds_nothing() {
         assert!(build_body(Vec::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn builder_emits_range_readable_v3() {
+        let (bytes, stats) = build_body(vec![(id(1), "legal production corpus".into())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..8], b"NAMIFT03");
+        assert_eq!(stats.doc_count, 1);
+        assert_eq!(stats.term_count, 3);
+        // The compatibility decoder must continue serving the existing
+        // full-body engine path while ranged integration lands.
+        let idx = TextIndex::decode(&bytes).unwrap();
+        assert_eq!(idx.search(&terms("legal"), None)[0].0, id(1));
     }
 
     #[test]
@@ -345,6 +388,24 @@ mod tests {
         let idx = build(&[(1, "x x x"), (2, "x x"), (3, "x")]);
         let hits = idx.search(&terms("x"), Some(2));
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn bounded_legacy_heap_matches_full_stable_ranking_for_every_k() {
+        let idx = build(&[
+            (1, "alpha alpha beta"),
+            (2, "alpha beta"),
+            (3, "alpha beta"),
+            (4, "beta"),
+            (5, "alpha alpha alpha"),
+        ]);
+        let query = parse_query("alpha beta");
+        let all = idx.search_query(&query, None);
+        for k in 0..=all.len() + 2 {
+            let mut expected = all.clone();
+            expected.truncate(k);
+            assert_eq!(idx.search_query(&query, Some(k)), expected, "k={k}");
+        }
     }
 
     #[test]
@@ -384,6 +445,25 @@ mod tests {
         let mut bytes = b"NAMIFT01".to_vec();
         bytes.extend_from_slice(&bincode::serialize(&v1).unwrap());
         assert!(TextIndex::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_accepts_legacy_v2_body() {
+        let mut postings = BTreeMap::new();
+        postings.insert("fox".to_string(), vec![(0u32, 1u32, vec![0u32])]);
+        let body = TextIndexBody {
+            n_docs: 1,
+            total_len: 1,
+            doc_ids: vec![id(1)],
+            doc_lens: vec![1],
+            postings,
+        };
+        let mut bytes = b"NAMIFT02".to_vec();
+        bytes.extend_from_slice(&bincode::serialize(&body).unwrap());
+        let idx = TextIndex::decode(&bytes).unwrap();
+        let hits = idx.search(&terms("fox"), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, id(1));
     }
 
     #[test]
@@ -498,5 +578,157 @@ mod tests {
             assert_eq!(h.0, e.0);
             assert!((h.1 - e.1).abs() < 1e-9, "score {} vs {}", h.1, e.1);
         }
+    }
+
+    #[derive(Debug)]
+    struct TrackingRangeSource {
+        body: Bytes,
+        ranges: Mutex<Vec<Range<u64>>>,
+    }
+
+    impl TrackingRangeSource {
+        fn new(body: Bytes) -> Self {
+            Self {
+                body,
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.ranges.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TextIndexRangeSource for TrackingRangeSource {
+        async fn read_range(&self, range: Range<u64>) -> Result<Bytes, Error> {
+            if range.start > range.end || range.end > self.body.len() as u64 {
+                return Err(Error::invariant("test range is outside the body"));
+            }
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.body.slice(range.start as usize..range.end as usize))
+        }
+
+        async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+            let mut out = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                out.push(self.read_range(range.clone()).await?);
+            }
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_range_reader_does_not_fetch_or_decode_the_corpus() {
+        // More than four dictionary blocks, and a sizeable irrelevant
+        // document table/posting corpus. One rare-term lookup should touch one
+        // dictionary block, one posting block and one document record.
+        let docs: Vec<([u8; 16], String)> = (0..700u16)
+            .map(|i| {
+                let text = if i == 431 {
+                    format!("term{i:04} needle needle")
+                } else {
+                    format!("term{i:04} filler")
+                };
+                let mut node = [0u8; 16];
+                node[14..].copy_from_slice(&i.to_be_bytes());
+                (node, text)
+            })
+            .collect();
+        let (body, _stats) = build_body(docs).unwrap().unwrap();
+        let source = Arc::new(TrackingRangeSource::new(body.clone()));
+        let reader = TextIndexV3Reader::open(source.clone(), body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(reader.doc_count(), 700);
+        let hits = reader.search(&terms("needle"), Some(5)).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        let mut expected = [0u8; 16];
+        expected[14..].copy_from_slice(&431u16.to_be_bytes());
+        assert_eq!(hits[0].0, expected);
+
+        let ranges = source.ranges();
+        assert!(
+            ranges
+                .iter()
+                .all(|range| !(range.start == 0 && range.end == body.len() as u64)),
+            "a ranged query must never fetch the whole object: {ranges:?}"
+        );
+        let bytes_read: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+        assert!(
+            bytes_read < body.len() as u64 / 2,
+            "rare-term query read {bytes_read} of {} bytes: {ranges:?}",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_range_search_matches_full_decode_for_phrase_prefix_and_top_k() {
+        let mut docs = vec![
+            (id(1), "graph database dataflow".to_string()),
+            (id(2), "database for graph datasets".to_string()),
+            (id(3), "graph database dataset dataset".to_string()),
+            (id(4), "unrelated legal text".to_string()),
+        ];
+        // Force several dictionary blocks without making any of those terms
+        // relevant to the query.
+        for i in 0..400u16 {
+            let mut node = [0u8; 16];
+            node[13..].copy_from_slice(&(10_000u32 + i as u32).to_be_bytes()[1..]);
+            docs.push((node, format!("vocabulary{i:04}")));
+        }
+        let (body, _stats) = build_body(docs).unwrap().unwrap();
+        let full = TextIndex::decode(&body).unwrap();
+        let source = Arc::new(TrackingRangeSource::new(body.clone()));
+        let ranged = TextIndexV3Reader::open(source, body.len() as u64)
+            .await
+            .unwrap();
+        let query = parse_query("\"graph database\" data*");
+        let expected = full.search_query(&query, Some(2));
+        let actual = ranged.search_query(&query, Some(2)).await.unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.0, expected.0);
+            assert!(
+                (actual.1 - expected.1).abs() < 1e-12,
+                "{} != {}",
+                actual.1,
+                expected.1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_membership_probe_binary_searches_the_document_table() {
+        let docs = (0..2_048u16)
+            .map(|ordinal| {
+                let mut node = [0u8; 16];
+                node[14..].copy_from_slice(&ordinal.to_be_bytes());
+                (node, format!("document {ordinal}"))
+            })
+            .collect();
+        let (body, _stats) = build_body(docs).unwrap().unwrap();
+        let source = Arc::new(TrackingRangeSource::new(body.clone()));
+        let reader = TextIndexV3Reader::open(source.clone(), body.len() as u64)
+            .await
+            .unwrap();
+
+        let mut present = [0u8; 16];
+        present[14..].copy_from_slice(&1_733u16.to_be_bytes());
+        let mut absent = [0u8; 16];
+        absent[13..].copy_from_slice(&[1, 0, 0]);
+        assert!(reader.contains_any_doc(&[absent, present]).await.unwrap());
+        assert!(!reader.contains_any_doc(&[absent]).await.unwrap());
+
+        let ranges = source.ranges();
+        let membership_bytes: u64 = ranges
+            .iter()
+            .filter(|range| range.end - range.start == 16)
+            .map(|range| range.end - range.start)
+            .sum();
+        assert!(
+            membership_bytes < 16 * 64,
+            "batched binary search read too many document IDs: {ranges:?}"
+        );
     }
 }

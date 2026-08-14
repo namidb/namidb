@@ -214,6 +214,65 @@ async fn typeless_knn_returns_multilabel_once_and_includes_unlabelled() {
     assert_eq!(got, vec!["multi", "bare", "other"]);
 }
 
+#[tokio::test]
+async fn flat_vector_search_breaks_equal_scores_by_node_id() {
+    let mut writer = WriterSession::open(store(), paths("knn-stable-ties"))
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = [9_u128, 2, 7, 1]
+        .into_iter()
+        .map(|raw| NodeId::from_uuid(uuid::Uuid::from_bytes(raw.to_be_bytes())))
+        .collect();
+    for (position, id) in ids.iter().copied().enumerate() {
+        writer
+            .upsert_node(
+                "Doc",
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("title".into(), CoreValue::Str(format!("equal-{position}"))),
+                        ("embedding".into(), CoreValue::Vec(vec![1.0, 0.0, 0.0])),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let plan = LogicalPlan::VectorSearch {
+        label: Some("Doc".into()),
+        alias: "d".into(),
+        property: "embedding".into(),
+        query: Expression {
+            kind: ExpressionKind::Parameter("q".into()),
+            span: SourceSpan::point(0),
+        },
+        k: RowCount::Const(3),
+        distance: VectorDistance::Cosine,
+        score_alias: "score".into(),
+        post_filter: None,
+    };
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let rows = execute(&plan, &writer.snapshot(), &params).await.unwrap();
+    let got: Vec<NodeId> = rows
+        .iter()
+        .map(|row| match row.get("d") {
+            Some(RuntimeValue::Node(node)) => node.id,
+            other => panic!("expected node result, got {other:?}"),
+        })
+        .collect();
+    let mut expected = ids;
+    expected.sort_unstable();
+    expected.truncate(3);
+    assert_eq!(
+        got, expected,
+        "equal vector scores require a deterministic cross-path tie-break"
+    );
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.

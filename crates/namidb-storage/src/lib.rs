@@ -32,8 +32,13 @@ pub mod parquet_loader;
 pub mod paths;
 pub mod pin;
 pub mod property_index;
+pub mod range_cache;
 pub mod read;
 pub mod recovery;
+pub mod search_lsm;
+pub(crate) mod search_lsm_flush;
+pub mod search_workspace;
+pub(crate) mod spooled_object;
 pub mod sst;
 pub mod text;
 pub mod unique_index;
@@ -51,8 +56,8 @@ pub use cache::{
 };
 pub use cache_budget::{
     cache_max_bytes, search_index_cache_max_bytes, shared_cache_capacities,
-    shared_cache_capacity_bytes, shared_cache_usage_bytes, CacheCapacities,
-    DEFAULT_CACHE_MAX_BYTES,
+    shared_cache_capacity_bytes, shared_cache_usage_bytes, validate_cache_configuration,
+    CacheCapacities, DEFAULT_CACHE_MAX_BYTES,
 };
 pub use compact::{
     compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
@@ -68,8 +73,8 @@ pub use ingest::{
 pub use janitor::{sweep_orphans, JanitorReport};
 pub use local::LocalFileObjectStore;
 pub use manifest::{
-    KindSpecificStats, Manifest, ManifestStore, SstDescriptor, SstKind, SstLevel,
-    WalSegmentDescriptor,
+    KindSpecificStats, Manifest, ManifestStore, NodePropertyPagesDescriptor, SstDescriptor,
+    SstKind, SstLevel, WalSegmentDescriptor,
 };
 pub use memtable::{FrozenMemtable, MemEntry, MemKey, MemOp, Memtable, MemtableSnapshot};
 pub use node_cache::{
@@ -81,6 +86,13 @@ pub use parquet_loader::{
 };
 pub use paths::NamespacePaths;
 pub use pin::{PinLease, RetentionPin, DEFAULT_PIN_TTL};
+pub use range_cache::{
+    shared_range_cache, ImmutableRangeCache, ImmutableRangeKey, PinnedObjectGeneration,
+    PinnedObjectRangeSource, RangeCacheConfig, RangeCacheError, RangeCacheStats,
+    DEFAULT_NVME_CACHE_BLOCK_BYTES, DEFAULT_NVME_CACHE_WRITE_BUFFER_BYTES,
+    DEFAULT_RAM_PAGE_CACHE_MAX_BYTES, DEFAULT_RANGE_CACHE_MAX_ENTRY_BYTES,
+    DEFAULT_RANGE_CACHE_PAGE_BYTES,
+};
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{

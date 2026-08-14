@@ -45,6 +45,12 @@ use crate::read::NodeView;
 /// Default budget for a [`NodeViewCache`]: 256 MiB. Override via
 /// `NAMIDB_NODE_CACHE_BUDGET_MIB`.
 pub const DEFAULT_NODE_CACHE_BUDGET_MIB: usize = 256;
+/// Per-query L1 ceiling when no process-wide cache hit is available.
+///
+/// This is intentionally small: every concurrent snapshot owns one L1, while
+/// the cross-snapshot L2 is already charged to `NAMIDB_CACHE_MAX_BYTES`.
+pub const DEFAULT_SNAPSHOT_NODE_CACHE_MAX_BYTES: usize = 1024 * 1024;
+pub const SNAPSHOT_NODE_CACHE_MAX_BYTES_ENV: &str = "NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES";
 
 /// Read `NAMIDB_NODE_CACHE` and return `false` only for `"0"`. Anything
 /// else (unset, `"1"`, garbage) returns `true`. Default flipped
@@ -62,6 +68,42 @@ pub fn node_cache_budget_bytes() -> usize {
         "NAMIDB_NODE_CACHE_BUDGET_MIB",
         DEFAULT_NODE_CACHE_BUDGET_MIB,
     )
+}
+
+/// Exact-byte ceiling for one snapshot's short-lived L1 node-view cache.
+///
+/// The explicit environment value wins.  Otherwise the default is capped by
+/// one sixty-fourth of the aggregate shared-cache budget, so selecting
+/// `NAMIDB_CACHE_MAX_BYTES=0` also disables this retained L1.  A malformed
+/// explicit value fails closed to zero instead of silently creating an
+/// unbounded per-query cache.
+pub fn snapshot_node_cache_max_bytes() -> usize {
+    match std::env::var(SNAPSHOT_NODE_CACHE_MAX_BYTES_ENV) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    value,
+                    %error,
+                    "disabling snapshot node cache: \
+                     NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES must be an exact byte count"
+                );
+                0
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_SNAPSHOT_NODE_CACHE_MAX_BYTES.min(
+            crate::cache_budget::cache_max_bytes()
+                .checked_div(64)
+                .unwrap_or(0),
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "disabling snapshot node cache: \
+                 NAMIDB_SNAPSHOT_NODE_CACHE_MAX_BYTES is not valid UTF-8"
+            );
+            0
+        }
+    }
 }
 
 /// Process-wide shared [`NodeViewCache`]: one instance for every
@@ -196,6 +238,9 @@ impl NodeViewCache {
     }
 
     pub fn used_bytes(&self) -> usize {
+        // Resident/cache-owned bytes only. `get` returns an owned NodeView
+        // clone whose request lifetime is deliberately outside cache
+        // residency, matching `shared_cache_usage_bytes`.
         self.inner.lock().unwrap().used_bytes
     }
 
@@ -232,6 +277,33 @@ impl NodeViewCache {
         }
     }
 
+    /// Probe a batch under one mutex acquisition.
+    ///
+    /// The outer `Option` preserves negative-cache semantics exactly as
+    /// [`Self::get`]: `None` is a miss, `Some(None)` is a cached tombstone /
+    /// absent result. Output order and duplicates match `keys`.
+    pub fn get_many(&self, keys: &[NodeCacheKey]) -> Vec<Option<CachedNodeView>> {
+        let inner = self.inner.lock().unwrap();
+        let mut hits = 0u64;
+        let mut misses = 0u64;
+        let results = keys
+            .iter()
+            .map(|key| match inner.map.get(key) {
+                Some((view, _seq)) => {
+                    hits = hits.saturating_add(1);
+                    Some(view.clone())
+                }
+                None => {
+                    misses = misses.saturating_add(1);
+                    None
+                }
+            })
+            .collect();
+        self.stats.hits.fetch_add(hits, Ordering::Relaxed);
+        self.stats.misses.fetch_add(misses, Ordering::Relaxed);
+        results
+    }
+
     /// Insert (or overwrite) the entry for `key`. Evicts oldest logical
     /// generations to fit `capacity_bytes` if necessary.
     pub fn insert(&self, key: NodeCacheKey, view: CachedNodeView) {
@@ -265,6 +337,7 @@ impl NodeViewCache {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
+        shrink_map_if_sparse(inner);
 
         let seq = inner.next_seq;
         inner.next_seq += 1;
@@ -293,6 +366,7 @@ impl NodeViewCache {
                 inner.used_bytes = inner.used_bytes.saturating_sub(entry_weight(&key, &view));
             }
         }
+        shrink_map_if_sparse(inner);
     }
 
     /// Drop every cached node view while preserving counters and capacity.
@@ -322,17 +396,29 @@ impl NodeViewCache {
     }
 }
 
+fn shrink_map_if_sparse(inner: &mut Inner) {
+    if inner.map.capacity() > 64 && inner.map.len().saturating_mul(2) < inner.map.capacity() {
+        inner.map.shrink_to_fit();
+    }
+}
+
 /// Budget weight of one cache entry: the view estimate plus the key's own
-/// heap footprint. The `namespace` component counts pointer-size only —
-/// the `Arc<str>` buffer is shared by every key of a snapshot.
+/// heap footprint. Charge the namespace allocation once per entry even though
+/// keys from one snapshot normally share it through `Arc<str>`. That
+/// conservative overcount is what bounds adversarial multi-tenant churn where
+/// every entry arrives with a distinct, long namespace allocation.
 fn entry_weight(key: &NodeCacheKey, view: &CachedNodeView) -> usize {
+    const INDEX_OVERHEAD_BYTES: usize = 256;
     approx_size(view)
         // The key is owned once by the HashMap and once by the BTreeMap order
         // index. String::clone allocates a second label buffer; Arc<str>
-        // namespace clones share their backing allocation.
+        // namespace clones share their backing allocation, charged once below.
         .saturating_add(key.label.capacity().saturating_mul(2))
+        .saturating_add(key.namespace.len())
         .saturating_add(std::mem::size_of::<NodeCacheKey>().saturating_mul(2))
-        .saturating_add(128)
+        // One HashMap bucket plus one BTreeMap node, load-factor slack and
+        // allocator headers. Deliberately higher than payload-only estimates.
+        .saturating_add(INDEX_OVERHEAD_BYTES)
 }
 
 /// Conservative size estimate for a [`CachedNodeView`]. Counts labels +
@@ -447,6 +533,24 @@ mod tests {
         assert!(got.is_none(), "cached negative should still hit");
         assert_eq!(c.hits(), 1);
         assert_eq!(c.misses(), 0);
+    }
+
+    #[test]
+    fn batch_probe_preserves_order_duplicates_and_negative_hits() {
+        let c = NodeViewCache::new(1024 * 1024);
+        let positive = NodeCacheKey::new(NS, 1, "Person", nid(1));
+        let negative = NodeCacheKey::new(NS, 1, "Person", nid(2));
+        let missing = NodeCacheKey::new(NS, 1, "Person", nid(3));
+        c.insert(positive.clone(), Some(make_view("Alice")));
+        c.insert(negative.clone(), None);
+
+        let got = c.get_many(&[negative.clone(), missing, positive.clone(), positive]);
+        assert!(matches!(got[0], Some(None)));
+        assert!(got[1].is_none());
+        assert!(got[2].as_ref().and_then(Option::as_ref).is_some());
+        assert!(got[3].as_ref().and_then(Option::as_ref).is_some());
+        assert_eq!(c.hits(), 3);
+        assert_eq!(c.misses(), 1);
     }
 
     #[test]
@@ -586,6 +690,73 @@ mod tests {
 
         c.insert(key.clone(), Some(make_view("Alice")));
         assert!(c.get(&key).is_some());
+    }
+
+    #[test]
+    fn long_unique_namespaces_are_charged_and_accounting_stays_consistent() {
+        let long_namespace = format!("tenants/{}", "n".repeat(4096));
+        let short = NodeCacheKey::new("t", 1, "L", nid(1));
+        let long = NodeCacheKey::new(long_namespace.clone(), 1, "L", nid(1));
+        assert!(
+            entry_weight(&long, &None)
+                >= entry_weight(&short, &None).saturating_add(long_namespace.len() - 1),
+            "the Arc<str> backing allocation must be part of admission weight"
+        );
+
+        let per_entry = entry_weight(&long, &None);
+        let c = NodeViewCache::new(per_entry.saturating_mul(3));
+        for i in 0..128u8 {
+            c.insert(
+                NodeCacheKey::new(
+                    format!("tenants/{i}/{}", "x".repeat(4096)),
+                    i as u64,
+                    "L",
+                    nid(i),
+                ),
+                None,
+            );
+        }
+
+        let inner = c.inner.lock().unwrap();
+        let recomputed = inner.map.iter().fold(0usize, |total, (key, (view, _))| {
+            total.saturating_add(entry_weight(key, view))
+        });
+        assert_eq!(inner.used_bytes, recomputed);
+        assert_eq!(inner.map.len(), inner.order.len());
+        assert!(inner.used_bytes <= c.capacity_bytes());
+        assert!(
+            inner.map.len() <= 3,
+            "unique namespace buffers must not escape the byte ceiling"
+        );
+    }
+
+    #[test]
+    fn eviction_shrinks_hash_buckets_after_a_large_entry_replaces_many_small_ones() {
+        let sample_key = NodeCacheKey::new(NS, 1, "L", nid(1));
+        let small_weight = entry_weight(&sample_key, &None);
+        let capacity = small_weight.saturating_mul(128);
+        let c = NodeViewCache::new(capacity);
+        for i in 0..128u8 {
+            c.insert(NodeCacheKey::new(NS, i as u64, "L", nid(i)), None);
+        }
+        assert!(c.inner.lock().unwrap().map.capacity() > 64);
+
+        c.insert(
+            NodeCacheKey::new(
+                format!("tenants/{}", "x".repeat(capacity / 2)),
+                10_000,
+                "L",
+                nid(255),
+            ),
+            None,
+        );
+
+        let inner = c.inner.lock().unwrap();
+        assert!(inner.used_bytes <= capacity);
+        assert!(
+            inner.map.capacity() <= inner.map.len().saturating_mul(2).max(64),
+            "eviction must not retain a bucket table sized for the old entry count"
+        );
     }
 
     #[test]

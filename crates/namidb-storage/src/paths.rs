@@ -25,6 +25,7 @@ use std::fmt::Write as _;
 
 use namidb_core::NamespaceId;
 use object_store::path::Path;
+use uuid::Uuid;
 
 /// Wrapper around a root prefix + namespace that knows how to render every
 /// canonical key the storage engine uses.
@@ -112,6 +113,10 @@ impl NamespacePaths {
     pub fn sst_object(&self, level: u32, file_name: &str) -> Path {
         self.join(&["sst", &format!("level{level}"), file_name])
     }
+    /// Immutable node-property page object paired with one Nodes SST.
+    pub fn node_property_pages(&self, level: u32, object_id: &Uuid) -> Path {
+        self.sst_object(level, &node_property_pages_file_name(object_id))
+    }
     pub fn snapshots_dir(&self) -> Path {
         self.join(&["snapshots"])
     }
@@ -140,6 +145,11 @@ impl NamespacePaths {
         }
         Path::from(buf)
     }
+}
+
+/// Canonical filename for independently ranged schemaless node properties.
+pub(crate) fn node_property_pages_file_name(object_id: &Uuid) -> String {
+    format!("{}-nodes.npp", object_id.simple())
 }
 
 fn pad_hex(n: u64, width: usize) -> String {
@@ -182,6 +192,11 @@ mod tests {
             "tenants/acme/wal/000000000000002a.wal"
         );
         assert_eq!(p.sst_dir(2).as_ref(), "tenants/acme/sst/level2");
+        let sst_id = Uuid::parse_str("018f93b4-3333-7abc-8000-000000000001").unwrap();
+        assert_eq!(
+            p.node_property_pages(2, &sst_id).as_ref(),
+            "tenants/acme/sst/level2/018f93b433337abc8000000000000001-nodes.npp"
+        );
         assert_eq!(
             p.snapshot("named").as_ref(),
             "tenants/acme/snapshots/named.json"

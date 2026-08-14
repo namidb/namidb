@@ -277,6 +277,30 @@ async fn copy_snapshot_pinned(
                 None => sst.node_locator = None,
             }
             pin.renew_if_due().await?;
+            if let Some(properties) = locator.property_pages {
+                if sst.node_locator.is_some() {
+                    match copy_optional_accelerator(
+                        src_store,
+                        dst_store,
+                        &src_prefix,
+                        &dst_prefix,
+                        &properties.path,
+                    )
+                    .await?
+                    {
+                        Some(size) => {
+                            bytes_copied += size;
+                            objects_copied += 1;
+                        }
+                        None => {
+                            if let Some(locator) = &mut sst.node_locator {
+                                locator.property_pages = None;
+                            }
+                        }
+                    }
+                    pin.renew_if_due().await?;
+                }
+            }
         }
     }
 
@@ -462,6 +486,12 @@ async fn verify_snapshot(
             )
             .chain(sst.label_index.as_ref().map(|l| l.path.as_str()))
             .chain(sst.node_locator.as_ref().map(|l| l.path.as_str()))
+            .chain(
+                sst.node_locator
+                    .as_ref()
+                    .and_then(|locator| locator.property_pages.as_ref())
+                    .map(|properties| properties.path.as_str()),
+            )
             .collect();
         for rel in rels {
             let p = Path::from(format!("{}/{}", prefix.as_ref(), rel));
@@ -980,6 +1010,9 @@ mod tests {
             }
             if let Some(locator) = &sst.node_locator {
                 sidecars.push(locator.path.clone());
+                if let Some(properties) = &locator.property_pages {
+                    sidecars.push(properties.path.clone());
+                }
             }
             if let Some(point) = crate::manifest::edge_point_sidecar_path(sst) {
                 sidecars.push(point);
@@ -1086,6 +1119,12 @@ mod tests {
                                 .as_ref()
                                 .map(|locator| locator.path.clone()),
                         )
+                        .chain(sst.node_locator.as_ref().and_then(|locator| {
+                            locator
+                                .property_pages
+                                .as_ref()
+                                .map(|properties| properties.path.clone())
+                        }))
                         .chain(crate::manifest::edge_point_sidecar_path(sst))
                 })
                 .collect();
@@ -1157,11 +1196,15 @@ mod tests {
         assert!(rebuilt
             .iter()
             .filter(|sst| sst.kind == crate::manifest::SstKind::Nodes)
-            .all(|sst| sst.node_locator.is_some()
-                && sst
-                    .equality_property_indices
-                    .iter()
-                    .all(|index| index.paged.is_some() || index.paged_build_unsupported)));
+            .all(|sst| sst
+                .node_locator
+                .as_ref()
+                .is_some_and(|locator| locator.property_pages.is_some())
+                && sst.equality_property_indices.iter().all(|index| {
+                    index.format == crate::manifest::PropertyIndexFormat::PagedV1
+                        || index.paged.is_some()
+                        || index.paged_build_unsupported
+                })));
     }
 
     #[tokio::test]
