@@ -40,6 +40,8 @@ pub(crate) mod search_lsm_flush;
 pub mod search_workspace;
 pub(crate) mod spooled_object;
 pub mod sst;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text;
 pub mod unique_index;
 pub mod uri;

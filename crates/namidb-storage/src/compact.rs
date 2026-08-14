@@ -195,6 +195,14 @@ pub struct PreparedCompaction {
     /// only their captured physical prefix and preserves append-only flushes.
     search_compactions: Vec<PreparedSearchCompaction>,
     search_build_states: Vec<crate::manifest::SearchIndexBuildState>,
+    /// 2.0.6-interop markers certifying each full base a BasePrefix
+    /// Search-LSM consolidation installs. A downgraded writer drops the
+    /// unknown `search_lsm` state but keeps these; on upgrade they are what
+    /// lets adoption re-bind the surviving base metadata-only instead of
+    /// rebuilding the corpus. Kept separate from `search_build_states`, which
+    /// also drives `replaced_search_lsm` and the rewrite/replace install
+    /// guard — reusing it would wrongly clear the active generation.
+    consolidated_base_markers: Vec<crate::manifest::SearchIndexBuildState>,
     search_lsm_activations: Vec<PreparedSearchLsmActivation>,
     replaced_search_lsm: Vec<(crate::search_lsm::SearchLsmKind, String)>,
 }
@@ -1639,6 +1647,38 @@ async fn prepare_leveled(
         })?;
     }
 
+    // Every BasePrefix consolidation certifies a complete physical base for
+    // its index, which is exactly what a 2.0.6-interop marker means: without
+    // one, a downgraded writer that drops the unknown `search_lsm` state
+    // leaves a manifest the upgrade path can only repair by rebuilding the
+    // corpus instead of re-adopting the surviving base metadata-only. The
+    // basis high-water is correct because the BasePrefix build scans every
+    // Nodes SST at this basis; a flush racing prepare→install leaves the
+    // marker conservatively stale, which forces a rebuild rather than a
+    // wrong adoption. Empty-output consolidations (authoritatively empty
+    // corpus) mint a marker too, mirroring the 2.0.6 rule that keeps
+    // compaction from replanning an empty build forever.
+    let basis_max_node_lsn = base
+        .manifest
+        .ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .map(|descriptor| descriptor.max_lsn)
+        .max()
+        .unwrap_or(0);
+    let consolidated_base_markers = search_compactions
+        .iter()
+        .filter(|search| {
+            search.selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+        })
+        .map(|search| crate::manifest::SearchIndexBuildState {
+            kind: search.selection.captured_state.kind.sst_kind(),
+            name: search.selection.captured_state.index_name.clone(),
+            catalog_signature: search.selection.captured_state.catalog_signature.clone(),
+            max_node_lsn: basis_max_node_lsn,
+        })
+        .collect();
+
     Ok(PreparedCompaction {
         new_descs,
         removed_ids,
@@ -1651,6 +1691,7 @@ async fn prepare_leveled(
         node_rewrites,
         search_compactions,
         search_build_states,
+        consolidated_base_markers,
         search_lsm_activations,
         replaced_search_lsm,
     })
@@ -2241,6 +2282,19 @@ pub async fn install_prepared(
         next.search_index_builds
             .retain(|existing| existing.kind != state.kind || existing.name != state.name);
         next.search_index_builds.push(state);
+    }
+    // Position-preserving upsert: migration tests pin unrelated-marker order.
+    // Install is all-or-nothing, so a marker can never commit without the
+    // base it certifies.
+    for marker in prepared.consolidated_base_markers {
+        match next
+            .search_index_builds
+            .iter_mut()
+            .find(|existing| existing.kind == marker.kind && existing.name == marker.name)
+        {
+            Some(existing) => *existing = marker,
+            None => next.search_index_builds.push(marker),
+        }
     }
     for activation in prepared.search_lsm_activations {
         let mut expected_nodes = activation
@@ -4568,67 +4622,11 @@ mod tests {
         }
     }
 
+    // Shared with the ingest tests: any test that mutates or observes the
+    // Search-LSM policy environment must hold the same lock, or force_base
+    // leaks across concurrently running tests.
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
-    static SEARCH_COMPACTION_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(any(feature = "vector-index", feature = "text-index"))]
-    struct SearchCompactionEnvRestore {
-        max_segments: Option<std::ffi::OsString>,
-        compact_segments: Option<std::ffi::OsString>,
-        base_bytes: Option<std::ffi::OsString>,
-        base_stale_percent: Option<std::ffi::OsString>,
-        force_base: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(any(feature = "vector-index", feature = "text-index"))]
-    impl SearchCompactionEnvRestore {
-        fn configure() -> Self {
-            let restore = Self {
-                max_segments: std::env::var_os("NAMIDB_SEARCH_LSM_MAX_SEGMENTS"),
-                compact_segments: std::env::var_os("NAMIDB_SEARCH_LSM_COMPACT_SEGMENTS"),
-                base_bytes: std::env::var_os("NAMIDB_SEARCH_LSM_BASE_COMPACT_BYTES"),
-                base_stale_percent: std::env::var_os("NAMIDB_SEARCH_LSM_BASE_STALE_PERCENT"),
-                force_base: std::env::var_os("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION"),
-            };
-            std::env::set_var("NAMIDB_SEARCH_LSM_MAX_SEGMENTS", "8");
-            std::env::set_var("NAMIDB_SEARCH_LSM_COMPACT_SEGMENTS", "3");
-            std::env::set_var("NAMIDB_SEARCH_LSM_BASE_COMPACT_BYTES", u64::MAX.to_string());
-            std::env::set_var("NAMIDB_SEARCH_LSM_BASE_STALE_PERCENT", u64::MAX.to_string());
-            std::env::set_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION", "true");
-            restore
-        }
-
-        fn select_delta_runs(&self, trigger: usize) {
-            std::env::set_var("NAMIDB_SEARCH_LSM_COMPACT_SEGMENTS", trigger.to_string());
-            std::env::set_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION", "false");
-        }
-    }
-
-    #[cfg(any(feature = "vector-index", feature = "text-index"))]
-    impl Drop for SearchCompactionEnvRestore {
-        fn drop(&mut self) {
-            match self.max_segments.take() {
-                Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_MAX_SEGMENTS", value),
-                None => std::env::remove_var("NAMIDB_SEARCH_LSM_MAX_SEGMENTS"),
-            }
-            match self.compact_segments.take() {
-                Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_COMPACT_SEGMENTS", value),
-                None => std::env::remove_var("NAMIDB_SEARCH_LSM_COMPACT_SEGMENTS"),
-            }
-            match self.base_bytes.take() {
-                Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_BASE_COMPACT_BYTES", value),
-                None => std::env::remove_var("NAMIDB_SEARCH_LSM_BASE_COMPACT_BYTES"),
-            }
-            match self.base_stale_percent.take() {
-                Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_BASE_STALE_PERCENT", value),
-                None => std::env::remove_var("NAMIDB_SEARCH_LSM_BASE_STALE_PERCENT"),
-            }
-            match self.force_base.take() {
-                Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION", value),
-                None => std::env::remove_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION"),
-            }
-        }
-    }
+    use crate::test_support::{SearchCompactionEnvRestore, SEARCH_COMPACTION_ENV};
 
     #[cfg(feature = "vector-index")]
     fn physical_search_schema() -> Schema {
@@ -5076,6 +5074,7 @@ mod tests {
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -5148,6 +5147,7 @@ mod tests {
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -5217,6 +5217,7 @@ mod tests {
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -7406,7 +7407,6 @@ mod tests {
     #[tokio::test]
     async fn compaction_builds_a_searchable_text_index() {
         use crate::manifest::TextIndexDescriptor;
-        use crate::sst::text::TextIndex;
 
         // Same forcing rationale as the vector twin: the assertions require
         // one consolidated base, which the default incremental policy would
@@ -7529,20 +7529,30 @@ mod tests {
         };
         assert_eq!(doc_count, bodies.len() as u64, "all docs indexed");
 
-        // Decode + search: the rare-term doc must rank first via real IDF.
-        let body = get_sst_body(s.as_ref(), &p, fts[0]).await.unwrap();
-        let idx = TextIndex::decode(&body).unwrap();
-        let hits = idx.search(&crate::text::tokenize("fox common"), None);
-        assert_eq!(hits.len(), bodies.len(), "every doc matches a query term");
-        assert_eq!(
-            hits[0].0,
-            *idx_id(1).as_bytes(),
-            "the rare-term doc ranks first"
-        );
-
+        // Search through the production dispatch: the consolidated base is a
+        // range-readable FT4 artifact, not the 2.0.6 monolithic body, so the
+        // legacy `TextIndex::decode` cannot read it. `text_search` returning
+        // `Some` also proves the index actually served (a flat-scan fallback
+        // yields `None`), which the old in-memory decode never could.
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
         let snap = Snapshot::new(out.committed.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search(
+                "note_ft",
+                "Note",
+                &crate::text::parse_query("fox common"),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the consolidated FT4 base must serve, not fall back");
+        assert_eq!(hits.len(), bodies.len(), "every doc matches a query term");
+        assert_eq!(
+            hits[0].0,
+            idx_id(1),
+            "the rare-term doc ranks first via real IDF"
+        );
         assert!(
             snap.text_search("note_ft", "Note", &crate::text::parse_query("fox"), Some(5),)
                 .await
@@ -8882,6 +8892,18 @@ mod tests {
         use crate::manifest::{TextIndexDescriptor, VectorIndexDescriptor, VectorMetric};
         use crate::text::parse_query;
 
+        // 2.1.0: flush writes native VG6/FT4 deltas under an Active Search-LSM
+        // generation, so the legacy authoritative rebuild is correctly skipped
+        // and the default incremental policy would (also correctly) retain the
+        // deltas. This parity test needs exactly one consolidated base per
+        // index, so it forces consolidation; the force works because the
+        // flushed deltas are consolidatable debt (it is a one-shot no-op on an
+        // already-consolidated singleton base).
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+
         fn idx_id(i: u64) -> NodeId {
             let mut bytes = [0u8; 16];
             bytes[8..16].copy_from_slice(&i.to_be_bytes());
@@ -8981,22 +9003,53 @@ mod tests {
             .iter()
             .find(|d| d.kind == SstKind::Nodes)
             .unwrap();
-        let vg = manifest
+        // Barrier-aware singleton lookups: the consolidation publishes a data
+        // base plus a downgrade barrier per index, both ordinary descriptors
+        // of the same kind. A first-match `find` could name the barrier.
+        let vector_barrier = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            })
+            .expect("vector base registered as an active Search-LSM generation")
+            .compat_barrier_sst_id
+            .unwrap();
+        let text_barrier = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("text base registered as an active Search-LSM generation")
+            .compat_barrier_sst_id
+            .unwrap();
+        let vgs: Vec<&SstDescriptor> = manifest
             .ssts
             .iter()
-            .find(|d| d.kind == SstKind::VectorGraph)
-            .expect("authoritative merge rebuilds the .vg");
-        let ft = manifest
+            .filter(|d| d.kind == SstKind::VectorGraph && d.id != vector_barrier)
+            .collect();
+        assert_eq!(vgs.len(), 1, "exactly one consolidated V5 base");
+        let vg = vgs[0];
+        let fts: Vec<&SstDescriptor> = manifest
             .ssts
             .iter()
-            .find(|d| d.kind == SstKind::TextIndex)
-            .expect("authoritative merge rebuilds the .ft");
+            .filter(|d| d.kind == SstKind::TextIndex && d.id != text_barrier)
+            .collect();
+        assert_eq!(fts.len(), 1, "exactly one consolidated FT4 base");
+        let ft = fts[0];
         assert_eq!(vg.row_count, 11, "12 docs - 1 tombstone, update deduped");
         assert_eq!(ft.row_count, 11);
-        // Freshness stamps: both indexes carry the merged corpus's
-        // high-water LSN, so the gate lets them serve.
+        // Freshness stamps. The V5 base carries the corpus high-water LSN
+        // from its coverage. The FT4 base stamps its members' max mutation
+        // LSN: the high-water event here is the id-5 tombstone at LSN 21,
+        // which has no live member, so the base stamps the id-3 update at 20;
+        // the Search-LSM coverage (not the descriptor stamp) is what proves
+        // freshness through the tombstone.
         assert_eq!(vg.max_lsn, node_desc.max_lsn);
-        assert_eq!(ft.max_lsn, node_desc.max_lsn);
+        assert_eq!(ft.max_lsn, 20);
         // Index descriptor key bounds are member NodeId bounds, not the legacy
         // 00..FF sentinel. Both corpora contain reconciled ids 1..=12 (id 5 is
         // deleted, but the extrema remain 1 and 12).
@@ -9058,8 +9111,14 @@ mod tests {
     /// merely clone the complete embedding/document corpus and can exhaust
     /// memory on a legal-scale store.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn sidecar_only_migration_preserves_fresh_vector_and_text_generations() {
+        // Observer of the DEFAULT policy: "fresh generations preserved" holds
+        // only while no concurrent test leaks force_base=true.
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::manifest::{
             NodeLocatorDescriptor, TextIndexDescriptor, VectorIndexDescriptor, VectorMetric,
             VectorQuantization,

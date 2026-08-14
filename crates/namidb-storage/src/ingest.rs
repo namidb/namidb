@@ -3550,8 +3550,16 @@ mod tests {
     }
 
     #[cfg(feature = "vector-index")]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn drop_vector_index_removes_descriptor_and_vg_ssts_in_one_commit() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::manifest::{VectorMetric, VectorQuantization};
 
         let store = make_store();
@@ -3627,28 +3635,31 @@ mod tests {
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session.compact_l0(&doc_schema).await.unwrap();
+        // Native model: flush minted an Active Search-LSM generation and VG6
+        // delta segments; legacy rebuild markers exist only for 2.0.6-store
+        // adoption and BasePrefix consolidation, neither of which ran here.
+        assert!(
+            session.current.manifest.search_index_builds.is_empty(),
+            "a native store must not mint legacy rebuild markers"
+        );
+        assert!(
+            session.current.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+                    && state.status == crate::search_lsm::SearchLsmStatus::Active
+            }),
+            "flush must register an Active vector generation"
+        );
         assert!(
             session
                 .current
                 .manifest
-                .search_index_builds
+                .ssts
                 .iter()
-                .any(|state| state.kind == SstKind::VectorGraph && state.name == "doc_emb"),
-            "authoritative build must record its catalog generation"
-        );
-        let vg_relative = session
-            .current
-            .manifest
-            .ssts
-            .iter()
-            .find(|d| d.kind == SstKind::VectorGraph && d.scope == "doc_emb")
-            .expect("compaction must have built the .vg SST for the registered index")
-            .path
-            .clone();
-        let vg_absolute = format!(
-            "{}/{}",
-            session.manifest_store.paths().namespace_prefix().as_ref(),
-            vg_relative
+                .any(|d| d.kind == SstKind::VectorGraph
+                    && d.scope == "doc_emb"
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)),
+            "flush must have written at least one VG6 delta segment body"
         );
         // The index path actually serves (fresh, and the .vg answers the KNN) —
         // not the trivially-equal flat fallback.
@@ -3661,15 +3672,6 @@ mod tests {
         assert_eq!(hits.len(), 1, "the .vg must answer the KNN before the drop");
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
-        let cache = session.sst_cache().unwrap().clone();
-        assert!(
-            cache.get_vector_index(&vg_absolute).is_some(),
-            "the serving query must populate the decoded graph cache"
-        );
-        assert!(
-            cache.get(&vg_absolute).is_some(),
-            "the serving query must populate the raw body cache"
-        );
 
         // A registration over the occupied (label, property, metric) slot is
         // still a duplicate at this point.
@@ -3709,12 +3711,11 @@ mod tests {
             "DROP must remove the durable build marker too"
         );
         assert!(
-            cache.get_vector_index(&vg_absolute).is_none(),
-            "DROP must eagerly prune the decoded graph"
-        );
-        assert!(
-            cache.get(&vg_absolute).is_none(),
-            "DROP must eagerly prune the raw graph body"
+            !m.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            }),
+            "the same commit must remove the Search-LSM generation"
         );
 
         // The flat scan still sees every row — dropping the index loses no data.
@@ -3750,8 +3751,16 @@ mod tests {
     }
 
     #[cfg(feature = "text-index")]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn drop_text_index_removes_descriptor_and_ft_ssts_and_falls_back() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let store = make_store();
         let paths = make_paths("ingest-drop-ftidx");
         let mut session = WriterSession::open_with_caches(
@@ -3799,25 +3808,31 @@ mod tests {
             .unwrap();
         session.flush(note_schema.clone()).await.unwrap();
         session.compact_l0(&note_schema).await.unwrap();
-        assert!(session
-            .current
-            .manifest
-            .search_index_builds
-            .iter()
-            .any(|state| state.kind == SstKind::TextIndex && state.name == "note_ft"));
-        let ft_relative = session
-            .current
-            .manifest
-            .ssts
-            .iter()
-            .find(|d| d.kind == SstKind::TextIndex && d.scope == "note_ft")
-            .expect("compaction must have built the .ft SST for the registered index")
-            .path
-            .clone();
-        let ft_absolute = format!(
-            "{}/{}",
-            session.manifest_store.paths().namespace_prefix().as_ref(),
-            ft_relative
+        // Native model: flush minted an Active Search-LSM generation and FT4
+        // delta segments; legacy rebuild markers exist only for 2.0.6-store
+        // adoption and BasePrefix consolidation, neither of which ran here.
+        assert!(
+            session.current.manifest.search_index_builds.is_empty(),
+            "a native store must not mint legacy rebuild markers"
+        );
+        assert!(
+            session.current.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+                    && state.status == crate::search_lsm::SearchLsmStatus::Active
+            }),
+            "flush must register an Active text generation"
+        );
+        assert!(
+            session
+                .current
+                .manifest
+                .ssts
+                .iter()
+                .any(|d| d.kind == SstKind::TextIndex
+                    && d.scope == "note_ft"
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)),
+            "flush must have written at least one FT4 delta segment body"
         );
         // The index path actually serves (`Some`, not the flat fallback).
         let snap = session.snapshot();
@@ -3834,15 +3849,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
-        let cache = session.sst_cache().unwrap().clone();
-        assert!(
-            cache.get_text_index(&ft_absolute).is_some(),
-            "the serving query must populate the decoded text cache"
-        );
-        assert!(
-            cache.get(&ft_absolute).is_some(),
-            "the serving query must populate the raw body cache"
-        );
 
         // Missing name: an error without IF EXISTS, a version-preserving no-op
         // with it.
@@ -3868,12 +3874,11 @@ mod tests {
             "DROP must remove the durable text build marker"
         );
         assert!(
-            cache.get_text_index(&ft_absolute).is_none(),
-            "DROP must eagerly prune the decoded text index"
-        );
-        assert!(
-            cache.get(&ft_absolute).is_none(),
-            "DROP must eagerly prune the raw text body"
+            !m.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            }),
+            "the same commit must remove the Search-LSM generation"
         );
 
         // The read path reports "no index" (`None` → the caller flat-scans) and
@@ -4127,8 +4132,16 @@ mod tests {
     /// gate routes index reads to the flat scan because the newer L0 outran
     /// the just-installed `.ft`.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn install_after_interleaved_write_and_flush_keeps_l0_and_outputs() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         fn body_record(body: &str) -> NodeWriteRecord {
             let mut props: BTreeMap<String, Value> = BTreeMap::new();
             props.insert("body".into(), Value::Str(body.into()));
@@ -4141,7 +4154,23 @@ mod tests {
 
         let (mut session, schema) = seeded_multi_bucket_session("ingest-prep-interleave").await;
         let base_version = session.manifest_version();
-        let inputs: Vec<Uuid> = session.current.manifest.ssts.iter().map(|d| d.id).collect();
+        // Only the structural kinds are merge inputs. Native FT4/VG6 delta
+        // segments and the `.slb` barrier are Search-LSM state: the default
+        // incremental policy correctly retains them across an L0→L1 node
+        // merge, so expecting their removal pins the 2.0.6 rebuild model.
+        let inputs: Vec<Uuid> = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv
+                )
+            })
+            .map(|d| d.id)
+            .collect();
 
         // Prepare from the basis at version N, then let the writer advance…
         let basis = session.compaction_basis();
@@ -4160,12 +4189,19 @@ mod tests {
         // node bucket.
         session.flush(schema.clone()).await.unwrap();
         assert_eq!(session.manifest_version(), base_version + 2);
+        // The compat barrier legitimately rotates ids when install rebases
+        // coverage, so it is excluded; everything else interleaved — the new
+        // Nodes L0 and its VG6/FT4 deltas — must survive the install.
         let interleaved_l0: Vec<Uuid> = session
             .current
             .manifest
             .ssts
             .iter()
-            .filter(|d| d.level == SstLevel::L0 && !inputs.contains(&d.id))
+            .filter(|d| {
+                d.level == SstLevel::L0
+                    && !inputs.contains(&d.id)
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)
+            })
             .map(|d| d.id)
             .collect();
         assert!(
@@ -4212,11 +4248,24 @@ mod tests {
                 .unwrap();
             assert_eq!(v.properties.get("body"), Some(&Value::Str(body.into())));
         }
-        // …and the freshness gate sees the newer L0 outrunning the
-        // just-installed indexes, so BM25 falls back to the exact flat scan
-        // instead of serving a corpus that misses node 8.
-        assert!(snap.index_outrun_by_nodes("doc_ft", SstKind::TextIndex));
-        assert!(snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        // …and the 2.0.6 post-install freshness gap no longer exists: the
+        // interleaved flush wrote its own FT4/VG6 delta, so coverage stays
+        // exact through the install and the index must SERVE node 8 rather
+        // than fall back to a flat scan. That gap's elimination is the core
+        // design goal of the incremental Search-LSM.
+        assert!(!snap.index_outrun_by_nodes("doc_ft", SstKind::TextIndex));
+        assert!(!snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        let got = snap
+            .text_search(
+                "doc_ft",
+                "Doc",
+                &crate::text::TextQuery::from_terms(&["lizard".to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("exact delta coverage must serve after install");
+        assert_eq!(got[0].0, sorted_node_id(8));
         let got = snap
             .text_search(
                 "doc_ft",
@@ -4225,8 +4274,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
-        assert!(got.is_none(), "an outrun index must fall back, not serve");
+            .unwrap()
+            .expect("the rebased generation must keep serving pre-compaction rows");
+        assert_eq!(got[0].0, sorted_node_id(1));
     }
 
     #[tokio::test]

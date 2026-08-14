@@ -3008,10 +3008,14 @@ impl<'mt> Snapshot<'mt> {
 
         // L3: cold SST walk. Resolve the id-primary record, then keep it only
         // if it actually carries `label` (the cache slot is per `(label, id)`).
+        // An empty label is unconstrained id-primary resolution, matching
+        // `batch_lookup_nodes`: both paths share the `(label, id)` cache
+        // keyspace, so diverging semantics would let one path cache an answer
+        // the other contradicts.
         let result = self
             .lookup_node_by_id(id)
             .await?
-            .filter(|v| v.labels.contains(label));
+            .filter(|v| label.is_empty() || v.labels.contains(label));
         // Insert into L1.
         self.node_cache.insert(cache_key.clone(), result.clone());
         // Insert into L2 if attached.
@@ -3641,10 +3645,12 @@ impl<'mt> Snapshot<'mt> {
         label: &str,
         id: NodeId,
     ) -> Result<Option<NodeView>> {
+        // The RFC-019 parity oracle mirrors `lookup_node` exactly, including
+        // the empty-label-is-unconstrained rule.
         Ok(self
             .lookup_node_by_id(id)
             .await?
-            .filter(|v| v.labels.contains(label)))
+            .filter(|v| label.is_empty() || v.labels.contains(label)))
     }
 
     /// The `LabelDef` to open a node SST with. Id-primary node SSTs carry

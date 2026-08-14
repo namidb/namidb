@@ -828,10 +828,20 @@ fn write_external_filters<W: Write + Seek>(
     Ok(result)
 }
 
+/// Streaming counterpart of [`encode_filter_posting`]. It must produce the
+/// byte-identical posting: the segment's `content_xxh3` covers these bytes,
+/// and the in-memory builder computes them through the canonical encoder. The
+/// canonical sparse→dense flip compares *encoded varint bytes* against the
+/// dense bitmap length, so this accumulator encodes deltas incrementally and
+/// flips at exactly that point — sizing the decision by resident `u64`s
+/// (as this once did) flipped to Dense far earlier and forked the fingerprint.
 #[derive(Debug)]
 enum AdaptiveOrdinals {
     Sparse {
-        ordinals: Vec<u64>,
+        /// Canonical delta-varint stream of everything pushed so far.
+        encoded: Vec<u8>,
+        cardinality: u64,
+        last_ordinal: Option<u64>,
         dense_bytes: usize,
         row_count: u64,
     },
@@ -845,7 +855,9 @@ enum AdaptiveOrdinals {
 impl AdaptiveOrdinals {
     fn new(row_count: u64, dense_bytes: usize) -> Self {
         Self::Sparse {
-            ordinals: Vec::new(),
+            encoded: Vec::new(),
+            cardinality: 0,
+            last_ordinal: None,
             dense_bytes,
             row_count,
         }
@@ -854,22 +866,38 @@ impl AdaptiveOrdinals {
     fn push(&mut self, ordinal: u64) -> Result<()> {
         match self {
             Self::Sparse {
-                ordinals,
+                encoded,
+                cardinality,
+                last_ordinal,
                 dense_bytes,
                 row_count,
             } => {
-                if ordinals.last().is_some_and(|previous| *previous >= ordinal) {
+                if last_ordinal.is_some_and(|previous| previous >= ordinal) {
                     return Err(Error::invariant(
                         "vector filter ordinals are not strictly increasing",
                     ));
                 }
-                ordinals.push(ordinal);
-                if ordinals.len().saturating_mul(size_of::<u64>()) >= *dense_bytes {
+                let delta = last_ordinal.map_or(ordinal, |previous| ordinal - previous);
+                encode_u64_varint(delta, encoded);
+                *last_ordinal = Some(ordinal);
+                *cardinality = cardinality
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("vector filter count overflows"))?;
+                if encoded.len() >= *dense_bytes {
+                    // Rebuild the bitmap from the canonical stream itself so
+                    // the flip cannot drift from what was actually encoded.
                     let mut bitmap = vec![0_u8; *dense_bytes];
-                    for ordinal in ordinals.drain(..) {
+                    let mut cursor = 0usize;
+                    let mut previous = 0u64;
+                    let mut first = true;
+                    while cursor < encoded.len() {
+                        let delta = decode_u64_varint(encoded, &mut cursor)?;
+                        let ordinal = if first { delta } else { previous + delta };
                         set_dense_filter_bit(&mut bitmap, ordinal, *row_count)?;
+                        previous = ordinal;
+                        first = false;
                     }
-                    let count = bitmap.iter().map(|byte| u64::from(byte.count_ones())).sum();
+                    let count = *cardinality;
                     *self = Self::Dense {
                         bitmap,
                         count,
@@ -894,13 +922,20 @@ impl AdaptiveOrdinals {
     fn finish(self) -> Result<(FilterPostingEncoding, Vec<u8>, u64)> {
         match self {
             Self::Sparse {
-                ordinals,
-                row_count,
+                encoded,
+                cardinality,
                 ..
             } => {
-                let cardinality = ordinals.len() as u64;
-                let (encoding, raw) = encode_filter_posting(&ordinals, row_count)?;
-                Ok((encoding, raw, cardinality))
+                if cardinality == 0 {
+                    return Err(Error::invariant(
+                        "vector v6 filter posting input is inconsistent",
+                    ));
+                }
+                Ok((
+                    FilterPostingEncoding::SparseDeltaVarint,
+                    encoded,
+                    cardinality,
+                ))
             }
             Self::Dense { bitmap, count, .. } => {
                 Ok((FilterPostingEncoding::DenseBitmap, bitmap, count))
