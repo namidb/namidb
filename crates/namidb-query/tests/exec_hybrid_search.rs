@@ -500,7 +500,11 @@ mod indexed_sparse_filter {
             location: &Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            if location.as_ref().ends_with(".ft") {
+            // Legacy monolithic bodies and native FT4 segments are both text
+            // index traffic; the native route reads ranges, so one logical
+            // probe costs several GETs — assertions below therefore bound by
+            // measured per-probe cost instead of counting whole-body fetches.
+            if location.as_ref().ends_with(".ft") || location.as_ref().ends_with(".ft4") {
                 self.text_gets.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get_opts(location, options).await
@@ -662,16 +666,24 @@ mod indexed_sparse_filter {
         let borrowed = borrowed_docs(&docs);
         let (writer, ids, probe) = indexed_corpus("hybrid-ft-widen", &borrowed).await;
 
+        let g8_before = probe.text_gets();
         let initial = authoritative_hits(&writer, "alpha", 8).await;
+        let g8 = probe.text_gets() - g8_before;
         assert_eq!(initial.len(), 8);
         assert!(
             initial.iter().all(|(id, _)| *id != ids["target"]),
             "the matching tenant must sit beyond the initial indexed prefix"
         );
+        let g32_before = probe.text_gets();
         let widened = authoritative_hits(&writer, "alpha", 32).await;
+        let g32 = probe.text_gets() - g32_before;
         assert!(
             widened.iter().any(|(id, _)| *id == ids["target"]),
             "the second authoritative prefix must expose the target"
+        );
+        assert!(
+            g8 > 0 && g32 > 0,
+            "authoritative probes must read the index"
         );
 
         let before = probe.text_gets();
@@ -685,10 +697,22 @@ mod indexed_sparse_filter {
         )
         .await;
         assert_eq!(titles(&rows), vec!["target".to_string()]);
-        assert_eq!(
-            probe.text_gets() - before,
-            2,
-            "cache-free execution must probe .ft at fetch=8 and widened fetch=32"
+        // The target sits beyond the initial prefix, so returning it at all
+        // proves the widening round ran (no starvation). The reads sandwich
+        // proves the index actually served — a flat scan reads zero index
+        // bytes — and that widening stayed within the two probes' measured
+        // budget (no runaway re-probing). The native filter-groups route may
+        // spend far less than an unfiltered probe, so its cost is bounded,
+        // not equated.
+        let spent = probe.text_gets() - before;
+        assert!(
+            spent > 0,
+            "the hybrid route must serve from the index, not the flat scan"
+        );
+        assert!(
+            spent <= g8 + g32,
+            "widening must stop within the measured two-probe budget              (spent {spent}, budget {})",
+            g8 + g32
         );
     }
 
@@ -708,11 +732,14 @@ mod indexed_sparse_filter {
         ));
         let borrowed = borrowed_docs(&docs);
         let (writer, _, probe) = indexed_corpus("hybrid-ft-short", &borrowed).await;
+        let g40_before = probe.text_gets();
         assert_eq!(
             authoritative_hits(&writer, "alpha", 40).await.len(),
             docs.len(),
             "fetch=40 proves the authoritative matching corpus is exhausted"
         );
+        let g40 = probe.text_gets() - g40_before;
+        assert!(g40 > 0, "the exhaustion proof must read the index");
 
         let before = probe.text_gets();
         let rows = run(
@@ -728,10 +755,13 @@ mod indexed_sparse_filter {
             titles(&rows),
             vec!["eligible-a".to_string(), "eligible-b".to_string()]
         );
-        assert_eq!(
-            probe.text_gets() - before,
-            1,
-            "an exhausted .ft returns the exact <k page without another probe"
+        // One exhausting probe's worth of reads, no widening round on top:
+        // an exhausted index returning fewer than k rows is an exact short
+        // page, not a reason to re-probe.
+        let spent = probe.text_gets() - before;
+        assert!(
+            spent > 0 && spent <= g40,
+            "an exhausted index returns the exact <k page without another              probe (spent {spent}, one-probe budget {g40})"
         );
     }
 
@@ -758,7 +788,16 @@ mod indexed_sparse_filter {
         ]);
         let borrowed = borrowed_docs(&docs);
         let (writer, ids, probe) = indexed_corpus("hybrid-ft-cap", &borrowed).await;
+        let g_full_before = probe.text_gets();
+        let full = authoritative_hits(&writer, "alpha", 64).await;
+        let g_full = probe.text_gets() - g_full_before;
+        assert!(
+            full.len() >= docs.len() - 1 && g_full > 0,
+            "fetch=64 measures one corpus-exhausting probe"
+        );
+        let g8_before = probe.text_gets();
         let top_eight = authoritative_hits(&writer, "alpha", 8).await;
+        let g8 = probe.text_gets() - g8_before;
         assert!(
             ["eligible-a", "eligible-b", "eligible-c"]
                 .iter()
@@ -772,19 +811,19 @@ mod indexed_sparse_filter {
 
         let indexed_before = probe.text_gets();
         let indexed = run(&writer, cypher, vec![]).await;
-        assert_eq!(
-            probe.text_gets() - indexed_before,
-            1,
-            "the uncapped authoritative route exhausts this corpus in one .ft probe"
+        let spent = probe.text_gets() - indexed_before;
+        assert!(
+            spent > 0 && spent <= g_full,
+            "the uncapped authoritative route exhausts this corpus within one              probe's budget (spent {spent}, budget {g_full})"
         );
 
         cap.update(8);
         let capped_before = probe.text_gets();
         let capped = run(&writer, cypher, vec![]).await;
-        assert_eq!(
-            probe.text_gets() - capped_before,
-            1,
-            "the capped route must consult the initial authoritative .ft prefix"
+        let capped_spent = probe.text_gets() - capped_before;
+        assert!(
+            capped_spent > 0 && capped_spent <= g8 + g_full,
+            "the capped route must consult the authoritative index before              falling back (spent {capped_spent})"
         );
         assert_eq!(
             titles(&capped),
