@@ -70,8 +70,7 @@ use crate::adjacency::{
     adjacency_enabled, build_adjacency, AdjacencyCache, AdjacencyKey, EdgeAdjacency,
 };
 use crate::cache::{
-    DecodedNodeRowGroup, EdgeStreamBundle, EqualityPropertySidecar, NodeRowGroupKey, SstCache,
-    UniquePropertySidecar,
+    DecodedNodeRowGroup, EqualityPropertySidecar, NodeRowGroupKey, SstCache, UniquePropertySidecar,
 };
 use crate::error::{Error, Result};
 use crate::flush::{decode_exact_node_record, EdgeWriteRecord, NodeWriteRecord};
@@ -90,6 +89,7 @@ use crate::search_lsm::{
     SearchSegmentRef, SearchSegmentStats, SearchStatValue,
 };
 use crate::sst::bloom::BloomFilter;
+use crate::sst::edges::format::OVERFLOW_JSON_NAME;
 use crate::sst::edges::paged_reader::PagedEdgeReader;
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::EdgeDirection;
@@ -4258,7 +4258,6 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        let mut local_streams: HashMap<String, Arc<EdgeStreamBundle>> = HashMap::new();
         let mut resolved: BTreeMap<(NodeId, NodeId), Option<EdgeView>> = BTreeMap::new();
         for ((src, dst), winner) in winners {
             let Some((lsn, winner)) = winner else {
@@ -4276,23 +4275,40 @@ impl<'mt> Snapshot<'mt> {
                     edge_offset,
                 } => {
                     if materialize_properties {
-                        // Property streams are still Arrow IPC streams in v1
-                        // and therefore eager. Delay this full-body path until
-                        // after LWW has selected a live winning point.
-                        let reader = self.fetch_edge_reader(&absolute).await?;
-                        let streams = match local_streams.get(&absolute) {
-                            Some(streams) => streams.clone(),
-                            None => {
-                                let streams =
-                                    self.fetch_edge_streams(&absolute, edge_type, reader.as_ref())?;
-                                local_streams.insert(absolute, streams.clone());
-                                streams
+                        // Hydrate exactly the winning row through the paged
+                        // property pages; only after LWW has selected a live
+                        // winning point. Legacy Arrow sections fall back to
+                        // the eager body inside `read_property_rows`.
+                        let paged_reader = self.fetch_paged_edge_reader(&absolute).await?;
+                        let row_start = u64::try_from(edge_offset)
+                            .map_err(|_| Error::invariant("edge offset does not fit u64"))?;
+                        let row_range = row_start..row_start.checked_add(1).ok_or_else(|| {
+                            Error::invariant("edge point row range overflows u64")
+                        })?;
+                        let overflow = paged_reader
+                            .read_property_rows(OVERFLOW_JSON_NAME, row_range.clone())
+                            .await?;
+                        let declared_property_names: Vec<String> = self
+                            .manifest
+                            .manifest
+                            .schema
+                            .edge_type(edge_type)
+                            .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
+                            .unwrap_or_default();
+                        let mut declared: Vec<(String, Vec<Option<String>>)> =
+                            Vec::with_capacity(declared_property_names.len());
+                        for name in declared_property_names {
+                            if let Some(values) = paged_reader
+                                .read_property_rows(&name, row_range.clone())
+                                .await?
+                            {
+                                declared.push((name, values));
                             }
-                        };
+                        }
                         decode_edge_properties(
-                            streams.overflow.as_ref().and_then(|v| v.get(edge_offset)),
-                            &streams.declared,
-                            edge_offset,
+                            overflow.as_ref().and_then(|values| values.first()),
+                            &declared,
+                            0,
                         )?
                     } else {
                         BTreeMap::new()
@@ -6040,13 +6056,38 @@ impl<'mt> Snapshot<'mt> {
             let Some(lookup) = paged_reader.lookup(&key_bytes).await? else {
                 continue;
             };
-            // S17.3: cache the decoded property streams per SST path.
-            // The streams are immutable for the SST's lifetime so the
-            // first call decodes O(edge_count) and every subsequent
-            // call on this snapshot — or any other snapshot sharing
-            // the cache — is a single map probe.
-            let reader = self.fetch_edge_reader(&absolute).await?;
-            let streams = self.fetch_edge_streams(&absolute, edge_type, reader.as_ref())?;
+            // Hydrate ONLY this key's property row range through the paged
+            // property pages. The former whole-body `EdgeSstReader` +
+            // stream-decode pair cost O(edge-SST bytes) per cold lookup —
+            // disqualifying at large edge SSTs — while the row range is
+            // O(deg). Legacy Arrow-stream sections keep exact behaviour:
+            // `read_property_rows` falls back to the eager body for them.
+            let row_start = u64::try_from(lookup.edge_offset)
+                .map_err(|_| Error::invariant("edge lookup offset does not fit u64"))?;
+            let row_range = row_start
+                ..row_start
+                    .checked_add(lookup.partners.len() as u64)
+                    .ok_or_else(|| Error::invariant("edge lookup row range overflows u64"))?;
+            let overflow = paged_reader
+                .read_property_rows(OVERFLOW_JSON_NAME, row_range.clone())
+                .await?;
+            let declared_property_names: Vec<String> = self
+                .manifest
+                .manifest
+                .schema
+                .edge_type(edge_type)
+                .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
+                .unwrap_or_default();
+            let mut declared: Vec<(String, Vec<Option<String>>)> =
+                Vec::with_capacity(declared_property_names.len());
+            for name in declared_property_names {
+                if let Some(values) = paged_reader
+                    .read_property_rows(&name, row_range.clone())
+                    .await?
+                {
+                    declared.push((name, values));
+                }
+            }
             for (i, partner_id) in lookup.partners.iter().enumerate() {
                 let lsn = lookup.lsns[i];
                 let tomb = lookup.tombstones[i];
@@ -6058,11 +6099,10 @@ impl<'mt> Snapshot<'mt> {
                         EdgeDirection::Forward => (key, partner_node),
                         EdgeDirection::Inverse => (partner_node, key),
                     };
-                    let absolute_idx = lookup.edge_offset + i;
                     let properties = decode_edge_properties(
-                        streams.overflow.as_ref().and_then(|v| v.get(absolute_idx)),
-                        &streams.declared,
-                        absolute_idx,
+                        overflow.as_ref().and_then(|values| values.get(i)),
+                        &declared,
+                        i,
                     )?;
                     Some(EdgeView {
                         edge_type: edge_type.to_string(),
@@ -7433,54 +7473,6 @@ impl<'mt> Snapshot<'mt> {
             .unwrap()
             .insert(cache_key, reader.clone(), weight);
         Ok(reader)
-    }
-
-    async fn fetch_edge_reader(&self, absolute: &str) -> Result<Arc<EdgeSstReader>> {
-        namidb_core::profile_scope!("Snapshot::fetch_edge_reader");
-        if let Some(cache) = self.cache.as_ref() {
-            if let Some(reader) = cache.get_edge_reader(absolute) {
-                namidb_core::profile_scope!("Snapshot::fetch_edge_reader.hit");
-                return Ok(reader);
-            }
-        }
-        namidb_core::profile_scope!("Snapshot::fetch_edge_reader.miss");
-        let body = self.fetch_bytes(absolute).await?;
-        let reader = Arc::new(EdgeSstReader::open(body)?);
-        if let Some(cache) = self.cache.as_ref() {
-            cache.insert_edge_reader(absolute.to_string(), reader.clone());
-        }
-        Ok(reader)
-    }
-
-    fn fetch_edge_streams(
-        &self,
-        absolute: &str,
-        edge_type: &str,
-        reader: &EdgeSstReader,
-    ) -> Result<Arc<EdgeStreamBundle>> {
-        namidb_core::profile_scope!("Snapshot::fetch_edge_streams");
-        if let Some(cache) = self.cache.as_ref() {
-            if let Some(bundle) = cache.get_edge_streams(absolute) {
-                namidb_core::profile_scope!("Snapshot::fetch_edge_streams.hit");
-                return Ok(bundle);
-            }
-        }
-        namidb_core::profile_scope!("Snapshot::fetch_edge_streams.miss");
-        let declared_property_names: Vec<String> = self
-            .manifest
-            .manifest
-            .schema
-            .edge_type(edge_type)
-            .map(|def| def.properties.iter().map(|p| p.name.clone()).collect())
-            .unwrap_or_default();
-        let bundle = Arc::new(EdgeStreamBundle {
-            overflow: reader.read_overflow_strings()?,
-            declared: load_declared_streams(reader, &declared_property_names)?,
-        });
-        if let Some(cache) = self.cache.as_ref() {
-            cache.insert_edge_streams(absolute.to_string(), bundle.clone());
-        }
-        Ok(bundle)
     }
 
     async fn fetch_unique_property_sidecar(
@@ -11216,10 +11208,11 @@ mod tests {
         assert_eq!(batch[0], batch[2]);
         assert_eq!(
             fallback_cache.edge_readers_inserts(),
-            1,
-            "one corrupt sidecar falls back to one CSR open for the whole batch"
+            0,
+            "the corrupt-sidecar fallback hydrates through paged property \
+             rows now; the eager whole-body reader cache must stay untouched"
         );
-        assert_eq!(fallback_cache.edge_streams_inserts(), 1);
+        assert_eq!(fallback_cache.edge_streams_inserts(), 0);
 
         // A downgrade-era janitor may remove an unrecognised `.epidx`. The
         // marker remains safe: NotFound falls through to the authoritative CSR
