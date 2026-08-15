@@ -5595,141 +5595,7 @@ mod tests {
     }
 
     /// `ObjectStore` wrapper that can fail or block the next matching
-    /// `put_opts` exactly once. Used to simulate both transient commit faults
-    /// and cancellation while an immutable flush body is in flight.
-    #[derive(Debug)]
-    struct FaultStore {
-        inner: Arc<dyn ObjectStore>,
-        fail_next_put_on: std::sync::Mutex<Option<String>>,
-        block_next_put_on: std::sync::Mutex<Option<String>>,
-        blocked_put: tokio::sync::Notify,
-        release_put: tokio::sync::Notify,
-    }
-
-    impl FaultStore {
-        fn new(inner: Arc<dyn ObjectStore>) -> Self {
-            Self {
-                inner,
-                fail_next_put_on: std::sync::Mutex::new(None),
-                block_next_put_on: std::sync::Mutex::new(None),
-                blocked_put: tokio::sync::Notify::new(),
-                release_put: tokio::sync::Notify::new(),
-            }
-        }
-        fn fail_next_put_containing(&self, needle: &str) {
-            *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
-        }
-
-        fn block_next_put_containing(&self, needle: &str) {
-            *self.block_next_put_on.lock().unwrap() = Some(needle.to_string());
-        }
-
-        async fn wait_for_blocked_put(&self) {
-            self.blocked_put.notified().await;
-        }
-    }
-
-    impl std::fmt::Display for FaultStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FaultStore({})", self.inner)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for FaultStore {
-        async fn put_opts(
-            &self,
-            location: &object_store::path::Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            let hit = {
-                let mut guard = self.fail_next_put_on.lock().unwrap();
-                match guard.as_deref() {
-                    Some(needle) if location.as_ref().contains(needle) => {
-                        *guard = None;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if hit {
-                return Err(object_store::Error::Generic {
-                    store: "FaultStore",
-                    source: "injected transient put failure".into(),
-                });
-            }
-            let block = {
-                let mut guard = self.block_next_put_on.lock().unwrap();
-                match guard.as_deref() {
-                    Some(needle) if location.as_ref().contains(needle) => {
-                        *guard = None;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if block {
-                // `notify_one` retains a permit if the test has not started
-                // waiting yet. The matching PUT then stays pending until the
-                // flush future is deliberately dropped.
-                self.blocked_put.notify_one();
-                self.release_put.notified().await;
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &object_store::path::Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &object_store::path::Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<object_store::path::Path>,
-            >,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
-        {
-            self.inner.delete_stream(locations)
-        }
-    }
+    use crate::test_support::FaultStore;
 
     #[tokio::test]
     async fn commit_batch_reseqs_and_recovers_when_base_plus_one_is_free() {
@@ -7444,5 +7310,187 @@ mod tests {
                 .unwrap(),
             UniqueProbe::NoConflict
         );
+    }
+
+    /// Plan item 10 (25 TB readiness): the search publish path survives a
+    /// fault at every PUT it makes — delta segment body, `.slb` barrier,
+    /// manifest body, and the consolidation output. After each injected
+    /// failure a fresh reader must serve the previous committed state
+    /// natively, the retried operation must succeed, and a deleting janitor
+    /// sweep must reclaim any half-published object without touching live
+    /// state.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn search_publish_crash_matrix_stays_serving_and_reclaims() {
+        use crate::janitor::sweep_orphans;
+        use crate::manifest::TextIndexDescriptor;
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+        use crate::search_lsm::{select_search_read_plan, SearchLsmKind, SearchReadPlan};
+
+        // Consolidation (the fourth fault point) needs the deterministic
+        // force-base policy; every phase here observes policy-dependent state.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = crate::test_support::SearchCompactionEnvRestore::configure();
+
+        let fault = Arc::new(crate::test_support::FaultStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = fault.clone();
+        let paths = make_paths("ingest-search-crash-matrix");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let dim = 4u32;
+        session
+            .register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim,
+                    metric: VectorMetric::Cosine,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        let doc_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("embedding", DataType::FloatVector { dim }, true).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let doc = |ordinal: u64| {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            let mut embedding = vec![0.0f32; dim as usize];
+            embedding[0] = 1.0;
+            embedding[1] = ordinal as f32 / 16.0;
+            props.insert("embedding".into(), Value::Vec(embedding));
+            props.insert("body".into(), Value::Str(format!("alpha doc {ordinal}")));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        };
+        let probe = vec![1.0f32, 0.0, 0.0, 0.0];
+
+        // Baseline: one flushed batch, natively served.
+        for ordinal in 0..6u64 {
+            session
+                .upsert_node("Doc", NodeId::new(), &doc(ordinal))
+                .unwrap();
+        }
+        session.flush(doc_schema.clone()).await.unwrap();
+        // The contract is a READER-NODE's view: the last committed manifest
+        // with no writer memtable. The writer's own snapshot legitimately
+        // falls back while it holds committed-but-unflushed rows — that is
+        // the freshness gate, not a failure.
+        async fn assert_serving(
+            store: &Arc<dyn ObjectStore>,
+            paths: &crate::paths::NamespacePaths,
+            probe: &[f32],
+            expected: usize,
+            label: &str,
+        ) {
+            use crate::search_lsm::{select_search_read_plan, SearchLsmKind, SearchReadPlan};
+            let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+            let loaded = manifest_store.load_current().await.unwrap();
+            let memtable = Memtable::new();
+            let view = memtable.snapshot_view();
+            let snap = crate::read::Snapshot::new(loaded, &view, store.clone(), paths.clone());
+            let manifest = snap.manifest().manifest.clone();
+            for (kind, name) in [
+                (SearchLsmKind::Vector, "doc_emb"),
+                (SearchLsmKind::Text, "doc_ft"),
+            ] {
+                let plan = select_search_read_plan(&manifest, kind, name);
+                // Both are native-serving plans: delta segments before the
+                // consolidation, the single-base fast path after it. Only a
+                // flat fallback or a bare legacy body would betray a broken
+                // publish.
+                assert!(
+                    matches!(
+                        plan,
+                        SearchReadPlan::ActiveSegments { .. }
+                            | SearchReadPlan::ActiveLegacyBase { .. }
+                    ),
+                    "{label}: {name} must keep selecting a native plan, got {plan:?}"
+                );
+            }
+            let hits = snap
+                .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: text generation must serve"));
+            assert_eq!(hits.len(), expected, "{label}: full corpus served");
+            let (vector_hits, _) = snap
+                .try_vector_search_with_point_count("doc_emb", probe, 3, 32)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: vector generation must serve"));
+            assert_eq!(vector_hits.len(), 3, "{label}: KNN served");
+        }
+        assert_serving(&store, &paths, &probe, 6, "baseline").await;
+
+        // Fault 1: the FT4 delta segment body PUT fails mid-flush.
+        session.upsert_node("Doc", NodeId::new(), &doc(6)).unwrap();
+        fault.fail_next_put_containing(".ft4");
+        session.flush(doc_schema.clone()).await.unwrap_err();
+        assert_serving(&store, &paths, &probe, 6, "after failed ft4 delta PUT").await;
+
+        // Fault 2: the rotated `.slb` barrier PUT fails on the retry.
+        fault.fail_next_put_containing(".slb");
+        session.flush(doc_schema.clone()).await.unwrap_err();
+        assert_serving(&store, &paths, &probe, 6, "after failed barrier PUT").await;
+
+        // Fault 3: the manifest body PUT fails. The write path may retry the
+        // commit internally at a fresh version; either way the corpus must
+        // land exactly once.
+        fault.fail_next_put_containing("manifest/v");
+        let _ = session.flush(doc_schema.clone()).await;
+        session.flush(doc_schema.clone()).await.unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after manifest fault and retry").await;
+
+        // Fault 4: the consolidation output PUT fails; the generation keeps
+        // serving its deltas, and the retried consolidation lands.
+        fault.fail_next_put_containing("sst/level1");
+        let _ = session.compact_l0(&doc_schema).await;
+        assert_serving(&store, &paths, &probe, 7, "after failed consolidation PUT").await;
+        session.compact_l0(&doc_schema).await.unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after retried consolidation").await;
+
+        // The janitor reclaims whatever half-published objects the faults
+        // stranded, without breaking the live state.
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let current = manifest_store.load_current().await.unwrap();
+        sweep_orphans(
+            &manifest_store,
+            current.manifest.version,
+            std::time::Duration::ZERO,
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after deleting sweep").await;
     }
 }

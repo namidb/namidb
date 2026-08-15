@@ -1207,6 +1207,177 @@ mod tests {
                 })));
     }
 
+    /// Plan item 9 (25 TB readiness): a backup taken over an Active
+    /// Search-LSM generation must round-trip the barrier, the delta segments
+    /// and the manifest state so the DESTINATION still selects the native
+    /// plan and serves identical results — restoring into a flat-scanning
+    /// namespace would be a silent 1000x regression at scale.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[tokio::test]
+    async fn snapshot_round_trips_active_search_generations() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+        use crate::search_lsm::{
+            select_search_read_plan, validate_search_barrier, SearchLsmKind, SearchReadPlan,
+        };
+
+        let (src_store, src_paths) = (store(), paths("bk-search-src"));
+        let dim = 4u32;
+        let doc_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("embedding", DataType::FloatVector { dim }, true).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let probe = vec![1.0f32, 0.0, 0.0, 0.0];
+        let source_hits;
+        let source_text;
+        {
+            let mut w = WriterSession::open(src_store.clone(), src_paths.clone())
+                .await
+                .unwrap();
+            w.register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim,
+                    metric: VectorMetric::Cosine,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            w.register_text_index(
+                TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+            for ordinal in 0..12u64 {
+                let mut properties = BTreeMap::new();
+                let mut embedding = vec![0.0f32; dim as usize];
+                embedding[0] = 1.0;
+                embedding[1] = ordinal as f32 / 12.0;
+                properties.insert("embedding".into(), Value::Vec(embedding));
+                properties.insert(
+                    "body".into(),
+                    Value::Str(if ordinal % 3 == 0 {
+                        format!("alpha doc {ordinal}")
+                    } else {
+                        format!("plain doc {ordinal}")
+                    }),
+                );
+                w.upsert_node(
+                    "Doc",
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                if ordinal == 5 {
+                    w.flush(doc_schema.clone()).await.unwrap();
+                }
+            }
+            w.flush(doc_schema.clone()).await.unwrap();
+
+            // Two flushes -> an Active generation with delta segments.
+            let snap = w.snapshot();
+            source_hits = snap
+                .try_vector_search_with_point_count("doc_emb", &probe, 3, 32)
+                .await
+                .unwrap()
+                .expect("the source must serve natively before the backup")
+                .0;
+            source_text = snap
+                .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+                .await
+                .unwrap()
+                .expect("the source text generation must serve natively");
+        }
+
+        let (dst_store, dst_paths) = (store(), paths("bk-search-dst"));
+        copy_namespace_snapshot(
+            src_store,
+            src_paths,
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            true, // verify: every copied object re-read and length-checked
+        )
+        .await
+        .unwrap();
+
+        let manifest_store = ManifestStore::new(dst_store.clone(), dst_paths.clone());
+        let restored = manifest_store.load_current().await.unwrap();
+        for (kind, name) in [
+            (SearchLsmKind::Vector, "doc_emb"),
+            (SearchLsmKind::Text, "doc_ft"),
+        ] {
+            let plan = select_search_read_plan(&restored.manifest, kind, name);
+            let SearchReadPlan::ActiveSegments {
+                state,
+                barrier_sst_id,
+            } = plan
+            else {
+                panic!("restored {name} must select the native plan, got {plan:?}");
+            };
+            // The copied barrier body must still authenticate the state.
+            let barrier = restored
+                .manifest
+                .ssts
+                .iter()
+                .find(|descriptor| descriptor.id == barrier_sst_id)
+                .expect("restored barrier descriptor");
+            let absolute = object_store::path::Path::from(format!(
+                "{}/{}",
+                dst_paths.namespace_prefix().as_ref(),
+                barrier.path
+            ));
+            let body = dst_store
+                .get(&absolute)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            validate_search_barrier(&state, &body).expect("copied barrier authenticates");
+        }
+
+        // And the destination actually serves, byte-identically.
+        let memtable = crate::memtable::Memtable::new();
+        let view = memtable.snapshot_view();
+        let snap = crate::read::Snapshot::new(restored, &view, dst_store, dst_paths);
+        let restored_hits = snap
+            .try_vector_search_with_point_count("doc_emb", &probe, 3, 32)
+            .await
+            .unwrap()
+            .expect("the restored vector generation must serve natively")
+            .0;
+        assert_eq!(restored_hits, source_hits, "restored KNN must match source");
+        let restored_text = snap
+            .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+            .await
+            .unwrap()
+            .expect("the restored text generation must serve natively");
+        assert_eq!(
+            restored_text, source_text,
+            "restored BM25 must match source"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_round_trips_empty_namespace() {
         let (src_store, src_paths) = (store(), paths("bk-empty-src"));

@@ -10,6 +10,10 @@
 //! [`SearchCompactionEnvRestore`] so the previous values return on drop even
 //! when the test panics.
 
+use std::sync::Arc;
+
+use object_store::ObjectStore;
+
 /// Serialises every test that touches or observes the Search-LSM policy env.
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
 pub(crate) static SEARCH_COMPACTION_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -72,5 +76,139 @@ impl Drop for SearchCompactionEnvRestore {
             Some(value) => std::env::set_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION", value),
             None => std::env::remove_var("NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION"),
         }
+    }
+}
+
+/// `put_opts` exactly once. Used to simulate both transient commit faults
+/// and cancellation while an immutable flush body is in flight.
+#[derive(Debug)]
+pub(crate) struct FaultStore {
+    inner: Arc<dyn ObjectStore>,
+    fail_next_put_on: std::sync::Mutex<Option<String>>,
+    block_next_put_on: std::sync::Mutex<Option<String>>,
+    blocked_put: tokio::sync::Notify,
+    release_put: tokio::sync::Notify,
+}
+
+impl FaultStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            fail_next_put_on: std::sync::Mutex::new(None),
+            block_next_put_on: std::sync::Mutex::new(None),
+            blocked_put: tokio::sync::Notify::new(),
+            release_put: tokio::sync::Notify::new(),
+        }
+    }
+    pub(crate) fn fail_next_put_containing(&self, needle: &str) {
+        *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
+    }
+
+    pub(crate) fn block_next_put_containing(&self, needle: &str) {
+        *self.block_next_put_on.lock().unwrap() = Some(needle.to_string());
+    }
+
+    pub(crate) async fn wait_for_blocked_put(&self) {
+        self.blocked_put.notified().await;
+    }
+}
+
+impl std::fmt::Display for FaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FaultStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let hit = {
+            let mut guard = self.fail_next_put_on.lock().unwrap();
+            match guard.as_deref() {
+                Some(needle) if location.as_ref().contains(needle) => {
+                    *guard = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if hit {
+            return Err(object_store::Error::Generic {
+                store: "FaultStore",
+                source: "injected transient put failure".into(),
+            });
+        }
+        let block = {
+            let mut guard = self.block_next_put_on.lock().unwrap();
+            match guard.as_deref() {
+                Some(needle) if location.as_ref().contains(needle) => {
+                    *guard = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if block {
+            // `notify_one` retains a permit if the test has not started
+            // waiting yet. The matching PUT then stays pending until the
+            // flush future is deliberately dropped.
+            self.blocked_put.notify_one();
+            self.release_put.notified().await;
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
 }
