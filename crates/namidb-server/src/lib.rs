@@ -3383,6 +3383,10 @@ fn json_to_runtime(v: &serde_json::Value) -> Result<RuntimeValue, String> {
         Number(n) => {
             if let Some(i) = n.as_i64() {
                 RuntimeValue::Integer(i)
+            } else if n.is_u64() {
+                // A u64 beyond i64::MAX would silently degrade to a lossy
+                // float; Cypher integers are 64-bit signed, so reject it.
+                return Err(format!("integer param {n} exceeds the 64-bit signed range"));
             } else if let Some(f) = n.as_f64() {
                 RuntimeValue::Float(f)
             } else {
@@ -3523,6 +3527,103 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, auth_token.map(|s| s.to_string()), "test".into());
         build_router(state)
+    }
+
+    /// Plan item 28: the HTTP JSON parameter route had no unit tests and no
+    /// HTTP test posted a non-empty params map.
+    #[test]
+    fn json_params_convert_nested_shapes_and_reject_out_of_range_integers() {
+        let map = serde_json::json!({
+            "nested": {"list": [1, 2.5, "x", null, true]},
+            "imax": i64::MAX,
+            "imin": i64::MIN,
+            "tenth": 0.1,
+        });
+        let params = params_from_json(map.as_object().unwrap()).unwrap();
+        match params.get("nested") {
+            Some(RuntimeValue::Map(m)) => match m.get("list") {
+                Some(RuntimeValue::List(items)) => {
+                    assert_eq!(items.len(), 5);
+                    assert!(matches!(items[0], RuntimeValue::Integer(1)));
+                    assert!(matches!(items[1], RuntimeValue::Float(f) if f == 2.5));
+                    assert!(matches!(&items[2], RuntimeValue::String(s) if s == "x"));
+                    assert!(matches!(items[3], RuntimeValue::Null));
+                    assert!(matches!(items[4], RuntimeValue::Bool(true)));
+                }
+                other => panic!("nested list must survive: {other:?}"),
+            },
+            other => panic!("nested map must survive: {other:?}"),
+        }
+        assert!(matches!(params.get("imax"), Some(RuntimeValue::Integer(i)) if *i == i64::MAX));
+        assert!(matches!(params.get("imin"), Some(RuntimeValue::Integer(i)) if *i == i64::MIN));
+        assert!(
+            matches!(params.get("tenth"), Some(RuntimeValue::Float(f)) if *f == 0.1),
+            "0.1 must round-trip bit-exact through serde_json"
+        );
+
+        let oversized = serde_json::json!({"big": u64::MAX});
+        let error = params_from_json(oversized.as_object().unwrap()).unwrap_err();
+        assert!(
+            error.contains("64-bit signed range"),
+            "a u64 beyond i64::MAX must be rejected, not degraded to a float: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_cypher_executes_with_a_non_empty_params_map() {
+        let app = fixture(None).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": "RETURN $flag AS flag, $nums AS nums, $meta AS meta, $tenth AS tenth",
+            "params": {
+                "flag": true,
+                "nums": [1, 2, 3],
+                "meta": {"tenant": "acme"},
+                "tenth": 0.1,
+            }
+        }))
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = &parsed["rows"][0];
+        assert_eq!(row["flag"], serde_json::json!(true));
+        assert_eq!(row["nums"], serde_json::json!([1, 2, 3]));
+        assert_eq!(row["meta"], serde_json::json!({"tenant": "acme"}));
+        assert_eq!(row["tenth"], serde_json::json!(0.1), "float round-trip");
+    }
+
+    #[tokio::test]
+    async fn http_cypher_rejects_an_out_of_range_integer_param_with_400() {
+        let app = fixture(None).await;
+        let body = format!(
+            "{{\"query\": \"RETURN $big AS big\", \"params\": {{\"big\": {}}}}}",
+            u64::MAX
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

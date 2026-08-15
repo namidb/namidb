@@ -175,7 +175,9 @@ crates/namidb-query/src/exec/expr.rs unit blocks: the three string operators inc
 
 exec_match_expand.rs: top-level MATCH..RETURN x UNION MATCH..RETURN x dedup + UNION ALL multiplicity, result-asserted on memtable and flushed states; plan/lower.rs test that RETURN a AS x UNION RETURN b AS y is rejected (after adding validation).
 
-### 28. [high] HTTP JSON parameter route untested: params_from_json/json_to_runtime has no unit tests and no HTTP test posts a non-empty params map (nested list/map, u64-beyond-i64, float round-trip). [Report 4.]
+### 28. [DONE] HTTP JSON parameter route untested: params_from_json/json_to_runtime has no unit tests and no HTTP test posts a non-empty params map (nested list/map, u64-beyond-i64, float round-trip). [Report 4.]
+
+**Resolution (2026-08-15):** found and fixed a real hazard — a u64 beyond i64::MAX silently degraded to a lossy float; it now rejects with a named error and HTTP 400. Unit tests pin nested list/map conversion, i64::MAX/MIN, bit-exact 0.1 round-trip and the out-of-range rejection; an HTTP e2e posts a non-empty params map (bool, list, map, float) through /v0/cypher and asserts the JSON round-trip.
 
 crates/namidb-server/src/lib.rs inline: post_cypher with {"params": {"n":1, "tags":[..], "props":{..}, "big": 18446744073709551615}} asserting bound results and a typed 400 for the unrepresentable number.
 
