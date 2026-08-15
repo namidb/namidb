@@ -189,7 +189,9 @@ New crates/namidb-storage/tests/manifest_rollback_206.rs modeled on manifest_rol
 
 crates/namidb-storage/src/compact.rs: extend compaction_builds_a_searchable_text_index with the vector test's three-phase downgrade block (state wiped → .slb metadata-only recovery; stale catalog marker → rebuild; adopted state serves via native FT4 route).
 
-### 31. [high] Janitor never tested against active search state: sweep preserving barrier/base/delta objects of an Active generation, and sweep racing a pinned native read over a just-retired generation. [Report 5; the race half overlaps rank 3's framework — keep the unit-level pair here.]
+### 31. [DONE] Janitor never tested against active search state: sweep preserving barrier/base/delta objects of an Active generation, and sweep racing a pinned native read over a just-retired generation. [Report 5; the race half overlaps rank 3's framework — keep the unit-level pair here.]
+
+**Resolution (2026-08-15):** `sweep_preserves_active_search_generations_until_the_horizon_passes`: the Active generation's body+barrier survive any sweep; after a consolidation retires them, a sweep pinned at the old version preserves the retired objects and a reader loaded at that version still serves the old corpus; past the horizon they are reclaimed while the new generation serves. The dynamic race half was already covered by `tests/search_concurrency.rs` (janitor fed by the readers' floor during live maintenance).
 
 crates/namidb-storage/src/janitor.rs: (1) sweep_finds_no_orphans_with_active_search_generation — Active vector+text generation + one planted true orphan; sweep deletes only the orphan; (2) sweep_keeps_retired_generation_under_pin_lease — retire a delta generation via search compaction while a RetentionPin at the old version is held; old segments survive until release.
 

@@ -714,6 +714,204 @@ mod tests {
             .committed
     }
 
+    /// Plan item 31: the janitor against ACTIVE search state. The barrier,
+    /// base and delta objects of an Active generation are live — a sweep at
+    /// any horizon must not touch them. Once a consolidation retires the old
+    /// generation, a sweep whose horizon still pins the old manifest must
+    /// preserve the retired bodies (a pinned reader may still be serving
+    /// them), and only a sweep past that horizon reclaims them.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn sweep_preserves_active_search_generations_until_the_horizon_passes() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::read::Snapshot;
+
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = crate::test_support::SearchCompactionEnvRestore::configure();
+
+        let store = make_store();
+        let paths = make_paths("janitor-active-search");
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        writer
+            .register_text_index(
+                TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        for body in ["alpha one", "alpha two", "beta three"] {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("body".to_string(), Value::Str(body.to_string()));
+            writer
+                .upsert_node(
+                    "Doc",
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties: props,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush(schema.clone()).await.unwrap();
+        writer.compact_l0(&schema).await.unwrap();
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let settled = ms.load_current().await.unwrap();
+        let state = settled
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.index_name == "doc_ft")
+            .expect("active text generation");
+        let mut generation_paths: Vec<String> = state
+            .segments
+            .iter()
+            .filter_map(|segment| {
+                settled
+                    .manifest
+                    .ssts
+                    .iter()
+                    .find(|descriptor| descriptor.id == segment.sst_id)
+                    .map(|descriptor| descriptor.path.clone())
+            })
+            .collect();
+        if let Some(barrier_id) = state.compat_barrier_sst_id {
+            generation_paths.extend(
+                settled
+                    .manifest
+                    .ssts
+                    .iter()
+                    .filter(|descriptor| descriptor.id == barrier_id)
+                    .map(|descriptor| descriptor.path.clone()),
+            );
+        }
+        assert!(
+            generation_paths.len() >= 2,
+            "generation must have at least a body and a barrier"
+        );
+        let old_version = settled.manifest.version;
+
+        // 1. Active generation, max horizon: the consolidation's leftovers
+        // (pre-consolidation deltas) are legitimate garbage, but nothing of
+        // the ACTIVE generation may be touched.
+        let _ = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 10, true)
+            .await
+            .unwrap();
+        for path in &generation_paths {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), path);
+            store
+                .head(&object_store::path::Path::from(absolute))
+                .await
+                .expect("active generation object must survive the sweep");
+        }
+
+        // 2. Retire the generation: more docs, flush, force-base consolidate.
+        for body in ["alpha four", "beta five"] {
+            let mut props = std::collections::BTreeMap::new();
+            props.insert("body".to_string(), Value::Str(body.to_string()));
+            writer
+                .upsert_node(
+                    "Doc",
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties: props,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        writer.flush(schema.clone()).await.unwrap();
+        writer.compact_l0(&schema).await.unwrap();
+        let current = ms.load_current().await.unwrap();
+        let retired: Vec<String> = generation_paths
+            .iter()
+            .filter(|path| {
+                !current
+                    .manifest
+                    .ssts
+                    .iter()
+                    .any(|descriptor| &descriptor.path == *path)
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !retired.is_empty(),
+            "the consolidation must have retired at least one old object"
+        );
+
+        // 3. A sweep whose horizon still pins the OLD version keeps the
+        // retired bodies, and a reader pinned there still serves.
+        sweep_orphans(&ms, old_version, Duration::from_secs(0), 10, true)
+            .await
+            .unwrap();
+        for path in &retired {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), path);
+            store
+                .head(&object_store::path::Path::from(absolute))
+                .await
+                .expect("a pinned horizon must preserve retired search objects");
+        }
+        let pinned_manifest = ms.load_manifest_at(old_version).await.unwrap();
+        let pinned_loaded = crate::manifest::LoadedManifest::new(
+            current.pointer.clone(),
+            None,
+            None,
+            pinned_manifest,
+        );
+        let memtable = Memtable::new();
+        let view = memtable.snapshot_view();
+        let pinned = Snapshot::new(pinned_loaded, &view, store.clone(), paths.clone());
+        let hits = pinned
+            .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+            .await
+            .unwrap()
+            .expect("the pinned reader must still serve the retired generation");
+        assert_eq!(hits.len(), 2, "the old snapshot sees the old corpus");
+
+        // 4. Advancing the horizon reclaims the retired objects; the new
+        // generation keeps serving.
+        let report = sweep_orphans(&ms, u64::MAX, Duration::from_secs(0), 10, true)
+            .await
+            .unwrap();
+        assert!(
+            report.orphans_deleted > 0,
+            "past the horizon the retired generation is garbage"
+        );
+        for path in &retired {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), path);
+            assert!(
+                store
+                    .head(&object_store::path::Path::from(absolute))
+                    .await
+                    .is_err(),
+                "retired object {path} must be reclaimed"
+            );
+        }
+        let fresh = ms.load_current().await.unwrap();
+        let view = memtable.snapshot_view();
+        let snapshot = Snapshot::new(fresh, &view, store.clone(), paths.clone());
+        let hits = snapshot
+            .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+            .await
+            .unwrap()
+            .expect("the new generation must serve after the sweep");
+        assert_eq!(hits.len(), 3);
+    }
+
     #[tokio::test]
     async fn sweep_finds_no_orphans_when_manifest_references_everything() {
         let store = make_store();
