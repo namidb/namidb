@@ -1539,6 +1539,7 @@ async fn cypher_delete_shrinks_the_native_text_corpus() {
 /// A typoed option key (`filtre`, `Filter`) must be a hard error, never a
 /// silently unfiltered result — with a tenant filter that is a data-exposure
 /// hazard.
+#[cfg(all(feature = "vector-index", feature = "text-index"))]
 #[tokio::test]
 async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
     let writer = WriterSession::open(store(), paths("exec-unknown-proc-keys"))
@@ -1572,6 +1573,7 @@ async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
 /// first terms — identically on the flat overlay route (memtable dirty),
 /// the single-base native route, and the multi-segment native route whose
 /// per-segment expansions must reconcile globally.
+#[cfg(feature = "text-index")]
 #[tokio::test]
 async fn prefix_expansion_beyond_the_cap_is_identical_on_every_route() {
     use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
