@@ -1565,3 +1565,136 @@ async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
         );
     }
 }
+
+/// Plan item 22: prefix expansion beyond the 64-term cap
+/// (`PREFIX_EXPANSION_LIMIT`) on both routes. With 100 distinct `tokNNN`
+/// terms, a `tok*` query must expand to exactly the 64 lexicographically
+/// first terms — identically on the flat overlay route (memtable dirty),
+/// the single-base native route, and the multi-segment native route whose
+/// per-segment expansions must reconcile globally.
+#[tokio::test]
+async fn prefix_expansion_beyond_the_cap_is_identical_on_every_route() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::TextIndexDescriptor;
+
+    let mut writer = WriterSession::open(store(), paths("bm25-prefix-cap"))
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+        })
+        .unwrap()
+        .build();
+
+    let doc = |token: &str| {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "body".to_string(),
+            namidb_core::Value::Str(format!("{token} filler")),
+        );
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    };
+    // 100 distinct terms, one document each: tok000 .. tok099.
+    for ordinal in 0..100 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("tok{ordinal:03}")))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let cypher = "CALL search.bm25({label: 'Note', text_properties: ['body'], \
+                  query: 'tok*'}) YIELD node, score RETURN node";
+    let bodies = |rows: &[namidb_query::Row]| -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|row| match row.get("node") {
+                Some(RuntimeValue::Node(node)) => match node.properties.get("body") {
+                    Some(RuntimeValue::String(text)) => {
+                        text.split_whitespace().next().unwrap().to_string()
+                    }
+                    other => panic!("body must hydrate: {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let expected: Vec<String> = (0..64).map(|o| format!("tok{o:03}")).collect();
+
+    // 1. Flat overlay route (nothing flushed yet).
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "the flat route must expand to exactly the 64 lexicographically \
+         first terms"
+    );
+
+    // 2. Single-base native route.
+    writer.flush(schema.clone()).await.unwrap();
+    writer.compact_l0(&schema).await.unwrap();
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(bodies(&rows), expected, "single-base native route parity");
+
+    // 3. Multi-segment native route: a second flush adds tok100..tok119
+    // (all lexicographically AFTER the cap) as a delta segment. The global
+    // expansion must still settle on the same first 64.
+    for ordinal in 100..120 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("tok{ordinal:03}")))
+            .unwrap();
+    }
+    writer.flush(schema.clone()).await.unwrap();
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "multi-segment global expansion must reconcile to the same 64 terms"
+    );
+
+    // 4. And a delta whose terms sort BEFORE the whole existing vocabulary
+    // must displace the tail of the expansion set.
+    for ordinal in 0..4 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("aaa{ordinal:03}")))
+            .unwrap();
+    }
+    writer.flush(schema.clone()).await.unwrap();
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', \
+        text_properties: ['body'], query: 'tok*'}) YIELD node, score RETURN node",
+    )
+    .await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "an unrelated-prefix delta must not disturb the tok* expansion"
+    );
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', \
+        text_properties: ['body'], query: 'a*'}) YIELD node, score RETURN node",
+    )
+    .await;
+    let expected_a: Vec<String> = (0..4).map(|o| format!("aaa{o:03}")).collect();
+    assert_eq!(
+        bodies(&rows),
+        expected_a,
+        "a prefix under the cap returns every matching term"
+    );
+}

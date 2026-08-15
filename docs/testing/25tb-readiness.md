@@ -145,7 +145,9 @@ Either reject in plan/lower.rs (like shortestPath validation) with an exec_match
 
 **Resolution (2026-08-15):** implemented the correct list binding instead: a starred alias accumulates the path's relationships per step and binds `List` on emission (empty list on the `*0..n` hop-0 row); the unstarred fixed form keeps its scalar. The factor expand route delegates starred-alias patterns to the flat executor (same pattern as path bindings) since its arena slots would resolve to the last hop. Pinned by `exec_match_expand.rs::var_length_alias_binds_the_relationship_list`.
 
-### 22. [high] Prefix expansion beyond the 64-term cap untested on both flat (displaces_last lexicographic loop) and native (global expansion under-fill/overflow branches) — silently wrong ranking for every wildcard query over a 25 TB vocabulary. [Report 2.]
+### 22. [DONE] Prefix expansion beyond the 64-term cap untested on both flat (displaces_last lexicographic loop) and native (global expansion under-fill/overflow branches) — silently wrong ranking for every wildcard query over a 25 TB vocabulary. [Report 2.]
+
+**Resolution (2026-08-15):** `exec_call.rs::prefix_expansion_beyond_the_cap_is_identical_on_every_route`: 100 distinct terms under one prefix expand to exactly the 64 lexicographically first on the flat overlay route, the single-base native route, AND the multi-segment native route (global reconciliation); a delta whose terms sort after the cap does not disturb the set, an unrelated-prefix delta neither, and an under-cap prefix returns every match. Passed first run.
 
 crates/namidb-query/tests/exec_call.rs parity test: >64 distinct terms sharing one prefix split across two FT4 segments with overlapping vocabularies; assert index/flat rank+score parity and identical lexicographically-first-64 selection; storage-level assert the overlap-underfill branch returns None (flat authority) rather than an under-filled expansion.
 
