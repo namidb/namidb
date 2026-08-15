@@ -909,6 +909,48 @@ mod indexed_sparse_filter {
         );
     }
 
+    /// The group-refusal twin: with `tenant` NOT schema-indexed the
+    /// coordinator refuses the postings-level filter route. Refusal must
+    /// downgrade to the plain native route with the equality applied
+    /// residually — not surrender the whole query to the flat scorer, which
+    /// pins no barrier and pays O(corpus) on every call.
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_unindexed_group_retries_plain_native_route() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(16);
+        docs.push((
+            "target".into(),
+            "acme".into(),
+            "alpha w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, ids, probe) =
+            indexed_corpus_with("hybrid-ft-refused-group", &borrowed, false).await;
+
+        let initial = authoritative_hits(&writer, "alpha", 8).await;
+        assert!(
+            initial.iter().all(|(id, _)| *id != ids["target"]),
+            "the matching tenant must sit beyond the unfiltered top-8"
+        );
+
+        let before = probe.barrier_pins();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            vec![],
+        )
+        .await;
+        assert_eq!(titles(&rows), vec!["target".to_string()]);
+        assert!(
+            probe.barrier_pins() - before >= 2,
+            "a refused filter group must retry the plain native route (one \
+             pin per widening round); a flat-scan surrender pins nothing"
+        );
+    }
+
     #[tokio::test]
     async fn hybrid_filtered_bm25_stale_ft_falls_back_to_fresh_corpus() {
         let _cap = CapEnvGuard::set(64);

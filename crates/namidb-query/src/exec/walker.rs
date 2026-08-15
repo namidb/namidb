@@ -2481,14 +2481,11 @@ async fn bm25_ranked_filtered(
                 .min(candidate_cap);
             let mut processed_prefix = 0usize;
             let mut survivors = Vec::with_capacity(query_initial_capacity(target, candidate_cap));
+            let mut use_groups = !native_groups.is_empty();
 
             loop {
-                let hits = if native_groups.is_empty() {
-                    snapshot
-                        .text_search(&index_name, label, &parsed, Some(fetch))
-                        .await?
-                } else {
-                    snapshot
+                let hits = if use_groups {
+                    match snapshot
                         .text_search_filter_groups(
                             &index_name,
                             label,
@@ -2496,6 +2493,26 @@ async fn bm25_ranked_filtered(
                             Some(fetch),
                             native_groups,
                         )
+                        .await?
+                    {
+                        // Group refusal is decided from index metadata, so it
+                        // can only happen before anything served. The plain
+                        // route stays authoritative for the unfiltered top-k
+                        // and the residual predicate re-checks every group
+                        // equality, so retry natively before surrendering the
+                        // whole query to the flat scorer (mirrors the vector
+                        // leg's `native_groups_supported` downgrade).
+                        None if processed_prefix == 0 => {
+                            use_groups = false;
+                            snapshot
+                                .text_search(&index_name, label, &parsed, Some(fetch))
+                                .await?
+                        }
+                        refused_or_served => refused_or_served,
+                    }
+                } else {
+                    snapshot
+                        .text_search(&index_name, label, &parsed, Some(fetch))
                         .await?
                 };
                 let Some(hits) = hits else {
