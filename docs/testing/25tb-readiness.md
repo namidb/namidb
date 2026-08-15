@@ -205,7 +205,9 @@ crates/namidb-storage/src/janitor.rs: (1) sweep_finds_no_orphans_with_active_sea
 
 crates/namidb-server/tests/memory_ceiling.rs: AppState with a tiny explicit ceiling + a test hook feeding real RSS; drive concurrent Cypher to rejection; assert 503 body then recovery. Docker workflow smoke step: container under --memory with NAMIDB_MEMORY_MAX_BYTES=auto asserts startup succeeds (and fails without a limit).
 
-### 33. [high] All S3/R2 behaviors (multipart of spooled artifacts, ranged GETs, CAS beyond manifest bootstrap, retry/backoff, TLS) tested only against InMemory; the lone LocalStack test covers manifest CAS and runs nowhere. [Report 5.]
+### 33. [MOSTLY DONE — real-provider runbook remains] All S3/R2 behaviors (multipart of spooled artifacts, ranged GETs, CAS beyond manifest bootstrap, retry/backoff, TLS) tested only against InMemory; the lone LocalStack test covers manifest CAS and runs nowhere. [Report 5.]
+
+**Resolution (2026-08-15):** `s3_integration.rs` gained `full_cycle_ingest_search_backup_against_s3` — ingest with vector+text indexes, flush, compact, reader-node native serving of both routes, a VERIFIED backup to a sibling prefix that serves too, and an orphan sweep, all against LocalStack S3 with real conditional writes. Validated locally against a live LocalStack (2/2 green) and wired into `nightly.yml` as the `s3-localstack` job with a health-checked service container. Real-provider behaviors (R2 WAN latency, TLS, retry) remain covered by the pre-load runbook §1-2.
 
 Extend tests/s3_integration.rs with an #[ignore] full cycle (ingest → flush with an object exceeding one multipart part → compact building .vg/.ft → native search via ranged reads → backup to second prefix → restore + re-query); add a CI job starting tests/docker-compose.s3.yml and running cargo test --test s3_integration -- --ignored. TLS/WAN stays in the pre-load runbook against the customer's real bucket.
 
