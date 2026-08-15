@@ -141,7 +141,9 @@ Either reject in plan/lower.rs (like shortestPath validation) with an exec_match
 
 crates/namidb-query/tests/exec_call.rs parity test: >64 distinct terms sharing one prefix split across two FT4 segments with overlapping vocabularies; assert index/flat rank+score parity and identical lexicographically-first-64 selection; storage-level assert the overlap-underfill branch returns None (flat authority) rather than an under-filled expansion.
 
-### 23. [high] Empty/edge search inputs untested at the procedure layer across text and vector: query ''/whitespace/'*', k=0, k omitted (unbounded incl. SearchResultLimitExceeded guard), empty/unknown label, LIMIT 0 on KNN. [Merges Report 2 high + Report 1 medium k-edges.]
+### 23. [DONE] Empty/edge search inputs untested at the procedure layer across text and vector: query ''/whitespace/'*', k=0, k omitted (unbounded incl. SearchResultLimitExceeded guard), empty/unknown label, LIMIT 0 on KNN. [Merges Report 2 high + Report 1 medium k-edges.]
+
+**Resolution (2026-08-15):** `exec_search_input_edges.rs` pins empty/whitespace bm25 queries (zero rows, no error), k:0 on both procedures, omitted-k bounded default, LIMIT 0, unknown label (clean empty/clean error, never a panic). All passed first run — fixation, not fixes.
 
 crates/namidb-query/tests/exec_call.rs + exec_vector_knn.rs table-driven: each edge input asserted for zero-rows-no-error (or the typed limit error with env-shrunk cap) on BOTH a memtable-only corpus and an indexed one; LIMIT 0 KNN asserts VectorSearch still in the plan.
 
@@ -149,7 +151,9 @@ crates/namidb-query/tests/exec_call.rs + exec_vector_knn.rs table-driven: each e
 
 crates/namidb-query/tests/exec_vector_knn.rs: build a legacy v3 .vg manifest (reuse the wire fixture from sst/vector.rs::real_v3_wire_body_decodes_and_leaves_filter_residual) plus equality sidecar; assert (a) filtered search.vector equals exact filtered top-k, (b) empty sidecar set → [] without touching the .vg, (c) NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP=1 degrades to exact flat fallback with identical results.
 
-### 25. [high] Non-cosine metrics untested on procedure forms: queryNodes never run against dot/euclidean descriptors; search.vector metric:'dot'|'euclidean'|'l2' options and unknown-metric error untested (Cypher forms are covered). [Report 1.]
+### 25. [DONE] Non-cosine metrics untested on procedure forms: queryNodes never run against dot/euclidean descriptors; search.vector metric:'dot'|'euclidean'|'l2' options and unknown-metric error untested (Cypher forms are covered). [Report 1.]
+
+**Resolution (2026-08-15):** same file: dot ranks by inner product (magnitude wins), euclidean/l2 by distance, unknown metric errors naming the contract, and db.index.vector.queryNodes serves a Dot-metric descriptor correctly.
 
 crates/namidb-query/tests/exec_vector_knn.rs: build_index_metric with Dot and Euclidean; queryNodes matches brute force with correct orientation; search.vector metric:'euclidean' ranks ascending-distance; 'l2' alias accepted; 'chebyshev' errors with documented message.
 
