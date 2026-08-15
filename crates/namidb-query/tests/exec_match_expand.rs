@@ -2764,3 +2764,73 @@ async fn parameterized_var_length_bound() {
         "depth=4 reaches all downstream nodes"
     );
 }
+
+/// openCypher: a variable-length relationship alias binds the LIST of
+/// traversed relationships, in order — never a single hop. The zero-length
+/// row of a `*0..n` pattern binds the empty list.
+#[tokio::test]
+async fn var_length_alias_binds_the_relationship_list() {
+    let mut writer = WriterSession::open(store(), paths("exec-varlen-rel-list"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let q = parse(
+        "MATCH (a:Person {name: 'Alice'})-[rs:KNOWS*1..2]->(b:Person) \
+         RETURN rs, b.name AS b",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+
+    let mut shape: Vec<(String, usize)> = rows
+        .iter()
+        .map(|row| {
+            let hops = match row.get("rs") {
+                Some(RuntimeValue::List(rels)) => {
+                    assert!(
+                        rels.iter().all(|rel| matches!(rel, RuntimeValue::Rel(_))),
+                        "every list element must be a relationship, got {rels:?}"
+                    );
+                    rels.len()
+                }
+                other => panic!("rs must bind a relationship list, got {other:?}"),
+            };
+            let name = match row.get("b") {
+                Some(RuntimeValue::String(name)) => name.clone(),
+                other => panic!("unexpected: {other:?}"),
+            };
+            (name, hops)
+        })
+        .collect();
+    shape.sort();
+    assert_eq!(
+        shape,
+        vec![
+            ("Bob".to_string(), 1),
+            ("Carol".to_string(), 1),
+            ("Carol".to_string(), 2),
+            ("Dave".to_string(), 2),
+        ],
+        "list length must equal the traversed hop count per path"
+    );
+
+    let q = parse(
+        "MATCH (a:Person {name: 'Alice'})-[rs:KNOWS*0..1]->(x:Person) \
+         RETURN rs, x.name AS x",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let zero_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| matches!(row.get("x"), Some(RuntimeValue::String(name)) if name == "Alice"))
+        .collect();
+    assert_eq!(zero_rows.len(), 1, "the hop-0 row binds the source itself");
+    assert!(
+        matches!(zero_rows[0].get("rs"), Some(RuntimeValue::List(rels)) if rels.is_empty()),
+        "the zero-length path binds the EMPTY list, got {:?}",
+        zero_rows[0].get("rs")
+    );
+}

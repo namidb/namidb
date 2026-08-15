@@ -1535,3 +1535,33 @@ async fn cypher_delete_shrinks_the_native_text_corpus() {
         .expect("surviving corpus must serve natively");
     assert_eq!(hits.len(), 3, "the three survivors keep matching");
 }
+
+/// A typoed option key (`filtre`, `Filter`) must be a hard error, never a
+/// silently unfiltered result — with a tenant filter that is a data-exposure
+/// hazard.
+#[tokio::test]
+async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
+    let writer = WriterSession::open(store(), paths("exec-unknown-proc-keys"))
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+
+    for query in [
+        "CALL search.vector({ label: 'Doc', property: 'embedding', \
+          query: [0.1, 0.2], filtre: { tenant: 'acme' } }) YIELD node RETURN node",
+        "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+          text_property: 'body', Filter: { tenant: 'acme' } }) \
+          YIELD node RETURN node",
+    ] {
+        let parsed = parse(query).unwrap();
+        let plan = lower(&parsed).unwrap();
+        let error = execute(&plan, &snapshot, &Params::new())
+            .await
+            .expect_err("an unknown option key must fail the call");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("does not recognise the option"),
+            "error must name the rejected key, got: {message}"
+        );
+    }
+}

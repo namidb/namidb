@@ -107,7 +107,9 @@ crates/namidb-storage/src/read.rs tests: build a multi-MB edge SST (many edge ty
 
 crates/namidb-query/tests/exec_vector_knn.rs: after build_index + a post-compaction flush producing a VG6 delta, assert select_search_read_plan(...) is ActiveSegments (or prove the VG6 segment object is read via a GET-counting ObjectStore probe like exec_hybrid_search's TextGetProbe). On that pinned state assert update/delete/filter/k>live-count semantics through both Cypher KNN and search.vector. Separately: rewrite compaction_builds_a_searchable_vector_graph (and its twin) to the multi-segment model using NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION under the env mutex.
 
-### 16. [high] Unknown keys in search.vector/search.hybrid single-map args are silently ignored (proc_single_map, walker.rs:2968): a typoed 'filtre'/'Filter' returns UNFILTERED results — a data-exposure/correctness hazard, not a convenience. [Report 1.]
+### 16. [DONE] Unknown keys in search.vector/search.hybrid single-map args are silently ignored (proc_single_map, walker.rs:2968): a typoed 'filtre'/'Filter' returns UNFILTERED results — a data-exposure/correctness hazard, not a convenience. [Report 1.]
+
+**Resolution (2026-08-15):** `proc_single_map` takes the procedure's allowed-key list and rejects any unknown key with an error naming it and the allowed set; wired for search.vector (7 keys) and search.hybrid (15 keys). Pinned by `exec_call.rs::unknown_procedure_map_keys_error_instead_of_running_unfiltered`.
 
 Implement key validation, then in crates/namidb-query/tests/exec_hybrid_search.rs assert CALL search.vector({label…, query…, filtre:{…}}) errors with an unknown-option message listing valid keys; same for search.hybrid, search.bm25, and the queryNodes 4th map.
 
@@ -127,9 +129,11 @@ crates/namidb-storage/src/read.rs envelope test: count_edge_type over multi-SST 
 
 crates/namidb-storage/src/compact.rs edge mirror of tombstone_above_a_deeper_level_is_preserved_then_gcd_at_the_deepest: edge upsert at L2, tombstone at L0; shallow merge asserts tombstone_count>0 in BOTH fwd and inv SSTs; deepest merge asserts 0 and out_edges/in_edges both empty.
 
-### 21. [high] Var-length pattern with a relationship alias ([r:KNOWS*1..2]) silently binds only the LAST hop instead of a list (walker.rs:1546) — wrong-shape results for a query form production users will write. [Report 3.]
+### 21. [DONE] Var-length pattern with a relationship alias ([r:KNOWS*1..2]) silently binds only the LAST hop instead of a list (walker.rs:1546) — wrong-shape results for a query form production users will write. [Report 3.]
 
 Either reject in plan/lower.rs (like shortestPath validation) with an exec_match_expand.rs test asserting the error, or implement list binding and assert MATCH (a)-[rs:KNOWS*1..2]->(b) RETURN rs yields per-path relationship lists. Rejection is the fast safe fix.
+
+**Resolution (2026-08-15):** implemented the correct list binding instead: a starred alias accumulates the path's relationships per step and binds `List` on emission (empty list on the `*0..n` hop-0 row); the unstarred fixed form keeps its scalar. The factor expand route delegates starred-alias patterns to the flat executor (same pattern as path bindings) since its arena slots would resolve to the last hop. Pinned by `exec_match_expand.rs::var_length_alias_binds_the_relationship_list`.
 
 ### 22. [high] Prefix expansion beyond the 64-term cap untested on both flat (displaces_last lexicographic loop) and native (global expansion under-fill/overflow branches) — silently wrong ranking for every wildcard query over a 25 TB vocabulary. [Report 2.]
 

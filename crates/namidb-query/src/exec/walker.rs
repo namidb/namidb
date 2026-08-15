@@ -1257,6 +1257,10 @@ pub(crate) async fn execute_expand(
     let edge_types = resolve_edge_types(snapshot, edge_type);
     let min = length.as_ref().map(|l| l.min).unwrap_or(1);
     let max = clamp_hop_max(length.as_ref().map(|l| l.max).unwrap_or(1));
+    // openCypher: an alias on a variable-length pattern (`[r:KNOWS*1..2]`,
+    // any starred range — `*1..1` included) binds the LIST of traversed
+    // relationships; only the unstarred fixed form binds a scalar.
+    let bind_rel_list = length.is_some();
 
     let mut out = Vec::new();
     for row in rows {
@@ -1325,8 +1329,9 @@ pub(crate) async fn execute_expand(
                 }
             }
             if let Some(name) = rel_alias {
-                // No edge traversed at hop 0 → rel binding is NULL.
-                zero_row.set(name, RuntimeValue::Null);
+                // No edge traversed at hop 0 → the alias is the empty list
+                // (openCypher: a variable-length alias is always a list).
+                zero_row.set(name, RuntimeValue::List(Vec::new()));
             }
             // At hop 0 the source node IS the far end, so the pattern's target
             // labels constrain it: `(a)-[:R*0..n]->(x:Label)` may bind the
@@ -1371,6 +1376,7 @@ pub(crate) async fn execute_expand(
                 row: row.clone(),
                 trail: initial_trail,
                 rels: Vec::new(),
+                rel_values: Vec::new(),
             }]
         } else {
             Vec::new()
@@ -1543,7 +1549,14 @@ pub(crate) async fn execute_expand(
                     };
                     let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge)));
                     let mut new_row = step.row.clone();
-                    if let Some(name) = rel_alias {
+                    let mut new_rel_values = step.rel_values.clone();
+                    if bind_rel_list {
+                        if rel_alias.is_some() {
+                            new_rel_values.push(rel_value.clone());
+                        }
+                    } else if let Some(name) = rel_alias {
+                        // A fixed single relationship (`[r:KNOWS]`, no `*`)
+                        // binds the scalar relationship.
                         new_row.set(name, rel_value.clone());
                     }
                     // For shortestPath trail materialisation we need a
@@ -1607,6 +1620,7 @@ pub(crate) async fn execute_expand(
                         row: new_row.clone(),
                         trail: new_trail.clone(),
                         rels: new_rels,
+                        rel_values: new_rel_values.clone(),
                     });
                     if hop >= min.max(1) {
                         let keeps = bound_target_matches_labels
@@ -1617,6 +1631,14 @@ pub(crate) async fn execute_expand(
                             };
                         if keeps {
                             let mut hit_row = new_row;
+                            if bind_rel_list {
+                                if let Some(name) = rel_alias {
+                                    hit_row.set(
+                                        name.to_string(),
+                                        RuntimeValue::List(new_rel_values.clone()),
+                                    );
+                                }
+                            }
                             if let Some(name) = path_binding {
                                 hit_row.set(name.to_string(), RuntimeValue::Path(new_trail));
                             }
@@ -1688,6 +1710,11 @@ struct Step {
     /// populated for multi-hop expansions (`max > 1`); left empty on the
     /// single-hop hot path, where reuse is impossible.
     rels: Vec<(String, NodeId, NodeId)>,
+    /// The path's relationship values in traversal order. openCypher binds a
+    /// variable-length alias (`[r:KNOWS*1..2]`) to the LIST of traversed
+    /// relationships, never to one hop. Populated only when the pattern
+    /// declares an alias.
+    rel_values: Vec<RuntimeValue>,
 }
 
 /// Flat (no-index) top-k vector search over `label`'s `property` embeddings
@@ -2986,18 +3013,33 @@ fn proc_single_map(
     args: &[Expression],
     params: &Params,
     proc: &str,
+    allowed_keys: &[&str],
 ) -> Result<std::collections::BTreeMap<String, RuntimeValue>, ExecError> {
-    match args {
+    let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
-            RuntimeValue::Map(m) => Ok(m),
-            _ => Err(proc_unsupported(format!(
-                "{proc} expects a single map argument"
-            ))),
+            RuntimeValue::Map(m) => m,
+            _ => {
+                return Err(proc_unsupported(format!(
+                    "{proc} expects a single map argument"
+                )))
+            }
         },
-        _ => Err(proc_unsupported(format!(
-            "{proc} requires one map argument"
-        ))),
+        _ => {
+            return Err(proc_unsupported(format!(
+                "{proc} requires one map argument"
+            )))
+        }
+    };
+    // A typo like `filtre` or `Filter` must not silently run UNFILTERED —
+    // that is a data-exposure hazard, not a convenience. Reject any key the
+    // procedure will not read.
+    if let Some(unknown) = map.keys().find(|key| !allowed_keys.contains(&key.as_str())) {
+        return Err(proc_unsupported(format!(
+            "{proc} does not recognise the option `{unknown}`; allowed options: {}",
+            allowed_keys.join(", ")
+        )));
     }
+    Ok(map)
 }
 
 /// A map value as an owned `String`, or `None` if it is not a string.
@@ -3568,7 +3610,12 @@ async fn vector_search_procedure(
     snapshot: &Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    let map = proc_single_map(args, params, "search.vector")?;
+    let map = proc_single_map(
+        args,
+        params,
+        "search.vector",
+        &["label", "property", "query", "k", "ef", "metric", "filter"],
+    )?;
     let label = map
         .get("label")
         .and_then(proc_str)
@@ -3789,7 +3836,28 @@ async fn hybrid_search_procedure(
 ) -> Result<Vec<Row>, ExecError> {
     use crate::exec::fusion;
 
-    let map = proc_single_map(args, params, "search.hybrid")?;
+    let map = proc_single_map(
+        args,
+        params,
+        "search.hybrid",
+        &[
+            "label",
+            "query_text",
+            "text_property",
+            "text_properties",
+            "query_vector",
+            "vector_property",
+            "k",
+            "k_dense",
+            "k_sparse",
+            "ef",
+            "fusion",
+            "rrf_k",
+            "alpha",
+            "metric",
+            "filter",
+        ],
+    )?;
     let label = map
         .get("label")
         .and_then(proc_str)
@@ -6570,10 +6638,16 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         .await?;
                 let length = resolve_length(length, params)?;
                 // The factor expand executor does not materialise a path binding
-                // (`p`) or a shortestPath trail. Route those to the flat executor
-                // (which does) and re-wrap — otherwise `p` / `nodes(p)` downstream
-                // of a factorised variable-length expand sees an unbound `p`.
-                if path_binding.is_some() || !matches!(shortest, crate::plan::ShortestMode::None) {
+                // (`p`), a shortestPath trail, or the per-path relationship
+                // LIST a starred alias binds (`[rs:KNOWS*1..2]` — its arena
+                // slots would resolve to the last hop only). Route those to
+                // the flat executor (which does) and re-wrap — otherwise `p`
+                // / `nodes(p)` / `rs` downstream of a factorised
+                // variable-length expand is unbound or wrongly scalar.
+                if path_binding.is_some()
+                    || !matches!(shortest, crate::plan::ShortestMode::None)
+                    || (length.is_some() && rel_alias.is_some())
+                {
                     let rows = input_set.materialize_all(None);
                     let out = execute_expand(
                         rows,
