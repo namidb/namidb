@@ -5668,6 +5668,64 @@ impl<'mt> Snapshot<'mt> {
     /// place of `NodeScan + Expand + Aggregate`.
     #[instrument(skip(self), fields(edge_type = edge_type))]
     pub async fn count_edge_type(&self, edge_type: &str) -> Result<u64> {
+        // Steady-state fast path (the 25 TB shape): one compacted forward
+        // SST per type. The manifest already carries exact edge and
+        // tombstone counts, and every memtable entry is newer than any
+        // flushed row (the LSM flush cut), so the count is metadata plus an
+        // O(memtable) point-lookup delta — never an O(edges) resident merge.
+        let fwd: Vec<usize> = self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::EdgesFwd, edge_type)
+            .to_vec();
+        if fwd.len() <= 1 {
+            let mut winners: BTreeMap<(NodeId, NodeId), (u64, bool)> = BTreeMap::new();
+            for (mk, entry) in self.edge_mem_entries_for_type(edge_type) {
+                let MemKey::Edge {
+                    edge_type: et,
+                    src,
+                    dst,
+                } = mk
+                else {
+                    continue;
+                };
+                if et != edge_type {
+                    continue;
+                }
+                let live = !matches!(entry.op, MemOp::Tombstone);
+                update_edge_count_winner(&mut winners, (*src, *dst), entry.lsn, live);
+            }
+            let Some(&idx) = fwd.first() else {
+                return Ok(winners.into_values().filter(|(_, live)| *live).count() as u64);
+            };
+            let desc = &self.manifest.manifest.ssts[idx];
+            if let crate::manifest::KindSpecificStats::Edges {
+                tombstone_count, ..
+            } = &desc.kind_specific
+            {
+                let base_live = desc.row_count.saturating_sub(*tombstone_count);
+                let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+                let mut delta: i64 = 0;
+                if !winners.is_empty() {
+                    let paged = self.fetch_paged_edge_reader(&absolute).await?;
+                    for ((src, dst), (_, live)) in winners {
+                        let sst_live = paged
+                            .lookup_partner(src.as_bytes(), dst.as_bytes())
+                            .await?
+                            .map(|row| !row.tombstone)
+                            .unwrap_or(false);
+                        match (live, sst_live) {
+                            (true, false) => delta += 1,
+                            (false, true) => delta -= 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let total = base_live as i64 + delta;
+                return Ok(u64::try_from(total.max(0)).unwrap_or(0));
+            }
+        }
+
         // (src, dst) -> (winning_lsn, is_live). Mirrors scan_edge_type's
         // merge exactly, minus the EdgeView materialisation.
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, bool)> = BTreeMap::new();
@@ -11571,6 +11629,125 @@ mod tests {
                 "sorted_partners (csr={use_csr}) must reflect the staged upsert and tombstone"
             );
         }
+    }
+
+    /// The metadata fast path (single compacted SST + memtable delta) and
+    /// the multi-SST merge fallback must agree on the same logical graph.
+    /// The overlay exercises every delta class: a new live edge (+1), a
+    /// tombstone of a flushed edge (-1), a re-upsert of a flushed edge (0)
+    /// and a tombstone of a never-flushed edge (0).
+    #[tokio::test]
+    async fn count_edge_type_fast_path_matches_the_multi_sst_merge() {
+        let schema = SchemaBuilder::new()
+            .label(person_label())
+            .unwrap()
+            .edge_type(knows_edge())
+            .unwrap()
+            .build();
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+        let eve = sorted_node_id(5);
+
+        let flushed_edges: [(NodeId, u64); 3] = [(bob, 10), (dave, 11), (eve, 12)];
+        let mut counts = Vec::new();
+        for split in [false, true] {
+            let store = make_store();
+            let paths = make_paths(if split {
+                "read-edges-count-split"
+            } else {
+                "read-edges-count-single"
+            });
+            let ms = ManifestStore::new(store.clone(), paths.clone());
+            let mut current = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+            let fence = WriterFence::new(current.manifest.epoch);
+            let chunks: Vec<&[(NodeId, u64)]> = if split {
+                vec![&flushed_edges[..1], &flushed_edges[1..]]
+            } else {
+                vec![&flushed_edges[..]]
+            };
+            for chunk in chunks {
+                let mut mt = Memtable::new();
+                for (dst, lsn) in chunk {
+                    mt.apply(
+                        MemKey::Edge {
+                            edge_type: "KNOWS".into(),
+                            src: alice,
+                            dst: *dst,
+                        },
+                        *lsn,
+                        MemOp::Upsert(edge_payload()),
+                    );
+                }
+                current = flush(&ms, &fence, &current, &mt.freeze(), schema.clone())
+                    .await
+                    .unwrap()
+                    .committed;
+            }
+            let sst_count = current
+                .manifest
+                .ssts
+                .iter()
+                .filter(|d| d.kind == SstKind::EdgesFwd)
+                .count();
+            assert_eq!(sst_count, if split { 2 } else { 1 });
+
+            let mut live = Memtable::new();
+            // +1: brand-new live edge.
+            live.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst: carol,
+                },
+                20,
+                MemOp::Upsert(edge_payload()),
+            );
+            // -1: tombstone of a flushed edge.
+            live.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst: bob,
+                },
+                21,
+                MemOp::Tombstone,
+            );
+            // 0: re-upsert of a flushed live edge.
+            live.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: alice,
+                    dst: dave,
+                },
+                22,
+                MemOp::Upsert(edge_payload()),
+            );
+            // 0: tombstone of an edge that never existed.
+            live.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src: bob,
+                    dst: carol,
+                },
+                23,
+                MemOp::Tombstone,
+            );
+            let view = live.snapshot_view();
+            let snapshot = Snapshot::new(current.clone(), &view, store.clone(), paths.clone());
+            let count = snapshot.count_edge_type("KNOWS").await.unwrap();
+            let scanned = snapshot.scan_edge_type("KNOWS").await.unwrap();
+            assert_eq!(
+                count,
+                scanned.len() as u64,
+                "count must equal the merged scan (split={split})"
+            );
+            counts.push(count);
+        }
+        assert_eq!(counts[0], counts[1], "fast path and fallback must agree");
+        // eve + dave (re-upsert) + carol survive; bob tombstoned: 3 live.
+        assert_eq!(counts[0], 3);
     }
 
     #[tokio::test]

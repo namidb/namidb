@@ -121,7 +121,9 @@ New crates/namidb-query/tests/exec_pagination.rs: seed ~50 nodes; page via pagin
 
 crates/namidb-query/tests/exec_match_expand.rs: flush a 10k+ out-degree hub with some partners tombstoned and some memtable-fresh; assert MATCH (hub)-[:R]->(x) RETURN count(x), a 2-hop var-length through the hub, and an aggregate each match computed expectations.
 
-### 19. [high] count_edge_type/scan_edge_type materialize a BTreeMap over every (src,dst) of the type (read.rs:5548-5692) — O(edges) RAM behind count(r) pushdown and every algo.* graph build; at 25 TB a single CALL algo.wcc() is O(corpus)-resident. [Report 3.]
+### 19. [MOSTLY DONE — scan_edge_type residual] count_edge_type/scan_edge_type materialize a BTreeMap over every (src,dst) of the type (read.rs:5548-5692) — O(edges) RAM behind count(r) pushdown and every algo.* graph build; at 25 TB a single CALL algo.wcc() is O(corpus)-resident. [Report 3.]
+
+**Resolution (2026-08-15), count half:** `count_edge_type` now takes a metadata fast path whenever the type has at most one forward SST (the compacted steady state): live = `row_count - tombstone_count` from the manifest stats plus an O(memtable) delta resolved by paged point lookups (every memtable entry outranks flushed rows by the LSM flush cut). Zero body bytes with an empty memtable. Multi-SST trees keep the exact merge fallback. Pinned by `count_edge_type_fast_path_matches_the_multi_sst_merge` (same logical graph built 1-flush and 2-flush; all four delta classes; count == merged scan on both). **Residual:** `scan_edge_type` still materialises the full map — it feeds `algo.*` graph builds, which need a streaming adjacency source design, tracked with the CSR/optimization backlog.
 
 crates/namidb-storage/src/read.rs envelope test: count_edge_type over multi-SST disjoint edge streams asserting a peak-resident bound (no per-pair map when SSTs are disjoint); plus a documented size gate for algo.* graph builds beyond a threshold. Like rank 14, expect an engineering fix before the test passes.
 
