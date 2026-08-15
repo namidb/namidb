@@ -1591,4 +1591,172 @@ mod indexed {
             "write path must reject a NaN embedding: {error}"
         );
     }
+
+    /// Plan item 15: the ActiveSegments route is never ASSERTED at the query
+    /// layer — result-parity tests pass identically on the flat fallback (the
+    /// documented reachability trap). Every `search_lsm_read` coordinator
+    /// invocation HEADs its `.slb` barrier exactly once and the flat scan pins
+    /// nothing, so barrier pins are a query-observable witness of the native
+    /// route.
+    mod active_route_witness {
+        use super::*;
+        use object_store::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct BarrierPinProbe {
+            inner: Arc<dyn ObjectStore>,
+            barrier_pins: AtomicUsize,
+        }
+
+        impl BarrierPinProbe {
+            fn new() -> Self {
+                Self {
+                    inner: Arc::new(InMemory::new()),
+                    barrier_pins: AtomicUsize::new(0),
+                }
+            }
+            fn barrier_pins(&self) -> usize {
+                self.barrier_pins.load(Ordering::SeqCst)
+            }
+        }
+
+        impl std::fmt::Display for BarrierPinProbe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "BarrierPinProbe({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for BarrierPinProbe {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if options.head && location.as_ref().ends_with(".slb") {
+                    self.barrier_pins.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.get_opts(location, options).await
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<
+                    'static,
+                    object_store::Result<object_store::path::Path>,
+                >,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+            {
+                self.inner.delete_stream(locations)
+            }
+        }
+
+        #[tokio::test]
+        async fn cypher_knn_pins_the_active_generation_and_dirty_writes_unpin_it() {
+            let probe = Arc::new(BarrierPinProbe::new());
+            let store: Arc<dyn ObjectStore> = probe.clone();
+            let mut w = WriterSession::open(store, paths("knn-active-witness"))
+                .await
+                .unwrap();
+            w.register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim: DIM,
+                    metric: VectorMetric::Cosine,
+                    r: 32,
+                    l_build: 64,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            for (title, kind, emb) in [
+                ("target", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("near", "kind-a", vec![0.9, 0.1, 0.0, 0.0]),
+                ("far", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+            ] {
+                w.upsert_node("Doc", NodeId::new(), &rec(title, kind, emb))
+                    .unwrap();
+            }
+            w.flush(schema()).await.unwrap();
+            w.compact_l0(&schema()).await.unwrap();
+
+            let knn = "CALL search.vector({label: 'Doc', property: 'embedding', \
+                   query: $q, k: 2}) YIELD node, score \
+                   RETURN node.title AS title, score";
+            let probe_vec = vec![1.0, 0.0, 0.0, 0.0];
+
+            let before = probe.barrier_pins();
+            let rows = run(&w, knn, probe_vec.clone()).await;
+            assert_eq!(
+                titles(&rows),
+                vec!["target".to_string(), "near".to_string()]
+            );
+            assert!(
+                probe.barrier_pins() > before,
+                "a clean snapshot must serve KNN through the ACTIVE generation \
+             (the coordinator pins its .slb); zero pins means the flat \
+             fallback answered and this test proved nothing"
+            );
+
+            // A dirty vector write flips the freshness gate. The coordinator may
+            // still pin its barrier while deciding, so the pin count is not the
+            // witness here — freshness is: the persisted index has never seen
+            // `fresh`, so only the exact overlay route can return it as top-1.
+            w.upsert_node(
+                "Doc",
+                NodeId::new(),
+                &rec("fresh", "kind-a", vec![0.0, 0.0, 0.0, 1.0]),
+            )
+            .unwrap();
+            w.commit_batch().await.unwrap();
+            let rows = run(&w, knn, vec![0.0, 0.0, 0.0, 1.0]).await;
+            assert_eq!(
+                titles(&rows)[0],
+                "fresh",
+                "a dirty memtable must serve through the freshness-exact route \
+             (the persisted index cannot know this document)"
+            );
+        }
+    }
 }
