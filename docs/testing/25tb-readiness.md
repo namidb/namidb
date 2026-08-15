@@ -113,7 +113,9 @@ crates/namidb-query/tests/exec_vector_knn.rs: after build_index + a post-compact
 
 Implement key validation, then in crates/namidb-query/tests/exec_hybrid_search.rs assert CALL search.vector({label…, query…, filtre:{…}}) errors with an unknown-option message listing valid keys; same for search.hybrid, search.bm25, and the queryNodes 4th map.
 
-### 17. [high] Keyset pagination (pagination.rs v2) has zero consumers and zero executions against data — the exact deep-pagination workload 25 TB will hit; duplicate-free/gap-free pages across flushes, deletes, and stale-cursor rejection all unproven. [Report 4.]
+### 17. [DONE] Keyset pagination (pagination.rs v2) has zero consumers and zero executions against data — the exact deep-pagination workload 25 TB will hit; duplicate-free/gap-free pages across flushes, deletes, and stale-cursor rejection all unproven. [Report 4.]
+
+**Resolution (2026-08-15):** `exec_pagination.rs` executes both cursor generations against data: v1 skip pages (10/10/5, gap-free, terminating), v2 keyset pages surviving a flush plus one already-served and one not-yet-served delete (no duplicates, the unseen delete vanishes, everything else exactly once), and the cursor wire contract (hash round-trip, doctored blobs rejected). The module remains without an in-tree server consumer — wiring it into the HTTP surface stays future product work, but its contracts are now pinned.
 
 New crates/namidb-query/tests/exec_pagination.rs: seed ~50 nodes; page via paginate_plan_keyset/next_cursor_keyset to exhaustion; assert concatenation equals the full ordered scan; repeat with a flush mid-pagination and a row deleted between pages (no dup, no gap besides the deleted row); assert plan-hash mismatch rejects a stale cursor.
 
