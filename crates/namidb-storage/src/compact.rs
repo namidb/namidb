@@ -6304,6 +6304,172 @@ mod tests {
         assert_eq!(in_bob.edges[0].src, alice);
     }
 
+    /// Edge-bucket tombstone GC at the deepest merge: an authoritative
+    /// compaction must physically drop edge tombstones from BOTH directions,
+    /// keep forward/inverse row sets mirror-consistent, and leave manifest
+    /// stats that agree (count_edge_type reads them directly).
+    #[tokio::test]
+    async fn edge_tombstone_gc_at_the_deepest_merge_drops_rows_in_both_directions() {
+        let s = store();
+        let p = paths("compact-edge-tombstone-gc");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+
+        let mut mt1 = Memtable::new();
+        for (src, dst, lsn) in [(alice, bob, 10u64), (alice, carol, 11), (bob, carol, 12)] {
+            mt1.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src,
+                    dst,
+                },
+                lsn,
+                MemOp::Upsert(edge_payload()),
+            );
+        }
+        let after1 = flush(&ms, &fence, &base, &mt1.freeze(), schema())
+            .await
+            .unwrap();
+
+        let mut mt2 = Memtable::new();
+        mt2.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        mt2.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: dave,
+            },
+            21,
+            MemOp::Upsert(edge_payload()),
+        );
+        let after2 = flush(&ms, &fence, &after1.committed, &mt2.freeze(), schema())
+            .await
+            .unwrap();
+
+        let out = compact_l0_to_l1(&ms, &fence, &after2.committed, &schema())
+            .await
+            .unwrap();
+
+        let mut fwd_pairs = Vec::new();
+        let mut inv_pairs = Vec::new();
+        for desc in &out.committed.manifest.ssts {
+            if !matches!(desc.kind, SstKind::EdgesFwd | SstKind::EdgesInv) {
+                continue;
+            }
+            let body = get_sst_body(s.as_ref(), &p, desc).await.unwrap();
+            let reader = crate::sst::edges::EdgeSstReader::open(body).unwrap();
+            let rows = reader.scan_all_edges().unwrap();
+            assert!(
+                rows.iter().all(|row| !row.tombstone),
+                "an authoritative merge must physically drop edge tombstones \
+                 ({:?})",
+                desc.kind
+            );
+            if let crate::manifest::KindSpecificStats::Edges {
+                tombstone_count, ..
+            } = &desc.kind_specific
+            {
+                assert_eq!(*tombstone_count, 0, "stats must reflect the drop");
+            } else {
+                panic!("edge SST must carry Edges stats");
+            }
+            assert_eq!(desc.row_count, 3);
+            for row in rows {
+                let pair = (row.key_id, row.partner_id);
+                match desc.kind {
+                    SstKind::EdgesFwd => fwd_pairs.push(pair),
+                    _ => inv_pairs.push((pair.1, pair.0)),
+                }
+            }
+        }
+        fwd_pairs.sort();
+        inv_pairs.sort();
+        assert_eq!(
+            fwd_pairs, inv_pairs,
+            "forward and inverse row sets must mirror after the drop"
+        );
+        assert_eq!(fwd_pairs.len(), 3);
+
+        let mt = Memtable::new();
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &view, s.clone(), p.clone());
+        let outgoing = snap.out_edges("KNOWS", alice).await.unwrap();
+        let mut dsts: Vec<NodeId> = outgoing.edges.iter().map(|edge| edge.dst).collect();
+        dsts.sort();
+        assert_eq!(dsts, vec![carol, dave], "the tombstoned edge must be gone");
+        let incoming = snap.in_edges("KNOWS", bob).await.unwrap();
+        assert!(
+            incoming.edges.is_empty(),
+            "the inverse partner of the dropped edge must be gone too"
+        );
+        assert_eq!(snap.count_edge_type("KNOWS").await.unwrap(), 3);
+    }
+
+    /// The `gc_tombstones` flag is what separates the authoritative drop
+    /// from the shadow-preserving merge: a non-authoritative merge must KEEP
+    /// the tombstone so a deeper un-merged level cannot resurrect the edge.
+    #[tokio::test]
+    async fn non_authoritative_edge_merge_preserves_tombstones() {
+        let s = store();
+        let p = paths("compact-edge-tombstone-keep");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: sorted_node_id(1),
+                dst: sorted_node_id(2),
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        let after = flush(&ms, &fence, &base, &mt.freeze(), schema())
+            .await
+            .unwrap();
+        let fwd = after
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::EdgesFwd)
+            .expect("tombstone-only flush still writes the shadow SST");
+        let body = get_sst_body(s.as_ref(), &p, fwd).await.unwrap();
+
+        for (gc, expect_edges, expect_tombs) in [(false, 1u64, 1u64), (true, 0, 0)] {
+            let merged = merge_edge_sources(
+                vec![body.clone()],
+                "KNOWS",
+                None,
+                &[],
+                crate::sst::edges::EdgeDirection::Forward,
+                gc,
+            )
+            .unwrap();
+            assert_eq!(
+                (merged.stats.edge_count, merged.stats.tombstone_count),
+                (expect_edges, expect_tombs),
+                "gc_tombstones={gc} must {} the tombstone",
+                if gc { "drop" } else { "keep" }
+            );
+        }
+    }
+
     fn knows_edge_with_declared_props() -> EdgeTypeDef {
         EdgeTypeDef {
             name: "KNOWS".into(),

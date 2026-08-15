@@ -117,7 +117,9 @@ Implement key validation, then in crates/namidb-query/tests/exec_hybrid_search.r
 
 New crates/namidb-query/tests/exec_pagination.rs: seed ~50 nodes; page via paginate_plan_keyset/next_cursor_keyset to exhaustion; assert concatenation equals the full ordered scan; repeat with a flush mid-pagination and a row deleted between pages (no dup, no gap besides the deleted row); assert plan-hash mismatch rejects a stale cursor.
 
-### 18. [high] No exec-level traversal ever crosses a flushed high-degree supernode: skew buckets and dense-block lookups are unit-tested but MATCH/Expand/var-length never touch a hub through the snapshot API. [Report 3.]
+### 18. [DONE] No exec-level traversal ever crosses a flushed high-degree supernode: skew buckets and dense-block lookups are unit-tested but MATCH/Expand/var-length never touch a hub through the snapshot API. [Report 3.]
+
+**Resolution (2026-08-15):** `exec_supernode.rs`: a flushed 2500-out/401-in hub crossed by single-hop out, inverse single-hop, directed `*2..2` through the hub, and count(r) pushdown at type scale — all exact.
 
 crates/namidb-query/tests/exec_match_expand.rs: flush a 10k+ out-degree hub with some partners tombstoned and some memtable-fresh; assert MATCH (hub)-[:R]->(x) RETURN count(x), a 2-hop var-length through the hub, and an aggregate each match computed expectations.
 
@@ -127,7 +129,9 @@ crates/namidb-query/tests/exec_match_expand.rs: flush a 10k+ out-degree hub with
 
 crates/namidb-storage/src/read.rs envelope test: count_edge_type over multi-SST disjoint edge streams asserting a peak-resident bound (no per-pair map when SSTs are disjoint); plus a documented size gate for algo.* graph builds beyond a threshold. Like rank 14, expect an engineering fix before the test passes.
 
-### 20. [high] Edge-bucket tombstone GC at the deepest merge (merge_edge_sources, compact.rs:3602) untested — every preserved-then-GC'd test is node-only; forward/inverse SST consistency after edge-tombstone drop unasserted. [Report 3.]
+### 20. [DONE] Edge-bucket tombstone GC at the deepest merge (merge_edge_sources, compact.rs:3602) untested — every preserved-then-GC'd test is node-only; forward/inverse SST consistency after edge-tombstone drop unasserted. [Report 3.]
+
+**Resolution (2026-08-15):** `edge_tombstone_gc_at_the_deepest_merge_drops_rows_in_both_directions` (authoritative compaction physically drops tombstones from both directions, forward/inverse row sets mirror, stats agree, reads and count confirm) plus `non_authoritative_edge_merge_preserves_tombstones` (the `gc_tombstones` flag keeps the shadow when a deeper level exists).
 
 crates/namidb-storage/src/compact.rs edge mirror of tombstone_above_a_deeper_level_is_preserved_then_gcd_at_the_deepest: edge upsert at L2, tombstone at L0; shallow merge asserts tombstone_count>0 in BOTH fwd and inv SSTs; deepest merge asserts 0 and out_edges/in_edges both empty.
 
