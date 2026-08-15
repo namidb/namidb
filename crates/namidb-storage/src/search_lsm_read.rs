@@ -2538,6 +2538,156 @@ mod tests {
             .is_none());
     }
 
+    /// Plan item 4 (25 TB readiness): the bounded over-fetch loop must widen
+    /// when reconciliation supersedes an entire first batch. An update-heavy
+    /// corpus routinely produces segments whose top-scoring candidates are
+    /// all stale; returning a silent short page instead of refilling is the
+    /// regression this pins.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn refill_loop_widens_past_a_fully_superseded_first_batch() {
+        use crate::manifest::{LoadedManifest, Manifest, ManifestPointer, TextIndexDescriptor};
+        use crate::search_lsm::{
+            encode_search_barrier, search_barrier_descriptor, text_lsm_catalog_signature,
+            SearchEventRange, SearchLsmStatus,
+        };
+        use crate::sst::text::v4::{
+            build_delta_v4, TextV4BuildContext, TextV4BuildOptions, TextV4Mutation,
+        };
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = crate::paths::NamespacePaths::new(
+            "tests",
+            namidb_core::NamespaceId::new("search-lsm-text-refill").unwrap(),
+        );
+        let index =
+            TextIndexDescriptor::new("law_text".into(), "Articulo".into(), vec!["texto".into()]);
+        let writer_id = Uuid::from_u128(950);
+        let mut manifest = Manifest::empty(crate::fence::Epoch::ZERO, writer_id);
+        manifest.text_indexes.push(index.clone());
+        let mut state = SearchLsmState {
+            index_name: index.name.clone(),
+            kind: SearchLsmKind::Text,
+            catalog_signature: text_lsm_catalog_signature(&manifest, &index),
+            generation_id: Uuid::from_u128(951),
+            status: SearchLsmStatus::Building,
+            ..SearchLsmState::default()
+        };
+        let id = |value| *Uuid::from_u128(value).as_bytes();
+
+        // Twelve `alpha` docs. The four shortest score highest under BM25
+        // length normalisation — exactly the over-fetch batch for k=1 — and
+        // every one of them is deleted by the second segment.
+        let mut first = Vec::new();
+        let mut doomed = Vec::new();
+        for ordinal in 0..12u128 {
+            let text = if ordinal < 4 {
+                "alpha".to_string()
+            } else if ordinal == 4 {
+                "alpha uno".to_string()
+            } else {
+                format!("alpha filler{ordinal} more words")
+            };
+            let payload = text_payload(&text, true);
+            first.push(TextV4Mutation {
+                node_id: id(ordinal + 1),
+                lsn: ordinal as u64 + 1,
+                before: None,
+                after: Some(payload.clone()),
+            });
+            if ordinal < 4 {
+                doomed.push((ordinal, payload));
+            }
+        }
+        let second = doomed
+            .into_iter()
+            .map(|(ordinal, payload)| TextV4Mutation {
+                node_id: id(ordinal + 1),
+                lsn: 20 + ordinal as u64,
+                before: Some(payload),
+                after: None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut segments = Vec::new();
+        let mut descriptors = Vec::new();
+        for (ordinal, mutations) in [first, second].into_iter().enumerate() {
+            let sst_id = Uuid::from_u128(960 + ordinal as u128);
+            let artifact = build_delta_v4(
+                &state,
+                TextV4BuildContext {
+                    sst_id,
+                    event_ranges: vec![SearchEventRange::new(ordinal as u64, ordinal as u64 + 1)],
+                    complete_filter_properties: vec!["vigente".into()],
+                },
+                mutations,
+                TextV4BuildOptions {
+                    postings_per_block: 2,
+                    terms_per_dictionary_block: 2,
+                    compression_level: 1,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let relative = format!("sst/L0/{sst_id}.ft");
+            put_relative(&store, &paths, &relative, artifact.body.clone()).await;
+            descriptors.push(text_search_descriptor(
+                &artifact.output.segment,
+                relative,
+                artifact.body.len() as u64,
+                &index.name,
+            ));
+            segments.push(artifact.output.segment);
+        }
+        let barrier_id = Uuid::from_u128(999);
+        state.status = SearchLsmStatus::Active;
+        state.next_event_seq = segments.len() as u64;
+        state.segments = segments;
+        state.compat_barrier_sst_id = Some(barrier_id);
+        let barrier = encode_search_barrier(&state).unwrap();
+        let barrier_path = format!("sst/L0/{barrier_id}.slb");
+        put_relative(&store, &paths, &barrier_path, barrier.clone()).await;
+        descriptors.push(search_barrier_descriptor(
+            &state,
+            barrier_id,
+            crate::manifest::SstLevel(0),
+            barrier_path,
+            barrier.len() as u64,
+        ));
+        manifest.ssts = descriptors;
+        manifest.search_lsm.push(state);
+        let pointer = ManifestPointer {
+            version: manifest.version,
+            epoch: manifest.epoch,
+            manifest_path: "manifest/v0.json".into(),
+        };
+        let loaded = LoadedManifest::new(pointer, None, None, manifest);
+
+        let memtable = crate::memtable::Memtable::new();
+        let view = memtable.snapshot_view();
+        let snapshot = Snapshot::new(loaded, &view, store, paths);
+        let hits = snapshot
+            .text_search(
+                "law_text",
+                "Articulo",
+                &crate::text::parse_query("alpha"),
+                Some(1),
+            )
+            .await
+            .unwrap()
+            .expect("the generation must serve, not fall back");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a fully superseded first batch must refill, not return short"
+        );
+        assert_eq!(
+            hits[0].0 .0,
+            Uuid::from_u128(5),
+            "the top surviving document must win after the refill"
+        );
+    }
+
     #[cfg(feature = "text-index")]
     #[tokio::test]
     async fn three_ft4_segments_use_global_stats_winners_prefix_and_native_filter() {
