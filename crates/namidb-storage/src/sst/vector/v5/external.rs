@@ -452,9 +452,10 @@ fn new_named_spool(directory: &Path) -> Result<NamedTempFile, Error> {
         .map_err(Error::from)
 }
 
-fn encode_filters(
-    filters: &BTreeMap<String, Value>,
-) -> Result<(Vec<(String, String)>, Vec<String>), Error> {
+/// Encoded `(property, token)` filter pairs plus the property names alone.
+type EncodedFilters = (Vec<(String, String)>, Vec<String>);
+
+fn encode_filters(filters: &BTreeMap<String, Value>) -> Result<EncodedFilters, Error> {
     if filters.len() > MAX_FILTERS_PER_ROW {
         return Err(Error::invariant("vector v5 row has too many filters"));
     }
@@ -780,6 +781,10 @@ impl Partition {
     }
 }
 
+/// `(root_partition, min_node_id, max_node_id, max_record_wire_bytes)` of the
+/// spooled corpus, or `None` when the spool holds no rows.
+type SpooledPartition = (Partition, [u8; 16], [u8; 16], usize);
+
 fn prepare_root_partition(
     source: &mut NamedTempFile,
     scratch_dir: &Path,
@@ -787,7 +792,7 @@ fn prepare_root_partition(
     metric: VectorMetric,
     memory_budget: usize,
     metrics: &mut VectorV5ExternalBuildMetrics,
-) -> Result<Option<(Partition, [u8; 16], [u8; 16], usize)>, Error> {
+) -> Result<Option<SpooledPartition>, Error> {
     validate_spool_header(source.as_file_mut(), dim)?;
     let mut root = Partition::create(scratch_dir, dim)?;
     metrics.scratch_bytes_written = metrics

@@ -203,6 +203,11 @@ pub struct PreparedCompaction {
     /// also drives `replaced_search_lsm` and the rewrite/replace install
     /// guard — reusing it would wrongly clear the active generation.
     consolidated_base_markers: Vec<crate::manifest::SearchIndexBuildState>,
+    /// Indexes whose interop marker certified an adoptable base but whose
+    /// physical body deterministically disproved it (unsupported magic or an
+    /// unsafe wrap). Install drops these markers so the next pass plans the
+    /// full rebuild instead of stalling on an adoption that can never land.
+    unadoptable_search_markers: Vec<(SstKind, String)>,
     search_lsm_activations: Vec<PreparedSearchLsmActivation>,
     replaced_search_lsm: Vec<(crate::search_lsm::SearchLsmKind, String)>,
 }
@@ -225,7 +230,9 @@ struct PreparedSearchLsmActivation {
 impl PreparedCompaction {
     /// `true` when the sweep found nothing to merge; installing is a no-op.
     pub fn is_noop(&self) -> bool {
-        self.removed_ids.is_empty() && self.search_lsm_activations.is_empty()
+        self.removed_ids.is_empty()
+            && self.search_lsm_activations.is_empty()
+            && self.unadoptable_search_markers.is_empty()
     }
 
     /// Manifest version the prepare ran against.
@@ -912,10 +919,15 @@ async fn prepare_search_lsm_activations(
     removed_ids: &[Uuid],
     new_build_states: &[crate::manifest::SearchIndexBuildState],
     replaced: &[(crate::search_lsm::SearchLsmKind, String)],
-) -> Result<(Vec<PreparedSearchLsmActivation>, Vec<Uuid>)> {
+) -> Result<(
+    Vec<PreparedSearchLsmActivation>,
+    Vec<Uuid>,
+    Vec<(SstKind, String)>,
+)> {
     use crate::search_lsm::{
         encode_search_barrier, search_barrier_descriptor, wrap_legacy_search_base, SearchLsmKind,
     };
+    let mut unadoptable: Vec<(SstKind, String)> = Vec::new();
 
     let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
     let mut projected = basis.clone();
@@ -1053,6 +1065,16 @@ async fn prepare_search_lsm_activations(
             SearchLsmKind::Text => false,
         };
         if !supported_magic {
+            // Deterministic: this body can never satisfy the adoption the
+            // marker certifies. Dropping the marker un-suppresses the full
+            // rebuild; a transient read error above keeps the marker and
+            // retries instead.
+            tracing::warn!(
+                index = %index_name,
+                path = %base.path,
+                "legacy search base magic is not adoptable; scheduling a rebuild"
+            );
+            unadoptable.push((kind.sst_kind(), index_name.clone()));
             continue;
         }
 
@@ -1071,8 +1093,9 @@ async fn prepare_search_lsm_activations(
                 tracing::warn!(
                     index = %index_name,
                     error = %error,
-                    "legacy search base is not safe to adopt"
+                    "legacy search base is not safe to adopt; scheduling a rebuild"
                 );
+                unadoptable.push((kind.sst_kind(), index_name.clone()));
                 continue;
             }
         };
@@ -1100,7 +1123,7 @@ async fn prepare_search_lsm_activations(
             barrier_already_present: false,
         });
     }
-    Ok((activations, retired_barriers))
+    Ok((activations, retired_barriers, unadoptable))
 }
 
 /// Run one leveled-lite compaction sweep across every `(kind, scope)`
@@ -1627,16 +1650,17 @@ async fn prepare_leveled(
             new_descs.push(output.clone());
         }
     }
-    let (search_lsm_activations, retired_search_barriers) = prepare_search_lsm_activations(
-        store,
-        paths,
-        &base.manifest,
-        &new_descs,
-        &removed_ids,
-        &search_build_states,
-        &replaced_search_lsm,
-    )
-    .await?;
+    let (search_lsm_activations, retired_search_barriers, unadoptable_search_markers) =
+        prepare_search_lsm_activations(
+            store,
+            paths,
+            &base.manifest,
+            &new_descs,
+            &removed_ids,
+            &search_build_states,
+            &replaced_search_lsm,
+        )
+        .await?;
     removed_ids.extend(retired_search_barriers);
 
     if !node_rewrites.is_empty() {
@@ -1658,6 +1682,10 @@ async fn prepare_leveled(
     // wrong adoption. Empty-output consolidations (authoritatively empty
     // corpus) mint a marker too, mirroring the 2.0.6 rule that keeps
     // compaction from replanning an empty build forever.
+    #[cfg_attr(
+        not(any(feature = "vector-index", feature = "text-index")),
+        allow(unused_variables)
+    )]
     let basis_max_node_lsn = base
         .manifest
         .ssts
@@ -1666,16 +1694,48 @@ async fn prepare_leveled(
         .map(|descriptor| descriptor.max_lsn)
         .max()
         .unwrap_or(0);
+    // The signature must be the one the 2.0.6 downgrade paths compare
+    // against (`catalog_build_states` / `adoption_catalog_signatures`), NOT
+    // the native `captured_state` signature: for text those forks (the LSM
+    // form hashes the manifest-scoped filter set), and a marker carrying a
+    // signature nobody accepts certifies nothing.
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let consolidated_base_markers = Vec::new();
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
     let consolidated_base_markers = search_compactions
         .iter()
         .filter(|search| {
             search.selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
         })
-        .map(|search| crate::manifest::SearchIndexBuildState {
-            kind: search.selection.captured_state.kind.sst_kind(),
-            name: search.selection.captured_state.index_name.clone(),
-            catalog_signature: search.selection.captured_state.catalog_signature.clone(),
-            max_node_lsn: basis_max_node_lsn,
+        .filter_map(|search| {
+            let name = search.selection.captured_state.index_name.as_str();
+            let catalog_signature = match search.selection.captured_state.kind {
+                #[cfg(feature = "vector-index")]
+                crate::search_lsm::SearchLsmKind::Vector => base
+                    .manifest
+                    .vector_indexes
+                    .iter()
+                    .find(|index| index.name == name)
+                    .map(|index| vector_catalog_signature(&base.manifest, index))?,
+                #[cfg(feature = "text-index")]
+                crate::search_lsm::SearchLsmKind::Text => base
+                    .manifest
+                    .text_indexes
+                    .iter()
+                    .find(|index| index.name == name)
+                    .map(text_catalog_signature)?,
+                // With the feature off no search compaction is ever selected.
+                #[cfg(not(feature = "vector-index"))]
+                crate::search_lsm::SearchLsmKind::Vector => return None,
+                #[cfg(not(feature = "text-index"))]
+                crate::search_lsm::SearchLsmKind::Text => return None,
+            };
+            Some(crate::manifest::SearchIndexBuildState {
+                kind: search.selection.captured_state.kind.sst_kind(),
+                name: name.to_owned(),
+                catalog_signature,
+                max_node_lsn: basis_max_node_lsn,
+            })
         })
         .collect();
 
@@ -1692,6 +1752,7 @@ async fn prepare_leveled(
         search_compactions,
         search_build_states,
         consolidated_base_markers,
+        unadoptable_search_markers,
         search_lsm_activations,
         replaced_search_lsm,
     })
@@ -2127,7 +2188,10 @@ pub async fn install_prepared(
     current: &LoadedManifest,
     prepared: PreparedCompaction,
 ) -> Result<CompactionOutcome> {
-    if prepared.removed_ids.is_empty() && prepared.search_lsm_activations.is_empty() {
+    if prepared.removed_ids.is_empty()
+        && prepared.search_lsm_activations.is_empty()
+        && prepared.unadoptable_search_markers.is_empty()
+    {
         debug!("compactor found no bucket worth merging; nothing to install");
         return Ok(CompactionOutcome {
             committed: current.clone(),
@@ -2283,6 +2347,13 @@ pub async fn install_prepared(
             .retain(|existing| existing.kind != state.kind || existing.name != state.name);
         next.search_index_builds.push(state);
     }
+    let mut dropped_unadoptable_markers = 0usize;
+    for (kind, name) in &prepared.unadoptable_search_markers {
+        let before = next.search_index_builds.len();
+        next.search_index_builds
+            .retain(|marker| !(marker.kind == *kind && marker.name == *name));
+        dropped_unadoptable_markers += before - next.search_index_builds.len();
+    }
     // Position-preserving upsert: migration tests pin unrelated-marker order.
     // Install is all-or-nothing, so a marker can never commit without the
     // base it certifies.
@@ -2399,7 +2470,11 @@ pub async fn install_prepared(
         result?;
     }
 
-    if source_count == 0 && new_count == 0 && installed_activation_count == 0 {
+    if source_count == 0
+        && new_count == 0
+        && installed_activation_count == 0
+        && dropped_unadoptable_markers == 0
+    {
         debug!("prepared Search-LSM activation was outrun; nothing to install");
         return Ok(CompactionOutcome {
             committed: current.clone(),
@@ -4479,6 +4554,9 @@ fn relative_sst_path(level: u32, file_name: &str) -> String {
 }
 
 #[cfg(test)]
+// The std-mutex env guard is deliberately held across awaits: it serializes
+// whole test bodies against process-global policy env.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -5075,6 +5153,7 @@ mod tests {
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -5148,6 +5227,7 @@ mod tests {
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -5218,6 +5298,7 @@ mod tests {
             search_compactions: Vec::new(),
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
         };
@@ -7577,6 +7658,166 @@ mod tests {
                 .is_none(),
             "a corrupt barrier must select the exact fallback"
         );
+    }
+
+    /// The residual left open by the interop-marker work: a 2.0.6 downgrade
+    /// drops the unknown Search-LSM state, and in this variant the `.slb`
+    /// barrier object is lost with it. The FT4 base survives as an ordinary
+    /// `TextIndex` descriptor next to the minted build marker, so the marker
+    /// keeps suppressing the rebuild while the adoption probe (NAMIFT03-only)
+    /// keeps rejecting the FT4 body — every query flat-scans forever. The
+    /// contract pinned here: the first pass drops the deterministically
+    /// disproven marker, the second plans the full rebuild and serves.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn text_base_with_lost_barrier_falls_back_to_rebuild() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::text::parse_query;
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(body: &str, label_id: u32) -> Bytes {
+            NodeWriteRecord {
+                properties: BTreeMap::from([("body".into(), Value::Str(body.into()))]),
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-text-lost-barrier");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let bodies = ["fox the cat", "common the dog", "common the bird"];
+        let mut cur = base;
+        for (index, body) in bodies.iter().enumerate() {
+            let mut mt = Memtable::new();
+            let lsn = (index + 1) as u64;
+            mt.apply(
+                MemKey::Node { id: idx_id(lsn) },
+                lsn,
+                MemOp::Upsert(doc_payload(body, note_id.0)),
+            );
+            cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+        let settled = compact_l0_to_l1(&ms, &fence, &cur, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert!(!search_indexes_need_rebuild(&settled.manifest));
+        assert!(
+            settled
+                .manifest
+                .search_index_builds
+                .iter()
+                .any(|marker| marker.kind == SstKind::TextIndex && marker.name == "note_ft"),
+            "the consolidation must mint the 2.0.6-interop marker this scenario turns on"
+        );
+
+        // Downgrade: the old writer preserves ordinary descriptors but drops
+        // the unknown top-level state, and the barrier is lost outright.
+        let mut downgraded = settled.clone();
+        downgraded.manifest.search_lsm.clear();
+        let barrier_ids: HashSet<Uuid> = downgraded
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| {
+                crate::search_lsm::is_canonical_search_barrier_descriptor(descriptor)
+            })
+            .map(|descriptor| descriptor.id)
+            .collect();
+        assert!(
+            !barrier_ids.is_empty(),
+            "the settled generation has a barrier to lose"
+        );
+        for descriptor in downgraded
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| barrier_ids.contains(&descriptor.id))
+        {
+            let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), descriptor.path);
+            s.delete(&Path::from(absolute)).await.unwrap();
+        }
+        downgraded
+            .manifest
+            .ssts
+            .retain(|descriptor| !barrier_ids.contains(&descriptor.id));
+        // The stall precondition: metadata alone still promises an adoption,
+        // so the rebuild stays suppressed.
+        assert!(!search_indexes_need_rebuild(&downgraded.manifest));
+
+        // Pass 1: the magic probe deterministically disproves the promise;
+        // the marker must fall with it instead of certifying forever.
+        let pass1 = compact_leveled(&ms, &fence, &downgraded, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert!(
+            !pass1
+                .manifest
+                .search_index_builds
+                .iter()
+                .any(|marker| marker.kind == SstKind::TextIndex && marker.name == "note_ft"),
+            "an unadoptable base must drop its interop marker"
+        );
+        assert!(
+            search_indexes_need_rebuild(&pass1.manifest),
+            "with the marker gone the full rebuild is unsuppressed"
+        );
+
+        // Pass 2: the rebuild plans from the settled tree and serves.
+        let pass2 = compact_leveled(&ms, &fence, &pass1, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert!(!search_indexes_need_rebuild(&pass2.manifest));
+        assert!(
+            pass2.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            }),
+            "a fresh Active generation must replace the stranded base"
+        );
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(pass2.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search("note_ft", "Note", &parse_query("fox"), Some(5))
+            .await
+            .unwrap()
+            .expect("the rebuilt generation must serve natively, not flat-scan");
+        assert_eq!(hits.len(), 1, "exactly the one fox document matches");
+        assert_eq!(hits[0].0, idx_id(1));
     }
 
     /// A `.ft` body with a legacy magic (a NAMIFT01 file left behind by a

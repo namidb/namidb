@@ -662,14 +662,11 @@ impl TextIndexV3Reader {
             .await?;
 
         let mut ranked = RankCollector::new(k, result_limit_bytes);
-        loop {
-            let Some(doc) = cursors
-                .iter()
-                .filter_map(|cursor| cursor.current().map(|posting| posting.doc))
-                .min()
-            else {
-                break;
-            };
+        while let Some(doc) = cursors
+            .iter()
+            .filter_map(|cursor| cursor.current().map(|posting| posting.doc))
+            .min()
+        {
             metrics.documents_evaluated = metrics.documents_evaluated.saturating_add(1);
             if metrics.documents_evaluated & (crate::cancel::CHECK_STRIDE - 1) == 0 {
                 crate::cancel::check()?;
@@ -827,14 +824,14 @@ impl TextIndexV3Reader {
         index: usize,
         cache: &'a mut HashMap<usize, Vec<TermEntry>>,
     ) -> Result<&'a [TermEntry], Error> {
-        if !cache.contains_key(&index) {
+        if let std::collections::hash_map::Entry::Vacant(vacant) = cache.entry(index) {
             let block = self.footer.dictionary.get(index).ok_or_else(|| {
                 Error::invariant(format!("text v3 dictionary block {index} is absent"))
             })?;
             let bytes = self.read_block(&block.wire, "dictionary").await?;
             let entries: Vec<TermEntry> = deserialize_bounded(&bytes, "dictionary block")?;
             validate_dictionary_entries(&entries, block, self.footer.n_docs, self.footer_offset)?;
-            cache.insert(index, entries);
+            vacant.insert(entries);
         }
         Ok(cache
             .get(&index)

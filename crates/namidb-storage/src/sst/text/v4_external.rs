@@ -1866,6 +1866,7 @@ fn set_dense_filter_bit(bitmap: &mut [u8], ordinal: u64, row_count: u64) -> Resu
 }
 
 impl<'a> ExternalAssembler<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         output: &'a mut File,
         term_spool: File,

@@ -551,6 +551,7 @@ fn text_payload(
     })
 }
 
+#[allow(clippy::large_enum_variant)] // one instance per index, never collected
 enum IndexWork {
     #[cfg(feature = "vector-index")]
     Vector(VectorWork),

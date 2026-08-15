@@ -336,6 +336,11 @@ impl crate::sst::search_delta::SearchVersionRangeSource for SearchObjectRangeSou
     }
 }
 
+/// `(doc_count, term_count, total_len, min_node_id, max_node_id)` of a
+/// range-readable text base.
+#[cfg(feature = "text-index")]
+type RangedTextMetadata = (u64, u64, u64, [u8; 16], [u8; 16]);
+
 #[cfg(feature = "text-index")]
 #[derive(Debug)]
 enum TextSearchIndex {
@@ -380,11 +385,11 @@ impl TextSearchIndex {
                         .saturating_add(1)
                         .min(documents),
                 };
-                let per_doc = SCORE_MAP_BYTES_PER_DOC.saturating_add(
-                    (!query.phrases.is_empty())
-                        .then_some(PHRASE_SET_BYTES_PER_DOC)
-                        .unwrap_or(0),
-                );
+                let per_doc = SCORE_MAP_BYTES_PER_DOC.saturating_add(if query.phrases.is_empty() {
+                    0
+                } else {
+                    PHRASE_SET_BYTES_PER_DOC
+                });
                 let required_bytes = documents.saturating_mul(per_doc).saturating_add(
                     retained_hits.saturating_mul(MATERIALISED_TEXT_RESULT_BYTES_PER_HIT),
                 );
@@ -412,7 +417,9 @@ impl TextSearchIndex {
         }
     }
 
-    fn ranged_metadata(&self) -> Option<(u64, u64, u64, [u8; 16], [u8; 16])> {
+    /// `(doc_count, term_count, total_len, min_node_id, max_node_id)` of a
+    /// range-readable text base.
+    fn ranged_metadata(&self) -> Option<RangedTextMetadata> {
         let Self::Ranged(index) = self else {
             return None;
         };

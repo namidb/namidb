@@ -221,17 +221,6 @@ pub(super) struct SearchCompactionSelection {
 }
 
 impl SearchCompactionSelection {
-    pub(super) fn key(&self) -> (SearchLsmKind, &str) {
-        (
-            self.captured_state.kind,
-            self.captured_state.index_name.as_str(),
-        )
-    }
-
-    pub(super) fn frontier(&self) -> u64 {
-        self.captured_state.next_event_seq
-    }
-
     pub(super) fn selected_ids(&self) -> impl Iterator<Item = uuid::Uuid> + '_ {
         self.selected_descriptors
             .iter()
@@ -2337,6 +2326,7 @@ fn native_filter_payload(
 }
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
+#[allow(clippy::large_enum_variant)] // one instance per index, never collected
 enum SearchBuildWork {
     #[cfg(feature = "vector-index")]
     Vector(VectorBaseWork),

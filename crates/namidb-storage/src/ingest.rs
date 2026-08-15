@@ -7326,7 +7326,6 @@ mod tests {
         use crate::janitor::sweep_orphans;
         use crate::manifest::TextIndexDescriptor;
         use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
-        use crate::search_lsm::{select_search_read_plan, SearchLsmKind, SearchReadPlan};
 
         // Consolidation (the fourth fault point) needs the deterministic
         // force-base policy; every phase here observes policy-dependent state.
