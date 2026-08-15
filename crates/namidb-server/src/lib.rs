@@ -3626,6 +3626,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Plan item 32 (the in-process half): the memory ceiling exercised
+    /// against the REAL resident-set sample, not a synthetic gauge. A
+    /// ceiling below the process's actual RSS must reject queries with 503
+    /// and count them; a sane ceiling must serve. The cgroup `auto` mode in
+    /// a real container stays with the pre-load runbook.
+    #[tokio::test]
+    async fn real_rss_ceiling_rejects_queries_and_recovers() {
+        let (store, paths) = namidb_storage::parse_uri("memory://rss-ceiling").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let tiny = Arc::new(memory::MemoryGovernor::new(64 * 1024));
+        if tiny.sample().is_none() {
+            // Platform without a resident-set source: nothing real to test.
+            return;
+        }
+        assert!(
+            tiny.over_limit(),
+            "a 64 KiB ceiling must sit below any real process RSS"
+        );
+        let state = AppState::new(writer, None, "rss-ceiling".into())
+            .with_memory_governor(Arc::clone(&tiny));
+        let app = build_router(state);
+        let body = serde_json::to_vec(&serde_json::json!({"query": "RETURN 1 AS v"})).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a real over-ceiling RSS must reject queries"
+        );
+        assert!(tiny.rejected_queries() > 0, "the rejection must be counted");
+
+        // Recovery: the same server shape under a sane ceiling serves.
+        let (store, paths) = namidb_storage::parse_uri("memory://rss-ceiling-ok").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let sane = Arc::new(memory::MemoryGovernor::new(usize::MAX));
+        sane.sample();
+        let state = AppState::new(writer, None, "rss-ceiling-ok".into()).with_memory_governor(sane);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "a sane ceiling serves");
+    }
+
     /// Plan item 34: the serving route must be observable at the server
     /// surface, or total loss of native serving passes every parity check.
     #[tokio::test]

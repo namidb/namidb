@@ -201,7 +201,9 @@ crates/namidb-storage/src/compact.rs: extend compaction_builds_a_searchable_text
 
 crates/namidb-storage/src/janitor.rs: (1) sweep_finds_no_orphans_with_active_search_generation — Active vector+text generation + one planted true orphan; sweep deletes only the orphan; (2) sweep_keeps_retired_generation_under_pin_lease — retire a delta generation via search compaction while a RetentionPin at the old version is held; old segments survive until release.
 
-### 32. [high] NAMIDB_MEMORY_MAX_BYTES proven only with synthetic RSS; no real-ceiling server test (503/Bolt-transient rejection, reclaim, recovery) and 'auto' cgroup mode never validated in a container. [Report 5.]
+### 32. [MOSTLY DONE — container `auto` mode stays with the runbook] NAMIDB_MEMORY_MAX_BYTES proven only with synthetic RSS; no real-ceiling server test (503/Bolt-transient rejection, reclaim, recovery) and 'auto' cgroup mode never validated in a container. [Report 5.]
+
+**Resolution (2026-08-15):** `real_rss_ceiling_rejects_queries_and_recovers` runs the ceiling against the REAL resident-set sample: a 64 KiB ceiling (below any real process RSS) rejects /v0/cypher with 503 and counts the rejection; a sane ceiling serves. Container `auto` cgroup validation stays in the pre-load runbook §3 where a real memory-limited container exists.
 
 crates/namidb-server/tests/memory_ceiling.rs: AppState with a tiny explicit ceiling + a test hook feeding real RSS; drive concurrent Cypher to rejection; assert 503 body then recovery. Docker workflow smoke step: container under --memory with NAMIDB_MEMORY_MAX_BYTES=auto asserts startup succeeds (and fails without a limit).
 
