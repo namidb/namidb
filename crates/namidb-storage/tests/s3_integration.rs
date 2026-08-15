@@ -95,7 +95,7 @@ async fn full_cycle_ingest_search_backup_against_s3() {
 
     let (store, _bucket) = s3_store_from_env();
     let unique = Uuid::now_v7().simple().to_string();
-    let ns = NamespaceId::new(&format!("cycle-{}", &unique[..12])).unwrap();
+    let ns = NamespaceId::new(format!("cycle-{}", &unique[..12])).unwrap();
     let paths = NamespacePaths::new("namidb-it", ns);
 
     let mut writer = WriterSession::open(store.clone(), paths.clone())
@@ -198,7 +198,7 @@ async fn full_cycle_ingest_search_backup_against_s3() {
     assert_eq!(hits[0].0, target);
 
     // Verified backup to a sibling prefix, which must serve identically.
-    let backup_ns = NamespaceId::new(&format!("cycleb-{}", &unique[..12])).unwrap();
+    let backup_ns = NamespaceId::new(format!("cycleb-{}", &unique[..12])).unwrap();
     let backup_paths = NamespacePaths::new("namidb-it", backup_ns);
     copy_namespace_snapshot(
         store.clone(),
