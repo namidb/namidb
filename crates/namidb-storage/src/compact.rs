@@ -7826,6 +7826,146 @@ mod tests {
         );
     }
 
+    /// The text twin of the vector downgrade-adoption cycle (plan item 30):
+    /// an old writer drops the unknown Search-LSM state but PRESERVES the
+    /// checksummed `.slb` barrier. The next maintenance pass must re-adopt
+    /// the generation metadata-only — zero SSTs rewritten, the barrier
+    /// reused byte-for-byte — and a DDL-stale marker must refuse adoption.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn text_preserved_barrier_readopts_after_state_wipe() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::text::parse_query;
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(body: &str, label_id: u32) -> Bytes {
+            NodeWriteRecord {
+                properties: BTreeMap::from([("body".into(), Value::Str(body.into()))]),
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-text-preserved-barrier");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut cur = base;
+        for (index, body) in ["fox the cat", "common the dog", "common the bird"]
+            .iter()
+            .enumerate()
+        {
+            let mut mt = Memtable::new();
+            let lsn = (index + 1) as u64;
+            mt.apply(
+                MemKey::Node { id: idx_id(lsn) },
+                lsn,
+                MemOp::Upsert(doc_payload(body, note_id.0)),
+            );
+            cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+        let settled = compact_l0_to_l1(&ms, &fence, &cur, &schema)
+            .await
+            .unwrap()
+            .committed;
+        let text_state = settled
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("active text generation");
+        let barrier_id = text_state.compat_barrier_sst_id.unwrap();
+        let base_body_id = text_state.segments[0].sst_id;
+
+        // The downgrade: state dropped, both descriptors (body + barrier)
+        // preserved. A DDL-stale marker variant must refuse adoption.
+        let mut wiped = settled.manifest.next_version(fence.writer_id);
+        wiped.search_lsm.clear();
+        let mut ddl_stale = wiped.clone();
+        ddl_stale
+            .search_index_builds
+            .iter_mut()
+            .find(|state| state.kind == SstKind::TextIndex && state.name == "note_ft")
+            .expect("text build marker")
+            .catalog_signature
+            .push_str("-pre-ddl");
+        assert!(
+            !search_lsm_adoption_needed(&ddl_stale),
+            "a DDL-stale text marker must rebuild, never adopt"
+        );
+        let legacy = ms.commit(&fence, &settled, wiped).await.unwrap();
+        assert!(search_lsm_adoption_needed(&legacy.manifest));
+
+        let adopted = compact_leveled(&ms, &fence, &legacy, &schema, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            (adopted.source_ssts_removed, adopted.new_ssts_written),
+            (0, 0),
+            "preserved-barrier text adoption must be metadata-only"
+        );
+        let adopted_state = adopted
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("the wiped text generation must come back");
+        assert_eq!(adopted_state.segments[0].sst_id, base_body_id);
+        assert_eq!(
+            adopted_state.compat_barrier_sst_id,
+            Some(barrier_id),
+            "the preserved barrier must be reused byte-for-byte"
+        );
+        crate::search_lsm::validate_search_lsm(&adopted.committed.manifest).unwrap();
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(adopted.committed.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search("note_ft", "Note", &parse_query("fox"), Some(5))
+            .await
+            .unwrap()
+            .expect("the re-adopted generation must serve natively");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, idx_id(1));
+    }
+
     /// The residual left open by the interop-marker work: a 2.0.6 downgrade
     /// drops the unknown Search-LSM state, and in this variant the `.slb`
     /// barrier object is lost with it. The FT4 base survives as an ordinary

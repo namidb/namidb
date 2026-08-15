@@ -183,7 +183,9 @@ crates/namidb-server/src/lib.rs inline: post_cypher with {"params": {"n":1, "tag
 
 New crates/namidb-storage/tests/manifest_rollback_206.rs modeled on manifest_rollback_204.rs: freeze the exact 2.0.6 manifest DTO; decode a 2.1.0 manifest carrying an Active generation; reserialize (dropping unknown fields); feed the round-trip to search_lsm_adoption_needed/compact_leveled asserting metadata-only re-adoption; plus decode a post-backup destination manifest (accelerators dropped) with the frozen DTO asserting it loads with self-contained WAL closure.
 
-### 30. [high] Vector-kind downgrade adoption cycle has no text twin: barrier recovery and marker-gated adoption after a state wipe proven only for SearchLsmKind::Vector. [Report 5.]
+### 30. [DONE] Vector-kind downgrade adoption cycle has no text twin: barrier recovery and marker-gated adoption after a state wipe proven only for SearchLsmKind::Vector. [Report 5.]
+
+**Resolution (2026-08-15):** `text_preserved_barrier_readopts_after_state_wipe`: a state wipe with the checksummed `.slb` preserved re-adopts the text generation metadata-only (0 SSTs removed/written, barrier reused byte-for-byte, `text_search` serves natively after), and a DDL-stale marker refuses adoption. The lost-barrier half was already pinned by `text_base_with_lost_barrier_falls_back_to_rebuild` (item 11); note the item-11 marker-signature fix is what makes text adoption possible at all.
 
 crates/namidb-storage/src/compact.rs: extend compaction_builds_a_searchable_text_index with the vector test's three-phase downgrade block (state wiped → .slb metadata-only recovery; stale catalog marker → rebuild; adopted state serves via native FT4 route).
 
