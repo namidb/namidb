@@ -211,7 +211,9 @@ crates/namidb-server/tests/memory_ceiling.rs: AppState with a tiny explicit ceil
 
 Extend tests/s3_integration.rs with an #[ignore] full cycle (ingest → flush with an object exceeding one multipart part → compact building .vg/.ft → native search via ranged reads → backup to second prefix → restore + re-query); add a CI job starting tests/docker-compose.s3.yml and running cargo test --test s3_integration -- --ignored. TLS/WAN stays in the pre-load runbook against the customer's real bucket.
 
-### 34. [high] Full-stack route-assertion gap: the only tests through the REAL server/py pipeline deliberately accept either route, so total permanent loss of native serving (every query O(corpus)) passes CI. [Report 2; the systemic version of the reachability trap.]
+### 34. [DONE] Full-stack route-assertion gap: the only tests through the REAL server/py pipeline deliberately accept either route, so total permanent loss of native serving (every query O(corpus)) passes CI. [Report 2; the systemic version of the reachability trap.]
+
+**Resolution (2026-08-15):** new `namidb_storage::route_telemetry` — process-wide monotonic counters recorded at the storage decision points (`text_search`/`try_vector_search_with_point_count` wrappers: served natively vs declined toward the fallback), exported by the server as `namidb_search_route_total{kind,route}` on `/v0/metrics`. A deployment whose native serving silently died now shows a flatlined native counter beside a climbing fallback counter. Pinned by a unit delta test, a storage e2e (native serve moves native, freshness decline moves fallback) and a server test asserting all four series render. Also fixed a latent env-race: `prepared_compaction_round_trip_matches_compact_l0` observed the policy env without the guard.
 
 Expose a route observable (metrics counter for native text/vector serves — also fixes part of the metrics blind spot) and assert it in crates/namidb-py/tests/test_cypher.py::test_compaction_materializes_vector_and_text_indexes (and a server twin) after flush+compact with no pending delta, alongside the existing result checks.
 

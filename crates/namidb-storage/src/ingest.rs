@@ -4025,8 +4025,14 @@ mod tests {
     /// edges + authoritative `.vg`/`.ft` rebuilds): same outcome counters,
     /// same manifest version, same structural SST contents, same reads.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    // Env-guard held across awaits by design: both compactions below OBSERVE
+    // the process-global Search-LSM policy env and must see the same value.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn prepared_compaction_round_trip_matches_compact_l0() {
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut legacy, schema) = seeded_multi_bucket_session("ingest-prep-rt-legacy").await;
         let (mut split, _) = seeded_multi_bucket_session("ingest-prep-rt-split").await;
 

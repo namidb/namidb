@@ -6880,6 +6880,23 @@ impl<'mt> Snapshot<'mt> {
         k: usize,
         ef: usize,
     ) -> Result<Option<(Vec<(NodeId, f32)>, u64)>> {
+        let result = self
+            .try_vector_search_with_point_count_inner(index_name, query, k, ef)
+            .await;
+        if let Ok(outcome) = &result {
+            crate::route_telemetry::record_vector(outcome.is_some());
+        }
+        result
+    }
+
+    #[cfg(feature = "vector-index")]
+    async fn try_vector_search_with_point_count_inner(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Option<(Vec<(NodeId, f32)>, u64)>> {
         match search_lsm_read::vector_search(self, index_name, query, k, ef, &[]).await? {
             search_lsm_read::ActiveSearch::Ready(
                 search_lsm_read::CoordinatedVectorFilterResult::Applied(result),
@@ -7321,6 +7338,21 @@ impl<'mt> Snapshot<'mt> {
     /// with the executor's flat scan.
     #[cfg(feature = "text-index")]
     pub async fn text_search(
+        &self,
+        index_name: &str,
+        label: &str,
+        query: &crate::text::TextQuery,
+        k: Option<usize>,
+    ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        let result = self.text_search_inner(index_name, label, query, k).await;
+        if let Ok(outcome) = &result {
+            crate::route_telemetry::record_text(outcome.is_some());
+        }
+        result
+    }
+
+    #[cfg(feature = "text-index")]
+    async fn text_search_inner(
         &self,
         index_name: &str,
         label: &str,

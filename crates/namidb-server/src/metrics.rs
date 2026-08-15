@@ -928,6 +928,34 @@ impl Metrics {
                 )
             })
             .unwrap_or_default();
+        let routes = namidb_storage::route_telemetry::snapshot();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_route_total Search index outcomes by kind and route. \
+             A flatlined native counter beside a climbing fallback counter means \
+             the index route silently died and every query pays the O(corpus) scan."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_route_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_search_route_total{{kind=\"text\",route=\"native\"}} {}",
+            routes.text_native
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_route_total{{kind=\"text\",route=\"fallback\"}} {}",
+            routes.text_fallback
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_route_total{{kind=\"vector\",route=\"native\"}} {}",
+            routes.vector_native
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_route_total{{kind=\"vector\",route=\"fallback\"}} {}",
+            routes.vector_fallback
+        );
         let _ = writeln!(
             out,
             "# HELP namidb_search_workspace_enabled Whether the process-wide object-native search workspace has been initialized."

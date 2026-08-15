@@ -3626,6 +3626,37 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Plan item 34: the serving route must be observable at the server
+    /// surface, or total loss of native serving passes every parity check.
+    #[tokio::test]
+    async fn metrics_expose_the_search_route_counters() {
+        let app = fixture(None).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v0/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for series in [
+            "namidb_search_route_total{kind=\"text\",route=\"native\"}",
+            "namidb_search_route_total{kind=\"text\",route=\"fallback\"}",
+            "namidb_search_route_total{kind=\"vector\",route=\"native\"}",
+            "namidb_search_route_total{kind=\"vector\",route=\"fallback\"}",
+        ] {
+            assert!(
+                text.contains(series),
+                "/metrics must export `{series}`; got:\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn allocator_trim_is_reserved_for_flushes_that_wrote_an_sst() {
         assert!(!flush_needs_allocator_trim(0));

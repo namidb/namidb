@@ -35,6 +35,7 @@ pub mod property_index;
 pub mod range_cache;
 pub mod read;
 pub mod recovery;
+pub mod route_telemetry;
 pub mod search_lsm;
 pub(crate) mod search_lsm_flush;
 pub mod search_workspace;
