@@ -153,11 +153,15 @@ crates/namidb-query/tests/exec_vector_knn.rs: build a legacy v3 .vg manifest (re
 
 crates/namidb-query/tests/exec_vector_knn.rs: build_index_metric with Dot and Euclidean; queryNodes matches brute force with correct orientation; search.vector metric:'euclidean' ranks ascending-distance; 'l2' alias accepted; 'chebyshev' errors with documented message.
 
-### 26. [high] Expression evaluator dark corners: STARTS WITH/ENDS WITH/CONTAINS never evaluated in any test (matching, case sensitivity, null/non-string → null, residual-above-index role); simple/scrutinee CASE form has no parse or eval test; missing-ELSE → NULL untested. [Report 4, two gaps merged.]
+### 26. [DONE] Expression evaluator dark corners: STARTS WITH/ENDS WITH/CONTAINS never evaluated in any test (matching, case sensitivity, null/non-string → null, residual-above-index role); simple/scrutinee CASE form has no parse or eval test; missing-ELSE → NULL untested. [Report 4, two gaps merged.]
+
+**Resolution (2026-08-15):** `exec_expression_corners.rs` pins case-sensitive STARTS WITH/ENDS WITH/CONTAINS, NULL and non-string operands NULL-filtering, both CASE forms and missing-ELSE → NULL.
 
 crates/namidb-query/src/exec/expr.rs unit blocks: the three string operators incl. NULL and integer operands; CASE 2 WHEN 1..WHEN 2..END branch selection; no-match-no-ELSE → Null; CASE NULL WHEN NULL pinned. One e2e in exec_match_expand.rs: WHERE p.name STARTS WITH 'A' as residual above an indexed equality conjunct over flushed data.
 
-### 27. [high] Top-level UNION/UNION ALL: no read e2e test and no column-name compatibility validation across branches (mismatched branches silently yield mixed-shape rows). [Reports 3+4, deduplicated.]
+### 27. [DONE] Top-level UNION/UNION ALL: no read e2e test and no column-name compatibility validation across branches (mismatched branches silently yield mixed-shape rows). [Reports 3+4, deduplicated.]
+
+**Resolution (2026-08-15):** the lowering now derives each branch's output column names (aliases or canonical expression names; CALL-with-YIELD binding names) and rejects any branch whose names or order differ from the head, naming both sets in the error. e2e UNION dedupe vs UNION ALL duplicates pinned in `exec_expression_corners.rs`.
 
 exec_match_expand.rs: top-level MATCH..RETURN x UNION MATCH..RETURN x dedup + UNION ALL multiplicity, result-asserted on memtable and flushed states; plan/lower.rs test that RETURN a AS x UNION RETURN b AS y is rejected (after adding validation).
 
