@@ -2345,6 +2345,24 @@ fn enforce_vector_dims(
                 desc.label, desc.property, desc.name, desc.dim
             )));
         }
+        // Reject non-finite components at the door: a stored NaN poisons every
+        // distance it ever participates in, and unlike a wrong dim it cannot
+        // be detected from the score a query gets back.
+        let non_finite = match core_props.get(&desc.property) {
+            Some(CoreValue::Vec(floats)) => floats.iter().any(|f| !f.is_finite()),
+            Some(CoreValue::List(items)) => items.iter().any(|item| match item {
+                CoreValue::F64(f) => !f.is_finite(),
+                _ => false,
+            }),
+            _ => false,
+        };
+        if non_finite {
+            return Err(ExecError::Constraint(format!(
+                "{}.{} embedding contains a non-finite component (NaN or \
+                 infinity) for vector index `{}`",
+                desc.label, desc.property, desc.name
+            )));
+        }
         // Correct dim but stored as a numeric List → coerce to a dense Vec so the
         // index build covers it.
         let coerced = match core_props.get(&desc.property) {

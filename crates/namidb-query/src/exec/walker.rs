@@ -4535,6 +4535,20 @@ async fn vector_search_rows(
 ) -> Result<Vec<Row>, ExecError> {
     use crate::exec::expr::vector_score;
 
+    // A non-finite query component makes every distance undefined; NaN
+    // ordering would silently produce garbage ranking on the flat route and
+    // arbitrary pruning on the indexed one. One typed error, before route
+    // selection, keeps both routes identical.
+    if let Some(components) = runtime_to_f32_vec(q) {
+        if components.iter().any(|component| !component.is_finite()) {
+            return Err(ExecError::Runtime(
+                "vector query contains a non-finite component (NaN or \
+                 infinity)"
+                    .into(),
+            ));
+        }
+    }
+
     // RFC-030 (`vector-index`): serve from the Vamana index when one exists for
     // (label, property, metric). Falls through to the flat scan otherwise (and
     // also when a residual filter is too selective for the index to satisfy).

@@ -1509,4 +1509,86 @@ mod indexed {
             "the procedure form must agree with the Cypher form post-flush"
         );
     }
+
+    /// Plan item 7 (25 TB readiness): non-finite vectors are typed errors at
+    /// both doors. A NaN query raises the same error on the indexed and flat
+    /// routes — never a silent O(corpus) downgrade with NaN ordering — and a
+    /// NaN embedding is rejected at write time before it can poison distances.
+    #[tokio::test]
+    async fn non_finite_vectors_error_identically_on_both_routes() {
+        use namidb_query::execute_write;
+
+        let (w, _ids) = build_index(
+            "knn-nan",
+            &[
+                ("a", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("b", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        )
+        .await;
+        async fn nan_query_error(w: &WriterSession) -> String {
+            let snap = w.snapshot();
+            let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+            let plan = optimize(
+                lower(
+                    &parse(
+                        "CALL search.vector({label: 'Doc', property: 'embedding', \
+                         query: $q, k: 2}) YIELD node, score \
+                         RETURN node.title AS title",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                &catalog,
+            );
+            let mut params = Params::new();
+            params.insert(
+                "q".into(),
+                RuntimeValue::Vector(vec![f32::NAN, 0.0, 0.0, 0.0]),
+            );
+            execute(&plan, &snap, &params)
+                .await
+                .unwrap_err()
+                .to_string()
+        }
+        let indexed_error = nan_query_error(&w).await;
+        assert!(
+            indexed_error.contains("non-finite"),
+            "indexed route must reject a NaN query: {indexed_error}"
+        );
+
+        // Same corpus without an index: identical error, not NaN ordering.
+        let mut flat = WriterSession::open(store(), paths("knn-nan-flat"))
+            .await
+            .unwrap();
+        flat.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("a", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        flat.commit_batch().await.unwrap();
+        let flat_error = nan_query_error(&flat).await;
+        assert_eq!(
+            indexed_error, flat_error,
+            "both routes must raise the same typed error"
+        );
+
+        // Write door: a NaN embedding never enters an indexed label.
+        let mut w = w;
+        let write = lower(
+            &parse("CREATE (:Doc {title: 'poison', kind: 'kind-a', embedding: $q})").unwrap(),
+        )
+        .unwrap();
+        let mut params = Params::new();
+        params.insert(
+            "q".into(),
+            RuntimeValue::Vector(vec![f32::NAN, 0.0, 0.0, 0.0]),
+        );
+        let error = execute_write(&write, &mut w, &params).await.unwrap_err();
+        assert!(
+            error.to_string().contains("non-finite"),
+            "write path must reject a NaN embedding: {error}"
+        );
+    }
 }
