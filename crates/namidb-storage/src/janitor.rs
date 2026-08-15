@@ -721,6 +721,9 @@ mod tests {
     /// preserve the retired bodies (a pinned reader may still be serving
     /// them), and only a sweep past that horizon reclaims them.
     #[cfg(feature = "text-index")]
+    // The std-mutex env guard is deliberately held across awaits: it
+    // serializes the whole test body against process-global policy env.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn sweep_preserves_active_search_generations_until_the_horizon_passes() {
         use crate::manifest::TextIndexDescriptor;
