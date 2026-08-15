@@ -5769,3 +5769,144 @@ async fn merge_relationship_matches_compound_temporal_bytes_and_vector_propertie
         "the final ON MATCH property map must survive commit and flush"
     );
 }
+
+/// The storage model keys relationships by `(edge_type, src, dst)`: creating
+/// the same triple twice is a last-write-wins upsert, not a second parallel
+/// edge. That is a deliberate divergence from Neo4j (where CREATE always adds
+/// an edge) and the 25 TB load plan depends on it — this pins the contract on
+/// the memtable route, across statements, and through a flush.
+#[tokio::test]
+async fn same_triple_create_is_last_write_wins_not_parallel_edges() {
+    let mut writer = WriterSession::open(store(), paths("w-parallel-edges"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "KNOWS".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            properties: vec![PropertyDef::new("weight", DataType::Int64, false).unwrap()],
+        })
+        .unwrap()
+        .build();
+
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {key: 'a'})-[:KNOWS {weight: 1}]->(b:Person {key: 'b'})",
+    )
+    .await;
+
+    // Same triple inside one statement: the second CREATE overwrites the
+    // first edge's properties instead of adding a sibling.
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'a'}), (b:Person {key: 'b'}) \
+         CREATE (a)-[:KNOWS {weight: 2}]->(b)",
+    )
+    .await;
+
+    async fn knows_weights(writer: &WriterSession) -> Vec<i64> {
+        let snap = writer.snapshot();
+        let plan = lower(
+            &parse("MATCH (:Person {key: 'a'})-[r:KNOWS]->(:Person {key: 'b'}) RETURN r").unwrap(),
+        )
+        .unwrap();
+        let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+        rows.iter()
+            .map(|row| match row.get("r") {
+                Some(RuntimeValue::Rel(rel)) => match rel.properties.get("weight") {
+                    Some(RuntimeValue::Integer(w)) => *w,
+                    other => panic!("weight must be an integer, got {other:?}"),
+                },
+                other => panic!("expected a relationship binding, got {other:?}"),
+            })
+            .collect()
+    }
+
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![2],
+        "one surviving edge with the last write's properties (memtable route)"
+    );
+
+    // A third write in a separate transaction after a flush: still one edge,
+    // still last-write-wins, now reconciling SST + memtable versions.
+    writer.flush(schema.clone()).await.unwrap();
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'a'}), (b:Person {key: 'b'}) \
+         CREATE (a)-[:KNOWS {weight: 3}]->(b)",
+    )
+    .await;
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![3],
+        "the post-flush rewrite supersedes the persisted edge"
+    );
+    writer.flush(schema).await.unwrap();
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![3],
+        "reconciled persisted state keeps exactly one edge"
+    );
+}
+
+/// openCypher/Neo4j: deleting a connected node without DETACH is an error —
+/// never a silent commit of dangling edges that traversals would then half
+/// resurrect. DETACH DELETE removes node and relationships atomically.
+#[tokio::test]
+async fn bare_delete_of_connected_node_errors_detach_succeeds() {
+    async fn count(writer: &WriterSession, q_text: &str) -> usize {
+        let snap = writer.snapshot();
+        let plan = lower(&parse(q_text).unwrap()).unwrap();
+        execute(&plan, &snap, &Params::new()).await.unwrap().len()
+    }
+    let mut writer = WriterSession::open(store(), paths("w-bare-delete"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    )
+    .await;
+
+    let plan = lower(&parse("MATCH (a:Person {name: 'Ada'}) DELETE a").unwrap()).unwrap();
+    let error = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("DETACH"),
+        "bare DELETE of a connected node must point at DETACH DELETE: {error}"
+    );
+    // The failed statement must not have committed anything.
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 2);
+    assert_eq!(
+        count(&writer, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r").await,
+        1
+    );
+
+    // A disconnected node deletes bare, and DETACH removes both atomically.
+    write_q(&mut writer, "CREATE (:Person {name: 'Solo'})").await;
+    let outcome = write_q(&mut writer, "MATCH (s:Person {name: 'Solo'}) DELETE s").await;
+    assert_eq!(outcome.nodes_deleted, 1);
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (a:Person {name: 'Ada'}) DETACH DELETE a",
+    )
+    .await;
+    assert_eq!(outcome.nodes_deleted, 1);
+    assert_eq!(outcome.edges_deleted, 1);
+    assert_eq!(
+        count(&writer, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r").await,
+        0,
+        "DETACH DELETE leaves no dangling edge"
+    );
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
+}

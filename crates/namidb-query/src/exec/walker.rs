@@ -5937,7 +5937,14 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
                 if is_float {
                     f_total += *n as f64;
                 } else {
-                    i_total += *n;
+                    // Silent wrap-around would return a plausible wrong number
+                    // at exactly the corpus sizes where sums get large.
+                    i_total = i_total.checked_add(*n).ok_or_else(|| {
+                        ExecError::Runtime(
+                            "integer overflow in sum(); cast an operand with                              toFloat() to aggregate beyond 64-bit range"
+                                .into(),
+                        )
+                    })?;
                 }
             }
             RuntimeValue::Float(f) => {
@@ -5956,7 +5963,9 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
         }
     }
     if vals.is_empty() {
-        return Ok(RuntimeValue::Null);
+        // openCypher: `sum` over zero rows is 0, unlike avg/min/max which are
+        // NULL. `Avg` handles its own empty case before calling here.
+        return Ok(RuntimeValue::Integer(0));
     }
     if is_float {
         Ok(RuntimeValue::Float(f_total))

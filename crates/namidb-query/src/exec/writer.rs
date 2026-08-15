@@ -3068,6 +3068,16 @@ async fn apply_delete(
             RuntimeValue::Node(n) => {
                 if detach {
                     detach_incident_edges(n.id, writer, outcome).await?;
+                } else if let Some(edge_type) = incident_edge_type(n.id, writer).await? {
+                    // openCypher/Neo4j contract: deleting a connected node
+                    // without DETACH is an error, never a silent commit of
+                    // dangling edges — which reads would then resurrect as
+                    // half-broken traversal results.
+                    return Err(ExecError::Runtime(format!(
+                        "cannot DELETE a node that still has relationships \
+                         (found {edge_type}); use DETACH DELETE to remove the \
+                         node and its relationships"
+                    )));
                 }
                 // Tombstone is keyed by id; the label arg is vestigial (a
                 // tombstone removes the node from every label scan). Pass any
@@ -3096,6 +3106,36 @@ async fn apply_delete(
         }
     }
     Ok(())
+}
+
+/// First edge type with a live edge incident to `node`, if any. Early-exits on
+/// the first hit, so the common disconnected-node DELETE pays at most one
+/// bounded adjacency probe per declared edge type.
+async fn incident_edge_type(
+    node: NodeId,
+    writer: &mut WriterSession,
+) -> Result<Option<String>, ExecError> {
+    let edge_types: Vec<String> = writer.observed_edge_types();
+    for et in edge_types {
+        crate::exec::limits::check_deadline()?;
+        let snap = writer.overlay_snapshot();
+        if !snap
+            .out_edges(&et, node)
+            .await
+            .map_err(ExecError::Storage)?
+            .edges
+            .is_empty()
+            || !snap
+                .in_edges(&et, node)
+                .await
+                .map_err(ExecError::Storage)?
+                .edges
+                .is_empty()
+        {
+            return Ok(Some(et));
+        }
+    }
+    Ok(None)
 }
 
 async fn detach_incident_edges(
