@@ -157,7 +157,9 @@ crates/namidb-query/tests/exec_call.rs parity test: >64 distinct terms sharing o
 
 crates/namidb-query/tests/exec_call.rs + exec_vector_knn.rs table-driven: each edge input asserted for zero-rows-no-error (or the typed limit error with env-shrunk cap) on BOTH a memtable-only corpus and an indexed one; LIMIT 0 KNN asserts VectorSearch still in the plan.
 
-### 24. [high] Capped-sidecar filtered fallback chain (native Unsupported → resolve_capped_filter_eligibility → try_vector_search_filtered, legacy-only) untested at every layer including the ID-candidate cap boundary and the empty-sidecar early return — the serving path for filtered KNN over migrated legacy v3 .vg bodies. [Report 1.]
+### 24. [DEPRIORITIZED — legacy-only path, not on the 25TB load] Capped-sidecar filtered fallback chain (native Unsupported → resolve_capped_filter_eligibility → try_vector_search_filtered, legacy-only) untested at every layer including the ID-candidate cap boundary and the empty-sidecar early return — the serving path for filtered KNN over migrated legacy v3 .vg bodies. [Report 1.]
+
+**Rationale (2026-08-15):** this chain serves ONLY deployments carrying migrated legacy v3 `.vg` bodies. The 25 TB engagement loads fresh data on 2.1.0 (native V5 bodies throughout), so the chain is unreachable there; fabricating v3 fixture bytes needs format archaeology with no writer left in-tree. Keep for a maintenance window driven by an actual v3-carrying deployment.
 
 crates/namidb-query/tests/exec_vector_knn.rs: build a legacy v3 .vg manifest (reuse the wire fixture from sst/vector.rs::real_v3_wire_body_decodes_and_leaves_filter_residual) plus equality sidecar; assert (a) filtered search.vector equals exact filtered top-k, (b) empty sidecar set → [] without touching the .vg, (c) NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP=1 degrades to exact flat fallback with identical results.
 
@@ -185,7 +187,9 @@ exec_match_expand.rs: top-level MATCH..RETURN x UNION MATCH..RETURN x dedup + UN
 
 crates/namidb-server/src/lib.rs inline: post_cypher with {"params": {"n":1, "tags":[..], "props":{..}, "big": 18446744073709551615}} asserting bound results and a typed 400 for the unrepresentable number.
 
-### 29. [high] No frozen 2.0.6 wire-decoder rollback test (downgrade simulated by struct mutation only), and no test that a backup taken on 2.1.0 opens on an older binary. [Report 5, two related gaps merged.]
+### 29. [MOSTLY DONE — old-binary backup open stays manual] No frozen 2.0.6 wire-decoder rollback test (downgrade simulated by struct mutation only), and no test that a backup taken on 2.1.0 opens on an older binary. [Report 5, two related gaps merged.]
+
+**Resolution (2026-08-15):** `tests/frozen_wire_206.rs` freezes the ACTUAL fa126e1 (v2.0.6) wire contract as golden constants — required manifest fields, required SstDescriptor core fields, decodable SstKind variants — and holds a real 2.1.0 manifest (active search generation included) against them, then prunes the JSON to exactly the 2.0.6 field set (a downgraded writer's rewrite) and reloads it with today's decoder, interop markers surviving. Changing a golden list is now a visible wire-break decision. Opening a 2.1.0 backup with a real old binary remains a manual pre-release step (needs the released 2.0.6 artifact).
 
 New crates/namidb-storage/tests/manifest_rollback_206.rs modeled on manifest_rollback_204.rs: freeze the exact 2.0.6 manifest DTO; decode a 2.1.0 manifest carrying an Active generation; reserialize (dropping unknown fields); feed the round-trip to search_lsm_adoption_needed/compact_leveled asserting metadata-only re-adoption; plus decode a post-backup destination manifest (accelerators dropped) with the frozen DTO asserting it loads with self-contained WAL closure.
 
