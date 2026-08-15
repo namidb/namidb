@@ -1418,3 +1418,120 @@ async fn text_index_gate_is_label_scoped() {
         "relabeled doc must not be served: {rows:?}"
     );
 }
+
+/// Plan item 5 (25 TB readiness): Cypher DELETE → flush → the NATIVE text
+/// route must both exclude the deleted document and shrink the corpus
+/// statistics it scores with. The route is asserted at the storage boundary
+/// (`text_search` returning `Some`), never inferred from result parity.
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn cypher_delete_shrinks_the_native_text_corpus() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_query::execute_write;
+    use namidb_storage::manifest::TextIndexDescriptor;
+
+    let mut writer = WriterSession::open(store(), paths("call-delete-shrink"))
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![
+                PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+
+    // "unicorn" lives ONLY in the doomed document; "common" in every other.
+    let write = lower(
+        &parse(
+            "CREATE (:Note {title: 'doomed', body: 'unicorn common words'}), \
+             (:Note {title: 'a', body: 'common words here'}), \
+             (:Note {title: 'b', body: 'common words there'}), \
+             (:Note {title: 'c', body: 'common words everywhere'})",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    execute_write(&write, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    writer.flush(schema.clone()).await.unwrap();
+
+    // Served natively before the delete: the unique term finds its document.
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("unicorn"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the flushed FT4 generation must serve, not fall back");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the unique term matches exactly its document"
+    );
+
+    // DELETE pre-flush: the dirty overlay must already exclude it.
+    let delete = lower(&parse("MATCH (n:Note {title: 'doomed'}) DELETE n").unwrap()).unwrap();
+    execute_write(&delete, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+    let rows = run(
+        &snapshot,
+        "CALL search.bm25({label: 'Note', text_property: 'body', \
+         query: 'unicorn', k: 10}) YIELD node, score \
+         RETURN node.title AS title",
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "the un-flushed tombstone must already hide the document: {rows:?}"
+    );
+    drop(snapshot);
+
+    // Flush the tombstone: the native route itself must now prove the corpus
+    // shrank — zero postings for the dead term, not a stale hit.
+    writer.flush(schema).await.unwrap();
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("unicorn"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the post-delete generation must still serve natively");
+    assert!(
+        hits.is_empty(),
+        "flushed tombstone must remove the document and its term stats: {hits:?}"
+    );
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("common"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("surviving corpus must serve natively");
+    assert_eq!(hits.len(), 3, "the three survivors keep matching");
+}

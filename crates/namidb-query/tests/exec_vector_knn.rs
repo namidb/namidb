@@ -1433,4 +1433,80 @@ mod indexed {
         // the (correct) ranking, it only raises recall.
         assert_eq!(titles(&rows), vec!["c".to_string(), "e".to_string()]);
     }
+
+    /// Plan item 6 (25 TB readiness): REMOVE n:Doc must suppress a stale hit
+    /// the persisted index still contains — first through the memtable-dirty
+    /// overlay, then after the relabel itself is flushed. Both KNN forms are
+    /// asserted so neither route can serve the relabeled document.
+    #[tokio::test]
+    async fn relabel_suppresses_persisted_vector_hits_pre_and_post_flush() {
+        use namidb_query::execute_write;
+
+        let (mut w, _ids) = build_index(
+            "knn-relabel",
+            &[
+                ("target", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("near", "kind-a", vec![0.9, 0.1, 0.0, 0.0]),
+                ("far", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+                ("other", "kind-a", vec![0.0, 0.0, 1.0, 0.0]),
+            ],
+        )
+        .await;
+        let probe = vec![1.0, 0.0, 0.0, 0.0];
+        let knn = "MATCH (d:Doc) RETURN d.title AS title, \
+                   cosine_similarity(d.embedding, $q) AS score \
+                   ORDER BY score DESC LIMIT 2";
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["target".to_string(), "near".to_string()],
+            "the persisted index serves the target before the relabel"
+        );
+
+        // REMOVE the label: the .vg still physically contains the vector, so
+        // only the freshness overlay can hide it.
+        let relabel =
+            lower(&parse("MATCH (d:Doc {title: 'target'}) REMOVE d:Doc").unwrap()).unwrap();
+        execute_write(&relabel, &mut w, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["near".to_string(), "far".to_string()],
+            "the un-flushed relabel must already hide the target (dirty overlay)"
+        );
+        let rows = run(
+            &w,
+            "CALL search.vector({label: 'Doc', property: 'embedding', \
+             query: $q, k: 2}) YIELD node, score \
+             RETURN node.title AS title, score",
+            probe.clone(),
+        )
+        .await;
+        assert_eq!(
+            titles(&rows),
+            vec!["near".to_string(), "far".to_string()],
+            "the procedure form must agree with the Cypher form pre-flush"
+        );
+
+        // Flush the relabel: whatever route now serves must still exclude it.
+        w.flush(schema()).await.unwrap();
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["near".to_string(), "far".to_string()],
+            "the flushed relabel must keep the target suppressed"
+        );
+        let rows = run(
+            &w,
+            "CALL search.vector({label: 'Doc', property: 'embedding', \
+             query: $q, k: 2}) YIELD node, score \
+             RETURN node.title AS title, score",
+            probe,
+        )
+        .await;
+        assert_eq!(
+            titles(&rows),
+            vec!["near".to_string(), "far".to_string()],
+            "the procedure form must agree with the Cypher form post-flush"
+        );
+    }
 }
