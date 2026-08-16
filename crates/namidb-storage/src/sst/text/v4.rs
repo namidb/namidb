@@ -723,6 +723,11 @@ pub struct TextV4Reader {
     footer_offset: u64,
     footer: Footer,
     version_reader: SearchVersionTableReader,
+    /// Decoded dictionary blocks keyed by wire offset. One term is commonly
+    /// resolved twice per query (delta-df reconciliation, then postings), and
+    /// prefix expansion revisits blocks — without this each visit re-fetched
+    /// and re-decoded the same block. Bounded; cleared when full.
+    dictionary_blocks: std::sync::Mutex<std::collections::HashMap<u64, Arc<Vec<TermEntry>>>>,
 }
 
 impl std::fmt::Debug for TextV4Reader {
@@ -1365,6 +1370,7 @@ impl TextV4Reader {
             footer_offset,
             footer,
             version_reader,
+            dictionary_blocks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1413,9 +1419,9 @@ impl TextV4Reader {
         })?;
         self.read_dictionary_block(reference).await.map(|entries| {
             entries
-                .into_iter()
+                .iter()
                 .map(|entry| TextV4TermDelta {
-                    term: entry.term,
+                    term: entry.term.clone(),
                     delta_df: entry.delta_df,
                 })
                 .collect()
@@ -2294,14 +2300,14 @@ impl TextV4Reader {
         let mut block_count = 0u64;
         for dictionary in &self.footer.dictionary {
             let entries = self.read_dictionary_block(dictionary).await?;
-            for entry in entries {
+            for entry in entries.iter() {
                 if previous_term
                     .as_ref()
                     .is_some_and(|term| term >= &entry.term)
                 {
                     return Err(Error::invariant("text v4 terms are not globally sorted"));
                 }
-                let decoded = self.verify_term_postings(&entry).await?;
+                let decoded = self.verify_term_postings(entry).await?;
                 if decoded != entry.live_doc_freq {
                     return Err(Error::invariant(
                         "text v4 term live df disagrees with postings",
@@ -2315,7 +2321,7 @@ impl TextV4Reader {
                     )?);
                     block_count += 1;
                 }
-                previous_term = Some(entry.term);
+                previous_term = Some(entry.term.clone());
             }
         }
         if block_count != self.footer.postings_region.block_count
@@ -2357,7 +2363,7 @@ impl TextV4Reader {
         let Ok(index) = entries.binary_search_by(|entry| entry.term.as_str().cmp(term)) else {
             return Ok(None);
         };
-        Ok(entries.into_iter().nth(index))
+        Ok(entries.get(index).cloned())
     }
 
     async fn expand_prefix(&self, prefix: &str) -> Result<Vec<String>> {
@@ -2378,9 +2384,9 @@ impl TextV4Reader {
             } else if !expanded.is_empty() && !reference.first_term.starts_with(prefix) {
                 break;
             }
-            for entry in self.read_dictionary_block(reference).await? {
+            for entry in self.read_dictionary_block(reference).await?.iter() {
                 if entry.term.starts_with(prefix) {
-                    expanded.push(entry.term);
+                    expanded.push(entry.term.clone());
                     if expanded.len() == PREFIX_EXPANSION_LIMIT {
                         return Ok(expanded);
                     }
@@ -2400,7 +2406,17 @@ impl TextV4Reader {
     async fn read_dictionary_block(
         &self,
         reference: &DictionaryBlockRef,
-    ) -> Result<Vec<TermEntry>> {
+    ) -> Result<Arc<Vec<TermEntry>>> {
+        const MAX_CACHED_DICTIONARY_BLOCKS: usize = 16;
+        let key = reference.wire.range()?.start;
+        if let Some(cached) = self
+            .dictionary_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(cached.clone());
+        }
         let compressed = self.source.read_range(reference.wire.range()?).await?;
         let raw = decode_block(&compressed, &reference.wire, "dictionary block")?;
         let entries: Vec<TermEntry> =
@@ -2411,6 +2427,15 @@ impl TextV4Reader {
             &self.footer.postings_region,
             self.footer.binding.segment.role,
         )?;
+        let entries = Arc::new(entries);
+        let mut cache = self
+            .dictionary_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_CACHED_DICTIONARY_BLOCKS {
+            cache.clear();
+        }
+        cache.insert(key, entries.clone());
         Ok(entries)
     }
 
@@ -4124,11 +4149,12 @@ mod tests {
             }
         );
 
+        let source = Arc::new(MemorySource {
+            body: first.body.clone(),
+            ranges: Mutex::new(Vec::new()),
+        });
         let reader = TextV4Reader::open(
-            Arc::new(MemorySource {
-                body: first.body.clone(),
-                ranges: Mutex::new(Vec::new()),
-            }),
+            source.clone(),
             first.body.len() as u64,
             &state(),
             &first.output.segment,
@@ -4138,6 +4164,17 @@ mod tests {
         assert_eq!(reader.term_delta_df("contrato").await.unwrap(), 1);
         assert_eq!(reader.term_delta_df("vigente").await.unwrap(), 2);
         assert_eq!(reader.term_delta_df("derogado").await.unwrap(), -1);
+        // Dictionary block cache: re-resolving terms from an already-decoded
+        // block must not issue new range reads (a term is commonly resolved
+        // twice per query: delta-df reconciliation, then postings).
+        let reads_after_first_pass = source.ranges.lock().unwrap().len();
+        assert_eq!(reader.term_delta_df("contrato").await.unwrap(), 1);
+        assert_eq!(reader.term_delta_df("vigente").await.unwrap(), 2);
+        assert_eq!(
+            source.ranges.lock().unwrap().len(),
+            reads_after_first_pass,
+            "cached dictionary blocks must serve repeat term lookups"
+        );
         let mut term_deltas = Vec::new();
         for block in 0..reader.term_delta_block_count() {
             let page = reader.read_term_delta_block(block).await.unwrap();
