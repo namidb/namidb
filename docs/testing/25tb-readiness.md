@@ -262,3 +262,15 @@ Of the seven verified 10M-scale blockers from the 2026-07-28 audit:
 5. No process-wide caches on the search path — SUBSTANTIALLY MITIGATED: the RAM page cache now defaults ON with per-store-instance keys, so hot index/nav/posting pages are shared process-wide; per-snapshot decoded readers remain (CPU-light over cached pages) and per-query barrier HEADs are deliberate validation.
 6. Legacy (format_minor 0) edge SSTs read full-body — BY DESIGN (compat); ranged property hydration covers modern SSTs.
 7. Object-native gate — CLOSED earlier (running in CI with measured thresholds).
+
+### 36. [planner, target 2.1.1] Pattern anchor is not inverted toward the selective endpoint.
+
+Found 2026-08-16 during the live 200k-node S3 validation. With a UNIQUE
+constraint on `Company.cid`, `MATCH (c:Company {cid: 0})<-[w:WORKS_AT]-(p:Person)
+WHERE w.since = 0` answers instantly (index lookup + inverse expand, O(degree)),
+but the semantically identical `MATCH (p:Person)-[w:WORKS_AT]->(c:Company
+{cid: 0}) WHERE w.since = 0` scans all 200k Person nodes and expands forward
+(~18s warm, times out cold at the default 30s query timeout). The optimizer
+should consider anchoring at the most selective pattern endpoint regardless of
+the direction the user wrote. Reproduction: any big label -> tiny
+unique-anchored endpoint written left-to-right.
