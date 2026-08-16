@@ -2588,7 +2588,7 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.1...HEAD
 [2.1.1]: https://github.com/namidb/namidb/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/namidb/namidb/compare/v2.0.6...v2.1.0
 [2.0.6]: https://github.com/namidb/namidb/compare/v2.0.5...v2.0.6
