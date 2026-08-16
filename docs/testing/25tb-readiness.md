@@ -251,3 +251,14 @@ Investigate: instrument `coordinated_vector_query`/the bench coordinator to dump
 **Findings (2026-08-15, second pass):** the "pinned at 0.72" invariance was an artifact of --queries 5 (25 samples, 0.04 granularity). At --queries 25: recall scales smoothly with nprobe (base cosine 0.896@8 -> 0.92@16; serving 0.80@8 -> 0.92@16, base == serving), and the coordinator's EXACT shadow reports node_ids_exact=true against the oracle — no engine bug, no harness bug. The residual difficulty is the synthetic generator's geometry: even Gram-Schmidt-orthogonalized centroids at spread 0.08 leave boundary queries whose true top-5 spans enough pages that 0.95 recall needs ~24-32 of 64 probes, at which point cold bytes exceed the corpus (nav+metadata dominance at 8 KiB exact pages). A separable-dataset flag was prototyped and reverted (broke the 256-vector PR gate's dot track and still did not reach 0.95@8).
 
 **Remaining task (not a blocker):** validate byte-pruning on a corpus where it is geometrically provable — either a nightly gate at 100k+ vectors with page-rows 128+ and a measured threshold, or against the real dataset via the pre-load runbook (§2 LoadR2). The PR gate deliberately stays at 256 vectors / ratio 2.0 as a semantic contract, not a pruning proof.
+
+## Optimization tracker status (2026-08-16)
+
+Of the seven verified 10M-scale blockers from the 2026-07-28 audit:
+1. O(corpus) BasePrefix rebuild RAM — CLOSED (streaming producer/consumer, `peak_resident_input_bytes` asserted).
+2. Sequential VG6 delta scans per query — CLOSED (concurrent per-round segment waves, byte-identical results).
+3. Block-Max/WAND reachable only via a single clean base — OPEN, post-release: absence costs text pruning with >1 segment, never correctness; needs a global-WAND-with-dirty-ids design.
+4. FT4 dictionary block double fetch — CLOSED (bounded per-reader decoded-block cache, zero-new-reads pinned).
+5. No process-wide caches on the search path — SUBSTANTIALLY MITIGATED: the RAM page cache now defaults ON with per-store-instance keys, so hot index/nav/posting pages are shared process-wide; per-snapshot decoded readers remain (CPU-light over cached pages) and per-query barrier HEADs are deliberate validation.
+6. Legacy (format_minor 0) edge SSTs read full-body — BY DESIGN (compat); ranged property hydration covers modern SSTs.
+7. Object-native gate — CLOSED earlier (running in CI with measured thresholds).
