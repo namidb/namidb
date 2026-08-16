@@ -15,7 +15,46 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
-## [2.1.0] - 2026-07-27: Incremental vector and full-text indexes
+## [2.1.0] - 2026-08-16: Incremental vector and full-text indexes
+
+### Production-hardening campaign
+
+Between the feature freeze and this release the engine went through a
+systematic 25 TB readiness campaign (`docs/testing/25tb-readiness.md`): every
+blocker and high-priority item closed, with the notable fixes below.
+
+**Fixed**
+- Compaction no longer wedges after `DROP` + `CREATE` INDEX: install exempted
+  the states its own rebuild replaces from coverage validation.
+- Traversal partner lists hydrate edge properties by row range instead of
+  fetching the whole edge SST body per cold lookup.
+- 2.0.6-interop markers are minted with the catalog signatures the downgrade
+  paths accept, and an unadoptable base now falls back to a full rebuild
+  instead of stalling on flat scan.
+- Variable-length relationship aliases (`[rs:KNOWS*1..2]`) bind the
+  openCypher relationship list, not the last hop.
+- `search.vector` / `search.hybrid` reject unknown option keys (a typoed
+  `filter` no longer runs unfiltered), and HTTP integer params beyond the
+  64-bit signed range are rejected instead of silently degrading to floats.
+- `UNION` branches must return the same column names in the same order.
+- Shared-cache keys carry a per-store-instance token, closing a cross-store
+  page collision.
+
+**Performance**
+- The immutable RAM page cache now defaults on (carved out of
+  `NAMIDB_CACHE_MAX_BYTES`, no new memory bound).
+- `count(r)` answers from manifest statistics in the compacted steady state.
+- Vector segments are searched concurrently per coordinator round; FT4
+  dictionary blocks are cached per reader.
+
+**Observability & operations**
+- `namidb_search_route_total{kind,route}` on `/v0/metrics` exposes whether
+  search serves natively or fell back to flat scans.
+- A nightly workflow runs the bounded-memory builder soaks, a million-row
+  Search-LSM lifecycle soak, and a full ingest/search/backup cycle against
+  LocalStack S3. `docs/testing/preload-runbook.md` documents the manual
+  validation against a real bucket before any large production load.
+
 
 Vector and full-text indexes are maintained as an immutable **base plus ordered
 delta segments** committed in the same manifest CAS as the `Nodes` SSTs they
