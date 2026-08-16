@@ -43,6 +43,7 @@ use namidb_core::{LabelDictionary, Schema};
 use crate::error::{Error, Result};
 use crate::fence::{Epoch, WriterFence};
 use crate::paths::NamespacePaths;
+use crate::search_lsm::SearchLsmState;
 use crate::sst::bloom::BloomDescriptor;
 use crate::sst::stats::{DegreeHistogram, HllSketchBytes, PropertyColumnStats, StatScalar};
 use crate::wal::WalSegment;
@@ -98,6 +99,15 @@ pub struct Manifest {
     /// descriptor, never by this marker.
     #[serde(default)]
     pub search_index_builds: Vec<SearchIndexBuildState>,
+    /// Incremental base+delta search generations.
+    ///
+    /// This metadata is inert until a state is `Active` and passes
+    /// [`crate::search_lsm::validate_search_lsm`]. Keeping it separate from
+    /// `search_index_builds` preserves that legacy field's meaning as a
+    /// full-corpus rebuild-attempt marker. Missing in pre-Search-LSM manifests
+    /// and therefore empty by default.
+    #[serde(default)]
+    pub search_lsm: Vec<SearchLsmState>,
 }
 
 impl Manifest {
@@ -115,6 +125,7 @@ impl Manifest {
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
+            search_lsm: Vec::new(),
         }
     }
 
@@ -134,6 +145,7 @@ impl Manifest {
             vector_indexes: self.vector_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
             search_index_builds: self.search_index_builds.clone(),
+            search_lsm: self.search_lsm.clone(),
         }
     }
 }
@@ -406,10 +418,10 @@ pub struct PerLabelPropertyStat {
     pub ndv_estimate: Option<HllSketchBytes>,
 }
 
-/// Side-car pointer for a single `(SST, unique property)` pair. The
-/// sidecar body is a bincode-serialised `BTreeMap<String, NodeId>` —
-/// sorted by value string so a future binary-search reader can probe
-/// in O(log N) without deserialising the whole map.
+/// Side-car pointer for a single `(SST, unique property)` pair. Current
+/// writers make `path` an authoritative PagedV2 B+tree. Legacy/explicit
+/// rolling-upgrade writers may keep the bincode map at `path` and advertise
+/// the paged representation through `paged`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UniquePropertyIndexDescriptor {
     /// Name of the unique property this sidecar indexes (e.g. `id`
@@ -428,14 +440,14 @@ pub struct UniquePropertyIndexDescriptor {
     /// `PagedV1` is range-readable and probes one B+tree search path.
     #[serde(default)]
     pub format: PropertyIndexFormat,
-    /// Optional range-readable mirror. `path` deliberately remains the
-    /// bincode-v0 object so a 2.0.4 reader can consume manifests written
-    /// during a rolling upgrade.
+    /// Optional range-readable mirror when `path` is deliberately retained as
+    /// a bounded bincode-v0 object for an explicit rolling upgrade. Direct
+    /// Paged writers leave this `None`.
     #[serde(default)]
     pub paged: Option<PagedPropertyIndexDescriptor>,
-    /// The authoritative legacy sidecar contains a key that cannot fit in a
-    /// PagedV1 leaf. This is a durable, non-error omission marker: maintenance
-    /// must not rewrite the same SST forever trying to add the accelerator.
+    /// Legacy omission marker retained for old manifests. Current direct
+    /// Paged writers fail the flush explicitly if a key cannot fit; they never
+    /// omit the authoritative sidecar.
     #[serde(default)]
     pub paged_build_unsupported: bool,
 }
@@ -493,7 +505,9 @@ pub enum PropertyIndexFormat {
     /// Legacy bincode `BTreeMap`; a cold point probe decodes the whole object.
     #[default]
     BincodeV0,
-    /// Fixed-page B+tree with range-readable leaves/postings.
+    /// Fixed-page B+tree with range-readable leaves/postings. The manifest
+    /// enum name is retained for compatibility; current bodies carry the
+    /// checksummed `NAMIPG02` wire.
     PagedV1,
 }
 
@@ -509,13 +523,13 @@ pub enum EqualityKeyEncoding {
     ScalarV1,
 }
 
-/// Side-car pointer for a node SST's label index. The sidecar body is a
-/// bincode-serialised `BTreeMap<u32, Vec<[u8; 16]>>` — a posting list of
-/// NodeIds per [`LabelId`](namidb_core::LabelId), with both the keys and each
-/// posting list sorted. It replaces the old "the SST partition IS the label
-/// index" arrangement once a single node SST spans every label: the reader
-/// resolves `scan_label(L)` by unioning the posting lists for `L`'s id across
-/// all node SSTs (plus the memtable) and confirming each candidate by id.
+/// Side-car pointer for a node SST's label index. Legacy bodies are bincode
+/// posting maps. Current bodies are a PagedV2 composite
+/// `(LabelId big-endian, NodeId) -> ()` tree, which supports exact membership
+/// and cursor/limit prefix reads without hydrating a label's complete posting.
+/// It replaces the old "the SST partition IS the label index" arrangement
+/// once a single node SST spans every label: the reader resolves
+/// `scan_label(L)` through `L`'s key prefix and confirms each candidate by id.
 /// Tombstones contribute nothing; last-LSN-wins at confirm time handles
 /// removal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +542,11 @@ pub struct LabelIndexDescriptor {
     pub label_count: u64,
     /// Total number of `(label, NodeId)` postings across every key.
     pub posting_count: u64,
+    /// Physical membership encoding. Legacy manifests default to the
+    /// monolithic bincode posting map. Current writers emit a composite-key
+    /// PagedV1/V2-integrity tree directly.
+    #[serde(default)]
+    pub format: PropertyIndexFormat,
     /// Live posting count per `LabelId` — the length of each label's posting
     /// list in the sidecar (tombstones already excluded by the builder). Sorted
     /// by label id. Now that node SSTs are no longer partitioned by label
@@ -547,11 +566,67 @@ pub struct LabelIndexDescriptor {
 /// every row. Current `.nloc2` bodies append an exact-record B+tree after the
 /// compatible locator prefix. `None` on legacy SSTs, whose reader retains the
 /// conservative row-group/RowFilter fallback.
+///
+/// Despite its historical name this descriptor is now the access bundle for
+/// one Nodes SST. New flushes attach independently ranged property pages to
+/// that bundle; manifests written before those pages existed deserialize with
+/// `property_pages = None` and retain the exact Parquet fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeLocatorDescriptor {
     pub path: String,
     pub size_bytes: u64,
     pub entry_count: u64,
+    #[serde(default)]
+    pub property_pages: Option<NodePropertyPagesDescriptor>,
+}
+
+/// Optional, range-readable schemaless property pages bound to one Nodes SST.
+///
+/// `id`, `parent_sst_id`, and the UUID repeated in the sidecar header/footer
+/// must all match the owning [`SstDescriptor::id`]. The duplicated manifest
+/// binding makes a stale/mis-routed object fail closed before any value page is
+/// trusted. This remains an accelerator: missing, incompatible, or corrupt
+/// objects select the exact Parquet representation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodePropertyPagesDescriptor {
+    pub id: Uuid,
+    pub parent_sst_id: Uuid,
+    pub path: String,
+    pub size_bytes: u64,
+    pub format_version: u16,
+    pub node_count: u64,
+    pub cell_count: u64,
+    pub property_count: u32,
+    pub page_count: u32,
+    pub content_xxh3: u64,
+}
+
+impl NodePropertyPagesDescriptor {
+    /// Cheap manifest-only binding check performed before opening the object.
+    pub fn is_bound_to(&self, parent: &SstDescriptor) -> bool {
+        parent.kind == SstKind::Nodes
+            && self.id == parent.id
+            && self.parent_sst_id == parent.id
+            && self.node_count == parent.row_count
+            && self.size_bytes >= 272
+    }
+}
+
+/// Discover the optional property object owned by a Nodes SST.
+///
+/// Rollback repair uses this to require the object before publishing a
+/// stalled manifest, and the janitor uses the same discovery rule to retain
+/// it in the active-manifest live-set. Removing it never changes query
+/// semantics because readers fall back exactly to Parquet, but it discards the
+/// projection accelerator. Backup/restore adoption remains a cross-phase
+/// artifact-walker concern.
+pub fn node_property_pages_sidecar(
+    descriptor: &SstDescriptor,
+) -> Option<&NodePropertyPagesDescriptor> {
+    descriptor
+        .node_locator
+        .as_ref()
+        .and_then(|locator| locator.property_pages.as_ref())
 }
 
 /// Distance metric a vector index is built for. The build and search must use
@@ -1453,6 +1528,22 @@ impl ManifestStore {
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
                 Err(e) => return Err(Error::ObjectStore(e)),
             }
+            if let Some(properties) = node_property_pages_sidecar(sst) {
+                if !properties.is_bound_to(sst) {
+                    return Ok(None);
+                }
+                let absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    properties.path
+                );
+                match self.store.head(&Path::from(absolute)).await {
+                    Ok(meta) if meta.size == properties.size_bytes => {}
+                    Ok(_) => return Ok(None),
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(e) => return Err(Error::ObjectStore(e)),
+                }
+            }
         }
 
         // Every WAL segment the orphan adds over the base must be durable
@@ -2212,6 +2303,79 @@ mod tests {
         let next = loaded.manifest.next_version(fence.writer_id);
         let committed = ms.commit(&fence, &loaded, next).await.unwrap();
         assert_eq!(committed.manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn stalled_manifest_requires_bound_property_object_before_adoption() {
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        let mut descriptor = sample_node_descriptor();
+        descriptor.path = "sst/level0/property-parent.parquet".into();
+        descriptor.size_bytes = 4;
+        descriptor.row_count = 1;
+        descriptor.node_locator = Some(NodeLocatorDescriptor {
+            path: "sst/level0/property-parent.nloc2".into(),
+            size_bytes: 4,
+            entry_count: 1,
+            property_pages: Some(NodePropertyPagesDescriptor {
+                id: descriptor.id,
+                parent_sst_id: descriptor.id,
+                path: "sst/level0/property-parent.npp".into(),
+                size_bytes: 272,
+                format_version: 1,
+                node_count: 1,
+                cell_count: 1,
+                property_count: 1,
+                page_count: 1,
+                content_xxh3: 7,
+            }),
+        });
+        orphan.ssts.push(descriptor);
+        store
+            .put(
+                &paths.sst_object(0, "property-parent.parquet"),
+                Bytes::from_static(b"body").into(),
+            )
+            .await
+            .unwrap();
+        let encoded = serde_json::to_vec(&orphan).unwrap();
+        assert!(
+            ms.orphan_ready_to_publish(&base, orphan.version, &encoded)
+                .await
+                .unwrap()
+                .is_none(),
+            "manifest must not publish before its property sidecar PUT"
+        );
+
+        store
+            .put(
+                &paths.sst_object(0, "property-parent.npp"),
+                Bytes::from(vec![0; 271]).into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ms.orphan_ready_to_publish(&base, orphan.version, &encoded)
+                .await
+                .unwrap()
+                .is_none(),
+            "manifest must reject a truncated property sidecar"
+        );
+        store
+            .put(
+                &paths.sst_object(0, "property-parent.npp"),
+                Bytes::from(vec![0; 272]).into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ms.orphan_ready_to_publish(&base, orphan.version, &encoded)
+                .await
+                .unwrap(),
+            Some(orphan)
+        );
     }
 
     #[tokio::test]
@@ -3025,13 +3189,56 @@ mod tests {
 
     #[test]
     fn sst_descriptor_round_trips_through_json_nodes() {
-        let d = sample_node_descriptor();
+        let mut d = sample_node_descriptor();
+        d.node_locator = Some(NodeLocatorDescriptor {
+            path: "sst/level0/0195-nodes.nloc2".into(),
+            size_bytes: 4096,
+            entry_count: d.row_count,
+            property_pages: Some(NodePropertyPagesDescriptor {
+                id: d.id,
+                parent_sst_id: d.id,
+                path: "sst/level0/0195-nodes.npp".into(),
+                size_bytes: 8192,
+                format_version: 1,
+                node_count: d.row_count,
+                cell_count: 24_690,
+                property_count: 3,
+                page_count: 6,
+                content_xxh3: 0xA11C_E55A_1234_5678,
+            }),
+        });
         let s = serde_json::to_string(&d).unwrap();
         let back: SstDescriptor = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
+        assert!(node_property_pages_sidecar(&back)
+            .unwrap()
+            .is_bound_to(&back));
         // JSON encodes [u8; 16] as base64 string of length 24.
         assert!(s.contains("\"min_key\":\""));
         assert!(s.contains("\"max_key\":\""));
+    }
+
+    #[test]
+    fn legacy_node_locator_without_property_pages_defaults_to_none() {
+        let mut descriptor = sample_node_descriptor();
+        descriptor.node_locator = Some(NodeLocatorDescriptor {
+            path: "sst/level0/0195-nodes.nloc2".into(),
+            size_bytes: 4096,
+            entry_count: descriptor.row_count,
+            property_pages: None,
+        });
+        let mut value = serde_json::to_value(descriptor).unwrap();
+        value["node_locator"]
+            .as_object_mut()
+            .unwrap()
+            .remove("property_pages");
+        let legacy: SstDescriptor = serde_json::from_value(value).unwrap();
+        assert!(legacy
+            .node_locator
+            .as_ref()
+            .unwrap()
+            .property_pages
+            .is_none());
     }
 
     #[test]

@@ -53,6 +53,23 @@ updates:
       - dependencies
       - python
 
+  # Keep the Dockerfile's immutable multi-arch manifest-list digests current.
+  # Dependabot updates the digest without weakening the explicit Rust/Debian
+  # release channels encoded in each image tag.
+  - package-ecosystem: docker
+    directory: /crates/namidb-server
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps-image)"
+    labels:
+      - dependencies
+      - docker
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

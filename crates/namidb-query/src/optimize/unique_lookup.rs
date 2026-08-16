@@ -15,9 +15,9 @@
 //! optimisation in Kuzu / Neo4j range indexes).
 //!
 //! The pass is conservative: it only fires when
-//! 1. The Filter's predicate is exactly `Property(a, <prop>) == <value>`
-//!    (single conjunct; multiple conjuncts fall through unchanged —
-//!    a follow-up could combine the unique lookup with residual filters).
+//! 1. A top-level `AND` conjunct is `Property(a, <prop>) == <value>`.
+//!    The best indexed conjunct (unique before non-unique) becomes the
+//!    lookup and every other conjunct remains as a residual `Filter`.
 //! 2. The immediate child is either a bare `NodeScan` or a `CrossProduct`
 //!    whose right side is that scan and whose left side produces every alias
 //!    referenced by `<value>`.
@@ -34,6 +34,7 @@ use super::{expression_aliases, produced_aliases};
 use crate::cost::StatsCatalog;
 use crate::parser::ast::{Expression, ExpressionKind};
 use crate::plan::LogicalPlan;
+use std::collections::BTreeSet;
 
 /// Run the unique-property lookup rewrite over `plan`.
 pub fn apply_unique_property_lookup(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
@@ -53,41 +54,24 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             } = input.as_ref()
             {
                 if predicates.is_empty() && projection.is_none() {
-                    if let Some((prop, value_expr)) = extract_eq_on_prop(&predicate, alias) {
-                        // The lookup input is `Empty`, so the scan alias is not
-                        // bound while `value_expr` is evaluated. Rewriting
-                        // `p.city = p.other` (or even `p.city = p.city`) would
-                        // therefore turn a valid per-row comparison into an
-                        // unbound-variable error. Correlated scans below have
-                        // the analogous, stricter subset check against the
-                        // aliases produced by their outer input.
-                        if expression_aliases(&value_expr).contains(alias) {
-                            return LogicalPlan::Filter {
-                                input: Box::new(rewrite(*input, catalog)),
-                                predicate,
-                            };
-                        }
-                        let lookup = match label {
-                            Some(label) => property_lookup_mode(catalog, label, &prop)
-                                .map(|multi| (label.clone(), multi)),
-                            None if global_property_lookup_available(catalog, &prop) => {
-                                // Empty label is the internal label-agnostic
-                                // scope. It always fans out: uniqueness is
-                                // per-label, not global.
-                                Some((String::new(), true))
-                            }
-                            None => None,
+                    if let Some(indexed) =
+                        extract_indexed_conjunct(&predicate, alias, label.as_deref(), catalog, None)
+                    {
+                        let lookup = LogicalPlan::NodeByPropertyValue {
+                            input: Box::new(LogicalPlan::Empty),
+                            label: indexed.label,
+                            alias: alias.clone(),
+                            property: indexed.property,
+                            value: indexed.value,
+                            multi: indexed.multi,
                         };
-                        if let Some((label, multi)) = lookup {
-                            return LogicalPlan::NodeByPropertyValue {
-                                input: Box::new(LogicalPlan::Empty),
-                                label,
-                                alias: alias.clone(),
-                                property: prop,
-                                value: value_expr,
-                                multi,
-                            };
-                        }
+                        return match indexed.residual {
+                            Some(residual) => LogicalPlan::Filter {
+                                input: Box::new(lookup),
+                                predicate: residual,
+                            },
+                            None => lookup,
+                        };
                     }
                 }
             }
@@ -117,40 +101,38 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                         predicates,
                         projection,
                     } if predicates.is_empty() && projection.is_none() => {
-                        extract_eq_on_prop(&predicate, alias).and_then(|(prop, value_expr)| {
-                            let outer_aliases = produced_aliases(left);
-                            let value_aliases = expression_aliases(&value_expr);
-                            if !value_aliases.is_subset(&outer_aliases) {
-                                return None;
-                            }
-                            let lookup = match label {
-                                Some(label) => property_lookup_mode(catalog, label, &prop)
-                                    .map(|multi| (label.clone(), multi)),
-                                None if global_property_lookup_available(catalog, &prop) => {
-                                    Some((String::new(), true))
-                                }
-                                None => None,
-                            };
-                            lookup.map(|(label, multi)| {
-                                (label, alias.clone(), prop, value_expr, multi)
-                            })
-                        })
+                        let outer_aliases = produced_aliases(left);
+                        extract_indexed_conjunct(
+                            &predicate,
+                            alias,
+                            label.as_deref(),
+                            catalog,
+                            Some(&outer_aliases),
+                        )
+                        .map(|indexed| (alias.clone(), indexed))
                     }
                     _ => None,
                 },
                 _ => None,
             };
-            if let Some((label, alias, property, value, multi)) = correlated {
+            if let Some((alias, indexed)) = correlated {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
                     unreachable!("correlated lookup was matched as CrossProduct")
                 };
-                return LogicalPlan::NodeByPropertyValue {
+                let lookup = LogicalPlan::NodeByPropertyValue {
                     input: Box::new(rewrite(*left, catalog)),
-                    label,
+                    label: indexed.label,
                     alias,
-                    property,
-                    value,
-                    multi,
+                    property: indexed.property,
+                    value: indexed.value,
+                    multi: indexed.multi,
+                };
+                return match indexed.residual {
+                    Some(residual) => LogicalPlan::Filter {
+                        input: Box::new(lookup),
+                        predicate: residual,
+                    },
+                    None => lookup,
                 };
             }
 
@@ -421,6 +403,139 @@ fn global_property_lookup_available(catalog: &StatsCatalog, property: &str) -> b
     })
 }
 
+struct IndexedConjunct {
+    label: String,
+    property: String,
+    value: Expression,
+    multi: bool,
+    residual: Option<Expression>,
+}
+
+/// Pick the best indexable equality from a top-level conjunction. Unique
+/// lookups win over non-unique postings even when they appear later, because
+/// they bound the candidate set to at most one row. The remaining expression
+/// tree is retained as a residual filter, so extracting the lookup never drops
+/// a predicate.
+///
+/// `outer_aliases == None` denotes an uncorrelated scan. In that shape the
+/// lookup value cannot reference any row binding because the lookup input is
+/// `Empty`. A correlated scan instead requires every value alias to be
+/// provided by its outer input.
+fn extract_indexed_conjunct(
+    predicate: &Expression,
+    scan_alias: &str,
+    label: Option<&str>,
+    catalog: &StatsCatalog,
+    outer_aliases: Option<&BTreeSet<String>>,
+) -> Option<IndexedConjunct> {
+    let mut conjuncts = Vec::new();
+    collect_top_level_conjuncts(predicate, &mut conjuncts);
+
+    let mut best: Option<(usize, String, String, Expression, bool)> = None;
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let Some((property, value)) = extract_eq_on_prop(conjunct, scan_alias) else {
+            continue;
+        };
+        let value_aliases = expression_aliases(&value);
+        let aliases_are_available = match outer_aliases {
+            Some(outer) => value_aliases.is_subset(outer),
+            None => value_aliases.is_empty(),
+        };
+        if !aliases_are_available {
+            continue;
+        }
+
+        let lookup = match label {
+            Some(label) => property_lookup_mode(catalog, label, &property)
+                .map(|multi| (label.to_owned(), multi)),
+            None if global_property_lookup_available(catalog, &property) => {
+                // Empty label is the internal label-agnostic scope. It always
+                // fans out: uniqueness is per-label, not global.
+                Some((String::new(), true))
+            }
+            None => None,
+        };
+        let Some((lookup_label, multi)) = lookup else {
+            continue;
+        };
+
+        // Preserve source order within the same lookup class, but replace a
+        // non-unique candidate with any unique one found later.
+        if best
+            .as_ref()
+            .is_some_and(|(_, _, _, _, best_multi)| !*best_multi || multi)
+        {
+            continue;
+        }
+        best = Some((index, lookup_label, property, value, multi));
+    }
+
+    let (index, label, property, value, multi) = best?;
+    let mut leaf_index = 0usize;
+    let residual = remove_top_level_conjunct(predicate, index, &mut leaf_index);
+    debug_assert_eq!(
+        leaf_index,
+        conjuncts.len(),
+        "conjunction traversal must assign stable leaf ordinals"
+    );
+    Some(IndexedConjunct {
+        label,
+        property,
+        value,
+        multi,
+        residual,
+    })
+}
+
+fn collect_top_level_conjuncts<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
+    if let ExpressionKind::Binary {
+        op: crate::parser::ast::BinaryOp::And,
+        left,
+        right,
+    } = &expr.kind
+    {
+        collect_top_level_conjuncts(left, out);
+        collect_top_level_conjuncts(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// Clone a conjunction while removing exactly the leaf at `remove_index`.
+/// Keeping the original tree shape avoids gratuitously reassociating boolean
+/// evaluation and preserves source spans for the residual diagnostics.
+fn remove_top_level_conjunct(
+    expr: &Expression,
+    remove_index: usize,
+    next_index: &mut usize,
+) -> Option<Expression> {
+    if let ExpressionKind::Binary {
+        op: crate::parser::ast::BinaryOp::And,
+        left,
+        right,
+    } = &expr.kind
+    {
+        let left = remove_top_level_conjunct(left, remove_index, next_index);
+        let right = remove_top_level_conjunct(right, remove_index, next_index);
+        return match (left, right) {
+            (Some(left), Some(right)) => Some(Expression {
+                span: expr.span,
+                kind: ExpressionKind::Binary {
+                    op: crate::parser::ast::BinaryOp::And,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            }),
+            (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        };
+    }
+
+    let index = *next_index;
+    *next_index += 1;
+    (index != remove_index).then(|| expr.clone())
+}
+
 /// If `expr` is exactly `alias.<prop> == <literal-ish>`, return
 /// `(prop, value_expr)`. Otherwise `None`.
 fn extract_eq_on_prop(expr: &Expression, scan_alias: &str) -> Option<(String, Expression)> {
@@ -519,12 +634,45 @@ mod tests {
         cat
     }
 
+    fn catalog_with_lookup_mix() -> StatsCatalog {
+        let mut cat = StatsCatalog::empty();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "city".to_string(),
+            PropStats {
+                indexed: true,
+                ..Default::default()
+            },
+        );
+        props.insert(
+            "external_id".to_string(),
+            PropStats {
+                unique: true,
+                ..Default::default()
+            },
+        );
+        props.insert("active".to_string(), PropStats::default());
+        cat.__test_insert_label(LabelStats {
+            name: "Person".into(),
+            node_count: 1000,
+            properties: props,
+        });
+        cat
+    }
+
     /// `multi` of the first `NodeByPropertyValue` in the plan, if any.
     fn find_lookup(plan: &LogicalPlan) -> Option<bool> {
         if let LogicalPlan::NodeByPropertyValue { multi, .. } = plan {
             return Some(*multi);
         }
         plan.children().into_iter().find_map(find_lookup)
+    }
+
+    fn find_lookup_property(plan: &LogicalPlan) -> Option<&str> {
+        if let LogicalPlan::NodeByPropertyValue { property, .. } = plan {
+            return Some(property);
+        }
+        plan.children().into_iter().find_map(find_lookup_property)
     }
 
     fn plan_contains_filter(plan: &LogicalPlan) -> bool {
@@ -558,6 +706,44 @@ mod tests {
             Some(false),
             "a unique property should stay a single point lookup"
         );
+    }
+
+    #[test]
+    fn unique_conjunct_drives_lookup_and_preserves_residual() {
+        let cat = catalog_with_lookup_mix();
+        let plan = rewrite_query(
+            "MATCH (p:Person) \
+             WHERE p.city = 'LA' AND p.active = true AND p.external_id = 'p-1' \
+             RETURN p",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup_property(&plan),
+            Some("external_id"),
+            "the unique equality must win over an earlier non-unique posting lookup: {plan:?}"
+        );
+        assert_eq!(find_lookup(&plan), Some(false));
+        assert!(
+            plan_contains_filter(&plan),
+            "unselected conjuncts must remain as a residual Filter: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn indexed_conjunct_does_not_cross_top_level_or() {
+        let cat = catalog_with_lookup_mix();
+        let plan = rewrite_query(
+            "MATCH (p:Person) \
+             WHERE p.external_id = 'p-1' OR p.active = true \
+             RETURN p",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup(&plan),
+            None,
+            "extracting an equality from OR would drop valid matches"
+        );
+        assert!(plan_contains_filter(&plan));
     }
 
     #[test]
@@ -614,6 +800,24 @@ mod tests {
         assert!(
             matches!(lookup_input(&plan), Some(LogicalPlan::Unwind { .. })),
             "the outer UNWIND must become the lookup input, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_unique_conjunct_preserves_residual_filter() {
+        let cat = catalog_with_lookup_mix();
+        let plan = rewrite_query(
+            "UNWIND ['p-1', 'p-2'] AS wanted \
+             MATCH (p:Person) \
+             WHERE p.external_id = wanted AND p.active = true \
+             SET p.active = false",
+            &cat,
+        );
+        assert_eq!(find_lookup(&plan), Some(false));
+        assert_eq!(find_lookup_property(&plan), Some("external_id"));
+        assert!(
+            plan_contains_filter(&plan),
+            "the node predicate not consumed by the lookup must survive: {plan:?}"
         );
     }
 

@@ -68,6 +68,52 @@ pub enum Error {
         capacity_bytes: usize,
     },
 
+    /// A search can preserve its requested accuracy only with more transient
+    /// workspace than the process-wide query pool permits. Concurrent searches
+    /// that individually fit are queued; this error means the request itself
+    /// requires a larger configured ceiling. Implementations must not silently
+    /// reduce recall, `k`, or query semantics to fit.
+    #[error(
+        "{operation} requires {required_bytes} bytes of query workspace, but \
+         NAMIDB_SEARCH_WORKSPACE_MAX_BYTES provides {capacity_bytes} bytes"
+    )]
+    QueryWorkspaceExceeded {
+        operation: &'static str,
+        required_bytes: usize,
+        capacity_bytes: usize,
+    },
+
+    /// An explicitly unbounded search (`k = None`) exceeded its configured
+    /// materialised-result allowance. This is an error rather than an
+    /// implicit truncation so callers never mistake a partial result for the
+    /// complete result set.
+    #[error(
+        "{index_kind} search without a finite k requires an estimated \
+         {estimated_bytes} result bytes, exceeding \
+         NAMIDB_SEARCH_MAX_RESULT_BYTES={limit_bytes}; provide k, raise the \
+         limit, or use a streaming result API"
+    )]
+    SearchResultLimitExceeded {
+        index_kind: &'static str,
+        estimated_bytes: usize,
+        limit_bytes: usize,
+    },
+
+    /// One document is too large for the exact BM25 fallback's bounded
+    /// streaming workspace. The input limit is checked before tokenization, so
+    /// this error is deterministic and cannot leave a partial ranking.
+    #[error(
+        "{operation} document contains {document_bytes} UTF-8 bytes across its \
+         configured string fields, exceeding \
+         NAMIDB_BM25_MAX_DOCUMENT_BYTES={limit_bytes}; raise both this limit \
+         and NAMIDB_SEARCH_WORKSPACE_MAX_BYTES with matching process headroom"
+    )]
+    SearchDocumentLimitExceeded {
+        operation: &'static str,
+        document_bytes: usize,
+        limit_bytes: usize,
+    },
+
     /// The expected manifest version does not exist yet.
     #[error("manifest version {0} not found")]
     ManifestNotFound(u64),

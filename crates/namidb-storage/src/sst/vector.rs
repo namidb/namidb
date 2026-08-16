@@ -19,6 +19,9 @@
 //! `euclidean` navigates with an L2 space (cosine would mis-rank whenever
 //! magnitudes vary).
 
+pub mod v5;
+pub mod v6;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,10 +45,18 @@ use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
 /// `(property, ScalarV1 value)` to sorted vector ordinals. The postings power
 /// native pre-filtering without hydrating the matching node corpus.
 const MAGIC: &[u8; 8] = b"NAMIVG04";
+/// Legacy monolithic magic used by the read path to avoid downloading a V5
+/// object before choosing its range-readable reader.
+pub const LEGACY_MONOLITHIC_MAGIC: &[u8; 8] = MAGIC;
 /// v3 body (same vector/graph representation, no metadata postings). It remains
 /// readable: filtered queries simply report "native filter unsupported" and use
 /// the existing adaptive widening/exact fallback until compaction emits v4.
 const LEGACY_MAGIC_V3: &[u8; 8] = b"NAMIVG03";
+
+/// Whether an 8-byte prefix belongs to a supported eager vector generation.
+pub fn is_supported_monolithic_magic(magic: &[u8]) -> bool {
+    magic == MAGIC || magic == LEGACY_MAGIC_V3
+}
 
 type VectorSearchResults = Vec<([u8; 16], f32)>;
 
@@ -69,33 +80,19 @@ pub fn vector_filter_bitmap_searches() -> u64 {
 }
 
 /// Build-time bounds for native vector metadata postings.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VectorFilterLimits {
     pub max_distinct_per_property: usize,
     pub max_bytes: usize,
 }
 
+#[cfg(test)]
 impl Default for VectorFilterLimits {
     fn default() -> Self {
         Self {
             max_distinct_per_property: DEFAULT_VECTOR_FILTER_MAX_DISTINCT,
             max_bytes: DEFAULT_VECTOR_FILTER_MAX_BYTES,
-        }
-    }
-}
-
-impl VectorFilterLimits {
-    pub(crate) fn from_env() -> Self {
-        let defaults = Self::default();
-        Self {
-            max_distinct_per_property: std::env::var("NAMIDB_VECTOR_FILTER_MAX_DISTINCT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(defaults.max_distinct_per_property),
-            max_bytes: std::env::var("NAMIDB_VECTOR_FILTER_MAX_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(defaults.max_bytes),
         }
     }
 }
@@ -150,6 +147,7 @@ impl VectorFilterPosting {
         }
     }
 
+    #[cfg(test)]
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Sparse(ordinals) => ordinals.len().saturating_mul(std::mem::size_of::<u32>()),
@@ -175,12 +173,14 @@ fn encode_vector_filter_value(value: &Value) -> Option<Cow<'_, str>> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct BuildingPosting {
     posting: VectorFilterPosting,
     cardinality: usize,
 }
 
+#[cfg(test)]
 impl BuildingPosting {
     fn new(ordinal: u32) -> Self {
         Self {
@@ -227,6 +227,7 @@ impl BuildingPosting {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum FilterPropertyState {
     Active {
@@ -242,6 +243,7 @@ enum FilterPropertyState {
 /// `u32` ordinal into the vector body's existing id table. A property is dropped
 /// atomically (never truncated) when either cap is crossed, preserving the
 /// invariant that presence in the body means complete coverage.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct VectorFilterPostingsBuilder {
     properties: BTreeMap<String, FilterPropertyState>,
@@ -249,6 +251,7 @@ pub(crate) struct VectorFilterPostingsBuilder {
     estimated_bytes: usize,
 }
 
+#[cfg(test)]
 impl VectorFilterPostingsBuilder {
     const ENTRY_OVERHEAD: usize = 64;
 
@@ -401,15 +404,6 @@ impl VectorStorage {
             VectorStorage::Int8 { codes, .. } => codes.len(),
         }
     }
-    /// The vector for node `i` materialised as f32 (dequantising int8).
-    fn f32_at(&self, i: usize) -> Vec<f32> {
-        match self {
-            VectorStorage::F32(v) => v[i].clone(),
-            VectorStorage::Int8 { codes, scales } => {
-                codes[i].iter().map(|&c| c as f32 * scales[i]).collect()
-            }
-        }
-    }
 }
 
 /// The body of a `SstKind::VectorGraph` SST, bincode-serialised after the
@@ -546,6 +540,20 @@ fn mips_augment(vectors: &[Vec<f32>]) -> Vec<Vec<f32>> {
             a
         })
         .collect()
+}
+
+/// Owned variant used while decoding. Appending the synthetic coordinate in
+/// place avoids a transient second full-corpus allocation on the read path.
+fn mips_augment_owned(mut vectors: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    let max_sq = vectors
+        .iter()
+        .map(|v| v.iter().map(|x| x * x).sum::<f32>())
+        .fold(0.0f32, f32::max);
+    for vector in &mut vectors {
+        let sq = vector.iter().map(|x| x * x).sum::<f32>();
+        vector.push((max_sq - sq).max(0.0).sqrt());
+    }
+    vectors
 }
 
 /// The navigation query for a MIPS-augmented graph: the raw query with a 0
@@ -734,10 +742,31 @@ enum NavSpace {
     Int8(Int8Space),
 }
 
+impl NavSpace {
+    /// Borrow the full-precision coordinates owned by the navigation space.
+    ///
+    /// A `dot-mips` member has one synthetic coordinate appended. Exact
+    /// reranking zips this slice with the un-augmented query, deliberately
+    /// ignoring that final coordinate and recovering the original dot product.
+    fn f32_vector(&self, ordinal: u32) -> Option<&[f32]> {
+        match self {
+            Self::Cosine(space) => Some(space.vector(ordinal)),
+            Self::L2(space) => Some(space.vector(ordinal)),
+            Self::Int8(_) => None,
+        }
+    }
+}
+
 /// A decoded, searchable VectorGraph index.
 #[derive(Debug)]
 pub struct VectorGraphIndex {
-    body: VectorGraphBody,
+    /// Slim resident form. `VectorGraphBody::storage` is moved into `nav`
+    /// during decode instead of keeping a second corpus-sized copy alive.
+    dim: u32,
+    metric_name: String,
+    ids: Vec<[u8; 16]>,
+    graph: VamanaGraph,
+    filter_postings: VectorFilterPostings,
     metric: VectorMetric,
     nav: NavSpace,
     /// The graph was built over MIPS-augmented vectors ("dot-mips"): navigate
@@ -952,23 +981,36 @@ impl VectorGraphIndex {
             Error::invariant(format!("vector graph unknown metric: {}", body.metric))
         })?;
         validate_decoded_body(&body, metric)?;
-        let nav = match &body.storage {
+        let VectorGraphBody {
+            dim,
+            metric: metric_name,
+            ids,
+            storage,
+            graph,
+            filter_postings,
+        } = body;
+        let nav = match storage {
             VectorStorage::Int8 { codes, scales } => {
-                let members: Vec<(Vec<i8>, f32)> =
-                    codes.iter().cloned().zip(scales.iter().copied()).collect();
+                let members: Vec<(Vec<i8>, f32)> = codes.into_iter().zip(scales).collect();
                 NavSpace::Int8(Int8Space::new(members))
             }
             VectorStorage::F32(v) if metric == VectorMetric::Euclidean => {
-                NavSpace::L2(L2Space::new(v.clone()))
+                NavSpace::L2(L2Space::new(v))
             }
             // dot-mips: rebuild the augmentation the graph was constructed
             // over (deterministic from the stored originals, so no format
             // field is needed).
-            VectorStorage::F32(v) if mips => NavSpace::Cosine(F32CosineSpace::new(mips_augment(v))),
-            VectorStorage::F32(v) => NavSpace::Cosine(F32CosineSpace::new(v.clone())),
+            VectorStorage::F32(v) if mips => {
+                NavSpace::Cosine(F32CosineSpace::new(mips_augment_owned(v)))
+            }
+            VectorStorage::F32(v) => NavSpace::Cosine(F32CosineSpace::new(v)),
         };
         Ok(Self {
-            body,
+            dim,
+            metric_name,
+            ids,
+            graph,
+            filter_postings,
             metric,
             nav,
             mips,
@@ -977,17 +1019,17 @@ impl VectorGraphIndex {
 
     /// Number of vectors indexed.
     pub fn point_count(&self) -> u64 {
-        self.body.ids.len() as u64
+        self.ids.len() as u64
     }
 
     /// Dimensionality.
     pub fn dim(&self) -> u32 {
-        self.body.dim
+        self.dim
     }
 
     /// Metric name (`"cosine"` / `"dot"` / `"euclidean"`).
     pub fn metric(&self) -> &str {
-        &self.body.metric
+        &self.metric_name
     }
 
     /// `true` when a higher score means a closer match (cosine / dot); `false`
@@ -1048,10 +1090,10 @@ impl VectorGraphIndex {
         ef: usize,
         groups: &[(String, Vec<Value>)],
     ) -> Option<(VectorSearchResults, usize)> {
-        let word_count = self.body.ids.len().div_ceil(64);
+        let word_count = self.ids.len().div_ceil(64);
         let mut eligible: Option<Vec<u64>> = None;
         for (property, alternatives) in groups {
-            let Some(postings) = self.body.filter_postings.get(property) else {
+            let Some(postings) = self.filter_postings.get(property) else {
                 continue;
             };
             let mut group = vec![0u64; word_count];
@@ -1066,7 +1108,7 @@ impl VectorGraphIndex {
                         VectorFilterPosting::Sparse(ordinals) => {
                             for &ordinal in ordinals {
                                 let ordinal = ordinal as usize;
-                                if ordinal < self.body.ids.len() {
+                                if ordinal < self.ids.len() {
                                     group[ordinal / 64] |= 1u64 << (ordinal % 64);
                                 }
                             }
@@ -1120,9 +1162,9 @@ impl VectorGraphIndex {
         ef: usize,
         mut is_allowed: impl FnMut(u32, &[u8; 16]) -> bool,
     ) -> Vec<([u8; 16], f32)> {
-        let point_count = self.body.ids.len();
+        let point_count = self.ids.len();
         let k = k.min(point_count);
-        if k == 0 || query.len() != self.body.dim as usize {
+        if k == 0 || query.len() != self.dim as usize {
             return Vec::new();
         }
         // Both knobs are query-controlled. The ANN crate also clamps its
@@ -1145,15 +1187,15 @@ impl VectorGraphIndex {
             query
         };
         let cands = match &self.nav {
-            NavSpace::Cosine(s) => search(s, &self.body.graph, nq, ef, ef),
-            NavSpace::L2(s) => search(s, &self.body.graph, nq, ef, ef),
-            NavSpace::Int8(s) => search(s, &self.body.graph, nq, ef, ef),
+            NavSpace::Cosine(s) => search(s, &self.graph, nq, ef, ef),
+            NavSpace::L2(s) => search(s, &self.graph, nq, ef, ef),
+            NavSpace::Int8(s) => search(s, &self.graph, nq, ef, ef),
         };
         let is_int8 = matches!(self.nav, NavSpace::Int8(_));
         let mut scored: Vec<([u8; 16], f32)> = cands
             .into_iter()
             .filter_map(|nb| {
-                let id = &self.body.ids[nb.id as usize];
+                let id = &self.ids[nb.id as usize];
                 if !is_allowed(nb.id, id) {
                     return None;
                 }
@@ -1161,8 +1203,11 @@ impl VectorGraphIndex {
                     // int8 cosine similarity (the stored, quantized score).
                     1.0 - nb.dist
                 } else {
-                    let v = self.body.storage.f32_at(nb.id as usize);
-                    metric_score(self.metric, &v, query).0 as f32
+                    let vector = self
+                        .nav
+                        .f32_vector(nb.id)
+                        .expect("non-int8 navigation must retain f32 vectors");
+                    metric_score(self.metric, vector, query).0 as f32
                 };
                 Some((*id, score))
             })

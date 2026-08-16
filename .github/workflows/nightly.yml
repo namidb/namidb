@@ -1,0 +1,96 @@
+name: nightly
+
+# Long-running soaks that would blow the PR-feedback budget: the bounded-memory
+# builder soaks and the million-row Search-LSM lifecycle. S3/MinIO-backed
+# ignored tests are deliberately NOT run here — they need a live endpoint and
+# have their own harness (see docs/testing/25tb-readiness.md, runbook section).
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_rows:
+        description: "Rows for the Search-LSM lifecycle soak"
+        required: false
+        default: "1000000"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  builder-soaks:
+    name: bounded-memory builder soaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run the ignored builder soaks (default features)
+        run: cargo test --locked -p namidb-storage --lib -- --ignored --test-threads=1
+
+  search-lsm-soak:
+    name: million-row Search-LSM lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Seed, churn, compact and verify native search exactness
+        env:
+          NAMIDB_SOAK_ROWS: ${{ github.event.inputs.soak_rows || '1000000' }}
+        run: |
+          cargo test --locked -p namidb-storage \
+            --features vector-index,text-index \
+            --test soak_search_lsm -- --ignored --test-threads=1
+
+  s3-localstack:
+    name: full cycle against LocalStack S3
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      localstack:
+        image: localstack/localstack:3
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3
+          PERSISTENCE: "0"
+        options: >-
+          --health-cmd "curl -f http://127.0.0.1:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://127.0.0.1:4566
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+      NAMIDB_TEST_BUCKET: namidb-tests
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Create the test bucket
+        run: |
+          curl -s -X PUT "http://127.0.0.1:4566/namidb-tests" \
+            -H "Host: namidb-tests.s3.amazonaws.com" || true
+          pip install --quiet awscli 2>/dev/null || true
+          aws --endpoint-url http://127.0.0.1:4566 s3 mb s3://namidb-tests || true
+      - name: Ingest, search, back up and sweep against S3
+        run: |
+          cargo test --locked -p namidb-storage \
+            --features vector-index,text-index \
+            --test s3_integration -- --ignored --test-threads=1

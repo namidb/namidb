@@ -46,6 +46,7 @@
 //! configure an incomplete-multipart lifecycle rule for process crashes.
 
 use std::collections::BTreeMap;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -54,15 +55,14 @@ use arrow_array::builder::{
     StringBuilder, TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 use namidb_core::{
@@ -77,6 +77,10 @@ use crate::manifest::{
 };
 use crate::memtable::{FrozenMemtable, MemKey, MemOp};
 use crate::paths::NamespacePaths;
+use crate::spooled_object::{
+    put_spooled_object, MultipartUploadGuard, SpooledObject, MULTIPART_MAX_CONCURRENCY,
+    MULTIPART_PART_SIZE, MULTIPART_THRESHOLD,
+};
 use crate::sst::bloom::{BloomDescriptor, BloomFilter};
 use crate::sst::edges::inverse::transpose_forward_to_inverse;
 use crate::sst::edges::writer::{
@@ -288,16 +292,39 @@ pub async fn flush(
     let build_paths: NamespacePaths = paths.clone();
     let build_schema = schema.clone();
     let build_label_dict = base.manifest.label_dict.clone();
-    let pendings = run_flush_build(move || {
-        build_pending_ssts(
+    let (pendings, node_rows) = run_flush_build(move || {
+        let pendings = build_pending_ssts(
             &build_paths,
-            node_rows,
+            &node_rows,
             edge_buckets,
             &build_schema,
             &build_label_dict,
-        )
+        )?;
+        Ok((pendings, node_rows))
     })
     .await?;
+
+    // Classify and build search deltas before the first object PUT. A segment
+    // cap/build failure therefore cannot expose a Nodes SST without exact
+    // search coverage.
+    let search_plan = match pendings
+        .iter()
+        .find(|pending| pending.descriptor.kind == SstKind::Nodes)
+    {
+        Some(nodes) => {
+            crate::search_lsm_flush::prepare_search_flush(
+                manifest_store,
+                base,
+                &schema,
+                &nodes.descriptor,
+                &node_rows,
+            )
+            .await?
+        }
+        None => crate::search_lsm_flush::SearchFlushPlan::default(),
+    };
+    let (search_uploads, search_manifest_update) = search_plan.into_parts();
+    let search_descriptor_count = search_manifest_update.descriptor_count();
 
     // 2. I/O phase — issue body + bloom PUTs with bounded object-level
     // concurrency. The PUTs are independent (each targets a fresh UUIDv7
@@ -320,9 +347,9 @@ pub async fn flush(
         } = p;
         let path = body_path;
         let store_ref = store.clone();
-        put_futures.push(Box::pin(
-            async move { put_object(store_ref, &path, body).await },
-        ));
+        put_futures.push(Box::pin(async move {
+            put_sidecar_payload(store_ref, &path, body).await
+        }));
         if let (Some(path), Some(body)) = (bloom_path, bloom_body) {
             bloom_count += 1;
             let store_ref = store.clone();
@@ -343,13 +370,20 @@ pub async fn flush(
         }
         new_ssts.push(descriptor);
     }
+    for upload in search_uploads {
+        let store_ref = store.clone();
+        put_futures.push(Box::pin(async move {
+            put_sidecar_payload(store_ref, &upload.path, upload.body).await
+        }));
+    }
     await_all_object_uploads(put_futures).await?;
 
-    let ssts_written = new_ssts.len();
+    let ssts_written = new_ssts.len().saturating_add(search_descriptor_count);
 
     let mut next = base.manifest.next_version(fence.writer_id);
     next.schema = schema;
     next.ssts.extend(new_ssts);
+    search_manifest_update.apply(&mut next);
     next.wal_segments.clear();
 
     let committed = manifest_store.commit(fence, base, next).await?;
@@ -361,7 +395,7 @@ pub async fn flush(
     })
 }
 
-async fn run_flush_build<T, F>(build: F) -> Result<T>
+pub(crate) async fn run_flush_build<T, F>(build: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -387,7 +421,7 @@ where
 struct PendingSst {
     descriptor: SstDescriptor,
     body_path: Path,
-    body: Bytes,
+    body: SidecarPayload,
     bloom_path: Option<Path>,
     bloom_body: Option<Bytes>,
     /// `(path, body)` for each optional accelerator emitted alongside this
@@ -398,12 +432,18 @@ struct PendingSst {
 /// Upload body for an immutable lookup accelerator.
 ///
 /// Most sidecars are compact enough to remain scatter/gather memory payloads.
-/// Exact node records can be corpus-sized, so their value region is spooled
-/// while the B+tree is built and consumed incrementally during multipart PUT.
+/// Exact node and edge-point records can be corpus-sized. Node values are
+/// spooled behind their existing in-memory locator prefix; edge-point pages
+/// and values are independent spools consumed incrementally during multipart
+/// PUT.
 #[derive(Debug)]
 pub(crate) enum SidecarPayload {
     InMemory(PutPayload),
+    Spooled(SpooledObject),
     NodeLocator(crate::sst::paged_index::NodeLocatorRecordUpload),
+    NodePropertyPages(crate::sst::nodes::property_pages::NodePropertyPageUpload),
+    EdgePoint(crate::sst::paged_index::EdgePointIndexUpload),
+    Paged(crate::sst::paged_index::SpooledPagedIndexUpload),
 }
 
 impl From<Bytes> for SidecarPayload {
@@ -473,7 +513,7 @@ fn bucket_nodes_and_edges(
 
 fn build_pending_ssts(
     paths: &NamespacePaths,
-    node_rows: Vec<NodeRow>,
+    node_rows: &[NodeRow],
     edge_buckets: BTreeMap<String, Vec<EdgeRow>>,
     schema: &Schema,
     label_dict: &LabelDictionary,
@@ -493,11 +533,11 @@ fn build_pending_ssts(
         // the schema's `indexed` properties, so the secondary index survives
         // the id-primary move.
         let index_props = union_indexed_props(schema);
-        let finish = build_node_sst(&column_label, &node_rows)?;
+        let finish = build_node_sst(&column_label, node_rows)?;
         pendings.push(prepare_node_pending(
             paths,
             &index_props,
-            &node_rows,
+            node_rows,
             finish,
             schema,
             label_dict,
@@ -888,35 +928,68 @@ fn prepare_node_pending(
     // stay wired for symmetry and a future typed-column layout.
     let (unique_property_indices, index_sidecars) =
         prepare_unique_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
-    let mut index_sidecars: Vec<(Path, SidecarPayload)> = index_sidecars
-        .into_iter()
-        .map(|(path, body)| (path, body.into()))
-        .collect();
+    let mut index_sidecars: Vec<(Path, SidecarPayload)> = index_sidecars;
     let (equality_property_indices, equality_sidecars) =
         prepare_equality_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
-    index_sidecars.extend(
-        equality_sidecars
-            .into_iter()
-            .map(|(path, body)| (path, body.into())),
-    );
+    index_sidecars.extend(equality_sidecars);
 
     // The label index (`LabelId -> [NodeId, ...]`) replaces "the SST partition
     // IS the label index" now that one node SST spans every label.
     let (label_index, label_sidecar) =
         prepare_label_index_sidecar(paths, level.as_u32(), &id, rows)?;
     if let Some((path, body)) = label_sidecar {
-        index_sidecars.push((path, body.into()));
+        index_sidecars.push((path, body));
     }
     let mut locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
     for row in rows {
         let record = encode_exact_node_record(row)?;
         locator_records.push(&row.id, &record)?;
     }
-    let (node_locator, locator_sidecar) =
+    let (mut node_locator, locator_sidecar) =
         prepare_node_locator_sidecar(paths, level.as_u32(), &id, locator_records)?;
     index_sidecars.push(locator_sidecar);
 
     let stats = finish.stats;
+    // Transitional dual-write: Parquet remains the authoritative complete
+    // node representation (and exact fallback), while `.npp` supplies
+    // independently ranged schemaless projection. Do not remove overflow
+    // properties until the node-wire compatibility barrier moves in a
+    // dedicated format migration.
+    let mut property_builder =
+        crate::sst::nodes::property_pages::NodePropertyPageBuilder::new_bound(
+            crate::sst::nodes::property_pages::NodePropertyPageConfig::from_env()?,
+            id,
+        )?;
+    for (ordinal, row) in rows.iter().enumerate() {
+        let ordinal = u64::try_from(ordinal)
+            .map_err(|_| Error::invariant("node property ordinal exceeds u64"))?;
+        match &row.op {
+            MemOp::Upsert(payload) => {
+                let record = NodeWriteRecord::decode(payload)?;
+                property_builder.push_sorted(row.id, ordinal, &record.properties)?;
+            }
+            MemOp::Tombstone => {
+                property_builder.push_sorted(row.id, ordinal, &BTreeMap::new())?;
+            }
+        }
+    }
+    let property_upload = property_builder.finish()?;
+    let property_stats = property_upload.stats();
+    if property_upload.sst_id() != id || property_stats.node_count != stats.row_count {
+        return Err(Error::invariant(
+            "node property pages are not bound to their Nodes SST",
+        ));
+    }
+    let (property_pages, property_sidecar) = prepare_node_property_pages_upload_sidecar(
+        paths,
+        level.as_u32(),
+        &id,
+        &id,
+        property_upload,
+    )?;
+    node_locator.property_pages = Some(property_pages);
+    index_sidecars.push(property_sidecar);
+
     let descriptor = SstDescriptor {
         id,
         kind: SstKind::Nodes,
@@ -947,7 +1020,7 @@ fn prepare_node_pending(
     Ok(PendingSst {
         descriptor,
         body_path,
-        body: finish.body,
+        body: finish.body.into(),
         bloom_path,
         bloom_body,
         index_sidecars,
@@ -998,6 +1071,7 @@ pub(crate) fn prepare_node_locator_upload_sidecar(
         path: relative,
         size_bytes: upload.size_bytes(),
         entry_count: upload.entry_count(),
+        property_pages: None,
     };
     Ok((
         descriptor,
@@ -1005,18 +1079,58 @@ pub(crate) fn prepare_node_locator_upload_sidecar(
     ))
 }
 
-/// Build the per-SST label index sidecar: `LabelId -> [NodeId, ...]` posting
-/// lists, bincode-serialised, mirroring the equality-index sidecar. Walks
-/// `rows` (already id-ascending) decoding each upsert's label set, so the
-/// posting lists come out id-sorted; tombstones contribute nothing
-/// (last-LSN-wins at read time handles removal). Returns `(None, None)` when no
-/// live labelled node is present.
+/// Attach canonical path and manifest binding metadata to finished schemaless
+/// node-property pages. `object_path_id` may be a fresh retry UUID for a
+/// sidecar-only migration while `parent_sst_id` remains the immutable Parquet
+/// UUID authenticated by the header/footer.
+pub(crate) fn prepare_node_property_pages_upload_sidecar(
+    paths: &NamespacePaths,
+    level: u32,
+    parent_sst_id: &Uuid,
+    object_path_id: &Uuid,
+    upload: crate::sst::nodes::property_pages::NodePropertyPageUpload,
+) -> Result<(
+    crate::manifest::NodePropertyPagesDescriptor,
+    (Path, SidecarPayload),
+)> {
+    if upload.sst_id() != *parent_sst_id {
+        return Err(Error::invariant(
+            "node property pages UUID differs from parent Nodes SST",
+        ));
+    }
+    let stats = upload.stats();
+    let file_name = crate::paths::node_property_pages_file_name(object_path_id);
+    let object_path = paths.node_property_pages(level, object_path_id);
+    let descriptor = crate::manifest::NodePropertyPagesDescriptor {
+        id: *parent_sst_id,
+        parent_sst_id: *parent_sst_id,
+        path: relative_sst_path(level, &file_name),
+        size_bytes: upload.size_bytes(),
+        format_version: crate::sst::nodes::property_pages::NODE_PROPERTY_PAGES_FORMAT_VERSION,
+        node_count: stats.node_count,
+        cell_count: stats.cell_count,
+        property_count: stats.property_count,
+        page_count: stats.page_count,
+        content_xxh3: upload.content_xxh3(),
+    };
+    Ok((
+        descriptor,
+        (object_path, SidecarPayload::NodePropertyPages(upload)),
+    ))
+}
+
+/// Build the per-SST label membership sidecar. Observations are externally
+/// sorted into composite `(LabelId big-endian, NodeId) -> ()` PagedV2 keys, so
+/// one label can be point-probed or cursor-paged without a corpus-sized
+/// posting allocation. Tombstones contribute nothing (last-LSN-wins at read
+/// time handles removal). Returns `(None, None)` when no live labelled node is
+/// present.
 /// Output of [`prepare_label_index_sidecar`]: the manifest descriptor plus the
 /// `(path, body)` to PUT next to the SST. Aliased to keep clippy's
 /// type-complexity lint happy, mirroring the unique/equality sidecar aliases.
 type LabelIndexSidecar = (
     Option<crate::manifest::LabelIndexDescriptor>,
-    Option<(Path, Bytes)>,
+    Option<(Path, SidecarPayload)>,
 );
 
 pub(crate) fn prepare_label_index_sidecar(
@@ -1025,11 +1139,11 @@ pub(crate) fn prepare_label_index_sidecar(
     sst_id: &Uuid,
     rows: &[NodeRow],
 ) -> Result<LabelIndexSidecar> {
-    let mut collector = LabelIndexCollector::new();
+    let mut collector = LabelIndexCollector::new()?;
     for row in rows {
         if let MemOp::Upsert(payload) = &row.op {
             let rec = NodeWriteRecord::decode(payload)?;
-            collector.observe(row.id, &rec);
+            collector.observe(row.id, &rec)?;
         }
     }
     collector.finish(paths, level, sst_id)
@@ -1039,57 +1153,79 @@ pub(crate) fn prepare_label_index_sidecar(
 /// compaction merge feeds it one reconciled winner row at a time (id
 /// ascending, tombstones excluded) so the label postings never require the
 /// whole merged bucket in memory — only the posting lists themselves.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LabelIndexCollector {
-    index: BTreeMap<u32, Vec<[u8; 16]>>,
+    sorter: crate::sst::external_pairs::ExternalPairSorter,
 }
 
 impl LabelIndexCollector {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            sorter: crate::sst::external_pairs::ExternalPairSorter::from_env()?,
+        })
     }
 
-    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) -> Result<()> {
         for &lid in &rec.labels {
-            let ids = self.index.entry(lid).or_default();
-            // Node SST input is id-primary: flush receives one memtable
-            // winner per id and compaction emits one reconciled winner per
-            // id, both in ascending order. `record.labels` is itself
-            // sorted/deduplicated, so a linear `contains` here was redundant
-            // and made a 1.5M-node label sidecar O(N²).
-            debug_assert!(
-                ids.last().is_none_or(|previous| *previous < id),
-                "label posting input must be strictly id-ascending"
-            );
-            ids.push(id);
+            // The external sort key is `(property,key,id)`. Reuse `property`
+            // for LabelId and an empty value key, yielding exact
+            // `(LabelId,NodeId)` order without retaining posting vectors.
+            self.sorter.push(lid, &[], id)?;
         }
+        Ok(())
     }
 
-    /// Serialise the harvested postings into the sidecar body + descriptor.
+    /// Emit a composite `(LabelId BE,NodeId)->()` tree directly. A fixed
+    /// footer binds the tree to exact per-label manifest counts.
     pub(crate) fn finish(
         self,
         paths: &NamespacePaths,
         level: u32,
         sst_id: &Uuid,
     ) -> Result<LabelIndexSidecar> {
-        let index = self.index;
-        if index.is_empty() {
+        let mut sorted = self.sorter.finish()?;
+        let mut builder =
+            crate::sst::paged_index::SortedSpooledPagedIndexBuilder::label_membership();
+        let mut per_label_counts = Vec::new();
+        let mut active_label = None;
+        let mut active_count = 0_u64;
+        let mut posting_count = 0_u64;
+        while let Some(pair) = sorted.next_pair()? {
+            if !pair.key.is_empty() {
+                return Err(Error::invariant(
+                    "label-index scratch record unexpectedly carries a property key",
+                ));
+            }
+            if active_label != Some(pair.property) {
+                if let Some(label) = active_label {
+                    per_label_counts.push((label, active_count));
+                }
+                active_label = Some(pair.property);
+                active_count = 0;
+            }
+            let mut key = [0_u8; 20];
+            key[..4].copy_from_slice(&pair.property.to_be_bytes());
+            key[4..].copy_from_slice(&pair.id);
+            builder.push_inline(&key, &[])?;
+            active_count = active_count
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("per-label posting count exceeds u64"))?;
+            posting_count = posting_count
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("label posting count exceeds u64"))?;
+        }
+        if let Some(label) = active_label {
+            per_label_counts.push((label, active_count));
+        }
+        if posting_count == 0 {
             return Ok((None, None));
         }
-        // `per_label_counts` mirrors each posting list's length so the cost
-        // model can recover per-label `node_count` from the manifest alone (no
-        // sidecar body read); `posting_count` is just their sum.
-        let per_label_counts: Vec<(u32, u64)> = index
-            .iter()
-            .map(|(&lid, ids)| (lid, ids.len() as u64))
-            .collect();
-        let label_count = index.len() as u64;
-        let posting_count = per_label_counts.iter().map(|(_, c)| *c).sum();
-        let body_bytes = bincode::serialize(&index)
-            .map_err(|e| Error::invariant(format!("label-index bincode: {e}")))?;
-        let body = Bytes::from(body_bytes);
+        let upload = builder
+            .finish()?
+            .bind_label_counts(&per_label_counts, *sst_id.as_bytes())?;
+        let label_count = per_label_counts.len() as u64;
         let file_name = format!(
-            "{}-{}.labelidx.bin",
+            "{}-{}.labelidx.pidx",
             uuid_path_id(sst_id),
             SstKind::Nodes.path_tag()
         );
@@ -1097,12 +1233,16 @@ impl LabelIndexCollector {
         let relative = relative_sst_path(level, &file_name);
         let descriptor = crate::manifest::LabelIndexDescriptor {
             path: relative,
-            size_bytes: body.len() as u64,
+            size_bytes: upload.size_bytes(),
             label_count,
             posting_count,
+            format: crate::manifest::PropertyIndexFormat::PagedV1,
             per_label_counts,
         };
-        Ok((Some(descriptor), Some((object_path, body))))
+        Ok((
+            Some(descriptor),
+            Some((object_path, SidecarPayload::Paged(upload))),
+        ))
     }
 }
 
@@ -1269,12 +1409,139 @@ fn value_to_stat_scalar(v: &Value) -> Option<StatScalar> {
 /// to keep the return type under clippy's type-complexity threshold.
 type UniquePropertySidecars = (
     Vec<crate::manifest::UniquePropertyIndexDescriptor>,
-    Vec<(Path, Bytes)>,
+    Vec<(Path, SidecarPayload)>,
 );
 
+/// Explicit rolling-upgrade mode for old readers that require the monolithic
+/// bincode property map. Zero/default emits only PagedV2. A positive cap is a
+/// hard per-sidecar bound: crossing it fails the flush/compaction rather than
+/// silently dropping either authoritative representation.
+/// Size cap for the legacy bincode property sidecar.
+///
+/// The legacy body stays authoritative by default: it is the only shape a key
+/// too large to page can fall back to, and dropping it would leave such a
+/// property with no index at all. An explicit `0` opts out entirely; any other
+/// value caps the spool, and exceeding that cap degrades to paged-only rather
+/// than failing the flush.
+fn legacy_property_index_max_bytes() -> Result<Option<u64>> {
+    match std::env::var("NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES") {
+        Ok(raw) => {
+            let bytes = raw.parse::<u64>().map_err(|error| {
+                Error::precondition(format!(
+                    "invalid NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES={raw:?}: {error}"
+                ))
+            })?;
+            Ok((bytes > 0).then_some(bytes))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(Some(u64::MAX)),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::precondition(
+            "NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES is not valid UTF-8",
+        )),
+    }
+}
+
+struct LegacyMapSpool {
+    file: std::fs::File,
+    len: u64,
+    entries: u64,
+    limit: u64,
+}
+
+impl LegacyMapSpool {
+    fn new(limit: u64) -> Result<Self> {
+        let mut this = Self {
+            file: crate::sst::paged_index::create_spool_file()?,
+            len: 0,
+            entries: 0,
+            limit,
+        };
+        this.append(&0_u64.to_le_bytes())?;
+        Ok(this)
+    }
+
+    fn write_unique(&mut self, key: &[u8], id: &[u8; 16]) -> Result<()> {
+        self.write_string(key)?;
+        self.append(id)?;
+        self.bump_entries()
+    }
+
+    fn write_posting(
+        &mut self,
+        key: &[u8],
+        posting: &mut std::fs::File,
+        posting_len: u64,
+    ) -> Result<()> {
+        if posting_len % 16 != 0 {
+            return Err(Error::invariant(
+                "legacy equality posting is not NodeId-aligned",
+            ));
+        }
+        self.write_string(key)?;
+        self.append(&(posting_len / 16).to_le_bytes())?;
+        self.ensure_capacity(posting_len)?;
+        posting.rewind()?;
+        let copied = std::io::copy(posting, &mut self.file)?;
+        if copied != posting_len {
+            return Err(Error::invariant(
+                "legacy property posting scratch length changed",
+            ));
+        }
+        self.len += copied;
+        self.bump_entries()
+    }
+
+    fn finish(mut self) -> Result<(std::fs::File, u64)> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&self.entries.to_le_bytes())?;
+        if self.file.metadata()?.len() != self.len {
+            return Err(Error::invariant("legacy property map spool length changed"));
+        }
+        self.file.sync_data()?;
+        self.file.rewind()?;
+        Ok((self.file, self.len))
+    }
+
+    fn write_string(&mut self, key: &[u8]) -> Result<()> {
+        let key_len = u64::try_from(key.len())
+            .map_err(|_| Error::invariant("legacy property key exceeds u64"))?;
+        self.append(&key_len.to_le_bytes())?;
+        self.append(key)
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.ensure_capacity(bytes.len() as u64)?;
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn ensure_capacity(&self, additional: u64) -> Result<()> {
+        let next = self
+            .len
+            .checked_add(additional)
+            .ok_or_else(|| Error::invariant("legacy property map exceeds u64"))?;
+        if next > self.limit {
+            return Err(Error::precondition(format!(
+                "legacy property sidecar requires {next} bytes, above \
+                 NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES={}",
+                self.limit
+            )));
+        }
+        Ok(())
+    }
+
+    fn bump_entries(&mut self) -> Result<()> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("legacy property map entry count exceeds u64"))?;
+        Ok(())
+    }
+}
+
 /// For every `PropertyDef::unique == true` in `label_def.properties`,
-/// walk `rows`, harvest `(value_string, NodeId)` pairs, sort them into a
-/// `BTreeMap`, serialise to bincode, and produce one
+/// walk `rows`, harvest `(value_string, NodeId)` pairs through a bounded
+/// external sort, and produce one direct range-readable PagedV2
 /// `(UniquePropertyIndexDescriptor, (path, body))` pair per property.
 ///
 /// Returns the parallel collections so the descriptor can land in the
@@ -1282,9 +1549,9 @@ type UniquePropertySidecars = (
 ///
 /// Tombstoned rows contribute nothing — they're encoded in the SST body
 /// and the reader's last-LSN-wins logic surfaces them correctly. Rows
-/// without the property (nullable column, schema-evolved out, ...)
-/// contribute nothing either. Non-string property values are skipped —
-/// v0 covers LDBC's `id` only; a future bump can promote typed keys.
+/// without the property (nullable column, schema-evolved out, ...) contribute
+/// nothing either. Non-string property values are skipped. An explicitly
+/// configured bounded legacy-migration mode also streams the old bincode map.
 ///
 /// `pub(crate)` so `compact.rs` can re-emit sidecars when merging
 /// L0 SSTs into L1 (without this, post-compaction `lookup_node_by_property`
@@ -1298,11 +1565,11 @@ pub(crate) fn prepare_unique_property_sidecars(
     label_def: &LabelDef,
     rows: &[NodeRow],
 ) -> Result<UniquePropertySidecars> {
-    let mut collector = UniqueSidecarCollector::new(label_def);
+    let mut collector = UniqueSidecarCollector::new(label_def)?;
     for row in rows {
         if let MemOp::Upsert(payload) = &row.op {
             let rec = NodeWriteRecord::decode(payload)?;
-            collector.observe(row.id, &rec);
+            collector.observe(row.id, &rec)?;
         }
     }
     collector.finish(paths, level, sst_id, label)
@@ -1315,33 +1582,38 @@ pub(crate) fn prepare_unique_property_sidecars(
 /// exactly.
 #[derive(Debug)]
 pub(crate) struct UniqueSidecarCollector {
-    entries: Vec<(String, BTreeMap<String, [u8; 16]>)>,
+    properties: Vec<String>,
+    sorter: crate::sst::external_pairs::ExternalPairSorter,
 }
 
 impl UniqueSidecarCollector {
-    pub(crate) fn new(label_def: &LabelDef) -> Self {
-        Self {
-            entries: label_def
-                .properties
-                .iter()
-                .filter(|p| p.unique)
-                .map(|p| (p.name.clone(), BTreeMap::new()))
-                .collect(),
-        }
+    pub(crate) fn new(label_def: &LabelDef) -> Result<Self> {
+        let properties: Vec<String> = label_def
+            .properties
+            .iter()
+            .filter(|p| p.unique)
+            .map(|p| p.name.clone())
+            .collect();
+        u32::try_from(properties.len())
+            .map_err(|_| Error::invariant("unique property count exceeds u32"))?;
+        Ok(Self {
+            properties,
+            sorter: crate::sst::external_pairs::ExternalPairSorter::from_env()?,
+        })
     }
 
-    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
-        for (name, index) in &mut self.entries {
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) -> Result<()> {
+        for (ordinal, name) in self.properties.iter().enumerate() {
             if let Some(Value::Str(s)) = rec.properties.get(name) {
-                // Last-write-wins within one SST; the BTreeMap
-                // overwrites cleanly when the same value re-occurs
-                // (writer guarantees row order matches lsn order).
-                index.insert(s.clone(), id);
+                self.sorter.push(ordinal as u32, s.as_bytes(), id)?;
             }
         }
+        Ok(())
     }
 
-    /// Serialise the harvested maps into one sidecar per non-empty property.
+    /// Externally sort and emit one authoritative PagedV2 sidecar per
+    /// non-empty property. Duplicate values retain the greatest NodeId,
+    /// matching the previous id-ordered `BTreeMap::insert` behavior.
     pub(crate) fn finish(
         self,
         paths: &NamespacePaths,
@@ -1349,27 +1621,80 @@ impl UniqueSidecarCollector {
         sst_id: &Uuid,
         label: &str,
     ) -> Result<UniquePropertySidecars> {
+        let mut sorted = self.sorter.finish()?;
+        let mut builders: Vec<_> = self
+            .properties
+            .iter()
+            .map(|_| crate::sst::paged_index::SortedSpooledPagedIndexBuilder::unique())
+            .collect();
+        let legacy_limit = legacy_property_index_max_bytes()?;
+        let mut legacy: Vec<Option<LegacyMapSpool>> = self
+            .properties
+            .iter()
+            .map(|_| legacy_limit.map(LegacyMapSpool::new).transpose())
+            .collect::<Result<_>>()?;
+        let mut counts = vec![0_u64; self.properties.len()];
+        let mut pending: Option<crate::sst::external_pairs::ExternalPair> = None;
+        while let Some(pair) = sorted.next_pair()? {
+            if pair.property as usize >= builders.len() {
+                return Err(Error::invariant(
+                    "unique-index scratch property ordinal is out of range",
+                ));
+            }
+            match &mut pending {
+                Some(previous)
+                    if previous.property == pair.property && previous.key == pair.key =>
+                {
+                    // Runs are sorted by NodeId after `(property,key)`, so the
+                    // last duplicate exactly reproduces prior last-insert.
+                    previous.id = pair.id;
+                }
+                Some(_) => {
+                    let previous = pending.take().expect("matched Some above");
+                    let ordinal = previous.property as usize;
+                    builders[ordinal].push_inline(&previous.key, &previous.id)?;
+                    if let Some(legacy) = &mut legacy[ordinal] {
+                        legacy.write_unique(&previous.key, &previous.id)?;
+                    }
+                    counts[ordinal] = counts[ordinal]
+                        .checked_add(1)
+                        .ok_or_else(|| Error::invariant("unique-index count exceeds u64"))?;
+                    pending = Some(pair);
+                }
+                None => pending = Some(pair),
+            }
+        }
+        if let Some(previous) = pending {
+            let ordinal = previous.property as usize;
+            builders[ordinal].push_inline(&previous.key, &previous.id)?;
+            if let Some(legacy) = &mut legacy[ordinal] {
+                legacy.write_unique(&previous.key, &previous.id)?;
+            }
+            counts[ordinal] = counts[ordinal]
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("unique-index count exceeds u64"))?;
+        }
+
         let mut descriptors = Vec::new();
         let mut bodies = Vec::new();
-        for (name, index) in self.entries {
-            if index.is_empty() {
+        for (((name, builder), legacy), entry_count) in self
+            .properties
+            .into_iter()
+            .zip(builders)
+            .zip(legacy)
+            .zip(counts)
+        {
+            if entry_count == 0 {
                 continue;
             }
-            let entry_count = index.len() as u64;
-            let legacy = Bytes::from(
-                bincode::serialize(&index)
-                    .map_err(|e| Error::invariant(format!("unique-index bincode: {e}")))?,
-            );
-            let paged = crate::sst::paged_index::unique_keys_fit(&index)
-                .then(|| crate::sst::paged_index::build_unique(&index))
-                .transpose()?;
-            let legacy_name = format!(
-                "{}-{}-{}.idx_{}.bin",
-                uuid_path_id(sst_id),
-                SstKind::Nodes.path_tag(),
-                label,
-                name,
-            );
+            // See the equality path: an unpageable key keeps the legacy body
+            // instead of failing the flush.
+            let declined = builder.declined();
+            let upload = if declined {
+                None
+            } else {
+                Some(builder.finish()?)
+            };
             let paged_name = format!(
                 "{}-{}-{}.idx_{}.pidx",
                 uuid_path_id(sst_id),
@@ -1377,27 +1702,55 @@ impl UniqueSidecarCollector {
                 label,
                 name,
             );
-            let legacy_path = paths.sst_object(level, &legacy_name);
-            let legacy_relative = relative_sst_path(level, &legacy_name);
-            let paged_descriptor = paged.as_ref().map(|body| {
-                let paged_relative = relative_sst_path(level, &paged_name);
-                crate::manifest::PagedPropertyIndexDescriptor {
-                    path: paged_relative,
-                    size_bytes: body.len() as u64,
+            let paged_path = paths.sst_object(level, &paged_name);
+            let paged_relative = relative_sst_path(level, &paged_name);
+            let paged_size = upload.as_ref().map_or(0, |upload| upload.size_bytes());
+            if let Some(legacy) = legacy {
+                let legacy_name = format!(
+                    "{}-{}-{}.idx_{}.bin",
+                    uuid_path_id(sst_id),
+                    SstKind::Nodes.path_tag(),
+                    label,
+                    name,
+                );
+                let legacy_path = paths.sst_object(level, &legacy_name);
+                let legacy_relative = relative_sst_path(level, &legacy_name);
+                let (legacy_file, legacy_size) = legacy.finish()?;
+                descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
+                    property: name,
+                    path: legacy_relative,
+                    size_bytes: legacy_size,
+                    entry_count,
+                    format: crate::manifest::PropertyIndexFormat::BincodeV0,
+                    paged: upload
+                        .as_ref()
+                        .map(|_| crate::manifest::PagedPropertyIndexDescriptor {
+                            path: paged_relative,
+                            size_bytes: paged_size,
+                        }),
+                    paged_build_unsupported: declined,
+                });
+                bodies.push((
+                    legacy_path,
+                    SidecarPayload::Spooled(SpooledObject::from_file(legacy_file, legacy_size)),
+                ));
+                if let Some(upload) = upload {
+                    bodies.push((paged_path, SidecarPayload::Paged(upload)));
                 }
-            });
-            descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
-                property: name,
-                path: legacy_relative,
-                size_bytes: legacy.len() as u64,
-                entry_count,
-                format: crate::manifest::PropertyIndexFormat::BincodeV0,
-                paged: paged_descriptor,
-                paged_build_unsupported: paged.is_none(),
-            });
-            bodies.push((legacy_path, legacy));
-            if let Some(paged) = paged {
-                bodies.push((paths.sst_object(level, &paged_name), paged));
+            } else {
+                let Some(upload) = upload else {
+                    continue;
+                };
+                descriptors.push(crate::manifest::UniquePropertyIndexDescriptor {
+                    property: name,
+                    path: paged_relative,
+                    size_bytes: paged_size,
+                    entry_count,
+                    format: crate::manifest::PropertyIndexFormat::PagedV1,
+                    paged: None,
+                    paged_build_unsupported: false,
+                });
+                bodies.push((paged_path, SidecarPayload::Paged(upload)));
             }
         }
         Ok((descriptors, bodies))
@@ -1407,7 +1760,7 @@ impl UniqueSidecarCollector {
 /// Parallel outputs of [`prepare_equality_property_sidecars`].
 type EqualityPropertySidecars = (
     Vec<crate::manifest::EqualityIndexDescriptor>,
-    Vec<(Path, Bytes)>,
+    Vec<(Path, SidecarPayload)>,
 );
 
 /// For every `PropertyDef::indexed == true`, harvest `value_string ->
@@ -1429,11 +1782,11 @@ pub(crate) fn prepare_equality_property_sidecars(
     label_def: &LabelDef,
     rows: &[NodeRow],
 ) -> Result<EqualityPropertySidecars> {
-    let mut collector = EqualitySidecarCollector::new(label_def);
+    let mut collector = EqualitySidecarCollector::new(label_def)?;
     for row in rows {
         if let MemOp::Upsert(payload) = &row.op {
             let rec = NodeWriteRecord::decode(payload)?;
-            collector.observe(row.id, &rec);
+            collector.observe(row.id, &rec)?;
         }
     }
     collector.finish(paths, level, sst_id, label)
@@ -1446,43 +1799,39 @@ pub(crate) fn prepare_equality_property_sidecars(
 /// deliberate even for a legacy label-scoped SST: the raw storage API can
 /// contain rows that predate or disagree with the later schema declaration,
 /// and an authoritative negative-answer index must cover those rows too.
-#[derive(Debug)]
-struct EqualityPostingEntry {
-    name: String,
-    index: BTreeMap<String, Vec<[u8; 16]>>,
-}
-
 /// Streaming harvester behind [`prepare_equality_property_sidecars`]; the
 /// posting-list analogue of [`UniqueSidecarCollector`].
 #[derive(Debug)]
 pub(crate) struct EqualitySidecarCollector {
-    entries: Vec<EqualityPostingEntry>,
+    properties: Vec<String>,
+    sorter: crate::sst::external_pairs::ExternalPairSorter,
 }
 
 impl EqualitySidecarCollector {
-    pub(crate) fn new(label_def: &LabelDef) -> Self {
-        Self {
-            entries: label_def
-                .properties
-                .iter()
-                .filter(|p| {
-                    p.indexed
-                        && matches!(
-                            p.data_type,
-                            DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
-                        )
-                })
-                .map(|p| EqualityPostingEntry {
-                    name: p.name.clone(),
-                    index: BTreeMap::new(),
-                })
-                .collect(),
-        }
+    pub(crate) fn new(label_def: &LabelDef) -> Result<Self> {
+        let properties: Vec<String> = label_def
+            .properties
+            .iter()
+            .filter(|p| {
+                p.indexed
+                    && matches!(
+                        p.data_type,
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+                    )
+            })
+            .map(|p| p.name.clone())
+            .collect();
+        u32::try_from(properties.len())
+            .map_err(|_| Error::invariant("equality property count exceeds u32"))?;
+        Ok(Self {
+            properties,
+            sorter: crate::sst::external_pairs::ExternalPairSorter::from_env()?,
+        })
     }
 
-    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) {
-        for entry in &mut self.entries {
-            let value = rec.properties.get(&entry.name);
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) -> Result<()> {
+        for (ordinal, name) in self.properties.iter().enumerate() {
+            let value = rec.properties.get(name);
             // The declaration only decides whether this property has a
             // ScalarV1 sidecar. Coverage follows the stored value: both
             // supported runtime types must be harvested so a schema change,
@@ -1497,18 +1846,10 @@ impl EqualitySidecarCollector {
                 .flatten()
                 .and_then(crate::cache::encode_equality_property_value)
             {
-                let ids = entry.index.entry(key).or_default();
-                // Same id-primary invariant as LabelIndexCollector. For a
-                // low-cardinality value, `Vec::contains` made this posting
-                // construction quadratic in its frequency; append is O(1)
-                // and preserves the on-disk sorted/unique contract.
-                debug_assert!(
-                    ids.last().is_none_or(|previous| *previous < id),
-                    "equality posting input must be strictly id-ascending"
-                );
-                ids.push(id);
+                self.sorter.push(ordinal as u32, key.as_bytes(), id)?;
             }
         }
+        Ok(())
     }
 
     /// Serialise one sidecar per indexed property, including an empty map.
@@ -1525,24 +1866,67 @@ impl EqualitySidecarCollector {
         sst_id: &Uuid,
         label: &str,
     ) -> Result<EqualityPropertySidecars> {
+        let mut sorted = self.sorter.finish()?;
+        let mut builders: Vec<_> = self
+            .properties
+            .iter()
+            .map(|_| crate::sst::paged_index::SortedSpooledPagedIndexBuilder::equality())
+            .collect();
+        let legacy_limit = legacy_property_index_max_bytes()?;
+        let mut legacy: Vec<Option<LegacyMapSpool>> = self
+            .properties
+            .iter()
+            .map(|_| legacy_limit.map(LegacyMapSpool::new).transpose())
+            .collect::<Result<_>>()?;
+        let mut distinct_counts = vec![0_u64; self.properties.len()];
+        let mut posting: Option<PendingExternalPosting> = None;
+        while let Some(pair) = sorted.next_pair()? {
+            if pair.property as usize >= builders.len() {
+                return Err(Error::invariant(
+                    "equality-index scratch property ordinal is out of range",
+                ));
+            }
+            if posting
+                .as_ref()
+                .is_some_and(|active| active.property != pair.property || active.key != pair.key)
+            {
+                finish_external_posting(
+                    posting.take().expect("active posting checked above"),
+                    &mut builders,
+                    &mut distinct_counts,
+                    &mut legacy,
+                )?;
+            }
+            if posting.is_none() {
+                posting = Some(PendingExternalPosting::new(pair.property, pair.key)?);
+            }
+            posting
+                .as_mut()
+                .expect("posting initialized above")
+                .push(pair.id)?;
+        }
+        if let Some(posting) = posting {
+            finish_external_posting(posting, &mut builders, &mut distinct_counts, &mut legacy)?;
+        }
+
         let mut descriptors = Vec::new();
         let mut bodies = Vec::new();
-        for EqualityPostingEntry { name, index, .. } in self.entries {
-            let distinct_values = index.len() as u64;
-            let legacy = Bytes::from(
-                bincode::serialize(&index)
-                    .map_err(|e| Error::invariant(format!("equality-index bincode: {e}")))?,
-            );
-            let paged = crate::sst::paged_index::equality_keys_fit(&index)
-                .then(|| crate::sst::paged_index::build_equality(&index))
-                .transpose()?;
-            let legacy_name = format!(
-                "{}-{}-{}.eqidx_{}.bin",
-                uuid_path_id(sst_id),
-                SstKind::Nodes.path_tag(),
-                label,
-                name,
-            );
+        for (((name, builder), legacy), distinct_values) in self
+            .properties
+            .into_iter()
+            .zip(builders)
+            .zip(legacy)
+            .zip(distinct_counts)
+        {
+            // One key too wide to page must not cost the property its index:
+            // keep the legacy body and mark the accelerator unsupported, which
+            // is the same contract the pre-paged writer offered.
+            let declined = builder.declined();
+            let upload = if declined {
+                None
+            } else {
+                Some(builder.finish()?)
+            };
             let paged_name = format!(
                 "{}-{}-{}.eqidx_{}.pidx",
                 uuid_path_id(sst_id),
@@ -1550,33 +1934,120 @@ impl EqualitySidecarCollector {
                 label,
                 name,
             );
-            let legacy_path = paths.sst_object(level, &legacy_name);
-            let legacy_relative = relative_sst_path(level, &legacy_name);
-            let paged_descriptor = paged.as_ref().map(|body| {
-                let paged_relative = relative_sst_path(level, &paged_name);
-                crate::manifest::PagedPropertyIndexDescriptor {
-                    path: paged_relative,
-                    size_bytes: body.len() as u64,
+            let paged_path = paths.sst_object(level, &paged_name);
+            let paged_relative = relative_sst_path(level, &paged_name);
+            let paged_size = upload.as_ref().map_or(0, |upload| upload.size_bytes());
+            if let Some(legacy) = legacy {
+                let legacy_name = format!(
+                    "{}-{}-{}.eqidx_{}.bin",
+                    uuid_path_id(sst_id),
+                    SstKind::Nodes.path_tag(),
+                    label,
+                    name,
+                );
+                let legacy_path = paths.sst_object(level, &legacy_name);
+                let legacy_relative = relative_sst_path(level, &legacy_name);
+                let (legacy_file, legacy_size) = legacy.finish()?;
+                descriptors.push(crate::manifest::EqualityIndexDescriptor {
+                    property: name,
+                    path: legacy_relative,
+                    size_bytes: legacy_size,
+                    distinct_values,
+                    key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
+                    mixed_type_complete: true,
+                    format: crate::manifest::PropertyIndexFormat::BincodeV0,
+                    paged: upload
+                        .as_ref()
+                        .map(|_| crate::manifest::PagedPropertyIndexDescriptor {
+                            path: paged_relative,
+                            size_bytes: paged_size,
+                        }),
+                    paged_build_unsupported: declined,
+                });
+                bodies.push((
+                    legacy_path,
+                    SidecarPayload::Spooled(SpooledObject::from_file(legacy_file, legacy_size)),
+                ));
+                if let Some(upload) = upload {
+                    bodies.push((paged_path, SidecarPayload::Paged(upload)));
                 }
-            });
-            descriptors.push(crate::manifest::EqualityIndexDescriptor {
-                property: name,
-                path: legacy_relative,
-                size_bytes: legacy.len() as u64,
-                distinct_values,
-                key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
-                mixed_type_complete: true,
-                format: crate::manifest::PropertyIndexFormat::BincodeV0,
-                paged: paged_descriptor,
-                paged_build_unsupported: paged.is_none(),
-            });
-            bodies.push((legacy_path, legacy));
-            if let Some(paged) = paged {
-                bodies.push((paths.sst_object(level, &paged_name), paged));
+            } else {
+                // The operator opted out of the legacy body, so a decline here
+                // leaves no accelerator at all; readers fall back to the scan.
+                let Some(upload) = upload else {
+                    continue;
+                };
+                descriptors.push(crate::manifest::EqualityIndexDescriptor {
+                    property: name,
+                    path: paged_relative,
+                    size_bytes: paged_size,
+                    distinct_values,
+                    key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
+                    mixed_type_complete: true,
+                    format: crate::manifest::PropertyIndexFormat::PagedV1,
+                    paged: None,
+                    paged_build_unsupported: false,
+                });
+                bodies.push((paged_path, SidecarPayload::Paged(upload)));
             }
         }
         Ok((descriptors, bodies))
     }
+}
+
+struct PendingExternalPosting {
+    property: u32,
+    key: Vec<u8>,
+    file: std::fs::File,
+    len: u64,
+    checksum: crc32fast::Hasher,
+}
+
+impl PendingExternalPosting {
+    fn new(property: u32, key: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            property,
+            key,
+            file: crate::sst::paged_index::create_spool_file()?,
+            len: 0,
+            checksum: crc32fast::Hasher::new(),
+        })
+    }
+
+    fn push(&mut self, id: [u8; 16]) -> Result<()> {
+        let next_len = self
+            .len
+            .checked_add(16)
+            .ok_or_else(|| Error::invariant("equality posting length exceeds u64"))?;
+        if next_len > u32::MAX as u64 {
+            return Err(Error::precondition(
+                "one equality posting exceeds the 4 GiB PagedV2 wire limit",
+            ));
+        }
+        self.file.write_all(&id)?;
+        self.checksum.update(&id);
+        self.len = next_len;
+        Ok(())
+    }
+}
+
+fn finish_external_posting(
+    mut posting: PendingExternalPosting,
+    builders: &mut [crate::sst::paged_index::SortedSpooledPagedIndexBuilder],
+    distinct_counts: &mut [u64],
+    legacy: &mut [Option<LegacyMapSpool>],
+) -> Result<()> {
+    posting.file.sync_data()?;
+    let ordinal = posting.property as usize;
+    let checksum = posting.checksum.finalize();
+    builders[ordinal].push_external_file(&posting.key, &mut posting.file, posting.len, checksum)?;
+    if let Some(legacy) = &mut legacy[ordinal] {
+        legacy.write_posting(&posting.key, &mut posting.file, posting.len)?;
+    }
+    distinct_counts[ordinal] = distinct_counts[ordinal]
+        .checked_add(1)
+        .ok_or_else(|| Error::invariant("equality distinct-value count exceeds u64"))?;
+    Ok(())
 }
 
 fn prepare_edge_pending(
@@ -1586,10 +2057,12 @@ fn prepare_edge_pending(
     build: EdgeSstBuild,
 ) -> PendingSst {
     let EdgeSstBuild {
-        finish,
+        id,
+        body,
+        stats,
+        bloom,
         point_index,
     } = build;
-    let id = Uuid::now_v7();
     let level = SstLevel::L0;
     let kind = match direction {
         EdgeDirection::Forward => SstKind::EdgesFwd,
@@ -1605,7 +2078,7 @@ fn prepare_edge_pending(
     );
     let body_path = paths.sst_object(level.as_u32(), &file_name);
     let relative_path = relative_sst_path(level.as_u32(), &file_name);
-    let body_len = finish.body.len() as u64;
+    let body_len = body.size_bytes();
     let point_file_name = format!(
         "{}-{}-{}.epidx",
         uuid_path_id(&id),
@@ -1614,7 +2087,7 @@ fn prepare_edge_pending(
     );
     let point_path = paths.sst_object(level.as_u32(), &point_file_name);
     let index_sidecars = point_index
-        .map(|point_body| vec![(point_path, point_body.into())])
+        .map(|point_body| vec![(point_path, SidecarPayload::EdgePoint(point_body))])
         .unwrap_or_default();
 
     let (bloom_descriptor, bloom_path, bloom_body) = prepare_bloom_sidecar(
@@ -1623,10 +2096,9 @@ fn prepare_edge_pending(
         &id,
         direction.path_tag(),
         edge_type,
-        finish.bloom,
+        bloom,
     );
 
-    let stats = finish.stats;
     let descriptor = SstDescriptor {
         id,
         kind,
@@ -1659,7 +2131,7 @@ fn prepare_edge_pending(
     PendingSst {
         descriptor,
         body_path,
-        body: finish.body,
+        body: SidecarPayload::Spooled(body.into_spooled_object()),
         bloom_path,
         bloom_body,
         index_sidecars,
@@ -1695,22 +2167,6 @@ async fn put_create_payload(store: &dyn ObjectStore, path: &Path, body: PutPaylo
     Ok(())
 }
 
-/// Per-part chunk size for multipart uploads. S3's hard floor is 5 MiB on
-/// every part except the trailing one; we match that floor so each part
-/// is valid in isolation. R2 inherits the same floor.
-const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
-
-/// Threshold at which an SST body is uploaded via multipart instead of a
-/// single PUT. It must not be lower than [`MULTIPART_PART_SIZE`]: buffering
-/// writers commonly fall back to an ordinary overwrite PUT below their
-/// capacity, which would silently defeat both multipart and `PutMode::Create`.
-const MULTIPART_THRESHOLD: usize = MULTIPART_PART_SIZE;
-
-/// Default in-flight concurrency for multipart upload parts. The
-/// bounded queue prevents compaction from serialising every network RTT while
-/// avoiding an unbounded number of resident request bodies.
-const MULTIPART_MAX_CONCURRENCY: usize = 8;
-
 /// Maximum number of independent SST/sidecar objects uploaded concurrently by
 /// one flush. Combined with [`MULTIPART_MAX_CONCURRENCY`], this caps a flush at
 /// 32 in-flight part requests instead of multiplying by every label/sidecar.
@@ -1736,106 +2192,6 @@ pub(crate) async fn await_all_object_uploads(uploads: Vec<ObjectUploadFuture>) -
         result?;
     }
     Ok(())
-}
-
-/// Owns an in-progress multipart upload until it is completed successfully.
-///
-/// Object-store multipart handles cannot perform asynchronous cleanup from
-/// their own `Drop`. This guard bridges that gap: dropping the enclosing
-/// upload future (including task cancellation/abort) detaches a cleanup task
-/// on the current Tokio runtime which calls `MultipartUpload::abort`. Explicit
-/// error paths call [`Self::abort_after_error`] synchronously; a failed abort
-/// leaves the guard armed so `Drop` makes one final cleanup attempt.
-///
-/// A process crash can still prevent cleanup, so deployments must retain the
-/// incomplete-multipart lifecycle rule documented at module level.
-struct MultipartUploadGuard {
-    upload: Option<Box<dyn object_store::MultipartUpload>>,
-    path: Path,
-}
-
-impl MultipartUploadGuard {
-    fn new(upload: Box<dyn object_store::MultipartUpload>, path: &Path) -> Self {
-        Self {
-            upload: Some(upload),
-            path: path.clone(),
-        }
-    }
-
-    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        self.upload
-            .as_mut()
-            .expect("multipart upload guard used after completion")
-            .put_part(data)
-    }
-
-    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
-        let result = self
-            .upload
-            .as_mut()
-            .expect("multipart upload guard used after completion")
-            .complete()
-            .await;
-        if result.is_ok() {
-            // A successful complete makes the object visible and disarms the
-            // cancellation cleanup.
-            self.upload = None;
-        }
-        result
-    }
-
-    async fn abort_after_error(&mut self, context: &'static str) {
-        let Some(upload) = self.upload.as_mut() else {
-            return;
-        };
-        match upload.abort().await {
-            Ok(()) => self.upload = None,
-            Err(error) => {
-                warn!(
-                    path = %self.path,
-                    error = %error,
-                    context,
-                    "failed to abort multipart upload"
-                );
-            }
-        }
-    }
-}
-
-impl Drop for MultipartUploadGuard {
-    fn drop(&mut self) {
-        let Some(mut upload) = self.upload.take() else {
-            return;
-        };
-        let path = self.path.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                // Dropping the JoinHandle detaches, rather than cancels, the
-                // cleanup task. The upload handle stays owned by that task
-                // until abort reaches a terminal result.
-                let _cleanup = runtime.spawn(async move {
-                    if let Err(error) = upload.abort().await {
-                        warn!(
-                            path = %path,
-                            error = %error,
-                            "failed to abort multipart upload during cancellation cleanup"
-                        );
-                    }
-                });
-            }
-            Err(error) => {
-                // This is only reachable when an async upload future is
-                // manually polled outside Tokio or the runtime itself is
-                // already shutting down. The object-store lifecycle rule is
-                // the remaining crash-safety net in that situation.
-                warn!(
-                    path = %path,
-                    error = %error,
-                    "could not schedule multipart cancellation cleanup"
-                );
-            }
-        }
-    }
 }
 
 /// Split a scatter/gather object body into valid S3 multipart parts without
@@ -1929,83 +2285,9 @@ pub(crate) async fn put_payload(
     Ok(())
 }
 
-struct SpooledPayloadReader {
-    prefix: std::vec::IntoIter<Bytes>,
-    current: Option<Bytes>,
-    current_offset: usize,
-    file: Option<tokio::fs::File>,
-    file_bytes_remaining: u64,
-}
-
-impl SpooledPayloadReader {
-    fn new(prefix: Vec<Bytes>, file: Option<std::fs::File>, file_bytes: u64) -> Self {
-        Self {
-            prefix: prefix.into_iter(),
-            current: None,
-            current_offset: 0,
-            file: file.map(tokio::fs::File::from_std),
-            file_bytes_remaining: file_bytes,
-        }
-    }
-
-    async fn next_part(&mut self, part_size: usize) -> Result<Option<PutPayload>> {
-        let mut part = BytesMut::with_capacity(part_size);
-        while part.len() < part_size {
-            if let Some(current) = &self.current {
-                let take = (part_size - part.len()).min(current.len() - self.current_offset);
-                part.extend_from_slice(
-                    &current[self.current_offset..self.current_offset.saturating_add(take)],
-                );
-                self.current_offset += take;
-                if self.current_offset == current.len() {
-                    self.current = None;
-                    self.current_offset = 0;
-                }
-                continue;
-            }
-            if let Some(next) = self.prefix.next() {
-                self.current = Some(next);
-                continue;
-            }
-            let Some(file) = &mut self.file else {
-                if self.file_bytes_remaining != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "node-record spool disappeared before all bytes were uploaded",
-                    )
-                    .into());
-                }
-                break;
-            };
-            if self.file_bytes_remaining == 0 {
-                self.file = None;
-                break;
-            }
-            let remaining_in_part = part_size - part.len();
-            part.reserve(remaining_in_part);
-            // `BytesMut` may have more spare capacity than requested. Limit
-            // the reader itself so an allocator growth policy can never make
-            // a non-final multipart part larger than the R2/S3 fixed size.
-            let read_limit = remaining_in_part
-                .min(usize::try_from(self.file_bytes_remaining).unwrap_or(usize::MAX));
-            let mut limited = (&mut *file).take(read_limit as u64);
-            let read = limited.read_buf(&mut part).await?;
-            if read == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "node-record spool was truncated before upload",
-                )
-                .into());
-            }
-            self.file_bytes_remaining -= read as u64;
-        }
-        Ok((!part.is_empty()).then(|| PutPayload::from(part.freeze())))
-    }
-}
-
 /// Upload one optional accelerator, preserving create-only PUTs for ordinary
-/// in-memory bodies and streaming corpus-sized exact node records from their
-/// anonymous spool file.
+/// in-memory bodies and streaming corpus-sized exact node/edge records from
+/// their anonymous spool files.
 pub(crate) async fn put_sidecar_payload(
     store: Arc<dyn ObjectStore>,
     path: &Path,
@@ -2013,8 +2295,62 @@ pub(crate) async fn put_sidecar_payload(
 ) -> Result<()> {
     match body {
         SidecarPayload::InMemory(body) => put_payload(store, path, body).await,
+        SidecarPayload::Spooled(body) => put_spooled_object(store, path, body).await,
         SidecarPayload::NodeLocator(body) => put_node_locator_upload(store, path, body).await,
+        SidecarPayload::NodePropertyPages(body) => {
+            put_node_property_pages_upload(store, path, body).await
+        }
+        SidecarPayload::EdgePoint(body) => put_edge_point_upload(store, path, body).await,
+        SidecarPayload::Paged(body) => put_spooled_paged_upload(store, path, body).await,
     }
+}
+
+async fn put_node_property_pages_upload(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    body: crate::sst::nodes::property_pages::NodePropertyPageUpload,
+) -> Result<()> {
+    let body_len = body.size_bytes();
+    let (files, exact_len) = body.into_files();
+    debug_assert_eq!(body_len, exact_len);
+    put_spooled_object(
+        store,
+        path,
+        SpooledObject::from_files(Vec::new(), files, body_len),
+    )
+    .await
+}
+
+async fn put_edge_point_upload(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    body: crate::sst::paged_index::EdgePointIndexUpload,
+) -> Result<()> {
+    let body_len = body.size_bytes();
+    let (files, exact_len) = body.into_files();
+    debug_assert_eq!(body_len, exact_len);
+    put_spooled_object(
+        store,
+        path,
+        SpooledObject::from_files(Vec::new(), files, body_len),
+    )
+    .await
+}
+
+async fn put_spooled_paged_upload(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    body: crate::sst::paged_index::SpooledPagedIndexUpload,
+) -> Result<()> {
+    let body_len = body.size_bytes();
+    let (files, exact_len) = body.into_files();
+    debug_assert_eq!(body_len, exact_len);
+    put_spooled_object(
+        store,
+        path,
+        SpooledObject::from_files(Vec::new(), files, body_len),
+    )
+    .await
 }
 
 async fn put_node_locator_upload(
@@ -2023,90 +2359,18 @@ async fn put_node_locator_upload(
     body: crate::sst::paged_index::NodeLocatorRecordUpload,
 ) -> Result<()> {
     let body_len = body.size_bytes();
-    let (prefix, file, file_bytes) = body.into_parts();
-    let mut reader = SpooledPayloadReader::new(prefix, file, file_bytes);
-
-    if body_len < MULTIPART_THRESHOLD as u64 {
-        let payload = reader
-            .next_part(MULTIPART_THRESHOLD)
-            .await?
-            .unwrap_or_default();
-        if payload.content_length() as u64 != body_len {
-            return Err(Error::invariant(
-                "spooled sidecar length disagrees with its descriptor",
-            ));
-        }
-        debug_assert!(reader.next_part(1).await?.is_none());
-        return put_create_payload(store.as_ref(), path, payload).await;
-    }
-
-    let upload = store
-        .put_multipart(path)
-        .await
-        .map_err(Error::ObjectStore)?;
-    let mut upload = MultipartUploadGuard::new(upload, path);
-    let mut pending = FuturesUnordered::new();
-    let mut upload_error: Option<Error> = None;
-    let mut produced_bytes = 0_u64;
-
-    loop {
-        match reader.next_part(MULTIPART_PART_SIZE).await {
-            Ok(Some(part)) => {
-                let Some(next_produced) = produced_bytes.checked_add(part.content_length() as u64)
-                else {
-                    upload_error = Some(Error::invariant("spooled upload byte count exceeds u64"));
-                    break;
-                };
-                produced_bytes = next_produced;
-                pending.push(upload.put_part(part));
-            }
-            Ok(None) => break,
-            Err(error) => {
-                upload_error = Some(error);
-                break;
-            }
-        }
-        if pending.len() < MULTIPART_MAX_CONCURRENCY {
-            continue;
-        }
-        if let Some(Err(source)) = pending.next().await {
-            upload_error = Some(Error::ObjectStore(source));
-            break;
-        }
-    }
-
-    while let Some(result) = pending.next().await {
-        if upload_error.is_none() {
-            if let Err(source) = result {
-                upload_error = Some(Error::ObjectStore(source));
-            }
-        }
-    }
-    if let Some(error) = upload_error {
-        upload.abort_after_error("spooled upload failure").await;
-        return Err(error);
-    }
-    if produced_bytes != body_len {
-        upload
-            .abort_after_error("spooled upload length mismatch")
-            .await;
-        return Err(Error::invariant(
-            "spooled sidecar length disagrees with its descriptor",
-        ));
-    }
-
-    if let Err(source) = upload.complete().await {
-        upload
-            .abort_after_error("spooled upload completion failure")
-            .await;
-        return Err(Error::ObjectStore(source));
-    }
-    Ok(())
+    let (prefix, file, _file_bytes) = body.into_parts();
+    put_spooled_object(
+        store,
+        path,
+        SpooledObject::from_parts(prefix, file, body_len),
+    )
+    .await
 }
 
 /// Contiguous-body convenience wrapper used by ordinary SSTs and existing
-/// sidecars. Large exact-node sidecars use [`put_sidecar_payload`] so their
-/// corpus-sized value region is never materialised in RAM.
+/// sidecars. Large exact node/edge sidecars use [`put_sidecar_payload`] so
+/// their corpus-sized value regions are never materialised in RAM.
 pub(crate) async fn put_object(
     store: std::sync::Arc<dyn ObjectStore>,
     path: &Path,
@@ -2532,7 +2796,7 @@ pub mod builder {
             self,
         ) -> (
             Path,
-            Bytes,
+            super::SidecarPayload,
             Option<(Path, Bytes)>,
             Vec<(Path, super::SidecarPayload)>,
             SstDescriptor,
@@ -2977,6 +3241,40 @@ mod tests {
         assert_eq!(records.get(&6_u128.to_be_bytes()), expected.as_ref());
     }
 
+    #[tokio::test]
+    async fn spooled_edge_point_upload_round_trips_across_multipart_boundaries() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("edges-spooled.epidx");
+        let mut builder = crate::sst::paged_index::EdgePointIndexBuilder::new();
+        let resident_bound = builder.resident_bound_bytes();
+        let mut expected = None;
+        for n in 0..7_u128 {
+            let src = (n * 2).to_be_bytes();
+            let dst = (n * 2 + 1).to_be_bytes();
+            let value: Vec<u8> = (0..(900 * 1024 + n as usize))
+                .map(|offset| (offset as u8).wrapping_mul(31).wrapping_add(n as u8))
+                .collect();
+            if n == 6 {
+                expected = Some(value.clone());
+            }
+            builder.push(&src, &dst, &value).unwrap();
+        }
+        let upload = builder.finish_upload().unwrap();
+        assert!(upload.size_bytes() > MULTIPART_THRESHOLD as u64);
+        assert!(resident_bound < 32 * 1024);
+        assert_eq!(upload.spooled_page_bytes(), (64 + 4096) as u64);
+        assert!(upload.spooled_value_bytes() > MULTIPART_THRESHOLD as u64);
+        put_sidecar_payload(store.clone(), &path, SidecarPayload::EdgePoint(upload))
+            .await
+            .unwrap();
+
+        let probes = [((12_u128).to_be_bytes(), (13_u128).to_be_bytes())];
+        let (found, _) = crate::sst::paged_index::probe_edge_points(store, path, &probes)
+            .await
+            .unwrap();
+        assert_eq!(found.get(&probes[0]), expected.as_ref());
+    }
+
     #[test]
     fn build_node_sst_chunked_batches_round_trip() {
         // Enough rows to force several 16k-row write_batch chunks; the body
@@ -3193,8 +3491,8 @@ mod tests {
                 schema_version: 1,
                 ..Default::default()
             };
-            let mut collector = EqualitySidecarCollector::new(&label);
-            collector.observe(id, &record);
+            let mut collector = EqualitySidecarCollector::new(&label).unwrap();
+            collector.observe(id, &record).unwrap();
             let paths = make_paths(suffix);
             let (descriptors, bodies) = collector
                 .finish(&paths, 0, &Uuid::now_v7(), "Legacy")
@@ -3205,12 +3503,23 @@ mod tests {
                 descriptors[0].mixed_type_complete,
                 "only a sidecar with full runtime-type coverage may advertise completeness"
             );
-            let legacy = bodies
-                .iter()
-                .find(|(path, _)| path.as_ref().ends_with(".bin"))
-                .map(|(_, body)| body)
-                .expect("legacy equality body");
-            let postings: BTreeMap<String, Vec<[u8; 16]>> = bincode::deserialize(legacy).unwrap();
+            // The legacy body stays authoritative so a key too wide to page can
+            // still fall back to it; the paged sidecar rides along as the
+            // range-readable mirror that point probes actually use.
+            assert_eq!(
+                descriptors[0].format,
+                crate::manifest::PropertyIndexFormat::BincodeV0
+            );
+            assert!(descriptors[0].paged.is_some());
+            assert!(!descriptors[0].paged_build_unsupported);
+            let body = bodies
+                .into_iter()
+                .find_map(|(_, payload)| match payload {
+                    SidecarPayload::Paged(upload) => Some(upload.into_bytes().unwrap()),
+                    _ => None,
+                })
+                .expect("the paged equality mirror must be published");
+            let postings = crate::sst::paged_index::decode_all_equality(&body).unwrap();
             assert_eq!(
                 postings.get(encoded),
                 Some(&vec![id]),
@@ -3221,6 +3530,45 @@ mod tests {
                 "an absent key remains an authoritative miss"
             );
         }
+    }
+
+    #[test]
+    fn bounded_legacy_spool_is_bincode_identical_and_fails_above_cap() {
+        use std::io::Read as _;
+
+        let unique = BTreeMap::from([
+            ("a".to_string(), 1_u128.to_be_bytes()),
+            ("z".to_string(), 2_u128.to_be_bytes()),
+        ]);
+        let mut writer = LegacyMapSpool::new(1024).unwrap();
+        for (key, id) in &unique {
+            writer.write_unique(key.as_bytes(), id).unwrap();
+        }
+        let (mut file, _) = writer.finish().unwrap();
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bincode::serialize(&unique).unwrap());
+
+        let equality = BTreeMap::from([(
+            "b:1".to_string(),
+            vec![1_u128.to_be_bytes(), 2_u128.to_be_bytes()],
+        )]);
+        let mut posting = crate::sst::paged_index::create_spool_file().unwrap();
+        for id in &equality["b:1"] {
+            posting.write_all(id).unwrap();
+        }
+        let mut writer = LegacyMapSpool::new(1024).unwrap();
+        writer.write_posting(b"b:1", &mut posting, 32).unwrap();
+        let (mut file, _) = writer.finish().unwrap();
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bincode::serialize(&equality).unwrap());
+
+        let mut capped = LegacyMapSpool::new(8).unwrap();
+        assert!(matches!(
+            capped.write_unique(b"x", &1_u128.to_be_bytes()),
+            Err(Error::Precondition(_))
+        ));
     }
 
     #[test]
@@ -3376,6 +3724,46 @@ mod tests {
             .iter()
             .find(|d| d.kind == SstKind::Nodes)
             .unwrap();
+        let property_descriptor = node_d
+            .node_locator
+            .as_ref()
+            .and_then(|locator| locator.property_pages.as_ref())
+            .expect("current node flush emits ranged property pages");
+        assert!(property_descriptor.is_bound_to(node_d));
+        let property_path = object_store::path::Path::from(format!(
+            "{}/{}",
+            ms.paths().namespace_prefix().as_ref(),
+            property_descriptor.path
+        ));
+        let property_meta = store.head(&property_path).await.unwrap();
+        assert_eq!(property_meta.size, property_descriptor.size_bytes);
+        let property_source = Arc::new(
+            crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(
+                store.clone(),
+                property_meta,
+            )
+            .await
+            .unwrap(),
+        );
+        let property_reader = crate::sst::nodes::property_pages::NodePropertyPageReader::open(
+            property_source,
+            node_d.id,
+            crate::sst::nodes::property_pages::NodePropertyPageConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            property_reader.content_xxh3(),
+            property_descriptor.content_xxh3
+        );
+        let (projected, _) = property_reader
+            .project_node_ids(&["name".into()], &[*alice.as_bytes(), *bob.as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str("Alice".into()))
+        );
         let abs = ms
             .paths()
             .sst_object(node_d.level.as_u32(), file_basename(&node_d.path));

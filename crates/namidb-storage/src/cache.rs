@@ -18,18 +18,19 @@
 //! any normalisation work on the hot path and matches what
 //! `Snapshot::get_sst_body` already constructs.
 //! - Eviction policy is `S3FifoConfig` (the foyer default).
-//! - Weight is `key.len() + value.len()` so the cache obeys a real-byte
-//! budget rather than an entry count.
+//! - Weight includes key/value bytes plus conservative cache-record,
+//! hash-index and eviction-policy overhead, so the budget is not bypassed by
+//! millions of tiny entries.
 //! - Legacy per-tier budgets are scaled under the process-wide
 //! `NAMIDB_CACHE_MAX_BYTES` ceiling before the shared cache is constructed.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arrow_array::RecordBatch;
 use bytes::Bytes;
-use foyer::{Cache, CacheBuilder};
+use foyer::{Cache, CacheBuilder, Event, EventListener};
 use parquet::file::metadata::ParquetMetaData;
 
 use namidb_core::Value;
@@ -79,6 +80,13 @@ pub const DEFAULT_TEXT_INDEX_CACHE_BUDGET_MIB: usize = 512;
 /// vectors and a navigation-space copy, so it receives a larger default.
 pub const DEFAULT_VECTOR_INDEX_CACHE_BUDGET_MIB: usize = 512;
 
+/// Default budget for manifest-admission and resident-path metadata.
+///
+/// This state owns path strings independently from Foyer values. Keeping it
+/// as a first-class tier prevents a long eviction/churn workload from growing
+/// cache metadata outside `NAMIDB_CACHE_MAX_BYTES`.
+pub const DEFAULT_PATH_REGISTRY_CACHE_BUDGET_MIB: usize = 32;
+
 /// Read `NAMIDB_DECODED_NODE_RG_CACHE_BUDGET_MIB` or fall back to
 /// [`DEFAULT_DECODED_NODE_RG_CACHE_BUDGET_MIB`].
 pub fn decoded_node_rg_cache_budget_bytes() -> usize {
@@ -92,6 +100,13 @@ pub fn property_sidecar_cache_budget_bytes() -> usize {
     legacy_budget_bytes(
         "NAMIDB_PROPERTY_SIDECAR_CACHE_BUDGET_MIB",
         DEFAULT_PROPERTY_SIDECAR_CACHE_BUDGET_MIB,
+    )
+}
+
+pub fn path_registry_cache_budget_bytes() -> usize {
+    legacy_budget_bytes(
+        "NAMIDB_CACHE_PATH_REGISTRY_BUDGET_MIB",
+        DEFAULT_PATH_REGISTRY_CACHE_BUDGET_MIB,
     )
 }
 
@@ -191,7 +206,7 @@ fn decoded_property_sidecar_weight(key: &str, value: &DecodedPropertySidecar) ->
             })
         }
     };
-    key.len().saturating_add(payload)
+    cache_key_weight(key).saturating_add(payload)
 }
 
 fn edge_stream_bundle_weight(key: &str, bundle: &Arc<EdgeStreamBundle>) -> usize {
@@ -220,7 +235,7 @@ fn edge_stream_bundle_weight(key: &str, bundle: &Arc<EdgeStreamBundle>) -> usize
                 .saturating_add(strings_weight(values))
         },
     );
-    key.len()
+    cache_key_weight(key)
         .saturating_add(std::mem::size_of::<EdgeStreamBundle>())
         .saturating_add(overflow)
         .saturating_add(declared)
@@ -231,7 +246,10 @@ fn edge_reader_weight(key: &str, reader: &Arc<crate::sst::edges::EdgeSstReader>)
     // section end is a safe lower bound for that retained allocation; charge
     // the footer/table and parsed cumulative/fence structures on top. These
     // estimates intentionally overcharge normal files so budget eviction is
-    // preferable to an unbounded resident graph.
+    // preferable to an unbounded resident graph. If the raw-body tier shares
+    // the same Bytes allocation, both tiers still charge the full body: this
+    // conservative double accounting is stable even when either owner evicts
+    // or an active query temporarily pins one clone.
     let footer = reader.footer();
     let body_end = footer
         .sections
@@ -246,11 +264,13 @@ fn edge_reader_weight(key: &str, reader: &Arc<crate::sst::edges::EdgeSstReader>)
         .saturating_mul(16)
         .saturating_add(footer.sections.len().saturating_mul(160))
         .saturating_add(4096);
-    key.len().saturating_add(body_bytes).saturating_add(parsed)
+    cache_key_weight(key)
+        .saturating_add(body_bytes)
+        .saturating_add(parsed)
 }
 
 fn bloom_filter_weight(key: &str, filter: &Arc<BloomFilter>) -> usize {
-    key.len()
+    cache_key_weight(key)
         .saturating_add(
             (filter.block_count() as usize).saturating_mul(8 * std::mem::size_of::<u32>()),
         )
@@ -266,7 +286,7 @@ struct WeightedArc<T> {
 
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 fn weighted_arc_weight<T>(key: &str, value: &WeightedArc<T>) -> usize {
-    key.len().saturating_add(value.estimated_bytes)
+    cache_key_weight(key).saturating_add(value.estimated_bytes)
 }
 
 /// Vector and full-text accelerators share one eviction pool. They are both
@@ -278,8 +298,15 @@ fn weighted_arc_weight<T>(key: &str, value: &WeightedArc<T>) -> usize {
 enum CachedSearchIndex {
     #[cfg(feature = "text-index")]
     Text(WeightedArc<crate::sst::text::TextIndex>),
+    /// Sparse footer/directory for a range-readable NAMIFT03 object. Posting
+    /// and document pages are retained by the separate hybrid range cache,
+    /// never in this decoded-index entry.
+    #[cfg(feature = "text-index")]
+    TextV3(WeightedArc<crate::sst::text::TextIndexV3Reader>),
     #[cfg(feature = "vector-index")]
     Vector(WeightedArc<crate::sst::vector::VectorGraphIndex>),
+    #[cfg(feature = "vector-index")]
+    VectorV5(WeightedArc<crate::sst::vector::v5::VectorV5Reader>),
 }
 
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
@@ -287,8 +314,12 @@ fn cached_search_index_weight(key: &str, value: &CachedSearchIndex) -> usize {
     match value {
         #[cfg(feature = "text-index")]
         CachedSearchIndex::Text(value) => weighted_arc_weight(key, value),
+        #[cfg(feature = "text-index")]
+        CachedSearchIndex::TextV3(value) => weighted_arc_weight(key, value),
         #[cfg(feature = "vector-index")]
         CachedSearchIndex::Vector(value) => weighted_arc_weight(key, value),
+        #[cfg(feature = "vector-index")]
+        CachedSearchIndex::VectorV5(value) => weighted_arc_weight(key, value),
     }
 }
 
@@ -316,6 +347,7 @@ struct SstCacheBudgets {
     body_bytes: usize,
     node_row_group_bytes: usize,
     property_sidecar_bytes: usize,
+    path_registry_bytes: usize,
     decoded: DecodedCacheBudgets,
 }
 
@@ -328,7 +360,8 @@ impl SstCacheBudgets {
             .saturating_add(self.decoded.metadata_bytes)
             .saturating_add(self.decoded.edge_stream_bytes)
             .saturating_add(self.decoded.edge_reader_bytes)
-            .saturating_add(self.decoded.bloom_bytes);
+            .saturating_add(self.decoded.bloom_bytes)
+            .saturating_add(self.path_registry_bytes);
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
         let base = base.saturating_add(self.decoded.search_index_bytes);
         base
@@ -405,8 +438,7 @@ pub(crate) fn decoded_node_row_group_weight(
     key: &NodeRowGroupKey,
     value: &DecodedNodeRowGroup,
 ) -> usize {
-    key.0
-        .len()
+    cache_key_weight(&key.0)
         .saturating_add(std::mem::size_of::<usize>())
         .saturating_add(value.iter().fold(0usize, |sum, batch| {
             sum.saturating_add(batch.get_array_memory_size())
@@ -414,11 +446,20 @@ pub(crate) fn decoded_node_row_group_weight(
 }
 
 fn raw_body_weight(key: &str, value: &Bytes) -> usize {
-    key.len().saturating_add(value.len())
+    cache_key_weight(key).saturating_add(value.len())
 }
 
 fn metadata_weight(key: &str, value: &Arc<ParquetMetaData>) -> usize {
-    key.len().saturating_add(value.memory_size())
+    cache_key_weight(key).saturating_add(value.memory_size())
+}
+
+/// Conservative cache-owned overhead outside the payload itself: Foyer record,
+/// hash-index/eviction-policy nodes, `Arc` bookkeeping, and allocator slack.
+/// The path bytes are charged separately by [`cache_key_weight`].
+const FOYER_ENTRY_OVERHEAD_BYTES: usize = 192;
+
+fn cache_key_weight(key: &str) -> usize {
+    key.len().saturating_add(FOYER_ENTRY_OVERHEAD_BYTES)
 }
 
 fn fits_capacity(capacity_bytes: usize, weight: usize) -> bool {
@@ -432,7 +473,7 @@ fn text_index_estimated_weight(key: &str, wire_bytes: usize, doc_count: usize) -
     // separately sorted id copy. The independent per-document floor protects
     // malformed/legacy descriptors whose serialized size understates the
     // decoded object.
-    key.len().saturating_add(
+    cache_key_weight(key).saturating_add(
         wire_bytes
             .saturating_mul(6)
             .max(doc_count.saturating_mul(512))
@@ -453,7 +494,7 @@ fn vector_index_estimated_weight(
     // no-body-cache path and, importantly, is used both before and after
     // decode so an admitted miss cannot turn into an uncached decode loop.
     let per_point = dim.saturating_mul(8).saturating_add(512);
-    key.len().saturating_add(
+    cache_key_weight(key).saturating_add(
         wire_bytes
             .saturating_mul(6)
             .max(point_count.saturating_mul(per_point))
@@ -556,7 +597,52 @@ impl TrackedCacheEntry {
     }
 }
 
-#[derive(Debug, Default)]
+/// Conservative metadata allowance for one registry entry, in addition to its
+/// owned path allocation and inline enum. This covers the hash-table bucket,
+/// control byte, load-factor slack and allocator bookkeeping.
+const TRACKED_CACHE_ENTRY_OVERHEAD_BYTES: usize = 160;
+const REGISTRY_HASH_ENTRY_OVERHEAD_BYTES: usize = 128;
+const REGISTRY_QUEUE_ENTRY_OVERHEAD_BYTES: usize = 64;
+
+fn tracked_cache_entry_metadata_bytes(entry: &TrackedCacheEntry) -> usize {
+    std::mem::size_of::<TrackedCacheEntry>()
+        .saturating_add(entry.path().len())
+        .saturating_add(TRACKED_CACHE_ENTRY_OVERHEAD_BYTES)
+}
+
+fn owned_string_metadata_bytes(value: &String) -> usize {
+    std::mem::size_of::<String>().saturating_add(value.capacity())
+}
+
+fn live_rule_metadata_bytes(prefix: &str, live: &HashSet<String>) -> usize {
+    std::mem::size_of::<HashSet<String>>()
+        .saturating_add(std::mem::size_of::<String>())
+        .saturating_add(prefix.len())
+        .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES)
+        .saturating_add(live.iter().fold(0usize, |total, path| {
+            total
+                .saturating_add(std::mem::size_of::<String>())
+                .saturating_add(path.len())
+                .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES)
+        }))
+        .saturating_add(if live.is_empty() {
+            std::mem::size_of::<String>()
+                .saturating_add(prefix.len())
+                .saturating_add(REGISTRY_QUEUE_ENTRY_OVERHEAD_BYTES)
+        } else {
+            0
+        })
+}
+
+fn denied_rule_metadata_bytes(prefix: &str) -> usize {
+    std::mem::size_of::<String>()
+        .saturating_mul(2)
+        .saturating_add(prefix.len().saturating_mul(2))
+        .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES)
+        .saturating_add(REGISTRY_QUEUE_ENTRY_OVERHEAD_BYTES)
+}
+
+#[derive(Debug)]
 struct CachePathRegistry {
     entries: HashSet<TrackedCacheEntry>,
     /// Normalized namespace prefix (always trailing `/`) -> absolute live
@@ -576,6 +662,15 @@ struct CachePathRegistry {
     /// control-plane path, so FIFO gives deterministic O(1) admission without
     /// adding an LRU dependency to every cache miss.
     denied_order: VecDeque<String>,
+    /// Logical, conservatively weighted metadata bytes. Entry bytes stay O(1)
+    /// to update on Foyer's hot eviction path; namespace-rule bytes are
+    /// recomputed only on manifest/tenant control-plane operations.
+    entry_bytes: usize,
+    rule_bytes: usize,
+    capacity_bytes: usize,
+    /// If an authoritative rule cannot fit, fail closed instead of retaining
+    /// unbounded metadata or allowing a stale decode to repopulate old data.
+    admission_disabled: bool,
 }
 
 const MAX_DENIED_CACHE_NAMESPACES: usize = 4096;
@@ -583,7 +678,70 @@ const MAX_DENIED_CACHE_NAMESPACES: usize = 4096;
 const MAX_EMPTY_LIVE_NAMESPACES: usize = 4096;
 
 impl CachePathRegistry {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            entries: HashSet::new(),
+            live_by_namespace: HashMap::new(),
+            denied_namespaces: HashSet::new(),
+            empty_live_order: VecDeque::new(),
+            denied_order: VecDeque::new(),
+            entry_bytes: 0,
+            rule_bytes: 0,
+            capacity_bytes,
+            admission_disabled: false,
+        }
+    }
+
+    fn used_bytes(&self) -> usize {
+        self.entry_bytes.saturating_add(self.rule_bytes)
+    }
+
+    fn can_reserve(&self, bytes: usize) -> bool {
+        bytes <= self.capacity_bytes.saturating_sub(self.used_bytes())
+    }
+
+    fn try_insert_entry(&mut self, entry: TrackedCacheEntry) -> bool {
+        if self.entries.contains(&entry) {
+            return true;
+        }
+        let bytes = tracked_cache_entry_metadata_bytes(&entry);
+        if !self.can_reserve(bytes) {
+            return false;
+        }
+        let inserted = self.entries.insert(entry);
+        if inserted {
+            self.entry_bytes = self.entry_bytes.saturating_add(bytes);
+        }
+        inserted
+    }
+
+    fn remove_entry(&mut self, entry: &TrackedCacheEntry) -> bool {
+        let Some(removed) = self.entries.take(entry) else {
+            return false;
+        };
+        self.entry_bytes = self
+            .entry_bytes
+            .saturating_sub(tracked_cache_entry_metadata_bytes(&removed));
+        // Natural eviction can empty a high-water table. Shrink
+        // geometrically so bucket allocations cannot survive churn forever,
+        // while avoiding a reallocation on every single eviction.
+        if self.entries.capacity() > 64
+            && self.entries.len().saturating_mul(2) < self.entries.capacity()
+        {
+            self.entries.shrink_to_fit();
+        }
+        true
+    }
+
+    fn clear_entries(&mut self) {
+        self.entries = HashSet::new();
+        self.entry_bytes = 0;
+    }
+
     fn admits(&self, path: &str) -> bool {
+        if self.admission_disabled {
+            return false;
+        }
         // Every engine-owned cache path is `<namespace-prefix>/sst/...`.
         // Recover the normalized prefix as a borrowed slice so the hot path
         // performs two hash probes without allocating or walking up to 4096
@@ -621,58 +779,197 @@ impl CachePathRegistry {
     }
 
     fn allow_namespace(&mut self, prefix: &str, live: &HashSet<String>) {
-        if self.denied_namespaces.remove(prefix) {
-            self.denied_order.retain(|denied| denied != prefix);
+        self.remove_namespace_rules(prefix);
+        if self.admission_disabled {
+            return;
         }
+
         // Empty is an authoritative manifest live set, not "no rule". It
         // occurs both on a fresh namespace and after compaction GCs the final
         // tombstone. Retaining it prevents a decode begun against the previous
         // manifest from repopulating an obsolete body after that transition.
         // The first flush publishes its non-empty live set before any later
         // read can cache the new immutable object.
-        if live.is_empty() {
-            if !self
-                .live_by_namespace
-                .get(prefix)
-                .is_some_and(HashSet::is_empty)
-            {
-                self.empty_live_order.retain(|empty| empty != prefix);
-                self.empty_live_order.push_back(prefix.to_string());
+        if live.is_empty() && self.empty_live_order.len() >= MAX_EMPTY_LIVE_NAMESPACES {
+            if let Some(expired) = self.empty_live_order.pop_front() {
+                if self
+                    .live_by_namespace
+                    .get(&expired)
+                    .is_some_and(HashSet::is_empty)
+                {
+                    self.live_by_namespace.remove(&expired);
+                }
             }
-        } else {
-            self.empty_live_order.retain(|empty| empty != prefix);
         }
+
+        self.recompute_rule_bytes();
+        let required = live_rule_metadata_bytes(prefix, live);
+        if !self.can_reserve(required) {
+            self.admission_disabled = true;
+            tracing::warn!(
+                registry_capacity_bytes = self.capacity_bytes,
+                registry_usage_bytes = self.used_bytes(),
+                required_rule_bytes = required,
+                "cache path registry exhausted; disabling SST cache admission"
+            );
+            return;
+        }
+
+        if live.is_empty() {
+            self.empty_live_order.push_back(prefix.to_string());
+        }
+        // Rebuild instead of `HashSet::clone`: callers can pass a sparse set
+        // whose historical bucket capacity is enormous. Only live elements,
+        // not the caller's high-water allocation, belong in this registry.
+        let compact_live = live.iter().cloned().collect();
         self.live_by_namespace
-            .insert(prefix.to_string(), live.clone());
-        while self.empty_live_order.len() > MAX_EMPTY_LIVE_NAMESPACES {
-            let Some(expired) = self.empty_live_order.pop_front() else {
-                break;
-            };
-            if self
-                .live_by_namespace
-                .get(&expired)
-                .is_some_and(HashSet::is_empty)
-            {
-                self.live_by_namespace.remove(&expired);
-            }
+            .insert(prefix.to_string(), compact_live);
+        self.recompute_rule_bytes();
+        if self.used_bytes() > self.capacity_bytes {
+            self.remove_namespace_rules(prefix);
+            self.admission_disabled = true;
+            tracing::warn!(
+                registry_capacity_bytes = self.capacity_bytes,
+                registry_usage_bytes = self.used_bytes(),
+                "cache path rule allocation exceeded its conservative estimate; disabling admission"
+            );
         }
     }
 
     fn deny_namespace(&mut self, prefix: String) {
-        self.live_by_namespace.remove(&prefix);
-        self.empty_live_order.retain(|empty| empty != &prefix);
-        if self.live_by_namespace.is_empty() {
+        self.remove_namespace_rules(&prefix);
+        if self.admission_disabled {
+            return;
+        }
+
+        if self.denied_namespaces.len() >= MAX_DENIED_CACHE_NAMESPACES {
+            if let Some(expired) = self.denied_order.pop_front() {
+                self.denied_namespaces.remove(&expired);
+            }
+        }
+        self.recompute_rule_bytes();
+        let required = denied_rule_metadata_bytes(&prefix);
+        if !self.can_reserve(required) {
+            self.admission_disabled = true;
+            tracing::warn!(
+                registry_capacity_bytes = self.capacity_bytes,
+                registry_usage_bytes = self.used_bytes(),
+                required_rule_bytes = required,
+                "cache path registry exhausted; disabling SST cache admission"
+            );
+            return;
+        }
+
+        self.denied_namespaces.insert(prefix.clone());
+        self.denied_order.push_back(prefix);
+        self.recompute_rule_bytes();
+        if self.used_bytes() > self.capacity_bytes {
+            let prefix = self.denied_order.back().cloned().unwrap_or_default();
+            self.remove_namespace_rules(&prefix);
+            self.admission_disabled = true;
+            tracing::warn!(
+                registry_capacity_bytes = self.capacity_bytes,
+                registry_usage_bytes = self.used_bytes(),
+                "cache deny-rule allocation exceeded its conservative estimate; disabling admission"
+            );
+        }
+    }
+
+    fn remove_namespace_rules(&mut self, prefix: &str) {
+        self.live_by_namespace.remove(prefix);
+        self.empty_live_order.retain(|empty| empty != prefix);
+        self.denied_namespaces.remove(prefix);
+        self.denied_order.retain(|denied| denied != prefix);
+        if self.live_by_namespace.is_empty()
+            || (self.live_by_namespace.capacity() > 64
+                && self.live_by_namespace.len().saturating_mul(2)
+                    < self.live_by_namespace.capacity())
+        {
             self.live_by_namespace.shrink_to_fit();
         }
-        if self.denied_namespaces.insert(prefix.clone()) {
-            self.denied_order.push_back(prefix);
+        if self.denied_namespaces.capacity() > 64
+            && self.denied_namespaces.len().saturating_mul(2) < self.denied_namespaces.capacity()
+        {
+            self.denied_namespaces.shrink_to_fit();
         }
-        while self.denied_namespaces.len() > MAX_DENIED_CACHE_NAMESPACES {
-            let Some(expired) = self.denied_order.pop_front() else {
-                break;
-            };
-            self.denied_namespaces.remove(&expired);
+        if self.empty_live_order.capacity() > 64
+            && self.empty_live_order.len().saturating_mul(2) < self.empty_live_order.capacity()
+        {
+            self.empty_live_order.shrink_to_fit();
         }
+        if self.denied_order.capacity() > 64
+            && self.denied_order.len().saturating_mul(2) < self.denied_order.capacity()
+        {
+            self.denied_order.shrink_to_fit();
+        }
+        self.recompute_rule_bytes();
+    }
+
+    fn recompute_rule_bytes(&mut self) {
+        let live_bytes = self
+            .live_by_namespace
+            .iter()
+            .fold(0usize, |total, (prefix, live)| {
+                let map_entry = owned_string_metadata_bytes(prefix)
+                    .saturating_add(std::mem::size_of::<HashSet<String>>())
+                    .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES);
+                let paths = live.iter().fold(0usize, |paths, path| {
+                    paths
+                        .saturating_add(owned_string_metadata_bytes(path))
+                        .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES)
+                });
+                total.saturating_add(map_entry).saturating_add(paths)
+            });
+        let empty_order_bytes = self.empty_live_order.iter().fold(0usize, |total, prefix| {
+            total
+                .saturating_add(owned_string_metadata_bytes(prefix))
+                .saturating_add(REGISTRY_QUEUE_ENTRY_OVERHEAD_BYTES)
+        });
+        let denied_set_bytes = self.denied_namespaces.iter().fold(0usize, |total, prefix| {
+            total
+                .saturating_add(owned_string_metadata_bytes(prefix))
+                .saturating_add(REGISTRY_HASH_ENTRY_OVERHEAD_BYTES)
+        });
+        let denied_order_bytes = self.denied_order.iter().fold(0usize, |total, prefix| {
+            total
+                .saturating_add(owned_string_metadata_bytes(prefix))
+                .saturating_add(REGISTRY_QUEUE_ENTRY_OVERHEAD_BYTES)
+        });
+        self.rule_bytes = live_bytes
+            .saturating_add(empty_order_bytes)
+            .saturating_add(denied_set_bytes)
+            .saturating_add(denied_order_bytes);
+    }
+}
+
+/// Foyer calls listeners after removing records from its shard lock. Only
+/// natural eviction and replacement are handled here: explicit `remove` is
+/// issued while the registry mutex is held by prune/clear and is accounted by
+/// those callers, avoiding listener reentrancy.
+struct CacheRegistryListener<K, V> {
+    registry: Weak<Mutex<CachePathRegistry>>,
+    classify: fn(&K, &V) -> TrackedCacheEntry,
+}
+
+impl<K, V> EventListener for CacheRegistryListener<K, V>
+where
+    K: foyer::Key,
+    V: foyer::Value,
+{
+    type Key = K;
+    type Value = V;
+
+    fn on_leave(&self, reason: Event, key: &K, value: &V) {
+        if !matches!(reason, Event::Evict | Event::Replace) {
+            return;
+        }
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        registry
+            .lock()
+            .unwrap()
+            .remove_entry(&(self.classify)(key, value));
     }
 }
 
@@ -738,6 +1035,16 @@ struct CacheStats {
     node_locator_pages: AtomicU64,
     node_locator_entries_examined: AtomicU64,
     node_locator_bytes: AtomicU64,
+    /// Exact `(LabelId, NodeId)` sidecar membership used to prune labelled
+    /// graph expansion targets without hydrating complete node rows. A probe
+    /// is one descriptor/label batch, not one endpoint.
+    label_membership_fast_paths: AtomicU64,
+    label_membership_fallbacks: AtomicU64,
+    label_membership_probes: AtomicU64,
+    label_membership_candidates: AtomicU64,
+    label_membership_pages: AtomicU64,
+    label_membership_entries_examined: AtomicU64,
+    label_membership_bytes: AtomicU64,
     /// Range-readable exact-edge sidecar work. One probe may contain a whole
     /// UNWIND batch and visit each distinct B+tree page once.
     edge_point_probes: AtomicU64,
@@ -836,6 +1143,14 @@ impl std::fmt::Debug for SstCache {
                 &self.budgets.aggregate_capacity_bytes(),
             )
             .field("aggregate_usage_bytes", &self.aggregate_usage_bytes())
+            .field(
+                "path_registry_capacity_bytes",
+                &self.budgets.path_registry_bytes,
+            )
+            .field(
+                "path_registry_usage_bytes",
+                &self.path_registry_usage_bytes(),
+            )
             .field(
                 "metadata_capacity_bytes",
                 &self.budgets.decoded.metadata_bytes,
@@ -956,8 +1271,8 @@ impl std::fmt::Debug for SstCache {
 }
 
 impl SstCache {
-    /// Build a new cache sized for `capacity_bytes`. Entries weight as
-    /// `key.len() + value.len()` so the budget is in real bytes. The decoded
+    /// Build a new cache sized for `capacity_bytes`. Entries include payload,
+    /// key and conservative Foyer-owned metadata in their weight. The decoded
     /// node row-group tier gets its own budget from
     /// [`decoded_node_rg_cache_budget_bytes`].
     pub fn new(capacity_bytes: usize) -> Self {
@@ -972,13 +1287,20 @@ impl SstCache {
             capacity_bytes,
             decoded_node_rg_bytes,
             property_sidecar_cache_budget_bytes(),
+            path_registry_cache_budget_bytes(),
             DecodedCacheBudgets::from_env(),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn with_uniform_budgets(bytes: usize) -> Self {
-        Self::with_all_budgets(bytes, bytes, bytes, DecodedCacheBudgets::uniform(bytes))
+        Self::with_all_budgets(
+            bytes,
+            bytes,
+            bytes,
+            bytes,
+            DecodedCacheBudgets::uniform(bytes),
+        )
     }
 
     fn with_shared_capacities(capacities: CacheCapacities) -> Self {
@@ -986,6 +1308,7 @@ impl SstCache {
             capacities.sst_body_bytes,
             capacities.decoded_node_row_group_bytes,
             capacities.property_sidecar_bytes,
+            capacities.path_registry_bytes,
             DecodedCacheBudgets::from_capacities(capacities),
         )
     }
@@ -994,14 +1317,17 @@ impl SstCache {
         capacity_bytes: usize,
         decoded_node_rg_bytes: usize,
         property_sidecar_bytes: usize,
+        path_registry_bytes: usize,
         decoded: DecodedCacheBudgets,
     ) -> Self {
         let budgets = SstCacheBudgets {
             body_bytes: capacity_bytes,
             node_row_group_bytes: decoded_node_rg_bytes,
             property_sidecar_bytes,
+            path_registry_bytes,
             decoded,
         };
+        let tracked_paths = Arc::new(Mutex::new(CachePathRegistry::new(path_registry_bytes)));
         let inner_capacity = capacity_bytes;
         let inner = CacheBuilder::new(inner_capacity.max(1))
             .with_shards(1)
@@ -1009,6 +1335,10 @@ impl SstCache {
             .with_filter(move |key: &String, value: &Bytes| {
                 fits_capacity(inner_capacity, raw_body_weight(key, value))
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &Bytes| TrackedCacheEntry::Body(key.clone()),
+            }))
             .build();
         let node_rg_capacity = decoded_node_rg_bytes;
         let decoded_node_row_groups = CacheBuilder::new(node_rg_capacity.max(1))
@@ -1017,6 +1347,12 @@ impl SstCache {
             .with_filter(move |key: &NodeRowGroupKey, value: &DecodedNodeRowGroup| {
                 fits_capacity(node_rg_capacity, decoded_node_row_group_weight(key, value))
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &NodeRowGroupKey, _value: &DecodedNodeRowGroup| {
+                    TrackedCacheEntry::NodeRowGroup(key.0.clone(), key.1)
+                },
+            }))
             .build();
         let property_sidecar_capacity = property_sidecar_bytes;
         let property_sidecars = CacheBuilder::new(property_sidecar_capacity.max(1))
@@ -1030,6 +1366,12 @@ impl SstCache {
                     decoded_property_sidecar_weight(key, value),
                 )
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &DecodedPropertySidecar| {
+                    TrackedCacheEntry::PropertySidecar(key.clone())
+                },
+            }))
             .build();
         let metadata_capacity = decoded.metadata_bytes;
         let metadata = CacheBuilder::new(metadata_capacity.max(1))
@@ -1038,6 +1380,12 @@ impl SstCache {
             .with_filter(move |key: &String, value: &Arc<ParquetMetaData>| {
                 fits_capacity(metadata_capacity, metadata_weight(key, value))
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &Arc<ParquetMetaData>| {
+                    TrackedCacheEntry::Metadata(key.clone())
+                },
+            }))
             .build();
         let edge_stream_capacity = decoded.edge_stream_bytes;
         let edge_streams = CacheBuilder::new(edge_stream_capacity.max(1))
@@ -1048,6 +1396,12 @@ impl SstCache {
             .with_filter(move |key: &String, value: &Arc<EdgeStreamBundle>| {
                 fits_capacity(edge_stream_capacity, edge_stream_bundle_weight(key, value))
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &Arc<EdgeStreamBundle>| {
+                    TrackedCacheEntry::EdgeStreams(key.clone())
+                },
+            }))
             .build();
         let edge_reader_capacity = decoded.edge_reader_bytes;
         let edge_readers = CacheBuilder::new(edge_reader_capacity.max(1))
@@ -1062,6 +1416,12 @@ impl SstCache {
                     fits_capacity(edge_reader_capacity, edge_reader_weight(key, value))
                 },
             )
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &Arc<crate::sst::edges::EdgeSstReader>| {
+                    TrackedCacheEntry::EdgeReader(key.clone())
+                },
+            }))
             .build();
         let bloom_capacity = decoded.bloom_bytes;
         let bloom_filters = CacheBuilder::new(bloom_capacity.max(1))
@@ -1070,6 +1430,12 @@ impl SstCache {
             .with_filter(move |key: &String, value: &Arc<BloomFilter>| {
                 fits_capacity(bloom_capacity, bloom_filter_weight(key, value))
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, _value: &Arc<BloomFilter>| {
+                    TrackedCacheEntry::Bloom(key.clone())
+                },
+            }))
             .build();
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
         let search_index_capacity = decoded.search_index_bytes;
@@ -1085,6 +1451,19 @@ impl SstCache {
                     cached_search_index_weight(key, value),
                 )
             })
+            .with_event_listener(Arc::new(CacheRegistryListener {
+                registry: Arc::downgrade(&tracked_paths),
+                classify: |key: &String, value: &CachedSearchIndex| match value {
+                    #[cfg(feature = "text-index")]
+                    CachedSearchIndex::Text(_) | CachedSearchIndex::TextV3(_) => {
+                        TrackedCacheEntry::TextIndex(key.clone())
+                    }
+                    #[cfg(feature = "vector-index")]
+                    CachedSearchIndex::Vector(_) | CachedSearchIndex::VectorV5(_) => {
+                        TrackedCacheEntry::VectorIndex(key.clone())
+                    }
+                },
+            }))
             .build();
         Self {
             budgets,
@@ -1097,19 +1476,69 @@ impl SstCache {
             bloom_filters: Arc::new(bloom_filters),
             #[cfg(any(feature = "text-index", feature = "vector-index"))]
             search_indexes: Arc::new(search_indexes),
-            tracked_paths: Arc::new(Mutex::new(CachePathRegistry::default())),
+            tracked_paths,
             stats: Arc::new(CacheStats::default()),
         }
     }
 
-    /// Run `insert` while holding the path-admission mutex. A stale pinned
-    /// snapshot that finishes decoding after a manifest prune is rejected
-    /// here, closing the old `paths.insert(); cache.insert()` race.
+    /// Reserve bounded path metadata, insert without holding the registry
+    /// mutex, then revalidate both manifest admission and Foyer residency.
+    ///
+    /// Foyer invokes eviction/replacement listeners synchronously from
+    /// `insert`, so holding the mutex across that call would deadlock. The
+    /// post-insert validation still closes the old prune race: a stale pinned
+    /// snapshot that finishes decoding after a manifest commit is removed
+    /// before this function returns.
     fn insert_tracked(&self, entry: TrackedCacheEntry, insert: impl FnOnce()) {
-        let mut paths = self.tracked_paths.lock().unwrap();
-        if paths.admits(entry.path()) {
-            insert();
-            paths.entries.insert(entry);
+        let reserved = {
+            let mut paths = self.tracked_paths.lock().unwrap();
+            if !paths.admits(entry.path()) {
+                false
+            } else {
+                let required = tracked_cache_entry_metadata_bytes(&entry);
+                if required > paths.capacity_bytes.saturating_sub(paths.rule_bytes) {
+                    false
+                } else {
+                    // Registry pressure must behave like cache pressure. Drop
+                    // resident metadata/value pairs until the new reservation
+                    // fits; otherwise a full registry could reject every
+                    // future insertion even though Foyer would evict for it.
+                    while !paths.try_insert_entry(entry.clone()) {
+                        let Some(victim) = paths.entries.iter().next().cloned() else {
+                            break;
+                        };
+                        self.remove_tracked(&victim);
+                        paths.remove_entry(&victim);
+                    }
+                    paths.entries.contains(&entry)
+                }
+            }
+        };
+        if !reserved {
+            return;
+        }
+
+        insert();
+
+        {
+            let mut paths = self.tracked_paths.lock().unwrap();
+            let resident = self.tracked_entry_present(&entry);
+            let registered = if resident && paths.admits(entry.path()) {
+                // A replacement listener can have removed the reservation for
+                // the outgoing value. Re-reserve for the value now resident.
+                paths.try_insert_entry(entry.clone())
+            } else {
+                false
+            };
+            if !registered {
+                paths.remove_entry(&entry);
+            }
+            if resident && !registered {
+                // Explicit removal is deliberately ignored by the listener,
+                // so this is safe while holding the registry mutex and leaves
+                // no window for a concurrent insert of the same key.
+                self.remove_tracked(&entry);
+            }
         }
     }
 
@@ -1123,9 +1552,53 @@ impl SstCache {
             .get(key)
             .and_then(|entry| match entry.value() {
                 CachedSearchIndex::Text(value) => Some(value.value.clone()),
+                CachedSearchIndex::TextV3(_) => None,
                 #[cfg(feature = "vector-index")]
-                CachedSearchIndex::Vector(_) => None,
+                CachedSearchIndex::Vector(_) | CachedSearchIndex::VectorV5(_) => None,
             })
+    }
+
+    /// Look up the sparse reader for a range-readable NAMIFT03 object.
+    #[cfg(feature = "text-index")]
+    pub fn get_text_v3_reader(
+        &self,
+        key: &str,
+    ) -> Option<Arc<crate::sst::text::TextIndexV3Reader>> {
+        self.search_indexes
+            .get(key)
+            .and_then(|entry| match entry.value() {
+                CachedSearchIndex::TextV3(value) => Some(value.value.clone()),
+                CachedSearchIndex::Text(_) => None,
+                #[cfg(feature = "vector-index")]
+                CachedSearchIndex::Vector(_) | CachedSearchIndex::VectorV5(_) => None,
+            })
+    }
+
+    /// Retain a sparse NAMIFT03 footer/directory when it fits the shared
+    /// search-index pool. Unlike a monolithic decode this is best-effort:
+    /// rejection only means the next query reopens a few metadata pages, never
+    /// that it must perform an O(corpus) flat scan.
+    #[cfg(feature = "text-index")]
+    pub fn insert_text_v3_reader(
+        &self,
+        key: String,
+        reader: Arc<crate::sst::text::TextIndexV3Reader>,
+    ) -> bool {
+        let required_bytes =
+            cache_key_weight(&key).saturating_add(reader.estimated_resident_bytes());
+        if !fits_capacity(self.budgets.decoded.search_index_bytes, required_bytes) {
+            return false;
+        }
+        let value = WeightedArc {
+            value: reader,
+            estimated_bytes: required_bytes.saturating_sub(cache_key_weight(&key)),
+        };
+        let tracked = TrackedCacheEntry::TextIndex(key.clone());
+        self.insert_tracked(tracked, || {
+            self.search_indexes
+                .insert(key, CachedSearchIndex::TextV3(value));
+        });
+        true
     }
 
     /// Preflight a serialized text-index body against the shared search pool.
@@ -1155,7 +1628,7 @@ impl SstCache {
     pub fn can_admit_text_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
         fits_capacity(
             self.budgets.decoded.search_index_bytes,
-            key.len().saturating_add(wire_bytes.saturating_mul(6)),
+            cache_key_weight(key).saturating_add(wire_bytes.saturating_mul(6)),
         )
     }
 
@@ -1214,7 +1687,7 @@ impl SstCache {
         self.admit_search_index("text", required_bytes)?;
         let value = WeightedArc {
             value: idx,
-            estimated_bytes: required_bytes.saturating_sub(key.len()),
+            estimated_bytes: required_bytes.saturating_sub(cache_key_weight(&key)),
         };
         let tracked = TrackedCacheEntry::TextIndex(key.clone());
         self.insert_tracked(tracked, || {
@@ -1232,9 +1705,52 @@ impl SstCache {
             .get(key)
             .and_then(|entry| match entry.value() {
                 CachedSearchIndex::Vector(value) => Some(value.value.clone()),
+                CachedSearchIndex::VectorV5(_) => None,
                 #[cfg(feature = "text-index")]
-                CachedSearchIndex::Text(_) => None,
+                CachedSearchIndex::Text(_) | CachedSearchIndex::TextV3(_) => None,
             })
+    }
+
+    /// Look up the sparse reader for a range-readable NAMIVG05 object.
+    #[cfg(feature = "vector-index")]
+    pub fn get_vector_v5_reader(
+        &self,
+        key: &str,
+    ) -> Option<Arc<crate::sst::vector::v5::VectorV5Reader>> {
+        self.search_indexes
+            .get(key)
+            .and_then(|entry| match entry.value() {
+                CachedSearchIndex::VectorV5(value) => Some(value.value.clone()),
+                CachedSearchIndex::Vector(_) => None,
+                #[cfg(feature = "text-index")]
+                CachedSearchIndex::Text(_) | CachedSearchIndex::TextV3(_) => None,
+            })
+    }
+
+    /// Best-effort retention of the centroid footer for NAMIVG05. Corpus
+    /// pages stay in the bounded hybrid range cache, so a metadata admission
+    /// miss never selects the O(corpus) vector fallback.
+    #[cfg(feature = "vector-index")]
+    pub fn insert_vector_v5_reader(
+        &self,
+        key: String,
+        reader: Arc<crate::sst::vector::v5::VectorV5Reader>,
+    ) -> bool {
+        let required_bytes =
+            cache_key_weight(&key).saturating_add(reader.resident_metadata_bytes());
+        if !fits_capacity(self.budgets.decoded.search_index_bytes, required_bytes) {
+            return false;
+        }
+        let value = WeightedArc {
+            value: reader,
+            estimated_bytes: required_bytes.saturating_sub(cache_key_weight(&key)),
+        };
+        let tracked = TrackedCacheEntry::VectorIndex(key.clone());
+        self.insert_tracked(tracked, || {
+            self.search_indexes
+                .insert(key, CachedSearchIndex::VectorV5(value));
+        });
+        true
     }
 
     /// Preflight a serialized vector-index body before GET/decode.
@@ -1260,7 +1776,7 @@ impl SstCache {
     pub fn can_admit_vector_index_wire_bytes(&self, key: &str, wire_bytes: usize) -> bool {
         fits_capacity(
             self.budgets.decoded.search_index_bytes,
-            key.len().saturating_add(wire_bytes.saturating_mul(6)),
+            cache_key_weight(key).saturating_add(wire_bytes.saturating_mul(6)),
         )
     }
 
@@ -1318,7 +1834,7 @@ impl SstCache {
         self.admit_search_index("vector", required_bytes)?;
         let value = WeightedArc {
             value: idx,
-            estimated_bytes: required_bytes.saturating_sub(key.len()),
+            estimated_bytes: required_bytes.saturating_sub(cache_key_weight(&key)),
         };
         let tracked = TrackedCacheEntry::VectorIndex(key.clone());
         self.insert_tracked(tracked, || {
@@ -1767,6 +2283,76 @@ impl SstCache {
         self.stats.node_locator_bytes.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn record_label_membership_fast_path(&self) {
+        self.stats
+            .label_membership_fast_paths
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_label_membership_fallback(&self) {
+        self.stats
+            .label_membership_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_label_membership_probe(
+        &self,
+        candidates: usize,
+        stats: crate::sst::paged_index::PagedProbeStats,
+    ) {
+        self.stats
+            .label_membership_probes
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .label_membership_candidates
+            .fetch_add(candidates as u64, Ordering::Relaxed);
+        self.stats
+            .label_membership_pages
+            .fetch_add(stats.pages_read as u64, Ordering::Relaxed);
+        self.stats
+            .label_membership_entries_examined
+            .fetch_add(stats.leaf_entries_examined as u64, Ordering::Relaxed);
+        self.stats
+            .label_membership_bytes
+            .fetch_add(stats.bytes_read as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_membership_fast_paths(&self) -> u64 {
+        self.stats
+            .label_membership_fast_paths
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_fallbacks(&self) -> u64 {
+        self.stats
+            .label_membership_fallbacks
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_probes(&self) -> u64 {
+        self.stats.label_membership_probes.load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_candidates(&self) -> u64 {
+        self.stats
+            .label_membership_candidates
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_pages(&self) -> u64 {
+        self.stats.label_membership_pages.load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_entries_examined(&self) -> u64 {
+        self.stats
+            .label_membership_entries_examined
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn label_membership_bytes(&self) -> u64 {
+        self.stats.label_membership_bytes.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn record_edge_point_probe(&self, stats: crate::sst::paged_index::PagedProbeStats) {
         self.stats.edge_point_probes.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -1932,15 +2518,23 @@ impl SstCache {
             TrackedCacheEntry::PropertySidecar(path) => self.property_sidecars.get(path).is_some(),
             TrackedCacheEntry::Bloom(path) => self.bloom_filters.get(path).is_some(),
             #[cfg(feature = "text-index")]
-            TrackedCacheEntry::TextIndex(path) => self
-                .search_indexes
-                .get(path)
-                .is_some_and(|entry| matches!(entry.value(), CachedSearchIndex::Text(_))),
+            TrackedCacheEntry::TextIndex(path) => {
+                self.search_indexes.get(path).is_some_and(|entry| {
+                    matches!(
+                        entry.value(),
+                        CachedSearchIndex::Text(_) | CachedSearchIndex::TextV3(_)
+                    )
+                })
+            }
             #[cfg(feature = "vector-index")]
-            TrackedCacheEntry::VectorIndex(path) => self
-                .search_indexes
-                .get(path)
-                .is_some_and(|entry| matches!(entry.value(), CachedSearchIndex::Vector(_))),
+            TrackedCacheEntry::VectorIndex(path) => {
+                self.search_indexes.get(path).is_some_and(|entry| {
+                    matches!(
+                        entry.value(),
+                        CachedSearchIndex::Vector(_) | CachedSearchIndex::VectorV5(_)
+                    )
+                })
+            }
         }
     }
 
@@ -1987,7 +2581,7 @@ impl SstCache {
             .collect();
         for entry in stale {
             self.remove_tracked(&entry);
-            paths.entries.remove(&entry);
+            paths.remove_entry(&entry);
         }
     }
 
@@ -2019,7 +2613,7 @@ impl SstCache {
         // `HashSet::clear` retains its peak bucket allocation. This hook runs
         // specifically under RSS pressure, so replace the registry storage as
         // well as dropping its logical entries.
-        paths.entries = HashSet::new();
+        paths.clear_entries();
         for live in paths.live_by_namespace.values_mut() {
             live.shrink_to_fit();
         }
@@ -2027,6 +2621,7 @@ impl SstCache {
         paths.empty_live_order.shrink_to_fit();
         paths.denied_namespaces.shrink_to_fit();
         paths.denied_order.shrink_to_fit();
+        paths.recompute_rule_bytes();
     }
 
     /// Count of resident entries across every tier whose SST path sits under
@@ -2046,7 +2641,7 @@ impl SstCache {
                     resident += 1;
                 }
             } else {
-                paths.entries.remove(&entry);
+                paths.remove_entry(&entry);
             }
         }
         resident
@@ -2161,13 +2756,22 @@ impl SstCache {
         self.budgets.body_bytes
     }
 
-    /// Sum of all compiled SST cache tier capacities (seven base tiers plus
-    /// one optional shared search-index tier).
+    /// Sum of all compiled SST cache tier capacities (seven Foyer base tiers,
+    /// the path registry, plus one optional shared search-index tier).
     pub fn aggregate_capacity_bytes(&self) -> usize {
         self.budgets.aggregate_capacity_bytes()
     }
 
-    /// Sum of cache-accounted resident bytes in every compiled SST tier.
+    pub fn path_registry_capacity_bytes(&self) -> usize {
+        self.budgets.path_registry_bytes
+    }
+
+    pub fn path_registry_usage_bytes(&self) -> usize {
+        self.tracked_paths.lock().unwrap().used_bytes()
+    }
+
+    /// Sum of cache-accounted resident bytes and path/admission metadata in
+    /// every compiled SST tier.
     pub fn aggregate_usage_bytes(&self) -> usize {
         let base = self
             .inner
@@ -2177,7 +2781,8 @@ impl SstCache {
             .saturating_add(self.metadata.usage())
             .saturating_add(self.edge_streams.usage())
             .saturating_add(self.edge_readers.usage())
-            .saturating_add(self.bloom_filters.usage());
+            .saturating_add(self.bloom_filters.usage())
+            .saturating_add(self.path_registry_usage_bytes());
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
         let base = base.saturating_add(self.search_indexes.usage());
         base
@@ -2267,8 +2872,9 @@ mod tests {
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
         assert_eq!(cache.search_indexes.capacity(), budget);
         let compiled_tiers =
-            7 + usize::from(cfg!(any(feature = "text-index", feature = "vector-index")));
+            8 + usize::from(cfg!(any(feature = "text-index", feature = "vector-index")));
         assert_eq!(cache.aggregate_capacity_bytes(), compiled_tiers * budget);
+        assert_eq!(cache.path_registry_capacity_bytes(), budget);
     }
 
     #[test]
@@ -2492,7 +3098,7 @@ mod tests {
 
     #[test]
     fn pruned_namespace_tombstones_are_bounded_without_empty_live_sets() {
-        let cache = tight_cache(1 << 20);
+        let cache = tight_cache(4 << 20);
         let live_path = "tenants/gone/sst/level0/live.parquet".to_string();
         cache.retain_paths("tenants/gone", &HashSet::from([live_path]));
         assert_eq!(
@@ -2521,6 +3127,7 @@ mod tests {
             "namespace churn must not grow eviction admission state forever"
         );
         assert_eq!(paths.denied_order.len(), MAX_DENIED_CACHE_NAMESPACES);
+        assert!(paths.used_bytes() <= paths.capacity_bytes);
     }
 
     #[test]
@@ -2577,7 +3184,7 @@ mod tests {
 
     #[test]
     fn embedded_empty_namespace_rules_are_fifo_bounded() {
-        let cache = tight_cache(1 << 20);
+        let cache = tight_cache(4 << 20);
         for i in 0..MAX_EMPTY_LIVE_NAMESPACES + 128 {
             cache.retain_paths(&format!("embedded/empty-{i}"), &HashSet::new());
         }
@@ -2592,6 +3199,7 @@ mod tests {
             MAX_EMPTY_LIVE_NAMESPACES,
             "fresh embedded namespace churn must not retain empty rules forever"
         );
+        assert!(paths.used_bytes() <= paths.capacity_bytes);
     }
 
     #[test]
@@ -2651,7 +3259,11 @@ mod tests {
         assert!(cache.tracked_paths.lock().unwrap().entries.capacity() > 0);
 
         cache.clear();
-        assert_eq!(cache.aggregate_usage_bytes(), 0);
+        assert_eq!(
+            cache.aggregate_usage_bytes(),
+            cache.path_registry_usage_bytes(),
+            "clear drops residents but preserves the authoritative live rule"
+        );
         assert_eq!(cache.namespace_side_entries("tenants/a"), 0);
         assert_eq!(
             cache.tracked_paths.lock().unwrap().entries.capacity(),
@@ -2708,6 +3320,146 @@ mod tests {
             cache.namespace_side_entries("tenants/b") < inserted * 2,
             "the diagnostic must discard path tombstones for foyer evictions"
         );
+    }
+
+    #[test]
+    fn natural_foyer_evictions_remove_path_metadata_without_a_diagnostic_sweep() {
+        let budget = 4 * 1024;
+        let cache = tight_cache(budget);
+        let inserted = 256usize;
+
+        for i in 0..inserted {
+            cache.insert(
+                format!("tenants/churn/sst/level0/{i:04}.parquet"),
+                Bytes::from(vec![i as u8; 512]),
+            );
+        }
+
+        // Inspect Foyer directly; calling `namespace_side_entries` here would
+        // mask the original leak by performing its legacy lazy sweep.
+        let resident = (0..inserted)
+            .filter(|i| {
+                cache
+                    .inner
+                    .get(&format!("tenants/churn/sst/level0/{i:04}.parquet"))
+                    .is_some()
+            })
+            .count();
+        let paths = cache.tracked_paths.lock().unwrap();
+        assert_eq!(
+            paths.entries.len(),
+            resident,
+            "eviction listeners must remove registry entries synchronously"
+        );
+        assert!(
+            paths.entries.len() < inserted / 4,
+            "path metadata must follow the bounded resident set"
+        );
+        assert_eq!(
+            paths.entry_bytes,
+            paths
+                .entries
+                .iter()
+                .map(tracked_cache_entry_metadata_bytes)
+                .sum::<usize>(),
+            "listener removals must keep the metadata counter exact"
+        );
+        assert!(paths.used_bytes() <= paths.capacity_bytes);
+    }
+
+    #[test]
+    fn natural_eviction_releases_registry_bucket_high_water() {
+        let budget = 64 * 1024;
+        let cache = tight_cache(budget);
+        let inserted = 256usize;
+        for i in 0..inserted {
+            cache.insert(
+                format!("tenants/shape/sst/level0/{i:04}.parquet"),
+                Bytes::new(),
+            );
+        }
+        assert!(cache.tracked_paths.lock().unwrap().entries.capacity() > 64);
+
+        let large_path = "tenants/shape/sst/level0/large.parquet".to_string();
+        cache.insert(large_path.clone(), Bytes::from(vec![0; 48 * 1024]));
+
+        let resident = (0..inserted)
+            .filter(|i| {
+                cache
+                    .inner
+                    .get(&format!("tenants/shape/sst/level0/{i:04}.parquet"))
+                    .is_some()
+            })
+            .count()
+            + usize::from(cache.inner.get(&large_path).is_some());
+        let registry = cache.tracked_paths.lock().unwrap();
+        assert_eq!(registry.entries.len(), resident);
+        assert!(
+            registry.entries.capacity() <= registry.entries.len().saturating_mul(2).max(64),
+            "listener removals must release historical registry buckets"
+        );
+        assert!(registry.used_bytes() <= registry.capacity_bytes);
+    }
+
+    #[test]
+    fn oversized_manifest_rule_fails_closed_with_bounded_metadata() {
+        let registry_budget = 1024;
+        let cache = SstCache::with_all_budgets(
+            64 * 1024,
+            64 * 1024,
+            64 * 1024,
+            registry_budget,
+            DecodedCacheBudgets::uniform(64 * 1024),
+        );
+        let prefix = "tenants/huge";
+        let live: HashSet<String> = (0..64)
+            .map(|i| format!("{prefix}/sst/level0/{i}-{}.parquet", "x".repeat(128)))
+            .collect();
+        cache.retain_paths(prefix, &live);
+
+        let path = live.iter().next().unwrap().clone();
+        cache.insert(path.clone(), Bytes::from_static(b"body"));
+        let registry = cache.tracked_paths.lock().unwrap();
+        assert!(registry.admission_disabled);
+        assert!(registry.used_bytes() <= registry_budget);
+        drop(registry);
+        assert!(
+            cache.get(&path).is_none(),
+            "an unrepresentable authoritative rule must disable admission"
+        );
+    }
+
+    #[test]
+    fn live_rule_does_not_clone_the_callers_sparse_hash_table_capacity() {
+        let registry_budget = 8 * 1024;
+        let cache = SstCache::with_all_budgets(
+            64 * 1024,
+            64 * 1024,
+            64 * 1024,
+            registry_budget,
+            DecodedCacheBudgets::uniform(64 * 1024),
+        );
+        let path = "tenants/sparse/sst/level0/live.parquet".to_string();
+        let mut live = HashSet::with_capacity(100_000);
+        live.insert(path.clone());
+        assert!(live.capacity() > 10_000);
+
+        cache.retain_paths("tenants/sparse", &live);
+        cache.insert(path.clone(), Bytes::from_static(b"body"));
+
+        let registry = cache.tracked_paths.lock().unwrap();
+        let stored = registry
+            .live_by_namespace
+            .get("tenants/sparse/")
+            .expect("authoritative rule");
+        assert!(
+            stored.capacity() < 128,
+            "the registry must rebuild a compact live set"
+        );
+        assert!(!registry.admission_disabled);
+        assert!(registry.used_bytes() <= registry_budget);
+        drop(registry);
+        assert!(cache.get(&path).is_some());
     }
 
     #[test]

@@ -84,6 +84,27 @@ fn lower_query(query: &Query, expose_result: bool) -> Result<LogicalPlan, LowerE
             query.span,
         ));
     }
+    if exposes_rows {
+        if let Some(head_columns) = single_query_column_names(&query.head) {
+            for part in &query.tail {
+                let Some(columns) = single_query_column_names(&part.query) else {
+                    continue;
+                };
+                if columns != head_columns {
+                    return Err(LowerError::new(
+                        LowerErrorKind::InvalidUnion,
+                        format!(
+                            "UNION branches must return the same column names in the same \
+                             order: first branch returns [{}], a later branch returns [{}]",
+                            head_columns.join(", "),
+                            columns.join(", ")
+                        ),
+                        part.query.span,
+                    ));
+                }
+            }
+        }
+    }
     let mut acc = lower_single_query(&query.head)?;
     for part in &query.tail {
         let right = lower_single_query(&part.query)?;
@@ -124,6 +145,33 @@ fn single_query_exposes_rows(query: &SingleQuery) -> bool {
         Some(Clause::Return(_) | Clause::Call(_)) => true,
         Some(Clause::CallSubquery(call)) => query_exposes_rows(&call.query),
         _ => false,
+    }
+}
+
+/// The output column names of a single UNION branch, in order — `None` when
+/// the final clause's shape cannot be derived syntactically (write-only
+/// branches, CALL without YIELD, subquery composition), in which case the
+/// branch is not validated against the head.
+fn single_query_column_names(query: &SingleQuery) -> Option<Vec<String>> {
+    match query.clauses.last()? {
+        Clause::Return(ret) => Some(
+            ret.items
+                .iter()
+                .map(|item| {
+                    item.alias
+                        .as_ref()
+                        .map(|alias| alias.name.clone())
+                        .unwrap_or_else(|| canonical_alias(&item.expression))
+                })
+                .collect(),
+        ),
+        Clause::Call(call) if !call.yield_items.is_empty() => Some(
+            call.yield_items
+                .iter()
+                .map(|item| item.binding_name().to_string())
+                .collect(),
+        ),
+        _ => None,
     }
 }
 

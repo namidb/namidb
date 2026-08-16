@@ -15,9 +15,10 @@ use rand::seq::{IteratorRandom, SliceRandom};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use thiserror::Error;
 
 use crate::graph::VamanaGraph;
-use crate::search::{beam_search_with_scratch, BeamScratch};
+use crate::search::{beam_search, beam_search_with_scratch, BeamScratch};
 use crate::space::VectorSpace;
 
 /// Build knobs. Defaults follow DiskANN's small/medium-set recommendations:
@@ -63,6 +64,25 @@ pub enum InitStrategy {
 /// above it, random init (avoids the `O(N²)` cost). SST-sized sets usually land
 /// under this, but a wide L1 merge can exceed it.
 pub const AUTO_BRUTEFORCE_MAX: usize = 4_000;
+
+/// A structural mismatch while appending a member to an existing Vamana
+/// graph. Dynamic insertion deliberately only accepts the next dense ordinal:
+/// callers must add one vector to the backing [`VectorSpace`] first, then call
+/// [`insert_last`]. This prevents a partially updated graph from silently
+/// indexing the wrong coordinates.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum InsertError {
+    /// The vector space must contain exactly the existing graph plus one new
+    /// member.
+    #[error(
+        "incremental Vamana insert requires space.len() == graph.len() + 1 \
+         (space={space_len}, graph={graph_len})"
+    )]
+    Cardinality { space_len: usize, graph_len: usize },
+    /// Vamana uses compact `u32` ordinals on disk.
+    #[error("incremental Vamana insert exceeds the u32 ordinal space")]
+    OrdinalOverflow,
+}
 
 /// `(distance-from-anchor, candidate-id)` pair — the working type for prune.
 type Cand = (f32, u32);
@@ -214,6 +234,77 @@ pub fn build<S: VectorSpace, R: Rng>(space: &S, params: BuildParams, rng: &mut R
 pub fn build_with_seed<S: VectorSpace>(space: &S, params: BuildParams, seed: u64) -> VamanaGraph {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     build(space, params, &mut rng)
+}
+
+/// Insert the final member of `space` into an existing graph.
+///
+/// The caller first appends the vector to its backing space, making
+/// `space.len() == graph.len() + 1`. The new point is found through the
+/// existing graph with the build beam, α-pruned to `R`, then linked in both
+/// directions; overflowing reverse lists are robust-pruned as in a full
+/// Vamana build. The entry point stays stable, which is important for an
+/// append-only on-disk delta.
+///
+/// This is the online half of a base+delta index: updates tombstone the old
+/// base ordinal and append the replacement to a small mutable delta. A later
+/// compaction can rebuild the authoritative base without making foreground
+/// writes retain or copy the full corpus.
+pub fn insert_last<S: VectorSpace>(
+    space: &S,
+    graph: &mut VamanaGraph,
+    params: BuildParams,
+) -> Result<u32, InsertError> {
+    let graph_len = graph.len();
+    let expected = graph_len
+        .checked_add(1)
+        .ok_or(InsertError::OrdinalOverflow)?;
+    if space.len() != expected {
+        return Err(InsertError::Cardinality {
+            space_len: space.len(),
+            graph_len,
+        });
+    }
+    let new_id = u32::try_from(graph_len).map_err(|_| InsertError::OrdinalOverflow)?;
+    if graph_len == 0 {
+        graph.adjacency.push(Vec::new());
+        graph.entry = 0;
+        return Ok(new_id);
+    }
+
+    let r = params.r;
+    let l_build = params.l_build.max(r.saturating_add(1));
+    // A foreground insert touches only a beam-sized neighbourhood. Use the
+    // sparse one-shot scratch rather than allocate/clear O(base corpus) marks.
+    let found = beam_search(
+        &graph.adjacency,
+        graph_len,
+        graph.entry,
+        l_build,
+        l_build,
+        |id| space.pair_distance(new_id, id),
+    );
+    let candidates = found
+        .into_iter()
+        .map(|neighbor| (neighbor.dist, neighbor.id))
+        .collect();
+    let neighbors = robust_prune(space, new_id, candidates, params.alpha, r);
+    graph.adjacency.push(neighbors.clone());
+
+    for neighbor in neighbors {
+        let list = &mut graph.adjacency[neighbor as usize];
+        if !list.contains(&new_id) {
+            list.push(new_id);
+        }
+        if list.len() > r {
+            let candidates = list
+                .iter()
+                .map(|&candidate| (space.pair_distance(neighbor, candidate), candidate))
+                .collect();
+            graph.adjacency[neighbor as usize] =
+                robust_prune(space, neighbor, candidates, params.alpha, r);
+        }
+    }
+    Ok(new_id)
 }
 
 /// Approximate medoid: the sample member minimizing total distance to the
@@ -530,5 +621,53 @@ mod tests {
         let g2 = build(&space, p, &mut ChaCha8Rng::seed_from_u64(1));
         assert_eq!(g1.adjacency, g2.adjacency, "same seed → same graph");
         assert_eq!(g1.entry, g2.entry);
+    }
+
+    #[test]
+    fn incremental_insert_is_bounded_and_searchable() {
+        let full = clustered(true, 160, 8, 24, 73);
+        let vectors: Vec<Vec<f32>> = (0..full.len())
+            .map(|ordinal| full.vector(ordinal as u32).to_vec())
+            .collect();
+        let params = BuildParams {
+            r: 24,
+            l_build: 48,
+            alpha: 1.2,
+            init: InitStrategy::Auto,
+        };
+        let mut graph = VamanaGraph::new(Vec::new(), 0);
+        for end in 1..=vectors.len() {
+            let current = F32CosineSpace::new(vectors[..end].to_vec());
+            assert_eq!(
+                insert_last(&current, &mut graph, params).unwrap(),
+                (end - 1) as u32
+            );
+            assert_eq!(graph.len(), end);
+            assert!(graph.max_degree() <= params.r);
+        }
+
+        // Dynamic insertion is approximate, but every exact member query must
+        // recover itself with a normal production-size beam.
+        for ordinal in (0..vectors.len()).step_by(7) {
+            let hits = search(&full, &graph, &vectors[ordinal], 10, 64);
+            assert!(
+                hits.iter().any(|hit| hit.id == ordinal as u32),
+                "inserted ordinal {ordinal} was not reachable: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_insert_rejects_cardinality_mismatch() {
+        let space = F32CosineSpace::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let mut graph = VamanaGraph::new(Vec::new(), 0);
+        assert_eq!(
+            insert_last(&space, &mut graph, BuildParams::default()),
+            Err(InsertError::Cardinality {
+                space_len: 2,
+                graph_len: 0,
+            })
+        );
+        assert!(graph.is_empty(), "a rejected insert must be atomic");
     }
 }

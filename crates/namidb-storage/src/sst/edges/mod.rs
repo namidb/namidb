@@ -12,17 +12,28 @@ pub mod encoding;
 pub mod fence_index;
 pub mod format;
 pub mod inverse;
+pub mod paged_reader;
 pub(crate) mod point_index;
+pub(crate) mod property_pages;
 pub mod reader;
 pub mod writer;
 
 pub use fence_index::{DEFAULT_FENCE_STRIDE, FENCE_INDEX_THRESHOLD};
 pub use format::{
-    EdgeFileFooter, EdgeFileHeader, SectionEntry, FLAG_HAS_PROPERTIES, FLAG_HAS_TOMBSTONES,
-    FLAG_INVERSE_PARTNER, FLAG_SKEW_BUCKETS,
+    EdgeFileFooter, EdgeFileHeader, EdgePageChecksumDirectory, EdgeSstBinding, SectionEntry,
+    SectionPageChecksums, EDGE_CHECKSUM_PAGE_BYTES, FLAG_HAS_PROPERTIES, FLAG_HAS_TOMBSTONES,
+    FLAG_INVERSE_PARTNER, FLAG_SKEW_BUCKETS, SECTION_EDGE_ORDINALS, SECTION_PAGE_CHECKSUMS,
+    SECTION_SST_BINDING,
+};
+pub use paged_reader::{
+    PagedEdgeIoStats, PagedEdgeReader, EDGE_FOOTER_PREFETCH_BYTES, MAX_CACHED_EDGE_FENCE_BYTES,
+    MAX_EDGE_FOOTER_BYTES, MAX_UNFENCED_KEY_IDS_BYTES,
 };
 pub use reader::{EdgeLookup, EdgePointLookup, EdgeRowProjection, EdgeSstReader};
-pub use writer::{EdgeRecord, EdgeSstFinish, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions};
+pub use writer::{
+    EdgeRecord, EdgeSstFinish, EdgeSstStats, EdgeSstWriter, EdgeSstWriterOptions,
+    DEFAULT_EDGE_IN_MEMORY_FINISH_MAX_BYTES, EDGE_IN_MEMORY_FINISH_MAX_BYTES_ENV,
+};
 
 /// Direction of an edge SST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

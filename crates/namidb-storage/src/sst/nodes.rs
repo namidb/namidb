@@ -26,11 +26,12 @@
 //! - All non-nullable columns have non-null values.
 //! - The batch's schema is exactly the canonical schema built from `LabelDef`.
 
+pub mod property_pages;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -46,7 +47,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use memmap2::MmapOptions;
 use object_store::path::Path as ObjectPath;
-use object_store::{GetOptions, GetRange, ObjectStore};
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
@@ -62,6 +63,7 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use namidb_core::{DataType, LabelDef, PropertyDef};
 
 use crate::error::{Error, Result};
+use crate::range_cache::PinnedObjectRangeSource;
 use crate::sst::bloom::{BloomFilter, DEFAULT_BITS_PER_KEY};
 use crate::sst::hll::{hash_bytes, Hll, DEFAULT_PRECISION as HLL_PRECISION};
 use crate::sst::predicates::{eval_row_group, RowGroupVerdict, ScanPredicate};
@@ -789,13 +791,48 @@ fn node_scan_plan(
             COL_TOMBSTONE,
             COL_LSN,
             SCHEMA_VERSION,
-            OVERFLOW_JSON,
             COL_LABELS,
         ] {
             if let Some(idx) = schema_descr
                 .columns()
                 .iter()
                 .position(|column| root_of(column).as_deref() == Some(engine))
+            {
+                leaves.push(idx);
+            }
+        }
+        // `__overflow_json` is often the widest column in an id-primary SST:
+        // it may contain text and 1,024-dimensional embeddings.  Keeping it
+        // in every projected scan made an id-only COUNT/Expand fetch those
+        // Parquet pages even though the decoder deliberately discarded them.
+        //
+        // A declared property has its own physical column.  Overflow is
+        // therefore required only when a projected/predicate property has no
+        // physical column (the normal representation for ad-hoc properties).
+        // `projection == None` still bypasses the mask and reads the complete
+        // row exactly as before.
+        let has_physical_property = |name: &str| {
+            label
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .map(prop_column_name)
+                .is_some_and(|parquet_name| {
+                    schema_descr
+                        .columns()
+                        .iter()
+                        .any(|column| column.name() == parquet_name)
+                })
+        };
+        let needs_overflow = cols.iter().any(|column| !has_physical_property(column))
+            || predicates
+                .iter()
+                .any(|predicate| !has_physical_property(predicate.column()));
+        if needs_overflow {
+            if let Some(idx) = schema_descr
+                .columns()
+                .iter()
+                .position(|column| root_of(column).as_deref() == Some(OVERFLOW_JSON))
             {
                 leaves.push(idx);
             }
@@ -971,50 +1008,128 @@ pub async fn load_node_sst_metadata_async(
     path: ObjectPath,
     file_size: u64,
 ) -> Result<Arc<ParquetMetaData>> {
-    let mut reader = ObjectStoreRangedReader {
-        store,
-        path: path.clone(),
-        file_size,
-        cached_metadata: None,
-        scan_stats: None,
-    };
+    let mut reader = ObjectStoreRangedReader::open(store, path.clone(), file_size, None).await?;
     AsyncFileReader::get_metadata(&mut reader, None)
         .await
         .map_err(|e| Error::invariant(format!("parquet metadata async {path}: {e}")))
 }
 
-/// Thin `parquet::AsyncFileReader` wrapper around our
-/// `Arc<dyn ObjectStore>`. Exists because `parquet 55`'s bundled
+/// Thin `parquet::AsyncFileReader` wrapper around the common
+/// generation-pinned range source. Exists because `parquet 55`'s bundled
 /// `ParquetObjectReader` is wired against `object_store 0.12`, while
 /// our workspace pins `object_store 0.13`; the two `ObjectStore` trait
 /// objects are not interchangeable. Implementing `AsyncFileReader`
 /// directly against our store crate side-steps the version split
 /// without adding a parallel object_store dependency.
 ///
-/// Every `get_bytes` issues a single `GET` with an `If-Match` byte
-/// range; that maps to a `Range` header on the wire — same path the
-/// sync `Bytes`-backed reader would take if we cached entire bodies.
+/// Construction performs one HEAD, validates the descriptor size, and pins
+/// the create-only object generation. Every later range is served through the
+/// shared RAM/NVMe page cache and carries a version/If-Match precondition on a
+/// physical miss.
 ///
 /// `cached_metadata` short-circuits the footer + page-index round-trip
 /// when the caller has it from a previous warm lookup on the same SST
 /// (RFC-003 §"Cache integration"). Bypasses `get_metadata` entirely.
 #[derive(Debug, Default)]
 pub struct RangedNodeScanStats {
-    bytes_read: AtomicU64,
+    source: Option<PinnedObjectRangeSource>,
 }
 
 impl RangedNodeScanStats {
+    fn new(source: PinnedObjectRangeSource) -> Self {
+        Self {
+            source: Some(source),
+        }
+    }
+
+    /// Exact bytes returned to Parquet after slicing aligned cache pages.
     pub fn bytes_read(&self) -> u64 {
-        self.bytes_read.load(Ordering::Relaxed)
+        self.source
+            .as_ref()
+            .map(|source| source.stats().logical_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn requests(&self) -> u64 {
+        self.source
+            .as_ref()
+            .map(|source| source.stats().logical_requests)
+            .unwrap_or(0)
+    }
+
+    /// Physical bytes fetched from the authoritative store. This remains zero
+    /// on a fully warm RAM/NVMe cache hit and may exceed logical bytes because
+    /// misses fetch aligned pages.
+    pub fn remote_bytes_read(&self) -> u64 {
+        self.source
+            .as_ref()
+            .map(|source| source.stats().remote_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn remote_requests(&self) -> u64 {
+        self.source
+            .as_ref()
+            .map(|source| source.stats().remote_requests)
+            .unwrap_or(0)
     }
 }
 
 struct ObjectStoreRangedReader {
+    source: PinnedObjectRangeSource,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+}
+
+impl ObjectStoreRangedReader {
+    async fn open(
+        store: Arc<dyn ObjectStore>,
+        path: ObjectPath,
+        expected_size: u64,
+        cached_metadata: Option<Arc<ParquetMetaData>>,
+    ) -> Result<Self> {
+        let source = pin_node_sst_source(store, path, expected_size).await?;
+        Ok(Self {
+            source,
+            cached_metadata,
+        })
+    }
+
+    fn from_source(
+        source: PinnedObjectRangeSource,
+        cached_metadata: Option<Arc<ParquetMetaData>>,
+    ) -> Self {
+        Self {
+            source,
+            cached_metadata,
+        }
+    }
+}
+
+async fn pin_node_sst_source(
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
-    file_size: u64,
-    cached_metadata: Option<Arc<ParquetMetaData>>,
-    scan_stats: Option<Arc<RangedNodeScanStats>>,
+    expected_size: u64,
+) -> Result<PinnedObjectRangeSource> {
+    let meta = store.head(&path).await?;
+    if meta.location != path {
+        return Err(Error::Corrupted {
+            path: path.to_string(),
+            detail: format!(
+                "node SST HEAD returned metadata for unexpected location {}",
+                meta.location
+            ),
+        });
+    }
+    if meta.size != expected_size {
+        return Err(Error::Corrupted {
+            path: path.to_string(),
+            detail: format!(
+                "node SST object size {} differs from descriptor size {expected_size}",
+                meta.size
+            ),
+        });
+    }
+    PinnedObjectRangeSource::from_create_only_meta(store, meta).await
 }
 
 impl AsyncFileReader for ObjectStoreRangedReader {
@@ -1022,60 +1137,29 @@ impl AsyncFileReader for ObjectStoreRangedReader {
         &mut self,
         range: Range<u64>,
     ) -> BoxFuture<'_, std::result::Result<Bytes, ParquetError>> {
-        let store = self.store.clone();
-        let path = self.path.clone();
-        let stats = self.scan_stats.clone();
+        let source = self.source.clone();
         async move {
-            let opts = GetOptions {
-                range: Some(GetRange::Bounded(range)),
-                ..Default::default()
-            };
-            let resp = store
-                .get_opts(&path, opts)
+            source
+                .read_range(range)
                 .await
-                .map_err(|e| ParquetError::External(Box::new(e)))?;
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| ParquetError::External(Box::new(e)))?;
-            if let Some(stats) = stats {
-                stats
-                    .bytes_read
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            }
-            Ok(bytes)
+                .map_err(|e| ParquetError::External(Box::new(e)))
         }
         .boxed()
     }
 
-    /// Override the default sequential `get_byte_ranges` to use
-    /// `object_store::get_ranges`, which coalesces nearby ranges into
-    /// a single HTTP `Range:` request and issues the remaining ones
-    /// in parallel. Without this override the parquet reader would
-    /// fetch each column page back-to-back, paying one full RTT per
-    /// GET — measured against R2 that turned a single cold lookup
-    /// into 8–10 serial round-trips and inflated the wall time from
-    /// ~500 ms (full body) to ~2 s (naive ranged). With coalescing
-    /// the count drops to 1–3 round-trips of larger ranges.
+    /// Batch through the common source. It preserves input order, limits
+    /// physical concurrency to sixteen, and coalesces overlaps through
+    /// identical aligned cache-page keys.
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, std::result::Result<Vec<Bytes>, ParquetError>> {
-        let store = self.store.clone();
-        let path = self.path.clone();
-        let stats = self.scan_stats.clone();
+        let source = self.source.clone();
         async move {
-            let chunks = store
-                .get_ranges(&path, &ranges)
+            source
+                .read_ranges(&ranges)
                 .await
-                .map_err(|e| ParquetError::External(Box::new(e)))?;
-            if let Some(stats) = stats {
-                let bytes = chunks.iter().fold(0_u64, |total, chunk| {
-                    total.saturating_add(chunk.len() as u64)
-                });
-                stats.bytes_read.fetch_add(bytes, Ordering::Relaxed);
-            }
-            Ok(chunks)
+                .map_err(|e| ParquetError::External(Box::new(e)))
         }
         .boxed()
     }
@@ -1090,7 +1174,7 @@ impl AsyncFileReader for ObjectStoreRangedReader {
         if let Some(meta) = self.cached_metadata.clone() {
             return async move { Ok(meta) }.boxed();
         }
-        let file_size = self.file_size;
+        let file_size = self.source.object_size();
         async move {
             // Prefetch hint: ask the metadata reader to pull 256 KiB
             // off the tail of the file in one GET instead of doing a
@@ -1156,14 +1240,9 @@ pub async fn scan_with_predicates_and_projection_async(
     projection: Option<&[String]>,
     cached_metadata: Option<Arc<ParquetMetaData>>,
 ) -> Result<(RangedNodeBatchStream, Arc<ParquetMetaData>)> {
-    let stats = Arc::new(RangedNodeScanStats::default());
-    let reader = ObjectStoreRangedReader {
-        store,
-        path: path.clone(),
-        file_size,
-        cached_metadata,
-        scan_stats: Some(stats.clone()),
-    };
+    let source = pin_node_sst_source(store, path.clone(), file_size).await?;
+    let stats = Arc::new(RangedNodeScanStats::new(source.clone()));
+    let reader = ObjectStoreRangedReader::from_source(source, cached_metadata);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(
         reader,
         ArrowReaderOptions::new().with_page_index(true),
@@ -1227,10 +1306,10 @@ pub async fn scan_with_predicates_and_projection_async(
 /// On real-WAN S3 from a laptop this drops cold p50 by ~50× per the
 /// R2 doc.
 ///
-/// `file_size` is the SST body length, available from
-/// `SstDescriptor.size_bytes` — passing it avoids a HEAD round trip.
-/// `label` is the declared schema used to instantiate the right
-/// column projection (same as the sync path).
+/// `file_size` is the manifest descriptor's SST body length. The reader still
+/// performs one HEAD to pin the immutable generation and rejects a size
+/// mismatch before Parquet sees any bytes. `label` is the declared schema used
+/// to instantiate the right column projection (same as the sync path).
 pub async fn targeted_scan_async(
     store: Arc<dyn ObjectStore>,
     path: ObjectPath,
@@ -1317,13 +1396,8 @@ pub async fn scan_rows_by_ordinals_async(
     ordinals: Vec<u64>,
     cached_metadata: Option<Arc<ParquetMetaData>>,
 ) -> Result<Vec<RecordBatch>> {
-    let reader = ObjectStoreRangedReader {
-        store,
-        path: path.clone(),
-        file_size,
-        cached_metadata,
-        scan_stats: None,
-    };
+    let reader =
+        ObjectStoreRangedReader::open(store, path.clone(), file_size, cached_metadata).await?;
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(
         reader,
         ArrowReaderOptions::new().with_page_index(true),
@@ -1366,13 +1440,8 @@ async fn ranged_scan_selected_row_groups(
     filter_keys: Option<Arc<HashSet<[u8; 16]>>>,
     select: impl FnOnce(&ParquetMetaData) -> Result<Vec<usize>>,
 ) -> Result<(Vec<RecordBatch>, Arc<ParquetMetaData>)> {
-    let reader = ObjectStoreRangedReader {
-        store,
-        path: path.clone(),
-        file_size,
-        cached_metadata,
-        scan_stats: None,
-    };
+    let reader =
+        ObjectStoreRangedReader::open(store, path.clone(), file_size, cached_metadata).await?;
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(
         reader,
         ArrowReaderOptions::new().with_page_index(true),
@@ -1870,17 +1939,143 @@ fn hex_short(b: &[u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow_array::builder::{
         BooleanBuilder, FixedSizeBinaryBuilder, StringBuilder, UInt64Builder,
     };
     use arrow_array::cast::AsArray;
     use arrow_array::ArrayRef;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
 
     use namidb_core::DataType;
 
+    use crate::range_cache::{ImmutableRangeCache, RangeCacheConfig};
+
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct NodeRangeProbeState {
+        heads: AtomicUsize,
+        ranged_gets: AtomicUsize,
+        full_gets: AtomicUsize,
+        missing_generation_pin: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct NodeRangeProbeStore {
+        inner: Arc<InMemory>,
+        state: Arc<NodeRangeProbeState>,
+        delay: Duration,
+    }
+
+    impl NodeRangeProbeStore {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                state: Arc::new(NodeRangeProbeState::default()),
+                delay,
+            })
+        }
+    }
+
+    impl fmt::Display for NodeRangeProbeStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("NodeRangeProbeStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for NodeRangeProbeStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            if options.head {
+                self.state.heads.fetch_add(1, AtomicOrdering::SeqCst);
+                return self.inner.get_opts(location, options).await;
+            }
+            if options.range.is_none() {
+                self.state.full_gets.fetch_add(1, AtomicOrdering::SeqCst);
+                return self.inner.get_opts(location, options).await;
+            }
+
+            self.state.ranged_gets.fetch_add(1, AtomicOrdering::SeqCst);
+            if options.version.is_none() && options.if_match.is_none() {
+                self.state
+                    .missing_generation_pin
+                    .fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            let active = self.state.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.state
+                .max_active
+                .fetch_max(active, AtomicOrdering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let result = self.inner.get_opts(location, options).await;
+            self.state.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            result
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+    }
 
     fn person_label() -> LabelDef {
         LabelDef {
@@ -2520,7 +2715,10 @@ mod tests {
         assert!(batch.column_by_name(COL_TOMBSTONE).is_some());
         assert!(batch.column_by_name(COL_LSN).is_some());
         assert!(batch.column_by_name(SCHEMA_VERSION).is_some());
-        assert!(batch.column_by_name(OVERFLOW_JSON).is_some());
+        assert!(
+            batch.column_by_name(OVERFLOW_JSON).is_none(),
+            "a declared-only projection must not fetch the potentially wide overflow stream"
+        );
         // `__labels` must survive projection: it is the id-primary source of
         // truth for a row's label set, and dropping it makes label scans return
         // nothing (its Parquet leaf is nested, so the mask matches on path root).
@@ -2538,6 +2736,37 @@ mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scan_projection_keeps_overflow_only_for_ad_hoc_properties() {
+        let label = person_label();
+        let mut writer =
+            NodeSstWriter::new(label.clone(), NodeSstWriterOptions::default()).unwrap();
+        writer
+            .write_batch(&build_batch(&[(
+                7,
+                false,
+                99,
+                Some("X"),
+                Some(7),
+                1,
+                Some(r#"{"city":"Cuenca"}"#),
+            )]))
+            .unwrap();
+        let reader = NodeSstReader::open(label, writer.finish().unwrap().body).unwrap();
+        let projection = vec!["city".to_string()];
+        let batches = reader
+            .scan_with_predicates_and_projection(&[], Some(&projection))
+            .unwrap();
+        assert!(
+            batches[0].column_by_name(OVERFLOW_JSON).is_some(),
+            "an ad-hoc property still requires the overflow stream"
+        );
+        assert!(
+            batches[0].column_by_name("prop_name").is_none(),
+            "unrequested declared columns must remain projected out"
         );
     }
 
@@ -2563,6 +2792,10 @@ mod tests {
             .unwrap();
         let batch = &batches[0];
         assert!(batch.column_by_name(COL_NODE_ID).is_some());
+        assert!(
+            batch.column_by_name(OVERFLOW_JSON).is_none(),
+            "an id-only projection must not read overflow pages"
+        );
         assert!(batch.column_by_name("prop_name").is_none());
         assert!(batch.column_by_name("prop_age").is_none());
     }
@@ -2599,6 +2832,270 @@ mod tests {
         let mut k = [0u8; 16];
         k[15] = seed;
         k
+    }
+
+    async fn put_node_body(
+        store: &Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+        body: Bytes,
+    ) -> ObjectMeta {
+        store.put(path, PutPayload::from(body)).await.unwrap();
+        store.head(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn async_node_paths_are_pinned_ranged_and_compatible() {
+        let (label, body) = build_multi_row_group_sst();
+        let probe = NodeRangeProbeStore::new(Duration::ZERO);
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/all-async.parquet");
+        put_node_body(&store, &path, body.clone()).await;
+        // Ignore the fixture helper's explicit HEAD; each API below must add
+        // exactly one pinning HEAD of its own.
+        let initial_heads = probe.state.heads.load(AtomicOrdering::SeqCst);
+
+        let metadata = load_node_sst_metadata_async(store.clone(), path.clone(), body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(metadata.num_row_groups(), 3);
+
+        let (targeted, _) = targeted_scan_async(
+            store.clone(),
+            path.clone(),
+            body.len() as u64,
+            &label,
+            &seed_key(6),
+            Some(metadata.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(targeted.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+
+        let selected = scan_row_groups_async(
+            store.clone(),
+            path.clone(),
+            body.len() as u64,
+            &label,
+            vec![2],
+            Some(metadata.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+
+        let keys = Arc::new(HashSet::from([seed_key(6)]));
+        let filtered = scan_row_groups_for_keys_async(
+            store.clone(),
+            path.clone(),
+            body.len() as u64,
+            &label,
+            vec![1],
+            keys,
+            Some(metadata.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let ordinals = scan_rows_by_ordinals_async(
+            store.clone(),
+            path.clone(),
+            body.len() as u64,
+            &label,
+            vec![0, 11],
+            Some(metadata.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ordinals.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        let (mut lazy, lazy_metadata) = scan_with_predicates_and_projection_async(
+            store,
+            path,
+            body.len() as u64,
+            &label,
+            &[],
+            None,
+            Some(metadata),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lazy_metadata.num_row_groups(), 3);
+        assert!(lazy.next_row_group().await.unwrap().is_some());
+        assert!(lazy.stats().bytes_read() > 0);
+        assert!(lazy.stats().requests() > 0);
+
+        assert_eq!(
+            probe.state.heads.load(AtomicOrdering::SeqCst) - initial_heads,
+            6,
+            "each public async API must HEAD exactly once"
+        );
+        assert_eq!(
+            probe.state.full_gets.load(AtomicOrdering::SeqCst),
+            0,
+            "node ranged APIs must never issue an unbounded full-body GET"
+        );
+        assert_eq!(
+            probe
+                .state
+                .missing_generation_pin
+                .load(AtomicOrdering::SeqCst),
+            0,
+            "every physical range must carry version or If-Match"
+        );
+        assert!(probe.state.ranged_gets.load(AtomicOrdering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn descriptor_size_mismatch_fails_before_any_data_range() {
+        let (_label, body) = build_multi_row_group_sst();
+        let probe = NodeRangeProbeStore::new(Duration::ZERO);
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/size-mismatch.parquet");
+        put_node_body(&store, &path, body.clone()).await;
+        let before_ranges = probe.state.ranged_gets.load(AtomicOrdering::SeqCst);
+
+        let error = load_node_sst_metadata_async(store, path, body.len() as u64 + 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Corrupted { .. }));
+        assert_eq!(
+            probe.state.ranged_gets.load(AtomicOrdering::SeqCst),
+            before_ranges,
+            "descriptor mismatch must stop before Parquet range reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_change_after_pin_is_rejected() {
+        let (_label, body) = build_multi_row_group_sst();
+        let probe = NodeRangeProbeStore::new(Duration::ZERO);
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/replaced.parquet");
+        let meta = put_node_body(&store, &path, body.clone()).await;
+        let source =
+            PinnedObjectRangeSource::from_meta_with_cache(store.clone(), meta, None).unwrap();
+        let mut reader = ObjectStoreRangedReader::from_source(source, None);
+
+        let replacement = Bytes::from(vec![0x5a; body.len()]);
+        store
+            .put(&path, PutPayload::from(replacement))
+            .await
+            .unwrap();
+        let error = AsyncFileReader::get_bytes(&mut reader, 0..8)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ParquetError::External(_)));
+        assert_eq!(
+            probe
+                .state
+                .missing_generation_pin
+                .load(AtomicOrdering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_node_page_cache_has_zero_remote_bytes_for_new_reader() {
+        let (_label, body) = build_multi_row_group_sst();
+        let probe = NodeRangeProbeStore::new(Duration::ZERO);
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/hot-cache.parquet");
+        let meta = put_node_body(&store, &path, body.clone()).await;
+        let mut config = RangeCacheConfig::memory_only(1024 * 1024);
+        config.max_entry_bytes = 4 * 1024;
+        config.page_size_bytes = 4 * 1024;
+        config.key_namespace = "node-ranged-hot-cache".into();
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+        let end = (body.len() as u64).min(512);
+        assert!(end > 64);
+
+        let first_source = PinnedObjectRangeSource::from_meta_with_cache(
+            store.clone(),
+            meta.clone(),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        let first_stats = RangedNodeScanStats::new(first_source.clone());
+        let mut first = ObjectStoreRangedReader::from_source(first_source, None);
+        let first_bytes = AsyncFileReader::get_bytes(&mut first, 64..end)
+            .await
+            .unwrap();
+        assert_eq!(first_bytes, body.slice(64..end as usize));
+        assert_eq!(first_stats.bytes_read(), end - 64);
+        assert!(first_stats.remote_bytes_read() > 0);
+
+        let second_source =
+            PinnedObjectRangeSource::from_meta_with_cache(store, meta, Some(cache.clone()))
+                .unwrap();
+        let second_stats = RangedNodeScanStats::new(second_source.clone());
+        let mut second = ObjectStoreRangedReader::from_source(second_source, None);
+        assert_eq!(
+            AsyncFileReader::get_bytes(&mut second, 64..end)
+                .await
+                .unwrap(),
+            first_bytes
+        );
+        assert_eq!(second_stats.bytes_read(), end - 64);
+        assert_eq!(
+            second_stats.remote_bytes_read(),
+            0,
+            "a new reader over a hot generation/page must not hit the store"
+        );
+        assert!(cache.stats().memory_hits > 0);
+    }
+
+    #[tokio::test]
+    async fn cached_parquet_metadata_still_short_circuits_all_ranges() {
+        let (_label, body) = build_multi_row_group_sst();
+        let metadata = parse_node_sst_metadata(&body).unwrap();
+        let probe = NodeRangeProbeStore::new(Duration::ZERO);
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/cached-metadata.parquet");
+        let meta = put_node_body(&store, &path, body).await;
+        let source = PinnedObjectRangeSource::from_meta_with_cache(store, meta, None).unwrap();
+        let stats = RangedNodeScanStats::new(source.clone());
+        let mut reader = ObjectStoreRangedReader::from_source(source, Some(metadata.clone()));
+        let before = probe.state.ranged_gets.load(AtomicOrdering::SeqCst);
+
+        let returned = AsyncFileReader::get_metadata(&mut reader, None)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&returned, &metadata));
+        assert_eq!(stats.bytes_read(), 0);
+        assert_eq!(stats.remote_bytes_read(), 0);
+        assert_eq!(probe.state.ranged_gets.load(AtomicOrdering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn parquet_batch_ranges_are_generation_pinned_and_capped_at_sixteen() {
+        let (_label, body) = build_multi_row_group_sst();
+        let probe = NodeRangeProbeStore::new(Duration::from_millis(2));
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let path = ObjectPath::from("nodes/batch-limit.parquet");
+        let meta = put_node_body(&store, &path, body.clone()).await;
+        let source = PinnedObjectRangeSource::from_meta_with_cache(store, meta, None).unwrap();
+        let mut reader = ObjectStoreRangedReader::from_source(source, None);
+        let range_count = body.len().min(32);
+        let ranges: Vec<_> = (0..range_count)
+            .map(|offset| offset as u64..offset as u64 + 1)
+            .collect();
+        let chunks = AsyncFileReader::get_byte_ranges(&mut reader, ranges)
+            .await
+            .unwrap();
+        assert_eq!(chunks.len(), range_count);
+        assert!(
+            probe.state.max_active.load(AtomicOrdering::SeqCst) <= 16,
+            "common source must cap physical GET concurrency at 16"
+        );
+        assert_eq!(
+            probe
+                .state
+                .missing_generation_pin
+                .load(AtomicOrdering::SeqCst),
+            0
+        );
+        assert_eq!(probe.state.full_gets.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]

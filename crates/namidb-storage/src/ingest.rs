@@ -46,6 +46,7 @@
 //! - Background flush / compaction. The caller drives them manually.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::Bytes;
@@ -351,6 +352,15 @@ pub struct WriterSession {
     /// further object-store writes and mints no new orphan segments.
     /// Only a fresh [`Self::open`] clears it.
     poisoned: bool,
+    /// Node rows decoded while the generic staged-aware unique String lookup
+    /// reconciles an immutable point batch with the complete staged memtable.
+    ///
+    /// This is a diagnostic counter, not cache state. The query executor's
+    /// bounded terminal `UNWIND ... MATCH ... SET` path starts from a clean
+    /// transaction and must keep this flat while it updates thousands of wide
+    /// nodes: it uses committed point batches plus a scalar, statement-local
+    /// overlay instead of repeatedly walking all prior staged embeddings.
+    staged_unique_overlay_rows_scanned: AtomicU64,
     /// Namespace label dictionary. Seeded from the manifest at `open` and
     /// extended as `upsert_node*` interns new label names; stamped onto every
     /// committed manifest so a node's on-row `LabelId`s always resolve to names.
@@ -533,6 +543,7 @@ impl WriterSession {
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
             poisoned: false,
+            staged_unique_overlay_rows_scanned: AtomicU64::new(0),
         };
         session.seed_exact_node_counts_from_metadata();
         // Publish this namespace's current immutable-object set to the shared
@@ -698,6 +709,8 @@ impl WriterSession {
             let target_label_id = self.label_dict.id(label).map(|id| id.get());
 
             for (key, entry) in self.staged_memtable.iter_nodes() {
+                self.staged_unique_overlay_rows_scanned
+                    .fetch_add(1, Ordering::Relaxed);
                 let MemKey::Node { id } = key else {
                     continue;
                 };
@@ -784,6 +797,73 @@ impl WriterSession {
                 .seed_committed_keys(label, &names, entries);
         }
         Ok(Some(views))
+    }
+
+    /// Resolve a unique String-property batch against committed state only.
+    ///
+    /// This deliberately neither scans nor overlays `staged_memtable`. It is
+    /// safe for the query writer's narrow terminal correlated-SET path, which
+    /// admits it only when the statement starts without staged node mutations
+    /// and every SET is a property update on the matched alias that cannot
+    /// change the lookup key or labels. That caller reconciles repeated keys
+    /// from a scalar statement-local map and point-reads only the corresponding
+    /// staged node. General RYOW callers must continue to use
+    /// [`Self::seed_unique_string_candidates`].
+    pub async fn batch_lookup_committed_unique_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Option<crate::read::NodeView>>> {
+        self.snapshot()
+            .batch_lookup_nodes_by_property(label, property, values)
+            .await
+    }
+
+    /// Resolve and seed unique String-property keys from committed state only.
+    ///
+    /// Unlike [`Self::seed_unique_string_candidates`], this method never walks
+    /// `staged_memtable`. The caller must prove that none of `values` has been
+    /// modified in the current transaction; otherwise installing a committed
+    /// hit/miss could overwrite the transactional index's newer claimant.
+    ///
+    /// The query writer uses this for a narrow terminal single-node MERGE. It
+    /// filters every statement-local key through its scalar overlay before
+    /// calling here, then lets normal node upserts journal newer claimants in
+    /// the transactional unique index. Once another key has been staged, these
+    /// still-committed answers are installed through the staged journal so a
+    /// later rollback cannot retain transaction-dependent partial-map state.
+    pub async fn seed_unmodified_committed_unique_string_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Option<crate::read::NodeView>>> {
+        let views = self
+            .snapshot()
+            .batch_lookup_nodes_by_property(label, property, values)
+            .await?;
+        let names = vec![property.to_string()];
+        let entries = values.iter().zip(&views).map(|(value, view)| {
+            let scalar = Value::Str(value.clone());
+            let key = crate::unique_index::encode_probe_key(&[&scalar])
+                .expect("String unique keys are indexable");
+            (key, view.as_ref().map(|node| node.id))
+        });
+        if self.pending_has_node_mutations() {
+            self.unique_index.seed_staged_keys(label, &names, entries);
+        } else {
+            self.unique_index
+                .seed_committed_keys(label, &names, entries);
+        }
+        Ok(views)
+    }
+
+    /// Diagnostic count of staged node rows walked by generic unique batch
+    /// reconciliation. Monotonic for the lifetime of this writer session.
+    pub fn staged_unique_overlay_rows_scanned(&self) -> u64 {
+        self.staged_unique_overlay_rows_scanned
+            .load(Ordering::Relaxed)
     }
 
     /// The per-writer unique-value index (RFC-026 constraint fast path).
@@ -2131,7 +2211,7 @@ impl WriterSession {
             attached_max_lsn = attached_max_lsn.max(descriptor.max_lsn);
             let store_ref = store.clone();
             put_futures.push(Box::pin(async move {
-                crate::flush::put_object(store_ref, &body_path, body).await
+                crate::flush::put_sidecar_payload(store_ref, &body_path, body).await
             }));
             if let Some((bloom_path, bloom_body)) = bloom {
                 bloom_count += 1;
@@ -2364,6 +2444,9 @@ impl WriterSession {
         next.vector_indexes.retain(|d| d.name != name);
         next.search_index_builds
             .retain(|state| state.kind != SstKind::VectorGraph || state.name != name);
+        next.search_lsm.retain(|state| {
+            state.kind != crate::search_lsm::SearchLsmKind::Vector || state.index_name != name
+        });
         next.ssts
             .retain(|d| !(d.kind == SstKind::VectorGraph && d.scope == name));
         let committed = self
@@ -2413,6 +2496,9 @@ impl WriterSession {
         next.text_indexes.retain(|d| d.name != name);
         next.search_index_builds
             .retain(|state| state.kind != SstKind::TextIndex || state.name != name);
+        next.search_lsm.retain(|state| {
+            state.kind != crate::search_lsm::SearchLsmKind::Text || state.index_name != name
+        });
         next.ssts
             .retain(|d| !(d.kind == SstKind::TextIndex && d.scope == name));
         let committed = self
@@ -2780,6 +2866,7 @@ pub fn clear_shared_caches() {
     if let Some(cache) = shared_adjacency_cache() {
         cache.clear();
     }
+    crate::range_cache::clear_shared_range_cache_memory();
     writer_local_cache_registry().clear();
 }
 
@@ -3463,8 +3550,16 @@ mod tests {
     }
 
     #[cfg(feature = "vector-index")]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn drop_vector_index_removes_descriptor_and_vg_ssts_in_one_commit() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::manifest::{VectorMetric, VectorQuantization};
 
         let store = make_store();
@@ -3540,28 +3635,31 @@ mod tests {
             .unwrap();
         session.flush(doc_schema.clone()).await.unwrap();
         session.compact_l0(&doc_schema).await.unwrap();
+        // Native model: flush minted an Active Search-LSM generation and VG6
+        // delta segments; legacy rebuild markers exist only for 2.0.6-store
+        // adoption and BasePrefix consolidation, neither of which ran here.
+        assert!(
+            session.current.manifest.search_index_builds.is_empty(),
+            "a native store must not mint legacy rebuild markers"
+        );
+        assert!(
+            session.current.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+                    && state.status == crate::search_lsm::SearchLsmStatus::Active
+            }),
+            "flush must register an Active vector generation"
+        );
         assert!(
             session
                 .current
                 .manifest
-                .search_index_builds
+                .ssts
                 .iter()
-                .any(|state| state.kind == SstKind::VectorGraph && state.name == "doc_emb"),
-            "authoritative build must record its catalog generation"
-        );
-        let vg_relative = session
-            .current
-            .manifest
-            .ssts
-            .iter()
-            .find(|d| d.kind == SstKind::VectorGraph && d.scope == "doc_emb")
-            .expect("compaction must have built the .vg SST for the registered index")
-            .path
-            .clone();
-        let vg_absolute = format!(
-            "{}/{}",
-            session.manifest_store.paths().namespace_prefix().as_ref(),
-            vg_relative
+                .any(|d| d.kind == SstKind::VectorGraph
+                    && d.scope == "doc_emb"
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)),
+            "flush must have written at least one VG6 delta segment body"
         );
         // The index path actually serves (fresh, and the .vg answers the KNN) —
         // not the trivially-equal flat fallback.
@@ -3574,15 +3672,6 @@ mod tests {
         assert_eq!(hits.len(), 1, "the .vg must answer the KNN before the drop");
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
-        let cache = session.sst_cache().unwrap().clone();
-        assert!(
-            cache.get_vector_index(&vg_absolute).is_some(),
-            "the serving query must populate the decoded graph cache"
-        );
-        assert!(
-            cache.get(&vg_absolute).is_some(),
-            "the serving query must populate the raw body cache"
-        );
 
         // A registration over the occupied (label, property, metric) slot is
         // still a duplicate at this point.
@@ -3622,12 +3711,11 @@ mod tests {
             "DROP must remove the durable build marker too"
         );
         assert!(
-            cache.get_vector_index(&vg_absolute).is_none(),
-            "DROP must eagerly prune the decoded graph"
-        );
-        assert!(
-            cache.get(&vg_absolute).is_none(),
-            "DROP must eagerly prune the raw graph body"
+            !m.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            }),
+            "the same commit must remove the Search-LSM generation"
         );
 
         // The flat scan still sees every row — dropping the index loses no data.
@@ -3663,8 +3751,16 @@ mod tests {
     }
 
     #[cfg(feature = "text-index")]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn drop_text_index_removes_descriptor_and_ft_ssts_and_falls_back() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let store = make_store();
         let paths = make_paths("ingest-drop-ftidx");
         let mut session = WriterSession::open_with_caches(
@@ -3712,25 +3808,31 @@ mod tests {
             .unwrap();
         session.flush(note_schema.clone()).await.unwrap();
         session.compact_l0(&note_schema).await.unwrap();
-        assert!(session
-            .current
-            .manifest
-            .search_index_builds
-            .iter()
-            .any(|state| state.kind == SstKind::TextIndex && state.name == "note_ft"));
-        let ft_relative = session
-            .current
-            .manifest
-            .ssts
-            .iter()
-            .find(|d| d.kind == SstKind::TextIndex && d.scope == "note_ft")
-            .expect("compaction must have built the .ft SST for the registered index")
-            .path
-            .clone();
-        let ft_absolute = format!(
-            "{}/{}",
-            session.manifest_store.paths().namespace_prefix().as_ref(),
-            ft_relative
+        // Native model: flush minted an Active Search-LSM generation and FT4
+        // delta segments; legacy rebuild markers exist only for 2.0.6-store
+        // adoption and BasePrefix consolidation, neither of which ran here.
+        assert!(
+            session.current.manifest.search_index_builds.is_empty(),
+            "a native store must not mint legacy rebuild markers"
+        );
+        assert!(
+            session.current.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+                    && state.status == crate::search_lsm::SearchLsmStatus::Active
+            }),
+            "flush must register an Active text generation"
+        );
+        assert!(
+            session
+                .current
+                .manifest
+                .ssts
+                .iter()
+                .any(|d| d.kind == SstKind::TextIndex
+                    && d.scope == "note_ft"
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)),
+            "flush must have written at least one FT4 delta segment body"
         );
         // The index path actually serves (`Some`, not the flat fallback).
         let snap = session.snapshot();
@@ -3747,15 +3849,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, sorted_node_id(1));
         drop(snap);
-        let cache = session.sst_cache().unwrap().clone();
-        assert!(
-            cache.get_text_index(&ft_absolute).is_some(),
-            "the serving query must populate the decoded text cache"
-        );
-        assert!(
-            cache.get(&ft_absolute).is_some(),
-            "the serving query must populate the raw body cache"
-        );
 
         // Missing name: an error without IF EXISTS, a version-preserving no-op
         // with it.
@@ -3781,12 +3874,11 @@ mod tests {
             "DROP must remove the durable text build marker"
         );
         assert!(
-            cache.get_text_index(&ft_absolute).is_none(),
-            "DROP must eagerly prune the decoded text index"
-        );
-        assert!(
-            cache.get(&ft_absolute).is_none(),
-            "DROP must eagerly prune the raw text body"
+            !m.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            }),
+            "the same commit must remove the Search-LSM generation"
         );
 
         // The read path reports "no index" (`None` → the caller flat-scans) and
@@ -3933,8 +4025,14 @@ mod tests {
     /// edges + authoritative `.vg`/`.ft` rebuilds): same outcome counters,
     /// same manifest version, same structural SST contents, same reads.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    // Env-guard held across awaits by design: both compactions below OBSERVE
+    // the process-global Search-LSM policy env and must see the same value.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn prepared_compaction_round_trip_matches_compact_l0() {
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut legacy, schema) = seeded_multi_bucket_session("ingest-prep-rt-legacy").await;
         let (mut split, _) = seeded_multi_bucket_session("ingest-prep-rt-split").await;
 
@@ -4040,8 +4138,16 @@ mod tests {
     /// gate routes index reads to the flat scan because the newer L0 outran
     /// the just-installed `.ft`.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn install_after_interleaved_write_and_flush_keeps_l0_and_outputs() {
+        // Holds the shared policy-env lock: these assertions depend on the
+        // DEFAULT incremental policy (deltas retained, no legacy markers), and
+        // a concurrently running consolidation test would otherwise leak
+        // force_base=true into this process.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         fn body_record(body: &str) -> NodeWriteRecord {
             let mut props: BTreeMap<String, Value> = BTreeMap::new();
             props.insert("body".into(), Value::Str(body.into()));
@@ -4054,7 +4160,23 @@ mod tests {
 
         let (mut session, schema) = seeded_multi_bucket_session("ingest-prep-interleave").await;
         let base_version = session.manifest_version();
-        let inputs: Vec<Uuid> = session.current.manifest.ssts.iter().map(|d| d.id).collect();
+        // Only the structural kinds are merge inputs. Native FT4/VG6 delta
+        // segments and the `.slb` barrier are Search-LSM state: the default
+        // incremental policy correctly retains them across an L0→L1 node
+        // merge, so expecting their removal pins the 2.0.6 rebuild model.
+        let inputs: Vec<Uuid> = session
+            .current
+            .manifest
+            .ssts
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.kind,
+                    SstKind::Nodes | SstKind::EdgesFwd | SstKind::EdgesInv
+                )
+            })
+            .map(|d| d.id)
+            .collect();
 
         // Prepare from the basis at version N, then let the writer advance…
         let basis = session.compaction_basis();
@@ -4073,12 +4195,19 @@ mod tests {
         // node bucket.
         session.flush(schema.clone()).await.unwrap();
         assert_eq!(session.manifest_version(), base_version + 2);
+        // The compat barrier legitimately rotates ids when install rebases
+        // coverage, so it is excluded; everything else interleaved — the new
+        // Nodes L0 and its VG6/FT4 deltas — must survive the install.
         let interleaved_l0: Vec<Uuid> = session
             .current
             .manifest
             .ssts
             .iter()
-            .filter(|d| d.level == SstLevel::L0 && !inputs.contains(&d.id))
+            .filter(|d| {
+                d.level == SstLevel::L0
+                    && !inputs.contains(&d.id)
+                    && !crate::search_lsm::is_canonical_search_barrier_descriptor(d)
+            })
             .map(|d| d.id)
             .collect();
         assert!(
@@ -4125,11 +4254,24 @@ mod tests {
                 .unwrap();
             assert_eq!(v.properties.get("body"), Some(&Value::Str(body.into())));
         }
-        // …and the freshness gate sees the newer L0 outrunning the
-        // just-installed indexes, so BM25 falls back to the exact flat scan
-        // instead of serving a corpus that misses node 8.
-        assert!(snap.index_outrun_by_nodes("doc_ft", SstKind::TextIndex));
-        assert!(snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        // …and the 2.0.6 post-install freshness gap no longer exists: the
+        // interleaved flush wrote its own FT4/VG6 delta, so coverage stays
+        // exact through the install and the index must SERVE node 8 rather
+        // than fall back to a flat scan. That gap's elimination is the core
+        // design goal of the incremental Search-LSM.
+        assert!(!snap.index_outrun_by_nodes("doc_ft", SstKind::TextIndex));
+        assert!(!snap.index_outrun_by_nodes("doc_emb", SstKind::VectorGraph));
+        let got = snap
+            .text_search(
+                "doc_ft",
+                "Doc",
+                &crate::text::TextQuery::from_terms(&["lizard".to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("exact delta coverage must serve after install");
+        assert_eq!(got[0].0, sorted_node_id(8));
         let got = snap
             .text_search(
                 "doc_ft",
@@ -4138,8 +4280,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
-        assert!(got.is_none(), "an outrun index must fall back, not serve");
+            .unwrap()
+            .expect("the rebased generation must keep serving pre-compaction rows");
+        assert_eq!(got[0].0, sorted_node_id(1));
     }
 
     #[tokio::test]
@@ -5458,141 +5601,7 @@ mod tests {
     }
 
     /// `ObjectStore` wrapper that can fail or block the next matching
-    /// `put_opts` exactly once. Used to simulate both transient commit faults
-    /// and cancellation while an immutable flush body is in flight.
-    #[derive(Debug)]
-    struct FaultStore {
-        inner: Arc<dyn ObjectStore>,
-        fail_next_put_on: std::sync::Mutex<Option<String>>,
-        block_next_put_on: std::sync::Mutex<Option<String>>,
-        blocked_put: tokio::sync::Notify,
-        release_put: tokio::sync::Notify,
-    }
-
-    impl FaultStore {
-        fn new(inner: Arc<dyn ObjectStore>) -> Self {
-            Self {
-                inner,
-                fail_next_put_on: std::sync::Mutex::new(None),
-                block_next_put_on: std::sync::Mutex::new(None),
-                blocked_put: tokio::sync::Notify::new(),
-                release_put: tokio::sync::Notify::new(),
-            }
-        }
-        fn fail_next_put_containing(&self, needle: &str) {
-            *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
-        }
-
-        fn block_next_put_containing(&self, needle: &str) {
-            *self.block_next_put_on.lock().unwrap() = Some(needle.to_string());
-        }
-
-        async fn wait_for_blocked_put(&self) {
-            self.blocked_put.notified().await;
-        }
-    }
-
-    impl std::fmt::Display for FaultStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FaultStore({})", self.inner)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for FaultStore {
-        async fn put_opts(
-            &self,
-            location: &object_store::path::Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            let hit = {
-                let mut guard = self.fail_next_put_on.lock().unwrap();
-                match guard.as_deref() {
-                    Some(needle) if location.as_ref().contains(needle) => {
-                        *guard = None;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if hit {
-                return Err(object_store::Error::Generic {
-                    store: "FaultStore",
-                    source: "injected transient put failure".into(),
-                });
-            }
-            let block = {
-                let mut guard = self.block_next_put_on.lock().unwrap();
-                match guard.as_deref() {
-                    Some(needle) if location.as_ref().contains(needle) => {
-                        *guard = None;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if block {
-                // `notify_one` retains a permit if the test has not started
-                // waiting yet. The matching PUT then stays pending until the
-                // flush future is deliberately dropped.
-                self.blocked_put.notify_one();
-                self.release_put.notified().await;
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &object_store::path::Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &object_store::path::Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<object_store::path::Path>,
-            >,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
-        {
-            self.inner.delete_stream(locations)
-        }
-    }
+    use crate::test_support::FaultStore;
 
     #[tokio::test]
     async fn commit_batch_reseqs_and_recovers_when_base_plus_one_is_free() {
@@ -7307,5 +7316,186 @@ mod tests {
                 .unwrap(),
             UniqueProbe::NoConflict
         );
+    }
+
+    /// Plan item 10 (25 TB readiness): the search publish path survives a
+    /// fault at every PUT it makes — delta segment body, `.slb` barrier,
+    /// manifest body, and the consolidation output. After each injected
+    /// failure a fresh reader must serve the previous committed state
+    /// natively, the retried operation must succeed, and a deleting janitor
+    /// sweep must reclaim any half-published object without touching live
+    /// state.
+    #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn search_publish_crash_matrix_stays_serving_and_reclaims() {
+        use crate::janitor::sweep_orphans;
+        use crate::manifest::TextIndexDescriptor;
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        // Consolidation (the fourth fault point) needs the deterministic
+        // force-base policy; every phase here observes policy-dependent state.
+        let _env_lock = crate::test_support::SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = crate::test_support::SearchCompactionEnvRestore::configure();
+
+        let fault = Arc::new(crate::test_support::FaultStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = fault.clone();
+        let paths = make_paths("ingest-search-crash-matrix");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let dim = 4u32;
+        session
+            .register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim,
+                    metric: VectorMetric::Cosine,
+                    r: 16,
+                    l_build: 32,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .register_text_index(
+                TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        let doc_schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("embedding", DataType::FloatVector { dim }, true).unwrap(),
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build();
+        let doc = |ordinal: u64| {
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            let mut embedding = vec![0.0f32; dim as usize];
+            embedding[0] = 1.0;
+            embedding[1] = ordinal as f32 / 16.0;
+            props.insert("embedding".into(), Value::Vec(embedding));
+            props.insert("body".into(), Value::Str(format!("alpha doc {ordinal}")));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        };
+        let probe = vec![1.0f32, 0.0, 0.0, 0.0];
+
+        // Baseline: one flushed batch, natively served.
+        for ordinal in 0..6u64 {
+            session
+                .upsert_node("Doc", NodeId::new(), &doc(ordinal))
+                .unwrap();
+        }
+        session.flush(doc_schema.clone()).await.unwrap();
+        // The contract is a READER-NODE's view: the last committed manifest
+        // with no writer memtable. The writer's own snapshot legitimately
+        // falls back while it holds committed-but-unflushed rows — that is
+        // the freshness gate, not a failure.
+        async fn assert_serving(
+            store: &Arc<dyn ObjectStore>,
+            paths: &crate::paths::NamespacePaths,
+            probe: &[f32],
+            expected: usize,
+            label: &str,
+        ) {
+            use crate::search_lsm::{select_search_read_plan, SearchLsmKind, SearchReadPlan};
+            let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+            let loaded = manifest_store.load_current().await.unwrap();
+            let memtable = Memtable::new();
+            let view = memtable.snapshot_view();
+            let snap = crate::read::Snapshot::new(loaded, &view, store.clone(), paths.clone());
+            let manifest = snap.manifest().manifest.clone();
+            for (kind, name) in [
+                (SearchLsmKind::Vector, "doc_emb"),
+                (SearchLsmKind::Text, "doc_ft"),
+            ] {
+                let plan = select_search_read_plan(&manifest, kind, name);
+                // Both are native-serving plans: delta segments before the
+                // consolidation, the single-base fast path after it. Only a
+                // flat fallback or a bare legacy body would betray a broken
+                // publish.
+                assert!(
+                    matches!(
+                        plan,
+                        SearchReadPlan::ActiveSegments { .. }
+                            | SearchReadPlan::ActiveLegacyBase { .. }
+                    ),
+                    "{label}: {name} must keep selecting a native plan, got {plan:?}"
+                );
+            }
+            let hits = snap
+                .text_search("doc_ft", "Doc", &crate::text::parse_query("alpha"), None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: text generation must serve"));
+            assert_eq!(hits.len(), expected, "{label}: full corpus served");
+            let (vector_hits, _) = snap
+                .try_vector_search_with_point_count("doc_emb", probe, 3, 32)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: vector generation must serve"));
+            assert_eq!(vector_hits.len(), 3, "{label}: KNN served");
+        }
+        assert_serving(&store, &paths, &probe, 6, "baseline").await;
+
+        // Fault 1: the FT4 delta segment body PUT fails mid-flush.
+        session.upsert_node("Doc", NodeId::new(), &doc(6)).unwrap();
+        fault.fail_next_put_containing(".ft4");
+        session.flush(doc_schema.clone()).await.unwrap_err();
+        assert_serving(&store, &paths, &probe, 6, "after failed ft4 delta PUT").await;
+
+        // Fault 2: the rotated `.slb` barrier PUT fails on the retry.
+        fault.fail_next_put_containing(".slb");
+        session.flush(doc_schema.clone()).await.unwrap_err();
+        assert_serving(&store, &paths, &probe, 6, "after failed barrier PUT").await;
+
+        // Fault 3: the manifest body PUT fails. The write path may retry the
+        // commit internally at a fresh version; either way the corpus must
+        // land exactly once.
+        fault.fail_next_put_containing("manifest/v");
+        let _ = session.flush(doc_schema.clone()).await;
+        session.flush(doc_schema.clone()).await.unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after manifest fault and retry").await;
+
+        // Fault 4: the consolidation output PUT fails; the generation keeps
+        // serving its deltas, and the retried consolidation lands.
+        fault.fail_next_put_containing("sst/level1");
+        let _ = session.compact_l0(&doc_schema).await;
+        assert_serving(&store, &paths, &probe, 7, "after failed consolidation PUT").await;
+        session.compact_l0(&doc_schema).await.unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after retried consolidation").await;
+
+        // The janitor reclaims whatever half-published objects the faults
+        // stranded, without breaking the live state.
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let current = manifest_store.load_current().await.unwrap();
+        sweep_orphans(
+            &manifest_store,
+            current.manifest.version,
+            std::time::Duration::ZERO,
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_serving(&store, &paths, &probe, 7, "after deleting sweep").await;
     }
 }

@@ -9,14 +9,141 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{collections::HashSet, path::PathBuf};
 
 /// Disabled by default for backward compatibility.
 pub const DEFAULT_MEMORY_MAX_BYTES: usize = 0;
+/// Fraction of a finite cgroup hard limit used by the `auto` admission rail.
+///
+/// The remaining ten percent is deliberately outside NamiDB's admission
+/// ceiling. It covers allocations already in flight, allocator/runtime
+/// overhead, and the delay between two 500 ms watchdog samples before the
+/// kernel's OOM killer reaches the container limit.
+pub const AUTO_MEMORY_LIMIT_PERCENT: usize = 90;
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const SELF_CGROUP: &str = "/proc/self/cgroup";
+// cgroup v1 reports values close to i64::MAX for "unlimited" instead of a
+// textual `max`. No realistic container allocation belongs in this range.
+const CGROUP_V1_UNLIMITED_FLOOR: u128 = 1u128 << 60;
 
 const RECLAIM_PERCENT: usize = 90;
 const RESUME_PERCENT: usize = 80;
 const HARD_RECLAIM_COOLDOWN: Duration = Duration::from_secs(1);
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Parse an exact-byte process ceiling or resolve `auto` from the current
+/// container's finite cgroup memory limit.
+///
+/// `auto` intentionally fails startup when the process has no finite cgroup
+/// limit. Falling back to a percentage of host RAM would be unsafe on a shared
+/// machine and silently resolving to zero would disable the very safety rail
+/// the operator requested.
+pub fn resolve_memory_max_bytes(raw: &str) -> Result<usize, String> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("auto") {
+        let hard_limit = finite_cgroup_memory_limit_bytes().ok_or_else(|| {
+            "NAMIDB_MEMORY_MAX_BYTES=auto requires a finite cgroup memory limit; \
+             set an exact byte count or start the container with --memory/Compose mem_limit"
+                .to_string()
+        })?;
+        return Ok(percent(hard_limit, AUTO_MEMORY_LIMIT_PERCENT));
+    }
+    raw.parse::<usize>().map_err(|error| {
+        format!("NAMIDB_MEMORY_MAX_BYTES must be an exact byte count, 0, or auto: {error}")
+    })
+}
+
+/// Current finite cgroup hard limit, if one is configured.
+///
+/// cgroup v2 is preferred. The v1 fallback keeps the official image safe on
+/// older Docker hosts. Errors and the respective unlimited sentinels return
+/// `None`; callers decide whether absence is fatal.
+pub fn finite_cgroup_memory_limit_bytes() -> Option<usize> {
+    cgroup_memory_limit_paths()
+        .into_iter()
+        .find_map(|(path, v1)| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| parse_cgroup_limit(&raw, v1))
+        })
+}
+
+fn parse_cgroup_limit(raw: &str, v1: bool) -> Option<usize> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let bytes = raw.parse::<u128>().ok()?;
+    if bytes == 0 || (v1 && bytes >= CGROUP_V1_UNLIMITED_FLOOR) {
+        return None;
+    }
+    usize::try_from(bytes).ok()
+}
+
+fn cgroup_memory_limit_paths() -> Vec<(PathBuf, bool)> {
+    let mut candidates = Vec::new();
+    if let Ok(membership) = std::fs::read_to_string(SELF_CGROUP) {
+        for line in membership.lines() {
+            let mut fields = line.splitn(3, ':');
+            let Some(_hierarchy) = fields.next() else {
+                continue;
+            };
+            let Some(controllers) = fields.next() else {
+                continue;
+            };
+            let Some(relative) = fields.next() else {
+                continue;
+            };
+            if controllers.is_empty() {
+                if let Some(mut directory) = cgroup_directory(CGROUP_ROOT, relative) {
+                    directory.push("memory.max");
+                    candidates.push((directory, false));
+                }
+            } else if controllers
+                .split(',')
+                .any(|controller| controller == "memory")
+            {
+                if let Some(mut directory) =
+                    cgroup_directory(&format!("{CGROUP_ROOT}/memory"), relative)
+                {
+                    directory.push("memory.limit_in_bytes");
+                    candidates.push((directory, true));
+                }
+            }
+        }
+    }
+
+    // Container cgroup namespaces commonly expose the current group directly
+    // at the mount root. These fallbacks also cover hosts where
+    // `/proc/self/cgroup` is hidden but the controller file is mounted.
+    candidates.push((PathBuf::from(CGROUP_ROOT).join("memory.max"), false));
+    candidates.push((
+        PathBuf::from(CGROUP_ROOT)
+            .join("memory")
+            .join("memory.limit_in_bytes"),
+        true,
+    ));
+
+    let mut seen = HashSet::new();
+    candidates.retain(|(path, _)| seen.insert(path.clone()));
+    candidates
+}
+
+fn cgroup_directory(root: &str, relative: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::from(root);
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => out.push(component),
+            // The membership path is kernel-owned, nevertheless refuse
+            // traversal rather than allowing a malformed mount/proc fixture
+            // to make startup read an arbitrary host file.
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
 
 #[derive(Debug, Default)]
 struct ReclaimState {
@@ -452,6 +579,14 @@ impl MemoryGovernor {
         self.rejected_queries.load(Ordering::Relaxed)
     }
 
+    /// Projected request working sets currently promised by admission guards.
+    ///
+    /// Exposed inside the server crate for deterministic protocol tests and
+    /// metrics; it is not a resident-byte measurement.
+    pub fn reserved_headroom_bytes(&self) -> usize {
+        self.reserved_headroom_bytes.load(Ordering::Acquire)
+    }
+
     pub fn over_limit(&self) -> bool {
         self.max_bytes > 0 && self.resident_bytes() >= self.max_bytes
     }
@@ -516,6 +651,53 @@ pub(crate) fn trim_allocator() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_limit_parser_accepts_exact_bytes_and_rejects_ambiguous_units() {
+        assert_eq!(resolve_memory_max_bytes("0"), Ok(0));
+        assert_eq!(resolve_memory_max_bytes(" 3758096384 "), Ok(3_758_096_384));
+        let error = resolve_memory_max_bytes("4GiB").unwrap_err();
+        assert!(error.contains("exact byte count, 0, or auto"));
+    }
+
+    #[test]
+    fn cgroup_limit_parser_rejects_unlimited_and_overflow_sentinels() {
+        assert_eq!(parse_cgroup_limit("max\n", false), None);
+        assert_eq!(parse_cgroup_limit("0", false), None);
+        assert_eq!(
+            parse_cgroup_limit("4294967296", false),
+            usize::try_from(4_294_967_296u64).ok()
+        );
+        assert_eq!(
+            parse_cgroup_limit(&(CGROUP_V1_UNLIMITED_FLOOR - 1).to_string(), true),
+            usize::try_from(CGROUP_V1_UNLIMITED_FLOOR - 1).ok()
+        );
+        assert_eq!(
+            parse_cgroup_limit(&CGROUP_V1_UNLIMITED_FLOOR.to_string(), true),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_limit(&(usize::MAX as u128 + 1).to_string(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_membership_paths_stay_beneath_the_controller_mount() {
+        assert_eq!(
+            cgroup_directory("/sys/fs/cgroup", "/tenant.slice/namidb.service"),
+            Some(PathBuf::from("/sys/fs/cgroup/tenant.slice/namidb.service"))
+        );
+        assert_eq!(
+            cgroup_directory("/sys/fs/cgroup", "/"),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
+        assert_eq!(
+            cgroup_directory("/sys/fs/cgroup", "../../etc"),
+            None,
+            "kernel membership text must never be allowed to escape the mount"
+        );
+    }
 
     #[tokio::test]
     async fn disabled_governor_never_rejects() {

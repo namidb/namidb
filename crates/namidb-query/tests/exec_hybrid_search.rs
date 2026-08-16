@@ -455,6 +455,12 @@ mod indexed_sparse_filter {
     struct TextGetProbe {
         inner: Arc<dyn ObjectStore>,
         text_gets: AtomicUsize,
+        /// Generation-barrier pins. Every `search_lsm_read` coordinator
+        /// invocation pins its `.slb` barrier exactly once via `store.head()`,
+        /// so this counts query-side probes on the NATIVE route only — a flat
+        /// fallback pins no barrier, and HEADs bypass the range cache, making
+        /// the count deterministic.
+        barrier_pins: AtomicUsize,
     }
 
     impl TextGetProbe {
@@ -462,11 +468,16 @@ mod indexed_sparse_filter {
             Self {
                 inner: Arc::new(InMemory::new()),
                 text_gets: AtomicUsize::new(0),
+                barrier_pins: AtomicUsize::new(0),
             }
         }
 
         fn text_gets(&self) -> usize {
             self.text_gets.load(Ordering::SeqCst)
+        }
+
+        fn barrier_pins(&self) -> usize {
+            self.barrier_pins.load(Ordering::SeqCst)
         }
     }
 
@@ -500,7 +511,13 @@ mod indexed_sparse_filter {
             location: &Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            if location.as_ref().ends_with(".ft") {
+            if options.head && location.as_ref().ends_with(".slb") {
+                self.barrier_pins.fetch_add(1, Ordering::SeqCst);
+            }
+            // Legacy monolithic bodies and native FT4 segments are both text
+            // index traffic; kept for the stale/corrupt tests, whose gates
+            // fire before any index fetch on either route.
+            if location.as_ref().ends_with(".ft") || location.as_ref().ends_with(".ft4") {
                 self.text_gets.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get_opts(location, options).await
@@ -548,6 +565,17 @@ mod indexed_sparse_filter {
         name: &str,
         docs: &[(&str, &str, &str)],
     ) -> (WriterSession, BTreeMap<String, NodeId>, Arc<TextGetProbe>) {
+        indexed_corpus_with(name, docs, false).await
+    }
+
+    /// `tenant_indexed` marks `tenant` as an indexed property, which makes
+    /// `text_native_filter_properties` include it and the FT4 segments
+    /// advertise it — the precondition for native filter-group serving.
+    async fn indexed_corpus_with(
+        name: &str,
+        docs: &[(&str, &str, &str)],
+        tenant_indexed: bool,
+    ) -> (WriterSession, BTreeMap<String, NodeId>, Arc<TextGetProbe>) {
         let probe = Arc::new(TextGetProbe::new());
         let store: Arc<dyn ObjectStore> = probe.clone();
         let namespace_paths = paths(name);
@@ -567,8 +595,16 @@ mod indexed_sparse_filter {
                 name: "Doc".into(),
                 properties: vec![
                     PropertyDef::new("body", DataType::Utf8, true).unwrap(),
-                    PropertyDef::new("tenant", DataType::Utf8, true).unwrap(),
+                    PropertyDef::new("tenant", DataType::Utf8, true)
+                        .unwrap()
+                        .with_indexed(tenant_indexed),
                     PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                    // Numeric filter target: numeric equality is never
+                    // extracted into native filter groups, so `filter:
+                    // { rank: N }` routes through the plain text_search the
+                    // fixture serves natively — exercising the walker's
+                    // residual-widening discipline on the native route.
+                    PropertyDef::new("rank", DataType::Int64, true).unwrap(),
                 ],
             })
             .unwrap()
@@ -585,6 +621,10 @@ mod indexed_sparse_filter {
                 let mut properties = BTreeMap::new();
                 properties.insert("title".into(), CoreValue::Str(title.into()));
                 properties.insert("tenant".into(), CoreValue::Str(tenant.into()));
+                properties.insert(
+                    "rank".into(),
+                    CoreValue::I64(if tenant == "acme" { 7 } else { 0 }),
+                );
                 properties.insert("body".into(), CoreValue::Str(body.into()));
                 let record = NodeWriteRecord {
                     properties,
@@ -662,7 +702,13 @@ mod indexed_sparse_filter {
         let borrowed = borrowed_docs(&docs);
         let (writer, ids, probe) = indexed_corpus("hybrid-ft-widen", &borrowed).await;
 
+        let pins_before = probe.barrier_pins();
         let initial = authoritative_hits(&writer, "alpha", 8).await;
+        assert_eq!(
+            probe.barrier_pins() - pins_before,
+            1,
+            "one authoritative probe pins the generation barrier exactly once"
+        );
         assert_eq!(initial.len(), 8);
         assert!(
             initial.iter().all(|(id, _)| *id != ids["target"]),
@@ -674,21 +720,26 @@ mod indexed_sparse_filter {
             "the second authoritative prefix must expose the target"
         );
 
-        let before = probe.text_gets();
+        let before = probe.barrier_pins();
         let rows = run(
             &writer,
             "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
              text_property: 'body', k: 1, k_sparse: 1, \
-             filter: { tenant: 'acme' } }) \
+             filter: { rank: 7 } }) \
              YIELD node, score RETURN node.title AS title, score",
             vec![],
         )
         .await;
         assert_eq!(titles(&rows), vec!["target".to_string()]);
+        // Barrier pins count coordinator invocations exactly and only on the
+        // native route (a flat fallback pins no barrier), so the original
+        // probe discipline is asserted verbatim: one probe at fetch=8, one
+        // more at the widened fetch=32, nothing else.
         assert_eq!(
-            probe.text_gets() - before,
+            probe.barrier_pins() - before,
             2,
-            "cache-free execution must probe .ft at fetch=8 and widened fetch=32"
+            "cache-free execution must probe the generation at fetch=8 and \
+             once more at the widened fetch=32"
         );
     }
 
@@ -708,18 +759,24 @@ mod indexed_sparse_filter {
         ));
         let borrowed = borrowed_docs(&docs);
         let (writer, _, probe) = indexed_corpus("hybrid-ft-short", &borrowed).await;
+        let pins_before = probe.barrier_pins();
         assert_eq!(
             authoritative_hits(&writer, "alpha", 40).await.len(),
             docs.len(),
             "fetch=40 proves the authoritative matching corpus is exhausted"
         );
+        assert_eq!(
+            probe.barrier_pins() - pins_before,
+            1,
+            "one authoritative probe pins the generation barrier exactly once"
+        );
 
-        let before = probe.text_gets();
+        let before = probe.barrier_pins();
         let rows = run(
             &writer,
             "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
              text_property: 'body', k: 5, k_sparse: 5, \
-             filter: { tenant: 'acme' } }) \
+             filter: { rank: 7 } }) \
              YIELD node, score RETURN node.title AS title, score",
             vec![],
         )
@@ -729,9 +786,10 @@ mod indexed_sparse_filter {
             vec!["eligible-a".to_string(), "eligible-b".to_string()]
         );
         assert_eq!(
-            probe.text_gets() - before,
+            probe.barrier_pins() - before,
             1,
-            "an exhausted .ft returns the exact <k page without another probe"
+            "an exhausted generation returns the exact <k page without \
+             another probe"
         );
     }
 
@@ -758,7 +816,13 @@ mod indexed_sparse_filter {
         ]);
         let borrowed = borrowed_docs(&docs);
         let (writer, ids, probe) = indexed_corpus("hybrid-ft-cap", &borrowed).await;
+        let pins_before = probe.barrier_pins();
         let top_eight = authoritative_hits(&writer, "alpha", 8).await;
+        assert_eq!(
+            probe.barrier_pins() - pins_before,
+            1,
+            "one authoritative probe pins the generation barrier exactly once"
+        );
         assert!(
             ["eligible-a", "eligible-b", "eligible-c"]
                 .iter()
@@ -767,24 +831,25 @@ mod indexed_sparse_filter {
         );
         let cypher = "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
              text_property: 'body', k: 3, k_sparse: 3, \
-             filter: { tenant: 'acme' } }) \
+             filter: { rank: 7 } }) \
              YIELD node, score RETURN node.title AS title, score";
 
-        let indexed_before = probe.text_gets();
+        let indexed_before = probe.barrier_pins();
         let indexed = run(&writer, cypher, vec![]).await;
         assert_eq!(
-            probe.text_gets() - indexed_before,
+            probe.barrier_pins() - indexed_before,
             1,
-            "the uncapped authoritative route exhausts this corpus in one .ft probe"
+            "the uncapped authoritative route exhausts this corpus in one probe"
         );
 
         cap.update(8);
-        let capped_before = probe.text_gets();
+        let capped_before = probe.barrier_pins();
         let capped = run(&writer, cypher, vec![]).await;
         assert_eq!(
-            probe.text_gets() - capped_before,
+            probe.barrier_pins() - capped_before,
             1,
-            "the capped route must consult the initial authoritative .ft prefix"
+            "the capped route consults the initial authoritative prefix \
+             exactly once before the exact fallback"
         );
         assert_eq!(
             titles(&capped),
@@ -798,6 +863,91 @@ mod indexed_sparse_filter {
                 "eligible-b".to_string(),
                 "eligible-c".to_string()
             ]
+        );
+    }
+
+    /// Native filter-group serving: with `tenant` schema-indexed, the FT4
+    /// segments advertise the property and the coordinator applies the
+    /// equality at the postings level — one probe finds what the residual
+    /// route needs a widening round for. Pins the equality-group fast path
+    /// distinctly from the residual-widening discipline above.
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_equality_group_served_natively() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(16);
+        docs.push((
+            "target".into(),
+            "acme".into(),
+            "alpha w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, ids, probe) =
+            indexed_corpus_with("hybrid-ft-native-group", &borrowed, true).await;
+
+        let initial = authoritative_hits(&writer, "alpha", 8).await;
+        assert!(
+            initial.iter().all(|(id, _)| *id != ids["target"]),
+            "the matching tenant must sit beyond the unfiltered top-8"
+        );
+
+        let before = probe.barrier_pins();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            vec![],
+        )
+        .await;
+        assert_eq!(titles(&rows), vec!["target".to_string()]);
+        assert_eq!(
+            probe.barrier_pins() - before,
+            1,
+            "postings-level native filtering finds the target in one probe, \
+             where the residual route needs a widening round"
+        );
+    }
+
+    /// The group-refusal twin: with `tenant` NOT schema-indexed the
+    /// coordinator refuses the postings-level filter route. Refusal must
+    /// downgrade to the plain native route with the equality applied
+    /// residually — not surrender the whole query to the flat scorer, which
+    /// pins no barrier and pays O(corpus) on every call.
+    #[tokio::test]
+    async fn hybrid_filtered_bm25_unindexed_group_retries_plain_native_route() {
+        let _cap = CapEnvGuard::set(64);
+        let mut docs = other_docs(16);
+        docs.push((
+            "target".into(),
+            "acme".into(),
+            "alpha w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11".into(),
+        ));
+        let borrowed = borrowed_docs(&docs);
+        let (writer, ids, probe) =
+            indexed_corpus_with("hybrid-ft-refused-group", &borrowed, false).await;
+
+        let initial = authoritative_hits(&writer, "alpha", 8).await;
+        assert!(
+            initial.iter().all(|(id, _)| *id != ids["target"]),
+            "the matching tenant must sit beyond the unfiltered top-8"
+        );
+
+        let before = probe.barrier_pins();
+        let rows = run(
+            &writer,
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+             text_property: 'body', k: 1, k_sparse: 1, \
+             filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            vec![],
+        )
+        .await;
+        assert_eq!(titles(&rows), vec!["target".to_string()]);
+        assert!(
+            probe.barrier_pins() - before >= 2,
+            "a refused filter group must retry the plain native route (one \
+             pin per widening round); a flat-scan surrender pins nothing"
         );
     }
 

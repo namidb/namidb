@@ -70,10 +70,11 @@
 //!
 //! Residual memory per bucket, by design: file-backed mappings of the
 //! compressed source bodies, one small decoded batch per activated node
-//! source, one chunk of
-//! winner rows, the sidecar maps, and — the true lower bound — the
-//! embeddings / documents collected for a vector/text index rebuild, which
-//! the Vamana/BM25 builders inherently need in full.
+//! source, one chunk of winner rows, the sidecar maps, and bounded
+//! vector/text index-build buffers. Search corpora and their final immutable
+//! objects are spooled to local disk and uploaded as fixed multipart windows;
+//! neither embeddings, documents, postings, nor the finished `.vg`/`.ft`
+//! body are retained in full.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
@@ -96,6 +97,7 @@ use parquet::arrow::arrow_reader::{
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 use uuid::Uuid;
+use xxhash_rust::xxh3::Xxh3;
 
 use namidb_core::{DataType, EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
 
@@ -103,8 +105,8 @@ use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{
     encode_exact_node_record, EqualitySidecarCollector, IncrementalNodeSstWriter,
-    LabelIndexCollector, NodeRow, NodeWriteRecord, PerLabelStatsCollector, UniqueSidecarCollector,
-    NODE_SST_BATCH_ROWS,
+    LabelIndexCollector, NodeRow, NodeWriteRecord, PerLabelStatsCollector, SidecarPayload,
+    UniqueSidecarCollector, NODE_SST_BATCH_ROWS,
 };
 #[cfg(feature = "vector-index")]
 use crate::manifest::VectorIndexDescriptor;
@@ -115,11 +117,19 @@ use crate::manifest::{
 use crate::memtable::MemOp;
 use crate::paths::NamespacePaths;
 use crate::read::arrow_value_to_value;
+use crate::search_lsm::{
+    encode_search_barrier, search_barrier_descriptor, validate_search_lsm, CoverageDisposition,
+    SearchCoverage, SearchEventRange, SearchLsmState, SearchLsmStatus,
+};
 use crate::sst::bloom::{BloomDescriptor, BloomFilter};
 use crate::sst::edges::encoding::{read_offset, read_partner_block, OffsetWidth};
 use crate::sst::edges::format::{
-    CODEC_NONE, CODEC_ZSTD, OVERFLOW_JSON_NAME, SECTION_KEY_IDS, SECTION_OFFSETS, SECTION_PARTNERS,
-    SECTION_PER_EDGE_LSN, SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
+    CODEC_NONE, CODEC_PROPERTY_PAGED_NONE, CODEC_PROPERTY_PAGED_ZSTD, CODEC_ZSTD,
+    OVERFLOW_JSON_NAME, SECTION_KEY_IDS, SECTION_OFFSETS, SECTION_PARTNERS, SECTION_PER_EDGE_LSN,
+    SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
+};
+use crate::sst::edges::property_pages::{
+    decode_property_page, PropertyPageEntry, PropertyPageIndex,
 };
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::writer::{EdgeRecord, EdgeSstBuild, EdgeSstWriter, EdgeSstWriterOptions};
@@ -130,6 +140,10 @@ use crate::sst::nodes::{
 };
 #[cfg(test)]
 use crate::sst::nodes::{parse_node_sst_metadata, NodeSstReader};
+
+#[path = "search_lsm_compact.rs"]
+mod search_lsm_compact;
+use search_lsm_compact::PreparedSearchCompaction;
 
 /// Outcome of [`compact_l0_to_l1`].
 #[derive(Debug, Clone)]
@@ -170,13 +184,55 @@ pub struct PreparedCompaction {
     /// publish outputs computed for a different catalog.
     base_vector_indexes: Vec<crate::manifest::VectorIndexDescriptor>,
     base_text_indexes: Vec<crate::manifest::TextIndexDescriptor>,
+    /// Captured Search-LSM state is a proof prefix, not an install image.
+    /// Ordinary flushes may append to it while this prepare runs.
+    base_search_lsm: Vec<crate::search_lsm::SearchLsmState>,
+    /// Exact Nodes descriptor replacements produced off-lock. Search-LSM
+    /// coverage is rebased from these inputs onto the current manifest during
+    /// install; no search corpus object is rewritten here.
+    node_rewrites: Vec<PreparedNodeRewrite>,
+    /// Full Search-LSM bases built and uploaded off-lock. Install replaces
+    /// only their captured physical prefix and preserves append-only flushes.
+    search_compactions: Vec<PreparedSearchCompaction>,
     search_build_states: Vec<crate::manifest::SearchIndexBuildState>,
+    /// 2.0.6-interop markers certifying each full base a BasePrefix
+    /// Search-LSM consolidation installs. A downgraded writer drops the
+    /// unknown `search_lsm` state but keeps these; on upgrade they are what
+    /// lets adoption re-bind the surviving base metadata-only instead of
+    /// rebuilding the corpus. Kept separate from `search_build_states`, which
+    /// also drives `replaced_search_lsm` and the rewrite/replace install
+    /// guard — reusing it would wrongly clear the active generation.
+    consolidated_base_markers: Vec<crate::manifest::SearchIndexBuildState>,
+    /// Indexes whose interop marker certified an adoptable base but whose
+    /// physical body deterministically disproved it (unsupported magic or an
+    /// unsafe wrap). Install drops these markers so the next pass plans the
+    /// full rebuild instead of stalling on an adoption that can never land.
+    unadoptable_search_markers: Vec<(SstKind, String)>,
+    search_lsm_activations: Vec<PreparedSearchLsmActivation>,
+    replaced_search_lsm: Vec<(crate::search_lsm::SearchLsmKind, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedNodeRewrite {
+    inputs: Vec<SstDescriptor>,
+    /// `None` is legal only for an authoritative merge whose winner stream is
+    /// empty (normally tombstone GC).
+    output: Option<SstDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSearchLsmActivation {
+    state: crate::search_lsm::SearchLsmState,
+    barrier: SstDescriptor,
+    barrier_already_present: bool,
 }
 
 impl PreparedCompaction {
     /// `true` when the sweep found nothing to merge; installing is a no-op.
     pub fn is_noop(&self) -> bool {
         self.removed_ids.is_empty()
+            && self.search_lsm_activations.is_empty()
+            && self.unadoptable_search_markers.is_empty()
     }
 
     /// Manifest version the prepare ran against.
@@ -252,6 +308,15 @@ impl CompactionBasis {
 /// I/O. Vector/text index SSTs are rebuilt from node buckets rather than
 /// planned directly, so only node and edge buckets participate.
 fn any_bucket_plans(manifest: &crate::manifest::Manifest, base_bytes: u64, ratio: u64) -> bool {
+    if search_lsm_adoption_needed(manifest) {
+        return true;
+    }
+    if search_lsm_compact::search_compaction_needed(
+        manifest,
+        search_lsm_compact::SearchCompactionPolicy::for_scheduling(),
+    ) {
+        return true;
+    }
     let mut buckets: std::collections::HashMap<(SstKind, &str), Vec<&SstDescriptor>> =
         std::collections::HashMap::new();
     for d in &manifest.ssts {
@@ -462,7 +527,16 @@ fn plan_node_bucket<'a>(
 
 fn node_descriptor_needs_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
     !crate::manifest::node_locator_has_exact_records(desc)
+        || !node_descriptor_has_property_pages(desc)
         || node_descriptor_needs_non_record_migration(desc, required)
+}
+
+fn node_descriptor_has_property_pages(desc: &SstDescriptor) -> bool {
+    crate::manifest::node_property_pages_sidecar(desc).is_some_and(|properties| {
+        properties.format_version
+            == crate::sst::nodes::property_pages::NODE_PROPERTY_PAGES_FORMAT_VERSION
+            && properties.is_bound_to(desc)
+    })
 }
 
 fn node_descriptor_needs_non_record_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
@@ -478,20 +552,23 @@ fn node_descriptor_needs_non_record_migration(desc: &SstDescriptor, required: &L
         })
         .map(|property| property.name.as_str())
         .collect();
-    desc.unique_property_indices
-        .iter()
-        .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
-        || desc
-            .equality_property_indices
-            .iter()
-            .any(|index| index.paged.is_none() && !index.paged_build_unsupported)
-        || required_equality.iter().any(|property| {
-            !desc.equality_property_indices.iter().any(|index| {
-                index.property == *property
-                    && index.mixed_type_complete
-                    && (index.paged.is_some() || index.paged_build_unsupported)
-            })
+    desc.unique_property_indices.iter().any(|index| {
+        index.format != crate::manifest::PropertyIndexFormat::PagedV1
+            && index.paged.is_none()
+            && !index.paged_build_unsupported
+    }) || desc.equality_property_indices.iter().any(|index| {
+        index.format != crate::manifest::PropertyIndexFormat::PagedV1
+            && index.paged.is_none()
+            && !index.paged_build_unsupported
+    }) || required_equality.iter().any(|property| {
+        !desc.equality_property_indices.iter().any(|index| {
+            index.property == *property
+                && index.mixed_type_complete
+                && (index.format == crate::manifest::PropertyIndexFormat::PagedV1
+                    || index.paged.is_some()
+                    || index.paged_build_unsupported)
         })
+    })
 }
 
 fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
@@ -502,8 +579,30 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
         .map(|sst| sst.max_lsn)
         .max()
         .unwrap_or(0);
+    let valid_lsm = crate::search_lsm::validate_search_lsm(manifest).is_ok();
     #[cfg(feature = "vector-index")]
     if manifest.vector_indexes.iter().any(|index| {
+        let matching_states = manifest
+            .search_lsm
+            .iter()
+            .filter(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == index.name
+            })
+            .collect::<Vec<_>>();
+        if !matching_states.is_empty() {
+            return !(valid_lsm
+                && matching_states.len() == 1
+                && matching_states[0].status == crate::search_lsm::SearchLsmStatus::Active);
+        }
+        if legacy_search_base_needs_adoption(
+            manifest,
+            crate::search_lsm::SearchLsmKind::Vector,
+            &index.name,
+            max_node_lsn,
+        ) {
+            return false;
+        }
         let signature = vector_catalog_signature(manifest, index);
         !manifest.search_index_builds.iter().any(|state| {
             state.kind == SstKind::VectorGraph
@@ -516,6 +615,27 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
     }
     #[cfg(feature = "text-index")]
     if manifest.text_indexes.iter().any(|index| {
+        let matching_states = manifest
+            .search_lsm
+            .iter()
+            .filter(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == index.name
+            })
+            .collect::<Vec<_>>();
+        if !matching_states.is_empty() {
+            return !(valid_lsm
+                && matching_states.len() == 1
+                && matching_states[0].status == crate::search_lsm::SearchLsmStatus::Active);
+        }
+        if legacy_search_base_needs_adoption(
+            manifest,
+            crate::search_lsm::SearchLsmKind::Text,
+            &index.name,
+            max_node_lsn,
+        ) {
+            return false;
+        }
         let signature = text_catalog_signature(index);
         !manifest.search_index_builds.iter().any(|state| {
             state.kind == SstKind::TextIndex
@@ -526,7 +646,120 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
     }) {
         return true;
     }
-    let _ = max_node_lsn;
+    let _ = (max_node_lsn, valid_lsm);
+    false
+}
+
+fn legacy_search_base_needs_adoption(
+    manifest: &crate::manifest::Manifest,
+    kind: crate::search_lsm::SearchLsmKind,
+    index_name: &str,
+    max_node_lsn: u64,
+) -> bool {
+    if manifest
+        .search_lsm
+        .iter()
+        .any(|state| state.kind == kind && state.index_name == index_name)
+    {
+        return false;
+    }
+    let mut bodies = manifest.ssts.iter().filter(|descriptor| {
+        descriptor.kind == kind.sst_kind()
+            && descriptor.scope == index_name
+            && !crate::search_lsm::is_canonical_search_barrier_descriptor(descriptor)
+    });
+    let Some(base) = bodies.next() else {
+        return false;
+    };
+    if bodies.next().is_some() || base.max_lsn < max_node_lsn {
+        return false;
+    }
+    let Some((canonical_signature, legacy_signature)) =
+        adoption_catalog_signatures(manifest, kind, index_name)
+    else {
+        return false;
+    };
+    manifest.search_index_builds.iter().any(|state| {
+        state.kind == kind.sst_kind()
+            && state.name == index_name
+            && state.max_node_lsn >= max_node_lsn
+            && (state.catalog_signature == canonical_signature
+                || state.catalog_signature == legacy_signature)
+    })
+}
+
+/// Resolve one unambiguous current catalog entry and both signatures that a
+/// pre-Search-LSM build marker may legitimately carry. Accepting only these
+/// values prevents a DDL-changed label/property/analyzer from wrapping a
+/// physically valid but semantically stale V5/V3 body into a new generation.
+fn adoption_catalog_signatures(
+    manifest: &crate::manifest::Manifest,
+    kind: crate::search_lsm::SearchLsmKind,
+    index_name: &str,
+) -> Option<(String, String)> {
+    match kind {
+        crate::search_lsm::SearchLsmKind::Vector => {
+            let mut matches = manifest
+                .vector_indexes
+                .iter()
+                .filter(|descriptor| descriptor.name == index_name);
+            let descriptor = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some((
+                crate::search_lsm::vector_catalog_signature(manifest, descriptor),
+                crate::search_lsm::legacy_vector_catalog_signature(manifest, descriptor),
+            ))
+        }
+        crate::search_lsm::SearchLsmKind::Text => {
+            let mut matches = manifest
+                .text_indexes
+                .iter()
+                .filter(|descriptor| descriptor.name == index_name);
+            let descriptor = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some((
+                crate::search_lsm::text_catalog_signature(descriptor),
+                crate::search_lsm::legacy_text_catalog_signature(descriptor),
+            ))
+        }
+    }
+}
+
+fn search_lsm_adoption_needed(manifest: &crate::manifest::Manifest) -> bool {
+    let max_node_lsn = manifest
+        .ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .map(|descriptor| descriptor.max_lsn)
+        .max()
+        .unwrap_or(0);
+    #[cfg(feature = "vector-index")]
+    if manifest.vector_indexes.iter().any(|index| {
+        legacy_search_base_needs_adoption(
+            manifest,
+            crate::search_lsm::SearchLsmKind::Vector,
+            &index.name,
+            max_node_lsn,
+        )
+    }) {
+        return true;
+    }
+    #[cfg(feature = "text-index")]
+    if manifest.text_indexes.iter().any(|index| {
+        legacy_search_base_needs_adoption(
+            manifest,
+            crate::search_lsm::SearchLsmKind::Text,
+            &index.name,
+            max_node_lsn,
+        )
+    }) {
+        return true;
+    }
+    let _ = (manifest, max_node_lsn);
     false
 }
 
@@ -535,40 +768,12 @@ fn vector_catalog_signature(
     manifest: &crate::manifest::Manifest,
     index: &crate::manifest::VectorIndexDescriptor,
 ) -> String {
-    // Native vector pre-filters are compiled into the immutable `.vg` body.
-    // Include their schema slice in the generation signature so CREATE/DROP
-    // INDEX on a Bool/String property rebuilds postings even when no node LSN
-    // changed. Sorting makes the signature insensitive to schema declaration
-    // order while still tracking name, type and index flags exactly.
-    let mut filter_properties: Vec<(&String, &DataType, bool, bool)> = manifest
-        .schema
-        .label(&index.label)
-        .into_iter()
-        .flat_map(|label| &label.properties)
-        .filter(|property| {
-            (property.indexed || property.unique)
-                && matches!(
-                    property.data_type,
-                    DataType::Bool | DataType::Utf8 | DataType::LargeUtf8
-                )
-        })
-        .map(|property| {
-            (
-                &property.name,
-                &property.data_type,
-                property.indexed,
-                property.unique,
-            )
-        })
-        .collect();
-    filter_properties.sort_by(|left, right| left.0.cmp(right.0));
-    serde_json::to_string(&(index, filter_properties))
-        .expect("vector descriptor and filter schema serialize")
+    crate::search_lsm::vector_catalog_signature(manifest, index)
 }
 
 #[cfg(feature = "text-index")]
 fn text_catalog_signature(index: &crate::manifest::TextIndexDescriptor) -> String {
-    serde_json::to_string(index).expect("text descriptor serializes")
+    crate::search_lsm::text_catalog_signature(index)
 }
 
 fn catalog_build_states(
@@ -606,6 +811,319 @@ fn catalog_build_states(
     );
     let _ = (manifest, max_node_lsn, attempted);
     states
+}
+
+async fn recover_preserved_search_barrier(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    projected: &crate::manifest::Manifest,
+    kind: crate::search_lsm::SearchLsmKind,
+    index_name: &str,
+    scoped: &[SstDescriptor],
+) -> Option<PreparedSearchLsmActivation> {
+    let barriers = scoped
+        .iter()
+        .filter(|descriptor| crate::search_lsm::is_canonical_search_barrier_descriptor(descriptor))
+        .collect::<Vec<_>>();
+    if barriers.is_empty() {
+        return None;
+    }
+
+    let mut valid = Vec::new();
+    for barrier in barriers {
+        let body = match get_sst_body(store.as_ref(), paths, barrier).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    index = index_name,
+                    path = %barrier.path,
+                    error = %error,
+                    "preserved Search-LSM barrier is unavailable"
+                );
+                continue;
+            }
+        };
+        if body.len() as u64 != barrier.size_bytes {
+            tracing::warn!(
+                index = index_name,
+                path = %barrier.path,
+                manifest_size = barrier.size_bytes,
+                object_size = body.len(),
+                "preserved Search-LSM barrier size disagrees with its descriptor"
+            );
+            continue;
+        }
+        let state = match crate::search_lsm::decode_search_barrier(&body) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    index = index_name,
+                    path = %barrier.path,
+                    error = %error,
+                    "preserved Search-LSM barrier is corrupt"
+                );
+                continue;
+            }
+        };
+        if state.kind != kind
+            || state.index_name != index_name
+            || state.compat_barrier_sst_id != Some(barrier.id)
+            || crate::search_lsm::validate_search_barrier(&state, &body).is_err()
+        {
+            tracing::warn!(
+                index = index_name,
+                path = %barrier.path,
+                "preserved Search-LSM barrier identity does not match its descriptor"
+            );
+            continue;
+        }
+        let mut validation = projected.clone();
+        validation
+            .search_lsm
+            .retain(|existing| existing.kind != kind || existing.index_name != index_name);
+        validation.search_lsm.push(state.clone());
+        if let Err(error) = crate::search_lsm::validate_search_lsm(&validation) {
+            tracing::warn!(
+                index = index_name,
+                path = %barrier.path,
+                error = %error,
+                "preserved Search-LSM state is no longer valid for the visible catalog/corpus"
+            );
+            continue;
+        }
+        valid.push(PreparedSearchLsmActivation {
+            state,
+            barrier: barrier.clone(),
+            barrier_already_present: true,
+        });
+    }
+
+    if valid.len() == 1 {
+        return valid.pop();
+    }
+    if valid.len() > 1 {
+        tracing::warn!(
+            index = index_name,
+            candidates = valid.len(),
+            "multiple preserved Search-LSM barriers validate; retiring ambiguity and rebuilding"
+        );
+    }
+    None
+}
+
+async fn prepare_search_lsm_activations(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    basis: &crate::manifest::Manifest,
+    new_descs: &[SstDescriptor],
+    removed_ids: &[Uuid],
+    new_build_states: &[crate::manifest::SearchIndexBuildState],
+    replaced: &[(crate::search_lsm::SearchLsmKind, String)],
+) -> Result<(
+    Vec<PreparedSearchLsmActivation>,
+    Vec<Uuid>,
+    Vec<(SstKind, String)>,
+)> {
+    use crate::search_lsm::{
+        encode_search_barrier, search_barrier_descriptor, wrap_legacy_search_base, SearchLsmKind,
+    };
+    let mut unadoptable: Vec<(SstKind, String)> = Vec::new();
+
+    let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
+    let mut projected = basis.clone();
+    projected
+        .ssts
+        .retain(|descriptor| !removed.contains(&descriptor.id));
+    projected.ssts.extend(new_descs.iter().cloned());
+    for state in new_build_states {
+        projected
+            .search_index_builds
+            .retain(|existing| existing.kind != state.kind || existing.name != state.name);
+        projected.search_index_builds.push(state.clone());
+    }
+    projected.search_lsm.retain(|state| {
+        !replaced
+            .iter()
+            .any(|(kind, name)| state.kind == *kind && state.index_name == *name)
+    });
+
+    #[allow(unused_mut)]
+    let mut candidates: Vec<(SearchLsmKind, String)> = Vec::new();
+    #[cfg(feature = "vector-index")]
+    candidates.extend(
+        projected
+            .vector_indexes
+            .iter()
+            .map(|index| (SearchLsmKind::Vector, index.name.clone())),
+    );
+    #[cfg(feature = "text-index")]
+    candidates.extend(
+        projected
+            .text_indexes
+            .iter()
+            .map(|index| (SearchLsmKind::Text, index.name.clone())),
+    );
+
+    let mut activations = Vec::new();
+    let mut retired_barriers = Vec::new();
+    let max_node_lsn = projected
+        .ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .map(|descriptor| descriptor.max_lsn)
+        .max()
+        .unwrap_or(0);
+    for (kind, index_name) in candidates {
+        if projected
+            .search_lsm
+            .iter()
+            .any(|state| state.kind == kind && state.index_name == index_name)
+        {
+            continue;
+        }
+        let scoped_snapshot = projected
+            .ssts
+            .iter()
+            .filter(|descriptor| {
+                descriptor.kind == kind.sst_kind() && descriptor.scope == index_name
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(recovered) = recover_preserved_search_barrier(
+            store.clone(),
+            paths,
+            &projected,
+            kind,
+            &index_name,
+            &scoped_snapshot,
+        )
+        .await
+        {
+            activations.push(recovered);
+            continue;
+        }
+
+        // An old writer can preserve the ordinary `.slb` descriptor while
+        // dropping the unknown top-level state. If its footer is corrupt,
+        // ambiguous, or stale, retire only that tiny compatibility artifact
+        // and either re-adopt the still-fresh base or let the normal rebuild
+        // path replace it. Keeping it would make two physical bodies look
+        // permanently ambiguous.
+        let stale_barrier_ids = scoped_snapshot
+            .iter()
+            .filter(|descriptor| {
+                crate::search_lsm::is_canonical_search_barrier_descriptor(descriptor)
+            })
+            .map(|descriptor| descriptor.id)
+            .collect::<HashSet<_>>();
+        if !stale_barrier_ids.is_empty() {
+            retired_barriers.extend(stale_barrier_ids.iter().copied());
+            projected
+                .ssts
+                .retain(|descriptor| !stale_barrier_ids.contains(&descriptor.id));
+        }
+        if !legacy_search_base_needs_adoption(&projected, kind, &index_name, max_node_lsn) {
+            continue;
+        }
+        let scoped = projected
+            .ssts
+            .iter()
+            .filter(|descriptor| {
+                descriptor.kind == kind.sst_kind() && descriptor.scope == index_name
+            })
+            .collect::<Vec<_>>();
+        let [base] = scoped.as_slice() else {
+            continue;
+        };
+        let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), base.path);
+        let object_path = Path::from(absolute);
+        // Only the feature-gated magic comparisons below read this probe.
+        #[cfg_attr(
+            not(any(feature = "vector-index", feature = "text-index")),
+            allow(unused_variables)
+        )]
+        let magic = match store.get_range(&object_path, 0..8).await {
+            Ok(magic) => magic,
+            Err(error) => {
+                tracing::warn!(
+                    index = %index_name,
+                    path = %base.path,
+                    error = %error,
+                    "cannot probe legacy search base for Search-LSM adoption"
+                );
+                continue;
+            }
+        };
+        let supported_magic = match kind {
+            #[cfg(feature = "vector-index")]
+            SearchLsmKind::Vector => magic.as_ref() == crate::sst::vector::v5::MAGIC_V5,
+            #[cfg(not(feature = "vector-index"))]
+            SearchLsmKind::Vector => false,
+            #[cfg(feature = "text-index")]
+            SearchLsmKind::Text => magic.as_ref() == crate::sst::text::RANGE_READABLE_MAGIC,
+            #[cfg(not(feature = "text-index"))]
+            SearchLsmKind::Text => false,
+        };
+        if !supported_magic {
+            // Deterministic: this body can never satisfy the adoption the
+            // marker certifies. Dropping the marker un-suppresses the full
+            // rebuild; a transient read error above keeps the marker and
+            // retries instead.
+            tracing::warn!(
+                index = %index_name,
+                path = %base.path,
+                "legacy search base magic is not adoptable; scheduling a rebuild"
+            );
+            unadoptable.push((kind.sst_kind(), index_name.clone()));
+            continue;
+        }
+
+        let generation_id = Uuid::now_v7();
+        let barrier_id = Uuid::now_v7();
+        let state = match wrap_legacy_search_base(
+            &projected,
+            kind,
+            &index_name,
+            base.id,
+            generation_id,
+            barrier_id,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    index = %index_name,
+                    error = %error,
+                    "legacy search base is not safe to adopt; scheduling a rebuild"
+                );
+                unadoptable.push((kind.sst_kind(), index_name.clone()));
+                continue;
+            }
+        };
+        let body = encode_search_barrier(&state)
+            .map_err(|error| Error::invariant(format!("barrier encode failed: {error}")))?;
+        let file_name = format!(
+            "{}-{}-{}.slb",
+            uuid_path_id(&barrier_id),
+            kind.sst_kind().path_tag(),
+            index_name
+        );
+        let object_path = paths.sst_object(base.level.as_u32(), &file_name);
+        let relative_path = relative_sst_path(base.level.as_u32(), &file_name);
+        crate::flush::put_object(store.clone(), &object_path, body.clone()).await?;
+        let barrier = search_barrier_descriptor(
+            &state,
+            barrier_id,
+            base.level,
+            relative_path,
+            body.len() as u64,
+        );
+        activations.push(PreparedSearchLsmActivation {
+            state,
+            barrier,
+            barrier_already_present: false,
+        });
+    }
+    Ok((activations, retired_barriers, unadoptable))
 }
 
 /// Run one leveled-lite compaction sweep across every `(kind, scope)`
@@ -738,6 +1256,10 @@ async fn prepare_leveled(
     let mut removed_ids: Vec<Uuid> = Vec::new();
     let mut bloom_count: usize = 0;
     let mut search_build_states = Vec::new();
+    let mut node_rewrites = Vec::new();
+    let search_policy = search_lsm_compact::SearchCompactionPolicy::from_env()?;
+    let mut search_selections =
+        search_lsm_compact::select_search_compactions(&base.manifest, search_policy)?;
 
     // Node tombstone GC needs the merge authoritative for every node key it
     // touches. Nodes are id-primary, so a key can live in any node SST
@@ -781,39 +1303,62 @@ async fn prepare_leveled(
         else {
             continue;
         };
-        // A lone, otherwise-current SST from 2.0.5 needs only the appended
-        // exact-record accelerator. Rewriting its complete Parquet body would
-        // retain another multi-gigabyte vector corpus and double disk/network
-        // I/O for no logical data change. Build the new sidecar directly from
-        // the source rows, preserve every existing descriptor/search body, and
-        // replace only the locator marker in the next manifest.
+        // A lone, otherwise-current legacy SST needs only its access bundle
+        // (`.nloc2` + `.npp`). Rewriting its complete Parquet body would retain
+        // another multi-gigabyte vector corpus and double disk/network I/O for
+        // no logical data change. Build both sidecars in one bounded source
+        // pass, preserve every existing descriptor/search body, and replace
+        // only the locator bundle in the next manifest.
         if plan.inputs.len() == 1
-            && !crate::manifest::node_locator_has_exact_records(plan.inputs[0])
+            && (!crate::manifest::node_locator_has_exact_records(plan.inputs[0])
+                || !node_descriptor_has_property_pages(plan.inputs[0]))
             && !node_descriptor_needs_non_record_migration(plan.inputs[0], &sidecar_def)
             && !rebuild_search
         {
             let source = (*plan.inputs[0]).clone();
             let body = get_sst_body(store.as_ref(), paths, &source).await?;
             let locator_label = label_def.clone();
-            let locator_upload = run_cpu(move || {
-                build_exact_node_locator_from_source(body, &locator_label)?.finish_upload()
+            let parent_sst_id = source.id;
+            let (locator_upload, property_upload) = run_cpu(move || {
+                build_node_access_sidecars_from_source(body, &locator_label, parent_sst_id)
             })
             .await??;
+            if locator_upload.entry_count() != source.row_count
+                || property_upload.stats().node_count != source.row_count
+            {
+                return Err(Error::invariant(
+                    "rebuilt node access bundle row count differs from parent Nodes SST",
+                ));
+            }
             // Use a fresh sidecar UUID even though the authoritative Parquet
             // descriptor keeps its id. A failed pre-manifest upload can then be
             // retried without colliding with a complete orphan from the prior
             // attempt.
             let sidecar_id = Uuid::now_v7();
-            let (node_locator, (sidecar_path, sidecar_body)) =
+            let (mut node_locator, (sidecar_path, sidecar_body)) =
                 crate::flush::prepare_node_locator_upload_sidecar(
                     paths,
                     source.level.as_u32(),
                     &sidecar_id,
                     locator_upload,
                 )?;
+            let (property_pages, (property_path, property_body)) =
+                crate::flush::prepare_node_property_pages_upload_sidecar(
+                    paths,
+                    source.level.as_u32(),
+                    &source.id,
+                    &sidecar_id,
+                    property_upload,
+                )?;
+            node_locator.property_pages = Some(property_pages);
             crate::flush::put_sidecar_payload(store.clone(), &sidecar_path, sidecar_body).await?;
+            crate::flush::put_sidecar_payload(store.clone(), &property_path, property_body).await?;
             let mut migrated = source.clone();
             migrated.node_locator = Some(node_locator);
+            node_rewrites.push(PreparedNodeRewrite {
+                inputs: vec![source.clone()],
+                output: Some(migrated.clone()),
+            });
             removed_ids.push(source.id);
             new_descs.push(migrated);
             continue;
@@ -874,6 +1419,7 @@ async fn prepare_leveled(
         let merge_schema = schema.clone();
         let merge_dict = base.manifest.label_dict.clone();
         let merge_scope = label.clone();
+        let output_sst_id = Uuid::now_v7();
         let out = run_cpu(move || {
             merge_node_sources(
                 bodies,
@@ -883,6 +1429,7 @@ async fn prepare_leveled(
                 &merge_schema,
                 &merge_dict,
                 &merge_scope,
+                output_sst_id,
                 index_specs,
             )
         })
@@ -948,8 +1495,17 @@ async fn prepare_leveled(
                 catalog_build_states(&base.manifest, finish_max_lsn, &attempted_search_builds);
         }
         if out.finish.stats.row_count == 0 {
+            if !gc {
+                return Err(Error::invariant(
+                    "non-authoritative node compaction produced an empty output",
+                ));
+            }
             // Nothing to write; still mark the merged sources for removal so
             // the bucket truly shrinks.
+            node_rewrites.push(PreparedNodeRewrite {
+                inputs: plan.inputs.iter().map(|source| (*source).clone()).collect(),
+                output: None,
+            });
             for src in &plan.inputs {
                 removed_ids.push(src.id);
             }
@@ -960,6 +1516,7 @@ async fn prepare_leveled(
             paths,
             plan.target_level,
             &label,
+            output_sst_id,
             out.sidecars,
             out.finish,
         )
@@ -976,6 +1533,10 @@ async fn prepare_leveled(
         for src in &plan.inputs {
             removed_ids.push(src.id);
         }
+        node_rewrites.push(PreparedNodeRewrite {
+            inputs: plan.inputs.iter().map(|source| (*source).clone()).collect(),
+            output: Some(descriptor.clone()),
+        });
         new_descs.push(descriptor);
     }
 
@@ -1044,6 +1605,140 @@ async fn prepare_leveled(
     #[cfg(not(feature = "vector-index"))]
     let _ = &vector_buckets;
 
+    let replaced_search_lsm = search_build_states
+        .iter()
+        .filter_map(|state| match state.kind {
+            SstKind::VectorGraph => {
+                Some((crate::search_lsm::SearchLsmKind::Vector, state.name.clone()))
+            }
+            SstKind::TextIndex => {
+                Some((crate::search_lsm::SearchLsmKind::Text, state.name.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // A stale/building catalog causes the authoritative Nodes merge above to
+    // rebuild every registered legacy base. Do not also publish a physical
+    // Search-LSM base for the same key in this pass: the two builders select
+    // different replacement contracts and would retire each other's inputs.
+    // Prefer the logical rebuild, while independent active generations may
+    // still compact physically in the same off-lock prepare.
+    search_selections.retain(|selection| {
+        let overlaps = replaced_search_lsm.iter().any(|(kind, name)| {
+            *kind == selection.captured_state.kind && *name == selection.captured_state.index_name
+        });
+        if overlaps {
+            tracing::warn!(
+                index = %selection.captured_state.index_name,
+                kind = ?selection.captured_state.kind,
+                abort_reason = "simultaneous_logical_search_rebuild",
+                "skipping redundant physical Search-LSM compaction"
+            );
+        }
+        !overlaps
+    });
+    let search_compactions = search_lsm_compact::prepare_search_compactions(
+        store.clone(),
+        paths,
+        base,
+        search_selections,
+    )
+    .await?;
+    for search in &search_compactions {
+        removed_ids.extend(search.selection.selected_ids());
+        if let Some(output) = search.output_descriptor() {
+            new_descs.push(output.clone());
+        }
+    }
+    let (search_lsm_activations, retired_search_barriers, unadoptable_search_markers) =
+        prepare_search_lsm_activations(
+            store,
+            paths,
+            &base.manifest,
+            &new_descs,
+            &removed_ids,
+            &search_build_states,
+            &replaced_search_lsm,
+        )
+        .await?;
+    removed_ids.extend(retired_search_barriers);
+
+    if !node_rewrites.is_empty() {
+        validate_search_lsm(&base.manifest).map_err(|error| {
+            Error::invariant(format!(
+                "cannot prepare a Nodes rewrite from invalid Search-LSM state: {error}"
+            ))
+        })?;
+    }
+
+    // Every BasePrefix consolidation certifies a complete physical base for
+    // its index, which is exactly what a 2.0.6-interop marker means: without
+    // one, a downgraded writer that drops the unknown `search_lsm` state
+    // leaves a manifest the upgrade path can only repair by rebuilding the
+    // corpus instead of re-adopting the surviving base metadata-only. The
+    // basis high-water is correct because the BasePrefix build scans every
+    // Nodes SST at this basis; a flush racing prepare→install leaves the
+    // marker conservatively stale, which forces a rebuild rather than a
+    // wrong adoption. Empty-output consolidations (authoritatively empty
+    // corpus) mint a marker too, mirroring the 2.0.6 rule that keeps
+    // compaction from replanning an empty build forever.
+    #[cfg_attr(
+        not(any(feature = "vector-index", feature = "text-index")),
+        allow(unused_variables)
+    )]
+    let basis_max_node_lsn = base
+        .manifest
+        .ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .map(|descriptor| descriptor.max_lsn)
+        .max()
+        .unwrap_or(0);
+    // The signature must be the one the 2.0.6 downgrade paths compare
+    // against (`catalog_build_states` / `adoption_catalog_signatures`), NOT
+    // the native `captured_state` signature: for text those forks (the LSM
+    // form hashes the manifest-scoped filter set), and a marker carrying a
+    // signature nobody accepts certifies nothing.
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    let consolidated_base_markers = Vec::new();
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    let consolidated_base_markers = search_compactions
+        .iter()
+        .filter(|search| {
+            search.selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+        })
+        .filter_map(|search| {
+            let name = search.selection.captured_state.index_name.as_str();
+            let catalog_signature = match search.selection.captured_state.kind {
+                #[cfg(feature = "vector-index")]
+                crate::search_lsm::SearchLsmKind::Vector => base
+                    .manifest
+                    .vector_indexes
+                    .iter()
+                    .find(|index| index.name == name)
+                    .map(|index| vector_catalog_signature(&base.manifest, index))?,
+                #[cfg(feature = "text-index")]
+                crate::search_lsm::SearchLsmKind::Text => base
+                    .manifest
+                    .text_indexes
+                    .iter()
+                    .find(|index| index.name == name)
+                    .map(text_catalog_signature)?,
+                // With the feature off no search compaction is ever selected.
+                #[cfg(not(feature = "vector-index"))]
+                crate::search_lsm::SearchLsmKind::Vector => return None,
+                #[cfg(not(feature = "text-index"))]
+                crate::search_lsm::SearchLsmKind::Text => return None,
+            };
+            Some(crate::manifest::SearchIndexBuildState {
+                kind: search.selection.captured_state.kind.sst_kind(),
+                name: name.to_owned(),
+                catalog_signature,
+                max_node_lsn: basis_max_node_lsn,
+            })
+        })
+        .collect();
+
     Ok(PreparedCompaction {
         new_descs,
         removed_ids,
@@ -1052,8 +1747,408 @@ async fn prepare_leveled(
         base_schema: base.manifest.schema.clone(),
         base_vector_indexes: base.manifest.vector_indexes.clone(),
         base_text_indexes: base.manifest.text_indexes.clone(),
+        base_search_lsm: base.manifest.search_lsm.clone(),
+        node_rewrites,
+        search_compactions,
         search_build_states,
+        consolidated_base_markers,
+        unadoptable_search_markers,
+        search_lsm_activations,
+        replaced_search_lsm,
     })
+}
+
+#[derive(Debug)]
+struct RebasedBarrier {
+    old_id: Uuid,
+    state: SearchLsmState,
+    descriptor: SstDescriptor,
+    object_path: Path,
+    body: Bytes,
+}
+
+fn verify_node_rewrite_inputs(
+    manifest: &crate::manifest::Manifest,
+    rewrites: &[PreparedNodeRewrite],
+) -> Result<()> {
+    let mut claimed = HashSet::new();
+    for rewrite in rewrites {
+        if rewrite.inputs.is_empty() {
+            return Err(Error::invariant(
+                "prepared Nodes rewrite has no input descriptors",
+            ));
+        }
+        for input in &rewrite.inputs {
+            if input.kind != SstKind::Nodes || !claimed.insert(input.id) {
+                return Err(Error::invariant(
+                    "prepared Nodes rewrite inputs are not unique Nodes descriptors",
+                ));
+            }
+            let mut matches = manifest
+                .ssts
+                .iter()
+                .filter(|descriptor| descriptor.id == input.id);
+            match (matches.next(), matches.next()) {
+                (Some(current), None) if current == input => {}
+                (Some(_), None) => {
+                    return Err(Error::precondition(format!(
+                        "abandoning prepared compaction: Nodes input {} changed after prepare",
+                        input.id
+                    )));
+                }
+                _ => {
+                    return Err(Error::precondition(format!(
+                        "abandoning prepared compaction: Nodes input {} is missing or ambiguous",
+                        input.id
+                    )));
+                }
+            }
+        }
+        if let Some(output) = &rewrite.output {
+            if output.kind != SstKind::Nodes {
+                return Err(Error::invariant(
+                    "prepared Nodes rewrite output is not a Nodes descriptor",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_search_state_append_only(
+    captured: &SearchLsmState,
+    current: &SearchLsmState,
+) -> Result<()> {
+    let identity_matches = current.kind == captured.kind
+        && current.index_name == captured.index_name
+        && current.catalog_signature == captured.catalog_signature
+        && current.generation_id == captured.generation_id
+        && current.status == captured.status
+        && current.base_frontier == captured.base_frontier
+        && current.equal_lsn_conflict_count == captured.equal_lsn_conflict_count;
+    let prefix_matches = current.next_event_seq >= captured.next_event_seq
+        && current.segments.starts_with(&captured.segments)
+        && current
+            .proven_empty_event_ranges
+            .starts_with(&captured.proven_empty_event_ranges)
+        && current.coverage.starts_with(&captured.coverage);
+    if !identity_matches || !prefix_matches {
+        return Err(Error::precondition(format!(
+            "abandoning prepared compaction: Search-LSM generation '{}' did not advance \
+             append-only from the captured prefix",
+            captured.index_name
+        )));
+    }
+    Ok(())
+}
+
+fn compressed_coverage_union(coverages: &[SearchCoverage]) -> Result<Vec<SearchEventRange>> {
+    let mut ranges = coverages
+        .iter()
+        .flat_map(|coverage| coverage.event_ranges.iter().copied())
+        .collect::<Vec<_>>();
+    if ranges.is_empty() || ranges.iter().any(|range| range.start >= range.end) {
+        return Err(Error::invariant(
+            "Nodes rewrite input coverage has no valid event range",
+        ));
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut compressed: Vec<SearchEventRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = compressed.last_mut() {
+            if range.start <= previous.end {
+                previous.end = previous.end.max(range.end);
+                continue;
+            }
+        }
+        compressed.push(range);
+    }
+    Ok(compressed)
+}
+
+fn input_coverage_digest(coverages: &[SearchCoverage]) -> Result<u64> {
+    let mut ordered = coverages.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|coverage| *coverage.node_sst_id.as_bytes());
+    let mut hasher = Xxh3::new();
+    hasher.update(b"NamiDB/NodesCoverageLogicalRewrite/v1");
+    hasher.update(&(ordered.len() as u64).to_le_bytes());
+    for coverage in ordered {
+        hasher.update(coverage.node_sst_id.as_bytes());
+        hasher.update(&coverage.node_sst_max_lsn.to_le_bytes());
+        hasher.update(&(coverage.event_ranges.len() as u64).to_le_bytes());
+        for range in &coverage.event_ranges {
+            if range.start >= range.end {
+                return Err(Error::invariant(
+                    "Nodes rewrite input coverage contains an invalid event range",
+                ));
+            }
+            hasher.update(&range.start.to_le_bytes());
+            hasher.update(&range.end.to_le_bytes());
+        }
+        match coverage.disposition {
+            CoverageDisposition::Segment => hasher.update(&[1]),
+            CoverageDisposition::ProvenEmpty {
+                classifier_version,
+                before_after_digest,
+            } => {
+                if classifier_version == 0 || before_after_digest == 0 {
+                    return Err(Error::invariant(
+                        "Nodes rewrite input has invalid ProvenEmpty coverage",
+                    ));
+                }
+                hasher.update(&[2]);
+                hasher.update(&classifier_version.to_le_bytes());
+                hasher.update(&before_after_digest.to_le_bytes());
+            }
+            CoverageDisposition::LogicalRewrite {
+                input_coverage_digest,
+            } => {
+                if input_coverage_digest == 0 {
+                    return Err(Error::invariant(
+                        "Nodes rewrite input has a zero coverage digest",
+                    ));
+                }
+                hasher.update(&[3]);
+                hasher.update(&input_coverage_digest.to_le_bytes());
+            }
+            CoverageDisposition::Unknown => {
+                return Err(Error::invariant(
+                    "Nodes rewrite input has unknown coverage disposition",
+                ));
+            }
+        }
+    }
+    Ok(hasher.digest().max(1))
+}
+
+fn rewrite_one_state_coverage(
+    captured: &SearchLsmState,
+    current: &mut SearchLsmState,
+    rewrite: &PreparedNodeRewrite,
+) -> Result<bool> {
+    let input_ids = rewrite
+        .inputs
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect::<HashSet<_>>();
+    let mut captured_inputs = Vec::with_capacity(input_ids.len());
+    let mut missing_inputs = 0usize;
+    for input in &rewrite.inputs {
+        let matches = captured
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.node_sst_id == input.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [coverage] => captured_inputs.push((*coverage).clone()),
+            [] if captured.status == SearchLsmStatus::Building => {
+                missing_inputs += 1;
+            }
+            [] => {
+                return Err(Error::precondition(format!(
+                    "abandoning prepared compaction: active Search-LSM '{}' did not cover Nodes \
+                     input {} at prepare time",
+                    captured.index_name, input.id
+                )));
+            }
+            _ => {
+                return Err(Error::invariant(
+                    "captured Search-LSM has duplicate Nodes coverage",
+                ));
+            }
+        }
+    }
+    if missing_inputs != 0 {
+        if captured_inputs.is_empty() {
+            return Ok(false);
+        }
+        return Err(Error::precondition(format!(
+            "abandoning prepared compaction: Building Search-LSM '{}' has partial coverage for \
+             the selected Nodes inputs",
+            captured.index_name
+        )));
+    }
+    for coverage in &captured_inputs {
+        let matches = current
+            .coverage
+            .iter()
+            .filter(|candidate| candidate.node_sst_id == coverage.node_sst_id)
+            .collect::<Vec<_>>();
+        if matches.as_slice() != [coverage] {
+            return Err(Error::precondition(format!(
+                "abandoning prepared compaction: Nodes input coverage {} changed after prepare",
+                coverage.node_sst_id
+            )));
+        }
+    }
+
+    if let Some(output) = &rewrite.output {
+        if current.coverage.iter().any(|coverage| {
+            coverage.node_sst_id == output.id && !input_ids.contains(&coverage.node_sst_id)
+        }) {
+            return Err(Error::precondition(format!(
+                "abandoning prepared compaction: Nodes output UUID {} already has unrelated coverage",
+                output.id
+            )));
+        }
+    }
+
+    let inherited_event_ranges = compressed_coverage_union(&captured_inputs)?;
+    let digest = input_coverage_digest(&captured_inputs)?;
+    let replacement = rewrite.output.as_ref().map(|output| SearchCoverage {
+        node_sst_id: output.id,
+        node_sst_max_lsn: output.max_lsn,
+        event_ranges: inherited_event_ranges,
+        disposition: CoverageDisposition::LogicalRewrite {
+            input_coverage_digest: digest,
+        },
+    });
+    let first_input = current
+        .coverage
+        .iter()
+        .position(|coverage| input_ids.contains(&coverage.node_sst_id))
+        .ok_or_else(|| {
+            Error::precondition(
+                "abandoning prepared compaction: captured Nodes inputs disappeared from coverage",
+            )
+        })?;
+    let old = std::mem::take(&mut current.coverage);
+    let mut next = Vec::with_capacity(
+        old.len()
+            .saturating_sub(input_ids.len())
+            .saturating_add(usize::from(replacement.is_some())),
+    );
+    let mut replacement = replacement;
+    for (position, coverage) in old.into_iter().enumerate() {
+        if position == first_input {
+            if let Some(replacement) = replacement.take() {
+                next.push(replacement);
+            }
+        }
+        if !input_ids.contains(&coverage.node_sst_id) {
+            next.push(coverage);
+        }
+    }
+    current.coverage = next;
+    Ok(true)
+}
+
+fn rebase_search_lsm_for_node_rewrites(
+    captured_states: &[SearchLsmState],
+    current_states: &[SearchLsmState],
+    rewrites: &[PreparedNodeRewrite],
+) -> Result<Vec<SearchLsmState>> {
+    if rewrites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let captured_keys = captured_states
+        .iter()
+        .map(|state| (state.kind, state.index_name.as_str()))
+        .collect::<HashSet<_>>();
+    let current_keys = current_states
+        .iter()
+        .map(|state| (state.kind, state.index_name.as_str()))
+        .collect::<HashSet<_>>();
+    if captured_keys.len() != captured_states.len()
+        || current_keys.len() != current_states.len()
+        || captured_keys != current_keys
+    {
+        return Err(Error::precondition(
+            "abandoning prepared compaction: Search-LSM generation set changed after prepare",
+        ));
+    }
+
+    let mut rebased = Vec::new();
+    for captured in captured_states {
+        let current = current_states
+            .iter()
+            .find(|state| state.kind == captured.kind && state.index_name == captured.index_name)
+            .expect("state key sets checked above");
+        verify_search_state_append_only(captured, current)?;
+        let mut state = current.clone();
+        let mut changed = false;
+        for rewrite in rewrites {
+            changed |= rewrite_one_state_coverage(captured, &mut state, rewrite)?;
+        }
+        if changed {
+            rebased.push(state);
+        }
+    }
+    Ok(rebased)
+}
+
+fn verify_search_replacement_inputs(
+    captured_states: &[SearchLsmState],
+    current_states: &[SearchLsmState],
+    replaced: &[(crate::search_lsm::SearchLsmKind, String)],
+    activations: &[PreparedSearchLsmActivation],
+) -> Result<()> {
+    let mut affected = replaced.iter().cloned().collect::<HashSet<_>>();
+    affected.extend(
+        activations
+            .iter()
+            .map(|activation| (activation.state.kind, activation.state.index_name.clone())),
+    );
+    for (kind, index_name) in affected {
+        let captured = captured_states
+            .iter()
+            .filter(|state| state.kind == kind && state.index_name == index_name)
+            .collect::<Vec<_>>();
+        let current = current_states
+            .iter()
+            .filter(|state| state.kind == kind && state.index_name == index_name)
+            .collect::<Vec<_>>();
+        if captured != current {
+            return Err(Error::precondition(format!(
+                "abandoning prepared compaction: physically replaced Search-LSM generation \
+                 '{index_name}' changed after prepare"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_rebased_barrier(
+    paths: &NamespacePaths,
+    state: &SearchLsmState,
+) -> Result<Option<RebasedBarrier>> {
+    let mut state = state.clone();
+    let Some(old_id) = state.compat_barrier_sst_id else {
+        if state.status == SearchLsmStatus::Active {
+            return Err(Error::invariant(
+                "active Search-LSM rewrite has no compatibility barrier",
+            ));
+        }
+        return Ok(None);
+    };
+    let barrier_id = Uuid::now_v7();
+    state.compat_barrier_sst_id = Some(barrier_id);
+    let body = encode_search_barrier(&state)
+        .map_err(|error| Error::invariant(format!("rebased barrier encode failed: {error}")))?;
+    let file_name = format!(
+        "{}-{}-{}.slb",
+        uuid_path_id(&barrier_id),
+        state.kind.sst_kind().path_tag(),
+        state.index_name
+    );
+    let level = SstLevel::L0;
+    let object_path = paths.sst_object(level.as_u32(), &file_name);
+    let descriptor = search_barrier_descriptor(
+        &state,
+        barrier_id,
+        level,
+        relative_sst_path(level.as_u32(), &file_name),
+        body.len() as u64,
+    );
+    crate::search_lsm::validate_search_barrier(&state, &body)
+        .map_err(|error| Error::invariant(format!("rebased barrier self-check failed: {error}")))?;
+    Ok(Some(RebasedBarrier {
+        old_id,
+        state,
+        descriptor,
+        object_path,
+        body,
+    }))
 }
 
 /// Commit phase of the prepare/commit split: fold a [`PreparedCompaction`]
@@ -1093,7 +2188,10 @@ pub async fn install_prepared(
     current: &LoadedManifest,
     prepared: PreparedCompaction,
 ) -> Result<CompactionOutcome> {
-    if prepared.removed_ids.is_empty() {
+    if prepared.removed_ids.is_empty()
+        && prepared.search_lsm_activations.is_empty()
+        && prepared.unadoptable_search_markers.is_empty()
+    {
         debug!("compactor found no bucket worth merging; nothing to install");
         return Ok(CompactionOutcome {
             committed: current.clone(),
@@ -1124,6 +2222,123 @@ pub async fn install_prepared(
         )));
     }
 
+    verify_search_replacement_inputs(
+        &prepared.base_search_lsm,
+        &current.manifest.search_lsm,
+        &prepared.replaced_search_lsm,
+        &prepared.search_lsm_activations,
+    )?;
+    let mut rebased_search_states = if prepared.node_rewrites.is_empty() {
+        Vec::new()
+    } else {
+        validate_search_lsm(&current.manifest).map_err(|error| {
+            Error::precondition(format!(
+                "abandoning prepared compaction (basis v{}): current Search-LSM state is \
+                 invalid: {error}",
+                prepared.base_version
+            ))
+        })?;
+        verify_node_rewrite_inputs(&current.manifest, &prepared.node_rewrites)?;
+        // States this very prepare REPLACES (the authoritative rebuild path —
+        // e.g. a freshly recreated index still Building with partial
+        // coverage) are retired below, not rebased: validating their partial
+        // coverage here would abort exactly the compaction that repairs
+        // them, wedging maintenance after every DROP+CREATE INDEX cycle.
+        let replaced_keys: HashSet<(crate::search_lsm::SearchLsmKind, &str)> = prepared
+            .replaced_search_lsm
+            .iter()
+            .map(|(kind, name)| (*kind, name.as_str()))
+            .collect();
+        let captured_kept: Vec<crate::search_lsm::SearchLsmState> = prepared
+            .base_search_lsm
+            .iter()
+            .filter(|state| !replaced_keys.contains(&(state.kind, state.index_name.as_str())))
+            .cloned()
+            .collect();
+        let current_kept: Vec<crate::search_lsm::SearchLsmState> = current
+            .manifest
+            .search_lsm
+            .iter()
+            .filter(|state| !replaced_keys.contains(&(state.kind, state.index_name.as_str())))
+            .cloned()
+            .collect();
+        rebase_search_lsm_for_node_rewrites(&captured_kept, &current_kept, &prepared.node_rewrites)?
+    };
+    if !prepared.search_compactions.is_empty() {
+        if prepared.node_rewrites.is_empty() {
+            validate_search_lsm(&current.manifest).map_err(|error| {
+                Error::precondition(format!(
+                    "abandoning prepared compaction (basis v{}): current Search-LSM state is \
+                     invalid: {error}",
+                    prepared.base_version
+                ))
+            })?;
+        }
+        let mut physical_keys = HashSet::new();
+        for search in &prepared.search_compactions {
+            let key = (
+                search.selection.captured_state.kind,
+                search.selection.captured_state.index_name.clone(),
+            );
+            if !physical_keys.insert(key.clone()) {
+                return Err(Error::invariant(
+                    "prepared compaction contains duplicate physical Search-LSM plans",
+                ));
+            }
+            let output_missing = search.output_descriptor().is_some_and(|output| {
+                !prepared
+                    .new_descs
+                    .iter()
+                    .any(|descriptor| descriptor == output)
+            });
+            if output_missing
+                || search
+                    .selection
+                    .selected_ids()
+                    .any(|id| !prepared.removed_ids.contains(&id))
+            {
+                return Err(Error::invariant(
+                    "prepared physical Search-LSM plan is not reflected in descriptor changes",
+                ));
+            }
+            let logical_position = rebased_search_states
+                .iter()
+                .position(|state| state.kind == key.0 && state.index_name == key.1);
+            let working = match logical_position {
+                Some(position) => rebased_search_states.remove(position),
+                None => current
+                    .manifest
+                    .search_lsm
+                    .iter()
+                    .find(|state| state.kind == key.0 && state.index_name == key.1)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::precondition(format!(
+                            "abandoning physical Search-LSM compaction: generation '{}' \
+                             disappeared",
+                            key.1
+                        ))
+                    })?,
+            };
+            rebased_search_states.push(search_lsm_compact::rebase_prepared_search_compaction(
+                &current.manifest,
+                search,
+                &working,
+            )?);
+        }
+    }
+    if rebased_search_states.iter().any(|state| {
+        prepared
+            .replaced_search_lsm
+            .iter()
+            .any(|(kind, name)| state.kind == *kind && state.index_name == *name)
+    }) {
+        return Err(Error::precondition(
+            "abandoning prepared compaction: one Search-LSM generation was both logically \
+             rewritten and physically replaced",
+        ));
+    }
+
     let live: HashSet<Uuid> = current.manifest.ssts.iter().map(|d| d.id).collect();
     if let Some(missing) = prepared.removed_ids.iter().find(|id| !live.contains(id)) {
         return Err(Error::precondition(format!(
@@ -1133,16 +2348,159 @@ pub async fn install_prepared(
         )));
     }
 
-    let source_count = prepared.removed_ids.len();
-    let new_count = prepared.new_descs.len();
+    let mut source_count = prepared.removed_ids.len();
+    let mut new_count = prepared.new_descs.len();
+    let mut installed_activation_count = 0usize;
     let mut next = current.manifest.next_version(fence.writer_id);
     let removed_set: HashSet<Uuid> = prepared.removed_ids.into_iter().collect();
     next.ssts.retain(|d| !removed_set.contains(&d.id));
     next.ssts.extend(prepared.new_descs);
+    next.search_lsm.retain(|state| {
+        !prepared
+            .replaced_search_lsm
+            .iter()
+            .any(|(kind, name)| state.kind == *kind && state.index_name == *name)
+    });
     for state in prepared.search_build_states {
         next.search_index_builds
             .retain(|existing| existing.kind != state.kind || existing.name != state.name);
         next.search_index_builds.push(state);
+    }
+    let mut dropped_unadoptable_markers = 0usize;
+    for (kind, name) in &prepared.unadoptable_search_markers {
+        let before = next.search_index_builds.len();
+        next.search_index_builds
+            .retain(|marker| !(marker.kind == *kind && marker.name == *name));
+        dropped_unadoptable_markers += before - next.search_index_builds.len();
+    }
+    // Position-preserving upsert: migration tests pin unrelated-marker order.
+    // Install is all-or-nothing, so a marker can never commit without the
+    // base it certifies.
+    for marker in prepared.consolidated_base_markers {
+        match next
+            .search_index_builds
+            .iter_mut()
+            .find(|existing| existing.kind == marker.kind && existing.name == marker.name)
+        {
+            Some(existing) => *existing = marker,
+            None => next.search_index_builds.push(marker),
+        }
+    }
+    for activation in prepared.search_lsm_activations {
+        let mut expected_nodes = activation
+            .state
+            .coverage
+            .iter()
+            .map(|coverage| (coverage.node_sst_id, coverage.node_sst_max_lsn))
+            .collect::<Vec<_>>();
+        let mut visible_nodes = next
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+            .map(|descriptor| (descriptor.id, descriptor.max_lsn))
+            .collect::<Vec<_>>();
+        expected_nodes.sort_unstable();
+        visible_nodes.sort_unstable();
+        if expected_nodes != visible_nodes {
+            tracing::info!(
+                index = %activation.state.index_name,
+                "prepared Search-LSM activation was outrun by a concurrent node commit; \
+                 installing the legacy base without its barrier and retaining exact fallback"
+            );
+            continue;
+        }
+
+        let mut validation = next.clone();
+        if !activation.barrier_already_present {
+            validation.ssts.push(activation.barrier.clone());
+        }
+        validation.search_lsm.retain(|state| {
+            state.kind != activation.state.kind || state.index_name != activation.state.index_name
+        });
+        validation.search_lsm.push(activation.state.clone());
+        if let Err(error) = crate::search_lsm::validate_search_lsm(&validation) {
+            tracing::warn!(
+                index = %activation.state.index_name,
+                error = %error,
+                "prepared Search-LSM activation failed final validation; retaining exact fallback"
+            );
+            continue;
+        }
+        next.search_lsm.retain(|state| {
+            state.kind != activation.state.kind || state.index_name != activation.state.index_name
+        });
+        if !activation.barrier_already_present {
+            next.ssts.push(activation.barrier);
+            new_count += 1;
+        }
+        next.search_lsm.push(activation.state);
+        installed_activation_count += 1;
+    }
+
+    let mut rebased_barriers = Vec::new();
+    for state in rebased_search_states {
+        let final_state = match prepare_rebased_barrier(manifest_store.paths(), &state)? {
+            Some(rotation) => {
+                next.ssts
+                    .retain(|descriptor| descriptor.id != rotation.old_id);
+                next.ssts.push(rotation.descriptor.clone());
+                source_count = source_count.saturating_add(1);
+                new_count = new_count.saturating_add(1);
+                let final_state = rotation.state.clone();
+                rebased_barriers.push(rotation);
+                final_state
+            }
+            None => state,
+        };
+        let position = next
+            .search_lsm
+            .iter()
+            .position(|existing| {
+                existing.kind == final_state.kind && existing.index_name == final_state.index_name
+            })
+            .ok_or_else(|| {
+                Error::precondition(
+                    "abandoning prepared compaction: rebased Search-LSM generation disappeared",
+                )
+            })?;
+        next.search_lsm[position] = final_state;
+    }
+
+    validate_search_lsm(&next).map_err(|error| {
+        Error::precondition(format!(
+            "abandoning prepared compaction (basis v{}): rebased Search-LSM manifest is invalid: \
+             {error}",
+            prepared.base_version
+        ))
+    })?;
+    let mut barrier_puts = futures::stream::FuturesUnordered::new();
+    for rotation in rebased_barriers {
+        let store = manifest_store.store().clone();
+        barrier_puts.push(async move {
+            crate::flush::put_sidecar_payload(
+                store,
+                &rotation.object_path,
+                SidecarPayload::InMemory(rotation.body.into()),
+            )
+            .await
+        });
+    }
+    while let Some(result) = barrier_puts.next().await {
+        result?;
+    }
+
+    if source_count == 0
+        && new_count == 0
+        && installed_activation_count == 0
+        && dropped_unadoptable_markers == 0
+    {
+        debug!("prepared Search-LSM activation was outrun; nothing to install");
+        return Ok(CompactionOutcome {
+            committed: current.clone(),
+            source_ssts_removed: 0,
+            new_ssts_written: 0,
+            bloom_sidecars_written: 0,
+        });
     }
     let committed = manifest_store.commit(fence, current, next).await?;
 
@@ -1191,7 +2549,7 @@ async fn compact_and_write_edges(
     })
     .await??;
     let removed: Vec<Uuid> = sources.iter().map(|d| d.id).collect();
-    if finish.finish.stats.edge_count == 0 {
+    if finish.stats.edge_count == 0 {
         return Ok((None, false, removed));
     }
     let (descriptor, wrote_bloom) =
@@ -1451,20 +2809,36 @@ impl NodeSourceCursor {
     }
 }
 
-fn build_exact_node_locator_from_source(
+fn build_node_access_sidecars_from_source(
     body: Bytes,
     label_def: &LabelDef,
-) -> Result<crate::sst::paged_index::NodeLocatorRecordBuilder> {
+    parent_sst_id: Uuid,
+) -> Result<(
+    crate::sst::paged_index::NodeLocatorRecordUpload,
+    crate::sst::nodes::property_pages::NodePropertyPageUpload,
+)> {
     let mut cursor = NodeSourceCursor::open(label_def, body)?;
     cursor.ensure_positioned()?;
-    let mut builder = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+    let mut locator = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+    let mut properties = crate::sst::nodes::property_pages::NodePropertyPageBuilder::new_bound(
+        crate::sst::nodes::property_pages::NodePropertyPageConfig::from_env()?,
+        parent_sst_id,
+    )?;
+    let mut ordinal = 0_u64;
     while cursor.peek().is_some() {
-        let (row, _) = cursor.materialize_current(label_def)?;
+        let (row, record) = cursor.materialize_current(label_def)?;
         let exact_record = encode_exact_node_record(&row)?;
-        builder.push(&row.id, &exact_record)?;
+        locator.push(&row.id, &exact_record)?;
+        match record {
+            Some(record) => properties.push_sorted(row.id, ordinal, &record.properties)?,
+            None => properties.push_sorted(row.id, ordinal, &BTreeMap::new())?,
+        }
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
         cursor.advance()?;
     }
-    Ok(builder)
+    Ok((locator.finish_upload()?, properties.finish()?))
 }
 
 /// Heap key for the node k-way merge: id ascending, then LSN **descending**
@@ -1505,6 +2879,64 @@ struct NodeMergeIndexSpecs {
     text: Vec<crate::manifest::TextIndexDescriptor>,
 }
 
+/// Aggregate (not per-index) memory contract for all search-index collectors
+/// retained by one authoritative node merge.
+///
+/// Text collectors buffer occurrences concurrently while the winner stream
+/// advances, and those buffers remain alive while vector artifacts are built.
+/// Giving every collector the full environment value therefore multiplies the
+/// operator's intended ceiling by the catalog size. We partition the single
+/// budget deterministically across every live collector. A builder may use
+/// less than its share, but can never borrow memory that another still owns.
+const DEFAULT_INDEX_BUILD_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const MIN_INDEX_BUILD_MEMORY_PER_COLLECTOR: usize = 64 * 1024;
+
+fn aggregate_index_build_memory_bytes() -> Result<usize> {
+    const ENV: &str = "NAMIDB_INDEX_BUILD_MEMORY_BYTES";
+    let bytes = match std::env::var(ENV) {
+        Ok(value) => value.trim().parse::<usize>().map_err(|error| {
+            Error::precondition(format!(
+                "{ENV} must be an exact positive byte count: {error}"
+            ))
+        })?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_INDEX_BUILD_MEMORY_BYTES,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::precondition(format!("{ENV} is not valid UTF-8")));
+        }
+    };
+    if bytes == 0 {
+        return Err(Error::precondition(format!(
+            "{ENV} must be greater than zero"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn per_collector_index_build_memory_bytes(collector_count: usize) -> Result<Option<usize>> {
+    if collector_count == 0 {
+        return Ok(None);
+    }
+    let aggregate = aggregate_index_build_memory_bytes()?;
+    partition_index_build_memory(aggregate, collector_count).map(Some)
+}
+
+fn partition_index_build_memory(aggregate: usize, collector_count: usize) -> Result<usize> {
+    if collector_count == 0 {
+        return Err(Error::invariant(
+            "cannot partition search-index memory across zero collectors",
+        ));
+    }
+    let per_collector = aggregate / collector_count;
+    if per_collector < MIN_INDEX_BUILD_MEMORY_PER_COLLECTOR {
+        return Err(Error::precondition(format!(
+            "NAMIDB_INDEX_BUILD_MEMORY_BYTES={aggregate} cannot fund {collector_count} \
+             concurrent search-index collectors: each requires at least \
+             {MIN_INDEX_BUILD_MEMORY_PER_COLLECTOR} bytes"
+        )));
+    }
+    Ok(per_collector)
+}
+
 /// Everything the streaming node merge harvests from the winner stream for
 /// [`put_node_sst_leveled`], in place of the old `&merged_rows` re-walks.
 struct NodeSidecarHarvest {
@@ -1512,25 +2944,17 @@ struct NodeSidecarHarvest {
     equality: EqualitySidecarCollector,
     label_index: LabelIndexCollector,
     node_locator_upload: crate::sst::paged_index::NodeLocatorRecordUpload,
+    property_pages_upload: crate::sst::nodes::property_pages::NodePropertyPageUpload,
     per_label_property_stats: Vec<PerLabelPropertyStat>,
 }
 
-/// Per-index `(descriptor, collected (id, embedding) members)` pairs the
-/// winner stream produced. Aliased for clippy's type-complexity lint.
+/// Per-index external vector collectors produced by the winner stream.
 #[cfg(feature = "vector-index")]
-type VectorIndexMembers = Vec<(
-    VectorIndexDescriptor,
-    Vec<([u8; 16], Vec<f32>)>,
-    crate::sst::vector::VectorFilterPostings,
-)>;
+type VectorIndexMembers = Vec<VectorMemberCollector>;
 
-/// Per-index `(descriptor, collected (id, document) members)` pairs the
-/// winner stream produced. Aliased for clippy's type-complexity lint.
+/// Per-index external text collectors produced by the winner stream.
 #[cfg(feature = "text-index")]
-type TextIndexMembers = Vec<(
-    crate::manifest::TextIndexDescriptor,
-    Vec<([u8; 16], String)>,
-)>;
+type TextIndexMembers = Vec<TextMemberCollector>;
 
 /// Output of [`merge_node_sources`].
 struct NodeMergeOutput {
@@ -1571,6 +2995,7 @@ fn merge_node_sources(
     schema: &Schema,
     label_dict: &LabelDictionary,
     bucket_scope: &str,
+    output_sst_id: Uuid,
     index_specs: NodeMergeIndexSpecs,
 ) -> Result<NodeMergeOutput> {
     let mut cursors: Vec<NodeSourceCursor> = Vec::with_capacity(inputs.len());
@@ -1593,23 +3018,51 @@ fn merge_node_sources(
         ..Default::default()
     };
     let mut writer = IncrementalNodeSstWriter::new(label_def, options, merge_chunk_rows())?;
-    let mut unique = UniqueSidecarCollector::new(sidecar_def);
-    let mut equality = EqualitySidecarCollector::new(sidecar_def);
-    let mut label_index = LabelIndexCollector::new();
+    let mut unique = UniqueSidecarCollector::new(sidecar_def)?;
+    let mut equality = EqualitySidecarCollector::new(sidecar_def)?;
+    let mut label_index = LabelIndexCollector::new()?;
     let mut node_locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
+    let mut property_pages = crate::sst::nodes::property_pages::NodePropertyPageBuilder::new_bound(
+        crate::sst::nodes::property_pages::NodePropertyPageConfig::from_env()?,
+        output_sst_id,
+    )?;
+    let mut output_ordinal = 0_u64;
     let mut stats = PerLabelStatsCollector::new();
+    #[allow(unused_mut)]
+    let mut search_collector_count = 0usize;
+    #[cfg(feature = "vector-index")]
+    {
+        search_collector_count = search_collector_count
+            .checked_add(index_specs.vector.len())
+            .ok_or_else(|| Error::invariant("search-index collector count overflows usize"))?;
+    }
+    #[cfg(feature = "text-index")]
+    {
+        search_collector_count = search_collector_count
+            .checked_add(index_specs.text.len())
+            .ok_or_else(|| Error::invariant("search-index collector count overflows usize"))?;
+    }
+    // Only the feature-gated collectors below consume this budget, but the
+    // check itself must still run so a misconfigured rail fails the same way in
+    // every build.
+    #[cfg_attr(
+        not(any(feature = "vector-index", feature = "text-index")),
+        allow(unused_variables)
+    )]
+    let per_collector_memory =
+        per_collector_index_build_memory_bytes(search_collector_count)?.unwrap_or(0);
     #[cfg(feature = "vector-index")]
     let mut vector_collectors: Vec<VectorMemberCollector> = index_specs
         .vector
         .into_iter()
-        .map(|desc| VectorMemberCollector::new(desc, label_dict, schema))
-        .collect();
+        .map(|desc| VectorMemberCollector::new(desc, label_dict, schema, per_collector_memory))
+        .collect::<Result<Vec<_>>>()?;
     #[cfg(feature = "text-index")]
     let mut text_collectors: Vec<TextMemberCollector> = index_specs
         .text
         .into_iter()
-        .map(|desc| TextMemberCollector::new(desc, label_dict))
-        .collect();
+        .map(|desc| TextMemberCollector::new(desc, label_dict, per_collector_memory))
+        .collect::<Result<Vec<_>>>()?;
     #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
     let _ = &index_specs;
 
@@ -1655,19 +3108,30 @@ fn merge_node_sources(
                 let exact_record = encode_exact_node_record(&row)?;
                 node_locator_records.push(&row.id, &exact_record)?;
                 if let Some(rec) = &rec {
-                    unique.observe(row.id, rec);
-                    equality.observe(row.id, rec);
-                    label_index.observe(row.id, rec);
+                    unique.observe(row.id, rec)?;
+                    equality.observe(row.id, rec)?;
+                    label_index.observe(row.id, rec)?;
                     stats.observe(rec);
                     #[cfg(feature = "vector-index")]
                     for collector in &mut vector_collectors {
-                        collector.observe(row.id, rec, bucket_scope);
+                        collector.observe(row.id, rec, bucket_scope)?;
                     }
                     #[cfg(feature = "text-index")]
                     for collector in &mut text_collectors {
-                        collector.observe(row.id, rec, bucket_scope);
+                        collector.observe(row.id, rec, bucket_scope)?;
                     }
                 }
+                match &rec {
+                    Some(record) => {
+                        property_pages.push_sorted(row.id, output_ordinal, &record.properties)?;
+                    }
+                    None => {
+                        property_pages.push_sorted(row.id, output_ordinal, &BTreeMap::new())?;
+                    }
+                }
+                output_ordinal = output_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
                 writer.push(row)?;
             }
         }
@@ -1687,6 +3151,12 @@ fn merge_node_sources(
 
     let finish = writer.finish()?;
     let node_locator_upload = node_locator_records.finish_upload()?;
+    let property_pages_upload = property_pages.finish()?;
+    if property_pages_upload.stats().node_count != finish.stats.row_count {
+        return Err(Error::invariant(
+            "compacted node property pages row count differs from Nodes SST",
+        ));
+    }
     let per_label_property_stats = stats.finish(schema, label_dict)?;
     Ok(NodeMergeOutput {
         finish,
@@ -1695,18 +3165,13 @@ fn merge_node_sources(
             equality,
             label_index,
             node_locator_upload,
+            property_pages_upload,
             per_label_property_stats,
         },
         #[cfg(feature = "vector-index")]
-        vector_members: vector_collectors
-            .into_iter()
-            .map(|c| (c.desc, c.members, c.filter_postings.finish()))
-            .collect(),
+        vector_members: vector_collectors,
         #[cfg(feature = "text-index")]
-        text_members: text_collectors
-            .into_iter()
-            .map(|c| (c.desc, c.members))
-            .collect(),
+        text_members: text_collectors,
     })
 }
 
@@ -1733,43 +3198,85 @@ fn raw_labels_from_batch(batch: &arrow_array::RecordBatch, row: usize) -> Vec<u3
 
 // ── Streaming k-way edge merge ──────────────────────────────────────────
 
-/// Incremental reader over one edge property stream (Arrow IPC of
-/// JSON-encoded `Value` strings, optionally zstd-compressed). Yields values
-/// in edge-enumeration order one mini-batch at a time — the zstd frame is
-/// decoded through a streaming `Read`, so at no point does the whole
-/// stream's `String` set exist in memory.
+/// Incremental reader over one edge property stream. Legacy Arrow IPC is
+/// streamed one record batch at a time; current codec-2/3 bodies decode one
+/// independently compressed property page at a time.
 struct PropertyStreamCursor {
     name: String,
-    reader: StreamReader<Box<dyn std::io::Read + Send>>,
-    current: Option<StringArray>,
-    row: usize,
+    inner: PropertyStreamCursorInner,
     rows_read: u64,
     edge_count: u64,
 }
 
+enum PropertyStreamCursorInner {
+    Arrow {
+        reader: StreamReader<Box<dyn std::io::Read + Send>>,
+        current: Option<StringArray>,
+        row: usize,
+    },
+    Paged {
+        bytes: Bytes,
+        entries: std::vec::IntoIter<PropertyPageEntry>,
+        compressed: bool,
+        current: Vec<Option<String>>,
+        row: usize,
+    },
+}
+
 impl PropertyStreamCursor {
     fn open(name: &str, bytes: Bytes, codec: u8, edge_count: u64) -> Result<Self> {
-        let read: Box<dyn std::io::Read + Send> = match codec {
-            CODEC_NONE => Box::new(std::io::Cursor::new(bytes)),
-            CODEC_ZSTD => Box::new(
-                zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes)).map_err(|e| {
-                    Error::invariant(format!("zstd decode (property stream {name}): {e}"))
-                })?,
-            ),
+        let inner = match codec {
+            CODEC_NONE | CODEC_ZSTD => {
+                let read: Box<dyn std::io::Read + Send> = if codec == CODEC_NONE {
+                    Box::new(std::io::Cursor::new(bytes))
+                } else {
+                    Box::new(
+                        zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes)).map_err(
+                            |e| {
+                                Error::invariant(format!(
+                                    "zstd decode (property stream {name}): {e}"
+                                ))
+                            },
+                        )?,
+                    )
+                };
+                let reader = StreamReader::try_new(read, None)
+                    .map_err(|e| Error::invariant(format!("property IPC reader ({name}): {e}")))?;
+                PropertyStreamCursorInner::Arrow {
+                    reader,
+                    current: None,
+                    row: 0,
+                }
+            }
+            CODEC_PROPERTY_PAGED_NONE | CODEC_PROPERTY_PAGED_ZSTD => {
+                let index = PropertyPageIndex::parse_prefix(&bytes, bytes.len() as u64)?;
+                if index.row_count != edge_count {
+                    return Err(Error::Corrupted {
+                        path: "<edges>".into(),
+                        detail: format!(
+                            "property stream {name} row count {} != edge_count {edge_count}",
+                            index.row_count
+                        ),
+                    });
+                }
+                PropertyStreamCursorInner::Paged {
+                    bytes,
+                    entries: index.entries.into_iter(),
+                    compressed: codec == CODEC_PROPERTY_PAGED_ZSTD,
+                    current: Vec::new(),
+                    row: 0,
+                }
+            }
             other => {
                 return Err(Error::Corrupted {
                     path: "<edges>".into(),
                     detail: format!("unknown codec {other} for property stream {name}"),
-                });
+                })
             }
         };
-        let reader = StreamReader::try_new(read, None)
-            .map_err(|e| Error::invariant(format!("property IPC reader ({name}): {e}")))?;
         Ok(Self {
             name: name.to_string(),
-            reader,
-            current: None,
-            row: 0,
+            inner,
             rows_read: 0,
             edge_count,
         })
@@ -1780,46 +3287,85 @@ impl PropertyStreamCursor {
     /// the string.
     fn next(&mut self, want: bool) -> Result<Option<String>> {
         loop {
-            if let Some(current) = &self.current {
-                if self.row < current.len() {
-                    let out = if want && !current.is_null(self.row) {
-                        Some(current.value(self.row).to_string())
-                    } else {
-                        None
+            match &mut self.inner {
+                PropertyStreamCursorInner::Arrow {
+                    reader,
+                    current,
+                    row,
+                } => {
+                    if let Some(batch) = current {
+                        if *row < batch.len() {
+                            let out = if want && !batch.is_null(*row) {
+                                Some(batch.value(*row).to_string())
+                            } else {
+                                None
+                            };
+                            *row += 1;
+                            self.rows_read += 1;
+                            return Ok(out);
+                        }
+                        *current = None;
+                    }
+                    let Some(batch) = reader.next() else {
+                        return property_short_stream_error(
+                            &self.name,
+                            self.rows_read,
+                            self.edge_count,
+                        );
                     };
-                    self.row += 1;
-                    self.rows_read += 1;
-                    return Ok(out);
-                }
-                self.current = None;
-            }
-            match self.reader.next() {
-                Some(batch) => {
                     let batch = batch.map_err(|e| {
                         Error::invariant(format!("property IPC batch ({}): {e}", self.name))
                     })?;
-                    let column = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| {
-                            Error::invariant(format!(
-                                "property IPC column ({}) is not Utf8",
-                                self.name
-                            ))
-                        })?
-                        .clone();
-                    self.current = Some(column);
-                    self.row = 0;
+                    *current = Some(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .ok_or_else(|| {
+                                Error::invariant(format!(
+                                    "property IPC column ({}) is not Utf8",
+                                    self.name
+                                ))
+                            })?
+                            .clone(),
+                    );
+                    *row = 0;
                 }
-                None => {
-                    return Err(Error::Corrupted {
+                PropertyStreamCursorInner::Paged {
+                    bytes,
+                    entries,
+                    compressed,
+                    current,
+                    row,
+                } => {
+                    if *row < current.len() {
+                        let out = if want { current[*row].clone() } else { None };
+                        *row += 1;
+                        self.rows_read += 1;
+                        return Ok(out);
+                    }
+                    let Some(entry) = entries.next() else {
+                        return property_short_stream_error(
+                            &self.name,
+                            self.rows_read,
+                            self.edge_count,
+                        );
+                    };
+                    let start = usize::try_from(entry.offset)
+                        .map_err(|_| Error::invariant("property page offset does not fit usize"))?;
+                    let end = usize::try_from(
+                        entry
+                            .offset
+                            .checked_add(entry.encoded_len)
+                            .ok_or_else(|| Error::invariant("property page end exceeds u64"))?,
+                    )
+                    .map_err(|_| Error::invariant("property page end does not fit usize"))?;
+                    let encoded = bytes.get(start..end).ok_or_else(|| Error::Corrupted {
                         path: "<edges>".into(),
-                        detail: format!(
-                            "property stream {} row count {} != edge_count {}",
-                            self.name, self.rows_read, self.edge_count
-                        ),
-                    });
+                        detail: format!("property page {} is truncated", self.name),
+                    })?;
+                    *current = decode_property_page(encoded, entry, *compressed)?;
+                    *row = 0;
                 }
             }
         }
@@ -1829,19 +3375,31 @@ impl PropertyStreamCursor {
     /// must be empty too — the streaming equivalent of the whole-stream
     /// row-count check the materialised decode performed.
     fn assert_exhausted(&mut self) -> Result<()> {
-        let leftover = match &self.current {
-            Some(current) if self.row < current.len() => true,
-            _ => match self.reader.next() {
-                Some(batch) => {
-                    batch
-                        .map_err(|e| {
-                            Error::invariant(format!("property IPC batch ({}): {e}", self.name))
-                        })?
-                        .num_rows()
-                        > 0
-                }
-                None => false,
+        let leftover = match &mut self.inner {
+            PropertyStreamCursorInner::Arrow {
+                reader,
+                current,
+                row,
+            } => match current {
+                Some(current) if *row < current.len() => true,
+                _ => match reader.next() {
+                    Some(batch) => {
+                        batch
+                            .map_err(|e| {
+                                Error::invariant(format!("property IPC batch ({}): {e}", self.name))
+                            })?
+                            .num_rows()
+                            > 0
+                    }
+                    None => false,
+                },
             },
+            PropertyStreamCursorInner::Paged {
+                entries,
+                current,
+                row,
+                ..
+            } => *row < current.len() || !entries.as_slice().is_empty(),
         };
         if leftover {
             return Err(Error::Corrupted {
@@ -1854,6 +3412,13 @@ impl PropertyStreamCursor {
         }
         Ok(())
     }
+}
+
+fn property_short_stream_error<T>(name: &str, rows_read: u64, edge_count: u64) -> Result<T> {
+    Err(Error::Corrupted {
+        path: "<edges>".into(),
+        detail: format!("property stream {name} row count {rows_read} != edge_count {edge_count}"),
+    })
 }
 
 /// Verified owned slice of one edge-SST section: `reader.section` checks the
@@ -2213,6 +3778,7 @@ async fn put_node_sst_leveled(
     paths: &NamespacePaths,
     out_level: u32,
     label: &str,
+    id: Uuid,
     // Sidecar/stat harvest the streaming merge collected off the winner
     // stream (unique + equality maps keyed by the sidecar def — for the
     // id-primary "" bucket that's `union_indexed_props(schema)`, mirroring
@@ -2221,7 +3787,6 @@ async fn put_node_sst_leveled(
     sidecars: NodeSidecarHarvest,
     finish: NodeSstFinish,
 ) -> Result<(SstDescriptor, bool)> {
-    let id = Uuid::now_v7();
     let level = SstLevel(out_level);
     let file_name = format!(
         "{}-{}-{}.parquet",
@@ -2254,10 +3819,7 @@ async fn put_node_sst_leveled(
     // (P4.19 only emitted sidecars on flush).
     let (unique_property_indices, index_sidecars) =
         sidecars.unique.finish(paths, level.as_u32(), &id, label)?;
-    let mut index_sidecars: Vec<(Path, crate::flush::SidecarPayload)> = index_sidecars
-        .into_iter()
-        .map(|(path, body)| (path, body.into()))
-        .collect();
+    let mut index_sidecars: Vec<(Path, crate::flush::SidecarPayload)> = index_sidecars;
     // Re-emit equality-index posting-list sidecars too, harvested from the
     // already-reconciled winner stream (tombstones dropped, highest-lsn per
     // id), so the L1 sidecar supersedes all the L0 partials.
@@ -2265,11 +3827,7 @@ async fn put_node_sst_leveled(
         sidecars
             .equality
             .finish(paths, level.as_u32(), &id, label)?;
-    index_sidecars.extend(
-        equality_sidecars
-            .into_iter()
-            .map(|(path, body)| (path, body.into())),
-    );
+    index_sidecars.extend(equality_sidecars);
     // Rebuild the label-index sidecar from the reconciled rows. id-primary
     // buckets (scope == "") carry per-row label sets, so this re-emits the
     // `LabelId -> [NodeId]` postings (with per-label counts) the cost model
@@ -2279,15 +3837,25 @@ async fn put_node_sst_leveled(
     // `None` here, falling back to `scope`-based counting downstream.
     let (label_index, label_sidecar) = sidecars.label_index.finish(paths, level.as_u32(), &id)?;
     if let Some((path, body)) = label_sidecar {
-        index_sidecars.push((path, body.into()));
+        index_sidecars.push((path, body));
     }
-    let (node_locator, locator_sidecar) = crate::flush::prepare_node_locator_upload_sidecar(
+    let (mut node_locator, locator_sidecar) = crate::flush::prepare_node_locator_upload_sidecar(
         paths,
         level.as_u32(),
         &id,
         sidecars.node_locator_upload,
     )?;
     index_sidecars.push(locator_sidecar);
+    let (property_pages, property_sidecar) =
+        crate::flush::prepare_node_property_pages_upload_sidecar(
+            paths,
+            level.as_u32(),
+            &id,
+            &id,
+            sidecars.property_pages_upload,
+        )?;
+    node_locator.property_pages = Some(property_pages);
+    index_sidecars.push(property_sidecar);
     for (path, body) in index_sidecars {
         crate::flush::put_sidecar_payload(store.clone(), &path, body).await?;
     }
@@ -2324,28 +3892,33 @@ async fn put_node_sst_leveled(
     Ok((descriptor, wrote_bloom))
 }
 
-/// Streaming member collector for one registered vector index: observes
-/// each reconciled winner row as the merge advances and keeps the
-/// `(id, embedding)` pairs the Vamana build needs — the inherent lower
-/// bound, since graph construction requires every member vector at once.
-/// Only instantiated for authoritative merges (see the caller): on a
-/// partial merge the winner stream is a strict subset of the corpus and
-/// rebuilding from it would silently truncate the index.
+/// Streaming member collector for one registered vector index.
+///
+/// Winner rows arrive in strict NodeId order and are written immediately to
+/// the external V5 spool. Only one decoded vector and its filter values are
+/// live here; clustering/partitioning later uses bounded multi-pass scratch
+/// I/O. The collector is instantiated only for authoritative merges: a
+/// partial winner stream is a strict subset of the corpus and must never
+/// replace the current full generation.
 #[cfg(feature = "vector-index")]
 struct VectorMemberCollector {
     desc: VectorIndexDescriptor,
     /// The index label resolved to its raw dictionary id (if interned).
     label_id: Option<u32>,
-    members: Vec<([u8; 16], Vec<f32>)>,
-    /// Complete String/Bool equality postings collected in the same winner
-    /// stream as the vectors, bounded and adaptive before they enter `.vg`.
-    filter_postings: crate::sst::vector::VectorFilterPostingsBuilder,
+    /// Complete String/Bool properties embedded as page-local typed bitmaps.
+    filter_properties: Vec<String>,
+    builder: crate::sst::vector::v5::external::VectorV5ExternalCollector,
 }
 
 #[cfg(feature = "vector-index")]
 impl VectorMemberCollector {
-    fn new(desc: VectorIndexDescriptor, label_dict: &LabelDictionary, schema: &Schema) -> Self {
-        let filter_properties = schema
+    fn new(
+        desc: VectorIndexDescriptor,
+        label_dict: &LabelDictionary,
+        schema: &Schema,
+        memory_budget_bytes: usize,
+    ) -> Result<Self> {
+        let mut filter_properties: Vec<String> = schema
             .label(&desc.label)
             .into_iter()
             .flat_map(|label| &label.properties)
@@ -2356,19 +3929,21 @@ impl VectorMemberCollector {
                         DataType::Bool | DataType::Utf8 | DataType::LargeUtf8
                     )
             })
-            .map(|property| property.name.clone());
-        Self {
+            .map(|property| property.name.clone())
+            .collect();
+        filter_properties.sort();
+        filter_properties.dedup();
+        let mut config = crate::sst::vector::v5::external::VectorV5ExternalBuildConfig::from_env()?;
+        config.memory_budget_bytes = memory_budget_bytes;
+        Ok(Self {
             label_id: label_dict.id(&desc.label).map(|lid| lid.0),
             desc,
-            members: Vec::new(),
-            filter_postings: crate::sst::vector::VectorFilterPostingsBuilder::new(
-                filter_properties,
-                crate::sst::vector::VectorFilterLimits::from_env(),
-            ),
-        }
+            filter_properties,
+            builder: crate::sst::vector::v5::external::VectorV5ExternalCollector::new(config)?,
+        })
     }
 
-    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) {
+    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) -> Result<()> {
         // id-primary rows carry an authoritative label set; legacy rows
         // (empty set) fall back to the bucket scope as their label.
         let carries_label = match self.label_id {
@@ -2379,49 +3954,91 @@ impl VectorMemberCollector {
             None => rec.labels.is_empty() && bucket_scope == self.desc.label,
         };
         if !carries_label {
-            return;
+            return Ok(());
         }
         let Some(val) = rec.properties.get(&self.desc.property) else {
-            return;
+            return Ok(());
         };
-        let v: Vec<f32> = match val {
-            Value::Vec(v) => v.clone(),
-            Value::VecI8 { codes, scale } => codes.iter().map(|&c| c as f32 * *scale).collect(),
-            _ => return,
+
+        let decoded;
+        let vector: &[f32] = match val {
+            Value::Vec(vector) => vector,
+            Value::VecI8 { codes, scale } => {
+                decoded = codes
+                    .iter()
+                    .map(|&code| code as f32 * *scale)
+                    .collect::<Vec<_>>();
+                &decoded
+            }
+            _ => return Ok(()),
         };
-        // `build_body` rejects an over-u32 corpus. Do not wrap postings before
-        // that invariant error is surfaced; still retain the member so the
-        // whole index build is rejected rather than silently truncated.
-        if let Ok(ordinal) = u32::try_from(self.members.len()) {
-            self.filter_postings.observe(ordinal, &rec.properties);
+
+        // Including every configured property with Null for absence is what
+        // lets V5 distinguish "supported but no row matches" from an
+        // unsupported residual predicate without a global postings map.
+        let filters = self
+            .filter_properties
+            .iter()
+            .map(|property| {
+                (
+                    property.clone(),
+                    rec.properties.get(property).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.builder.push(id, vector, &filters)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn from_test_members(
+        desc: VectorIndexDescriptor,
+        members: Vec<([u8; 16], Vec<f32>)>,
+    ) -> Result<Self> {
+        let mut collector = Self {
+            desc,
+            label_id: None,
+            filter_properties: Vec::new(),
+            builder: crate::sst::vector::v5::external::VectorV5ExternalCollector::new(
+                crate::sst::vector::v5::external::VectorV5ExternalBuildConfig::default(),
+            )?,
+        };
+        for (id, vector) in members {
+            collector.builder.push(id, &vector, &BTreeMap::new())?;
         }
-        self.members.push((id, v));
+        Ok(collector)
     }
 }
 
-/// Streaming member collector for one registered full-text index: keeps
-/// `(id, concatenated document)` pairs for the BM25 build (which needs the
-/// whole corpus for its N / avgdl / df statistics — the text analogue of
-/// the vector lower bound). Same label-filter and authority rules as
-/// [`VectorMemberCollector`].
+/// Streaming member collector for one registered full-text index.
+///
+/// Documents feed a bounded occurrence buffer. Sorted runs, postings,
+/// dictionary blocks and the finished object live on scratch disk rather than
+/// in a corpus-sized `BTreeMap`.
 #[cfg(feature = "text-index")]
 struct TextMemberCollector {
     desc: crate::manifest::TextIndexDescriptor,
     label_id: Option<u32>,
-    members: Vec<([u8; 16], String)>,
+    builder: crate::sst::text::TextIndexExternalBuilder,
 }
 
 #[cfg(feature = "text-index")]
 impl TextMemberCollector {
-    fn new(desc: crate::manifest::TextIndexDescriptor, label_dict: &LabelDictionary) -> Self {
-        Self {
+    fn new(
+        desc: crate::manifest::TextIndexDescriptor,
+        label_dict: &LabelDictionary,
+        memory_budget_bytes: usize,
+    ) -> Result<Self> {
+        let mut options = crate::sst::text::ExternalTextIndexBuildOptions::from_env()?;
+        options.memory_budget_bytes = memory_budget_bytes;
+        Ok(Self {
             label_id: label_dict.id(&desc.label).map(|lid| lid.0),
             desc,
-            members: Vec::new(),
-        }
+            builder: crate::sst::text::TextIndexExternalBuilder::with_options(options)?,
+        })
     }
 
-    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) {
+    fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord, bucket_scope: &str) -> Result<()> {
         // Same legacy-row fallback as the vector collector above.
         let carries_label = match self.label_id {
             Some(lid) => {
@@ -2431,7 +4048,7 @@ impl TextMemberCollector {
             None => rec.labels.is_empty() && bucket_scope == self.desc.label,
         };
         if !carries_label {
-            return;
+            return Ok(());
         }
         // Concatenate the indexed properties' string values into one document.
         let mut parts: Vec<&str> = Vec::new();
@@ -2441,9 +4058,10 @@ impl TextMemberCollector {
             }
         }
         if parts.is_empty() {
-            return; // not a member of this index's corpus
+            return Ok(()); // not a member of this index's corpus
         }
-        self.members.push((id, parts.join(" ")));
+        self.builder.push((id, parts.join(" ")))?;
+        Ok(())
     }
 }
 
@@ -2463,6 +4081,25 @@ impl TextMemberCollector {
 /// and falls back to the exact flat scan until an authoritative merge
 /// rebuilds the index.
 #[cfg(feature = "vector-index")]
+fn vector_v5_build_options() -> crate::sst::vector::v5::VectorV5BuildOptions {
+    let defaults = crate::sst::vector::v5::VectorV5BuildOptions::default();
+    crate::sst::vector::v5::VectorV5BuildOptions {
+        target_rows_per_page: std::env::var("NAMIDB_VECTOR_PAGE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(defaults.target_rows_per_page),
+        branch_factor: std::env::var("NAMIDB_VECTOR_BRANCH_FACTOR")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(defaults.branch_factor),
+        compression_level: std::env::var("NAMIDB_VECTOR_PAGE_ZSTD_LEVEL")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(defaults.compression_level),
+    }
+}
+
+#[cfg(feature = "vector-index")]
 async fn build_vector_indexes_from_members(
     store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
@@ -2471,13 +4108,17 @@ async fn build_vector_indexes_from_members(
     collected: VectorIndexMembers,
     old_vector_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>, Vec<String>)> {
-    use crate::sst::vector::build_body_with_filter_postings;
-
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
     let mut attempted = Vec::new();
 
-    for (desc, members, filter_postings) in collected {
+    for collector in collected {
+        let VectorMemberCollector {
+            desc,
+            label_id: _,
+            filter_properties: _,
+            builder,
+        } = collector;
         // Reaching the deterministic body builder is an authoritative attempt
         // for this exact catalog signature + node generation. Persist that
         // fact even when validation rejects the body: otherwise an idle lone
@@ -2485,17 +4126,13 @@ async fn build_vector_indexes_from_members(
         // Physical availability is still represented solely by a VectorGraph
         // SST descriptor; this marker is never consulted by reads.
         attempted.push(desc.name.clone());
-        // Skip-and-warn on a per-index build error (e.g. a malformed descriptor)
-        // rather than `?`-aborting the whole compaction — one bad index must
-        // never wedge the namespace's compaction permanently. The Vamana
-        // construction is O(n·R·L·dim) pure CPU, so it runs on the blocking
-        // pool instead of stalling the async runtime for its duration.
+        // Skip-and-warn on a per-index deterministic build error rather than
+        // wedging compaction permanently. External partitioning is CPU +
+        // scratch I/O and remains on the blocking pool.
         let build_desc = desc.clone();
-        let built = match run_cpu(move || {
-            build_body_with_filter_postings(&build_desc, members, filter_postings)
-        })
-        .await?
-        {
+        let input_rows = builder.input_rows();
+        let options = vector_v5_build_options();
+        let built = match run_cpu(move || builder.finish(&build_desc, options)).await? {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(index = %desc.name, error = %e, "skipping vector index build");
@@ -2513,12 +4150,31 @@ async fn build_vector_indexes_from_members(
         // `Ok(None)` is a successful authoritative build of a corpus too
         // small for a graph. Remove any older graph; the durable attempt marker
         // prevents a rewrite loop while reads use the exact flat fallback.
-        let Some((body, stats)) = built else {
+        let Some(artifact) = built else {
             if let Some(old) = old_vector_by_scope.get(&desc.name) {
                 removed.extend(old.iter().map(|d| d.id));
             }
             continue;
         };
+        let crate::sst::vector::v5::external::VectorV5ExternalArtifact {
+            file,
+            len: body_len,
+            stats,
+            metrics,
+        } = artifact;
+        tracing::info!(
+            index = %desc.name,
+            input_rows,
+            point_count = stats.point_count,
+            pages = metrics.page_count,
+            partitions = metrics.partition_count,
+            peak_build_bytes = metrics.peak_logical_memory_bytes,
+            resident_metadata_bytes = metrics.resident_metadata_bytes,
+            scratch_bytes = metrics.scratch_bytes_written,
+            artifact_bytes = body_len,
+            format = "NAMIVG05",
+            "built bounded-memory vector search index"
+        );
 
         let id = Uuid::now_v7();
         let level = SstLevel(out_level);
@@ -2530,8 +4186,12 @@ async fn build_vector_indexes_from_members(
         );
         let object_path = paths.sst_object(level.as_u32(), &file_name);
         let relative_path = relative_sst_path(level.as_u32(), &file_name);
-        let body_len = body.len() as u64;
-        crate::flush::put_object(store.clone(), &object_path, body).await?;
+        crate::spooled_object::put_spooled_object(
+            store.clone(),
+            &object_path,
+            crate::spooled_object::SpooledObject::from_file(file, body_len),
+        )
+        .await?;
 
         let descriptor = SstDescriptor {
             id,
@@ -2603,22 +4263,26 @@ async fn build_text_indexes_from_members(
     collected: TextIndexMembers,
     old_text_by_scope: &BTreeMap<String, Vec<&SstDescriptor>>,
 ) -> Result<(Vec<SstDescriptor>, Vec<Uuid>, Vec<String>)> {
-    use crate::sst::text::build_body;
-
     let mut new_descs = Vec::new();
     let mut removed = Vec::new();
     let mut attempted = Vec::new();
 
-    for (desc, members) in collected {
+    for collector in collected {
+        let TextMemberCollector {
+            desc,
+            label_id: _,
+            builder,
+        } = collector;
         // Same generation-attempt contract as vector builds. A deterministic
         // encoder/build invariant must not make an unchanged L1 rewrite
         // forever; no TextIndex descriptor means reads remain on the exact
         // fallback. Runtime join failures and object-store errors still abort
         // compaction and therefore publish no marker.
         attempted.push(desc.name.clone());
-        // BM25 postings construction is pure CPU over the collected corpus;
-        // run it on the blocking pool like the Vamana build above.
-        let built = match run_cpu(move || build_body(members)).await? {
+        // External occurrence sorting and posting assembly remain on the
+        // blocking pool. Their owned buffers are bounded by
+        // NAMIDB_INDEX_BUILD_MEMORY_BYTES.
+        let built = match run_cpu(move || builder.finish()).await? {
             Ok(body) => body,
             Err(error) => {
                 tracing::warn!(
@@ -2632,12 +4296,25 @@ async fn build_text_indexes_from_members(
                 continue;
             }
         };
-        let Some((body, stats)) = built else {
+        let Some(artifact) = built else {
             if let Some(old) = old_text_by_scope.get(&desc.name) {
                 removed.extend(old.iter().map(|d| d.id));
             }
             continue;
         };
+        let (file, body_len, stats, metrics) = artifact.into_parts();
+        tracing::info!(
+            index = %desc.name,
+            documents = stats.doc_count,
+            terms = stats.term_count,
+            max_buffer_bytes = metrics.max_buffer_bytes,
+            initial_runs = metrics.initial_run_count,
+            run_merges = metrics.run_merge_count,
+            scratch_bytes = metrics.spool_bytes_written,
+            artifact_bytes = body_len,
+            format = "NAMIFT03",
+            "built bounded-memory full-text index"
+        );
 
         let id = Uuid::now_v7();
         let level = SstLevel(out_level);
@@ -2649,8 +4326,12 @@ async fn build_text_indexes_from_members(
         );
         let object_path = paths.sst_object(level.as_u32(), &file_name);
         let relative_path = relative_sst_path(level.as_u32(), &file_name);
-        let body_len = body.len() as u64;
-        crate::flush::put_object(store.clone(), &object_path, body).await?;
+        crate::spooled_object::put_spooled_object(
+            store.clone(),
+            &object_path,
+            crate::spooled_object::SpooledObject::from_file(file, body_len),
+        )
+        .await?;
 
         let descriptor = SstDescriptor {
             id,
@@ -2705,10 +4386,12 @@ async fn put_edge_sst_leveled(
     build: EdgeSstBuild,
 ) -> Result<(SstDescriptor, bool)> {
     let EdgeSstBuild {
-        finish,
+        id,
+        body,
+        stats,
+        bloom,
         point_index,
     } = build;
-    let id = Uuid::now_v7();
     let level = SstLevel(out_level);
     let kind = match direction {
         EdgeDirection::Forward => SstKind::EdgesFwd,
@@ -2725,9 +4408,13 @@ async fn put_edge_sst_leveled(
     let object_path = paths.sst_object(level.as_u32(), &file_name);
     let relative_path = relative_sst_path(level.as_u32(), &file_name);
 
-    let body = finish.body;
-    let body_len = body.len() as u64;
-    crate::flush::put_object(store.clone(), &object_path, body).await?;
+    let body_len = body.size_bytes();
+    crate::flush::put_sidecar_payload(
+        store.clone(),
+        &object_path,
+        crate::flush::SidecarPayload::Spooled(body.into_spooled_object()),
+    )
+    .await?;
     let point_file_name = format!(
         "{}-{}-{}.epidx",
         uuid_path_id(&id),
@@ -2736,7 +4423,12 @@ async fn put_edge_sst_leveled(
     );
     let point_path = paths.sst_object(level.as_u32(), &point_file_name);
     if let Some(point_body) = point_index {
-        crate::flush::put_object(store.clone(), &point_path, point_body).await?;
+        crate::flush::put_sidecar_payload(
+            store.clone(),
+            &point_path,
+            crate::flush::SidecarPayload::EdgePoint(point_body),
+        )
+        .await?;
     }
 
     let (bloom_descriptor, wrote_bloom) = put_bloom_sidecar(
@@ -2746,11 +4438,10 @@ async fn put_edge_sst_leveled(
         &id,
         direction.path_tag(),
         edge_type,
-        finish.bloom,
+        bloom,
     )
     .await?;
 
-    let stats = finish.stats;
     let descriptor = SstDescriptor {
         id,
         kind,
@@ -2882,6 +4573,9 @@ fn relative_sst_path(level: u32, file_name: &str) -> String {
 }
 
 #[cfg(test)]
+// The std-mutex env guard is deliberately held across awaits: it serializes
+// whole test bodies against process-global policy env.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -2906,6 +4600,53 @@ mod tests {
 
     fn paths(name: &str) -> NamespacePaths {
         NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+    }
+
+    async fn open_compacted_property_pages(
+        store: Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        descriptor: &SstDescriptor,
+    ) -> crate::sst::nodes::property_pages::NodePropertyPageReader {
+        let properties = crate::manifest::node_property_pages_sidecar(descriptor)
+            .expect("compacted Nodes SST must carry property pages");
+        assert!(properties.is_bound_to(descriptor));
+        let absolute = Path::from(format!(
+            "{}/{}",
+            paths.namespace_prefix().as_ref(),
+            properties.path
+        ));
+        let meta = store.head(&absolute).await.unwrap();
+        assert_eq!(meta.size, properties.size_bytes);
+        let source = Arc::new(
+            crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(store, meta)
+                .await
+                .unwrap(),
+        );
+        let reader = crate::sst::nodes::property_pages::NodePropertyPageReader::open(
+            source,
+            descriptor.id,
+            crate::sst::nodes::property_pages::NodePropertyPageConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.node_count(), descriptor.row_count);
+        assert_eq!(reader.content_xxh3(), properties.content_xxh3);
+        reader
+    }
+
+    #[test]
+    fn search_index_build_memory_is_one_aggregate_budget() {
+        let aggregate = 256 * 1024 * 1024;
+        let share = partition_index_build_memory(aggregate, 5).unwrap();
+        assert_eq!(share, aggregate / 5);
+        assert!(share.checked_mul(5).unwrap() <= aggregate);
+    }
+
+    #[test]
+    fn search_index_build_memory_rejects_an_unfundable_catalog() {
+        let error = partition_index_build_memory(2 * MIN_INDEX_BUILD_MEMORY_PER_COLLECTOR - 1, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("each requires at least"));
     }
 
     fn person_label() -> LabelDef {
@@ -2942,6 +4683,103 @@ mod tests {
         NodeId::from_uuid(Uuid::from_bytes(bytes))
     }
 
+    #[cfg(feature = "vector-index")]
+    struct TestVectorV5Source(Bytes);
+
+    #[cfg(feature = "vector-index")]
+    #[async_trait::async_trait]
+    impl crate::sst::vector::v5::VectorV5RangeSource for TestVectorV5Source {
+        async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
+            let start = usize::try_from(range.start)
+                .map_err(|_| Error::invariant("test V5 range start exceeds usize"))?;
+            let end = usize::try_from(range.end)
+                .map_err(|_| Error::invariant("test V5 range end exceeds usize"))?;
+            if start > end || end > self.0.len() {
+                return Err(Error::invariant("test V5 range is out of bounds"));
+            }
+            Ok(self.0.slice(start..end))
+        }
+    }
+
+    #[cfg(feature = "text-index")]
+    struct TestTextV4Source(Bytes);
+
+    #[cfg(feature = "text-index")]
+    #[async_trait::async_trait]
+    impl crate::sst::search_delta::SearchVersionRangeSource for TestTextV4Source {
+        async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
+            let start = usize::try_from(range.start)
+                .map_err(|_| Error::invariant("test FT4 range start exceeds usize"))?;
+            let end = usize::try_from(range.end)
+                .map_err(|_| Error::invariant("test FT4 range end exceeds usize"))?;
+            if start > end || end > self.0.len() {
+                return Err(Error::invariant("test FT4 range is out of bounds"));
+            }
+            Ok(self.0.slice(start..end))
+        }
+    }
+
+    // Shared with the ingest tests: any test that mutates or observes the
+    // Search-LSM policy environment must hold the same lock, or force_base
+    // leaks across concurrently running tests.
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    use crate::test_support::{SearchCompactionEnvRestore, SEARCH_COMPACTION_ENV};
+
+    #[cfg(feature = "vector-index")]
+    fn physical_search_schema() -> Schema {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![PropertyDef::new(
+                    "embedding",
+                    DataType::FloatVector { dim: 2 },
+                    false,
+                )
+                .unwrap()],
+            })
+            .unwrap()
+            .build()
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn physical_search_payload(label_id: u32, vector: Vec<f32>) -> Bytes {
+        NodeWriteRecord {
+            properties: BTreeMap::from([("embedding".into(), Value::Vec(vector))]),
+            schema_version: 1,
+            labels: vec![label_id],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[cfg(feature = "text-index")]
+    fn physical_text_schema() -> Schema {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("body", DataType::Utf8, false).unwrap(),
+                    PropertyDef::new("note", DataType::Utf8, false).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build()
+    }
+
+    #[cfg(feature = "text-index")]
+    fn physical_text_payload(label_id: u32, body: &str, note: &str) -> Bytes {
+        NodeWriteRecord {
+            properties: BTreeMap::from([
+                ("body".into(), Value::Str(body.into())),
+                ("note".into(), Value::Str(note.into())),
+            ]),
+            schema_version: 1,
+            labels: vec![label_id],
+        }
+        .encode()
+        .unwrap()
+    }
+
     #[cfg(any(feature = "vector-index", feature = "text-index"))]
     fn search_generation_node_sst(max_lsn: u64) -> SstDescriptor {
         SstDescriptor {
@@ -2968,6 +4806,1088 @@ mod tests {
             node_locator: None,
             per_label_property_stats: Vec::new(),
         }
+    }
+
+    fn rewrite_test_descriptor(
+        id: Uuid,
+        kind: SstKind,
+        scope: &str,
+        min_lsn: u64,
+        max_lsn: u64,
+    ) -> SstDescriptor {
+        let kind_specific = match kind {
+            SstKind::Nodes => KindSpecificStats::Nodes { tombstone_count: 0 },
+            SstKind::VectorGraph => KindSpecificStats::VectorGraph {
+                dim: 2,
+                metric: "cosine".into(),
+                point_count: 1,
+                r: 8,
+                l_build: 16,
+                alpha: 1.2,
+                entry_medoid: 0,
+            },
+            other => panic!("unexpected rewrite fixture kind {other:?}"),
+        };
+        SstDescriptor {
+            id,
+            kind,
+            scope: scope.into(),
+            level: SstLevel::L0,
+            path: format!("sst/level0/{id}-rewrite-fixture"),
+            size_bytes: 128,
+            row_count: 1,
+            created_at: Utc::now(),
+            min_key: [0; 16],
+            max_key: [0xff; 16],
+            min_lsn,
+            max_lsn,
+            schema_version_min: 1,
+            schema_version_max: 1,
+            property_stats: Vec::new(),
+            kind_specific,
+            bloom: None,
+            unique_property_indices: Vec::new(),
+            equality_property_indices: Vec::new(),
+            label_index: None,
+            node_locator: None,
+            per_label_property_stats: Vec::new(),
+        }
+    }
+
+    fn rewrite_test_segment(
+        id: Uuid,
+        start: u64,
+        end: u64,
+        min_lsn: u64,
+        max_lsn: u64,
+    ) -> crate::search_lsm::SearchSegmentRef {
+        crate::search_lsm::SearchSegmentRef {
+            sst_id: id,
+            role: crate::search_lsm::SearchSegmentRole::Delta,
+            format: crate::search_lsm::SearchSegmentFormat::VectorV6,
+            payload: crate::search_lsm::SearchSegmentPayload::Complete,
+            event_ranges: vec![SearchEventRange::new(start, end)],
+            min_lsn,
+            max_lsn,
+            mutation_count: 1,
+            live_payload_count: 1,
+            suppress_count: 0,
+            content_xxh3: end.saturating_add(100),
+            complete_filter_properties: Vec::new(),
+            stats: crate::search_lsm::SearchSegmentStats::Vector {
+                live_count: crate::search_lsm::SearchStatValue::Delta(1),
+            },
+            equal_lsn_conflict_count: 0,
+        }
+    }
+
+    fn active_rewrite_manifest() -> crate::manifest::Manifest {
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        let mut manifest =
+            crate::manifest::Manifest::empty(crate::fence::Epoch::ZERO, Uuid::now_v7());
+        manifest.schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![PropertyDef::new(
+                    "embedding",
+                    DataType::FloatVector { dim: 2 },
+                    false,
+                )
+                .unwrap()],
+            })
+            .unwrap()
+            .build();
+        manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_vec".into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 8,
+            l_build: 16,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        let node_a = Uuid::from_u128(0x101);
+        let node_b = Uuid::from_u128(0x102);
+        let segment_a = Uuid::from_u128(0x201);
+        let segment_b = Uuid::from_u128(0x202);
+        let barrier = Uuid::from_u128(0x301);
+        manifest.ssts.extend([
+            rewrite_test_descriptor(node_a, SstKind::Nodes, "", 1, 10),
+            rewrite_test_descriptor(node_b, SstKind::Nodes, "", 11, 20),
+            rewrite_test_descriptor(segment_a, SstKind::VectorGraph, "doc_vec", 1, 10),
+            rewrite_test_descriptor(segment_b, SstKind::VectorGraph, "doc_vec", 11, 20),
+        ]);
+        let state = SearchLsmState {
+            index_name: "doc_vec".into(),
+            kind: crate::search_lsm::SearchLsmKind::Vector,
+            catalog_signature: crate::search_lsm::vector_catalog_signature(
+                &manifest,
+                &manifest.vector_indexes[0],
+            ),
+            generation_id: Uuid::from_u128(0x401),
+            status: SearchLsmStatus::Active,
+            next_event_seq: 2,
+            base_frontier: None,
+            segments: vec![
+                rewrite_test_segment(segment_a, 0, 1, 1, 10),
+                rewrite_test_segment(segment_b, 1, 2, 11, 20),
+            ],
+            proven_empty_event_ranges: Vec::new(),
+            coverage: vec![
+                SearchCoverage {
+                    node_sst_id: node_a,
+                    node_sst_max_lsn: 10,
+                    event_ranges: vec![SearchEventRange::new(0, 1)],
+                    disposition: CoverageDisposition::Segment,
+                },
+                SearchCoverage {
+                    node_sst_id: node_b,
+                    node_sst_max_lsn: 20,
+                    event_ranges: vec![SearchEventRange::new(1, 2)],
+                    disposition: CoverageDisposition::Segment,
+                },
+            ],
+            compat_barrier_sst_id: Some(barrier),
+            equal_lsn_conflict_count: 0,
+        };
+        let barrier_body = encode_search_barrier(&state).unwrap();
+        manifest.ssts.push(search_barrier_descriptor(
+            &state,
+            barrier,
+            SstLevel::L0,
+            format!("sst/level0/{barrier}-doc_vec.slb"),
+            barrier_body.len() as u64,
+        ));
+        manifest.search_lsm.push(state);
+        validate_search_lsm(&manifest).unwrap();
+        manifest
+    }
+
+    fn rewrite_plan(
+        manifest: &crate::manifest::Manifest,
+        output: Option<SstDescriptor>,
+    ) -> PreparedNodeRewrite {
+        PreparedNodeRewrite {
+            inputs: manifest
+                .ssts
+                .iter()
+                .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+                .cloned()
+                .collect(),
+            output,
+        }
+    }
+
+    fn append_rewrite_fixture_event(manifest: &mut crate::manifest::Manifest) -> (Uuid, Uuid) {
+        let node = Uuid::from_u128(0x104);
+        let segment = Uuid::from_u128(0x203);
+        let barrier = Uuid::from_u128(0x302);
+        let old_barrier = manifest.search_lsm[0].compat_barrier_sst_id.unwrap();
+        manifest
+            .ssts
+            .retain(|descriptor| descriptor.id != old_barrier);
+        manifest
+            .ssts
+            .push(rewrite_test_descriptor(node, SstKind::Nodes, "", 21, 30));
+        manifest.ssts.push(rewrite_test_descriptor(
+            segment,
+            SstKind::VectorGraph,
+            "doc_vec",
+            21,
+            30,
+        ));
+        let state = &mut manifest.search_lsm[0];
+        state
+            .segments
+            .push(rewrite_test_segment(segment, 2, 3, 21, 30));
+        state.coverage.push(SearchCoverage {
+            node_sst_id: node,
+            node_sst_max_lsn: 30,
+            event_ranges: vec![SearchEventRange::new(2, 3)],
+            disposition: CoverageDisposition::Segment,
+        });
+        state.next_event_seq = 3;
+        state.compat_barrier_sst_id = Some(barrier);
+        let body = encode_search_barrier(state).unwrap();
+        manifest.ssts.push(search_barrier_descriptor(
+            state,
+            barrier,
+            SstLevel::L0,
+            format!("sst/level0/{barrier}-doc_vec.slb"),
+            body.len() as u64,
+        ));
+        validate_search_lsm(manifest).unwrap();
+        (node, segment)
+    }
+
+    #[test]
+    fn node_coverage_rewrite_is_deterministic_and_empty_output_removes_coverage() {
+        let manifest = active_rewrite_manifest();
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x103), SstKind::Nodes, "", 1, 20);
+        let plan = rewrite_plan(&manifest, Some(output));
+        let first = rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            &manifest.search_lsm,
+            std::slice::from_ref(&plan),
+        )
+        .unwrap();
+        let second = rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            &manifest.search_lsm,
+            std::slice::from_ref(&plan),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[0].next_event_seq, 2, "rewrite allocates no event");
+        assert_eq!(
+            first[0].segments, manifest.search_lsm[0].segments,
+            "node rewrite never mutates search payload segments"
+        );
+        assert_eq!(
+            first[0].coverage[0].event_ranges,
+            vec![SearchEventRange::new(0, 2)]
+        );
+        assert!(matches!(
+            first[0].coverage[0].disposition,
+            CoverageDisposition::LogicalRewrite {
+                input_coverage_digest
+            } if input_coverage_digest != 0
+        ));
+
+        let empty_plan = rewrite_plan(&manifest, None);
+        let empty = rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            &manifest.search_lsm,
+            &[empty_plan],
+        )
+        .unwrap();
+        assert!(empty[0].coverage.is_empty());
+        assert_eq!(empty[0].segments, manifest.search_lsm[0].segments);
+
+        let mut projected = manifest.clone();
+        projected
+            .ssts
+            .retain(|descriptor| descriptor.kind != SstKind::Nodes);
+        projected.search_lsm = empty;
+        validate_search_lsm(&projected).unwrap();
+    }
+
+    #[test]
+    fn node_coverage_rebase_preserves_concurrent_append_and_rejects_drift() {
+        let manifest = active_rewrite_manifest();
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x103), SstKind::Nodes, "", 1, 20);
+        let plan = rewrite_plan(&manifest, Some(output));
+        let mut current = manifest.search_lsm[0].clone();
+        let concurrent_node = Uuid::from_u128(0x104);
+        let concurrent_segment = Uuid::from_u128(0x203);
+        current
+            .segments
+            .push(rewrite_test_segment(concurrent_segment, 2, 3, 21, 30));
+        current.coverage.push(SearchCoverage {
+            node_sst_id: concurrent_node,
+            node_sst_max_lsn: 30,
+            event_ranges: vec![SearchEventRange::new(2, 3)],
+            disposition: CoverageDisposition::Segment,
+        });
+        current.next_event_seq = 3;
+        current.compat_barrier_sst_id = Some(Uuid::from_u128(0x302));
+        let rebased = rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&plan),
+        )
+        .unwrap();
+        assert_eq!(rebased[0].segments, current.segments);
+        assert_eq!(rebased[0].next_event_seq, 3);
+        assert_eq!(rebased[0].coverage.len(), 2);
+        assert_eq!(rebased[0].coverage[1].node_sst_id, concurrent_node);
+
+        let mut generation_drift = current.clone();
+        generation_drift.generation_id = Uuid::now_v7();
+        assert!(rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            &[generation_drift],
+            std::slice::from_ref(&plan),
+        )
+        .is_err());
+
+        let mut ddl_drift = current.clone();
+        ddl_drift.catalog_signature.push_str("-ddl");
+        assert!(rebase_search_lsm_for_node_rewrites(
+            &manifest.search_lsm,
+            &[ddl_drift],
+            std::slice::from_ref(&plan),
+        )
+        .is_err());
+
+        let mut conflicting_manifest = manifest.clone();
+        conflicting_manifest
+            .ssts
+            .iter_mut()
+            .find(|descriptor| descriptor.id == plan.inputs[0].id)
+            .unwrap()
+            .max_lsn += 1;
+        assert!(
+            verify_node_rewrite_inputs(&conflicting_manifest, std::slice::from_ref(&plan)).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_node_rewrite_rotates_bound_barrier_and_keeps_active_segments() {
+        let s = store();
+        let p = paths("compact-search-logical-rewrite");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let boot = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(boot.manifest.epoch);
+        let fixture = active_rewrite_manifest();
+        let mut seeded = boot.manifest.next_version(fence.writer_id);
+        seeded.schema = fixture.schema;
+        seeded.ssts = fixture.ssts;
+        seeded.vector_indexes = fixture.vector_indexes;
+        seeded.search_lsm = fixture.search_lsm;
+        let current = ms.commit(&fence, &boot, seeded).await.unwrap();
+        let old_barrier = current.manifest.search_lsm[0]
+            .compat_barrier_sst_id
+            .unwrap();
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x105), SstKind::Nodes, "", 1, 20);
+        let rewrite = rewrite_plan(&current.manifest, Some(output.clone()));
+        let removed_ids = rewrite
+            .inputs
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .collect::<Vec<_>>();
+        let prepared = PreparedCompaction {
+            new_descs: vec![output.clone()],
+            removed_ids,
+            bloom_count: 0,
+            base_version: current.manifest.version,
+            base_schema: current.manifest.schema.clone(),
+            base_vector_indexes: current.manifest.vector_indexes.clone(),
+            base_text_indexes: current.manifest.text_indexes.clone(),
+            base_search_lsm: current.manifest.search_lsm.clone(),
+            node_rewrites: vec![rewrite],
+            search_compactions: Vec::new(),
+            search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+        let installed = install_prepared(&ms, &fence, &current, prepared)
+            .await
+            .unwrap();
+        validate_search_lsm(&installed.committed.manifest).unwrap();
+        let state = &installed.committed.manifest.search_lsm[0];
+        assert_eq!(state.coverage.len(), 1);
+        assert_eq!(state.coverage[0].node_sst_id, output.id);
+        assert_eq!(state.next_event_seq, 2);
+        assert_eq!(state.segments, current.manifest.search_lsm[0].segments);
+        let new_barrier = state.compat_barrier_sst_id.unwrap();
+        assert_ne!(new_barrier, old_barrier);
+        assert!(!installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.id == old_barrier));
+        let barrier = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == new_barrier)
+            .unwrap();
+        let barrier_body = get_sst_body(s.as_ref(), &p, barrier).await.unwrap();
+        crate::search_lsm::validate_search_barrier(state, &barrier_body).unwrap();
+        assert!(matches!(
+            crate::search_lsm::select_search_read_plan(
+                &installed.committed.manifest,
+                crate::search_lsm::SearchLsmKind::Vector,
+                "doc_vec",
+            ),
+            crate::search_lsm::SearchReadPlan::ActiveSegments { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_node_rewrite_rebases_over_concurrent_flush_append() {
+        let s = store();
+        let p = paths("compact-search-rebase-flush");
+        let ms = ManifestStore::new(s, p);
+        let boot = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(boot.manifest.epoch);
+        let fixture = active_rewrite_manifest();
+        let mut seeded = boot.manifest.next_version(fence.writer_id);
+        seeded.schema = fixture.schema;
+        seeded.ssts = fixture.ssts;
+        seeded.vector_indexes = fixture.vector_indexes;
+        seeded.search_lsm = fixture.search_lsm;
+        let basis = ms.commit(&fence, &boot, seeded).await.unwrap();
+
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x105), SstKind::Nodes, "", 1, 20);
+        let rewrite = rewrite_plan(&basis.manifest, Some(output.clone()));
+        let prepared = PreparedCompaction {
+            new_descs: vec![output.clone()],
+            removed_ids: rewrite
+                .inputs
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect(),
+            bloom_count: 0,
+            base_version: basis.manifest.version,
+            base_schema: basis.manifest.schema.clone(),
+            base_vector_indexes: basis.manifest.vector_indexes.clone(),
+            base_text_indexes: basis.manifest.text_indexes.clone(),
+            base_search_lsm: basis.manifest.search_lsm.clone(),
+            node_rewrites: vec![rewrite],
+            search_compactions: Vec::new(),
+            search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+
+        let mut concurrent_manifest = basis.manifest.next_version(fence.writer_id);
+        let (concurrent_node, concurrent_segment) =
+            append_rewrite_fixture_event(&mut concurrent_manifest);
+        let concurrent = ms
+            .commit(&fence, &basis, concurrent_manifest)
+            .await
+            .unwrap();
+        let installed = install_prepared(&ms, &fence, &concurrent, prepared)
+            .await
+            .unwrap();
+        validate_search_lsm(&installed.committed.manifest).unwrap();
+        let state = &installed.committed.manifest.search_lsm[0];
+        assert_eq!(state.next_event_seq, 3);
+        assert_eq!(state.segments.len(), 3);
+        assert_eq!(state.segments[2].sst_id, concurrent_segment);
+        assert_eq!(state.coverage.len(), 2);
+        assert_eq!(state.coverage[0].node_sst_id, output.id);
+        assert_eq!(state.coverage[1].node_sst_id, concurrent_node);
+        assert!(installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.id == concurrent_segment));
+        assert!(installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.id == concurrent_node));
+    }
+
+    #[tokio::test]
+    async fn install_node_rewrite_rejects_concurrent_schema_ddl() {
+        let s = store();
+        let p = paths("compact-search-rebase-ddl");
+        let ms = ManifestStore::new(s, p);
+        let boot = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(boot.manifest.epoch);
+        let fixture = active_rewrite_manifest();
+        let mut seeded = boot.manifest.next_version(fence.writer_id);
+        seeded.schema = fixture.schema;
+        seeded.ssts = fixture.ssts;
+        seeded.vector_indexes = fixture.vector_indexes;
+        seeded.search_lsm = fixture.search_lsm;
+        let basis = ms.commit(&fence, &boot, seeded).await.unwrap();
+
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x105), SstKind::Nodes, "", 1, 20);
+        let rewrite = rewrite_plan(&basis.manifest, Some(output.clone()));
+        let prepared = PreparedCompaction {
+            new_descs: vec![output],
+            removed_ids: rewrite
+                .inputs
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect(),
+            bloom_count: 0,
+            base_version: basis.manifest.version,
+            base_schema: basis.manifest.schema.clone(),
+            base_vector_indexes: basis.manifest.vector_indexes.clone(),
+            base_text_indexes: basis.manifest.text_indexes.clone(),
+            base_search_lsm: basis.manifest.search_lsm.clone(),
+            node_rewrites: vec![rewrite],
+            search_compactions: Vec::new(),
+            search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+
+        let mut ddl_manifest = basis.manifest.next_version(fence.writer_id);
+        ddl_manifest
+            .schema
+            .labels
+            .get_mut("Doc")
+            .unwrap()
+            .properties
+            .push(PropertyDef::new("title", DataType::Utf8, false).unwrap());
+        let ddl = ms.commit(&fence, &basis, ddl_manifest).await.unwrap();
+        let error = install_prepared(&ms, &fence, &ddl, prepared)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("schema"));
+        let still_current = ms.load_current().await.unwrap();
+        assert_eq!(still_current.manifest.version, ddl.manifest.version);
+    }
+
+    /// Exercises the production prepare/install seam, including immutable PUT
+    /// before CAS and append-only rebase while the off-lock build is pending.
+    #[cfg(feature = "vector-index")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn physical_search_prepare_install_builds_one_base_and_preserves_append() {
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+        let store = store();
+        let paths = paths("physical-search-compact-e2e");
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let mut current = manifest_store.bootstrap(Uuid::now_v7()).await.unwrap();
+        let label_id = current.manifest.label_dict.intern("Doc").0;
+        current.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_embedding".into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 8,
+            l_build: 16,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        let schema = physical_search_schema();
+        let fence = WriterFence::new(current.manifest.epoch);
+
+        for (event, vector) in [vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.7]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut memtable = Memtable::new();
+            memtable.apply(
+                MemKey::Node {
+                    id: sorted_node_id(event as u8 + 1),
+                },
+                event as u64 + 1,
+                MemOp::Upsert(physical_search_payload(label_id, vector)),
+            );
+            current = flush(
+                &manifest_store,
+                &fence,
+                &current,
+                &memtable.freeze(),
+                schema.clone(),
+            )
+            .await
+            .unwrap()
+            .committed;
+        }
+        let captured = current.manifest.search_lsm[0].clone();
+        assert_eq!(captured.segments.len(), 3);
+
+        let prepared = prepare_compaction(&manifest_store, &fence, &current, &schema)
+            .await
+            .unwrap();
+        assert_eq!(prepared.search_compactions.len(), 1);
+        let physical = &prepared.search_compactions[0];
+        assert!(physical.metrics.peak_resident_input_bytes > 0);
+        assert!(
+            physical.metrics.peak_resident_input_bytes < physical.metrics.input_bytes,
+            "disjoint-range Nodes SSTs must stream through the base build, \
+             not co-reside: peak {} vs total {}",
+            physical.metrics.peak_resident_input_bytes,
+            physical.metrics.input_bytes
+        );
+        let selected_ids = physical.selection.selected_ids().collect::<Vec<_>>();
+        let output = physical.output.as_ref().expect("non-empty V5 base");
+        assert_eq!(
+            output.segment.role,
+            crate::search_lsm::SearchSegmentRole::Base
+        );
+        assert_eq!(
+            output.segment.event_ranges,
+            vec![SearchEventRange::new(0, 3)]
+        );
+        store
+            .head(&search_lsm_compact::descriptor_path(
+                &paths,
+                &output.descriptor,
+            ))
+            .await
+            .expect("base object must exist before manifest CAS");
+
+        // Foreground flush lands while the base is already uploaded but still
+        // invisible. Its delta and Nodes coverage must survive installation.
+        let mut memtable = Memtable::new();
+        memtable.apply(
+            MemKey::Node {
+                id: sorted_node_id(4),
+            },
+            4,
+            MemOp::Upsert(physical_search_payload(label_id, vec![-1.0, 0.0])),
+        );
+        let concurrent = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &memtable.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+        let appended_segment = concurrent.manifest.search_lsm[0]
+            .segments
+            .last()
+            .unwrap()
+            .sst_id;
+
+        let installed = install_prepared(&manifest_store, &fence, &concurrent, prepared)
+            .await
+            .unwrap();
+        validate_search_lsm(&installed.committed.manifest).unwrap();
+        let state = installed
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.index_name == "doc_embedding")
+            .unwrap();
+        assert_eq!(state.next_event_seq, 4);
+        assert_eq!(state.base_frontier, Some(3));
+        assert_eq!(
+            state
+                .segments
+                .iter()
+                .filter(|segment| segment.role == crate::search_lsm::SearchSegmentRole::Base)
+                .count(),
+            1
+        );
+        assert_eq!(state.segments.len(), 2);
+        assert_eq!(state.segments[1].sst_id, appended_segment);
+        assert!(selected_ids.iter().all(|selected| {
+            !installed
+                .committed
+                .manifest
+                .ssts
+                .iter()
+                .any(|descriptor| descriptor.id == *selected)
+        }));
+
+        let base_descriptor = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == state.segments[0].sst_id)
+            .unwrap();
+        let base_body = get_sst_body(store.as_ref(), &paths, base_descriptor)
+            .await
+            .unwrap();
+        let reader = crate::sst::vector::v5::VectorV5Reader::open(
+            Arc::new(TestVectorV5Source(base_body.clone())),
+            base_body.len() as u64,
+        )
+        .await
+        .expect("V5 footer and page directory must verify");
+        assert_eq!(reader.point_count(), 3);
+        assert_eq!(reader.dim(), 2);
+
+        let appended_descriptor = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == appended_segment)
+            .unwrap();
+        store
+            .head(&search_lsm_compact::descriptor_path(
+                &paths,
+                appended_descriptor,
+            ))
+            .await
+            .expect("concurrent delta object remains described");
+        let barrier = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == state.compat_barrier_sst_id.unwrap())
+            .unwrap();
+        let barrier_body = get_sst_body(store.as_ref(), &paths, barrier).await.unwrap();
+        crate::search_lsm::validate_search_barrier(state, &barrier_body).unwrap();
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn physical_search_prepare_install_publishes_proven_empty_without_payload() {
+        use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+        let store = store();
+        let paths = paths("physical-search-empty-e2e");
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let mut current = manifest_store.bootstrap(Uuid::now_v7()).await.unwrap();
+        let label_id = current.manifest.label_dict.intern("Doc").0;
+        current.manifest.vector_indexes.push(VectorIndexDescriptor {
+            name: "doc_embedding".into(),
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: 2,
+            metric: VectorMetric::Cosine,
+            r: 8,
+            l_build: 16,
+            alpha: 1.2,
+            quantization: VectorQuantization::None,
+        });
+        let schema = physical_search_schema();
+        let fence = WriterFence::new(current.manifest.epoch);
+        let first = sorted_node_id(1);
+        let second = sorted_node_id(2);
+
+        let mut create = Memtable::new();
+        create.apply(
+            MemKey::Node { id: first },
+            1,
+            MemOp::Upsert(physical_search_payload(label_id, vec![1.0, 0.0])),
+        );
+        create.apply(
+            MemKey::Node { id: second },
+            1,
+            MemOp::Upsert(physical_search_payload(label_id, vec![0.0, 1.0])),
+        );
+        current = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &create.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+        for (lsn, id) in [(2, first), (3, second)] {
+            let mut remove = Memtable::new();
+            remove.apply(MemKey::Node { id }, lsn, MemOp::Tombstone);
+            current = flush(
+                &manifest_store,
+                &fence,
+                &current,
+                &remove.freeze(),
+                schema.clone(),
+            )
+            .await
+            .unwrap()
+            .committed;
+        }
+        assert_eq!(current.manifest.search_lsm[0].segments.len(), 3);
+
+        let prepared = prepare_compaction(&manifest_store, &fence, &current, &schema)
+            .await
+            .unwrap();
+        assert_eq!(prepared.search_compactions.len(), 1);
+        assert!(prepared.search_compactions[0].output.is_none());
+        assert!(prepared.search_compactions[0]
+            .empty_proof_digest
+            .is_some_and(|digest| digest != 0));
+
+        let installed = install_prepared(&manifest_store, &fence, &current, prepared)
+            .await
+            .unwrap();
+        validate_search_lsm(&installed.committed.manifest).unwrap();
+        let state = installed
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.index_name == "doc_embedding")
+            .unwrap();
+        assert!(state.segments.is_empty());
+        assert_eq!(state.base_frontier, None);
+        assert_eq!(
+            state.proven_empty_event_ranges,
+            vec![SearchEventRange::new(0, 3)]
+        );
+        assert!(installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .all(|descriptor| descriptor.kind != SstKind::Nodes));
+        let barrier = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == state.compat_barrier_sst_id.unwrap())
+            .unwrap();
+        let barrier_body = get_sst_body(store.as_ref(), &paths, barrier).await.unwrap();
+        crate::search_lsm::validate_search_barrier(state, &barrier_body).unwrap();
+    }
+
+    #[cfg(feature = "text-index")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn physical_text_delta_run_preserves_term_sums_and_source_winner_lsn() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::search_lsm::{SearchSegmentRole, SearchSegmentStats, SearchStatValue};
+        use crate::sst::text::v4::{TextV4GlobalStats, TextV4Payload, TextV4Reader};
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let env_restore = SearchCompactionEnvRestore::configure();
+        let store = store();
+        let paths = paths("physical-text-delta-run-e2e");
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let mut current = manifest_store.bootstrap(Uuid::now_v7()).await.unwrap();
+        let label_id = current.manifest.label_dict.intern("Doc").0;
+        current.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "doc_body".into(),
+            "Doc".into(),
+            vec!["body".into()],
+        ));
+        let schema = physical_text_schema();
+        let fence = WriterFence::new(current.manifest.epoch);
+        let first = sorted_node_id(1);
+        let second = sorted_node_id(2);
+
+        // Seed one document and force exactly one authoritative FT4 base.
+        let mut create = Memtable::new();
+        create.apply(
+            MemKey::Node { id: first },
+            1,
+            MemOp::Upsert(physical_text_payload(
+                label_id,
+                "alpha desaparecido",
+                "seed",
+            )),
+        );
+        current = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &create.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+        let prepared_base = prepare_compaction(&manifest_store, &fence, &current, &schema)
+            .await
+            .unwrap();
+        assert_eq!(prepared_base.search_compactions.len(), 1);
+        assert_eq!(
+            prepared_base.search_compactions[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .segment
+                .role,
+            SearchSegmentRole::Base
+        );
+        current = install_prepared(&manifest_store, &fence, &current, prepared_base)
+            .await
+            .unwrap()
+            .committed;
+
+        // Routine mode compacts the next two deltas, never the retained base.
+        env_restore.select_delta_runs(2);
+        let mut update = Memtable::new();
+        update.apply(
+            MemKey::Node { id: first },
+            2,
+            MemOp::Upsert(physical_text_payload(label_id, "alpha gamma", "relevant")),
+        );
+        current = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &update.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+        let mut second_create = Memtable::new();
+        second_create.apply(
+            MemKey::Node { id: second },
+            3,
+            MemOp::Upsert(physical_text_payload(label_id, "beta", "new")),
+        );
+        current = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &second_create.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+
+        // A later Nodes event changes only an unindexed property. It is
+        // ProvenEmpty for FT4, so Nodes resolves LSN 4 while the physical
+        // search winner must remain the selected NAMISV01 record at LSN 2.
+        let mut irrelevant = Memtable::new();
+        irrelevant.apply(
+            MemKey::Node { id: first },
+            4,
+            MemOp::Upsert(physical_text_payload(
+                label_id,
+                "alpha gamma",
+                "irrelevant-newer-lsn",
+            )),
+        );
+        current = flush(
+            &manifest_store,
+            &fence,
+            &current,
+            &irrelevant.freeze(),
+            schema.clone(),
+        )
+        .await
+        .unwrap()
+        .committed;
+        let captured = current
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.index_name == "doc_body")
+            .unwrap();
+        assert_eq!(captured.segments.len(), 3);
+        assert_eq!(
+            captured.proven_empty_event_ranges,
+            vec![SearchEventRange::new(3, 4)]
+        );
+
+        let prepared = prepare_compaction(&manifest_store, &fence, &current, &schema)
+            .await
+            .unwrap();
+        assert_eq!(prepared.search_compactions.len(), 1);
+        let output = prepared.search_compactions[0]
+            .output
+            .as_ref()
+            .expect("DeltaRun must emit final winner records");
+        assert_eq!(output.segment.role, SearchSegmentRole::Delta);
+        assert_eq!(
+            output.segment.event_ranges,
+            vec![SearchEventRange::new(1, 3)]
+        );
+        assert_eq!(
+            output.segment.stats,
+            SearchSegmentStats::Text {
+                doc_count: SearchStatValue::Delta(1),
+                total_len: SearchStatValue::Delta(1),
+                term_df_violation_count: 0,
+            }
+        );
+        let output_id = output.segment.sst_id;
+        assert_eq!(prepared.search_compactions[0].metrics.input_rows, 2);
+        assert_eq!(prepared.search_compactions[0].metrics.touched_rows, 2);
+        store
+            .head(&search_lsm_compact::descriptor_path(
+                &paths,
+                &output.descriptor,
+            ))
+            .await
+            .expect("FT4 DeltaRun object must exist before manifest CAS");
+
+        let installed = install_prepared(&manifest_store, &fence, &current, prepared)
+            .await
+            .unwrap();
+        validate_search_lsm(&installed.committed.manifest).unwrap();
+        let state = installed
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.index_name == "doc_body")
+            .unwrap();
+        assert_eq!(state.segments.len(), 2);
+        assert_eq!(state.segments[0].role, SearchSegmentRole::Base);
+        assert_eq!(state.segments[1].sst_id, output_id);
+        assert_eq!(
+            state.proven_empty_event_ranges,
+            vec![SearchEventRange::new(3, 4)]
+        );
+        let segment = &state.segments[1];
+        let descriptor = installed
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == output_id)
+            .unwrap();
+        let body = get_sst_body(store.as_ref(), &paths, descriptor)
+            .await
+            .unwrap();
+        let reader = TextV4Reader::open(
+            Arc::new(TestTextV4Source(body.clone())),
+            body.len() as u64,
+            state,
+            segment,
+        )
+        .await
+        .unwrap();
+        reader.verify_all().await.unwrap();
+        assert_eq!(reader.term_delta_df("alpha").await.unwrap(), 0);
+        assert_eq!(reader.term_delta_df("beta").await.unwrap(), 1);
+        assert_eq!(reader.term_delta_df("desaparecido").await.unwrap(), -1);
+        assert_eq!(reader.term_delta_df("gamma").await.unwrap(), 1);
+
+        let winner = reader
+            .version_reader()
+            .point_probe(*first.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.lsn, 2);
+        let expected_payload = TextV4Payload {
+            text: "alpha gamma".into(),
+            filters: BTreeMap::new(),
+        };
+        assert_eq!(
+            winner.payload_fingerprint,
+            crate::sst::text::v4::text_v4_payload_fingerprint(&expected_payload).unwrap()
+        );
+
+        let empty_memtable = crate::memtable::MemtableSnapshot::empty();
+        let snapshot =
+            crate::read::Snapshot::new(installed.committed.clone(), &empty_memtable, store, paths);
+        assert_eq!(
+            snapshot.lookup_node("", first).await.unwrap().unwrap().lsn,
+            4
+        );
+
+        let query = crate::text::TextQuery::from_terms(&["alpha".into()]);
+        let global = TextV4GlobalStats {
+            document_count: 2,
+            total_document_len: 3,
+            document_frequency: BTreeMap::from([("alpha".into(), 1)]),
+        };
+        let hits = reader
+            .search_query_exact(&query, &global, 10, &[])
+            .await
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].node_id, *first.as_bytes());
+        assert_eq!(hits.hits[0].lsn, 2);
     }
 
     fn node_payload(name: &str, age: Option<i32>) -> Bytes {
@@ -3097,6 +6017,30 @@ mod tests {
         assert_eq!(only.level, SstLevel(1));
         assert_eq!(only.kind, SstKind::Nodes);
         assert_eq!(only.row_count, 2);
+        let property_reader = open_compacted_property_pages(s.clone(), &p, only).await;
+        let (projected, _) = property_reader
+            .project_node_ids(
+                &["name".into(), "age".into()],
+                &[*sorted_node_id(1).as_bytes(), *sorted_node_id(2).as_bytes()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str("Alice".into()))
+        );
+        assert_eq!(
+            projected[0].properties["age"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::I64(30))
+        );
+        assert_eq!(
+            projected[1].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str("Bob".into()))
+        );
+        assert_eq!(
+            projected[1].properties["age"],
+            crate::sst::nodes::property_pages::PropertyCell::Absent
+        );
 
         // Snapshot through the new manifest must still see both nodes.
         let mt = Memtable::new();
@@ -3377,6 +6321,172 @@ mod tests {
         let in_bob = snap.in_edges("KNOWS", bob).await.unwrap();
         assert_eq!(in_bob.edges.len(), 1);
         assert_eq!(in_bob.edges[0].src, alice);
+    }
+
+    /// Edge-bucket tombstone GC at the deepest merge: an authoritative
+    /// compaction must physically drop edge tombstones from BOTH directions,
+    /// keep forward/inverse row sets mirror-consistent, and leave manifest
+    /// stats that agree (count_edge_type reads them directly).
+    #[tokio::test]
+    async fn edge_tombstone_gc_at_the_deepest_merge_drops_rows_in_both_directions() {
+        let s = store();
+        let p = paths("compact-edge-tombstone-gc");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let alice = sorted_node_id(1);
+        let bob = sorted_node_id(2);
+        let carol = sorted_node_id(3);
+        let dave = sorted_node_id(4);
+
+        let mut mt1 = Memtable::new();
+        for (src, dst, lsn) in [(alice, bob, 10u64), (alice, carol, 11), (bob, carol, 12)] {
+            mt1.apply(
+                MemKey::Edge {
+                    edge_type: "KNOWS".into(),
+                    src,
+                    dst,
+                },
+                lsn,
+                MemOp::Upsert(edge_payload()),
+            );
+        }
+        let after1 = flush(&ms, &fence, &base, &mt1.freeze(), schema())
+            .await
+            .unwrap();
+
+        let mut mt2 = Memtable::new();
+        mt2.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: bob,
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        mt2.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: alice,
+                dst: dave,
+            },
+            21,
+            MemOp::Upsert(edge_payload()),
+        );
+        let after2 = flush(&ms, &fence, &after1.committed, &mt2.freeze(), schema())
+            .await
+            .unwrap();
+
+        let out = compact_l0_to_l1(&ms, &fence, &after2.committed, &schema())
+            .await
+            .unwrap();
+
+        let mut fwd_pairs = Vec::new();
+        let mut inv_pairs = Vec::new();
+        for desc in &out.committed.manifest.ssts {
+            if !matches!(desc.kind, SstKind::EdgesFwd | SstKind::EdgesInv) {
+                continue;
+            }
+            let body = get_sst_body(s.as_ref(), &p, desc).await.unwrap();
+            let reader = crate::sst::edges::EdgeSstReader::open(body).unwrap();
+            let rows = reader.scan_all_edges().unwrap();
+            assert!(
+                rows.iter().all(|row| !row.tombstone),
+                "an authoritative merge must physically drop edge tombstones \
+                 ({:?})",
+                desc.kind
+            );
+            if let crate::manifest::KindSpecificStats::Edges {
+                tombstone_count, ..
+            } = &desc.kind_specific
+            {
+                assert_eq!(*tombstone_count, 0, "stats must reflect the drop");
+            } else {
+                panic!("edge SST must carry Edges stats");
+            }
+            assert_eq!(desc.row_count, 3);
+            for row in rows {
+                let pair = (row.key_id, row.partner_id);
+                match desc.kind {
+                    SstKind::EdgesFwd => fwd_pairs.push(pair),
+                    _ => inv_pairs.push((pair.1, pair.0)),
+                }
+            }
+        }
+        fwd_pairs.sort();
+        inv_pairs.sort();
+        assert_eq!(
+            fwd_pairs, inv_pairs,
+            "forward and inverse row sets must mirror after the drop"
+        );
+        assert_eq!(fwd_pairs.len(), 3);
+
+        let mt = Memtable::new();
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &view, s.clone(), p.clone());
+        let outgoing = snap.out_edges("KNOWS", alice).await.unwrap();
+        let mut dsts: Vec<NodeId> = outgoing.edges.iter().map(|edge| edge.dst).collect();
+        dsts.sort();
+        assert_eq!(dsts, vec![carol, dave], "the tombstoned edge must be gone");
+        let incoming = snap.in_edges("KNOWS", bob).await.unwrap();
+        assert!(
+            incoming.edges.is_empty(),
+            "the inverse partner of the dropped edge must be gone too"
+        );
+        assert_eq!(snap.count_edge_type("KNOWS").await.unwrap(), 3);
+    }
+
+    /// The `gc_tombstones` flag is what separates the authoritative drop
+    /// from the shadow-preserving merge: a non-authoritative merge must KEEP
+    /// the tombstone so a deeper un-merged level cannot resurrect the edge.
+    #[tokio::test]
+    async fn non_authoritative_edge_merge_preserves_tombstones() {
+        let s = store();
+        let p = paths("compact-edge-tombstone-keep");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(base.manifest.epoch);
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Edge {
+                edge_type: "KNOWS".into(),
+                src: sorted_node_id(1),
+                dst: sorted_node_id(2),
+            },
+            20,
+            MemOp::Tombstone,
+        );
+        let after = flush(&ms, &fence, &base, &mt.freeze(), schema())
+            .await
+            .unwrap();
+        let fwd = after
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|d| d.kind == SstKind::EdgesFwd)
+            .expect("tombstone-only flush still writes the shadow SST");
+        let body = get_sst_body(s.as_ref(), &p, fwd).await.unwrap();
+
+        for (gc, expect_edges, expect_tombs) in [(false, 1u64, 1u64), (true, 0, 0)] {
+            let merged = merge_edge_sources(
+                vec![body.clone()],
+                "KNOWS",
+                None,
+                &[],
+                crate::sst::edges::EdgeDirection::Forward,
+                gc,
+            )
+            .unwrap();
+            assert_eq!(
+                (merged.stats.edge_count, merged.stats.tombstone_count),
+                (expect_edges, expect_tombs),
+                "gc_tombstones={gc} must {} the tombstone",
+                if gc { "drop" } else { "keep" }
+            );
+        }
     }
 
     fn knows_edge_with_declared_props() -> EdgeTypeDef {
@@ -3661,10 +6771,13 @@ mod tests {
             .unwrap();
         descriptor.level = SstLevel(1);
         descriptor.node_locator = None;
+        let legacy_sst_id = descriptor.id;
         for index in &mut descriptor.unique_property_indices {
+            index.format = crate::manifest::PropertyIndexFormat::BincodeV0;
             index.paged = None;
         }
         for index in &mut descriptor.equality_property_indices {
+            index.format = crate::manifest::PropertyIndexFormat::BincodeV0;
             index.paged = None;
         }
         let refs: Vec<_> = legacy
@@ -3690,24 +6803,153 @@ mod tests {
             .iter()
             .find(|sst| sst.kind == SstKind::Nodes)
             .unwrap();
+        assert_ne!(
+            upgraded.id, legacy_sst_id,
+            "a true legacy property-index generation requires one full Nodes rewrite"
+        );
         assert!(upgraded.node_locator.is_some());
         assert!(upgraded
             .unique_property_indices
             .iter()
-            .all(|index| index.paged.is_some()));
+            .all(
+                |index| index.format == crate::manifest::PropertyIndexFormat::PagedV1
+                    || index.paged.is_some()
+            ));
         assert!(upgraded
             .equality_property_indices
             .iter()
-            .all(|index| index.paged.is_some()));
+            .all(
+                |index| index.format == crate::manifest::PropertyIndexFormat::PagedV1
+                    || index.paged.is_some()
+            ));
         assert!(upgraded
             .equality_property_indices
             .iter()
             .all(|index| index.mixed_type_complete));
+        let property_reader = open_compacted_property_pages(s.clone(), &p, upgraded).await;
+        let (projected, _) = property_reader
+            .project_node_ids(&["name".into()], &[*sorted_node_id(7).as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str("legacy".into()))
+        );
 
         let upgraded_refs = vec![upgraded];
         assert!(
             plan_node_bucket(&upgraded_refs, u64::MAX, 10, &required, false).is_none(),
             "migration must not rewrite the same L1 again"
+        );
+    }
+
+    #[tokio::test]
+    async fn lone_l1_missing_property_pages_rebuilds_access_bundle_without_parquet_rewrite() {
+        let s = store();
+        let p = paths("compact-migrate-missing-property-pages");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Person");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let sc = schema();
+        let alice = sorted_node_id(7);
+
+        let mut mt = Memtable::new();
+        mt.apply(
+            MemKey::Node { id: alice },
+            1,
+            MemOp::Upsert(node_payload("sidecar-only", Some(42))),
+        );
+        let current = flush(&ms, &fence, &base, &mt.freeze(), sc.clone())
+            .await
+            .unwrap()
+            .committed;
+
+        // Model the exact backup/restore gap: Parquet and the exact-record
+        // `.nloc2` survived, while only the nested `.npp` descriptor was
+        // absent. A lone settled L1 must rebuild the complete access bundle
+        // without copying its authoritative Parquet object.
+        let mut missing_pages = current.clone();
+        let source = missing_pages
+            .manifest
+            .ssts
+            .iter_mut()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        source.level = SstLevel(1);
+        let source_id = source.id;
+        let source_path = source.path.clone();
+        let prior_locator_path = source.node_locator.as_ref().unwrap().path.clone();
+        source.node_locator.as_mut().unwrap().property_pages = None;
+        assert!(crate::manifest::node_locator_has_exact_records(source));
+        assert!(!node_descriptor_has_property_pages(source));
+
+        let prepared = prepare_leveled(&ms, &fence, &missing_pages, &sc, u64::MAX, 10)
+            .await
+            .unwrap();
+        let prepared_node = prepared
+            .new_descs
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .expect("sidecar-only replacement");
+        assert_eq!(
+            (prepared_node.id, prepared_node.path.as_str()),
+            (source_id, source_path.as_str()),
+            "sidecar-only prepare must retain the parent Parquet object"
+        );
+        let prepared_locator = prepared_node.node_locator.as_ref().unwrap();
+        assert_ne!(
+            prepared_locator.path, prior_locator_path,
+            "migration must publish a fresh retry-safe locator object"
+        );
+        let prepared_properties = prepared_locator
+            .property_pages
+            .as_ref()
+            .expect("prepared property pages");
+        assert_eq!(prepared_properties.parent_sst_id, source_id);
+        assert!(prepared_properties.is_bound_to(prepared_node));
+
+        // Both access objects are already durable while the manifest still
+        // points at the old generation: prepare always uploads before CAS.
+        for relative in [&prepared_locator.path, &prepared_properties.path] {
+            let absolute = Path::from(format!("{}/{}", p.namespace_prefix().as_ref(), relative));
+            s.head(&absolute).await.unwrap();
+        }
+
+        let out = install_prepared(&ms, &fence, &missing_pages, prepared)
+            .await
+            .unwrap();
+        let upgraded = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        assert_eq!(
+            (upgraded.id, upgraded.path.as_str()),
+            (source_id, source_path.as_str())
+        );
+        let reader = open_compacted_property_pages(s, &p, upgraded).await;
+        let (projected, _) = reader
+            .project_node_ids(&["name".into(), "age".into()], &[*alice.as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str(
+                "sidecar-only".into()
+            ))
+        );
+        assert_eq!(
+            projected[0].properties["age"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::I64(42))
+        );
+
+        let required = crate::flush::union_indexed_props(&sc);
+        assert!(
+            plan_node_bucket(&[upgraded], u64::MAX, 10, &required, false).is_none(),
+            "the completed access bundle must not schedule another migration"
         );
     }
 
@@ -3885,14 +7127,14 @@ mod tests {
         // this exact generation, so unchanged maintenance does not rewrite L1
         // forever. No VectorGraph descriptor is emitted, hence reads continue
         // through the exact fallback.
-        let invalid_members = vec![(
+        let invalid_members = vec![VectorMemberCollector::from_test_members(
             descriptor.clone(),
             vec![
                 ((*sorted_node_id(1).as_bytes()), vec![1.0]),
                 ((*sorted_node_id(2).as_bytes()), vec![0.0]),
             ],
-            BTreeMap::new(),
-        )];
+        )
+        .unwrap()];
         let mut old_vector = search_generation_node_sst(7);
         old_vector.kind = SstKind::VectorGraph;
         old_vector.scope = "doc_emb".into();
@@ -3941,11 +7183,11 @@ mod tests {
         // One valid vector is a legitimate `Ok(None)` corpus: no graph body,
         // but the attempted generation is durable and must not rewrite L1 on
         // every maintenance tick.
-        let small_members = vec![(
+        let small_members = vec![VectorMemberCollector::from_test_members(
             descriptor.clone(),
             vec![((*sorted_node_id(1).as_bytes()), vec![1.0, 0.0])],
-            BTreeMap::new(),
-        )];
+        )
+        .unwrap()];
         let (_, _, attempted) = build_vector_indexes_from_members(
             store(),
             &paths("vector-marker-empty"),
@@ -4272,6 +7514,34 @@ mod tests {
             vec![1, 2],
             "the shallow merge stays at L1; L2 untouched"
         );
+        let shallow = m
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes && sst.level == SstLevel(1))
+            .expect("shallow L1 Nodes output");
+        assert_eq!(
+            match &shallow.kind_specific {
+                KindSpecificStats::Nodes { tombstone_count } => *tombstone_count,
+                _ => unreachable!("Nodes descriptor carries node stats"),
+            },
+            1,
+            "the non-authoritative output must retain alice's tombstone"
+        );
+        let shallow_properties = open_compacted_property_pages(s.clone(), &p, shallow).await;
+        let (projected, _) = shallow_properties
+            .project_node_ids(&["name".into()], &[*alice.as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["name"],
+            crate::sst::nodes::property_pages::PropertyCell::Absent,
+            "a retained tombstone has an exact empty property map"
+        );
+        assert_eq!(
+            projected[0].ordinal, None,
+            "empty tombstone rows must not invent a property cell"
+        );
 
         // alice reads as deleted: the L1 tombstone (LSN 20) shadows the L2
         // value (LSN 10). If the shallow merge had GC'd the tombstone, alice
@@ -4294,6 +7564,26 @@ mod tests {
             .await
             .unwrap()
             .committed;
+        let deepest = m
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .expect("deepest Nodes output");
+        assert_eq!(
+            match &deepest.kind_specific {
+                KindSpecificStats::Nodes { tombstone_count } => *tombstone_count,
+                _ => unreachable!("Nodes descriptor carries node stats"),
+            },
+            0,
+            "the authoritative merge must omit the GC'd tombstone"
+        );
+        let deepest_properties = open_compacted_property_pages(s.clone(), &p, deepest).await;
+        assert_eq!(
+            deepest_properties.node_count(),
+            deepest.row_count,
+            "property pages contain exactly the surviving winner stream"
+        );
         let mt = Memtable::new();
         let mt_view = mt.snapshot_view();
         let snap = Snapshot::new(m.clone(), &mt_view, s, p);
@@ -4383,7 +7673,14 @@ mod tests {
     #[tokio::test]
     async fn compaction_builds_a_searchable_text_index() {
         use crate::manifest::TextIndexDescriptor;
-        use crate::sst::text::TextIndex;
+
+        // Same forcing rationale as the vector twin: the assertions require
+        // one consolidated base, which the default incremental policy would
+        // (correctly) not produce from two fresh deltas.
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
 
         fn idx_id(i: u64) -> NodeId {
             let mut bytes = [0u8; 16];
@@ -4453,14 +7750,44 @@ mod tests {
 
         // Compact L0 → L1. The build hook emits one TextIndex SST.
         let out = compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+        let text_state = out
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("text base registered as an active Search-LSM generation");
+        let barrier_id = text_state.compat_barrier_sst_id.unwrap();
         let fts: Vec<&SstDescriptor> = out
             .committed
             .manifest
             .ssts
             .iter()
-            .filter(|d| d.kind == SstKind::TextIndex)
+            .filter(|d| d.kind == SstKind::TextIndex && d.id != barrier_id)
             .collect();
         assert_eq!(fts.len(), 1, "exactly one TextIndex SST after compaction");
+        assert_eq!(
+            out.committed
+                .manifest
+                .ssts
+                .iter()
+                .filter(|d| d.kind == SstKind::TextIndex)
+                .count(),
+            2,
+            "data base and downgrade barrier are both ordinary SST descriptors"
+        );
+        let barrier = out
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == barrier_id)
+            .unwrap();
+        let barrier_body = get_sst_body(s.as_ref(), &p, barrier).await.unwrap();
+        crate::search_lsm::validate_search_barrier(text_state, &barrier_body).unwrap();
         assert_eq!(fts[0].scope, "note_ft");
         let doc_count = match &fts[0].kind_specific {
             KindSpecificStats::TextIndex { doc_count, .. } => *doc_count,
@@ -4468,16 +7795,354 @@ mod tests {
         };
         assert_eq!(doc_count, bodies.len() as u64, "all docs indexed");
 
-        // Decode + search: the rare-term doc must rank first via real IDF.
-        let body = get_sst_body(s.as_ref(), &p, fts[0]).await.unwrap();
-        let idx = TextIndex::decode(&body).unwrap();
-        let hits = idx.search(&crate::text::tokenize("fox common"), None);
+        // Search through the production dispatch: the consolidated base is a
+        // range-readable FT4 artifact, not the 2.0.6 monolithic body, so the
+        // legacy `TextIndex::decode` cannot read it. `text_search` returning
+        // `Some` also proves the index actually served (a flat-scan fallback
+        // yields `None`), which the old in-memory decode never could.
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(out.committed.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search(
+                "note_ft",
+                "Note",
+                &crate::text::parse_query("fox common"),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the consolidated FT4 base must serve, not fall back");
         assert_eq!(hits.len(), bodies.len(), "every doc matches a query term");
         assert_eq!(
             hits[0].0,
-            *idx_id(1).as_bytes(),
-            "the rare-term doc ranks first"
+            idx_id(1),
+            "the rare-term doc ranks first via real IDF"
         );
+        assert!(
+            snap.text_search("note_ft", "Note", &crate::text::parse_query("fox"), Some(5),)
+                .await
+                .unwrap()
+                .is_some(),
+            "a valid base + barrier generation must serve"
+        );
+        let mut corrupt_barrier = barrier_body.to_vec();
+        corrupt_barrier[0] ^= 1;
+        let barrier_absolute = format!("{}/{}", p.namespace_prefix().as_ref(), barrier.path);
+        s.put(
+            &Path::from(barrier_absolute),
+            PutPayload::from(Bytes::from(corrupt_barrier)),
+        )
+        .await
+        .unwrap();
+        let snap = Snapshot::new(out.committed.clone(), &empty_view, s.clone(), p.clone());
+        assert!(
+            snap.text_search("note_ft", "Note", &crate::text::parse_query("fox"), Some(5),)
+                .await
+                .unwrap()
+                .is_none(),
+            "a corrupt barrier must select the exact fallback"
+        );
+    }
+
+    /// The text twin of the vector downgrade-adoption cycle (plan item 30):
+    /// an old writer drops the unknown Search-LSM state but PRESERVES the
+    /// checksummed `.slb` barrier. The next maintenance pass must re-adopt
+    /// the generation metadata-only — zero SSTs rewritten, the barrier
+    /// reused byte-for-byte — and a DDL-stale marker must refuse adoption.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn text_preserved_barrier_readopts_after_state_wipe() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::text::parse_query;
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(body: &str, label_id: u32) -> Bytes {
+            NodeWriteRecord {
+                properties: BTreeMap::from([("body".into(), Value::Str(body.into()))]),
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-text-preserved-barrier");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let mut cur = base;
+        for (index, body) in ["fox the cat", "common the dog", "common the bird"]
+            .iter()
+            .enumerate()
+        {
+            let mut mt = Memtable::new();
+            let lsn = (index + 1) as u64;
+            mt.apply(
+                MemKey::Node { id: idx_id(lsn) },
+                lsn,
+                MemOp::Upsert(doc_payload(body, note_id.0)),
+            );
+            cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+        let settled = compact_l0_to_l1(&ms, &fence, &cur, &schema)
+            .await
+            .unwrap()
+            .committed;
+        let text_state = settled
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("active text generation");
+        let barrier_id = text_state.compat_barrier_sst_id.unwrap();
+        let base_body_id = text_state.segments[0].sst_id;
+
+        // The downgrade: state dropped, both descriptors (body + barrier)
+        // preserved. A DDL-stale marker variant must refuse adoption.
+        let mut wiped = settled.manifest.next_version(fence.writer_id);
+        wiped.search_lsm.clear();
+        let mut ddl_stale = wiped.clone();
+        ddl_stale
+            .search_index_builds
+            .iter_mut()
+            .find(|state| state.kind == SstKind::TextIndex && state.name == "note_ft")
+            .expect("text build marker")
+            .catalog_signature
+            .push_str("-pre-ddl");
+        assert!(
+            !search_lsm_adoption_needed(&ddl_stale),
+            "a DDL-stale text marker must rebuild, never adopt"
+        );
+        let legacy = ms.commit(&fence, &settled, wiped).await.unwrap();
+        assert!(search_lsm_adoption_needed(&legacy.manifest));
+
+        let adopted = compact_leveled(&ms, &fence, &legacy, &schema, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            (adopted.source_ssts_removed, adopted.new_ssts_written),
+            (0, 0),
+            "preserved-barrier text adoption must be metadata-only"
+        );
+        let adopted_state = adopted
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("the wiped text generation must come back");
+        assert_eq!(adopted_state.segments[0].sst_id, base_body_id);
+        assert_eq!(
+            adopted_state.compat_barrier_sst_id,
+            Some(barrier_id),
+            "the preserved barrier must be reused byte-for-byte"
+        );
+        crate::search_lsm::validate_search_lsm(&adopted.committed.manifest).unwrap();
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(adopted.committed.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search("note_ft", "Note", &parse_query("fox"), Some(5))
+            .await
+            .unwrap()
+            .expect("the re-adopted generation must serve natively");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, idx_id(1));
+    }
+
+    /// The residual left open by the interop-marker work: a 2.0.6 downgrade
+    /// drops the unknown Search-LSM state, and in this variant the `.slb`
+    /// barrier object is lost with it. The FT4 base survives as an ordinary
+    /// `TextIndex` descriptor next to the minted build marker, so the marker
+    /// keeps suppressing the rebuild while the adoption probe (NAMIFT03-only)
+    /// keeps rejecting the FT4 body — every query flat-scans forever. The
+    /// contract pinned here: the first pass drops the deterministically
+    /// disproven marker, the second plans the full rebuild and serves.
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn text_base_with_lost_barrier_falls_back_to_rebuild() {
+        use crate::manifest::TextIndexDescriptor;
+        use crate::text::parse_query;
+
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
+
+        fn idx_id(i: u64) -> NodeId {
+            let mut bytes = [0u8; 16];
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            NodeId::from_uuid(Uuid::from_bytes(bytes))
+        }
+        fn doc_payload(body: &str, label_id: u32) -> Bytes {
+            NodeWriteRecord {
+                properties: BTreeMap::from([("body".into(), Value::Str(body.into()))]),
+                schema_version: 1,
+                labels: vec![label_id],
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let s = store();
+        let p = paths("compact-text-lost-barrier");
+        let ms = ManifestStore::new(s.clone(), p.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let note_id = base.manifest.label_dict.intern("Note");
+        base.manifest.text_indexes.push(TextIndexDescriptor::new(
+            "note_ft".into(),
+            "Note".into(),
+            vec!["body".into()],
+        ));
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+            })
+            .unwrap()
+            .build();
+        let fence = WriterFence::new(base.manifest.epoch);
+
+        let bodies = ["fox the cat", "common the dog", "common the bird"];
+        let mut cur = base;
+        for (index, body) in bodies.iter().enumerate() {
+            let mut mt = Memtable::new();
+            let lsn = (index + 1) as u64;
+            mt.apply(
+                MemKey::Node { id: idx_id(lsn) },
+                lsn,
+                MemOp::Upsert(doc_payload(body, note_id.0)),
+            );
+            cur = flush(&ms, &fence, &cur, &mt.freeze(), schema.clone())
+                .await
+                .unwrap()
+                .committed;
+        }
+        let settled = compact_l0_to_l1(&ms, &fence, &cur, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert!(!search_indexes_need_rebuild(&settled.manifest));
+        assert!(
+            settled
+                .manifest
+                .search_index_builds
+                .iter()
+                .any(|marker| marker.kind == SstKind::TextIndex && marker.name == "note_ft"),
+            "the consolidation must mint the 2.0.6-interop marker this scenario turns on"
+        );
+
+        // Downgrade: the old writer preserves ordinary descriptors but drops
+        // the unknown top-level state, and the barrier is lost outright.
+        let mut downgraded = settled.clone();
+        downgraded.manifest.search_lsm.clear();
+        let barrier_ids: HashSet<Uuid> = downgraded
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| {
+                crate::search_lsm::is_canonical_search_barrier_descriptor(descriptor)
+            })
+            .map(|descriptor| descriptor.id)
+            .collect();
+        assert!(
+            !barrier_ids.is_empty(),
+            "the settled generation has a barrier to lose"
+        );
+        for descriptor in downgraded
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| barrier_ids.contains(&descriptor.id))
+        {
+            let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), descriptor.path);
+            s.delete(&Path::from(absolute)).await.unwrap();
+        }
+        downgraded
+            .manifest
+            .ssts
+            .retain(|descriptor| !barrier_ids.contains(&descriptor.id));
+        // The stall precondition: metadata alone still promises an adoption,
+        // so the rebuild stays suppressed.
+        assert!(!search_indexes_need_rebuild(&downgraded.manifest));
+
+        // Pass 1: the magic probe deterministically disproves the promise;
+        // the marker must fall with it instead of certifying forever.
+        let pass1 = compact_leveled(&ms, &fence, &downgraded, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert!(
+            !pass1
+                .manifest
+                .search_index_builds
+                .iter()
+                .any(|marker| marker.kind == SstKind::TextIndex && marker.name == "note_ft"),
+            "an unadoptable base must drop its interop marker"
+        );
+        assert!(
+            search_indexes_need_rebuild(&pass1.manifest),
+            "with the marker gone the full rebuild is unsuppressed"
+        );
+
+        // Pass 2: the rebuild plans from the settled tree and serves.
+        let pass2 = compact_leveled(&ms, &fence, &pass1, &schema, u64::MAX, 10)
+            .await
+            .unwrap()
+            .committed;
+        assert!(!search_indexes_need_rebuild(&pass2.manifest));
+        assert!(
+            pass2.manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            }),
+            "a fresh Active generation must replace the stranded base"
+        );
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(pass2.clone(), &empty_view, s.clone(), p.clone());
+        let hits = snap
+            .text_search("note_ft", "Note", &parse_query("fox"), Some(5))
+            .await
+            .unwrap()
+            .expect("the rebuilt generation must serve natively, not flat-scan");
+        assert_eq!(hits.len(), 1, "exactly the one fox document matches");
+        assert_eq!(hits[0].0, idx_id(1));
     }
 
     /// A `.ft` body with a legacy magic (a NAMIFT01 file left behind by a
@@ -4953,12 +8618,99 @@ mod tests {
             };
             let b1 = get(&d1.path).await;
             let b2 = get(&d2.path).await;
+            // An edge SST binds its body to its own UUID so a misrouted object
+            // cannot be served under another descriptor. Two prepares therefore
+            // differ in the binding section and in the page checksums covering
+            // it — but in nothing the merge itself produced.
+            match d1.kind {
+                SstKind::EdgesFwd | SstKind::EdgesInv => {
+                    assert_edge_bodies_agree_modulo_identity(&b1, &b2, d1)
+                }
+                _ => assert_eq!(
+                    b1, b2,
+                    "{:?}/{} bodies must be byte-identical",
+                    d1.kind, d1.scope
+                ),
+            }
+        }
+    }
+
+    /// Assert two edge SST bodies carry identical merge output, allowing only
+    /// the per-object identity binding to differ.
+    fn assert_edge_bodies_agree_modulo_identity(b1: &Bytes, b2: &Bytes, desc: &SstDescriptor) {
+        use crate::sst::edges::{
+            EdgeFileFooter, EdgeSstBinding, SECTION_PAGE_CHECKSUMS, SECTION_SST_BINDING,
+        };
+
+        let what = format!("{:?}/{}", desc.kind, desc.scope);
+        let (f1, _) = EdgeFileFooter::decode(b1).expect("first run edge footer");
+        let (f2, _) = EdgeFileFooter::decode(b2).expect("second run edge footer");
+
+        assert_eq!(
+            (
+                f1.key_count,
+                f1.edge_count,
+                f1.offsets_bits,
+                f1.min_key_id,
+                f1.max_key_id,
+                f1.min_lsn,
+                f1.max_lsn,
+                f1.schema_version_min,
+                f1.schema_version_max,
+            ),
+            (
+                f2.key_count,
+                f2.edge_count,
+                f2.offsets_bits,
+                f2.min_key_id,
+                f2.max_key_id,
+                f2.min_lsn,
+                f2.max_lsn,
+                f2.schema_version_min,
+                f2.schema_version_max,
+            ),
+            "{what} footer scalars"
+        );
+        assert_eq!(f1.sections.len(), f2.sections.len(), "{what} section count");
+
+        for (e1, e2) in f1.sections.iter().zip(&f2.sections) {
             assert_eq!(
-                b1, b2,
-                "{:?}/{} bodies must be byte-identical",
-                d1.kind, d1.scope
+                (e1.kind, &e1.name, e1.offset, e1.length, e1.codec),
+                (e2.kind, &e2.name, e2.offset, e2.length, e2.codec),
+                "{what} section layout"
+            );
+            if matches!(e1.kind, SECTION_SST_BINDING | SECTION_PAGE_CHECKSUMS) {
+                continue;
+            }
+            let range = e1.offset as usize..(e1.offset + e1.length) as usize;
+            assert_eq!(
+                e1.xxhash3_64, e2.xxhash3_64,
+                "{what} section {} content hash",
+                e1.kind
+            );
+            assert_eq!(
+                b1[range.clone()],
+                b2[range],
+                "{what} section {} bytes",
+                e1.kind
             );
         }
+
+        let entry = f1
+            .find_kind(SECTION_SST_BINDING)
+            .expect("edge SST carries an identity binding");
+        let range = entry.offset as usize..(entry.offset + entry.length) as usize;
+        let k1 = EdgeSstBinding::decode(&b1[range.clone()]).expect("first run binding");
+        let k2 = EdgeSstBinding::decode(&b2[range]).expect("second run binding");
+        assert_ne!(
+            k1.sst_id, k2.sst_id,
+            "{what} two prepares must mint distinct object ids"
+        );
+        assert_eq!(
+            (k1.header_xxhash3_64, k1.sections_xxhash3_64),
+            (k2.header_xxhash3_64, k2.sections_xxhash3_64),
+            "{what} binding covers identical header and section root"
+        );
     }
 
     #[tokio::test]
@@ -5370,6 +9122,7 @@ mod tests {
         };
         let body_a = build(1..=20, 100, "a");
         let body_b = build(11..=30, 200, "b");
+        let output_sst_id = Uuid::now_v7();
 
         let out = merge_node_sources(
             vec![
@@ -5388,12 +9141,18 @@ mod tests {
             &schema(),
             &LabelDictionary::new(),
             "",
+            output_sst_id,
             NodeMergeIndexSpecs::default(),
         )
         .unwrap();
         assert_eq!(out.finish.stats.row_count, 30);
         assert_eq!(out.finish.stats.min_lsn, 101);
         assert_eq!(out.finish.stats.max_lsn, 230);
+        assert_eq!(out.sidecars.property_pages_upload.sst_id(), output_sst_id);
+        assert_eq!(
+            out.sidecars.property_pages_upload.stats().node_count,
+            out.finish.stats.row_count
+        );
 
         // Decode the merged body and verify order + winners row by row.
         let reader = NodeSstReader::open(label.clone(), out.finish.body).unwrap();
@@ -5434,9 +9193,18 @@ mod tests {
     #[tokio::test]
     async fn compaction_builds_a_searchable_vector_graph() {
         use crate::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
-        use crate::sst::vector::VectorGraphIndex;
         use rand::Rng;
         use rand::SeedableRng;
+
+        // This test's downgrade/adoption scenario needs one complete base, so
+        // it forces consolidation. Under the default incremental policy the
+        // two flushed deltas would (correctly) survive compaction instead.
+        // The force is one-shot: once the singleton base exists, the later
+        // adoption compaction has no consolidatable debt and stays metadata-only.
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
 
         fn normalize_inplace(v: &mut [f32]) {
             let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -5533,14 +9301,35 @@ mod tests {
         // Compact L0 → L1. The build hook emits one VectorGraph SST alongside
         // the merged node SST.
         let out = compact_l0_to_l1(&ms, &fence, &cur, &schema).await.unwrap();
+        let vector_state = out
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            })
+            .expect("vector base registered as an active Search-LSM generation");
+        let barrier_id = vector_state.compat_barrier_sst_id.unwrap();
         let vgs: Vec<&SstDescriptor> = out
             .committed
             .manifest
             .ssts
             .iter()
-            .filter(|d| d.kind == SstKind::VectorGraph)
+            .filter(|d| d.kind == SstKind::VectorGraph && d.id != barrier_id)
             .collect();
         assert_eq!(vgs.len(), 1, "exactly one VectorGraph SST after compaction");
+        assert_eq!(
+            out.committed
+                .manifest
+                .ssts
+                .iter()
+                .filter(|d| d.kind == SstKind::VectorGraph)
+                .count(),
+            2,
+            "data base and downgrade barrier are both ordinary SST descriptors"
+        );
         assert_eq!(vgs[0].scope, "doc_emb");
         let stats = match &vgs[0].kind_specific {
             KindSpecificStats::VectorGraph { point_count, .. } => *point_count,
@@ -5548,25 +9337,112 @@ mod tests {
         };
         assert_eq!(stats, 160, "all 160 docs indexed");
 
-        // Decode + search; a query near centroid 0 must surface cluster-0 docs.
-        let body = get_sst_body(s.as_ref(), &p, vgs[0]).await.unwrap();
-        let idx = VectorGraphIndex::decode(&body).unwrap();
-        assert_eq!(idx.point_count(), 160);
-
+        // Query through the production magic-dispatch + range reader; a query
+        // near centroid 0 must surface cluster-0 docs without downloading the
+        // V5 artifact in full.
         let mut q = centroids[0].clone();
         normalize_inplace(&mut q);
-        let hits = idx.search(&q, 10, 48);
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snapshot = Snapshot::new(out.committed.clone(), &empty_view, s.clone(), p.clone());
+        let (hits, point_count) = snapshot
+            .try_vector_search_with_point_count("doc_emb", &q, 10, 48)
+            .await
+            .unwrap()
+            .expect("fresh V5 index");
+        assert_eq!(point_count, 160);
         assert_eq!(hits.len(), 10);
         // The query sits on centroid 0; the true top-10 are cluster-0 docs.
         // Count how many returned hits belong to cluster 0 (recall proxy).
         let cluster0_hits = hits
             .iter()
-            .filter(|(id, _)| cluster_of.get(&NodeId::from_uuid(Uuid::from_bytes(*id))) == Some(&0))
+            .filter(|(id, _)| cluster_of.get(id) == Some(&0))
             .count();
         assert!(
             cluster0_hits >= 8,
             "expected >= 8/10 hits from cluster 0, got {cluster0_hits}"
         );
+
+        // Model a rolling downgrade/upgrade: an old writer reserializes the
+        // manifest, drops the unknown Search-LSM state, but preserves both
+        // ordinary SST descriptors. The next maintenance pass must recover
+        // the checksummed `.slb` state instead of remaining in ambiguous
+        // flat-scan mode or rebuilding the 160-vector corpus.
+        let vector_base_id = vgs[0].id;
+        let mut legacy_manifest = out.committed.manifest.next_version(fence.writer_id);
+        legacy_manifest.search_lsm.clear();
+        let mut ddl_stale = legacy_manifest.clone();
+        ddl_stale
+            .search_index_builds
+            .iter_mut()
+            .find(|state| state.kind == SstKind::VectorGraph && state.name == "doc_emb")
+            .expect("vector build marker")
+            .catalog_signature
+            .push_str("-pre-ddl");
+        assert!(
+            !search_lsm_adoption_needed(&ddl_stale),
+            "a physically valid body with a stale catalog marker must rebuild, never be adopted"
+        );
+        let legacy = ms
+            .commit(&fence, &out.committed, legacy_manifest)
+            .await
+            .unwrap();
+        assert!(search_lsm_adoption_needed(&legacy.manifest));
+
+        let adopted = compact_leveled(&ms, &fence, &legacy, &schema, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            adopted.source_ssts_removed, 0,
+            "metadata adoption must not rewrite node or vector data"
+        );
+        assert_eq!(
+            adopted.new_ssts_written, 0,
+            "recovering a preserved checksummed barrier writes no new SST"
+        );
+        let adopted_state = adopted
+            .committed
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            })
+            .expect("the legacy V5 base must become an active generation");
+        assert_eq!(adopted_state.segments[0].sst_id, vector_base_id);
+        crate::search_lsm::validate_search_lsm(&adopted.committed.manifest).unwrap();
+        let adopted_barrier = adopted
+            .committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|descriptor| Some(descriptor.id) == adopted_state.compat_barrier_sst_id)
+            .expect("adopted generation barrier descriptor");
+        assert_eq!(
+            adopted_barrier.id, barrier_id,
+            "the preserved barrier should be reused byte-for-byte"
+        );
+        let adopted_barrier_body = get_sst_body(s.as_ref(), &p, adopted_barrier).await.unwrap();
+        crate::search_lsm::validate_search_barrier(adopted_state, &adopted_barrier_body).unwrap();
+
+        // A still older writer/backup may drop both the state and its barrier.
+        // That case remains metadata-only too, but creates one fresh barrier.
+        let mut missing_barrier_manifest = adopted.committed.manifest.next_version(fence.writer_id);
+        missing_barrier_manifest.search_lsm.clear();
+        missing_barrier_manifest
+            .ssts
+            .retain(|descriptor| descriptor.id != adopted_barrier.id);
+        let missing_barrier = ms
+            .commit(&fence, &adopted.committed, missing_barrier_manifest)
+            .await
+            .unwrap();
+        let recreated = compact_leveled(&ms, &fence, &missing_barrier, &schema, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert_eq!(recreated.source_ssts_removed, 0);
+        assert_eq!(recreated.new_ssts_written, 1);
+        crate::search_lsm::validate_search_lsm(&recreated.committed.manifest).unwrap();
     }
 
     /// End-to-end index parity through the streaming merge: overlapping doc
@@ -5581,6 +9457,18 @@ mod tests {
 
         use crate::manifest::{TextIndexDescriptor, VectorIndexDescriptor, VectorMetric};
         use crate::text::parse_query;
+
+        // 2.1.0: flush writes native VG6/FT4 deltas under an Active Search-LSM
+        // generation, so the legacy authoritative rebuild is correctly skipped
+        // and the default incremental policy would (also correctly) retain the
+        // deltas. This parity test needs exactly one consolidated base per
+        // index, so it forces consolidation; the force works because the
+        // flushed deltas are consolidatable debt (it is a one-shot no-op on an
+        // already-consolidated singleton base).
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_restore = SearchCompactionEnvRestore::configure();
 
         fn idx_id(i: u64) -> NodeId {
             let mut bytes = [0u8; 16];
@@ -5681,22 +9569,53 @@ mod tests {
             .iter()
             .find(|d| d.kind == SstKind::Nodes)
             .unwrap();
-        let vg = manifest
+        // Barrier-aware singleton lookups: the consolidation publishes a data
+        // base plus a downgrade barrier per index, both ordinary descriptors
+        // of the same kind. A first-match `find` could name the barrier.
+        let vector_barrier = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Vector
+                    && state.index_name == "doc_emb"
+            })
+            .expect("vector base registered as an active Search-LSM generation")
+            .compat_barrier_sst_id
+            .unwrap();
+        let text_barrier = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == "note_ft"
+            })
+            .expect("text base registered as an active Search-LSM generation")
+            .compat_barrier_sst_id
+            .unwrap();
+        let vgs: Vec<&SstDescriptor> = manifest
             .ssts
             .iter()
-            .find(|d| d.kind == SstKind::VectorGraph)
-            .expect("authoritative merge rebuilds the .vg");
-        let ft = manifest
+            .filter(|d| d.kind == SstKind::VectorGraph && d.id != vector_barrier)
+            .collect();
+        assert_eq!(vgs.len(), 1, "exactly one consolidated V5 base");
+        let vg = vgs[0];
+        let fts: Vec<&SstDescriptor> = manifest
             .ssts
             .iter()
-            .find(|d| d.kind == SstKind::TextIndex)
-            .expect("authoritative merge rebuilds the .ft");
+            .filter(|d| d.kind == SstKind::TextIndex && d.id != text_barrier)
+            .collect();
+        assert_eq!(fts.len(), 1, "exactly one consolidated FT4 base");
+        let ft = fts[0];
         assert_eq!(vg.row_count, 11, "12 docs - 1 tombstone, update deduped");
         assert_eq!(ft.row_count, 11);
-        // Freshness stamps: both indexes carry the merged corpus's
-        // high-water LSN, so the gate lets them serve.
+        // Freshness stamps. The V5 base carries the corpus high-water LSN
+        // from its coverage. The FT4 base stamps its members' max mutation
+        // LSN: the high-water event here is the id-5 tombstone at LSN 21,
+        // which has no live member, so the base stamps the id-3 update at 20;
+        // the Search-LSM coverage (not the descriptor stamp) is what proves
+        // freshness through the tombstone.
         assert_eq!(vg.max_lsn, node_desc.max_lsn);
-        assert_eq!(ft.max_lsn, node_desc.max_lsn);
+        assert_eq!(ft.max_lsn, 20);
         // Index descriptor key bounds are member NodeId bounds, not the legacy
         // 00..FF sentinel. Both corpora contain reconciled ids 1..=12 (id 5 is
         // deleted, but the extrema remain 1 and 12).
@@ -5758,8 +9677,14 @@ mod tests {
     /// merely clone the complete embedding/document corpus and can exhaust
     /// memory on a legal-scale store.
     #[cfg(all(feature = "vector-index", feature = "text-index"))]
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn sidecar_only_migration_preserves_fresh_vector_and_text_generations() {
+        // Observer of the DEFAULT policy: "fresh generations preserved" holds
+        // only while no concurrent test leaks force_base=true.
+        let _env_lock = SEARCH_COMPACTION_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::manifest::{
             NodeLocatorDescriptor, TextIndexDescriptor, VectorIndexDescriptor, VectorMetric,
             VectorQuantization,
@@ -5869,6 +9794,14 @@ mod tests {
             .expect("real text index")
             .id;
         let build_states = settled.manifest.search_index_builds.clone();
+        let settled_node = settled
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
+        let settled_node_id = settled_node.id;
+        let settled_node_path = settled_node.path.clone();
 
         // Model a valid 2.0.5 locator-only sidecar on the settled L1. The
         // source Parquet and search bodies are the real objects emitted above.
@@ -5910,6 +9843,7 @@ mod tests {
             path: legacy_relative,
             size_bytes: legacy_locator.len() as u64,
             entry_count: node.row_count,
+            property_pages: None,
         });
         assert!(
             !search_indexes_need_rebuild(&legacy.manifest),
@@ -5920,15 +9854,32 @@ mod tests {
             .await
             .unwrap()
             .committed;
+        let migrated_node = migrated
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .unwrap();
         assert!(
-            migrated
-                .manifest
-                .ssts
-                .iter()
-                .find(|sst| sst.kind == SstKind::Nodes)
-                .and_then(|sst| sst.node_locator.as_ref())
+            migrated_node
+                .node_locator
+                .as_ref()
                 .is_some_and(|locator| locator.path.ends_with(".nloc2")),
             "the legacy node locator must still migrate"
+        );
+        assert_eq!(
+            (migrated_node.id, migrated_node.path.as_str()),
+            (settled_node_id, settled_node_path.as_str()),
+            "sidecar-only migration must not rewrite authoritative Parquet"
+        );
+        let property_reader = open_compacted_property_pages(s.clone(), &p, migrated_node).await;
+        let (projected, _) = property_reader
+            .project_node_ids(&["body".into()], &[*idx_id(1).as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(
+            projected[0].properties["body"],
+            crate::sst::nodes::property_pages::PropertyCell::Value(Value::Str("alpha one".into()))
         );
         assert_eq!(
             migrated
@@ -5963,6 +9914,41 @@ mod tests {
         // equality mirror requires rebuilding the node SST's property
         // sidecars, but still does not change the logical search corpus.
         let mut legacy_paged = migrated.clone();
+        let legacy_equality: BTreeMap<String, Vec<[u8; 16]>> = docs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, body))| {
+                (
+                    (*body).to_owned(),
+                    vec![*idx_id((index + 1) as u64).as_bytes()],
+                )
+            })
+            .collect();
+        let legacy_equality_body = bincode::serialize(&legacy_equality).unwrap();
+        let current_equality_path = legacy_paged
+            .manifest
+            .ssts
+            .iter()
+            .find(|sst| sst.kind == SstKind::Nodes)
+            .and_then(|node| {
+                node.equality_property_indices
+                    .iter()
+                    .find(|index| index.property == "body")
+            })
+            .expect("indexed body equality sidecar")
+            .path
+            .clone();
+        let legacy_equality_path = format!("{current_equality_path}.legacy.bin");
+        s.put(
+            &Path::from(format!(
+                "{}/{}",
+                p.namespace_prefix().as_ref(),
+                legacy_equality_path
+            )),
+            PutPayload::from(legacy_equality_body.clone()),
+        )
+        .await
+        .unwrap();
         let node = legacy_paged
             .manifest
             .ssts
@@ -5974,6 +9960,9 @@ mod tests {
             .iter_mut()
             .find(|index| index.property == "body")
             .expect("indexed body equality sidecar");
+        equality.path = legacy_equality_path;
+        equality.size_bytes = legacy_equality_body.len() as u64;
+        equality.format = crate::manifest::PropertyIndexFormat::BincodeV0;
         equality.paged = None;
         equality.paged_build_unsupported = false;
         let required = crate::flush::union_indexed_props(&schema);

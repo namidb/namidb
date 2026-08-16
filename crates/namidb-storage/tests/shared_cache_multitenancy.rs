@@ -82,14 +82,18 @@ async fn open_defaults_to_process_wide_shared_caches() {
         Arc::ptr_eq(na, nb),
         "two sessions must share one NodeViewCache instance"
     );
-    let (aa, ab) = (
-        a.adjacency_cache().expect("adjacency cache on by default"),
-        b.adjacency_cache().expect("adjacency cache on by default"),
-    );
-    assert!(
-        Arc::ptr_eq(aa, ab),
-        "two sessions must share one AdjacencyCache instance"
-    );
+    // Whole-CSR adjacency retention is an explicit latency-for-memory opt-in
+    // (`NAMIDB_ADJACENCY`): point traversals read edge pages by range instead
+    // of pinning decoded CSRs. When opted in, both sessions must still share
+    // one instance.
+    match (a.adjacency_cache(), b.adjacency_cache()) {
+        (None, None) => {}
+        (Some(aa), Some(ab)) => assert!(
+            Arc::ptr_eq(aa, ab),
+            "two sessions must share one AdjacencyCache instance"
+        ),
+        _ => panic!("adjacency opt-in must resolve identically for both sessions"),
+    }
 
     // SstCache is a Clone-able handle over inner Arcs; prove sharing by
     // observation: a body inserted through A's handle is readable via B's.

@@ -29,7 +29,8 @@ pub mod pdp;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Extension, Path, State};
+use axum::body::HttpBody as _;
+use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -52,6 +53,59 @@ use crate::metrics::{CompactionTrigger, Metrics, Protocol, QueryKind, WriterLock
 use crate::recovery::WriterHealth;
 use crate::registry::{NamespaceRegistry, NamespaceState};
 use crate::shared::SharedAppState;
+
+/// Explicit limit for the JSON body accepted by `/v0/cypher`.
+///
+/// Axum's `Json` extractor currently defaults to the same two MiB, but wiring
+/// the value into both the body-limit layer and pre-decode memory reservation
+/// prevents those independently evolving into contradictory bounds.
+const HTTP_CYPHER_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Conservative serde_json + RuntimeValue + execution amplification charged
+/// before the JSON extractor allocates. This mirrors Bolt's measured 16x
+/// decode working-set rail.
+const HTTP_MEMORY_BYTES_PER_WIRE_BYTE: usize = 16;
+const HTTP_MEMORY_BASE_BYTES: usize = 64 * 1024;
+
+fn estimated_http_request_memory_bytes(wire_bytes: usize) -> usize {
+    HTTP_MEMORY_BASE_BYTES
+        .saturating_add(wire_bytes.saturating_mul(HTTP_MEMORY_BYTES_PER_WIRE_BYTE))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpBodyAdmissionError {
+    InvalidContentLength,
+    TooLarge { observed: u64 },
+}
+
+/// Conservative wire-size bound available before Axum materialises JSON.
+///
+/// A valid Content-Length is exact. Without it, a body implementation may
+/// still expose an exact/upper size hint (ordinary small test/client bodies
+/// do); genuinely chunked/unknown bodies reserve the same real two-MiB limit
+/// the extractor enforces instead of being rejected merely for lacking the
+/// header.
+fn http_cypher_wire_bytes(
+    request: &axum::extract::Request,
+) -> Result<usize, HttpBodyAdmissionError> {
+    let content_length = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .ok_or(HttpBodyAdmissionError::InvalidContentLength)
+        })
+        .transpose()?;
+    let observed = content_length
+        .or_else(|| request.body().size_hint().upper())
+        .unwrap_or(HTTP_CYPHER_BODY_LIMIT_BYTES as u64);
+    if observed > HTTP_CYPHER_BODY_LIMIT_BYTES as u64 {
+        return Err(HttpBodyAdmissionError::TooLarge { observed });
+    }
+    usize::try_from(observed).map_err(|_| HttpBodyAdmissionError::TooLarge { observed })
+}
 
 /// Process-wide configuration assembled from CLI flags or env vars.
 #[derive(Debug, Clone)]
@@ -476,11 +530,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/version", get(version))
         .route("/v0/metrics", get(metrics_handler));
 
-    // Cypher is the only private HTTP work that creates an unbounded query
-    // working set. Admission runs before its JSON extractor, so a large body
-    // is not materialised after the process reaches its RSS ceiling.
+    // Cypher is the only private HTTP work that creates a query working set.
+    // Admission reserves conservative Content-Length/body-limit amplification
+    // before its JSON extractor and retains it through the complete response.
     let admitted = Router::new()
         .route("/v0/cypher", post(cypher))
+        .layer(DefaultBodyLimit::max(HTTP_CYPHER_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_memory_admission,
@@ -587,6 +642,7 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     let namespace_admitted = Router::new()
         .route("/:namespace/v0/cypher", post(cypher_multi))
         .route("/v0/cypher", post(cypher_multi_unprefixed))
+        .layer(DefaultBodyLimit::max(HTTP_CYPHER_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_memory_admission_multi,
@@ -657,9 +713,7 @@ fn resolve_request_namespace(
 /// SIGINT.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let memory_max_bytes = match std::env::var("NAMIDB_MEMORY_MAX_BYTES") {
-        Ok(raw) => raw.parse::<usize>().map_err(|error| {
-            anyhow::anyhow!("NAMIDB_MEMORY_MAX_BYTES must be an exact byte count: {error}")
-        })?,
+        Ok(raw) => memory::resolve_memory_max_bytes(&raw).map_err(anyhow::Error::msg)?,
         Err(std::env::VarError::NotPresent) => memory::DEFAULT_MEMORY_MAX_BYTES,
         Err(error) => {
             return Err(anyhow::anyhow!(
@@ -679,6 +733,7 @@ pub async fn run_with_memory_max_bytes(
     config: Config,
     memory_max_bytes: usize,
 ) -> anyhow::Result<()> {
+    namidb_storage::validate_cache_configuration().map_err(anyhow::Error::msg)?;
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
     }
@@ -1146,16 +1201,56 @@ async fn wait_for_shutdown_signal() {
 ///
 /// This middleware is layered inside authentication, so invalid credentials
 /// are still rejected without disclosing process-pressure telemetry.
+async fn admit_http_cypher_request(
+    memory: &Arc<memory::MemoryGovernor>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let wire_bytes = match http_cypher_wire_bytes(&req) {
+        Ok(bytes) => bytes,
+        Err(HttpBodyAdmissionError::InvalidContentLength) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "invalid Content-Length for /v0/cypher".into(),
+                }),
+            )
+                .into_response();
+        }
+        Err(HttpBodyAdmissionError::TooLarge { observed }) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorBody {
+                    error: format!(
+                        "Cypher JSON body is {observed} bytes; maximum is \
+                         {HTTP_CYPHER_BODY_LIMIT_BYTES} bytes"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let started = std::time::Instant::now();
+    let reservation = match memory
+        .reserve_query_headroom(estimated_http_request_memory_bytes(wire_bytes))
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(pressure) => return memory_pressure_observation(started, pressure).response,
+    };
+    let response = next.run(req).await;
+    // Keep projected JSON/query amplification charged through extraction,
+    // planning, execution, response construction, and every early error.
+    drop(reservation);
+    response
+}
+
 async fn require_memory_admission(
     State(state): State<AppState>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let started = std::time::Instant::now();
-    match state.memory.admit_query().await {
-        Ok(()) => next.run(req).await,
-        Err(pressure) => memory_pressure_observation(started, pressure).response,
-    }
+    admit_http_cypher_request(&state.memory, req, next).await
 }
 
 /// Multi-tenant twin of [`require_memory_admission`]. It runs before namespace
@@ -1166,11 +1261,7 @@ async fn require_memory_admission_multi(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let started = std::time::Instant::now();
-    match shared.memory.admit_query().await {
-        Ok(()) => next.run(req).await,
-        Err(pressure) => memory_pressure_observation(started, pressure).response,
-    }
+    admit_http_cypher_request(&shared.memory, req, next).await
 }
 
 async fn require_auth_multi(
@@ -1281,6 +1372,16 @@ fn exec_error_classification(
             StatusCode::SERVICE_UNAVAILABLE,
             Some("search_index_cache_capacity"),
         ),
+        ExecError::Storage(namidb_storage::Error::QueryWorkspaceExceeded { .. }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("search_workspace_capacity"),
+        ),
+        ExecError::Storage(namidb_storage::Error::SearchResultLimitExceeded { .. }) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("search_result_limit"))
+        }
+        ExecError::Storage(namidb_storage::Error::SearchDocumentLimitExceeded { .. }) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("search_document_limit"))
+        }
         other if other.is_unsupported() => (StatusCode::BAD_REQUEST, Some("unsupported")),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
     }
@@ -1511,21 +1612,31 @@ fn memory_pressure_observation(
     started: std::time::Instant,
     pressure: memory::MemoryPressure,
 ) -> ObservedQuery {
+    let projected = pressure
+        .resident_bytes
+        .saturating_add(pressure.requested_headroom_bytes);
+    let error = if pressure.requested_headroom_bytes == 0 {
+        format!(
+            "process memory pressure: resident {} bytes reached configured maximum {} bytes; \
+             reconstructible caches were reclaimed, retry after memory falls",
+            pressure.resident_bytes, pressure.max_bytes
+        )
+    } else {
+        format!(
+            "process memory pressure: resident {} bytes plus {} bytes of projected request \
+             headroom would reach {} bytes, at or above configured maximum {} bytes; split the \
+             request or retry after memory falls",
+            pressure.resident_bytes,
+            pressure.requested_headroom_bytes,
+            projected,
+            pressure.max_bytes
+        )
+    };
     ObservedQuery {
         kind: None,
         ok: false,
         elapsed: started.elapsed(),
-        response: (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                error: format!(
-                    "process memory pressure: resident {} bytes reached configured maximum {} \
-                     bytes; reconstructible caches were reclaimed, retry after memory falls",
-                    pressure.resident_bytes, pressure.max_bytes
-                ),
-            }),
-        )
-            .into_response(),
+        response: (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { error })).into_response(),
     }
 }
 
@@ -3272,6 +3383,10 @@ fn json_to_runtime(v: &serde_json::Value) -> Result<RuntimeValue, String> {
         Number(n) => {
             if let Some(i) = n.as_i64() {
                 RuntimeValue::Integer(i)
+            } else if n.is_u64() {
+                // A u64 beyond i64::MAX would silently degrade to a lossy
+                // float; Cypher integers are 64-bit signed, so reject it.
+                return Err(format!("integer param {n} exceeds the 64-bit signed range"));
             } else if let Some(f) = n.as_f64() {
                 RuntimeValue::Float(f)
             } else {
@@ -3414,11 +3529,375 @@ mod tests {
         build_router(state)
     }
 
+    /// Plan item 28: the HTTP JSON parameter route had no unit tests and no
+    /// HTTP test posted a non-empty params map.
+    #[test]
+    fn json_params_convert_nested_shapes_and_reject_out_of_range_integers() {
+        let map = serde_json::json!({
+            "nested": {"list": [1, 2.5, "x", null, true]},
+            "imax": i64::MAX,
+            "imin": i64::MIN,
+            "tenth": 0.1,
+        });
+        let params = params_from_json(map.as_object().unwrap()).unwrap();
+        match params.get("nested") {
+            Some(RuntimeValue::Map(m)) => match m.get("list") {
+                Some(RuntimeValue::List(items)) => {
+                    assert_eq!(items.len(), 5);
+                    assert!(matches!(items[0], RuntimeValue::Integer(1)));
+                    assert!(matches!(items[1], RuntimeValue::Float(f) if f == 2.5));
+                    assert!(matches!(&items[2], RuntimeValue::String(s) if s == "x"));
+                    assert!(matches!(items[3], RuntimeValue::Null));
+                    assert!(matches!(items[4], RuntimeValue::Bool(true)));
+                }
+                other => panic!("nested list must survive: {other:?}"),
+            },
+            other => panic!("nested map must survive: {other:?}"),
+        }
+        assert!(matches!(params.get("imax"), Some(RuntimeValue::Integer(i)) if *i == i64::MAX));
+        assert!(matches!(params.get("imin"), Some(RuntimeValue::Integer(i)) if *i == i64::MIN));
+        assert!(
+            matches!(params.get("tenth"), Some(RuntimeValue::Float(f)) if *f == 0.1),
+            "0.1 must round-trip bit-exact through serde_json"
+        );
+
+        let oversized = serde_json::json!({"big": u64::MAX});
+        let error = params_from_json(oversized.as_object().unwrap()).unwrap_err();
+        assert!(
+            error.contains("64-bit signed range"),
+            "a u64 beyond i64::MAX must be rejected, not degraded to a float: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_cypher_executes_with_a_non_empty_params_map() {
+        let app = fixture(None).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": "RETURN $flag AS flag, $nums AS nums, $meta AS meta, $tenth AS tenth",
+            "params": {
+                "flag": true,
+                "nums": [1, 2, 3],
+                "meta": {"tenant": "acme"},
+                "tenth": 0.1,
+            }
+        }))
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = &parsed["rows"][0];
+        assert_eq!(row["flag"], serde_json::json!(true));
+        assert_eq!(row["nums"], serde_json::json!([1, 2, 3]));
+        assert_eq!(row["meta"], serde_json::json!({"tenant": "acme"}));
+        assert_eq!(row["tenth"], serde_json::json!(0.1), "float round-trip");
+    }
+
+    #[tokio::test]
+    async fn http_cypher_rejects_an_out_of_range_integer_param_with_400() {
+        let app = fixture(None).await;
+        let body = format!(
+            "{{\"query\": \"RETURN $big AS big\", \"params\": {{\"big\": {}}}}}",
+            u64::MAX
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Unaudited dimension (25tb-readiness): the in-process concurrent write
+    /// contract. Simultaneous HTTP write transactions serialize on the
+    /// writer mutex — both must succeed, their effects must both commit, and
+    /// a subsequent read sees every write exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_http_writes_serialize_and_both_commit() {
+        let app = fixture(None).await;
+        let post = |app: Router, body: serde_json::Value| async move {
+            let body = serde_json::to_vec(&body).unwrap();
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let mut writers = Vec::new();
+        for ordinal in 0..8 {
+            let app = app.clone();
+            writers.push(tokio::spawn(async move {
+                let response = post(
+                    app,
+                    serde_json::json!({
+                        "query": format!("CREATE (:Audit {{slot: {ordinal}}})")
+                    }),
+                )
+                .await;
+                response.status()
+            }));
+        }
+        for writer in writers {
+            assert_eq!(
+                writer.await.unwrap(),
+                StatusCode::OK,
+                "every concurrent write must serialize and succeed"
+            );
+        }
+        let response = post(
+            app,
+            serde_json::json!({"query": "MATCH (a:Audit) RETURN count(*) AS c"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["rows"][0]["c"],
+            serde_json::json!(8),
+            "all eight serialized writes must be visible exactly once"
+        );
+    }
+
+    /// Plan item 32 (the in-process half): the memory ceiling exercised
+    /// against the REAL resident-set sample, not a synthetic gauge. A
+    /// ceiling below the process's actual RSS must reject queries with 503
+    /// and count them; a sane ceiling must serve. The cgroup `auto` mode in
+    /// a real container stays with the pre-load runbook.
+    #[tokio::test]
+    async fn real_rss_ceiling_rejects_queries_and_recovers() {
+        let (store, paths) = namidb_storage::parse_uri("memory://rss-ceiling").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let tiny = Arc::new(memory::MemoryGovernor::new(64 * 1024));
+        if tiny.sample().is_none() {
+            // Platform without a resident-set source: nothing real to test.
+            return;
+        }
+        assert!(
+            tiny.over_limit(),
+            "a 64 KiB ceiling must sit below any real process RSS"
+        );
+        let state = AppState::new(writer, None, "rss-ceiling".into())
+            .with_memory_governor(Arc::clone(&tiny));
+        let app = build_router(state);
+        let body = serde_json::to_vec(&serde_json::json!({"query": "RETURN 1 AS v"})).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a real over-ceiling RSS must reject queries"
+        );
+        assert!(tiny.rejected_queries() > 0, "the rejection must be counted");
+
+        // Recovery: the same server shape under a sane ceiling serves.
+        let (store, paths) = namidb_storage::parse_uri("memory://rss-ceiling-ok").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let sane = Arc::new(memory::MemoryGovernor::new(usize::MAX));
+        sane.sample();
+        let state = AppState::new(writer, None, "rss-ceiling-ok".into()).with_memory_governor(sane);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "a sane ceiling serves");
+    }
+
+    /// Plan item 34: the serving route must be observable at the server
+    /// surface, or total loss of native serving passes every parity check.
+    #[tokio::test]
+    async fn metrics_expose_the_search_route_counters() {
+        let app = fixture(None).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v0/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for series in [
+            "namidb_search_route_total{kind=\"text\",route=\"native\"}",
+            "namidb_search_route_total{kind=\"text\",route=\"fallback\"}",
+            "namidb_search_route_total{kind=\"vector\",route=\"native\"}",
+            "namidb_search_route_total{kind=\"vector\",route=\"fallback\"}",
+        ] {
+            assert!(
+                text.contains(series),
+                "/metrics must export `{series}`; got:\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn allocator_trim_is_reserved_for_flushes_that_wrote_an_sst() {
         assert!(!flush_needs_allocator_trim(0));
         assert!(flush_needs_allocator_trim(1));
         assert!(flush_needs_allocator_trim(2));
+    }
+
+    #[test]
+    fn http_headroom_uses_exact_lengths_and_real_limit_for_unknown_streams() {
+        let exact = Request::builder()
+            .uri("/v0/cypher")
+            .header(axum::http::header::CONTENT_LENGTH, "123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(http_cypher_wire_bytes(&exact), Ok(123));
+
+        let hinted = Request::builder()
+            .uri("/v0/cypher")
+            .body(Body::from("small"))
+            .unwrap();
+        assert_eq!(http_cypher_wire_bytes(&hinted), Ok(5));
+
+        let unknown = Request::builder()
+            .uri("/v0/cypher")
+            .body(Body::from_stream(futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{}"))
+            })))
+            .unwrap();
+        assert_eq!(
+            http_cypher_wire_bytes(&unknown),
+            Ok(HTTP_CYPHER_BODY_LIMIT_BYTES),
+            "chunked/unknown bodies reserve the exact extractor ceiling instead of bypassing it"
+        );
+
+        let oversized = Request::builder()
+            .uri("/v0/cypher")
+            .header(
+                axum::http::header::CONTENT_LENGTH,
+                (HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            http_cypher_wire_bytes(&oversized),
+            Err(HttpBodyAdmissionError::TooLarge {
+                observed: HTTP_CYPHER_BODY_LIMIT_BYTES as u64 + 1
+            })
+        );
+
+        let malformed = Request::builder()
+            .uri("/v0/cypher")
+            .header(axum::http::header::CONTENT_LENGTH, "not-a-number")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            http_cypher_wire_bytes(&malformed),
+            Err(HttpBodyAdmissionError::InvalidContentLength)
+        );
+        assert_eq!(
+            estimated_http_request_memory_bytes(10),
+            HTTP_MEMORY_BASE_BYTES + 10 * HTTP_MEMORY_BYTES_PER_WIRE_BYTE
+        );
+        assert_eq!(
+            estimated_http_request_memory_bytes(usize::MAX),
+            usize::MAX,
+            "projection must saturate instead of wrapping below the memory rail"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_headroom_guard_lives_through_handler_and_is_released() {
+        let (store, paths) = namidb_storage::parse_uri("memory://http-headroom-raii").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let governor = Arc::new(memory::MemoryGovernor::new(usize::MAX));
+        let state = AppState::new(writer, None, "http-headroom-raii".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let app = build_router(state);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": "RETURN 1 AS value"
+        }))
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            governor.reserved_headroom_bytes(),
+            0,
+            "the middleware's RAII reservation must release after the full response is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_oversized_content_length_is_413_before_json_decode() {
+        let app = fixture(None).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(
+                        axum::http::header::CONTENT_LENGTH,
+                        (HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
@@ -3436,6 +3915,69 @@ mod tests {
                 Some("search_index_cache_capacity")
             )
         );
+    }
+
+    #[test]
+    fn search_workspace_capacity_is_retryable_http_503() {
+        let error =
+            namidb_query::exec::ExecError::Storage(namidb_storage::Error::QueryWorkspaceExceeded {
+                operation: "exact full-text fallback",
+                required_bytes: 512 * 1024 * 1024,
+                capacity_bytes: 256 * 1024 * 1024,
+            });
+        assert_eq!(
+            exec_error_classification(&error),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("search_workspace_capacity")
+            )
+        );
+    }
+
+    #[test]
+    fn search_result_and_document_limits_are_http_413() {
+        let result = namidb_query::exec::ExecError::Storage(
+            namidb_storage::Error::SearchResultLimitExceeded {
+                index_kind: "full-text",
+                estimated_bytes: 80 * 1024 * 1024,
+                limit_bytes: 64 * 1024 * 1024,
+            },
+        );
+        assert_eq!(
+            exec_error_classification(&result),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("search_result_limit"))
+        );
+
+        let document = namidb_query::exec::ExecError::Storage(
+            namidb_storage::Error::SearchDocumentLimitExceeded {
+                operation: "exact full-text fallback",
+                document_bytes: 2 * 1024 * 1024,
+                limit_bytes: 1024 * 1024,
+            },
+        );
+        assert_eq!(
+            exec_error_classification(&document),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("search_document_limit"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_limit_response_exposes_stable_machine_code() {
+        let error = namidb_query::exec::ExecError::Storage(
+            namidb_storage::Error::SearchDocumentLimitExceeded {
+                operation: "exact full-text fallback",
+                document_bytes: 2 * 1024 * 1024,
+                limit_bytes: 1024 * 1024,
+            },
+        );
+        let response = exec_failure_response("query failed", &error);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "search_document_limit");
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("NAMIDB_BM25_MAX_DOCUMENT_BYTES")));
     }
 
     /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the

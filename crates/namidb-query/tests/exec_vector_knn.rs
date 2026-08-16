@@ -214,6 +214,65 @@ async fn typeless_knn_returns_multilabel_once_and_includes_unlabelled() {
     assert_eq!(got, vec!["multi", "bare", "other"]);
 }
 
+#[tokio::test]
+async fn flat_vector_search_breaks_equal_scores_by_node_id() {
+    let mut writer = WriterSession::open(store(), paths("knn-stable-ties"))
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = [9_u128, 2, 7, 1]
+        .into_iter()
+        .map(|raw| NodeId::from_uuid(uuid::Uuid::from_bytes(raw.to_be_bytes())))
+        .collect();
+    for (position, id) in ids.iter().copied().enumerate() {
+        writer
+            .upsert_node(
+                "Doc",
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("title".into(), CoreValue::Str(format!("equal-{position}"))),
+                        ("embedding".into(), CoreValue::Vec(vec![1.0, 0.0, 0.0])),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let plan = LogicalPlan::VectorSearch {
+        label: Some("Doc".into()),
+        alias: "d".into(),
+        property: "embedding".into(),
+        query: Expression {
+            kind: ExpressionKind::Parameter("q".into()),
+            span: SourceSpan::point(0),
+        },
+        k: RowCount::Const(3),
+        distance: VectorDistance::Cosine,
+        score_alias: "score".into(),
+        post_filter: None,
+    };
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let rows = execute(&plan, &writer.snapshot(), &params).await.unwrap();
+    let got: Vec<NodeId> = rows
+        .iter()
+        .map(|row| match row.get("d") {
+            Some(RuntimeValue::Node(node)) => node.id,
+            other => panic!("expected node result, got {other:?}"),
+        })
+        .collect();
+    let mut expected = ids;
+    expected.sort_unstable();
+    expected.truncate(3);
+    assert_eq!(
+        got, expected,
+        "equal vector scores require a deterministic cross-path tie-break"
+    );
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.
@@ -1373,5 +1432,331 @@ mod indexed {
         // kind Y only → c (cos ≈ .994) then e (cos 0); the wide beam doesn't change
         // the (correct) ranking, it only raises recall.
         assert_eq!(titles(&rows), vec!["c".to_string(), "e".to_string()]);
+    }
+
+    /// Plan item 6 (25 TB readiness): REMOVE n:Doc must suppress a stale hit
+    /// the persisted index still contains — first through the memtable-dirty
+    /// overlay, then after the relabel itself is flushed. Both KNN forms are
+    /// asserted so neither route can serve the relabeled document.
+    #[tokio::test]
+    async fn relabel_suppresses_persisted_vector_hits_pre_and_post_flush() {
+        use namidb_query::execute_write;
+
+        let (mut w, _ids) = build_index(
+            "knn-relabel",
+            &[
+                ("target", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("near", "kind-a", vec![0.9, 0.1, 0.0, 0.0]),
+                ("far", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+                ("other", "kind-a", vec![0.0, 0.0, 1.0, 0.0]),
+            ],
+        )
+        .await;
+        let probe = vec![1.0, 0.0, 0.0, 0.0];
+        let knn = "MATCH (d:Doc) RETURN d.title AS title, \
+                   cosine_similarity(d.embedding, $q) AS score \
+                   ORDER BY score DESC LIMIT 2";
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["target".to_string(), "near".to_string()],
+            "the persisted index serves the target before the relabel"
+        );
+
+        // REMOVE the label: the .vg still physically contains the vector, so
+        // only the freshness overlay can hide it.
+        let relabel =
+            lower(&parse("MATCH (d:Doc {title: 'target'}) REMOVE d:Doc").unwrap()).unwrap();
+        execute_write(&relabel, &mut w, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["near".to_string(), "far".to_string()],
+            "the un-flushed relabel must already hide the target (dirty overlay)"
+        );
+        let rows = run(
+            &w,
+            "CALL search.vector({label: 'Doc', property: 'embedding', \
+             query: $q, k: 2}) YIELD node, score \
+             RETURN node.title AS title, score",
+            probe.clone(),
+        )
+        .await;
+        assert_eq!(
+            titles(&rows),
+            vec!["near".to_string(), "far".to_string()],
+            "the procedure form must agree with the Cypher form pre-flush"
+        );
+
+        // Flush the relabel: whatever route now serves must still exclude it.
+        w.flush(schema()).await.unwrap();
+        assert_eq!(
+            titles(&run(&w, knn, probe.clone()).await),
+            vec!["near".to_string(), "far".to_string()],
+            "the flushed relabel must keep the target suppressed"
+        );
+        let rows = run(
+            &w,
+            "CALL search.vector({label: 'Doc', property: 'embedding', \
+             query: $q, k: 2}) YIELD node, score \
+             RETURN node.title AS title, score",
+            probe,
+        )
+        .await;
+        assert_eq!(
+            titles(&rows),
+            vec!["near".to_string(), "far".to_string()],
+            "the procedure form must agree with the Cypher form post-flush"
+        );
+    }
+
+    /// Plan item 7 (25 TB readiness): non-finite vectors are typed errors at
+    /// both doors. A NaN query raises the same error on the indexed and flat
+    /// routes — never a silent O(corpus) downgrade with NaN ordering — and a
+    /// NaN embedding is rejected at write time before it can poison distances.
+    #[tokio::test]
+    async fn non_finite_vectors_error_identically_on_both_routes() {
+        use namidb_query::execute_write;
+
+        let (w, _ids) = build_index(
+            "knn-nan",
+            &[
+                ("a", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("b", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        )
+        .await;
+        async fn nan_query_error(w: &WriterSession) -> String {
+            let snap = w.snapshot();
+            let catalog = StatsCatalog::from_manifest(&snap.manifest().manifest);
+            let plan = optimize(
+                lower(
+                    &parse(
+                        "CALL search.vector({label: 'Doc', property: 'embedding', \
+                         query: $q, k: 2}) YIELD node, score \
+                         RETURN node.title AS title",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                &catalog,
+            );
+            let mut params = Params::new();
+            params.insert(
+                "q".into(),
+                RuntimeValue::Vector(vec![f32::NAN, 0.0, 0.0, 0.0]),
+            );
+            execute(&plan, &snap, &params)
+                .await
+                .unwrap_err()
+                .to_string()
+        }
+        let indexed_error = nan_query_error(&w).await;
+        assert!(
+            indexed_error.contains("non-finite"),
+            "indexed route must reject a NaN query: {indexed_error}"
+        );
+
+        // Same corpus without an index: identical error, not NaN ordering.
+        let mut flat = WriterSession::open(store(), paths("knn-nan-flat"))
+            .await
+            .unwrap();
+        flat.upsert_node(
+            "Doc",
+            NodeId::new(),
+            &rec("a", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        flat.commit_batch().await.unwrap();
+        let flat_error = nan_query_error(&flat).await;
+        assert_eq!(
+            indexed_error, flat_error,
+            "both routes must raise the same typed error"
+        );
+
+        // Write door: a NaN embedding never enters an indexed label.
+        let mut w = w;
+        let write = lower(
+            &parse("CREATE (:Doc {title: 'poison', kind: 'kind-a', embedding: $q})").unwrap(),
+        )
+        .unwrap();
+        let mut params = Params::new();
+        params.insert(
+            "q".into(),
+            RuntimeValue::Vector(vec![f32::NAN, 0.0, 0.0, 0.0]),
+        );
+        let error = execute_write(&write, &mut w, &params).await.unwrap_err();
+        assert!(
+            error.to_string().contains("non-finite"),
+            "write path must reject a NaN embedding: {error}"
+        );
+    }
+
+    /// Plan item 15: the ActiveSegments route is never ASSERTED at the query
+    /// layer — result-parity tests pass identically on the flat fallback (the
+    /// documented reachability trap). Every `search_lsm_read` coordinator
+    /// invocation HEADs its `.slb` barrier exactly once and the flat scan pins
+    /// nothing, so barrier pins are a query-observable witness of the native
+    /// route.
+    mod active_route_witness {
+        use super::*;
+        use object_store::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct BarrierPinProbe {
+            inner: Arc<dyn ObjectStore>,
+            barrier_pins: AtomicUsize,
+        }
+
+        impl BarrierPinProbe {
+            fn new() -> Self {
+                Self {
+                    inner: Arc::new(InMemory::new()),
+                    barrier_pins: AtomicUsize::new(0),
+                }
+            }
+            fn barrier_pins(&self) -> usize {
+                self.barrier_pins.load(Ordering::SeqCst)
+            }
+        }
+
+        impl std::fmt::Display for BarrierPinProbe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "BarrierPinProbe({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for BarrierPinProbe {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if options.head && location.as_ref().ends_with(".slb") {
+                    self.barrier_pins.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.get_opts(location, options).await
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<
+                    'static,
+                    object_store::Result<object_store::path::Path>,
+                >,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+            {
+                self.inner.delete_stream(locations)
+            }
+        }
+
+        #[tokio::test]
+        async fn cypher_knn_pins_the_active_generation_and_dirty_writes_unpin_it() {
+            let probe = Arc::new(BarrierPinProbe::new());
+            let store: Arc<dyn ObjectStore> = probe.clone();
+            let mut w = WriterSession::open(store, paths("knn-active-witness"))
+                .await
+                .unwrap();
+            w.register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim: DIM,
+                    metric: VectorMetric::Cosine,
+                    r: 32,
+                    l_build: 64,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            for (title, kind, emb) in [
+                ("target", "kind-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("near", "kind-a", vec![0.9, 0.1, 0.0, 0.0]),
+                ("far", "kind-a", vec![0.0, 1.0, 0.0, 0.0]),
+            ] {
+                w.upsert_node("Doc", NodeId::new(), &rec(title, kind, emb))
+                    .unwrap();
+            }
+            w.flush(schema()).await.unwrap();
+            w.compact_l0(&schema()).await.unwrap();
+
+            let knn = "CALL search.vector({label: 'Doc', property: 'embedding', \
+                   query: $q, k: 2}) YIELD node, score \
+                   RETURN node.title AS title, score";
+            let probe_vec = vec![1.0, 0.0, 0.0, 0.0];
+
+            let before = probe.barrier_pins();
+            let rows = run(&w, knn, probe_vec.clone()).await;
+            assert_eq!(
+                titles(&rows),
+                vec!["target".to_string(), "near".to_string()]
+            );
+            assert!(
+                probe.barrier_pins() > before,
+                "a clean snapshot must serve KNN through the ACTIVE generation \
+             (the coordinator pins its .slb); zero pins means the flat \
+             fallback answered and this test proved nothing"
+            );
+
+            // A dirty vector write flips the freshness gate. The coordinator may
+            // still pin its barrier while deciding, so the pin count is not the
+            // witness here — freshness is: the persisted index has never seen
+            // `fresh`, so only the exact overlay route can return it as top-1.
+            w.upsert_node(
+                "Doc",
+                NodeId::new(),
+                &rec("fresh", "kind-a", vec![0.0, 0.0, 0.0, 1.0]),
+            )
+            .unwrap();
+            w.commit_batch().await.unwrap();
+            let rows = run(&w, knn, vec![0.0, 0.0, 0.0, 1.0]).await;
+            assert_eq!(
+                titles(&rows)[0],
+                "fresh",
+                "a dirty memtable must serve through the freshness-exact route \
+             (the persisted index cannot know this document)"
+            );
+        }
     }
 }

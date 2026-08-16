@@ -500,6 +500,50 @@ async fn call_search_bm25_ranks_rare_terms_higher() {
 }
 
 #[tokio::test]
+async fn call_search_bm25_filter_is_applied_before_top_k() {
+    let mut writer = WriterSession::open(store(), paths("call-bm25-filter"))
+        .await
+        .unwrap();
+    let obsolete = NodeId::new();
+    let vigente = NodeId::new();
+    let mut obsolete_record = node_with_body("fox fox fox fox fox fox");
+    obsolete_record
+        .properties
+        .insert("vigente".into(), namidb_core::Value::Bool(false));
+    let mut vigente_record = node_with_body("fox");
+    vigente_record
+        .properties
+        .insert("vigente".into(), namidb_core::Value::Bool(true));
+    writer
+        .upsert_node("Note", obsolete, &obsolete_record)
+        .unwrap();
+    writer
+        .upsert_node("Note", vigente, &vigente_record)
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox', \
+         k: 1, filter: {vigente: true}}) YIELD node, score RETURN node, score",
+    )
+    .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "a selective filter must refill the sparse result to k"
+    );
+    let result = match rows[0].get("node") {
+        Some(RuntimeValue::Node(node)) => node.id,
+        other => panic!("node not a node: {other:?}"),
+    };
+    assert_eq!(
+        result, vigente,
+        "filtering must happen before top-k instead of discarding the stronger obsolete hit"
+    );
+}
+
+#[tokio::test]
 async fn call_search_bm25_mcp_query_shape_executes() {
     // Exactly the query shape the MCP lexical channel generates: a map arg with
     // a list value + a `$param`, then `id(node)` / property access in RETURN and
@@ -1372,5 +1416,287 @@ async fn text_index_gate_is_label_scoped() {
     assert!(
         rows.is_empty(),
         "relabeled doc must not be served: {rows:?}"
+    );
+}
+
+/// Plan item 5 (25 TB readiness): Cypher DELETE → flush → the NATIVE text
+/// route must both exclude the deleted document and shrink the corpus
+/// statistics it scores with. The route is asserted at the storage boundary
+/// (`text_search` returning `Some`), never inferred from result parity.
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn cypher_delete_shrinks_the_native_text_corpus() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_query::execute_write;
+    use namidb_storage::manifest::TextIndexDescriptor;
+
+    let mut writer = WriterSession::open(store(), paths("call-delete-shrink"))
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![
+                PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+            ],
+        })
+        .unwrap()
+        .build();
+
+    // "unicorn" lives ONLY in the doomed document; "common" in every other.
+    let write = lower(
+        &parse(
+            "CREATE (:Note {title: 'doomed', body: 'unicorn common words'}), \
+             (:Note {title: 'a', body: 'common words here'}), \
+             (:Note {title: 'b', body: 'common words there'}), \
+             (:Note {title: 'c', body: 'common words everywhere'})",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    execute_write(&write, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    writer.flush(schema.clone()).await.unwrap();
+
+    // Served natively before the delete: the unique term finds its document.
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("unicorn"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the flushed FT4 generation must serve, not fall back");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the unique term matches exactly its document"
+    );
+
+    // DELETE pre-flush: the dirty overlay must already exclude it.
+    let delete = lower(&parse("MATCH (n:Note {title: 'doomed'}) DELETE n").unwrap()).unwrap();
+    execute_write(&delete, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+    let rows = run(
+        &snapshot,
+        "CALL search.bm25({label: 'Note', text_property: 'body', \
+         query: 'unicorn', k: 10}) YIELD node, score \
+         RETURN node.title AS title",
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "the un-flushed tombstone must already hide the document: {rows:?}"
+    );
+    drop(snapshot);
+
+    // Flush the tombstone: the native route itself must now prove the corpus
+    // shrank — zero postings for the dead term, not a stale hit.
+    writer.flush(schema).await.unwrap();
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("unicorn"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the post-delete generation must still serve natively");
+    assert!(
+        hits.is_empty(),
+        "flushed tombstone must remove the document and its term stats: {hits:?}"
+    );
+    let hits = writer
+        .snapshot()
+        .text_search(
+            "note_ft",
+            "Note",
+            &namidb_storage::text::parse_query("common"),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("surviving corpus must serve natively");
+    assert_eq!(hits.len(), 3, "the three survivors keep matching");
+}
+
+/// A typoed option key (`filtre`, `Filter`) must be a hard error, never a
+/// silently unfiltered result — with a tenant filter that is a data-exposure
+/// hazard.
+#[cfg(all(feature = "vector-index", feature = "text-index"))]
+#[tokio::test]
+async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
+    let writer = WriterSession::open(store(), paths("exec-unknown-proc-keys"))
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+
+    for query in [
+        "CALL search.vector({ label: 'Doc', property: 'embedding', \
+          query: [0.1, 0.2], filtre: { tenant: 'acme' } }) YIELD node RETURN node",
+        "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
+          text_property: 'body', Filter: { tenant: 'acme' } }) \
+          YIELD node RETURN node",
+    ] {
+        let parsed = parse(query).unwrap();
+        let plan = lower(&parsed).unwrap();
+        let error = execute(&plan, &snapshot, &Params::new())
+            .await
+            .expect_err("an unknown option key must fail the call");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("does not recognise the option"),
+            "error must name the rejected key, got: {message}"
+        );
+    }
+}
+
+/// Plan item 22: prefix expansion beyond the 64-term cap
+/// (`PREFIX_EXPANSION_LIMIT`) on both routes. With 100 distinct `tokNNN`
+/// terms, a `tok*` query must expand to exactly the 64 lexicographically
+/// first terms — identically on the flat overlay route (memtable dirty),
+/// the single-base native route, and the multi-segment native route whose
+/// per-segment expansions must reconcile globally.
+#[cfg(feature = "text-index")]
+#[tokio::test]
+async fn prefix_expansion_beyond_the_cap_is_identical_on_every_route() {
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+    use namidb_storage::manifest::TextIndexDescriptor;
+
+    let mut writer = WriterSession::open(store(), paths("bm25-prefix-cap"))
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("note_ft".into(), "Note".into(), vec!["body".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("body", DataType::Utf8, true).unwrap()],
+        })
+        .unwrap()
+        .build();
+
+    let doc = |token: &str| {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "body".to_string(),
+            namidb_core::Value::Str(format!("{token} filler")),
+        );
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    };
+    // 100 distinct terms, one document each: tok000 .. tok099.
+    for ordinal in 0..100 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("tok{ordinal:03}")))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let cypher = "CALL search.bm25({label: 'Note', text_properties: ['body'], \
+                  query: 'tok*'}) YIELD node, score RETURN node";
+    let bodies = |rows: &[namidb_query::Row]| -> Vec<String> {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|row| match row.get("node") {
+                Some(RuntimeValue::Node(node)) => match node.properties.get("body") {
+                    Some(RuntimeValue::String(text)) => {
+                        text.split_whitespace().next().unwrap().to_string()
+                    }
+                    other => panic!("body must hydrate: {other:?}"),
+                },
+                other => panic!("unexpected: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let expected: Vec<String> = (0..64).map(|o| format!("tok{o:03}")).collect();
+
+    // 1. Flat overlay route (nothing flushed yet).
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "the flat route must expand to exactly the 64 lexicographically \
+         first terms"
+    );
+
+    // 2. Single-base native route.
+    writer.flush(schema.clone()).await.unwrap();
+    writer.compact_l0(&schema).await.unwrap();
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(bodies(&rows), expected, "single-base native route parity");
+
+    // 3. Multi-segment native route: a second flush adds tok100..tok119
+    // (all lexicographically AFTER the cap) as a delta segment. The global
+    // expansion must still settle on the same first 64.
+    for ordinal in 100..120 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("tok{ordinal:03}")))
+            .unwrap();
+    }
+    writer.flush(schema.clone()).await.unwrap();
+    let rows = run(&writer.snapshot(), cypher).await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "multi-segment global expansion must reconcile to the same 64 terms"
+    );
+
+    // 4. And a delta whose terms sort BEFORE the whole existing vocabulary
+    // must displace the tail of the expansion set.
+    for ordinal in 0..4 {
+        writer
+            .upsert_node("Note", NodeId::new(), &doc(&format!("aaa{ordinal:03}")))
+            .unwrap();
+    }
+    writer.flush(schema.clone()).await.unwrap();
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', \
+        text_properties: ['body'], query: 'tok*'}) YIELD node, score RETURN node",
+    )
+    .await;
+    assert_eq!(
+        bodies(&rows),
+        expected,
+        "an unrelated-prefix delta must not disturb the tok* expansion"
+    );
+    let rows = run(
+        &writer.snapshot(),
+        "CALL search.bm25({label: 'Note', \
+        text_properties: ['body'], query: 'a*'}) YIELD node, score RETURN node",
+    )
+    .await;
+    let expected_a: Vec<String> = (0..4).map(|o| format!("aaa{o:03}")).collect();
+    assert_eq!(
+        bodies(&rows),
+        expected_a,
+        "a prefix under the cap returns every matching term"
     );
 }

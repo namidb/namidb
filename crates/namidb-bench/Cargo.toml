@@ -18,6 +18,10 @@ default = []
 # RFC-030 ANN index bench (`ann-bench`): builds the real Vamana `.vg` and queries
 # it through the engine. Off by default so the standard bench build stays light.
 vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
+# Object-store-native acceptance harness. This deliberately exercises the
+# range-readable wire formats directly, without bringing the query executor
+# into the measurement.
+object-native = ["namidb-storage/vector-index", "namidb-storage/text-index"]
 
 [dependencies]
 namidb-core = { workspace = true }
@@ -26,10 +30,15 @@ namidb-query = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 object_store = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+tempfile = { workspace = true }
 rand = "0.8"
 rand_chacha = "0.3"
 csv = "1.3"

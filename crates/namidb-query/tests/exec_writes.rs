@@ -4059,28 +4059,59 @@ async fn correlated_unique_match_set_batches_existing_node_updates() {
 
 #[tokio::test]
 async fn write_only_vector_update_discards_rows_and_embedding_results() {
-    const ROWS: usize = 12;
+    // Large enough to cross several default correlated-write chunks while
+    // remaining practical in the integration suite. Every committed source
+    // node already carries a wide vector: this is the incremental
+    // re-vectorisation case that previously retained the complete old corpus
+    // slice plus a second copy of the request.
+    const ROWS: usize = 2_000;
     const DIMENSIONS: usize = 1024;
 
     let mut writer = WriterSession::open(store(), paths("w-match-set-vector-discard"))
         .await
         .unwrap();
-    write_q(
-        &mut writer,
-        "UNWIND range(1, 24) AS i \
-         CREATE (:Articulo {key: toString(i), titulo: 'old'})",
-    )
-    .await;
+    for i in 1..=ROWS {
+        writer
+            .upsert_node(
+                "Articulo",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(i.to_string())),
+                        (
+                            "embedding".into(),
+                            CoreValue::Vec(vec![-(i as f32); DIMENSIONS]),
+                        ),
+                        ("titulo".into(), CoreValue::Str("old".into())),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
     let schema = SchemaBuilder::new()
         .label(LabelDef {
             name: "Articulo".into(),
-            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
-                .unwrap()
-                .with_unique(true)],
+            properties: vec![
+                PropertyDef::new("key", DataType::Utf8, false)
+                    .unwrap()
+                    .with_unique(true),
+                PropertyDef::new(
+                    "embedding",
+                    DataType::FloatVector {
+                        dim: DIMENSIONS as u32,
+                    },
+                    false,
+                )
+                .unwrap(),
+                PropertyDef::new("titulo", DataType::Utf8, false).unwrap(),
+            ],
         })
         .unwrap()
         .build();
-    writer.flush(schema).await.unwrap();
+    writer.flush(schema.clone()).await.unwrap();
 
     let query = parse(
         "UNWIND $rows AS row \
@@ -4097,7 +4128,7 @@ async fn write_only_vector_update_discards_rows_and_embedding_results() {
         "write-only statement must keep its explicit result sink after optimization: {plan:?}"
     );
 
-    let rows = (1..=ROWS)
+    let mut rows = (1..=ROWS)
         .map(|i| {
             let embedding = (0..DIMENSIONS)
                 .map(|dimension| i as f32 + dimension as f32 / 1024.0)
@@ -4111,10 +4142,41 @@ async fn write_only_vector_update_discards_rows_and_embedding_results() {
                 ),
             ]))
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Cross-chunk duplicate: the final rewrite must observe the staged value
+    // from the earlier chunk (RYOW) and win without rehydrating/storing every
+    // prior row.
+    rows.push(RuntimeValue::Map(BTreeMap::from([
+        ("key".into(), RuntimeValue::String("1".into())),
+        (
+            "embedding".into(),
+            RuntimeValue::Vector(vec![42.0; DIMENSIONS]),
+        ),
+        (
+            "titulo".into(),
+            RuntimeValue::String("articulo-1-final".into()),
+        ),
+    ])));
+    // A miss must stay a miss without forcing the staged-aware fallback or
+    // being confused with a prior chunk's local overlay.
+    rows.push(RuntimeValue::Map(BTreeMap::from([
+        ("key".into(), RuntimeValue::String("does-not-exist".into())),
+        (
+            "embedding".into(),
+            RuntimeValue::Vector(vec![777.0; DIMENSIONS]),
+        ),
+        (
+            "titulo".into(),
+            RuntimeValue::String("must-not-be-written".into()),
+        ),
+    ])));
+    let update_rows = rows.len();
+    let matched_update_rows = ROWS + 1; // all originals + one duplicate
     let mut params = Params::new();
     params.insert("rows".into(), RuntimeValue::List(rows));
 
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let staged_scan_rows_before = writer.staged_unique_overlay_rows_scanned();
     let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
     assert!(
         outcome.rows.is_empty(),
@@ -4125,7 +4187,50 @@ async fn write_only_vector_update_discards_rows_and_embedding_results() {
         0,
         "the sink must not allocate an output batch that retains cloned embeddings"
     );
-    assert_eq!(outcome.properties_set, (ROWS * 2) as u64);
+    assert_eq!(
+        outcome.properties_set,
+        (matched_update_rows * 2) as u64,
+        "the missing key must not stage either SET"
+    );
+    let chunk_rows = outcome.correlated_write_chunk_rows as usize;
+    assert!(
+        chunk_rows > 0,
+        "the write-only correlated SET must select the bounded path"
+    );
+    assert!(
+        outcome.correlated_write_peak_hydrated_rows <= chunk_rows as u64,
+        "hydrated old NodeViews escaped the configured chunk: peak={} cap={chunk_rows}",
+        outcome.correlated_write_peak_hydrated_rows
+    );
+    assert!(
+        outcome.correlated_write_peak_materialized_rows <= chunk_rows as u64,
+        "materialized executor rows escaped the configured chunk: peak={} cap={chunk_rows}",
+        outcome.correlated_write_peak_materialized_rows
+    );
+    assert_eq!(
+        outcome.correlated_write_lookup_batches,
+        update_rows.div_ceil(chunk_rows) as u64,
+        "each chunk must issue exactly one sidecar-backed point batch"
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        outcome.correlated_write_lookup_batches,
+        "the observable storage batches must agree with the executor counter"
+    );
+    assert_eq!(
+        outcome.correlated_write_local_overlay_hits, 1,
+        "only the deliberate cross-chunk duplicate should use the scalar local overlay"
+    );
+    assert_eq!(
+        writer.staged_unique_overlay_rows_scanned(),
+        staged_scan_rows_before,
+        "the bounded clean-transaction path must never rescan accumulated staged embeddings"
+    );
+    assert_eq!(
+        writer.staged_memtable_len(),
+        0,
+        "commit must release the transaction-local LWW overlay"
+    );
 
     let snapshot = writer.snapshot();
     let updated = snapshot
@@ -4144,6 +4249,456 @@ async fn write_only_vector_update_discards_rows_and_embedding_results() {
         updated.properties.get("titulo"),
         Some(&namidb_core::Value::Str(format!("articulo-{ROWS}")))
     );
+
+    let duplicate = snapshot
+        .lookup_node_by_property("Articulo", "key", "1")
+        .await
+        .unwrap()
+        .expect("duplicate-key article");
+    assert_eq!(
+        duplicate.properties.get("embedding"),
+        Some(&namidb_core::Value::Vec(vec![42.0; DIMENSIONS])),
+        "the final cross-chunk duplicate must win"
+    );
+    assert_eq!(
+        duplicate.properties.get("titulo"),
+        Some(&namidb_core::Value::Str("articulo-1-final".into()))
+    );
+    drop(snapshot);
+
+    // Flush must release the complete updated-vector memtable, not leave one
+    // retained payload per existing node behind.
+    assert!(
+        writer.memtable_bytes() > 0,
+        "the committed updates should be visible in the live memtable before flush"
+    );
+    writer.flush(schema).await.unwrap();
+    assert_eq!(
+        writer.memtable_bytes(),
+        0,
+        "flush must release committed update payloads"
+    );
+
+    // A later-row expression error can arrive after earlier rows (and even an
+    // earlier SET on the failing row) have staged more than one complete
+    // lookup chunk. The auto-commit statement boundary must still discard
+    // every chunk atomically.
+    let failing_query = parse(
+        "UNWIND $rows AS row \
+         MATCH (a:Articulo {key: row.key}) \
+         SET a.embedding = row.embedding, a.titulo = toString(10 / row.divisor)",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let failing_plan = optimize(lower(&failing_query).unwrap(), &catalog);
+    let mut failing_params = Params::new();
+    let failing_row_count = chunk_rows + 1;
+    let failing_rows = (0..failing_row_count)
+        .map(|offset| {
+            let key = (offset % ROWS) + 1;
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String(key.to_string())),
+                (
+                    "embedding".into(),
+                    RuntimeValue::Vector(vec![99.0 + offset as f32; DIMENSIONS]),
+                ),
+                (
+                    "divisor".into(),
+                    RuntimeValue::Integer(if offset + 1 == failing_row_count {
+                        0
+                    } else {
+                        2
+                    }),
+                ),
+            ]))
+        })
+        .collect();
+    failing_params.insert("rows".into(), RuntimeValue::List(failing_rows));
+    let staged_scan_rows_before_failure = writer.staged_unique_overlay_rows_scanned();
+    let error = execute_write(&failing_plan, &mut writer, &failing_params)
+        .await
+        .expect_err("division by zero must abort the complete correlated update");
+    assert!(
+        error.to_string().contains("division by zero"),
+        "unexpected correlated update error: {error}"
+    );
+    assert_eq!(
+        writer.staged_memtable_len(),
+        0,
+        "a late error must release every staged wide-node payload"
+    );
+    assert_eq!(
+        writer.staged_unique_overlay_rows_scanned(),
+        staged_scan_rows_before_failure,
+        "rollback coverage must retain the O(total rows) local-overlay path"
+    );
+
+    let snapshot = writer.snapshot();
+    let rolled_back = snapshot
+        .lookup_node_by_property("Articulo", "key", "2")
+        .await
+        .unwrap()
+        .expect("rolled-back article");
+    let expected_embedding = (0..DIMENSIONS)
+        .map(|dimension| 2.0 + dimension as f32 / 1024.0)
+        .collect();
+    assert_eq!(
+        rolled_back.properties.get("embedding"),
+        Some(&namidb_core::Value::Vec(expected_embedding)),
+        "an error after staging rows must not leak a partial vector rewrite"
+    );
+    assert_eq!(
+        rolled_back.properties.get("titulo"),
+        Some(&namidb_core::Value::Str("articulo-2".into()))
+    );
+}
+
+#[tokio::test]
+async fn write_only_unique_merge_updates_wide_nodes_in_bounded_chunks() {
+    const ROWS: usize = 2_000;
+    const DIMENSIONS: usize = 1024;
+
+    let mut writer = WriterSession::open(store(), paths("w-merge-vector-discard"))
+        .await
+        .unwrap();
+    for i in 1..=ROWS {
+        writer
+            .upsert_node(
+                "Articulo",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("key".into(), CoreValue::Str(i.to_string())),
+                        (
+                            "embedding".into(),
+                            CoreValue::Vec(vec![-(i as f32); DIMENSIONS]),
+                        ),
+                        ("titulo".into(), CoreValue::Str("old".into())),
+                        ("branch".into(), CoreValue::Str("seed".into())),
+                    ]),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Articulo".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema.clone()).await.unwrap();
+
+    let query = parse(
+        "UNWIND $rows AS row \
+         MERGE (a:Articulo {key: row.key}) \
+         ON CREATE SET a.branch = 'created' \
+         ON MATCH SET a.branch = 'matched' \
+         SET a.embedding = row.embedding, a.titulo = row.titulo",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let plan = optimize(lower(&query).unwrap(), &catalog);
+    assert!(
+        matches!(plan, namidb_query::LogicalPlan::DiscardResult { .. }),
+        "write-only MERGE must retain the terminal result sink: {plan:?}"
+    );
+
+    // A new key before the first chunk plus existing/new duplicates after the
+    // final complete chunk exercise both MERGE branches and cross-chunk RYOW.
+    let mut rows = vec![RuntimeValue::Map(BTreeMap::from([
+        ("key".into(), RuntimeValue::String("new".into())),
+        (
+            "embedding".into(),
+            RuntimeValue::Vector(vec![7.0; DIMENSIONS]),
+        ),
+        ("titulo".into(), RuntimeValue::String("new-first".into())),
+    ]))];
+    rows.extend((1..=ROWS).map(|i| {
+        RuntimeValue::Map(BTreeMap::from([
+            ("key".into(), RuntimeValue::String(i.to_string())),
+            (
+                "embedding".into(),
+                RuntimeValue::Vector(vec![i as f32; DIMENSIONS]),
+            ),
+            ("titulo".into(), RuntimeValue::String(format!("merge-{i}"))),
+        ]))
+    }));
+    rows.push(RuntimeValue::Map(BTreeMap::from([
+        ("key".into(), RuntimeValue::String("1".into())),
+        (
+            "embedding".into(),
+            RuntimeValue::Vector(vec![41.0; DIMENSIONS]),
+        ),
+        (
+            "titulo".into(),
+            RuntimeValue::String("merge-1-final".into()),
+        ),
+    ])));
+    rows.push(RuntimeValue::Map(BTreeMap::from([
+        ("key".into(), RuntimeValue::String("new".into())),
+        (
+            "embedding".into(),
+            RuntimeValue::Vector(vec![42.0; DIMENSIONS]),
+        ),
+        ("titulo".into(), RuntimeValue::String("new-final".into())),
+    ])));
+    let row_count = rows.len();
+    let mut params = Params::new();
+    params.insert("rows".into(), RuntimeValue::List(rows));
+
+    let point_reads_before = writer.property_index_cache().unique_lookup_calls();
+    let staged_scan_rows_before = writer.staged_unique_overlay_rows_scanned();
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert!(outcome.rows.is_empty());
+    assert_eq!(outcome.rows.capacity(), 0);
+    assert_eq!(outcome.nodes_created, 1);
+    assert_eq!(outcome.properties_set, (row_count * 3) as u64);
+    let chunk_rows = outcome.correlated_write_chunk_rows as usize;
+    assert!(chunk_rows > 0, "MERGE must use the bounded terminal path");
+    assert!(
+        outcome.correlated_write_peak_hydrated_rows <= chunk_rows as u64,
+        "MERGE hydrated peak {} exceeded chunk {chunk_rows}",
+        outcome.correlated_write_peak_hydrated_rows
+    );
+    assert!(
+        outcome.correlated_write_peak_materialized_rows <= chunk_rows as u64,
+        "MERGE materialized peak {} exceeded chunk {chunk_rows}",
+        outcome.correlated_write_peak_materialized_rows
+    );
+    assert_eq!(
+        outcome.correlated_write_lookup_batches,
+        row_count.div_ceil(chunk_rows) as u64
+    );
+    assert_eq!(
+        writer.property_index_cache().unique_lookup_calls() - point_reads_before,
+        outcome.correlated_write_lookup_batches
+    );
+    assert_eq!(outcome.correlated_write_local_overlay_hits, 2);
+    assert_eq!(
+        writer.staged_unique_overlay_rows_scanned(),
+        staged_scan_rows_before,
+        "bounded MERGE must not walk accumulated staged vector records"
+    );
+    assert_eq!(writer.staged_memtable_len(), 0);
+
+    let snapshot = writer.snapshot();
+    let existing = snapshot
+        .lookup_node_by_property("Articulo", "key", "1")
+        .await
+        .unwrap()
+        .expect("existing MERGE row");
+    assert_eq!(
+        existing.properties.get("embedding"),
+        Some(&CoreValue::Vec(vec![41.0; DIMENSIONS]))
+    );
+    assert_eq!(
+        existing.properties.get("titulo"),
+        Some(&CoreValue::Str("merge-1-final".into()))
+    );
+    assert_eq!(
+        existing.properties.get("branch"),
+        Some(&CoreValue::Str("matched".into()))
+    );
+    let created = snapshot
+        .lookup_node_by_property("Articulo", "key", "new")
+        .await
+        .unwrap()
+        .expect("new MERGE row");
+    assert_eq!(
+        created.properties.get("embedding"),
+        Some(&CoreValue::Vec(vec![42.0; DIMENSIONS]))
+    );
+    assert_eq!(
+        created.properties.get("branch"),
+        Some(&CoreValue::Str("matched".into())),
+        "the repeated new key must take ON MATCH after its ON CREATE row"
+    );
+    drop(snapshot);
+
+    writer.flush(schema).await.unwrap();
+    assert_eq!(writer.memtable_bytes(), 0);
+
+    // Fail after more than one chunk, including a newly-created key. The
+    // auto-commit boundary must release every wide staged payload and the
+    // created node.
+    let failing_query = parse(
+        "UNWIND $rows AS row \
+         MERGE (a:Articulo {key: row.key}) \
+         ON MATCH SET a.embedding = row.embedding \
+         ON CREATE SET a.embedding = row.embedding \
+         SET a.titulo = toString(10 / row.divisor)",
+    )
+    .unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    drop(snapshot);
+    let failing_plan = optimize(lower(&failing_query).unwrap(), &catalog);
+    let failing_row_count = chunk_rows + 1;
+    let failing_rows = (0..failing_row_count)
+        .map(|offset| {
+            let key = if offset == 0 {
+                "rollback-new".to_string()
+            } else {
+                ((offset % ROWS) + 1).to_string()
+            };
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String(key)),
+                (
+                    "embedding".into(),
+                    RuntimeValue::Vector(vec![99.0 + offset as f32; DIMENSIONS]),
+                ),
+                (
+                    "divisor".into(),
+                    RuntimeValue::Integer(if offset + 1 == failing_row_count {
+                        0
+                    } else {
+                        2
+                    }),
+                ),
+            ]))
+        })
+        .collect();
+    let mut failing_params = Params::new();
+    failing_params.insert("rows".into(), RuntimeValue::List(failing_rows));
+    let staged_scan_rows_before_failure = writer.staged_unique_overlay_rows_scanned();
+    let error = execute_write(&failing_plan, &mut writer, &failing_params)
+        .await
+        .expect_err("late MERGE expression failure must roll back every chunk");
+    assert!(error.to_string().contains("division by zero"));
+    assert_eq!(writer.staged_memtable_len(), 0);
+    assert_eq!(
+        writer.staged_unique_overlay_rows_scanned(),
+        staged_scan_rows_before_failure
+    );
+    assert!(
+        writer
+            .snapshot()
+            .lookup_node_by_property("Articulo", "key", "rollback-new")
+            .await
+            .unwrap()
+            .is_none(),
+        "the new-key branch must not survive a late rollback"
+    );
+}
+
+#[tokio::test]
+async fn write_only_unique_merge_key_mutation_uses_exact_fallback() {
+    let mut writer = WriterSession::open(store(), paths("w-merge-key-mutation-fallback"))
+        .await
+        .unwrap();
+    writer
+        .upsert_node(
+            "Articulo",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: BTreeMap::from([("key".into(), CoreValue::Str("fallback".into()))]),
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Articulo".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .build();
+    writer.flush(schema).await.unwrap();
+
+    let plan = lower(
+        &parse(
+            "UNWIND $rows AS row \
+             MERGE (a:Articulo {key: row.key}) \
+             ON MATCH SET a.key = row.next \
+             ON CREATE SET a.marker = 'created'",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut params = Params::new();
+    params.insert(
+        "rows".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String("fallback".into())),
+                (
+                    "next".into(),
+                    RuntimeValue::String("fallback-renamed".into()),
+                ),
+            ])),
+            RuntimeValue::Map(BTreeMap::from([
+                ("key".into(), RuntimeValue::String("fallback".into())),
+                ("next".into(), RuntimeValue::String("fallback-final".into())),
+            ])),
+        ]),
+    );
+    let outcome = execute_write(&plan, &mut writer, &params).await.unwrap();
+    assert_eq!(
+        outcome.correlated_write_chunk_rows, 0,
+        "lookup-key mutation must reject the specialised path"
+    );
+    assert_eq!(outcome.nodes_created, 1);
+    let snapshot = writer.snapshot();
+    assert!(snapshot
+        .lookup_node_by_property("Articulo", "key", "fallback")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(snapshot
+        .lookup_node_by_property("Articulo", "key", "fallback-renamed")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(snapshot
+        .lookup_node_by_property("Articulo", "key", "fallback-final")
+        .await
+        .unwrap()
+        .is_none());
+    drop(snapshot);
+
+    let prior_write = lower(&parse("CREATE (:Articulo {key: 'prior-staged'})").unwrap()).unwrap();
+    execute_write_staged(&prior_write, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    let safe_merge = lower(
+        &parse(
+            "UNWIND $rows AS row \
+             MERGE (a:Articulo {key: row.key}) \
+             SET a.marker = 'safe'",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut safe_params = Params::new();
+    safe_params.insert(
+        "rows".into(),
+        RuntimeValue::List(vec![RuntimeValue::Map(BTreeMap::from([(
+            "key".into(),
+            RuntimeValue::String("fallback".into()),
+        )]))]),
+    );
+    let staged_outcome = execute_write_staged(&safe_merge, &mut writer, &safe_params)
+        .await
+        .unwrap();
+    assert_eq!(
+        staged_outcome.correlated_write_chunk_rows, 0,
+        "a transaction with prior staged node writes must retain the canonical RYOW path"
+    );
+    writer.discard_batch();
 }
 
 #[tokio::test]
@@ -5213,4 +5768,145 @@ async fn merge_relationship_matches_compound_temporal_bytes_and_vector_propertie
         persisted, expected,
         "the final ON MATCH property map must survive commit and flush"
     );
+}
+
+/// The storage model keys relationships by `(edge_type, src, dst)`: creating
+/// the same triple twice is a last-write-wins upsert, not a second parallel
+/// edge. That is a deliberate divergence from Neo4j (where CREATE always adds
+/// an edge) and the 25 TB load plan depends on it — this pins the contract on
+/// the memtable route, across statements, and through a flush.
+#[tokio::test]
+async fn same_triple_create_is_last_write_wins_not_parallel_edges() {
+    let mut writer = WriterSession::open(store(), paths("w-parallel-edges"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Person".into(),
+            properties: vec![PropertyDef::new("key", DataType::Utf8, false)
+                .unwrap()
+                .with_unique(true)],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "KNOWS".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            properties: vec![PropertyDef::new("weight", DataType::Int64, false).unwrap()],
+        })
+        .unwrap()
+        .build();
+
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {key: 'a'})-[:KNOWS {weight: 1}]->(b:Person {key: 'b'})",
+    )
+    .await;
+
+    // Same triple inside one statement: the second CREATE overwrites the
+    // first edge's properties instead of adding a sibling.
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'a'}), (b:Person {key: 'b'}) \
+         CREATE (a)-[:KNOWS {weight: 2}]->(b)",
+    )
+    .await;
+
+    async fn knows_weights(writer: &WriterSession) -> Vec<i64> {
+        let snap = writer.snapshot();
+        let plan = lower(
+            &parse("MATCH (:Person {key: 'a'})-[r:KNOWS]->(:Person {key: 'b'}) RETURN r").unwrap(),
+        )
+        .unwrap();
+        let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+        rows.iter()
+            .map(|row| match row.get("r") {
+                Some(RuntimeValue::Rel(rel)) => match rel.properties.get("weight") {
+                    Some(RuntimeValue::Integer(w)) => *w,
+                    other => panic!("weight must be an integer, got {other:?}"),
+                },
+                other => panic!("expected a relationship binding, got {other:?}"),
+            })
+            .collect()
+    }
+
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![2],
+        "one surviving edge with the last write's properties (memtable route)"
+    );
+
+    // A third write in a separate transaction after a flush: still one edge,
+    // still last-write-wins, now reconciling SST + memtable versions.
+    writer.flush(schema.clone()).await.unwrap();
+    write_q(
+        &mut writer,
+        "MATCH (a:Person {key: 'a'}), (b:Person {key: 'b'}) \
+         CREATE (a)-[:KNOWS {weight: 3}]->(b)",
+    )
+    .await;
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![3],
+        "the post-flush rewrite supersedes the persisted edge"
+    );
+    writer.flush(schema).await.unwrap();
+    assert_eq!(
+        knows_weights(&writer).await,
+        vec![3],
+        "reconciled persisted state keeps exactly one edge"
+    );
+}
+
+/// openCypher/Neo4j: deleting a connected node without DETACH is an error —
+/// never a silent commit of dangling edges that traversals would then half
+/// resurrect. DETACH DELETE removes node and relationships atomically.
+#[tokio::test]
+async fn bare_delete_of_connected_node_errors_detach_succeeds() {
+    async fn count(writer: &WriterSession, q_text: &str) -> usize {
+        let snap = writer.snapshot();
+        let plan = lower(&parse(q_text).unwrap()).unwrap();
+        execute(&plan, &snap, &Params::new()).await.unwrap().len()
+    }
+    let mut writer = WriterSession::open(store(), paths("w-bare-delete"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    )
+    .await;
+
+    let plan = lower(&parse("MATCH (a:Person {name: 'Ada'}) DELETE a").unwrap()).unwrap();
+    let error = execute_write(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("DETACH"),
+        "bare DELETE of a connected node must point at DETACH DELETE: {error}"
+    );
+    // The failed statement must not have committed anything.
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 2);
+    assert_eq!(
+        count(&writer, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r").await,
+        1
+    );
+
+    // A disconnected node deletes bare, and DETACH removes both atomically.
+    write_q(&mut writer, "CREATE (:Person {name: 'Solo'})").await;
+    let outcome = write_q(&mut writer, "MATCH (s:Person {name: 'Solo'}) DELETE s").await;
+    assert_eq!(outcome.nodes_deleted, 1);
+    let outcome = write_q(
+        &mut writer,
+        "MATCH (a:Person {name: 'Ada'}) DETACH DELETE a",
+    )
+    .await;
+    assert_eq!(outcome.nodes_deleted, 1);
+    assert_eq!(outcome.edges_deleted, 1);
+    assert_eq!(
+        count(&writer, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r").await,
+        0,
+        "DETACH DELETE leaves no dangling edge"
+    );
+    assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
 }

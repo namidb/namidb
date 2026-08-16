@@ -662,7 +662,12 @@ mod tests {
         let (_unused, paths) = namidb_storage::parse_uri("memory://maintenance-fairness").unwrap();
         let blocking_store = Arc::new(BlockFirstSstGet {
             inner: Arc::new(object_store::memory::InMemory::new()),
-            should_block: AtomicBool::new(true),
+            // Armed below, immediately before the compaction trigger. Flush
+            // itself reads SSTs back (it mirrors equality sidecars into their
+            // paged form), so arming at construction lets the setup flushes
+            // consume the one-shot barrier and deadlock the test against a
+            // `release` that is only sent once the worker is in flight.
+            should_block: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         });
@@ -674,6 +679,7 @@ mod tests {
         commit_and_flush(&state, NodeId::new(), "second").await;
         assert_eq!(state.writer.lock().await.max_l0_bucket_len(), 2);
 
+        blocking_store.should_block.store(true, Ordering::SeqCst);
         let scheduler = Arc::new(CompactionScheduler::new());
         let worker = request_for_state(&state, &scheduler, CompactionTrigger::Periodic)
             .expect("the first trigger must start the sole worker");
@@ -718,7 +724,9 @@ mod tests {
             .await
             .expect("the two-pass burst must drain")
             .expect("compaction worker must not panic");
-        scheduler.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(30), scheduler.wait_idle())
+            .await
+            .expect("the compaction scheduler must reach idle");
         assert_eq!(
             scheduler.stats(),
             (false, false, 1, 2),
@@ -757,18 +765,35 @@ mod tests {
             namidb_storage::parse_uri("memory://maintenance-sweep-exclusion").unwrap();
         let blocking_store = Arc::new(BlockFirstSstGet {
             inner: Arc::new(object_store::memory::InMemory::new()),
-            should_block: AtomicBool::new(true),
+            // Armed after the setup flushes: those read SSTs back and would
+            // otherwise consume the one-shot barrier the compaction needs.
+            should_block: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         });
         let store: Arc<dyn ObjectStore> = blocking_store.clone();
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, None, "maintenance-sweep-exclusion".into());
-        commit_and_flush(&state, NodeId::new(), "first").await;
-        commit_and_flush(&state, NodeId::new(), "second").await;
+        // Guarded so a setup flush that blocks on the store barrier fails
+        // legibly instead of hanging the whole CI job.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            commit_and_flush(&state, NodeId::new(), "first"),
+        )
+        .await
+        .expect("setup flush must not block on the SST barrier");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            commit_and_flush(&state, NodeId::new(), "second"),
+        )
+        .await
+        .expect("second setup flush must not block on the SST barrier");
 
+        blocking_store.should_block.store(true, Ordering::SeqCst);
         let scheduler = Arc::new(CompactionScheduler::new());
-        scheduler.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(30), scheduler.wait_idle())
+            .await
+            .expect("the compaction scheduler must reach idle");
         let sweep_guard = scheduler.sweep_guard().await;
         let worker = request_for_state(&state, &scheduler, CompactionTrigger::Reactive)
             .expect("the racing trigger starts the sole worker");
@@ -805,16 +830,31 @@ mod tests {
             namidb_storage::parse_uri("memory://maintenance-cancel-install").unwrap();
         let blocking_store = Arc::new(BlockFirstSstGet {
             inner: Arc::new(object_store::memory::InMemory::new()),
-            should_block: AtomicBool::new(true),
+            // Armed after the setup flushes: those read SSTs back and would
+            // otherwise consume the one-shot barrier the compaction needs.
+            should_block: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         });
         let store: Arc<dyn ObjectStore> = blocking_store.clone();
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, None, "maintenance-cancel-install".into());
-        commit_and_flush(&state, NodeId::new(), "first").await;
-        commit_and_flush(&state, NodeId::new(), "second").await;
+        // Guarded so a setup flush that blocks on the store barrier fails
+        // legibly instead of hanging the whole CI job.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            commit_and_flush(&state, NodeId::new(), "first"),
+        )
+        .await
+        .expect("setup flush must not block on the SST barrier");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            commit_and_flush(&state, NodeId::new(), "second"),
+        )
+        .await
+        .expect("second setup flush must not block on the SST barrier");
 
+        blocking_store.should_block.store(true, Ordering::SeqCst);
         let scheduler = Arc::new(CompactionScheduler::new());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = request_compaction(
@@ -839,7 +879,9 @@ mod tests {
             .expect("cancelled prepare must terminate")
             .expect("worker must not panic");
 
-        scheduler.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(30), scheduler.wait_idle())
+            .await
+            .expect("the compaction scheduler must reach idle");
         assert_eq!(
             state.writer.lock().await.max_l0_bucket_len(),
             2,

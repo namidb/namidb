@@ -10,10 +10,12 @@
 
 pub mod bloom;
 pub mod edges;
+pub(crate) mod external_pairs;
 pub mod hll;
 pub mod nodes;
 pub(crate) mod paged_index;
 pub mod predicates;
+pub mod search_delta;
 pub mod stats;
 #[cfg(feature = "text-index")]
 pub mod text;

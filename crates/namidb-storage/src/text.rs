@@ -28,6 +28,7 @@
 //! inside the IDF log is the Lucene form that keeps IDF non-negative.
 
 use std::collections::{BTreeSet, HashMap};
+use std::convert::Infallible;
 
 /// BM25 `k1` — term-frequency saturation point.
 pub const K1: f64 = 1.5;
@@ -189,6 +190,43 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Visit lowercased tokens one at a time, stopping immediately if `visitor`
+/// returns an error.
+///
+/// Unlike [`tokenize`], this never retains a document-sized token vector. It
+/// also walks CJK runs with a rolling two-character window, so a giant CJK
+/// segment does not first become a `Vec<char>`. The callback's `&str` is valid
+/// only for the duration of that callback.
+pub fn try_visit_tokens<E>(
+    text: &str,
+    mut visitor: impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut scratch = String::new();
+    let mut emitted = 0usize;
+    for segment in text.split(|c: char| !c.is_alphanumeric()) {
+        if segment.is_empty() {
+            continue;
+        }
+        emitted = emitted.saturating_add(try_visit_segment_tokens(
+            segment,
+            &mut scratch,
+            &mut visitor,
+        )?);
+    }
+    Ok(emitted)
+}
+
+/// Infallible streaming token visitor. Returns the emitted document length.
+pub fn visit_tokens(text: &str, mut visitor: impl FnMut(&str)) -> usize {
+    match try_visit_tokens(text, |token| {
+        visitor(token);
+        Ok::<(), Infallible>(())
+    }) {
+        Ok(emitted) => emitted,
+        Err(never) => match never {},
+    }
+}
+
 /// Tokenize text into lowercased terms (split on non-alphanumeric runs; no
 /// stemming, no stopwords).
 ///
@@ -207,55 +245,113 @@ fn is_cjk(c: char) -> bool {
 /// authoritative compaction).
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for segment in text.split(|c: char| !c.is_alphanumeric()) {
-        if segment.is_empty() {
-            continue;
-        }
-        emit_segment_tokens(segment, &mut out);
-    }
+    visit_tokens(text, |token| out.push(token.to_owned()));
     out
 }
 
 /// Emit tokens for one maximal alphanumeric segment: non-CJK subruns become one
 /// lowercased word each; CJK subruns become overlapping lowercased bigrams.
 fn emit_segment_tokens(segment: &str, out: &mut Vec<String>) {
-    let chars: Vec<char> = segment.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if is_cjk(chars[i]) {
-            // Consume the maximal CJK run and emit overlapping bigrams.
-            let start = i;
-            while i < chars.len() && is_cjk(chars[i]) {
-                i += 1;
-            }
-            let run = &chars[start..i];
-            if run.len() == 1 {
-                out.push(run[0].to_lowercase().to_string());
-            } else {
-                for w in run.windows(2) {
-                    out.push(w.iter().collect::<String>().to_lowercase());
-                }
-            }
-        } else {
-            // Consume the maximal non-CJK run as one word.
-            let start = i;
-            while i < chars.len() && !is_cjk(chars[i]) {
-                i += 1;
-            }
-            out.push(chars[start..i].iter().collect::<String>().to_lowercase());
-        }
+    let mut scratch = String::new();
+    match try_visit_segment_tokens(segment, &mut scratch, &mut |token| {
+        out.push(token.to_owned());
+        Ok::<(), Infallible>(())
+    }) {
+        Ok(_) => {}
+        Err(never) => match never {},
     }
+}
+
+/// Visit one maximal alphanumeric segment without materialising its Unicode
+/// scalar values. Byte offsets delimit CJK/non-CJK subruns safely.
+fn try_visit_segment_tokens<E>(
+    segment: &str,
+    scratch: &mut String,
+    visitor: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut chars = segment.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return Ok(0);
+    };
+    let mut run_start = 0usize;
+    let mut run_is_cjk = is_cjk(first);
+    let mut emitted = 0usize;
+
+    for (offset, current) in chars {
+        let current_is_cjk = is_cjk(current);
+        if current_is_cjk == run_is_cjk {
+            continue;
+        }
+        emitted = emitted.saturating_add(try_visit_subrun_tokens(
+            &segment[run_start..offset],
+            run_is_cjk,
+            scratch,
+            visitor,
+        )?);
+        run_start = offset;
+        run_is_cjk = current_is_cjk;
+    }
+    emitted = emitted.saturating_add(try_visit_subrun_tokens(
+        &segment[run_start..],
+        run_is_cjk,
+        scratch,
+        visitor,
+    )?);
+    Ok(emitted)
+}
+
+fn try_visit_subrun_tokens<E>(
+    run: &str,
+    cjk: bool,
+    scratch: &mut String,
+    visitor: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    if !cjk {
+        scratch.clear();
+        scratch.extend(run.chars().flat_map(|c| c.to_lowercase()));
+        visitor(scratch)?;
+        return Ok(1);
+    }
+
+    let mut chars = run.chars();
+    let Some(mut previous) = chars.next() else {
+        return Ok(0);
+    };
+    let Some(mut current) = chars.next() else {
+        scratch.clear();
+        scratch.extend(previous.to_lowercase());
+        visitor(scratch)?;
+        return Ok(1);
+    };
+
+    let mut emitted = 0usize;
+    loop {
+        scratch.clear();
+        scratch.extend(previous.to_lowercase());
+        scratch.extend(current.to_lowercase());
+        visitor(scratch)?;
+        emitted = emitted.saturating_add(1);
+
+        previous = current;
+        let Some(next) = chars.next() else {
+            break;
+        };
+        current = next;
+    }
+    Ok(emitted)
 }
 
 /// Tokenize `text` into a term→count map plus the total token count (document
 /// length). The basis for corpus-aware BM25 over a document.
 pub fn tokenize_counts(text: &str) -> (HashMap<String, u32>, usize) {
-    let terms = tokenize(text);
-    let len = terms.len();
     let mut counts: HashMap<String, u32> = HashMap::new();
-    for t in terms {
-        *counts.entry(t).or_insert(0) += 1;
-    }
+    let len = visit_tokens(text, |term| {
+        if let Some(count) = counts.get_mut(term) {
+            *count = count.saturating_add(1);
+        } else {
+            counts.insert(term.to_owned(), 1);
+        }
+    });
     (counts, len)
 }
 
@@ -295,6 +391,7 @@ pub fn avg_len(total_len: u64, n_docs: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
 
     #[test]
     fn idf_rewards_rarer_terms_and_stays_non_negative() {
@@ -357,6 +454,84 @@ mod tests {
         assert_eq!(tokenize("iPhone東京"), vec!["iphone", "東京"]);
         // Latin words are unaffected.
         assert_eq!(tokenize("hello world"), vec!["hello", "world"]);
+    }
+
+    /// Frozen copy of the pre-streaming tokenizer. Keeping the old
+    /// `Vec<char>` implementation in tests makes Unicode/CJK compatibility a
+    /// direct differential assertion rather than a handful of examples.
+    fn reference_tokenize(text: &str) -> Vec<String> {
+        fn emit_reference_segment(segment: &str, out: &mut Vec<String>) {
+            let chars: Vec<char> = segment.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if is_cjk(chars[i]) {
+                    let start = i;
+                    while i < chars.len() && is_cjk(chars[i]) {
+                        i += 1;
+                    }
+                    let run = &chars[start..i];
+                    if run.len() == 1 {
+                        out.push(run[0].to_lowercase().to_string());
+                    } else {
+                        for window in run.windows(2) {
+                            out.push(window.iter().collect::<String>().to_lowercase());
+                        }
+                    }
+                } else {
+                    let start = i;
+                    while i < chars.len() && !is_cjk(chars[i]) {
+                        i += 1;
+                    }
+                    out.push(chars[start..i].iter().collect::<String>().to_lowercase());
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for segment in text.split(|c: char| !c.is_alphanumeric()) {
+            if !segment.is_empty() {
+                emit_reference_segment(segment, &mut out);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn streaming_tokenizer_matches_legacy_reference_on_adversarial_unicode() {
+        let mut text = String::from("CAFÉ—ÜBER;ПРИВЕТ iPhone東京 ");
+        // One giant run yields thousands of distinct overlapping CJK bigrams.
+        for codepoint in 0x3400..0x4400 {
+            text.push(char::from_u32(codepoint).unwrap());
+        }
+        // Thousands of short distinct Latin/digit tokens stress the opposite
+        // segmentation shape and Unicode lowercasing between CJK runs.
+        for i in 0..4_096 {
+            write!(&mut text, " Term{i}あ漢 ").unwrap();
+        }
+
+        let expected = reference_tokenize(&text);
+        assert_eq!(tokenize(&text), expected);
+
+        let mut streamed = Vec::new();
+        let emitted = visit_tokens(&text, |token| streamed.push(token.to_owned()));
+        assert_eq!(emitted, expected.len());
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn fallible_token_visitor_stops_without_scanning_the_tail() {
+        let mut visited = Vec::new();
+        let error = try_visit_tokens("one two three four", |token| {
+            visited.push(token.to_owned());
+            if token == "two" {
+                Err("stop")
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "stop");
+        assert_eq!(visited, vec!["one", "two"]);
     }
 
     #[test]

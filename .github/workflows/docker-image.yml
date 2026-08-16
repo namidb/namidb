@@ -58,7 +58,6 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   # The Docker Hub username is a repo *variable*, not a secret: as a secret
@@ -101,6 +100,12 @@ jobs:
             PROMOTE_ROLLING=false
           fi
 
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ "$PUBLISH" == "true" && ! "$VERSION" =~ $SEMVER_RE ]]; then
+            echo "::error::Invalid release version: $VERSION"
+            exit 1
+          fi
+
           ROLLING_TAGS=""
           # Rolling tags belong only to a new stable tag push. They are
           # promoted after both registries' immutable manifests validate.
@@ -119,6 +124,7 @@ jobs:
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           ref: ${{ steps.compute.outputs.ref }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -173,6 +179,9 @@ jobs:
   # *by digest* to every target repository; tags are attached in `publish`.
   build:
     needs: meta
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: true
       matrix:
@@ -187,6 +196,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           ref: ${{ needs.meta.outputs.ref }}
 
       - name: Resolve image source revision
@@ -236,6 +246,11 @@ jobs:
             NAMIDB_VERSION=${{ needs.meta.outputs.version || 'dev' }}
             NAMIDB_REVISION=${{ steps.source.outputs.revision }}
           outputs: ${{ steps.out.outputs.outputs }}
+          # BuildKit emits in-registry SPDX and SLSA provenance attestations
+          # for official immutable images. Cache-only PR builds cannot export
+          # attestations, so keep those explicitly disabled.
+          sbom: ${{ needs.meta.outputs.publish == 'true' }}
+          provenance: ${{ needs.meta.outputs.publish == 'true' && 'mode=max' || 'false' }}
           cache-from: type=gha,scope=docker-image-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=docker-image-${{ matrix.arch }}
 
@@ -260,6 +275,12 @@ jobs:
     needs: [meta, build]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+      packages: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -284,6 +305,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Publish immutable manifests, verify both registries, then promote rolling tags
+        id: publish
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           ROLLING_TAGS_TEXT: ${{ needs.meta.outputs.rolling_tags }}
@@ -308,7 +330,31 @@ jobs:
             for D in "${DIGESTS[@]}"; do
               SRCS+=("$IMG@sha256:$D")
             done
-            docker buildx imagetools create -t "$IMG:$VERSION" "${SRCS[@]}"
+
+            # An immutable version may be retried only when the candidate is
+            # descriptor-for-descriptor identical. Never overwrite an existing
+            # version tag with a rebuild that merely came from the same source.
+            CANDIDATE_MANIFESTS=$(
+              docker buildx imagetools create --dry-run "${SRCS[@]}" |
+                jq -cS '[.manifests[] |
+                  {digest, mediaType, platform}] |
+                  sort_by(.platform.os, .platform.architecture, .digest)'
+            )
+            if docker buildx imagetools inspect "$IMG:$VERSION" >/dev/null 2>&1; then
+              EXISTING_MANIFESTS=$(
+                docker buildx imagetools inspect --raw "$IMG:$VERSION" |
+                  jq -cS '[.manifests[] |
+                    {digest, mediaType, platform}] |
+                    sort_by(.platform.os, .platform.architecture, .digest)'
+              )
+              if [[ "$EXISTING_MANIFESTS" != "$CANDIDATE_MANIFESTS" ]]; then
+                echo "::error::Refusing to overwrite immutable image $IMG:$VERSION"
+                exit 1
+              fi
+              echo "Reusing byte-identical immutable image $IMG:$VERSION"
+            else
+              docker buildx imagetools create -t "$IMG:$VERSION" "${SRCS[@]}"
+            fi
           done
 
           EXPECTED_DIGESTS=""
@@ -355,3 +401,32 @@ jobs:
               test "$TAG_DIGESTS" = "$EXPECTED_DIGESTS"
             done
           done
+
+          GHCR_DIGEST=$(
+            docker buildx imagetools inspect \
+              "ghcr.io/namidb/namidb-server:$VERSION" \
+              --format '{{.Manifest.Digest}}'
+          )
+          [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "ghcr_digest=$GHCR_DIGEST" >> "$GITHUB_OUTPUT"
+
+      # BuildKit's per-platform provenance/SBOM records travel with both
+      # registries. This signed GitHub attestation binds the final multi-arch
+      # GHCR manifest itself to this workflow and source revision.
+      - name: Attest the final multi-arch GHCR manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ghcr.io/namidb/namidb-server
+          subject-digest: ${{ steps.publish.outputs.ghcr_digest }}
+          push-to-registry: true
+
+      - name: Verify the published image attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify \
+            "oci://ghcr.io/namidb/namidb-server@${{ steps.publish.outputs.ghcr_digest }}" \
+            --bundle-from-oci \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/docker-image.yml" \
+            --source-ref "$GITHUB_REF"

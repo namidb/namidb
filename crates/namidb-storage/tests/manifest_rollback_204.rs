@@ -170,12 +170,14 @@ fn manifest_205_round_trips_through_the_204_wire_prefix() {
         size_bytes: 300,
         label_count: 1,
         posting_count: 17,
+        format: PropertyIndexFormat::BincodeV0,
         per_label_counts: vec![(1, 17)],
     });
     node.node_locator = Some(NodeLocatorDescriptor {
         path: "sst/level1/nodes-articles.nloc".into(),
         size_bytes: 256,
         entry_count: 17,
+        property_pages: None,
     });
 
     let edge_stats = || KindSpecificStats::Edges {

@@ -36,12 +36,17 @@ concurrency:
   # Branch/PR preflights may still supersede an older run.
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+permissions:
+  contents: read
+
 jobs:
   validate-release:
     name: validate release metadata
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
@@ -55,6 +60,46 @@ jobs:
           python scripts/check-release-metadata.py \
             --tag "$RELEASE_TAG" --tag-kind engine
 
+  # Generate one architecture-independent dependency SBOM from the immutable
+  # source tree. This job has no release-write permission; the publishing job
+  # only receives the already-generated, attested JSON artifact.
+  build-sbom:
+    name: build and attest source SBOM
+    needs: validate-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Generate SPDX dependency SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        env:
+          SYFT_SOURCE_NAME: namidb-source
+          SYFT_SOURCE_VERSION: ${{ github.ref_name }}
+        with:
+          path: .
+          format: spdx-json
+          output-file: namidb-source-${{ github.ref_name }}.spdx.json
+          syft-version: v1.42.3
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest the source SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: namidb-source-${{ github.ref_name }}.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-source-sbom
+          path: namidb-source-${{ github.ref_name }}.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
   # Fast debug build to catch binary regressions on PRs without paying for the
   # release LTO build or touching the release. A manual dispatch uses the full
   # release matrix below instead.
@@ -65,6 +110,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - run: cargo build --locked --bin namidb --bin namidb-mcp
       # The HTTP server is shipped with vector + text search ON (see the `upload`
@@ -91,6 +138,8 @@ jobs:
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Build and package namidb + namidb-mcp (dry run)
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
@@ -144,13 +193,15 @@ jobs:
   # publishes it only after every platform succeeds, so users never see a
   # partially populated release after one target fails.
   create-release:
-    needs: validate-release
+    needs: [validate-release, build-sbom]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Create a private draft for this immutable tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -171,6 +222,17 @@ jobs:
               --generate-notes \
               --verify-tag
           fi
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-source-sbom
+          path: /tmp/release-sbom
+      - name: Attach the attested source SBOM to the private draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "/tmp/release-sbom/namidb-source-$GITHUB_REF_NAME.spdx.json" \
+            --clobber
 
   # On a `v*` tag: build release archives per platform and upload to the
   # release created above.
@@ -180,7 +242,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     permissions:
+      attestations: write
+      artifact-metadata: write
       contents: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +258,14 @@ jobs:
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-source-sbom
+          path: /tmp/release-sbom
       - name: Build and upload namidb + namidb-mcp
+        id: cli_archive
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: namidb,namidb-mcp
@@ -212,6 +284,7 @@ jobs:
       # crate so `--features` resolves unambiguously; the distinct `archive` name
       # avoids clobbering the CLI archive above.
       - name: Build and upload namidb-server (vector + text index)
+        id: server_archive
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: namidb-server
@@ -225,6 +298,19 @@ jobs:
           include: LICENSE,README.md
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest release archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ steps.cli_archive.outputs.tar || steps.cli_archive.outputs.zip }}
+            ${{ steps.server_archive.outputs.tar || steps.server_archive.outputs.zip }}
+      - name: Attach the SPDX SBOM to release archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ steps.cli_archive.outputs.tar || steps.cli_archive.outputs.zip }}
+            ${{ steps.server_archive.outputs.tar || steps.server_archive.outputs.zip }}
+          sbom-path: /tmp/release-sbom/namidb-source-${{ github.ref_name }}.spdx.json
       - name: Verify GNU/Linux glibc baseline before finalizing the draft
         if: endsWith(matrix.target, '-unknown-linux-gnu')
         shell: bash
@@ -252,6 +338,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
+      attestations: read
       contents: write
     steps:
       - name: Verify the complete private release and every checksum
@@ -275,6 +362,24 @@ jobs:
             x86_64-pc-windows-msvc
           )
           PREFIXES=(namidb namidb-server)
+          SBOM="namidb-source-$GITHUB_REF_NAME.spdx.json"
+          SIGNER_WORKFLOW="$GH_REPO/.github/workflows/release-binaries.yml"
+          test -s "$RELEASE_DIR/$SBOM"
+          jq -e --arg release_tag "$GITHUB_REF_NAME" '
+            .spdxVersion == "SPDX-2.3" and
+            (.packages | type == "array") and
+            (.packages | length > 0) and
+            any(
+              .packages[];
+              .name == "namidb-source" and
+              .versionInfo == $release_tag
+            )
+          ' "$RELEASE_DIR/$SBOM" >/dev/null
+          gh attestation verify "$RELEASE_DIR/$SBOM" \
+            --repo "$GH_REPO" \
+            --signer-workflow "$SIGNER_WORKFLOW" \
+            --source-ref "$GITHUB_REF"
+
           for TARGET in "${TARGETS[@]}"; do
             EXT=tar.gz
             if [[ "$TARGET" == "x86_64-pc-windows-msvc" ]]; then
@@ -284,11 +389,20 @@ jobs:
               ARCHIVE="$PREFIX-$GITHUB_REF_NAME-$TARGET.$EXT"
               test -s "$RELEASE_DIR/$ARCHIVE"
               test -s "$RELEASE_DIR/$PREFIX-$GITHUB_REF_NAME-$TARGET.sha256"
+              gh attestation verify "$RELEASE_DIR/$ARCHIVE" \
+                --repo "$GH_REPO" \
+                --signer-workflow "$SIGNER_WORKFLOW" \
+                --source-ref "$GITHUB_REF"
+              gh attestation verify "$RELEASE_DIR/$ARCHIVE" \
+                --repo "$GH_REPO" \
+                --predicate-type https://spdx.dev/Document/v2.3 \
+                --signer-workflow "$SIGNER_WORKFLOW" \
+                --source-ref "$GITHUB_REF"
             done
           done
 
           mapfile -t ASSETS < <(find "$RELEASE_DIR" -maxdepth 1 -type f -printf '%f\n')
-          test "${#ASSETS[@]}" -eq 16
+          test "${#ASSETS[@]}" -eq 17
           (
             cd "$RELEASE_DIR"
             sha256sum --strict -c ./*.sha256

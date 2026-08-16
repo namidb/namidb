@@ -148,14 +148,17 @@ pub fn write_offset(value: u64, width: OffsetWidth, buf: &mut Vec<u8>) {
 /// Read a single offset from `buf` starting at `cursor`.
 pub fn read_offset(buf: &[u8], cursor: usize, width: OffsetWidth) -> Result<u64> {
     let need = width.bytes();
-    if cursor + need > buf.len() {
+    let end = cursor
+        .checked_add(need)
+        .ok_or_else(|| Error::invariant("offset read end overflows usize"))?;
+    if end > buf.len() {
         return Err(Error::invariant(format!(
             "offset read out of bounds: cursor={cursor} need={need} len={}",
             buf.len()
         )));
     }
     let mut raw = [0u8; 8];
-    raw[..need].copy_from_slice(&buf[cursor..cursor + need]);
+    raw[..need].copy_from_slice(&buf[cursor..end]);
     Ok(u64::from_le_bytes(raw))
 }
 
@@ -163,6 +166,8 @@ pub fn read_offset(buf: &[u8], cursor: usize, width: OffsetWidth) -> Result<u64>
 
 pub const TAG_SPLIT: u8 = 0x01;
 pub const TAG_DENSE: u8 = 0x10;
+pub const DEFAULT_EDGE_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const EDGE_DECODE_MAX_BYTES_ENV: &str = "NAMIDB_EDGE_DECODE_MAX_BYTES";
 
 /// Binary-search a sorted sequence of contiguous 16-byte identifiers.
 pub fn binary_search_fixed_16(buf: &[u8], target: &[u8; 16]) -> Result<Option<usize>> {
@@ -206,7 +211,7 @@ pub fn split_block_cost(partners: &[[u8; 16]]) -> usize {
 
 /// Byte cost of the dense block (always 16 × deg).
 pub fn dense_block_cost(partners: &[[u8; 16]]) -> usize {
-    partners.len() * 16
+    partners.len().saturating_mul(16)
 }
 
 /// Selection rule (§3.2.4): emit dense when split would not save bytes,
@@ -270,22 +275,114 @@ fn write_dense_payload(partners: &[[u8; 16]], buf: &mut Vec<u8>) {
 /// Decode a single partner block from `buf` starting at `cursor`. Returns
 /// the decoded partners and the number of bytes consumed.
 pub fn read_partner_block(buf: &[u8], cursor: usize) -> Result<(Vec<[u8; 16]>, usize)> {
+    read_partner_block_impl(buf, cursor, None, edge_decode_limit_bytes()?)
+}
+
+/// Decode a block whose degree was independently obtained from the checksummed
+/// offsets/ordinal directory. The degree is compared before any corpus-sized
+/// allocation, so corrupt varints cannot request arbitrary capacity.
+pub fn read_partner_block_expected(
+    buf: &[u8],
+    cursor: usize,
+    expected_degree: usize,
+) -> Result<(Vec<[u8; 16]>, usize)> {
+    read_partner_block_impl(
+        buf,
+        cursor,
+        Some(expected_degree),
+        edge_decode_limit_bytes()?,
+    )
+}
+
+/// Reject a full-adjacency ranged read before issuing it when either the
+/// decoded vector would exceed the configured workspace or the checksummed
+/// offsets claim more bytes than any legal encoding of `degree` partners.
+pub(crate) fn validate_partner_block_read_bounds(degree: usize, encoded_len: u64) -> Result<()> {
+    let decoded_bytes = degree
+        .checked_mul(16)
+        .ok_or_else(|| Error::invariant("decoded partner block size overflows usize"))?;
+    let workspace_limit_bytes = edge_decode_limit_bytes()?;
+    if decoded_bytes > workspace_limit_bytes {
+        return Err(Error::invariant(format!(
+            "decoded partner block requires {decoded_bytes} bytes, above \
+             {EDGE_DECODE_MAX_BYTES_ENV}={workspace_limit_bytes}; use paged expansion"
+        )));
+    }
+    // degree varint (<=10) + tag (1) +, in the worst split encoding, one
+    // top/delta varint (<=10) and one bot64 (8) per partner.
+    let maximum_encoded = u64::try_from(degree)
+        .ok()
+        .and_then(|degree| degree.checked_mul(18))
+        .and_then(|payload| payload.checked_add(11))
+        .ok_or_else(|| Error::invariant("maximum partner block wire length overflows u64"))?;
+    if encoded_len > maximum_encoded {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "partner block length {encoded_len} exceeds legal maximum \
+                 {maximum_encoded} for degree {degree}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_partner_block_impl(
+    buf: &[u8],
+    cursor: usize,
+    expected_degree: Option<usize>,
+    workspace_limit_bytes: usize,
+) -> Result<(Vec<[u8; 16]>, usize)> {
     let start = cursor;
     let (deg, n) = read_varint(buf, cursor)?;
-    let mut c = cursor + n;
+    let mut c = cursor
+        .checked_add(n)
+        .ok_or_else(|| Error::invariant("partner block cursor overflows usize"))?;
     if c >= buf.len() {
         return Err(Error::invariant("partner block truncated: missing tag"));
     }
     let tag = buf[c];
     c += 1;
-    let deg = deg as usize;
+    let deg = usize::try_from(deg)
+        .map_err(|_| Error::invariant("partner block degree does not fit usize"))?;
+    if let Some(expected) = expected_degree {
+        if deg != expected {
+            return Err(Error::invariant(format!(
+                "partner block degree {deg} disagrees with expected ordinal delta {expected}"
+            )));
+        }
+    }
+    let decoded_bytes = deg
+        .checked_mul(16)
+        .ok_or_else(|| Error::invariant("decoded partner block size overflows usize"))?;
+    if decoded_bytes > workspace_limit_bytes {
+        return Err(Error::invariant(format!(
+            "decoded partner block requires {decoded_bytes} bytes, above \
+             {EDGE_DECODE_MAX_BYTES_ENV}={workspace_limit_bytes}; use paged expansion"
+        )));
+    }
     let partners = match tag {
         TAG_SPLIT => {
+            let minimum = deg
+                .checked_mul(9)
+                .ok_or_else(|| Error::invariant("split partner minimum size overflows usize"))?;
+            if minimum > buf.len().saturating_sub(c) {
+                return Err(Error::invariant(format!(
+                    "split block degree {deg} requires at least {minimum} payload bytes, have {}",
+                    buf.len().saturating_sub(c)
+                )));
+            }
             let (out, consumed) = read_split_payload(buf, c, deg)?;
             c += consumed;
             out
         }
         TAG_DENSE => {
+            if decoded_bytes > buf.len().saturating_sub(c) {
+                return Err(Error::invariant(format!(
+                    "dense block truncated: need {decoded_bytes} bytes, have {}",
+                    buf.len().saturating_sub(c)
+                )));
+            }
             let (out, consumed) = read_dense_payload(buf, c, deg)?;
             c += consumed;
             out
@@ -298,6 +395,28 @@ pub fn read_partner_block(buf: &[u8], cursor: usize) -> Result<(Vec<[u8; 16]>, u
         }
     };
     Ok((partners, c - start))
+}
+
+fn edge_decode_limit_bytes() -> Result<usize> {
+    match std::env::var(EDGE_DECODE_MAX_BYTES_ENV) {
+        Ok(raw) => {
+            let value = raw.trim().parse::<usize>().map_err(|error| {
+                Error::invariant(format!(
+                    "{EDGE_DECODE_MAX_BYTES_ENV} must be an exact positive byte count: {error}"
+                ))
+            })?;
+            if value < 16 {
+                return Err(Error::invariant(format!(
+                    "{EDGE_DECODE_MAX_BYTES_ENV} must be at least 16"
+                )));
+            }
+            Ok(value)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_EDGE_DECODE_MAX_BYTES),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::invariant(format!(
+            "{EDGE_DECODE_MAX_BYTES_ENV} is not valid UTF-8"
+        ))),
+    }
 }
 
 /// Find one partner inside an encoded block without materialising the whole
@@ -345,14 +464,19 @@ pub fn find_partner_in_block(
             let mut previous_top = 0u64;
             for index in 0..deg {
                 let (encoded_top, consumed) = read_varint(buf, c)?;
-                c += consumed;
-                if c + 8 > buf.len() {
+                c = c
+                    .checked_add(consumed)
+                    .ok_or_else(|| Error::invariant("split partner cursor overflows usize"))?;
+                let bot_end = c
+                    .checked_add(8)
+                    .ok_or_else(|| Error::invariant("split partner bot64 end overflows usize"))?;
+                if bot_end > buf.len() {
                     return Err(Error::invariant(format!(
                         "split block truncated: bot64[{index}]"
                     )));
                 }
-                let bot = u64::from_le_bytes(buf[c..c + 8].try_into().unwrap());
-                c += 8;
+                let bot = u64::from_le_bytes(buf[c..bot_end].try_into().unwrap());
+                c = bot_end;
                 let top = if index == 0 {
                     encoded_top
                 } else {
@@ -384,23 +508,33 @@ fn read_split_payload(buf: &[u8], cursor: usize, deg: usize) -> Result<(Vec<[u8;
     let mut c = cursor;
 
     let (top, n) = read_varint(buf, c)?;
-    c += n;
-    if c + 8 > buf.len() {
+    c = c
+        .checked_add(n)
+        .ok_or_else(|| Error::invariant("split partner cursor overflows usize"))?;
+    let bot_end = c
+        .checked_add(8)
+        .ok_or_else(|| Error::invariant("split partner bot64 end overflows usize"))?;
+    if bot_end > buf.len() {
         return Err(Error::invariant("split block truncated: bot64[0]"));
     }
-    let bot = u64::from_le_bytes(buf[c..c + 8].try_into().unwrap());
-    c += 8;
+    let bot = u64::from_le_bytes(buf[c..bot_end].try_into().unwrap());
+    c = bot_end;
     out.push(combine_top_bot(top, bot));
     let mut prev_top = top;
 
     for _ in 1..deg {
         let (delta, n) = read_varint(buf, c)?;
-        c += n;
-        if c + 8 > buf.len() {
+        c = c
+            .checked_add(n)
+            .ok_or_else(|| Error::invariant("split partner cursor overflows usize"))?;
+        let bot_end = c
+            .checked_add(8)
+            .ok_or_else(|| Error::invariant("split partner bot64 end overflows usize"))?;
+        if bot_end > buf.len() {
             return Err(Error::invariant("split block truncated: bot64[j]"));
         }
-        let bot = u64::from_le_bytes(buf[c..c + 8].try_into().unwrap());
-        c += 8;
+        let bot = u64::from_le_bytes(buf[c..bot_end].try_into().unwrap());
+        c = bot_end;
         let top = prev_top.wrapping_add(delta);
         out.push(combine_top_bot(top, bot));
         prev_top = top;
@@ -409,11 +543,16 @@ fn read_split_payload(buf: &[u8], cursor: usize, deg: usize) -> Result<(Vec<[u8;
 }
 
 fn read_dense_payload(buf: &[u8], cursor: usize, deg: usize) -> Result<(Vec<[u8; 16]>, usize)> {
-    let need = deg * 16;
-    if cursor + need > buf.len() {
+    let need = deg
+        .checked_mul(16)
+        .ok_or_else(|| Error::invariant("dense partner block size overflows usize"))?;
+    let end = cursor
+        .checked_add(need)
+        .ok_or_else(|| Error::invariant("dense partner block end overflows usize"))?;
+    if end > buf.len() {
         return Err(Error::invariant(format!(
             "dense block truncated: need {need} bytes, have {}",
-            buf.len() - cursor
+            buf.len().saturating_sub(cursor)
         )));
     }
     let mut out = Vec::with_capacity(deg);
@@ -592,6 +731,41 @@ mod tests {
         buf.extend_from_slice(&[0u8; 16]);
         let err = read_partner_block(&buf, 0).unwrap_err();
         assert!(matches!(err, Error::Corrupted { .. }));
+    }
+
+    #[test]
+    fn corrupt_huge_degree_fails_before_allocation_without_panicking() {
+        let mut buf = Vec::new();
+        write_varint(u64::MAX, &mut buf);
+        buf.push(TAG_DENSE);
+        let result = std::panic::catch_unwind(|| read_partner_block(&buf, 0));
+        assert!(result.is_ok(), "corrupt degree must never panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn independently_known_degree_is_checked_before_decoding_payload() {
+        let partners = [partner(1, 1), partner(1, 2)];
+        let mut buf = Vec::new();
+        write_partner_block(&partners, 10_000, &mut buf);
+        let error = read_partner_block_expected(&buf, 0, 3).unwrap_err();
+        assert!(matches!(error, Error::Invariant(_)));
+        let (decoded, consumed) = read_partner_block_expected(&buf, 0, 2).unwrap();
+        assert_eq!(decoded, partners);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn impossible_partner_range_is_rejected_before_remote_allocation() {
+        let maximum_for_two = 11 + 2 * 18;
+        assert!(validate_partner_block_read_bounds(2, maximum_for_two).is_ok());
+        let error = validate_partner_block_read_bounds(2, maximum_for_two + 1).unwrap_err();
+        assert!(matches!(error, Error::Corrupted { .. }));
+
+        let result =
+            std::panic::catch_unwind(|| validate_partner_block_read_bounds(usize::MAX, u64::MAX));
+        assert!(result.is_ok(), "overflowing degree must never panic");
+        assert!(result.unwrap().is_err());
     }
 
     #[test]

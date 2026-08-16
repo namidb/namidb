@@ -408,22 +408,42 @@ struct VectorSource<'a> {
 /// candidate directly is cheaper and exact.
 fn peel_vector_source(plan: &LogicalPlan) -> Option<VectorSource<'_>> {
     match plan {
-        LogicalPlan::Filter { input, predicate } => {
-            let LogicalPlan::NodeScan {
+        LogicalPlan::Filter { input, predicate } => match input.as_ref() {
+            LogicalPlan::NodeScan {
                 label: Some(label),
                 alias,
                 predicates,
                 ..
-            } = input.as_ref()
-            else {
-                return None;
-            };
-            predicates.is_empty().then(|| VectorSource {
+            } => predicates.is_empty().then(|| VectorSource {
                 label,
                 alias,
                 filter: Some(predicate.clone()),
-            })
-        }
+            }),
+            // The equality-index rewrite may pull one indexed conjunct out of
+            // a multi-conjunct WHERE, leaving the rest as this residual
+            // Filter. Both halves describe the same logical source, so fold
+            // the posting equality back into the vector operator's filter —
+            // otherwise a filtered KNN silently loses the index and pays a
+            // flat scan.
+            LogicalPlan::NodeByPropertyValue {
+                input: lookup_input,
+                label,
+                alias,
+                property,
+                value,
+                multi: true,
+            } if matches!(lookup_input.as_ref(), LogicalPlan::Empty) && !label.is_empty() => {
+                Some(VectorSource {
+                    label,
+                    alias,
+                    filter: Some(and_expr(
+                        property_equality(alias, property, value),
+                        predicate.clone(),
+                    )),
+                })
+            }
+            _ => None,
+        },
         LogicalPlan::NodeScan {
             label: Some(label),
             alias,
@@ -449,6 +469,18 @@ fn peel_vector_source(plan: &LogicalPlan) -> Option<VectorSource<'_>> {
             })
         }
         _ => None,
+    }
+}
+
+fn and_expr(left: Expression, right: Expression) -> Expression {
+    let span = right.span;
+    Expression {
+        kind: ExpressionKind::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        span,
     }
 }
 
@@ -716,6 +748,28 @@ mod tests {
         assert!(
             contains_vector_search(&optimized),
             "indexed non-unique KNN filter must terminate in VectorSearch: {optimized:?}"
+        );
+        assert_eq!(
+            property_lookup_mode(&optimized),
+            None,
+            "the posting leaf must be folded into VectorSearch, not hide the KNN shape"
+        );
+    }
+
+    #[test]
+    fn residual_filter_over_posting_leaf_is_consumed_by_vector_search() {
+        // A multi-conjunct WHERE lets the equality rewrite pull the indexed
+        // conjunct out, leaving the threshold as a residual Filter over the
+        // posting leaf. The vector rewrite must recognise that shape too, or
+        // a filtered KNN silently degrades to the (exact, trivially equal)
+        // flat scan.
+        let catalog = catalog_with_property_index(false, true);
+        let lowered =
+            lower_knn_with_where("d.key = 'group-a' AND cosine_similarity(d.emb, $q) >= 0.5");
+        let optimized = crate::optimize::optimize(lowered, &catalog);
+        assert!(
+            contains_vector_search(&optimized),
+            "residual-over-posting KNN must terminate in VectorSearch: {optimized:?}"
         );
         assert_eq!(
             property_lookup_mode(&optimized),

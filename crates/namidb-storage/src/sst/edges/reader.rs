@@ -14,15 +14,19 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result};
 use crate::sst::edges::encoding::{
-    binary_search_fixed_16, find_partner_in_block, read_offset, read_partner_block, read_varint,
-    OffsetWidth,
+    binary_search_fixed_16, find_partner_in_block, read_offset, read_partner_block_expected,
+    read_varint, OffsetWidth,
 };
 use crate::sst::edges::fence_index::FenceIndex;
 use crate::sst::edges::format::{
-    EdgeFileFooter, EdgeFileHeader, SectionEntry, CODEC_NONE, CODEC_ZSTD, FOOTER_TRAILER_LEN,
-    HEADER_LEN, OVERFLOW_JSON_NAME, SECTION_FENCE_INDEX, SECTION_KEY_IDS, SECTION_OFFSETS,
-    SECTION_PARTNERS, SECTION_PER_EDGE_LSN, SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM,
+    EdgeFileFooter, EdgeFileHeader, EdgePageChecksumDirectory, EdgeSstBinding, SectionEntry,
+    CODEC_NONE, CODEC_PROPERTY_PAGED_NONE, CODEC_PROPERTY_PAGED_ZSTD, CODEC_ZSTD,
+    FLAG_HAS_TOMBSTONES, FOOTER_TRAILER_LEN, HEADER_LEN, MAX_EDGE_PAGE_CHECKSUM_DIRECTORY_BYTES,
+    OVERFLOW_JSON_NAME, SECTION_EDGE_ORDINALS, SECTION_FENCE_INDEX, SECTION_KEY_IDS,
+    SECTION_OFFSETS, SECTION_PAGE_CHECKSUMS, SECTION_PARTNERS, SECTION_PER_EDGE_LSN,
+    SECTION_PER_EDGE_TOMBSTONES, SECTION_PROPERTY_STREAM, SECTION_SST_BINDING,
 };
+use crate::sst::edges::property_pages::{decode_property_page, PropertyPageIndex};
 use crate::sst::edges::EdgeDirection;
 
 /// In-memory edge SST reader.
@@ -84,6 +88,7 @@ impl EdgeSstReader {
         let header = EdgeFileHeader::decode(&body)?;
         let (footer, _footer_start) = EdgeFileFooter::decode(&body)?;
         let offset_width = OffsetWidth::from_bits(footer.offsets_bits)?;
+        validate_eager_layout(&header, &footer, offset_width)?;
 
         // Verify topology/metadata sections exactly once when the reader
         // enters the shared cache. Random lookups must not re-hash whole
@@ -95,6 +100,69 @@ impl EdgeSstReader {
             if entry.kind != SECTION_PROPERTY_STREAM {
                 let _ = verified_section(&body, entry)?;
             }
+        }
+        let checksum_entries: Vec<_> = footer
+            .sections
+            .iter()
+            .filter(|entry| entry.kind == SECTION_PAGE_CHECKSUMS)
+            .collect();
+        if checksum_entries.len() > 1 {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "edge SST contains duplicate page checksum directories".into(),
+            });
+        }
+        if header.format_minor >= 2 && checksum_entries.is_empty() {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "edge SST v1.2 is missing its page checksum directory".into(),
+            });
+        }
+        if let Some(entry) = checksum_entries.first() {
+            if entry.codec != CODEC_NONE || !entry.name.is_empty() {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: "page checksum directory must be unnamed and uncompressed".into(),
+                });
+            }
+            if entry.length > MAX_EDGE_PAGE_CHECKSUM_DIRECTORY_BYTES {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!(
+                        "page checksum directory length {} exceeds limit \
+                         {MAX_EDGE_PAGE_CHECKSUM_DIRECTORY_BYTES}",
+                        entry.length
+                    ),
+                });
+            }
+            // Its complete section hash was verified by the loop above. The
+            // decoded shape now proves one-to-one coverage of every data
+            // section before any topology or property payload is decoded.
+            EdgePageChecksumDirectory::decode(section_bytes(&body, entry)?, &footer)?;
+        }
+        let bindings: Vec<_> = footer
+            .sections
+            .iter()
+            .filter(|entry| entry.kind == SECTION_SST_BINDING)
+            .collect();
+        if bindings.len() > 1 {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "edge SST contains duplicate identity bindings".into(),
+            });
+        }
+        if let Some(entry) = bindings.first() {
+            if entry.codec != CODEC_NONE || !entry.name.is_empty() {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: "edge SST identity binding must be unnamed and uncompressed".into(),
+                });
+            }
+            EdgeSstBinding::decode(section_bytes(&body, entry)?)?.validate(
+                &body[..HEADER_LEN],
+                &footer.sections,
+                None,
+            )?;
         }
 
         let fence_index = if let Some(entry) = footer.find_kind(SECTION_FENCE_INDEX) {
@@ -212,7 +280,12 @@ impl EdgeSstReader {
                 ),
             });
         }
-        let (partners, _consumed) = read_partner_block(partners_bytes, start)?;
+        let expected_degree = self.cumulative_edges[idx + 1]
+            .checked_sub(self.cumulative_edges[idx])
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| Error::invariant("partner degree does not fit usize"))?;
+        let (partners, _consumed) =
+            read_partner_block_expected(partners_bytes, start, expected_degree)?;
         // Sanity-check: `_consumed == end - start`.
         if start + _consumed != end {
             return Err(Error::Corrupted {
@@ -228,7 +301,9 @@ impl EdgeSstReader {
         // Per-edge index range for this key. Cached at `open()` time so the
         // hot path is O(1) instead of O(idx) (see `build_cumulative_edges`).
         let edge_offset = self.cumulative_edges[idx] as usize;
-        let edge_end = edge_offset + partners.len();
+        let edge_end = edge_offset
+            .checked_add(partners.len())
+            .ok_or_else(|| Error::invariant("per-edge metadata range overflows usize"))?;
 
         // per_edge_lsn
         let lsn_bytes = self.section(SECTION_PER_EDGE_LSN, "")?;
@@ -388,7 +463,9 @@ impl EdgeSstReader {
 
         let key_count = self.footer.key_count as usize;
         let stride = self.offset_width.bytes();
-        let mut out: Vec<EdgeRowProjection> = Vec::with_capacity(self.footer.edge_count as usize);
+        let edge_count = usize::try_from(self.footer.edge_count)
+            .map_err(|_| Error::invariant("edge count does not fit usize"))?;
+        let mut out: Vec<EdgeRowProjection> = Vec::with_capacity(edge_count);
         let mut edge_idx = 0usize;
 
         for k_idx in 0..key_count {
@@ -396,7 +473,12 @@ impl EdgeSstReader {
                 .try_into()
                 .map_err(|_| Error::invariant("key_ids row length != 16"))?;
             let start = read_offset(offsets_bytes, k_idx * stride, self.offset_width)? as usize;
-            let (partners, _consumed) = read_partner_block(partners_bytes, start)?;
+            let expected_degree = self.cumulative_edges[k_idx + 1]
+                .checked_sub(self.cumulative_edges[k_idx])
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::invariant("partner degree does not fit usize"))?;
+            let (partners, _consumed) =
+                read_partner_block_expected(partners_bytes, start, expected_degree)?;
             for (i, partner_id) in partners.iter().enumerate() {
                 let edge_i = edge_idx + i;
                 let lsn = u64::from_le_bytes(
@@ -460,6 +542,42 @@ impl EdgeSstReader {
             return Ok(None);
         };
         let raw = self.section_with_name(SECTION_PROPERTY_STREAM, name)?;
+        if matches!(
+            entry.codec,
+            CODEC_PROPERTY_PAGED_NONE | CODEC_PROPERTY_PAGED_ZSTD
+        ) {
+            let index = PropertyPageIndex::parse_prefix(raw, entry.length)?;
+            if index.row_count != self.footer.edge_count {
+                return Err(Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!(
+                        "property page stream {name} row count {} != edge_count {}",
+                        index.row_count, self.footer.edge_count
+                    ),
+                });
+            }
+            let mut out = Vec::with_capacity(self.footer.edge_count as usize);
+            for page in index.entries {
+                let start = usize::try_from(page.offset)
+                    .map_err(|_| Error::invariant("property page offset does not fit usize"))?;
+                let end = usize::try_from(
+                    page.offset
+                        .checked_add(page.encoded_len)
+                        .ok_or_else(|| Error::invariant("property page end exceeds u64"))?,
+                )
+                .map_err(|_| Error::invariant("property page end does not fit usize"))?;
+                let encoded = raw.get(start..end).ok_or_else(|| Error::Corrupted {
+                    path: "<edges>".into(),
+                    detail: format!("property page stream {name} is truncated"),
+                })?;
+                out.extend(decode_property_page(
+                    encoded,
+                    page,
+                    entry.codec == CODEC_PROPERTY_PAGED_ZSTD,
+                )?);
+            }
+            return Ok(Some(out));
+        }
         let decoded = match entry.codec {
             CODEC_NONE => raw.to_vec(),
             CODEC_ZSTD => zstd::stream::decode_all(raw).map_err(|e| {
@@ -548,10 +666,180 @@ impl EdgeSstReader {
     }
 }
 
+fn validate_eager_layout(
+    header: &EdgeFileHeader,
+    footer: &EdgeFileFooter,
+    offset_width: OffsetWidth,
+) -> Result<()> {
+    let key_ids = required_unique_section(footer, SECTION_KEY_IDS)?;
+    let offsets = required_unique_section(footer, SECTION_OFFSETS)?;
+    let partners = required_unique_section(footer, SECTION_PARTNERS)?;
+    let lsns = required_unique_section(footer, SECTION_PER_EDGE_LSN)?;
+    for entry in [key_ids, offsets, partners, lsns] {
+        if entry.codec != CODEC_NONE {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "topology section kind 0x{:04x} must be uncompressed",
+                    entry.kind
+                ),
+            });
+        }
+    }
+
+    let expected_key_bytes = footer
+        .key_count
+        .checked_mul(16)
+        .ok_or_else(|| Error::invariant("key_ids length overflows u64"))?;
+    if key_ids.length != expected_key_bytes {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "key_ids length {} != key_count*16 ({expected_key_bytes})",
+                key_ids.length
+            ),
+        });
+    }
+    let expected_offset_bytes = footer
+        .key_count
+        .checked_add(1)
+        .and_then(|rows| rows.checked_mul(offset_width.bytes() as u64))
+        .ok_or_else(|| Error::invariant("offsets length overflows u64"))?;
+    if offsets.length != expected_offset_bytes {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "offsets length {} != (key_count+1)*{} ({expected_offset_bytes})",
+                offsets.length,
+                offset_width.bytes()
+            ),
+        });
+    }
+    let expected_lsn_bytes = footer
+        .edge_count
+        .checked_mul(8)
+        .ok_or_else(|| Error::invariant("per-edge LSN length overflows u64"))?;
+    if lsns.length != expected_lsn_bytes {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "per_edge_lsn length {} != edge_count*8 ({expected_lsn_bytes})",
+                lsns.length
+            ),
+        });
+    }
+    if footer.key_count > footer.edge_count {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!(
+                "key_count {} exceeds edge_count {}",
+                footer.key_count, footer.edge_count
+            ),
+        });
+    }
+
+    let ordinals = optional_unique_section(footer, SECTION_EDGE_ORDINALS)?;
+    if header.format_minor >= 2 && ordinals.is_none() {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: "edge SST v1.2 is missing its edge ordinal section".into(),
+        });
+    }
+    if let Some(ordinals) = ordinals {
+        if ordinals.codec != CODEC_NONE {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "edge ordinal section must be uncompressed".into(),
+            });
+        }
+        let expected = footer
+            .key_count
+            .checked_add(1)
+            .and_then(|rows| rows.checked_mul(8))
+            .ok_or_else(|| Error::invariant("edge ordinal length overflows u64"))?;
+        if ordinals.length != expected {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "edge ordinal length {} != (key_count+1)*8 ({expected})",
+                    ordinals.length
+                ),
+            });
+        }
+    }
+
+    let tombstones = optional_unique_section(footer, SECTION_PER_EDGE_TOMBSTONES)?;
+    if (header.flags & FLAG_HAS_TOMBSTONES != 0) != tombstones.is_some() {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: "HAS_TOMBSTONES flag and tombstone section presence disagree".into(),
+        });
+    }
+    if let Some(tombstones) = tombstones {
+        if tombstones.codec != CODEC_NONE {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "tombstone section must be uncompressed".into(),
+            });
+        }
+        let expected = footer
+            .edge_count
+            .checked_add(7)
+            .ok_or_else(|| Error::invariant("tombstone length rounds past u64"))?
+            / 8;
+        if tombstones.length != expected {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: format!(
+                    "tombstone length {} != ceil(edge_count/8) ({expected})",
+                    tombstones.length
+                ),
+            });
+        }
+    }
+    if let Some(fence) = optional_unique_section(footer, SECTION_FENCE_INDEX)? {
+        if fence.codec != CODEC_NONE {
+            return Err(Error::Corrupted {
+                path: "<edges>".into(),
+                detail: "fence index must be uncompressed".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn required_unique_section(footer: &EdgeFileFooter, kind: u16) -> Result<&SectionEntry> {
+    optional_unique_section(footer, kind)?.ok_or_else(|| Error::Corrupted {
+        path: "<edges>".into(),
+        detail: format!("edge SST missing mandatory section kind 0x{kind:04x}"),
+    })
+}
+
+fn optional_unique_section(footer: &EdgeFileFooter, kind: u16) -> Result<Option<&SectionEntry>> {
+    let mut matches = footer.sections.iter().filter(|entry| entry.kind == kind);
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(Error::Corrupted {
+            path: "<edges>".into(),
+            detail: format!("edge SST contains duplicate section kind 0x{kind:04x}"),
+        });
+    }
+    Ok(first)
+}
+
 fn section_bytes<'a>(body: &'a Bytes, entry: &SectionEntry) -> Result<&'a [u8]> {
-    let start = entry.offset as usize;
-    let end = (entry.offset + entry.length) as usize;
-    let body_end = body.len() - FOOTER_TRAILER_LEN;
+    let start = usize::try_from(entry.offset)
+        .map_err(|_| Error::invariant("section offset does not fit usize"))?;
+    let end_u64 = entry
+        .offset
+        .checked_add(entry.length)
+        .ok_or_else(|| Error::invariant("section offset+length overflows u64"))?;
+    let end =
+        usize::try_from(end_u64).map_err(|_| Error::invariant("section end does not fit usize"))?;
+    let body_end = body
+        .len()
+        .checked_sub(FOOTER_TRAILER_LEN)
+        .ok_or_else(|| Error::invariant("edge body is shorter than its footer trailer"))?;
     if start < HEADER_LEN || end > body_end {
         return Err(Error::Corrupted {
             path: "<edges>".into(),
@@ -580,8 +868,12 @@ fn build_cumulative_edges(
     footer: &EdgeFileFooter,
     offset_width: OffsetWidth,
 ) -> Result<Vec<u64>> {
-    let key_count = footer.key_count as usize;
-    let mut cumulative = Vec::with_capacity(key_count + 1);
+    let key_count = usize::try_from(footer.key_count)
+        .map_err(|_| Error::invariant("edge key_count does not fit usize"))?;
+    let capacity = key_count
+        .checked_add(1)
+        .ok_or_else(|| Error::invariant("cumulative edge row count overflows usize"))?;
+    let mut cumulative = Vec::with_capacity(capacity);
     cumulative.push(0u64);
 
     if key_count == 0 {

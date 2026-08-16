@@ -20,6 +20,8 @@ use clap::{Parser, Subcommand};
 mod ann_bench;
 mod dataset;
 mod loader;
+#[cfg(feature = "object-native")]
+mod object_native;
 mod queries;
 mod runner;
 mod vector_recall;
@@ -175,6 +177,82 @@ enum Cmd {
         ef: usize,
         #[arg(short = 'S', long, default_value_t = 42)]
         seed: u64,
+    },
+    /// Gate V5/FT3, incremental VG6/FT4 and paged forward/inverse graph SSTs.
+    ///
+    /// Corpus generation and builders are streaming. Search readers use an
+    /// instrumented immutable RangeSource in cache=0/sized modes; graph readers
+    /// report authenticated paged I/O and exact endpoint/property parity.
+    #[cfg(feature = "object-native")]
+    ObjectNative {
+        #[arg(long, default_value_t = 100_000)]
+        vectors: usize,
+        #[arg(long, default_value_t = 100_000)]
+        documents: usize,
+        #[arg(long, default_value_t = 256)]
+        dim: usize,
+        #[arg(long, default_value_t = 20)]
+        queries: usize,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 64)]
+        clusters: usize,
+        #[arg(long, default_value_t = 0.20)]
+        spread: f32,
+        /// Native `tenant` filter cardinality; one query keeps bucket zero.
+        #[arg(long, default_value_t = 16)]
+        filter_buckets: usize,
+        #[arg(long, default_value_t = 512)]
+        page_rows: usize,
+        #[arg(long, default_value_t = 8)]
+        branch_factor: usize,
+        #[arg(long, default_value_t = 8)]
+        nprobe: usize,
+        #[arg(long, default_value_t = 64)]
+        max_nprobe: usize,
+        #[arg(long, default_value_t = 8)]
+        rerank_factor: usize,
+        /// Exact-range LRU capacity used for the warm pass.
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        cache_bytes: usize,
+        /// Logical ceiling for each external-memory index builder.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        build_memory_bytes: usize,
+        /// Deterministic latency added to every cache-miss range request.
+        #[arg(long, default_value_t = 0)]
+        range_latency_ms: u64,
+        /// Number of ordered VG6/FT4 mutation deltas after the complete seed.
+        #[arg(long, default_value_t = 3)]
+        delta_segments: usize,
+        /// Regular one-to-one graph keys in addition to both adversarial hubs.
+        #[arg(long, default_value_t = 1_024)]
+        graph_keys: usize,
+        /// Degree of the forward and inverse adversarial hubs.
+        #[arg(long, default_value_t = 4_096)]
+        graph_high_degree: usize,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+        /// Fail if any filtered/unfiltered metric has lower recall.
+        #[arg(long)]
+        min_recall_at_k: Option<f64>,
+        /// Fail if one cold query fetches more than this artifact fraction.
+        #[arg(long)]
+        max_cold_bytes_ratio: Option<f64>,
+        /// Fail if decoded reader metadata exceeds this artifact fraction.
+        #[arg(long)]
+        max_reader_metadata_ratio: Option<f64>,
+        /// Fail if a cold vector/text p95 exceeds this many milliseconds.
+        #[arg(long)]
+        max_query_p95_ms: Option<f64>,
+        /// Linux: fail if the process VmHWM exceeds this exact byte count.
+        #[arg(long)]
+        max_rss_bytes: Option<u64>,
+        /// Fail if one Search-LSM family fans out to more segments.
+        #[arg(long, default_value_t = 32)]
+        max_fanout: usize,
+        /// Execution ceiling and gate for concurrent immutable range fetches.
+        #[arg(long, default_value_t = 16)]
+        max_in_flight: u64,
     },
 }
 
@@ -457,6 +535,75 @@ async fn main() -> Result<()> {
                 report.build_secs,
             );
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "object-native")]
+        Cmd::ObjectNative {
+            vectors,
+            documents,
+            dim,
+            queries,
+            k,
+            clusters,
+            spread,
+            filter_buckets,
+            page_rows,
+            branch_factor,
+            nprobe,
+            max_nprobe,
+            rerank_factor,
+            cache_bytes,
+            build_memory_bytes,
+            range_latency_ms,
+            delta_segments,
+            graph_keys,
+            graph_high_degree,
+            seed,
+            min_recall_at_k,
+            max_cold_bytes_ratio,
+            max_reader_metadata_ratio,
+            max_query_p95_ms,
+            max_rss_bytes,
+            max_fanout,
+            max_in_flight,
+        } => {
+            let report = object_native::run(object_native::ObjectNativeConfig {
+                vectors,
+                documents,
+                dim,
+                queries,
+                k,
+                clusters,
+                spread,
+                filter_buckets,
+                page_rows,
+                branch_factor,
+                nprobe,
+                max_nprobe,
+                rerank_factor,
+                cache_bytes,
+                build_memory_bytes,
+                range_latency_ms,
+                delta_segments,
+                graph_keys,
+                graph_high_degree,
+                seed,
+                gates: object_native::GateThresholds {
+                    min_recall_at_k,
+                    max_cold_bytes_ratio,
+                    max_reader_metadata_ratio,
+                    max_query_p95_ms,
+                    max_rss_bytes,
+                    max_fanout,
+                    max_in_flight,
+                },
+            })
+            .await?;
+            let passed = report.passed();
+            let failures = report.gates.failures.clone();
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !passed {
+                anyhow::bail!("object-native gates failed: {}", failures.join("; "));
+            }
         }
     }
     Ok(())
