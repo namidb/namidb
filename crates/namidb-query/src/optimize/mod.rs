@@ -26,6 +26,7 @@ use crate::parser::ast::{
 use crate::parser::SourceSpan;
 use crate::plan::logical::{CreateElement, LogicalPlan, ProjectionItem};
 
+pub mod anchor_inversion;
 pub mod decorrelation;
 pub mod edge_count_pushdown;
 pub mod join_conversion;
@@ -35,7 +36,7 @@ pub mod normalize;
 pub mod parquet_pushdown;
 pub mod projection_pushdown;
 pub mod pushdown;
-pub mod unique_lookup;
+mod unique_lookup;
 #[cfg(feature = "vector-index")]
 pub mod vector_search;
 
@@ -74,6 +75,12 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // point lookups even under a KNN, while non-unique posting lookups are
         // consumed by the vector rewrite below and become native pre-k filters.
         let unique_lookup = unique_lookup::apply_unique_property_lookup(current.clone(), catalog);
+        // Anchor inversion (25tb-readiness item 36): a single-hop Expand from
+        // a bare NodeScan whose TARGET is pinned by an index-answerable
+        // equality re-anchors at the target and walks the edge inverted, so
+        // `(p:Person)-[w]->(c:Company {cid: 0})` plans like the
+        // `(c {cid: 0})<-[w]-(p)` form the user could have written.
+        let unique_lookup = anchor_inversion::apply_anchor_inversion(unique_lookup, catalog);
         // RFC-030 (`vector-index`): collapse a flat KNN shape into a
         // VectorSearch when a backing index exists. Runs after unique_lookup so
         // point-selective filters keep their cheaper exact plan; the rewrite

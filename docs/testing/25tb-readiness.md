@@ -263,7 +263,28 @@ Of the seven verified 10M-scale blockers from the 2026-07-28 audit:
 6. Legacy (format_minor 0) edge SSTs read full-body — BY DESIGN (compat); ranged property hydration covers modern SSTs.
 7. Object-native gate — CLOSED earlier (running in CI with measured thresholds).
 
-### 36. [planner, target 2.1.1] Pattern anchor is not inverted toward the selective endpoint.
+### 36. [DONE — planner, lands in 2.1.1] Pattern anchor is not inverted toward the selective endpoint.
+
+**Resolution (2026-08-16):** new fixpoint pass
+`optimize/anchor_inversion.rs`, run right after `unique_lookup`. When a
+single-hop pattern is anchored on a bare `NodeScan` but the *target* node
+carries an indexed equality conjunct (same `extract_indexed_conjunct`
+machinery unique_lookup uses), the pass re-anchors: `NodeByPropertyValue`
+on the target, the `Expand` direction flipped (`->` ↔ `<-`, `--` stays),
+aliases/labels swapped to preserve every binding, residual predicates
+re-attached above. Unique targets always invert; non-unique indexed
+targets only when catalog stats say the target label is no larger than
+the source (posting fanout could otherwise lose). Semantics-bearing
+shapes are refused: var-length, OPTIONAL, back-references, shortestPath,
+and walker-materialized trails (`path_binding`); single-hop `q = ...`
+paths still invert because their trail is assembled statically from the
+bindings by a Project. Pinned by six unit tests on lowered plans plus
+`tests/exec_anchor_inversion.rs`: both spellings return identical
+bindings on memtable and flushed routes, the slow spelling's optimized
+plan contains the cid anchor and no Person scan, a post-flush memtable
+delta stays visible through the inverted anchor, and the optimized path
+shape equals the unoptimized reference. Cold all-memtable namespaces
+(no manifest stats yet) keep the un-inverted plan by design.
 
 Found 2026-08-16 during the live 200k-node S3 validation. With a UNIQUE
 constraint on `Company.cid`, `MATCH (c:Company {cid: 0})<-[w:WORKS_AT]-(p:Person)
