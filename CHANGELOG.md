@@ -15,6 +15,25 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-08-16
+
+**Fixed**
+- Property DDL (`CREATE CONSTRAINT` / `CREATE INDEX` on an existing
+  property) no longer wedges maintenance: schema commits now retire
+  search-LSM generations whose catalog signature the DDL invalidated, and
+  the flush validator treats a pure signature mismatch as staleness
+  (rebuild) instead of a fatal invariant. Previously flush and compaction
+  looped on the invariant error and search degraded to flat scans until a
+  manual intervention.
+
+**Performance**
+- The optimizer now anchors a single-hop pattern at its selective
+  endpoint regardless of the direction it was written:
+  `MATCH (p:Person)-[w:WORKS_AT]->(c:Company {cid: 0})` plans the same
+  index lookup + inverse expansion as the hand-anchored
+  `(c {cid: 0})<-[w]-(p)` form. On the 200k-node validation dataset this
+  takes the written-forward form from ~18 s (cold timeout) to instant.
+
 ## [2.1.0] - 2026-08-16: Incremental vector and full-text indexes
 
 ### Production-hardening campaign
@@ -2570,6 +2589,7 @@ Change License: Apache License 2.0).
   under [`bench/`](./bench/).
 
 [Unreleased]: https://github.com/namidb/namidb/compare/v2.1.0...HEAD
+[2.1.1]: https://github.com/namidb/namidb/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/namidb/namidb/compare/v2.0.6...v2.1.0
 [2.0.6]: https://github.com/namidb/namidb/compare/v2.0.5...v2.0.6
 [2.0.5]: https://github.com/namidb/namidb/compare/v2.0.4...v2.0.5
