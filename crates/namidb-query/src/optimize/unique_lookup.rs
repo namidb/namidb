@@ -403,12 +403,12 @@ fn global_property_lookup_available(catalog: &StatsCatalog, property: &str) -> b
     })
 }
 
-struct IndexedConjunct {
-    label: String,
-    property: String,
-    value: Expression,
-    multi: bool,
-    residual: Option<Expression>,
+pub(super) struct IndexedConjunct {
+    pub(super) label: String,
+    pub(super) property: String,
+    pub(super) value: Expression,
+    pub(super) multi: bool,
+    pub(super) residual: Option<Expression>,
 }
 
 /// Pick the best indexable equality from a top-level conjunction. Unique
@@ -421,7 +421,7 @@ struct IndexedConjunct {
 /// lookup value cannot reference any row binding because the lookup input is
 /// `Empty`. A correlated scan instead requires every value alias to be
 /// provided by its outer input.
-fn extract_indexed_conjunct(
+pub(super) fn extract_indexed_conjunct(
     predicate: &Expression,
     scan_alias: &str,
     label: Option<&str>,
