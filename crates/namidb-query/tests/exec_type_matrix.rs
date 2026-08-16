@@ -41,7 +41,7 @@ fn schema() -> Schema {
 /// schema-indexed with multibyte UTF-8 — the property-index encoding risk.
 fn corpus_rows() -> Vec<(&'static str, BTreeMap<String, CoreValue>)> {
     let mut rows = Vec::new();
-    let mut base = |name: &str| {
+    let base = |name: &str| {
         let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
         props.insert("name".into(), CoreValue::Str(name.into()));
         props
