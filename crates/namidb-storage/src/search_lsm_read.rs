@@ -1046,23 +1046,47 @@ pub(super) async fn vector_search(
     let (ranked, every_segment_exhausted) = loop {
         let mut ranked = BoundedVectorResults::new(target, higher_is_better);
         let mut statuses = Vec::with_capacity(generation.segments.len());
+        // Search every segment concurrently (the base V5 probe and each VG6
+        // exhaustive scan are independent range-read pipelines); collect the
+        // futures into a Vec BEFORE `stream::iter` so no borrowing closure
+        // rides inside the opaque stream type (rust-lang/rust#102211).
+        // Reconciliation and ranking below stay sequential in segment order,
+        // so results are byte-identical to the serial loop.
+        let mut round_futures = Vec::with_capacity(generation.segments.len());
         for (segment_index, segment) in generation.segments.iter().enumerate() {
             let limit = limits[segment_index];
             if limit == 0 {
-                statuses.push((0usize, true, true));
                 continue;
             }
-            let searched = match search_vector_segment(
-                segment,
-                query,
-                limit,
-                probe_ef[segment_index],
-                groups,
-                &canonical_groups,
-            )
-            .await
-            {
-                Ok(result) => result,
+            let canonical_groups = &canonical_groups;
+            let segment_ef = probe_ef[segment_index];
+            round_futures.push(async move {
+                (
+                    segment_index,
+                    search_vector_segment(
+                        segment,
+                        query,
+                        limit,
+                        segment_ef,
+                        groups,
+                        canonical_groups,
+                    )
+                    .await,
+                )
+            });
+        }
+        use futures::StreamExt as _;
+        let round_results: Vec<(usize, Result<SegmentVectorCandidates>)> =
+            futures::stream::iter(round_futures)
+                .buffered(SEARCH_SEGMENT_FANOUT)
+                .collect()
+                .await;
+        let mut searched_by_index: Vec<Option<SegmentVectorCandidates>> =
+            (0..generation.segments.len()).map(|_| None).collect();
+        for (segment_index, result) in round_results {
+            let segment = &generation.segments[segment_index];
+            match result {
+                Ok(searched) => searched_by_index[segment_index] = Some(searched),
                 Err(error) if optional_accelerator_fallback(&error) => {
                     tracing::warn!(
                         index = index_name,
@@ -1073,7 +1097,17 @@ pub(super) async fn vector_search(
                     return Ok(ActiveSearch::Unavailable);
                 }
                 Err(error) => return Err(error),
-            };
+            }
+        }
+        for (segment_index, segment) in generation.segments.iter().enumerate() {
+            let limit = limits[segment_index];
+            if limit == 0 {
+                statuses.push((0usize, true, true));
+                continue;
+            }
+            let searched = searched_by_index[segment_index]
+                .take()
+                .ok_or_else(|| Error::invariant("vector segment round lost a result"))?;
             let accepted = match reconcile_vector_candidates(&generation, &searched.hits).await {
                 Ok(Some(accepted)) => accepted,
                 Ok(None) => return Ok(ActiveSearch::Unavailable),
