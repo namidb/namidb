@@ -1088,7 +1088,13 @@ impl ImmutableRangeCache {
         })?;
         let first_page = range.start / page_size * page_size;
         let path_string = location.to_string();
-        let generation_token = generation.cache_token()?;
+        // Scope every key to the store INSTANCE. Backend generations are only
+        // unique within one store: `InMemory` e_tags are per-instance
+        // counters, and two buckets can hold different objects at one path
+        // with colliding tokens. Readers sharing one `Arc<dyn ObjectStore>`
+        // — the production shape, one store per process — still share pages.
+        let store_token = store_instance_token(&store);
+        let generation_token = format!("{}@st{store_token:x}", generation.cache_token()?);
         let pages = (first_page..range.end)
             .step_by(self.config.page_size_bytes)
             .map(|start| start..start.saturating_add(page_size).min(object_size));
@@ -1803,6 +1809,34 @@ fn pinned_range_cache_error(location: &ObjectPath, error: RangeCacheError) -> cr
         store: "pinned-object-range",
         source: Box::new(error),
     })
+}
+
+/// A process-unique id per live `Arc<dyn ObjectStore>` instance, ABA-safe: a
+/// recycled allocation address gets a fresh id because the stored `Weak` no
+/// longer upgrades to the same instance. One store per process (production)
+/// resolves to one id forever, so page sharing is unaffected.
+fn store_instance_token(store: &Arc<dyn ObjectStore>) -> u64 {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock, Weak};
+
+    type StoreTokenMap = HashMap<usize, (u64, Weak<dyn ObjectStore>)>;
+    static TOKENS: OnceLock<Mutex<StoreTokenMap>> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    let pointer = Arc::as_ptr(store) as *const () as usize;
+    let mut map = TOKENS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((id, weak)) = map.get(&pointer) {
+        if weak.upgrade().is_some_and(|live| Arc::ptr_eq(&live, store)) {
+            return *id;
+        }
+    }
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    map.insert(pointer, (id, Arc::downgrade(store)));
+    id
 }
 
 static SHARED_RANGE_CACHE: tokio::sync::OnceCell<Option<ImmutableRangeCache>> =

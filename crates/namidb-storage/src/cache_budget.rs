@@ -432,24 +432,13 @@ fn default_ram_page_cache_request() -> usize {
     // outright instead of colliding on a constant path+range token (see
     // `PinnedObjectRangeSource::from_create_only_meta`).
     //
-    // What still gates the flip is test debt, not a defect: several
-    // namidb-query integration tests (`exec_hybrid_search.rs`
-    // indexed_sparse_filter among them) pin *exact* object-store GET counts
-    // that a warm cache legitimately reduces. Audit and re-anchor those
-    // assertions to what they actually protect, then return
-    // `DEFAULT_RAM_PAGE_CACHE_MAX_BYTES` unconditionally here.
-    let has_path = std::env::var("NAMIDB_NVME_CACHE_PATH")
-        .ok()
-        .is_some_and(|path| !path.trim().is_empty());
-    let has_capacity = std::env::var("NAMIDB_NVME_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .is_some_and(|bytes| bytes > 0);
-    if has_path && has_capacity {
-        DEFAULT_RAM_PAGE_CACHE_MAX_BYTES
-    } else {
-        0
-    }
+    // The remaining gate was test debt — integration tests pinning exact
+    // object-store GET counts that a warm cache legitimately reduces. Those
+    // assertions were audited when this default flipped ON: barrier pins are
+    // HEADs and bypass the cache (still exact), and byte/GET envelopes hold
+    // because per-test namespaces give every object a unique cache key, so a
+    // test's own first read is still a real store round trip.
+    DEFAULT_RAM_PAGE_CACHE_MAX_BYTES
 }
 
 /// Process-wide effective capacity plan. Environment configuration is sampled

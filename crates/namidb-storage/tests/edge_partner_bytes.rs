@@ -157,6 +157,11 @@ fn note(src: u64, slot: u64) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_partner_lookup_reads_a_sliver_of_a_multi_mb_edge_sst() {
+    // This pins the RANGED-HYDRATION contract, so measure the raw read
+    // path: the shared range cache rounds every fetch up to its 256 KiB
+    // pages (an amortization TRADE, deliberately excluded from this
+    // envelope). Integration tests own their process, so the env is ours.
+    std::env::set_var("NAMIDB_RAM_PAGE_CACHE_MAX_BYTES", "0");
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = counting.clone();
     let paths = NamespacePaths::new("tenants", NamespaceId::new("edge-partner-bytes").unwrap());
