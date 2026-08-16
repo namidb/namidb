@@ -3626,6 +3626,63 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Unaudited dimension (25tb-readiness): the in-process concurrent write
+    /// contract. Simultaneous HTTP write transactions serialize on the
+    /// writer mutex — both must succeed, their effects must both commit, and
+    /// a subsequent read sees every write exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_http_writes_serialize_and_both_commit() {
+        let app = fixture(None).await;
+        let post = |app: Router, body: serde_json::Value| async move {
+            let body = serde_json::to_vec(&body).unwrap();
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/cypher")
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let mut writers = Vec::new();
+        for ordinal in 0..8 {
+            let app = app.clone();
+            writers.push(tokio::spawn(async move {
+                let response = post(
+                    app,
+                    serde_json::json!({
+                        "query": format!("CREATE (:Audit {{slot: {ordinal}}})")
+                    }),
+                )
+                .await;
+                response.status()
+            }));
+        }
+        for writer in writers {
+            assert_eq!(
+                writer.await.unwrap(),
+                StatusCode::OK,
+                "every concurrent write must serialize and succeed"
+            );
+        }
+        let response = post(
+            app,
+            serde_json::json!({"query": "MATCH (a:Audit) RETURN count(*) AS c"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["rows"][0]["c"],
+            serde_json::json!(8),
+            "all eight serialized writes must be visible exactly once"
+        );
+    }
+
     /// Plan item 32 (the in-process half): the memory ceiling exercised
     /// against the REAL resident-set sample, not a synthetic gauge. A
     /// ceiling below the process's actual RSS must reject queries with 503
