@@ -1236,6 +1236,44 @@ pub fn select_search_read_plan(
 /// 10. Invariant 9 (footer/object binding) belongs to object readers: the
 /// migration read path enforces it for barrier + V5/V3, and VG6/FT4 will bind
 /// it directly in each segment footer.
+/// Retire every Search-LSM generation whose catalog signature no longer
+/// matches `manifest`'s current catalog/schema — the aftermath of a property
+/// index / uniqueness DDL that changed the native-filter set. Removes the
+/// generation state, its physical segment and barrier descriptors, and any
+/// interop build marker for the same index, leaving a manifest that
+/// validates cleanly and lets the next flush start a fresh Building
+/// generation with the new signature. Returns the retired index names.
+pub fn retire_signature_stale_generations(manifest: &mut Manifest) -> Vec<String> {
+    let mut retired_names = Vec::new();
+    let mut retired_ids: HashSet<Uuid> = HashSet::new();
+    let mut kept = Vec::with_capacity(manifest.search_lsm.len());
+    for state in std::mem::take(&mut manifest.search_lsm) {
+        let expected = catalog_signature(manifest, state.kind, &state.index_name);
+        if expected.as_deref() == Some(state.catalog_signature.as_str()) {
+            kept.push(state);
+            continue;
+        }
+        for segment in &state.segments {
+            retired_ids.insert(segment.sst_id);
+        }
+        if let Some(barrier) = state.compat_barrier_sst_id {
+            retired_ids.insert(barrier);
+        }
+        let sst_kind = state.kind.sst_kind();
+        manifest
+            .search_index_builds
+            .retain(|marker| !(marker.kind == sst_kind && marker.name == state.index_name));
+        retired_names.push(state.index_name);
+    }
+    manifest.search_lsm = kept;
+    if !retired_ids.is_empty() {
+        manifest
+            .ssts
+            .retain(|descriptor| !retired_ids.contains(&descriptor.id));
+    }
+    retired_names
+}
+
 pub fn validate_search_lsm(manifest: &Manifest) -> Result<(), SearchLsmValidationError> {
     let mut keys = HashSet::new();
     let mut claimed_descriptors: HashMap<Uuid, String> = HashMap::new();
