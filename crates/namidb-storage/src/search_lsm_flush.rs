@@ -227,17 +227,37 @@ pub(crate) async fn prepare_search_flush(
     }
 
     // A malformed committed generation is corruption, not an invitation to
-    // silently replace it with a fallback state. Only a legitimate projected
-    // catalog/schema change may invalidate the old generation and start a new
-    // Building generation below.
-    validate_search_lsm(&base.manifest).map_err(|error| {
-        Error::invariant(format!(
-            "committed Search-LSM state is invalid before node flush: {error}"
-        ))
-    })?;
+    // silently replace it with a fallback state — EXCEPT for a pure catalog
+    // signature mismatch: property/uniqueness DDL changes the native-filter
+    // set out from under a committed generation (older writers committed the
+    // schema without retiring it). That is a staleness condition, not
+    // corruption; treat it exactly like a projected catalog change so the
+    // machinery below retires the generation and starts a fresh Building one
+    // with the new signature. Every other invariant failure stays fatal.
+    let committed_catalog_stale = match validate_search_lsm(&base.manifest) {
+        Ok(()) => false,
+        Err(error)
+            if matches!(
+                error.invariant,
+                crate::search_lsm::SearchLsmInvariant::Catalog
+            ) =>
+        {
+            tracing::warn!(
+                index = %error.index_name,
+                detail = %error.detail,
+                "committed search generation is catalog-stale; retiring it for rebuild"
+            );
+            true
+        }
+        Err(error) => {
+            return Err(Error::invariant(format!(
+                "committed Search-LSM state is invalid before node flush: {error}"
+            )))
+        }
+    };
     let mut projected = base.manifest.clone();
     projected.schema = final_schema.clone();
-    let projected_lsm_valid = validate_search_lsm(&projected).is_ok();
+    let projected_lsm_valid = !committed_catalog_stale && validate_search_lsm(&projected).is_ok();
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths().clone();
     let mut retired = HashSet::new();

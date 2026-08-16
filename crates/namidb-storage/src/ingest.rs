@@ -2669,6 +2669,17 @@ impl WriterSession {
 
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let stale = crate::search_lsm::retire_signature_stale_generations(&mut next);
+            if !stale.is_empty() {
+                tracing::warn!(
+                    indexes = ?stale,
+                    "property DDL changed the native-filter catalog; retiring the \
+                     affected search generations for rebuild"
+                );
+            }
+        }
         let committed = self
             .manifest_store
             .commit(&self.fence, &self.current, next)
@@ -2764,6 +2775,40 @@ impl WriterSession {
         let mut schema = self.current.manifest.schema.clone();
         upsert_property_flags(&mut schema, label, property, dtype, unique, indexed)?;
 
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.schema = schema;
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let stale = crate::search_lsm::retire_signature_stale_generations(&mut next);
+            if !stale.is_empty() {
+                tracing::warn!(
+                    indexes = ?stale,
+                    "property DDL changed the native-filter catalog; retiring the \
+                     affected search generations for rebuild"
+                );
+            }
+        }
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        let version = committed.manifest.version;
+        self.current = committed;
+        self.refresh_published();
+        self.property_index_cache.reset_preserving_node_counts();
+        self.unique_index.reset();
+        Ok(version)
+    }
+
+    /// Test-only: commit `schema` directly WITHOUT retiring signature-stale
+    /// search generations — models the pre-2.1.1 property-DDL bug so the
+    /// flush self-heal path can be pinned from integration tests.
+    #[doc(hidden)]
+    pub async fn commit_schema_without_search_retirement_for_test(
+        &mut self,
+        schema: namidb_core::Schema,
+    ) -> Result<u64> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
         let committed = self
