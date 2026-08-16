@@ -2037,7 +2037,14 @@ fn finish_external_posting(
     distinct_counts: &mut [u64],
     legacy: &mut [Option<LegacyMapSpool>],
 ) -> Result<()> {
-    posting.file.sync_data()?;
+    // Deliberately NO sync_data here: this runs once per DISTINCT VALUE, so an
+    // fsync makes a string-heavy flush O(distinct values) journal commits — a
+    // 500k-value flush crawls at KB/s and holds the writer lock for hours (the
+    // 5M-row live-load outage). The scratch is an anonymous deleted temp file:
+    // it needs no durability, its bytes are copied out immediately below while
+    // still page-cache resident, the copy is covered end-to-end by the crc32
+    // stored in the paged-index leaf, and ENOSPC still surfaces at the value
+    // region's own sync_data when the builder finishes.
     let ordinal = posting.property as usize;
     let checksum = posting.checksum.finalize();
     builders[ordinal].push_external_file(&posting.key, &mut posting.file, posting.len, checksum)?;
