@@ -2239,11 +2239,30 @@ pub async fn install_prepared(
             ))
         })?;
         verify_node_rewrite_inputs(&current.manifest, &prepared.node_rewrites)?;
-        rebase_search_lsm_for_node_rewrites(
-            &prepared.base_search_lsm,
-            &current.manifest.search_lsm,
-            &prepared.node_rewrites,
-        )?
+        // States this very prepare REPLACES (the authoritative rebuild path —
+        // e.g. a freshly recreated index still Building with partial
+        // coverage) are retired below, not rebased: validating their partial
+        // coverage here would abort exactly the compaction that repairs
+        // them, wedging maintenance after every DROP+CREATE INDEX cycle.
+        let replaced_keys: HashSet<(crate::search_lsm::SearchLsmKind, &str)> = prepared
+            .replaced_search_lsm
+            .iter()
+            .map(|(kind, name)| (*kind, name.as_str()))
+            .collect();
+        let captured_kept: Vec<crate::search_lsm::SearchLsmState> = prepared
+            .base_search_lsm
+            .iter()
+            .filter(|state| !replaced_keys.contains(&(state.kind, state.index_name.as_str())))
+            .cloned()
+            .collect();
+        let current_kept: Vec<crate::search_lsm::SearchLsmState> = current
+            .manifest
+            .search_lsm
+            .iter()
+            .filter(|state| !replaced_keys.contains(&(state.kind, state.index_name.as_str())))
+            .cloned()
+            .collect();
+        rebase_search_lsm_for_node_rewrites(&captured_kept, &current_kept, &prepared.node_rewrites)?
     };
     if !prepared.search_compactions.is_empty() {
         if prepared.node_rewrites.is_empty() {
