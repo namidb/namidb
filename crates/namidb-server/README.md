@@ -6,10 +6,14 @@ the HTTP boundary, bearer-token auth, and a periodic flush loop.
 
 ## Install
 
-From source (workspace root):
+From source (workspace root). Note the feature flags: vector and
+full-text search are compile-time features that the official binaries,
+image, and wheels all enable, but a bare `cargo install` does NOT — a
+from-source build without them rejects `CREATE VECTOR INDEX` /
+`CREATE FULLTEXT INDEX` with HTTP 400:
 
 ```bash
-cargo install --path crates/namidb-server
+cargo install --path crates/namidb-server --features vector-index,text-index
 ```
 
 Container image (official, multi-arch amd64/arm64, from
