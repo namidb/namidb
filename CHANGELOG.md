@@ -15,6 +15,19 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-08-17
+
+**Fixed**
+- The first large flush no longer stalls all writes for hours on
+  string-heavy indexed data: the property-posting spool called `fsync`
+  once per distinct indexed value (O(rows) ext4 journal commits when
+  values are per-row distinct, e.g. names), crawling at KB/s while
+  holding the writer lock. The per-value fsync is gone — the scratch is
+  an anonymous deleted temp file whose bytes are checksummed end-to-end
+  into the index, and disk-full errors still surface at the builder's
+  amortized sync. A 5M-record live load that previously wedged at ~265k
+  rows now completes in 210 seconds with flushes finishing in ~20 s.
+
 ## [2.1.1] - 2026-08-16
 
 **Fixed**
@@ -2588,7 +2601,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/namidb/namidb/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/namidb/namidb/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/namidb/namidb/compare/v2.0.6...v2.1.0
 [2.0.6]: https://github.com/namidb/namidb/compare/v2.0.5...v2.0.6
