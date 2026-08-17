@@ -963,6 +963,24 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP namidb_property_lookup_route_total Graph property lookups by physical route. \
+             A climbing fallback counter beside a flat native one means an indexed property is \
+             silently paying O(label) scan prices (pre-sidecar SSTs in scope, unreadable sidecar, \
+             or oversized posting)."
+        );
+        let _ = writeln!(out, "# TYPE namidb_property_lookup_route_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_property_lookup_route_total{{route=\"native\"}} {}",
+            routes.property_native
+        );
+        let _ = writeln!(
+            out,
+            "namidb_property_lookup_route_total{{route=\"fallback\"}} {}",
+            routes.property_fallback
+        );
+        let _ = writeln!(
+            out,
             "# HELP namidb_search_workspace_enabled Whether the process-wide object-native search workspace has been initialized."
         );
         let _ = writeln!(out, "# TYPE namidb_search_workspace_enabled gauge");

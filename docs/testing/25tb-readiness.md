@@ -370,7 +370,7 @@ the window between DDL and the pass finishing, one uncovered SST in
 scope silently disables the index for the whole lookup (no metric) —
 that observability gap is item 39's territory.
 
-### 39. [observability, target 2.2] EXPLAIN shows NodeScan + Filter even when the posting index accelerates the scan at runtime.
+### 39. [DONE — observability, lands in 2.1.3] EXPLAIN shows NodeScan + Filter even when the posting index accelerates the scan at runtime.
 
 The pushed-predicate/posting acceleration happens INSIDE the scan
 operator, so the logical plan is truthful about shape but silent about
@@ -382,6 +382,31 @@ the physical access path chosen at execution (or at minimum a
 `route: native|scan` counter per operator in EXPLAIN VERBOSE), mirroring
 the `namidb_search_route_total{route}` pattern that already exists for
 search.
+
+**Resolution (2026-08-17):** the recon found the reality was worse than
+reported: the SERVER never handled EXPLAIN at all — `EXPLAIN <query>`
+over HTTP or Bolt silently EXECUTED the query (an `EXPLAIN CREATE` wrote
+data), and the only real consumer, `namidb explain` (CLI), renders with
+an empty StatsCatalog so it can never show `NodeByPropertyValue`. Now:
+(1) both surfaces serve `EXPLAIN [RAW] [VERBOSE]` — the optimized plan
+against the real manifest catalog, one row per line, nothing executes;
+(2) a `# route:` footer states the physical access path per index
+lookup, computed from actual sidecar coverage
+(`Snapshot::property_index_coverage`): `index (unique|posting lookup;
+posting sidecars N/N SSTs)`, `memtable (no SSTs in scope)`,
+`SCAN FALLBACK (sidecars K/N SSTs)`, or the numeric caveat
+(`numeric equality is not posting-indexed`); (3) the silent
+index-to-scan demotions in the storage lookup routes (pre-sidecar SST in
+scope, unreadable sidecar — across the unique, string-multi, batch, and
+equality-inner paths) now count into
+`namidb_property_lookup_route_total{route="native"|"fallback"}` on
+/v0/metrics, the same alarm shape as `namidb_search_route_total`; and
+(4) the stale AST doc promising executor-side EXPLAIN handling was
+corrected. Pinned by `namidb-server/tests/explain_surface.rs`: EXPLAIN
+of a write creates nothing, the optimized plan shows
+`NodeByPropertyValue`, the footer transitions memtable→index across a
+flush, numeric equality carries the caveat, VERBOSE adds estimates, and
+a real indexed lookup moves the native route counter on /v0/metrics.
 
 ### 40. [DONE — resilience, lands in 2.1.3] Disk-full during flush permanently wedges the namespace: writer lock never released, reads queue behind the guard, no error, no timeout — only a restart recovers.
 

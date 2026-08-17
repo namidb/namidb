@@ -17,8 +17,12 @@ use super::error::SourceSpan;
 
 /// A whole query — one or more single-queries joined by `UNION` / `UNION ALL`.
 ///
-/// - `explain`: user wrote `EXPLAIN <query>`. The executor honours it by
-/// returning the plan tree instead of executing.
+/// - `explain`: user wrote `EXPLAIN <query>`. The SERVER honours it
+/// (HTTP and Bolt): the optimized plan tree is rendered and returned —
+/// one row per line plus a `# route:` footer stating the physical
+/// access path per index lookup — and nothing executes. The embedded
+/// `execute*` functions do NOT consult this flag; a library caller
+/// renders via [`crate::plan::explain`] themselves.
 /// - `explain_verbose`: user wrote `EXPLAIN VERBOSE <query>`. Implies
 /// `explain`. The plan is rendered with per-operator cardinality
 /// estimates from the [`StatsCatalog`] (RFC-010).

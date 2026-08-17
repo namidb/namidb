@@ -17,6 +17,8 @@ static TEXT_NATIVE: AtomicU64 = AtomicU64::new(0);
 static TEXT_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static VECTOR_NATIVE: AtomicU64 = AtomicU64::new(0);
 static VECTOR_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static PROPERTY_NATIVE: AtomicU64 = AtomicU64::new(0);
+static PROPERTY_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
 /// Record one text index search outcome: `native = true` when the index
 /// served the answer, `false` when it declined (freshness gate, missing or
@@ -38,6 +40,21 @@ pub fn record_vector(native: bool) {
     }
 }
 
+/// Record one graph property-lookup outcome: `native = true` when the
+/// posting-sidecar/warm-index route served (or the store is memtable-only,
+/// where a scan is the correct route and no index could exist), `false`
+/// when SSTs exist but the lookup fell back to an O(label) scan — a
+/// pre-sidecar SST in scope, an unreadable sidecar, or an oversized
+/// posting. A climbing fallback counter beside a flat native one is the
+/// item-39 signature: the "index" is silently paying scan prices.
+pub fn record_property(native: bool) {
+    if native {
+        PROPERTY_NATIVE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PROPERTY_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A monotonic snapshot of every route counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteTelemetrySnapshot {
@@ -45,6 +62,8 @@ pub struct RouteTelemetrySnapshot {
     pub text_fallback: u64,
     pub vector_native: u64,
     pub vector_fallback: u64,
+    pub property_native: u64,
+    pub property_fallback: u64,
 }
 
 pub fn snapshot() -> RouteTelemetrySnapshot {
@@ -53,6 +72,8 @@ pub fn snapshot() -> RouteTelemetrySnapshot {
         text_fallback: TEXT_FALLBACK.load(Ordering::Relaxed),
         vector_native: VECTOR_NATIVE.load(Ordering::Relaxed),
         vector_fallback: VECTOR_FALLBACK.load(Ordering::Relaxed),
+        property_native: PROPERTY_NATIVE.load(Ordering::Relaxed),
+        property_fallback: PROPERTY_FALLBACK.load(Ordering::Relaxed),
     }
 }
 
@@ -67,10 +88,14 @@ mod tests {
         super::record_text(false);
         super::record_vector(true);
         super::record_vector(false);
+        super::record_property(true);
+        super::record_property(false);
         let after = super::snapshot();
         assert!(after.text_native > before.text_native);
         assert!(after.text_fallback > before.text_fallback);
         assert!(after.vector_native > before.vector_native);
         assert!(after.vector_fallback > before.vector_fallback);
+        assert!(after.property_native > before.property_native);
+        assert!(after.property_fallback > before.property_fallback);
     }
 }
