@@ -573,16 +573,31 @@ impl ServerBackend {
         drop(writer);
         let elapsed = started.elapsed();
         match result {
-            Ok(_) => RunObservation {
-                kind: Some(QueryKind::Write),
-                elapsed,
-                result: Ok(RunOutcome {
-                    fields: vec![],
-                    rows: vec![],
-                    statement_type: StatementType::Schema,
-                    counters: BTreeMap::new(),
-                }),
-            },
+            Ok(_) => {
+                // Materialize the new index on already-flushed SSTs now
+                // instead of waiting for the periodic tick — same rationale
+                // as the HTTP DDL path (item 38).
+                let _ = crate::maintenance::request_compaction(
+                    &self.state.compaction_scheduler,
+                    crate::metrics::CompactionTrigger::Ddl,
+                    &self.state.writer,
+                    &self.state.snapshot,
+                    &self.state.writer_health,
+                    &self.state.namespace,
+                    &self.state.metrics,
+                    None,
+                );
+                RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result: Ok(RunOutcome {
+                        fields: vec![],
+                        rows: vec![],
+                        statement_type: StatementType::Schema,
+                        counters: BTreeMap::new(),
+                    }),
+                }
+            }
             Err(e) => {
                 let is_user = matches!(
                     &e,

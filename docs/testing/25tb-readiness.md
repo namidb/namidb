@@ -329,7 +329,7 @@ any flush once the memtable passes the stall threshold — acceptable at
 ~20 s per flush, but a soak asserting an upper bound on write-outage
 windows during sustained load would pin it.
 
-### 38. [product, target 2.2] CREATE INDEX on already-loaded data has no effect until a flush/compaction rewrites the SSTs — there is no backfill or REINDEX.
+### 38. [DONE — product, lands in 2.1.3] CREATE INDEX on already-loaded data has no effect until a flush/compaction rewrites the SSTs — there is no backfill or REINDEX.
 
 Reported from field validation 2026-08-17 (twin-namespace experiment:
 index-before-load = sub-millisecond lookups; index-after-load = ~850 ms,
@@ -343,6 +343,32 @@ compaction of SSTs whose generation predates the DDL (the search-LSM
 already does exactly this via signature retirement — PR #133 — the graph
 side needs its twin), (c) an explicit `db.index.build()` procedure.
 Recommend (b): the machinery and the precedent both exist.
+
+**Resolution (2026-08-17):** option (b), and it turned out the heavy half
+already existed: since 2.0.5 the compaction planner treats a node SST
+whose descriptors lack a posting sidecar for a currently-indexed
+Utf8/Bool property as needing migration (`node_descriptor_needs_migration`,
+compact.rs) and will rewrite even a single fully-compacted L1 SST
+(`plan_node_bucket`) — the schema commit alone flips `needs_compaction()`
+to true. What was missing was the trigger: materialization waited for the
+periodic compaction tick (default 5 min) and never happened with periodic
+compaction disabled. Now every successful property DDL — HTTP
+CREATE CONSTRAINT / CREATE INDEX (single- and multi-tenant) and the Bolt
+twin — requests one compaction pass with a new `CompactionTrigger::Ddl`
+(visible as `namidb_compactions_total{trigger="ddl"}`); the scheduler's
+single-flight admission coalesces storms and an IF NOT EXISTS no-op
+re-request answers Noop from metadata. Pinned by
+`namidb-server/tests/ddl_index_backfill.rs`: with every periodic loop
+disabled, 300 flushed rows + CREATE CONSTRAINT + CREATE INDEX →
+both posting sidecars appear on every node SST (observed via a second
+store handle on the same file:// prefix, in under 2 s), the lookup
+answers through the query surface, and the ddl-trigger counter moves.
+Still true and now recorded here: postings only exist for
+Utf8/LargeUtf8/Bool properties (numeric equality stays scan-side — the
+type filter in `union_indexed_props`/`EqualitySidecarCollector`), and in
+the window between DDL and the pass finishing, one uncovered SST in
+scope silently disables the index for the whole lookup (no metric) —
+that observability gap is item 39's territory.
 
 ### 39. [observability, target 2.2] EXPLAIN shows NodeScan + Filter even when the posting index accelerates the scan at runtime.
 

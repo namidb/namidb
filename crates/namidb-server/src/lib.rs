@@ -2312,6 +2312,8 @@ async fn run_create_property_ddl(
     namespace: &str,
     namespace_state: Option<&NamespaceState>,
     authz: &Arc<dyn authz::AuthzHook>,
+    compaction_scheduler: &Arc<CompactionScheduler>,
+    metrics: &Arc<metrics::Metrics>,
     name: Option<&str>,
     label: &str,
     properties: &[String],
@@ -2384,17 +2386,37 @@ async fn run_create_property_ddl(
     drop(w);
     let elapsed = started.elapsed();
     match result {
-        Ok(_) => ObservedQuery {
-            kind: Some(QueryKind::Write),
-            ok: true,
-            elapsed,
-            response: Json(CypherResponse {
-                columns: vec![],
-                rows: vec![],
-                write_outcome: None,
-            })
-            .into_response(),
-        },
+        Ok(_) => {
+            // The schema commit alone makes `needs_compaction()` true for
+            // every node SST whose descriptors lack the posting sidecar the
+            // new index requires. Without this request, materialization
+            // waits for the next periodic tick — or never happens when
+            // periodic compaction is disabled — leaving the "index" at
+            // full-scan speed on already-loaded data (item 38). An
+            // IF NOT EXISTS no-op re-request is harmless: the pass gates on
+            // metadata and answers Noop.
+            let _ = request_compaction(
+                compaction_scheduler,
+                CompactionTrigger::Ddl,
+                writer,
+                snapshot,
+                writer_health,
+                namespace,
+                metrics,
+                None,
+            );
+            ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: true,
+                elapsed,
+                response: Json(CypherResponse {
+                    columns: vec![],
+                    rows: vec![],
+                    write_outcome: None,
+                })
+                .into_response(),
+            }
+        }
         Err(e) => {
             // A pre-existing duplicate (constraint) is a user error (400); a
             // fence/lost CAS is a server condition (503).
@@ -2550,6 +2572,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.namespace,
             None,
             &state.authz,
+            &state.compaction_scheduler,
+            &state.metrics,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
             &properties,
@@ -2569,6 +2593,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             &state.namespace,
             None,
             &state.authz,
+            &state.compaction_scheduler,
+            &state.metrics,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
             &properties,
@@ -3150,6 +3176,8 @@ async fn run_cypher_multi(
             &ns_state.namespace,
             Some(ns_state),
             &shared.authz,
+            &ns_state.compaction_scheduler,
+            &shared.metrics,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
             &properties,
@@ -3169,6 +3197,8 @@ async fn run_cypher_multi(
             &ns_state.namespace,
             Some(ns_state),
             &shared.authz,
+            &ns_state.compaction_scheduler,
+            &shared.metrics,
             c.name.as_ref().map(|n| n.name.as_str()),
             &c.label.name,
             &properties,
