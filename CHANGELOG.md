@@ -15,6 +15,37 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-08-17
+
+**Fixed**
+- A disk-full (or unwritable-spool) flush no longer wedges the namespace
+  permanently. Previously the flush retried a doomed O(corpus) build in a
+  loop while holding the writer lock: every write got "writer is busy"
+  forever, stuck admin/DDL requests exhausted the global HTTP concurrency
+  cap until even reads and health checks hung, and only a restart
+  recovered. Now the namespace degrades to read-only with a typed 507
+  (`namespace degraded: ...`) on every write surface, reads keep serving
+  the last committed state, `/v0/health` carries the reason, flush
+  retries back off 30 s, and the first successful flush clears the state
+  — self-healing once the disk frees, no restart.
+
+**Added**
+- `CREATE CONSTRAINT` / `CREATE INDEX` on already-loaded data now takes
+  effect immediately: the DDL schedules the compaction pass that
+  materializes the posting sidecars on pre-existing SSTs (visible as
+  `namidb_compactions_total{trigger="ddl"}`). Previously the index only
+  materialized on the next periodic compaction tick — or never, with
+  periodic compaction disabled.
+- The server now serves `EXPLAIN [RAW] [VERBOSE]` over HTTP and Bolt:
+  the optimized plan against the live catalog, one row per line, without
+  executing the query (previously the prefix was silently ignored and
+  the query ran). A `# route:` footer states the physical access path
+  per index lookup — index with sidecar coverage, memtable, scan
+  fallback, or the numeric-equality caveat.
+- `namidb_property_lookup_route_total{route="native"|"fallback"}` on
+  `/v0/metrics`: silent index-to-scan demotions in property lookups are
+  now observable, mirroring `namidb_search_route_total`.
+
 ## [2.1.2] - 2026-08-17
 
 **Fixed**
@@ -2601,7 +2632,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.2...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/namidb/namidb/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/namidb/namidb/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/namidb/namidb/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/namidb/namidb/compare/v2.0.6...v2.1.0
