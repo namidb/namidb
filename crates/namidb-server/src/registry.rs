@@ -295,12 +295,18 @@ impl NamespaceRegistry {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // first tick fires immediately; skip
+                                   // Back off after a local-persistence flush failure — see the
+                                   // single-tenant loop and `FLUSH_FAILURE_RETRY_BACKOFF`.
+                let mut retry_after: Option<Instant> = None;
                 loop {
                     tokio::select! {
                         biased;
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
+                    }
+                    if retry_after.is_some_and(|at| Instant::now() < at) {
+                        continue;
                     }
                     // Flush under the writer lock, then only enqueue a
                     // trigger when the L0 high-water mark trips. The
@@ -325,11 +331,20 @@ impl NamespaceRegistry {
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         match w.flush(schema.clone()).await {
                             Ok(_) => {
+                                retry_after = None;
+                                s.writer_health.clear_persistence_degraded();
                                 s.snapshot.store(w.owned_snapshot());
                                 l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
                             }
                             Err(e) => {
                                 error!(namespace = %ns, error = %e, "periodic flush failed");
+                                if e.is_local_persistence() {
+                                    s.writer_health.mark_persistence_degraded(
+                                        crate::persistence_degraded_reason(&e),
+                                    );
+                                    retry_after =
+                                        Some(Instant::now() + crate::FLUSH_FAILURE_RETRY_BACKOFF);
+                                }
                                 // A fenced/poisoned writer would fail every later
                                 // flush AND every write on this namespace; reopen
                                 // it under the lock we already hold.

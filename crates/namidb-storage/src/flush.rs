@@ -395,14 +395,39 @@ pub async fn flush(
     })
 }
 
+/// How long a flush may wait for the process-wide build gate before giving
+/// up. The permit lives inside an unabortable `spawn_blocking` closure, so a
+/// build wedged on pathological local I/O (a full, thrashing spool disk)
+/// holds the gate with no owner visible to the async side; an unbounded
+/// acquire here would then park every later flush — in every namespace —
+/// while it holds its writer mutex, freezing all writes process-wide until a
+/// restart. Bounding the wait converts that permanent wedge into a failed
+/// flush the caller can log, classify, and retry.
+fn flush_build_gate_timeout() -> std::time::Duration {
+    std::env::var("NAMIDB_FLUSH_BUILD_GATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(600))
+}
+
 pub(crate) async fn run_flush_build<T, F>(build: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    let permit = FLUSH_BUILD_GATE
-        .acquire()
+    let wait = flush_build_gate_timeout();
+    let permit = tokio::time::timeout(wait, FLUSH_BUILD_GATE.acquire())
         .await
+        .map_err(|_| {
+            Error::precondition(format!(
+                "flush build gate saturated for {}s: another corpus-sized \
+                 build is still running (possibly wedged on local spool I/O); \
+                 this flush attempt is abandoned and will be retried",
+                wait.as_secs()
+            ))
+        })?
         .map_err(|_| Error::invariant("flush SST build gate closed"))?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;

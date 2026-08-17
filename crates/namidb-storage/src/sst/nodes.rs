@@ -233,8 +233,12 @@ impl NodeSstWriter {
 
         let schema = node_arrow_schema(&label);
         let writer_props = build_writer_properties(&options);
-        let spool = crate::sst::paged_index::create_spool_file()
-            .map_err(|e| Error::invariant(format!("node SST spool create: {e}")))?;
+        let spool = crate::sst::paged_index::create_spool_file().map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("node SST spool create: {e}"),
+            ))
+        })?;
         let inner = ArrowWriter::try_new(spool, schema.clone(), Some(writer_props))
             .map_err(|e| Error::invariant(format!("parquet writer init: {e}")))?;
 
@@ -377,20 +381,31 @@ impl NodeSstWriter {
             .inner
             .into_inner()
             .map_err(|e| Error::invariant(format!("parquet close: {e}")))?;
-        spool
-            .flush()
-            .map_err(|e| Error::invariant(format!("node SST spool flush: {e}")))?;
+        spool.flush().map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("node SST spool flush: {e}"),
+            ))
+        })?;
         // Make the spool reclaimable before the immutable mapping is read by
         // property-stat collection and object upload. Merely flushing the
         // `File` exposes the bytes but may leave a corpus-sized dirty page
         // cache charged to the process cgroup on a slow disk. It also defers
         // delayed-allocation failures until after the SST is being published.
-        spool
-            .sync_data()
-            .map_err(|e| Error::invariant(format!("node SST spool sync: {e}")))?;
+        spool.sync_data().map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("node SST spool sync: {e}"),
+            ))
+        })?;
         let body_len_u64 = spool
             .metadata()
-            .map_err(|e| Error::invariant(format!("node SST spool metadata: {e}")))?
+            .map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("node SST spool metadata: {e}"),
+                ))
+            })?
             .len();
         if body_len_u64 == 0 {
             return Err(Error::invariant(
@@ -405,10 +420,12 @@ impl NodeSstWriter {
         // the file handle is dropped, and `Bytes::from_owner` keeps it alive
         // for every clone sent through the existing upload/read APIs.
         let mapped = unsafe {
-            MmapOptions::new()
-                .len(body_len)
-                .map(&spool)
-                .map_err(|e| Error::invariant(format!("node SST spool mmap: {e}")))?
+            MmapOptions::new().len(body_len).map(&spool).map_err(|e| {
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("node SST spool mmap: {e}"),
+                ))
+            })?
         };
         if mapped.len() != body_len {
             return Err(Error::invariant(

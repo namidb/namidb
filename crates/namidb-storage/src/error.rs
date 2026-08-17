@@ -173,4 +173,16 @@ impl Error {
     pub fn requires_writer_reopen(&self) -> bool {
         matches!(self, Error::Fenced { .. } | Error::ManifestCommitCas { .. })
     }
+
+    /// True when the failure is machine-local persistence (spool/scratch
+    /// disk I/O — disk full, unwritable spool directory) rather than the
+    /// object store or a logical error. A flush that fails this way will
+    /// fail identically on every immediate retry: the O(corpus) build
+    /// grinds the same full disk while holding the writer lock, starving
+    /// every write into "writer is busy". Servers should treat it as a
+    /// degrade-writes-keep-serving-reads condition and back off the retry
+    /// cadence until the local condition clears.
+    pub fn is_local_persistence(&self) -> bool {
+        matches!(self, Error::Io(_))
+    }
 }
