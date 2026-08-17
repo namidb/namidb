@@ -1409,6 +1409,123 @@ fn exec_error_classification(
 /// deliberately-unsupported feature surfaces as 400/`unsupported` instead of
 /// a bare 500. The `code` field is emitted only when classified, so existing
 /// clients that deserialize the body loosely see no change on plain 500s.
+/// Serve `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan instead of
+/// executing. The AST has always promised this ("the executor honours it by
+/// returning the plan tree"), but the server previously ignored the prefix
+/// and silently EXECUTED the query — an `EXPLAIN CREATE ...` wrote data.
+/// Non-RAW forms render the plan the optimizer actually produced against
+/// the real manifest catalog, so index rewrites like `NodeByPropertyValue`
+/// are visible (the CLI's offline explain has an empty catalog and can
+/// never show them). A `# route:` footer then states the PHYSICAL access
+/// path for every index lookup in the plan: posting-sidecar coverage
+/// decides index-vs-scan at run time, and until item 39 that decision was
+/// observable only through `elapsed_ms`.
+fn explain_observation(
+    parsed: &namidb_query::Query,
+    plan: &namidb_query::LogicalPlan,
+    owned: &namidb_storage::OwnedSnapshot,
+    catalog: &StatsCatalog,
+    started: std::time::Instant,
+) -> ObservedQuery {
+    let rows = explain_plan_lines(parsed, plan, owned, catalog)
+        .into_iter()
+        .map(|line| {
+            let mut row = serde_json::Map::new();
+            row.insert("plan".into(), serde_json::Value::String(line));
+            row
+        })
+        .collect();
+    ObservedQuery {
+        kind: Some(QueryKind::Read),
+        ok: true,
+        elapsed: started.elapsed(),
+        response: Json(CypherResponse {
+            columns: vec!["plan".into()],
+            rows,
+            write_outcome: None,
+        })
+        .into_response(),
+    }
+}
+
+/// The rendered EXPLAIN lines (plan tree + `# route:` footer), shared by
+/// the HTTP and Bolt surfaces.
+pub(crate) fn explain_plan_lines(
+    parsed: &namidb_query::Query,
+    plan: &namidb_query::LogicalPlan,
+    owned: &namidb_storage::OwnedSnapshot,
+    catalog: &StatsCatalog,
+) -> Vec<String> {
+    let text = if parsed.explain_raw && parsed.explain_verbose {
+        namidb_query::explain_query_raw_verbose(parsed, catalog)
+            .unwrap_or_else(|e| format!("explain error: {e}"))
+    } else if parsed.explain_raw {
+        namidb_query::explain_query_raw(parsed).unwrap_or_else(|e| format!("explain error: {e}"))
+    } else if parsed.explain_verbose {
+        namidb_query::explain_verbose(plan, catalog)
+    } else {
+        namidb_query::explain(plan)
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if !parsed.explain_raw {
+        let snapshot = owned.borrow();
+        collect_route_notes(plan, &snapshot, &mut lines);
+    }
+    lines
+}
+
+/// Append one `# route:` line per index-lookup operator in the plan.
+fn collect_route_notes(
+    plan: &namidb_query::LogicalPlan,
+    snapshot: &namidb_storage::Snapshot<'_>,
+    out: &mut Vec<String>,
+) {
+    if let namidb_query::LogicalPlan::NodeByPropertyValue {
+        label,
+        property,
+        value,
+        multi,
+        ..
+    } = plan
+    {
+        let shown = if label.is_empty() { "*" } else { label };
+        let kind = if *multi { "posting" } else { "unique" };
+        let numeric = matches!(
+            &value.kind,
+            namidb_query::parser::ast::ExpressionKind::Literal(
+                namidb_query::parser::ast::Literal::Integer(_)
+                    | namidb_query::parser::ast::Literal::Float(_)
+            )
+        );
+        let note = if numeric {
+            format!(
+                "# route: {shown}.{property} → scan \
+                 (numeric equality is not posting-indexed; only String/Bool are)"
+            )
+        } else {
+            let (covered, total) = snapshot.property_index_coverage(label, property);
+            if total == 0 {
+                format!("# route: {shown}.{property} → memtable ({kind} lookup; no SSTs in scope)")
+            } else if covered == total {
+                format!(
+                    "# route: {shown}.{property} → index \
+                     ({kind} lookup; posting sidecars {covered}/{total} SSTs)"
+                )
+            } else {
+                format!(
+                    "# route: {shown}.{property} → SCAN FALLBACK \
+                     (posting sidecars {covered}/{total} SSTs; \
+                     a compaction pass materializes the rest)"
+                )
+            }
+        };
+        out.push(note);
+    }
+    for child in plan.children() {
+        collect_route_notes(child, snapshot, out);
+    }
+}
+
 fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Response {
     let (status, code) = exec_error_classification(e);
     let error = format!("{prefix}: {e}");
@@ -2636,24 +2753,22 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
 
     // Plan against the latest published snapshot — no writer lock yet.
     let owned = state.snapshot.load();
-    let plan = {
-        let catalog = state.catalog_for(&owned.manifest().manifest);
-        match build_plan(&parsed, &catalog) {
-            Ok(p) => p,
-            Err(e) => {
-                return ObservedQuery {
-                    kind: None,
-                    ok: false,
-                    elapsed: started.elapsed(),
-                    response: (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorBody {
-                            error: format!("plan error: {e}"),
-                        }),
-                    )
-                        .into_response(),
-                };
-            }
+    let catalog = state.catalog_for(&owned.manifest().manifest);
+    let plan = match build_plan(&parsed, &catalog) {
+        Ok(p) => p,
+        Err(e) => {
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("plan error: {e}"),
+                    }),
+                )
+                    .into_response(),
+            };
         }
     };
 
@@ -2673,6 +2788,10 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             )
                 .into_response(),
         };
+    }
+
+    if parsed.explain {
+        return explain_observation(&parsed, &plan, &owned, &catalog, started);
     }
 
     if plan.contains_write() {
@@ -3241,24 +3360,22 @@ async fn run_cypher_multi(
     // memoised per manifest version on the namespace state (building it is
     // O(ssts)), so a read-heavy namespace does not rebuild it every query.
     let owned = ns_state.snapshot.load();
-    let plan = {
-        let catalog = ns_state.catalog_for(&owned.manifest().manifest);
-        match build_plan(&parsed, &catalog) {
-            Ok(p) => p,
-            Err(e) => {
-                return ObservedQuery {
-                    kind: None,
-                    ok: false,
-                    elapsed: started.elapsed(),
-                    response: (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorBody {
-                            error: format!("plan error: {e}"),
-                        }),
-                    )
-                        .into_response(),
-                };
-            }
+    let catalog = ns_state.catalog_for(&owned.manifest().manifest);
+    let plan = match build_plan(&parsed, &catalog) {
+        Ok(p) => p,
+        Err(e) => {
+            return ObservedQuery {
+                kind: None,
+                ok: false,
+                elapsed: started.elapsed(),
+                response: (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorBody {
+                        error: format!("plan error: {e}"),
+                    }),
+                )
+                    .into_response(),
+            };
         }
     };
 
@@ -3276,6 +3393,10 @@ async fn run_cypher_multi(
             )
                 .into_response(),
         };
+    }
+
+    if parsed.explain {
+        return explain_observation(&parsed, &plan, &owned, &catalog, started);
     }
 
     if plan.contains_write() {

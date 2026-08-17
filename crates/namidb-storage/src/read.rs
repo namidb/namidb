@@ -1367,11 +1367,13 @@ impl<'mt> Snapshot<'mt> {
                 })
                 .collect();
             let Some(sidecars) = sidecars else {
+                crate::route_telemetry::record_property(false);
                 return Ok(IndexedPropertyLookup::Unavailable);
             };
             // No SSTs means the committed/staged memtable is the whole store.
             // Otherwise every relevant SST must have contributed one sidecar.
             if have_node_ssts && sidecars.len() != sst_idxs.len() {
+                crate::route_telemetry::record_property(false);
                 return Ok(IndexedPropertyLookup::Unavailable);
             }
 
@@ -1409,6 +1411,7 @@ impl<'mt> Snapshot<'mt> {
                             error = %error,
                             "equality accelerator unavailable; falling back to exact scan"
                         );
+                        crate::route_telemetry::record_property(false);
                         return Ok(IndexedPropertyLookup::Unavailable);
                     }
                     Err(error) => return Err(error),
@@ -1510,6 +1513,7 @@ impl<'mt> Snapshot<'mt> {
             // the cutoff or every posting is exhausted.
             return Ok(IndexedPropertyLookup::Truncated);
         }
+        crate::route_telemetry::record_property(true);
         Ok(IndexedPropertyLookup::Available(confirmed))
     }
 
@@ -1763,6 +1767,31 @@ impl<'mt> Snapshot<'mt> {
         }
     }
 
+    /// Posting-sidecar coverage for `(label, property)` over the node SSTs
+    /// that can contain the label: `(covered, in_scope)`. The lookup routes
+    /// demote to a label scan unless every in-scope SST is covered, so
+    /// `covered < in_scope` means "the index exists in the schema but this
+    /// snapshot pays scan prices" — the physical-route fact EXPLAIN
+    /// annotates (item 39). `(0, 0)` = memtable-only (no SSTs in scope;
+    /// the claimant map serves natively).
+    pub fn property_index_coverage(&self, label: &str, property: &str) -> (usize, usize) {
+        let in_scope: Vec<usize> = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .filter(|i| node_sst_can_contain_label(&self.manifest.manifest, *i, label))
+            .collect();
+        let covered = in_scope
+            .iter()
+            .filter(|i| {
+                string_property_sidecar(&self.manifest.manifest.ssts[**i], label, property)
+                    .is_some()
+            })
+            .count();
+        (covered, in_scope.len())
+    }
+
     /// Point-lookup a node by a *unique* user property. The first call
     /// per (label, prop) pays a full label scan to populate the
     /// cross-snapshot cache; subsequent calls are `O(1)`. Caller is
@@ -1812,6 +1841,7 @@ impl<'mt> Snapshot<'mt> {
                 .property_index_generation
                 .unwrap_or_else(|| cache.generation());
             if let Some(idx) = cache.get_at(label, property, generation) {
+                crate::route_telemetry::record_property(true);
                 if let Some(node_id) = idx.get(value).copied() {
                     return self.lookup_node(label, node_id).await;
                 } else {
@@ -1955,6 +1985,7 @@ impl<'mt> Snapshot<'mt> {
             }
 
             if sidecars_available {
+                crate::route_telemetry::record_property(true);
                 // Under a valid unique constraint there is at most one
                 // confirmed live owner. If legacy/corrupt data contains more,
                 // select deterministically by newest row LSN, then lowest
@@ -1987,6 +2018,7 @@ impl<'mt> Snapshot<'mt> {
         // pre-sidecar build (or when the property wasn't declared
         // `unique` at flush time). The in-memory cache caches the
         // result so subsequent calls bypass the scan.
+        crate::route_telemetry::record_property(!have_node_ssts);
         let all_nodes = self.scan_label(label).await?;
         let mut idx: std::collections::HashMap<String, namidb_core::id::NodeId> =
             std::collections::HashMap::with_capacity(all_nodes.len());
@@ -2113,9 +2145,11 @@ impl<'mt> Snapshot<'mt> {
         // intentionally per-SST so a rolling-upgrade generation can combine a
         // legacy unique map with a current global equality posting map.
         if have_node_ssts && sidecars.is_none() {
+            crate::route_telemetry::record_property(false);
             let views = self.scan_label(label).await?;
             return self.batch_unique_from_scan(label, property, values, views);
         }
+        crate::route_telemetry::record_property(true);
 
         let memtable_claimants = self.memtable_property_claimants(label, property)?;
         for (value, ids_out) in &mut candidates {
@@ -2146,6 +2180,7 @@ impl<'mt> Snapshot<'mt> {
                                 error = %error,
                                 "unique property accelerator unavailable; falling back to one exact batch label scan"
                             );
+                            crate::route_telemetry::record_property(false);
                             let views = self.scan_label(label).await?;
                             return self.batch_unique_from_scan(label, property, values, views);
                         }
@@ -2181,6 +2216,7 @@ impl<'mt> Snapshot<'mt> {
                                 error = %error,
                                 "equality property accelerator unavailable; falling back to one exact batch label scan"
                             );
+                            crate::route_telemetry::record_property(false);
                             let views = self.scan_label(label).await?;
                             return self.batch_unique_from_scan(label, property, values, views);
                         }
@@ -2355,6 +2391,7 @@ impl<'mt> Snapshot<'mt> {
         // `indexed` at flush time). A memtable-only store is NOT cold: its
         // claimant map is the complete index and is cached per generation.
         if have_node_ssts && !all_have_sidecar {
+            crate::route_telemetry::record_property(false);
             let all_nodes = self.scan_label(label).await?;
             return Ok(all_nodes
                 .into_iter()
@@ -2364,6 +2401,7 @@ impl<'mt> Snapshot<'mt> {
                 })
                 .collect());
         }
+        crate::route_telemetry::record_property(true);
 
         namidb_core::profile_scope!("Snapshot::lookup_nodes_by_property.sidecar");
         // Gather candidate ids: memtable upserts carrying `value`, plus the

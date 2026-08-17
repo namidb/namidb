@@ -751,6 +751,26 @@ impl ServerBackend {
             );
         }
 
+        if parsed.explain {
+            let lines = crate::explain_plan_lines(&parsed, &plan, &owned, &catalog);
+            let rows = lines
+                .into_iter()
+                .map(|line| {
+                    namidb_query::Row::new().with("plan", namidb_query::RuntimeValue::String(line))
+                })
+                .collect();
+            return RunObservation {
+                kind: Some(QueryKind::Read),
+                elapsed: started.elapsed(),
+                result: Ok(RunOutcome {
+                    fields: vec!["plan".into()],
+                    rows,
+                    statement_type: StatementType::Read,
+                    counters: Default::default(),
+                }),
+            };
+        }
+
         if plan.contains_write() {
             // A read-only token may not write — reject before the writer lock.
             if let Some(err) = self.write_forbidden() {
