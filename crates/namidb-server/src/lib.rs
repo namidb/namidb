@@ -925,6 +925,12 @@ pub async fn run_with_memory_max_bytes(
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // first tick fires immediately; skip.
+                               // After a local-persistence flush failure (spool disk full),
+                               // an immediate retry re-runs the same doomed O(corpus) build
+                               // under the writer lock. Hold retries back so the mutex stays
+                               // available and the degraded state can be observed; the next
+                               // attempt after the window self-heals once the disk clears.
+            let mut retry_after: Option<std::time::Instant> = None;
             loop {
                 // Flush on the timer OR when a committed write crossed the
                 // memtable byte threshold (`after_commit_backpressure`
@@ -933,6 +939,9 @@ pub async fn run_with_memory_max_bytes(
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = state_for_flush.flush_notify.notified() => {}
+                }
+                if retry_after.is_some_and(|at| std::time::Instant::now() < at) {
+                    continue;
                 }
                 // Flush under the writer lock, then only enqueue a trigger
                 // when the L0 high-water mark trips. The scheduler captures
@@ -949,6 +958,8 @@ pub async fn run_with_memory_max_bytes(
                     let schema = w.snapshot().manifest().manifest.schema.clone();
                     match w.flush(schema.clone()).await {
                         Ok(_) => {
+                            retry_after = None;
+                            state_for_flush.writer_health.clear_persistence_degraded();
                             state_for_flush.snapshot.store(w.owned_snapshot());
                             state_for_flush
                                 .memtable_bytes_gauge
@@ -957,6 +968,13 @@ pub async fn run_with_memory_max_bytes(
                         }
                         Err(e) => {
                             error!(error = %e, "periodic flush failed");
+                            if e.is_local_persistence() {
+                                state_for_flush
+                                    .writer_health
+                                    .mark_persistence_degraded(persistence_degraded_reason(&e));
+                                retry_after =
+                                    Some(std::time::Instant::now() + FLUSH_FAILURE_RETRY_BACKOFF);
+                            }
                             // A fenced/poisoned writer would fail every later
                             // flush AND every write; reopen under the held lock.
                             recovery::recover_writer_if_needed(
@@ -1413,6 +1431,49 @@ pub(crate) async fn lock_writer_bounded(
     tokio::time::timeout(timeout, writer.lock()).await.ok()
 }
 
+/// How long the periodic flush loop waits after a local-persistence flush
+/// failure before retrying. Immediate retries re-run the same doomed
+/// O(corpus) build against the same full disk while holding the writer
+/// mutex; this window keeps the mutex available and gives the operator a
+/// stable degraded state instead of a grinding loop.
+pub(crate) const FLUSH_FAILURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The reason recorded in `WriterHealth` when a flush fails on local
+/// persistence. Written for the operator who reads `/v0/health`.
+pub(crate) fn persistence_degraded_reason(e: &namidb_storage::Error) -> String {
+    format!(
+        "flush failed on local persistence (spool disk full or unwritable?): {e}; \
+         writes are rejected with 507 and reads keep serving the last committed \
+         state; the flush retries automatically and recovery clears this"
+    )
+}
+
+/// The uniform 507 body for writes rejected while the namespace is
+/// persistence-degraded. 507 (Insufficient Storage) so clients and load
+/// balancers can tell "stop sending writes, the disk is the problem" apart
+/// from the transient 503 "writer is busy; retry".
+fn persistence_degraded_response(reason: &str) -> Response {
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        Json(ErrorBody {
+            error: format!("namespace degraded: {reason}"),
+        }),
+    )
+        .into_response()
+}
+
+/// Typed rejection for write intake while the namespace's local persistence
+/// is degraded (spool disk full/unwritable — the flush cannot drain the
+/// memtable). Checked BEFORE queueing on the writer mutex so a doomed flush
+/// cycle cannot convert every write into an opaque lock-timeout 503, and so
+/// rejected writes never pin a concurrency slot waiting on the mutex.
+/// Reads are never gated on this.
+fn write_intake_rejection(health: &recovery::WriterHealth) -> Option<Response> {
+    health
+        .persistence_degraded_reason()
+        .map(|reason| persistence_degraded_response(&reason))
+}
+
 /// The uniform 503 body for a foreground writer-lock timeout.
 fn writer_busy_response() -> Response {
     (
@@ -1761,6 +1822,14 @@ async fn run_create_vector_index(
                 .into_response(),
         };
     }
+    if let Some(rejection) = write_intake_rejection(writer_health) {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: rejection,
+        };
+    }
     let mut w = writer.lock().await;
     if namespace_state.is_some_and(NamespaceState::is_retired) {
         drop(w);
@@ -1891,6 +1960,14 @@ async fn run_create_fulltext_index(
                 .into_response(),
         };
     }
+    if let Some(rejection) = write_intake_rejection(writer_health) {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: rejection,
+        };
+    }
     let mut w = writer.lock().await;
     if namespace_state.is_some_and(NamespaceState::is_retired) {
         drop(w);
@@ -2004,6 +2081,14 @@ async fn run_drop_vector_index(
                 }),
             )
                 .into_response(),
+        };
+    }
+    if let Some(rejection) = write_intake_rejection(writer_health) {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: rejection,
         };
     }
     let mut w = writer.lock().await;
@@ -2121,6 +2206,14 @@ async fn run_drop_fulltext_index(
                 }),
             )
                 .into_response(),
+        };
+    }
+    if let Some(rejection) = write_intake_rejection(writer_health) {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: rejection,
         };
     }
     let mut w = writer.lock().await;
@@ -2261,6 +2354,14 @@ async fn run_create_property_ddl(
                 }),
             )
                 .into_response(),
+        };
+    }
+    if let Some(rejection) = write_intake_rejection(writer_health) {
+        return ObservedQuery {
+            kind: None,
+            ok: false,
+            elapsed: started.elapsed(),
+            response: rejection,
         };
     }
     let mut w = writer.lock().await;
@@ -2565,6 +2666,14 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     .into_response(),
             };
         }
+        if let Some(rejection) = write_intake_rejection(&state.writer_health) {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: rejection,
+            };
+        }
         let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
             return ObservedQuery {
                 kind: Some(QueryKind::Write),
@@ -2703,12 +2812,41 @@ async fn admin_flush(
     run_admin_flush(state).await
 }
 
+/// Bound for the admin-flush waits (the process-wide flush permit and the
+/// writer mutex). This route is excluded from the request timeout, so an
+/// unbounded wait pins one global HTTP concurrency slot per queued client —
+/// enough stuck clients exhaust the cap and starve reads process-wide (the
+/// disk-full field outage, item 40). A 503 keeps the slot economy honest.
+const ADMIN_FLUSH_WAIT: Duration = Duration::from_secs(30);
+
+fn admin_flush_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "another flush is already running; retry shortly".into(),
+        }),
+    )
+        .into_response()
+}
+
 async fn run_admin_flush(state: AppState) -> Response {
-    let flush_permit = state.memory.admin_flush_permit().await;
-    let mut w = state.writer.lock().await;
+    let Ok(flush_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_flush_permit()).await
+    else {
+        return admin_flush_busy_response();
+    };
+    let bound = if state.writer_lock_timeout.is_zero() {
+        ADMIN_FLUSH_WAIT
+    } else {
+        state.writer_lock_timeout
+    };
+    let Some(mut w) = lock_writer_bounded(&state.writer, bound).await else {
+        return writer_busy_response();
+    };
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
         Ok(outcome) => {
+            state.writer_health.clear_persistence_degraded();
             state.snapshot.store(w.owned_snapshot());
             state
                 .memtable_bytes_gauge
@@ -2738,6 +2876,13 @@ async fn run_admin_flush(state: AppState) -> Response {
                 &e,
             )
             .await;
+            if e.is_local_persistence() {
+                let reason = persistence_degraded_reason(&e);
+                state
+                    .writer_health
+                    .mark_persistence_degraded(reason.clone());
+                return persistence_degraded_response(&reason);
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorBody {
@@ -3119,6 +3264,14 @@ async fn run_cypher_multi(
                     .into_response(),
             };
         }
+        if let Some(rejection) = write_intake_rejection(&ns_state.writer_health) {
+            return ObservedQuery {
+                kind: Some(QueryKind::Write),
+                ok: false,
+                elapsed: started.elapsed(),
+                response: rejection,
+            };
+        }
         let lock_started = std::time::Instant::now();
         let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
         shared.metrics.observe_writer_lock(
@@ -3273,7 +3426,11 @@ async fn dispatch_admin_flush_multi(
 }
 
 async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Response {
-    let flush_permit = shared.memory.admin_flush_permit().await;
+    let Ok(flush_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.memory.admin_flush_permit()).await
+    else {
+        return admin_flush_busy_response();
+    };
     // Refresh the gauge because this route intentionally bypasses query
     // admission. At the hard limit, only an already-open namespace can own a
     // memtable worth flushing; recovering a cold one would allocate memory
@@ -3309,7 +3466,14 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
             }
         }
     };
-    let mut w = ns_state.writer.lock().await;
+    let bound = if shared.writer_lock_timeout.is_zero() {
+        ADMIN_FLUSH_WAIT
+    } else {
+        shared.writer_lock_timeout
+    };
+    let Some(mut w) = lock_writer_bounded(&ns_state.writer, bound).await else {
+        return writer_busy_response();
+    };
     // Same post-lock incarnation check as normal writes and schema DDL.
     if ns_state.is_retired() {
         drop(w);
@@ -3318,6 +3482,7 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
         Ok(outcome) => {
+            ns_state.writer_health.clear_persistence_degraded();
             ns_state.snapshot.store(w.owned_snapshot());
             let response = FlushResponse {
                 ssts_written: outcome.ssts_written,
@@ -3340,6 +3505,13 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
                     &e,
                 )
                 .await;
+            }
+            if e.is_local_persistence() {
+                let reason = persistence_degraded_reason(&e);
+                ns_state
+                    .writer_health
+                    .mark_persistence_degraded(reason.clone());
+                return persistence_degraded_response(&reason);
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

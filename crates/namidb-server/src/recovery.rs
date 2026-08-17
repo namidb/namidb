@@ -35,6 +35,15 @@ const REOPEN_BACKOFF: Duration = Duration::from_millis(50);
 #[derive(Debug, Default)]
 pub struct WriterHealth {
     degraded: std::sync::Mutex<Option<String>>,
+    /// Local-persistence failure (spool disk full/unwritable during flush).
+    /// Kept separate from `degraded`: that slot is owned by the
+    /// fence-probe/commit-recovery machinery and its prefix-matching clear
+    /// logic, while this one is set and cleared strictly by flush outcomes.
+    /// While set, write intake is rejected with a typed error (the memtable
+    /// cannot drain, so accepting writes only grows an unbounded buffer and
+    /// turns into "writer is busy" confusion); reads keep serving the last
+    /// committed snapshot. It self-clears on the first successful flush.
+    persistence: std::sync::Mutex<Option<String>>,
 }
 
 impl WriterHealth {
@@ -43,11 +52,32 @@ impl WriterHealth {
     }
 
     /// The failure keeping the writer degraded, or `None` when healthy.
+    /// A local-persistence failure reports here too so `/v0/health` and
+    /// readiness surface it without a second field.
     pub fn degraded_reason(&self) -> Option<String> {
         self.degraded
             .lock()
             .expect("writer health poisoned")
             .clone()
+            .or_else(|| self.persistence_degraded_reason())
+    }
+
+    /// The local-persistence failure currently rejecting write intake, or
+    /// `None`. Write handlers consult this before queueing on the writer
+    /// mutex; reads never consult it.
+    pub fn persistence_degraded_reason(&self) -> Option<String> {
+        self.persistence
+            .lock()
+            .expect("writer health poisoned")
+            .clone()
+    }
+
+    pub(crate) fn mark_persistence_degraded(&self, reason: String) {
+        *self.persistence.lock().expect("writer health poisoned") = Some(reason);
+    }
+
+    pub(crate) fn clear_persistence_degraded(&self) {
+        *self.persistence.lock().expect("writer health poisoned") = None;
     }
 
     /// `"ok"` / `"degraded"` — the `writer` field of the health payload.

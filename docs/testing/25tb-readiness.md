@@ -357,7 +357,7 @@ the physical access path chosen at execution (or at minimum a
 the `namidb_search_route_total{route}` pattern that already exists for
 search.
 
-### 40. [resilience, blocker, target 2.1.3] Disk-full during flush permanently wedges the namespace: writer lock never released, reads queue behind the guard, no error, no timeout — only a restart recovers.
+### 40. [DONE — resilience, lands in 2.1.3] Disk-full during flush permanently wedges the namespace: writer lock never released, reads queue behind the guard, no error, no timeout — only a restart recovers.
 
 Reported reproduced twice in field validation with a full spool disk.
 The flush error path must (1) release the writer lock on ANY failure,
@@ -370,6 +370,38 @@ FaultStore/ENOSPC injection test (tmpfs with a size cap) pinning all
 three behaviors. This is the most serious resilience finding of the
 round; the production mitigation until fixed is disk alerting
 (node_exporter) plus the bulk deadline's clean 408.
+
+**Resolution (2026-08-17):** the wedge was a four-link chain, each link now
+cut. (1) The flush's local spool I/O errors were wrapped into
+`Error::invariant`, hiding their nature — they now stay `Error::Io` and a
+new `Error::is_local_persistence()` classifies them. (2) On such a failure
+the periodic flush loops (single- and multi-tenant) mark the namespace
+persistence-degraded in `WriterHealth` and back off retries 30 s
+(`FLUSH_FAILURE_RETRY_BACKOFF`) instead of immediately re-running the doomed
+O(corpus) build under the writer mutex; the first successful flush clears
+the state. (3) While degraded, every write intake point — HTTP write, all
+five schema-DDL handlers, all six Bolt write sites, Bolt BEGIN — rejects
+with a typed 507 `namespace degraded: …` (Bolt: a non-retriable failure
+carrying the reason) BEFORE queueing on the writer mutex, and reads are
+never gated; `/v0/health` carries the reason. (4) The starvation vectors
+that let the outage swallow reads are bounded: `/v0/admin/flush` now bounds
+both its process-wide permit wait and its writer-lock wait (30 s → 503)
+instead of pinning global HTTP concurrency slots on a route excluded from
+every timeout, and the process-wide `FLUSH_BUILD_GATE` acquire — which a
+detached, unabortable spool build could trap forever — is bounded at 10 min
+(`NAMIDB_FLUSH_BUILD_GATE_TIMEOUT_SECS`). Pinned by
+`namidb-storage/tests/flush_spool_failure.rs` (failed flush: Io-classified,
+session not poisoned, memtable restored byte-exact, later commits accepted,
+retry lossless) and `namidb-server/tests/disk_full_degraded.rs` (real HTTP:
+flush on broken spool → 507 + degraded; writes 507 typed, reads 200,
+health 503 with reason; after the disk clears one flush retry restores
+writes with nothing lost — no restart). Both are single-test integration
+binaries because they mutate the process-global `NAMIDB_SPOOL_DIR`.
+Remaining (recorded, not blocking): each backoff-spaced retry still holds
+the writer mutex for its build duration; the multi-tenant registry eviction
+still waits unbounded on the evicted writer while holding the sessions
+lock (short now that the mutex frees); moving the flush build off-lock like
+compaction's prepare stays future work.
 
 ### 41. [performance, target 2.2] Concurrent large scans collapse aggregate throughput (~660 rps mixed ceiling; pathological control: ~2 rps aggregate, 8 GB RSS on parallel 1M-row scans without index).
 

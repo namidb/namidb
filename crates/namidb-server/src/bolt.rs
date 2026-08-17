@@ -34,6 +34,15 @@ use crate::AppState;
 /// it failed before planning), the wall-clock it took (up to the end of
 /// execution, excluding any write-stall sleep), and the outcome the protocol
 /// returns to the driver.
+/// Typed failure for writes rejected while the namespace's local
+/// persistence is degraded (spool disk full/unwritable — the flush cannot
+/// drain the memtable). Distinct from `writer_busy_error`: this one is not
+/// resolved by retrying, so it carries the operator-facing reason. Mirrors
+/// HTTP's 507.
+fn persistence_degraded_error(reason: &str) -> BackendError {
+    BackendError::Storage(format!("namespace degraded: {reason}"))
+}
+
 /// The uniform transient failure for a foreground writer-lock timeout.
 fn writer_busy_error() -> BackendError {
     BackendError::Storage(
@@ -178,6 +187,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(persistence_degraded_error(&reason)),
+            };
+        }
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
@@ -259,6 +275,13 @@ impl ServerBackend {
                 result: Err(BackendError::Forbidden(denied.to_string())),
             };
         }
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(persistence_degraded_error(&reason)),
+            };
+        }
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
@@ -323,6 +346,13 @@ impl ServerBackend {
                 kind: None,
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(persistence_degraded_error(&reason)),
             };
         }
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
@@ -402,6 +432,13 @@ impl ServerBackend {
                 kind: None,
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(persistence_degraded_error(&reason)),
             };
         }
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
@@ -486,6 +523,13 @@ impl ServerBackend {
                 kind: None,
                 elapsed: started.elapsed(),
                 result: Err(BackendError::Forbidden(denied.to_string())),
+            };
+        }
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return RunObservation {
+                kind: Some(QueryKind::Write),
+                elapsed: started.elapsed(),
+                result: Err(persistence_degraded_error(&reason)),
             };
         }
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
@@ -699,6 +743,13 @@ impl ServerBackend {
                     kind: Some(QueryKind::Write),
                     elapsed: started.elapsed(),
                     result: Err(err),
+                };
+            }
+            if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+                return RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed: started.elapsed(),
+                    result: Err(persistence_degraded_error(&reason)),
                 };
             }
             // Writes still take the writer lock (single-writer invariant),
@@ -1220,6 +1271,12 @@ impl Backend for ServerBackend {
         // release the lock and its staged memory.
         if let Err(pressure) = self.state.memory.admit_query().await {
             return Err(memory_pressure_error(pressure));
+        }
+        // A transaction exists to write; reject it up front while local
+        // persistence is degraded instead of letting it pin the writer
+        // mutex on a namespace whose memtable cannot drain.
+        if let Some(reason) = self.state.writer_health.persistence_degraded_reason() {
+            return Err(persistence_degraded_error(&reason));
         }
         // Take the global writer lock for the whole transaction, bounded so
         // a BEGIN queued behind a stuck/long transaction fails fast instead
