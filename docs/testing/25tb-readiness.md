@@ -328,3 +328,65 @@ restored 580k acknowledged records exactly. Remaining related exposure
 any flush once the memtable passes the stall threshold — acceptable at
 ~20 s per flush, but a soak asserting an upper bound on write-outage
 windows during sustained load would pin it.
+
+### 38. [product, target 2.2] CREATE INDEX on already-loaded data has no effect until a flush/compaction rewrites the SSTs — there is no backfill or REINDEX.
+
+Reported from field validation 2026-08-17 (twin-namespace experiment:
+index-before-load = sub-millisecond lookups; index-after-load = ~850 ms,
+identical to no index). Confirmed in code: property-posting sidecars are
+only written by `finish_external_posting` during flush and by compaction
+rewrites; `CREATE INDEX`/`CREATE CONSTRAINT` only stamps the schema. On a
+loaded, quiet namespace the new index never materializes. Options, in
+increasing effort: (a) document "indexes before bulk load" as a hard rule
+(done — but it will burn users), (b) have property DDL schedule a
+compaction of SSTs whose generation predates the DDL (the search-LSM
+already does exactly this via signature retirement — PR #133 — the graph
+side needs its twin), (c) an explicit `db.index.build()` procedure.
+Recommend (b): the machinery and the precedent both exist.
+
+### 39. [observability, target 2.2] EXPLAIN shows NodeScan + Filter even when the posting index accelerates the scan at runtime.
+
+The pushed-predicate/posting acceleration happens INSIDE the scan
+operator, so the logical plan is truthful about shape but silent about
+the physical route. Users from Neo4j expect `NodeIndexSeek` to confirm an
+index works and will (reasonably) conclude ours don't; today the only
+witness is `elapsed_ms`, plus the plan-level `NodeByPropertyValue` when
+the optimizer rewrite fires. Fix direction: annotate EXPLAIN output with
+the physical access path chosen at execution (or at minimum a
+`route: native|scan` counter per operator in EXPLAIN VERBOSE), mirroring
+the `namidb_search_route_total{route}` pattern that already exists for
+search.
+
+### 40. [resilience, blocker, target 2.1.3] Disk-full during flush permanently wedges the namespace: writer lock never released, reads queue behind the guard, no error, no timeout — only a restart recovers.
+
+Reported reproduced twice in field validation with a full spool disk.
+The flush error path must (1) release the writer lock on ANY failure,
+(2) fail the namespace into a degraded read-only state that keeps serving
+the last committed snapshot instead of queueing reads forever, and
+(3) surface a typed error on writes rather than infinite "writer is
+busy". Reads blocking behind a failed flush is the worst part — losing
+reads to a WRITE-side disk problem inverts the durability story. Needs a
+FaultStore/ENOSPC injection test (tmpfs with a size cap) pinning all
+three behaviors. This is the most serious resilience finding of the
+round; the production mitigation until fixed is disk alerting
+(node_exporter) plus the bulk deadline's clean 408.
+
+### 41. [performance, target 2.2] Concurrent large scans collapse aggregate throughput (~660 rps mixed ceiling; pathological control: ~2 rps aggregate, 8 GB RSS on parallel 1M-row scans without index).
+
+Suspected shared-cache thrash (unprofiled). The per-query protections
+(row cap, deadline, breaker) contain the blast radius, but the engine
+does not degrade gracefully on its own: one scan-heavy tenant can starve
+the box. Also note 8 GB RSS implies the run was outside the memory
+governor's admission (or the governor does not bound scan working sets —
+worth checking which). Follow-ups: profile the pathological control
+(cache hit rates, eviction churn), consider scan admission (limit
+concurrent full scans per namespace), and per-tenant cache partitioning
+or scan-resistant eviction (e.g., segmented LRU so one scan cannot flush
+the point-lookup working set).
+
+### 42. [product surface, backlog] Index surface limits observed in the field: single-property indexes only (no composites), DDL must be a single statement, and vector/full-text are compile-time features the cloud build does not ship.
+
+Recording as product backlog rather than defects. Composite indexes and
+multi-statement DDL scripts are roadmap-sized; the cloud build's missing
+`vector-index`/text features is a packaging decision to revisit before
+any customer needs search on the managed tier.
