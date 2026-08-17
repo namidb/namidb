@@ -100,15 +100,20 @@ impl WriterLockKind {
 pub enum CompactionTrigger {
     Periodic = 0,
     Reactive = 1,
+    /// Requested by a successful property DDL so a new index materializes
+    /// on already-flushed SSTs immediately instead of waiting for the next
+    /// periodic tick (item 38 of the 25 TB readiness plan).
+    Ddl = 2,
 }
 
 impl CompactionTrigger {
-    const ALL: [Self; 2] = [Self::Periodic, Self::Reactive];
+    const ALL: [Self; 3] = [Self::Periodic, Self::Reactive, Self::Ddl];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Periodic => "periodic",
             Self::Reactive => "reactive",
+            Self::Ddl => "ddl",
         }
     }
 }
