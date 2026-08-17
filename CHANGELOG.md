@@ -15,6 +15,26 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-08-17
+
+**Added**
+- Admission gate for concurrent full scans: queries whose plan contains a
+  full `NodeScan` now acquire one of `NAMIDB_MAX_CONCURRENT_SCANS`
+  permits (default 4; `0` disables) before executing, on HTTP and Bolt.
+  Index lookups and expand chains are unaffected. Previously up to 1024
+  concurrent scans could each materialize an entire label — in field
+  testing, parallel 1M-row scans collapsed aggregate throughput to
+  ~2 requests/s at 8 GB RSS while evicting every point-lookup cache
+  working set. Worst-case scan memory is now `permits x largest-label`
+  and indexed traffic keeps its cache locality.
+
+**Fixed**
+- The from-source install instructions now include
+  `--features vector-index,text-index`: the official binaries, image,
+  and wheels always shipped both, but a bare
+  `cargo install --path crates/namidb-server` produced a server that
+  rejects `CREATE VECTOR INDEX` / `CREATE FULLTEXT INDEX`.
+
 ## [2.1.3] - 2026-08-17
 
 **Fixed**
@@ -2632,7 +2652,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.3...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.4...HEAD
+[2.1.4]: https://github.com/namidb/namidb/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/namidb/namidb/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/namidb/namidb/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/namidb/namidb/compare/v2.1.0...v2.1.1
