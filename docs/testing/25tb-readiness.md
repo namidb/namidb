@@ -295,3 +295,36 @@ but the semantically identical `MATCH (p:Person)-[w:WORKS_AT]->(c:Company
 should consider anchoring at the most selective pattern endpoint regardless of
 the direction the user wrote. Reproduction: any big label -> tiny
 unique-anchored endpoint written left-to-right.
+
+### 37. [DONE — storage, blocker-at-scale, fix on fix/flush-posting-fsync-storm] First large flush fsyncs once per distinct indexed-property value, holding the writer lock for hours.
+
+Found 2026-08-16 during the 5M-record live S3 validation (LocalStack,
+released 2.1.1 and 2.1.0 binaries — NOT a 2.1.1 regression). Loading 5M
+records (2.475M Person + 50k Company with a UNIQUE string `cid` + 2.475M
+WORKS_AT) stalled permanently at ~265k rows: the first flush past the
+memtable threshold acquired the writer lock and crawled at ~128 KB/s to
+anonymous O_TMPFILE scratch files, so every write got "writer is busy"
+(503) for what would have been hours. Root cause:
+`finish_external_posting` (flush.rs) called `sync_data()` once per
+DISTINCT VALUE of every posting-indexed property — with string-heavy
+properties (names are per-row distinct) that is O(rows) ext4 journal
+commits at ~3 ms each. The fsync bought nothing: the scratch is a deleted
+anonymous file (no durability role), its bytes are copied into the
+paged-index value spool immediately while page-cache resident, that copy
+is covered end-to-end by the crc32 stored in the index leaf (fail-stop on
+read), and ENOSPC still surfaces at the value region's own amortized
+`sync_data` when the builder finishes. The other nine `sync_data` sites
+in the flush/SST pipeline are per-run or per-builder (amortized over MBs)
+and remain untouched.
+
+**Resolution (2026-08-16):** removed the per-value `sync_data`. With the
+fix the same 5M load completes in 210 s (~24k rows/s sustained; flushes
+now finish in ~20 s, visible only as brief throughput dips), RSS peaks at
+1.50 GB under the 3 GB ceiling, and the item-36 validation passes 13/13
+on the flushed data through both the patched build and the released 2.1.1
+binary. Also re-verified during diagnosis: WAL recovery after `kill -9`
+restored 580k acknowledged records exactly. Remaining related exposure
+(untested, future work): writes are unavailable for the full duration of
+any flush once the memtable passes the stall threshold — acceptable at
+~20 s per flush, but a soak asserting an upper bound on write-outage
+windows during sustained load would pin it.
