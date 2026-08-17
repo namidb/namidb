@@ -911,6 +911,7 @@ impl ServerBackend {
             // Read path: borrow a short-lived `Snapshot` from the owned
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
+            let _scan_permit = crate::acquire_scan_permit(&plan).await;
             let snap = owned.borrow();
             let read = execute_with_limits(
                 &plan,
@@ -1142,6 +1143,7 @@ impl ServerBackend {
                     };
                 }
             };
+            let _scan_permit = crate::acquire_scan_permit(&plan).await;
             let snap = tx.writer.overlay_snapshot();
             let read = execute_with_limits(
                 &plan,

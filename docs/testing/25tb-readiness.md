@@ -454,7 +454,7 @@ still waits unbounded on the evicted writer while holding the sessions
 lock (short now that the mutex frees); moving the flush build off-lock like
 compaction's prepare stays future work.
 
-### 41. [performance, target 2.2] Concurrent large scans collapse aggregate throughput (~660 rps mixed ceiling; pathological control: ~2 rps aggregate, 8 GB RSS on parallel 1M-row scans without index).
+### 41. [CONTAINED — performance; gate lands in 2.1.4, deep fixes remain] Concurrent large scans collapse aggregate throughput (~660 rps mixed ceiling; pathological control: ~2 rps aggregate, 8 GB RSS on parallel 1M-row scans without index).
 
 Suspected shared-cache thrash (unprofiled). The per-query protections
 (row cap, deadline, breaker) contain the blast radius, but the engine
@@ -467,9 +467,66 @@ concurrent full scans per namespace), and per-tenant cache partitioning
 or scan-resistant eviction (e.g., segmented LRU so one scan cannot flush
 the point-lookup working set).
 
-### 42. [product surface, backlog] Index surface limits observed in the field: single-property indexes only (no composites), DDL must be a single statement, and vector/full-text are compile-time features the cloud build does not ship.
+**Containment (2026-08-17) + mechanism map.** Recon established the full
+chain: (1) a `NodeScan` materializes its whole label THREE times (the
+LWW-reconciliation `BTreeMap` over potentially the whole store, the
+`Vec<NodeView>`, then the walker's `Vec<Row>`) — nothing streams on the
+executor path even though `visit_label_with_projection` exists; (2) the
+memory governor's admission is wire-byte-sized (a 50-byte scan query
+reserves ~65 KiB against a multi-GB execution) and `admit_query` samples
+RSS point-in-time with zero headroom, so N scans admit low and balloon —
+that is the 8 GB; (3) every body a scan touches was inserted into the
+shared S3-FIFO body tier whose EFFECTIVE budget is ~86 MiB after
+proportional scaling, and N concurrent scans re-touching keys promote
+them past the probationary queue, flushing the point-lookup working set;
+(4) at 90% RSS the watchdog's only lever is `clear_shared_caches()` —
+nuking ALL tiers repeatedly while the scans keep allocating. Shipped
+now: a process-wide **scan admission gate** — plans containing a
+`NodeScan` acquire one of `NAMIDB_MAX_CONCURRENT_SCANS` permits
+(default 4, `0` disables) before execution, on HTTP (both tenants) and
+Bolt (auto-commit and in-tx); index lookups and expand chains pass free;
+waiters queue fairly inside the request-timeout layer. Worst-case scan
+memory drops from `1024 x largest-label` to `permits x largest-label`
+and indexed traffic keeps its cache working set. Pinned by
+`namidb-server/tests/scan_gate.rs` (8 concurrent full scans through one
+permit all answer exactly, non-scan traffic flows meanwhile). Remaining
+(recorded, sized): streaming `NodeScan` execution (the deep fix for
+per-scan RSS), stats-based per-scan memory reservation through the
+existing `reserve_query_headroom` CAS ledger (`LabelStats.node_count` x
+estimated row bytes), scan-resistant insertion across the body/decoded/
+page tiers (a first bypass attempt showed sweeps traverse the paged
+sidecar and range-cache routes too — a per-route audit must precede any
+policy change), and reclaim hysteresis so the watchdog stops
+re-clearing caches it just cleared.
+
+### 42. [AUDITED — product surface, backlog corrected] Index surface limits observed in the field: single-property indexes only (no composites), DDL must be a single statement, and vector/full-text are compile-time features the cloud build does not ship.
 
 Recording as product backlog rather than defects. Composite indexes and
 multi-statement DDL scripts are roadmap-sized; the cloud build's missing
 `vector-index`/text features is a packaging decision to revisit before
 any customer needs search on the managed tier.
+
+**Audit (2026-08-17)** — two of the three reports needed correction:
+- Composite UNIQUE CONSTRAINTS already work end-to-end (parser accepts
+  `(n.a, n.b)`, `create_unique_constraint_named` validates existing data
+  with a tuple scan and enforces on write via the transactional unique
+  index's tuple `encode_probe_key`) — they are enforcement-only, with no
+  read acceleration. What is actually missing: composite `CREATE INDEX`
+  (the parser accepts exactly one property; `parse_create_index` errors
+  on a comma) and a persisted tuple posting sidecar
+  (`EqualityKeyEncoding::TupleV1` + flush/compaction harvesters +
+  read-side tuple probe + planner conjunct-cover detection). Sized at
+  ~3-4 weeks; roadmap.
+- The OFFICIAL artifacts all ship `vector-index,text-index`: release
+  binaries (release-binaries.yml `features:` line), the Docker image
+  (Dockerfile bakes them), and the wheels (pyproject maturin features).
+  The field report's "cloud build lacks them" matches a FROM-SOURCE
+  build: the README's `cargo install --path crates/namidb-server` had no
+  `--features` flag, producing a server that 400s on search DDL — the
+  README now includes the flags.
+- Multi-statement DDL confirmed absent: the parser is one-statement
+  (`expect_eof`; a trailing `;` is tolerated, a second statement errors)
+  and there is no batch endpoint. Cheapest useful step is client-side
+  splitting in namidb-cli (~hours); server-side scripts (sequential,
+  stop-on-first-error, per-statement writer lock) are ~2-4 days.
+  Roadmap.

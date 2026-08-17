@@ -1409,6 +1409,55 @@ fn exec_error_classification(
 /// deliberately-unsupported feature surfaces as 400/`unsupported` instead of
 /// a bare 500. The `code` field is emitted only when classified, so existing
 /// clients that deserialize the body loosely see no change on plain 500s.
+/// Process-wide admission gate for full-scan queries (item 41).
+///
+/// A `NodeScan` materializes its whole label (and, through the LWW
+/// reconciliation fallback, potentially the whole store) into memory, and
+/// nothing else bounds how many of those run at once — the global HTTP
+/// concurrency cap (1024) counts a point lookup and a 10M-row scan the
+/// same. In field testing, parallel 1M-row scans collapsed aggregate
+/// throughput to ~2 rps at 8 GB RSS: each scan's working set ballooned
+/// past the memory governor's wire-byte-sized reservation and their
+/// combined cache traffic evicted every point-lookup working set. This
+/// gate bounds worst-case scan memory to `permits x largest-label` and
+/// keeps the box responsive for indexed traffic. Waiters queue fairly
+/// INSIDE the request-timeout layer, so a queued scan times out cleanly.
+///
+/// `NAMIDB_MAX_CONCURRENT_SCANS` overrides the default of 4; `0` disables
+/// the gate.
+fn scan_gate() -> Option<&'static tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Option<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let permits = std::env::var("NAMIDB_MAX_CONCURRENT_SCANS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(4);
+        (permits > 0).then(|| tokio::sync::Semaphore::new(permits))
+    })
+    .as_ref()
+}
+
+/// True when the plan contains a full `NodeScan` anywhere (subplans
+/// included) — the operator class the scan gate meters. Index lookups
+/// (`NodeByPropertyValue`, `NodeById`) and pure expand chains pass free.
+pub(crate) fn plan_contains_node_scan(plan: &namidb_query::LogicalPlan) -> bool {
+    matches!(plan, namidb_query::LogicalPlan::NodeScan { .. })
+        || plan.children().into_iter().any(plan_contains_node_scan)
+}
+
+/// Acquire a scan permit when the plan needs one. Holding the returned
+/// guard for the duration of execution is the whole contract.
+pub(crate) async fn acquire_scan_permit(
+    plan: &namidb_query::LogicalPlan,
+) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let gate = scan_gate()?;
+    if !plan_contains_node_scan(plan) {
+        return None;
+    }
+    // The semaphore is never closed, so acquire cannot fail.
+    gate.acquire().await.ok()
+}
+
 /// Serve `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan instead of
 /// executing. The AST has always promised this ("the executor honours it by
 /// returning the plan tree"), but the server previously ignored the prefix
@@ -2888,6 +2937,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
+        let _scan_permit = acquire_scan_permit(&plan).await;
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,
@@ -3504,6 +3554,7 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
+        let _scan_permit = acquire_scan_permit(&plan).await;
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,
