@@ -15,6 +15,29 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-08-28
+
+Found smoke-testing the released 2.2.0 artifacts against a dense graph.
+
+**Fixed**
+- `RETURN DISTINCT <endpoint> ORDER BY <endpoint key>` over a
+  variable-length pattern hung: the bare-ORDER-BY lowering places the
+  sort between the distinct projection and the expand, so the 2.2.0
+  endpoint-BFS eligibility missed the shape and fell back to the
+  exponential path enumeration. The BFS now looks through that sandwich
+  and re-applies the sort to its output.
+- `RETURN DISTINCT x ORDER BY x` returned fingerprint order, not value
+  order (e.g. `[10, 1, 20, 2]` for ascending) — the DISTINCT dedup
+  silently re-sorted its input by an internal fingerprint whose
+  lexicographic order diverges from value order. Long-standing bug,
+  predates 2.2.0; dedup is now order-preserving (first occurrence).
+- The query deadline and row cap now fire INSIDE a single seed's
+  variable-length expansion (per hop and every few thousand edges, in
+  both executors). Previously both were probed only at seed boundaries,
+  so one seed's dense enumeration burned unbounded time and memory —
+  a 30 s query budget was simply ignored by a six-hop expansion over a
+  20-node complete graph.
+
 ## [2.2.0] - 2026-08-28
 
 Closes the second production field report (12 findings against 2.1.4).
@@ -2727,7 +2750,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/namidb/namidb/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/namidb/namidb/compare/v2.1.4...v2.2.0
 [2.1.4]: https://github.com/namidb/namidb/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/namidb/namidb/compare/v2.1.2...v2.1.3

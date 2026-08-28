@@ -1249,6 +1249,25 @@ async fn try_execute_endpoint_distinct_project(
     routing: &PlanRouting,
     cap: Option<usize>,
 ) -> Result<Option<Vec<Row>>, ExecError> {
+    // The bare-ORDER-BY lowering places `TopN{keys}` BETWEEN the distinct
+    // projection and the Expand (project → order → dedupe; dedup_rows is
+    // order-preserving so the sort survives). Look through it when its keys
+    // also read only the endpoint — the sort is re-applied to the BFS
+    // output below. Defensive: only the no-skip/no-limit shape, which is
+    // all that layout is ever built for.
+    let empty_keys: &[crate::plan::OrderKey] = &[];
+    let (input, sort_keys) = match input {
+        LogicalPlan::TopN {
+            input: topn_input,
+            keys,
+            skip: crate::plan::RowCount::Const(0),
+            limit: crate::plan::RowCount::Const(u64::MAX),
+        } if !keys.is_empty() => (topn_input.as_ref(), keys.as_slice()),
+        other => (other, empty_keys),
+    };
+    if !sort_keys.is_empty() && cap.is_some() {
+        return Ok(None);
+    }
     let LogicalPlan::Expand {
         input: expand_input,
         source,
@@ -1269,12 +1288,16 @@ async fn try_execute_endpoint_distinct_project(
     if length.is_none() {
         return Ok(None);
     }
-    // Multiplicity is only unobservable when the projection reads nothing
-    // but the endpoint — any other referenced binding (the seed, a rel
-    // list) re-introduces per-path / per-seed visibility.
+    // Multiplicity is only unobservable when the projection (and any
+    // looked-through sort key) reads nothing but the endpoint — any other
+    // referenced binding (the seed, a rel list) re-introduces per-path /
+    // per-seed visibility.
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for item in items {
         collect_referenced_variables(&item.expression, &mut referenced);
+    }
+    for key in sort_keys {
+        collect_referenced_variables(&key.expression, &mut referenced);
     }
     if referenced.is_empty() || !referenced.iter().all(|name| name == target_alias) {
         return Ok(None);
@@ -1308,6 +1331,10 @@ async fn try_execute_endpoint_distinct_project(
         true,
     )
     .await?;
+    let mut expanded = expanded;
+    if !sort_keys.is_empty() {
+        sort_rows(&mut expanded, sort_keys, params)?;
+    }
     let projected = project_rows(&expanded, items, discard_input_bindings, params)?;
     Ok(Some(dedup_rows(projected)))
 }
@@ -1563,6 +1590,15 @@ pub(crate) async fn execute_expand(
         let hop_start = min.max(1);
         let _ = hop_start;
         for hop in 1..=max {
+            // A single seed's expansion can dwarf the whole result set (a
+            // dense 6-hop enumeration is millions of walks), so the deadline
+            // and row cap must fire INSIDE the traversal too — the
+            // seed-boundary checks alone let one seed burn unbounded time
+            // and memory before erroring (field-found: a K20 `*1..6`
+            // DISTINCT query hung past the 30 s budget).
+            crate::exec::limits::check_deadline()?;
+            crate::exec::limits::check_row_cap(out.len() + hop_results.len() + frontier.len())?;
+            let mut guard_tick: u32 = 0;
             let mut next_frontier = Vec::new();
             let mut level_seen: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
@@ -1620,6 +1656,16 @@ pub(crate) async fn execute_expand(
             .await?;
             for (step, neighbours) in step_neighbours {
                 for edge in neighbours {
+                    // Periodic in-loop guard: the (step × edge) space is the
+                    // deg^hop blowup itself, so probe the budgets every few
+                    // thousand edges rather than once per hop.
+                    guard_tick = guard_tick.wrapping_add(1);
+                    if guard_tick % 4096 == 0 {
+                        crate::exec::limits::check_deadline()?;
+                        crate::exec::limits::check_row_cap(
+                            out.len() + hop_results.len() + next_frontier.len(),
+                        )?;
+                    }
                     let target_id = partner_id(&edge, direction, step.tail);
                     if prune_visits {
                         // Reached at an earlier level → any path through it now
@@ -5905,13 +5951,19 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
     out
 }
 
-pub(crate) fn dedup_rows(mut rows: Vec<Row>) -> Vec<Row> {
-    // For determinism we sort by canonical key first then dedup. Since
-    // RuntimeValue can hold Floats (which don't implement Ord), we use
-    // a String fingerprint computed by serialising the row.
-    rows.sort_by_key(row_fingerprint);
-    rows.dedup();
-    rows
+pub(crate) fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+    // ORDER-PRESERVING first-occurrence dedup. The previous
+    // sort-by-fingerprint + dedup silently re-ordered its input, which
+    // broke the `RETURN DISTINCT x ORDER BY x` lowering (TopN under
+    // Project{distinct}): `[10, 2, 1, 20]` came back as `[10, 1, 20, 2]`
+    // because "I10;" < "I2;" lexicographically. Deduping on a fingerprint
+    // set keeps the incoming (deterministic) order and the same equality
+    // relation.
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(rows.len());
+    rows.into_iter()
+        .filter(|row| seen.insert(row_fingerprint(row)))
+        .collect()
 }
 
 fn row_fingerprint(row: &Row) -> String {
@@ -7591,6 +7643,14 @@ async fn execute_expand_factor(
         };
 
         for hop in 1..=max {
+            // In-loop budget guards, mirroring `execute_expand`: one seed's
+            // deg^hop enumeration must hit the deadline / row cap instead of
+            // burning unbounded time and memory before the per-seed check.
+            crate::exec::limits::check_deadline()?;
+            crate::exec::limits::check_row_cap(
+                out_leaves.len() + hop_outputs_for_this_input.len() + frontier.len(),
+            )?;
+            let mut guard_tick: u32 = 0;
             let mut next_frontier: Vec<FactorFrontierEntry> = Vec::new();
             // Phase 1: pre-collect neighbours per frontier entry so the
             // batch prewarm below can populate L1 with one SST decode
@@ -7639,6 +7699,15 @@ async fn execute_expand_factor(
             .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
                 for edge in neighbours {
+                    guard_tick = guard_tick.wrapping_add(1);
+                    if guard_tick % 4096 == 0 {
+                        crate::exec::limits::check_deadline()?;
+                        crate::exec::limits::check_row_cap(
+                            out_leaves.len()
+                                + hop_outputs_for_this_input.len()
+                                + next_frontier.len(),
+                        )?;
+                    }
                     let target_id = partner_id(&edge, direction, tail);
                     // Cypher relationship uniqueness (trail semantics): skip an
                     // edge already traversed on this path so `-[:R*2..2]-` can't

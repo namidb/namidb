@@ -571,7 +571,7 @@ auto-retried TransientError bucket; HTTP bodies now carry `neo4j_code` + `gql_st
 per family (table in the server README); eval errors are 400 not 500. Bolt ≥5.7
 GQLSTATUS-on-the-wire: roadmap (~2-3 days: negotiate 5.7, extend FAILURE metadata).
 
-### 46. [DONE — lands in 2.2.0] NDB-04: var-length traversal enumerates all paths under DISTINCT+LIMIT.
+### 46. [DONE — BFS in 2.2.0; ORDER BY sandwich + in-loop budgets in 2.2.1] NDB-04: var-length traversal enumerates all paths under DISTINCT+LIMIT.
 
 Confirmed end to end: only shortest-mode had visited pruning; `execute_capped`'s
 whitelist excluded `Project{distinct:true}`, so DISTINCT+LIMIT got zero pushdown; the
@@ -587,6 +587,22 @@ per-seed route asserted on memtable + flushed routes, including the seed-reachab
 through-a-cycle endpoint. Not covered (falls back to the exhaustive route, correct but
 slow): a Filter between Expand and DISTINCT, projections referencing the seed or rel
 list, `min >= 2`.
+
+**2.2.1 addendum (found smoke-testing the released 2.2.0 binaries).** The bare-ORDER-BY
+lowering places `TopN{keys}` BETWEEN the distinct projection and the Expand, so
+`RETURN DISTINCT b.x ORDER BY b.x` missed the BFS eligibility and hung on the released
+binary — invisible to the 2.2.0 tests because they executed `lower()` output while the
+server executes `optimize()` output (the same class of trap as the index-reachability
+rule: test the pipeline the server runs). Three fixes in 2.2.1: (a) eligibility looks
+through the no-skip/no-limit `TopN{keys}` sandwich when the keys also read only the
+endpoint, re-applying the sort to the BFS output; (b) `dedup_rows` is now
+order-preserving first-occurrence — the old sort-by-fingerprint dedup silently
+re-ordered its input ("I10;" < "I2;"), so `RETURN DISTINCT x ORDER BY x` returned
+fingerprint order, a correctness bug PREDATING this work; (c) the deadline and row cap
+now fire INSIDE a single seed's expansion (per-hop + every 4096 edges in both the flat
+and factor executors) — before, one seed's deg^hop enumeration ran unbounded past the
+30 s budget because both guards only probed at seed boundaries. The
+exec_distinct_endpoints suite now runs every plan through `optimize()`.
 
 ### 47. [PARTIALLY DONE — mechanism refuted; two real gaps fixed, one deferred] NDB-09: shortestPath blows the 1M row cap.
 
