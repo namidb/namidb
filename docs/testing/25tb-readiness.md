@@ -529,7 +529,13 @@ any customer needs search on the managed tier.
   and there is no batch endpoint. Cheapest useful step is client-side
   splitting in namidb-cli (~hours); server-side scripts (sequential,
   stop-on-first-error, per-statement writer lock) are ~2-4 days.
-  Roadmap.
+  **Follow-up shipped:** `namidb run` splits `;`-separated scripts
+  (string/backtick/comment-aware state machine), runs them sequentially
+  on one session with stop-on-first-error, and intercepts
+  CREATE CONSTRAINT / CREATE INDEX as schema commands — the CLI could
+  not run DDL at all before. A server-side script endpoint stays
+  unplanned: HTTP callers can split client-side with the same rules,
+  and per-statement requests keep the error surface per statement.
 
 ## Second field report (2026-08-27) — contactability platform, 24.6k-node graph, Bolt via official Neo4j driver
 

@@ -16,6 +16,13 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- `namidb run` accepts `;`-separated multi-statement scripts: statements
+  split outside strings/backticks/comments, run sequentially against one
+  session, and stop at the first error (reported with its position). The
+  CLI also gained schema DDL support — `CREATE CONSTRAINT` and
+  `CREATE INDEX` now execute as schema commands (previously the CLI
+  could not run DDL at all) — so a pasted schema-bootstrap script works
+  end to end.
 - Group commit now covers multi-tenant namespaces: the registry spawns
   one committer per namespace (cancelled on eviction, stragglers failed
   rather than hung), `--group-commit-window` applies to the multi-tenant

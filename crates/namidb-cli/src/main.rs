@@ -70,6 +70,12 @@ enum Cmd {
     /// Run a Cypher query against a NamiDB namespace and print rows
     /// (for read queries) or the `WriteOutcome` (for write queries).
     ///
+    /// Accepts a `;`-separated multi-statement script (semicolons inside
+    /// strings, backticks, and comments do not split): statements run
+    /// sequentially against one session and stop at the first error, and
+    /// `CREATE CONSTRAINT` / `CREATE INDEX` execute as schema commands —
+    /// so a pasted schema-bootstrap script just works.
+    ///
     /// Without `--store`, the command opens an ephemeral in-memory
     /// namespace whose state vanishes on exit. With `--store <uri>`,
     /// the namespace is durable on the configured backend
@@ -489,7 +495,14 @@ async fn watch_vault_cmd(
 }
 
 async fn run_query(store_uri: Option<&str>, namespace: &str, query: &str) -> anyhow::Result<()> {
-    let q = parse(query).map_err(|errs| parse_err(&errs))?;
+    // Multi-statement scripts (first field report, item 42): split on `;`
+    // outside strings/backticks/comments and run sequentially against ONE
+    // session, stopping at the first error. This is what makes a pasted
+    // schema-bootstrap script (constraints + indexes + seed writes) work.
+    let statements = split_statements(query);
+    if statements.is_empty() {
+        anyhow::bail!("no statements in input");
+    }
 
     let (store, paths): (Arc<dyn ObjectStore>, NamespacePaths) = match store_uri {
         Some(uri) => parse_uri(uri).map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -499,13 +512,62 @@ async fn run_query(store_uri: Option<&str>, namespace: &str, query: &str) -> any
             (Arc::new(InMemory::new()), paths)
         }
     };
-
     let mut writer = WriterSession::open(store, paths).await?;
+
+    let total = statements.len();
+    for (index, statement) in statements.iter().enumerate() {
+        if total > 1 {
+            println!("== statement {}/{total}", index + 1);
+        }
+        run_statement(&mut writer, statement)
+            .await
+            .map_err(|e| anyhow::anyhow!("statement {}/{total}: {e}", index + 1))?;
+    }
+    Ok(())
+}
+
+/// One statement against the shared session. Schema DDL is intercepted the
+/// same way the server does it — `CREATE CONSTRAINT` / `CREATE INDEX`
+/// execute out-of-band through the writer's schema commit, never through
+/// the planner (which has no DDL operators).
+async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::Result<()> {
+    let q = parse(statement).map_err(|errs| parse_err(&errs))?;
+
+    if let Some(c) = q.as_create_constraint() {
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
+        let version = writer
+            .create_unique_constraint_named(
+                c.name.as_ref().map(|n| n.name.as_str()),
+                &c.label.name,
+                &properties,
+                c.if_not_exists,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("constraint applied (manifest v{version})");
+        return Ok(());
+    }
+    if let Some(ix) = q.as_create_index() {
+        let version = writer
+            .create_property_index_named(
+                ix.name.as_ref().map(|n| n.name.as_str()),
+                &ix.label.name,
+                &ix.property.name,
+                ix.if_not_exists,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("index applied (manifest v{version})");
+        return Ok(());
+    }
+
+    // The catalog is rebuilt per statement: an earlier DDL or write in the
+    // same script changes what the optimizer should know.
     let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
     let plan = build_plan(&q, &catalog).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if plan.contains_write() {
-        let outcome = execute_write(&plan, &mut writer, &Params::new())
+        let outcome = execute_write(&plan, writer, &Params::new())
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         print_write_outcome(&outcome);
@@ -517,6 +579,93 @@ async fn run_query(store_uri: Option<&str>, namespace: &str, query: &str) -> any
         print_rows(&rows);
     }
     Ok(())
+}
+
+/// Split a `;`-separated Cypher script into statements, honouring single-
+/// and double-quoted strings (with backslash escapes), backtick-quoted
+/// identifiers, and `//` line / `/* */` block comments (the lexer strips
+/// comments itself, so they pass through unsplit). Empty fragments (stray
+/// or trailing `;`) are dropped.
+fn split_statements(input: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Mode {
+        Plain,
+        Single,
+        Double,
+        Backtick,
+        LineComment,
+        BlockComment,
+    }
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut mode = Mode::Plain;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match mode {
+            Mode::Plain => match c {
+                ';' => {
+                    let trimmed = current.trim();
+                    if !trimmed.is_empty() {
+                        statements.push(trimmed.to_string());
+                    }
+                    current.clear();
+                    continue;
+                }
+                '\'' => mode = Mode::Single,
+                '"' => mode = Mode::Double,
+                '`' => mode = Mode::Backtick,
+                '/' if chars.peek() == Some(&'/') => mode = Mode::LineComment,
+                '/' if chars.peek() == Some(&'*') => mode = Mode::BlockComment,
+                _ => {}
+            },
+            Mode::Single => match c {
+                '\\' => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    continue;
+                }
+                '\'' => mode = Mode::Plain,
+                _ => {}
+            },
+            Mode::Double => match c {
+                '\\' => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    continue;
+                }
+                '"' => mode = Mode::Plain,
+                _ => {}
+            },
+            Mode::Backtick => {
+                if c == '`' {
+                    mode = Mode::Plain;
+                }
+            }
+            Mode::LineComment => {
+                if c == '\n' {
+                    mode = Mode::Plain;
+                }
+            }
+            Mode::BlockComment => {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    current.push(c);
+                    current.push(chars.next().expect("peeked"));
+                    mode = Mode::Plain;
+                    continue;
+                }
+            }
+        }
+        current.push(c);
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+    statements
 }
 
 fn parse_err(errs: &[namidb_query::ParseError]) -> anyhow::Error {
@@ -617,3 +766,49 @@ fn format_runtime(v: &RuntimeValue) -> String {
 // closure-style logging dispatch ever changes.
 #[allow(dead_code)]
 fn _suppress_core_value_unused(_v: CoreValue) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitter_honours_strings_backticks_and_comments() {
+        let script = "CREATE (:P {name: 'a;b'}); // trailing; comment\n\
+                      MATCH (`weird;name`) RETURN 1; /* block; \n comment */ RETURN \"x;y\";;";
+        let statements = split_statements(script);
+        assert_eq!(statements.len(), 3, "{statements:?}");
+        assert!(statements[0].contains("'a;b'"));
+        assert!(statements[1].contains("`weird;name`"));
+        assert!(statements[2].contains("\"x;y\""));
+        // Escaped quote inside a string hides the terminator.
+        let statements = split_statements(r"RETURN 'don\'t; split'; RETURN 2");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].contains(r"don\'t; split"));
+        // Single statement without any semicolon.
+        assert_eq!(split_statements("RETURN 1").len(), 1);
+        assert!(split_statements(" ;; ; ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_query_executes_a_multi_statement_schema_script() {
+        // DDL + writes + a read in one script against one session; the
+        // MERGE proves the constraint from statement 1 is live for
+        // statement 3 (stop-on-first-error would surface any failure).
+        run_query(
+            None,
+            "cli-script",
+            "CREATE CONSTRAINT person_email IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE; \
+             CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name); \
+             CREATE (:Person {email: 'a@x', name: 'Ada'}); \
+             MERGE (p:Person {email: 'a@x'}) RETURN p.name AS name",
+        )
+        .await
+        .expect("schema script must run end to end");
+
+        // Stop-on-first-error: the second statement is garbage, the call fails.
+        let err = run_query(None, "cli-script-err", "RETURN 1; THIS IS NOT CYPHER")
+            .await
+            .expect_err("bad second statement must fail the script");
+        assert!(err.to_string().contains("statement 2/2"), "{err}");
+    }
+}
