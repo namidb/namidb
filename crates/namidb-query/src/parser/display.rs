@@ -238,7 +238,8 @@ impl fmt::Display for CreateIndexClause {
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ")?;
         }
-        write!(f, "FOR (n:{}) ON (n.{})", self.label, self.property)
+        let properties: Vec<String> = self.properties.iter().map(|p| format!("n.{p}")).collect();
+        write!(f, "FOR (n:{}) ON ({})", self.label, properties.join(", "))
     }
 }
 

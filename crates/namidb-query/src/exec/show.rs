@@ -81,6 +81,16 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
             }
         }
     }
+    // Composite equality indexes carry their persisted name and their
+    // DECLARATION-ordered property list.
+    for index in &manifest.schema.indexes {
+        entries.push((
+            index.name.clone(),
+            "RANGE",
+            index.label.clone(),
+            index.properties.clone(),
+        ));
+    }
     for vi in &manifest.vector_indexes {
         entries.push((
             vi.name.clone(),

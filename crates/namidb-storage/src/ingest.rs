@@ -2931,7 +2931,13 @@ impl WriterSession {
         let dtype = declared_type.unwrap_or_else(|| inferred.unwrap_or(DataType::Utf8));
         let mut schema = self.current.manifest.schema.clone();
         upsert_property_flags(&mut schema, label, property, dtype, unique, indexed)?;
+        self.commit_schema_ddl(schema).await
+    }
 
+    /// Commit an updated schema (metadata-only manifest bump), retiring
+    /// signature-stale search generations and resetting the caches whose
+    /// contents key off the schema. Shared tail of every property/index DDL.
+    async fn commit_schema_ddl(&mut self, schema: Schema) -> Result<u64> {
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -2955,6 +2961,119 @@ impl WriterSession {
         self.property_index_cache.reset_preserving_node_counts();
         self.unique_index.reset();
         Ok(version)
+    }
+
+    /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, n.b, …)`
+    /// — the composite (length >= 2) form. Unlike the single-property flag
+    /// on [`namidb_core::schema::PropertyDef`], composite indexes are
+    /// recorded as named [`namidb_core::schema::IndexDef`]s in
+    /// `Schema.indexes`, DECLARATION order preserved — it defines the tuple
+    /// key layout of the posting sidecar. Member properties get their type
+    /// declared (inferred from the first live value when absent) WITHOUT
+    /// setting the single-property `indexed` flag.
+    pub async fn create_composite_index_named(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        properties: &[String],
+        if_not_exists: bool,
+    ) -> Result<u64> {
+        use namidb_core::schema::IndexDef;
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        if properties.len() < 2 {
+            return Err(Error::precondition(
+                "a composite index needs at least two properties; use the \
+                 single-property CREATE INDEX form",
+            ));
+        }
+        let mut deduped: Vec<&String> = properties.iter().collect();
+        deduped.sort();
+        deduped.dedup();
+        if deduped.len() != properties.len() {
+            return Err(Error::precondition(format!(
+                "duplicate property in composite index over {label}: {properties:?}"
+            )));
+        }
+        let name = match name {
+            Some(explicit) => explicit.to_string(),
+            None => IndexDef::default_name(label, properties),
+        };
+        if let Some(existing) = self
+            .current
+            .manifest
+            .schema
+            .indexes
+            .iter()
+            .find(|index| index.matches(label, properties))
+        {
+            if if_not_exists {
+                return Ok(self.current.manifest.version);
+            }
+            return Err(Error::precondition(format!(
+                "index `{}` on {label}({}) already exists",
+                existing.name,
+                existing.properties.join(", ")
+            )));
+        }
+        if self
+            .current
+            .manifest
+            .schema
+            .indexes
+            .iter()
+            .any(|index| index.name == name)
+        {
+            return Err(Error::precondition(format!(
+                "an index named `{name}` already exists"
+            )));
+        }
+
+        // Resolve each member's type first (immutable phase: the inference
+        // scan borrows a snapshot), then mutate and commit.
+        let mut member_types: Vec<(String, DataType)> = Vec::with_capacity(properties.len());
+        {
+            let snap = self.snapshot();
+            for property in properties {
+                let declared = self
+                    .current
+                    .manifest
+                    .schema
+                    .label(label)
+                    .and_then(|l| l.properties.iter().find(|p| p.name == *property))
+                    .map(|p| p.data_type.clone());
+                let dtype = match declared {
+                    Some(dtype) => dtype,
+                    None => {
+                        let mut inferred: Option<DataType> = None;
+                        for node in snap.scan_label(label).await? {
+                            let Some(v) = node.properties.get(property) else {
+                                continue;
+                            };
+                            if matches!(v, Value::Null) {
+                                continue;
+                            }
+                            inferred = value_datatype(v);
+                            break;
+                        }
+                        inferred.unwrap_or(DataType::Utf8)
+                    }
+                };
+                member_types.push((property.clone(), dtype));
+            }
+        }
+        let mut schema = self.current.manifest.schema.clone();
+        for (property, dtype) in member_types {
+            // `false, false`: declare the type only; per-property flags are
+            // OR-preserved by `upsert_property_flags`, so an existing
+            // single-property index/constraint on a member is untouched.
+            upsert_property_flags(&mut schema, label, &property, dtype, false, false)?;
+        }
+        schema.indexes.push(IndexDef {
+            name,
+            label: label.to_string(),
+            properties: properties.to_vec(),
+        });
+        self.commit_schema_ddl(schema).await
     }
 
     /// Test-only: commit `schema` directly WITHOUT retiring signature-stale

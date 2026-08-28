@@ -396,6 +396,40 @@ impl Constraint {
     }
 }
 
+/// A declared multi-property equality index (`CREATE INDEX ... ON (n.a,
+/// n.b)`). Single-property indexes stay flag-based ([`PropertyDef::indexed`],
+/// no catalog entry, synthesized name) for compatibility; this list carries
+/// ONLY composite (length >= 2) indexes. `properties` keeps DECLARATION
+/// order — it defines the tuple key layout of the posting sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    pub label: String,
+    /// Properties forming the index, in declaration order. Length >= 2.
+    pub properties: Vec<String>,
+}
+
+impl IndexDef {
+    /// Default name when the user did not supply one: `idx_<label>_<prop…>`.
+    /// Deterministic, matching [`Constraint::default_name`]'s rationale.
+    pub fn default_name(label: &str, properties: &[String]) -> String {
+        format!("idx_{label}_{}", properties.join("_"))
+    }
+
+    /// True iff this index covers `label` and the same *set* of properties
+    /// (order-independent for `IF NOT EXISTS` — two declaration orders over
+    /// one set answer the same equality conjunctions).
+    pub fn matches(&self, label: &str, properties: &[String]) -> bool {
+        self.label == label && {
+            let mut a = self.properties.clone();
+            let mut b = properties.to_vec();
+            a.sort();
+            b.sort();
+            a == b
+        }
+    }
+}
+
 /// Logical schema for a graph.
 ///
 /// `version` is monotonic per-namespace. Each schema-altering manifest commit
@@ -409,6 +443,11 @@ pub struct Schema {
     /// `serde(default)` keeps pre-constraint manifests loading unchanged.
     #[serde(default)]
     pub constraints: Vec<Constraint>,
+    /// Declared composite equality indexes (length >= 2; single-property
+    /// indexes stay flag-based on [`PropertyDef::indexed`]). `serde(default)`
+    /// keeps earlier manifests loading unchanged.
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 impl Schema {

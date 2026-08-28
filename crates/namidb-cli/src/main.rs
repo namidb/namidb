@@ -548,15 +548,19 @@ async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::R
         return Ok(());
     }
     if let Some(ix) = q.as_create_index() {
-        let version = writer
-            .create_property_index_named(
-                ix.name.as_ref().map(|n| n.name.as_str()),
-                &ix.label.name,
-                &ix.property.name,
-                ix.if_not_exists,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let properties: Vec<String> = ix.properties.iter().map(|p| p.name.clone()).collect();
+        let name = ix.name.as_ref().map(|n| n.name.as_str());
+        let version = if properties.len() > 1 {
+            writer
+                .create_composite_index_named(name, &ix.label.name, &properties, ix.if_not_exists)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        } else {
+            writer
+                .create_property_index_named(name, &ix.label.name, &properties[0], ix.if_not_exists)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        };
         println!("index applied (manifest v{version})");
         return Ok(());
     }
@@ -799,6 +803,7 @@ mod tests {
             "cli-script",
             "CREATE CONSTRAINT person_email IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE; \
              CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name); \
+             CREATE INDEX person_pair IF NOT EXISTS FOR (p:Person) ON (p.city, p.age); \
              CREATE (:Person {email: 'a@x', name: 'Ada'}); \
              MERGE (p:Person {email: 'a@x'}) RETURN p.name AS name",
         )
