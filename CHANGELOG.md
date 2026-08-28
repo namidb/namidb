@@ -15,6 +15,21 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- A manifest pointer-CAS transport failure could falsify a negative ACK:
+  the client was told the write failed, but the dangling WAL segment +
+  manifest body were later (correctly, by crash semantics) published by
+  the stalled-commit repair — silently resurrecting rows the caller
+  believed rejected. The writer now RESOLVES the indeterminate outcome
+  before reporting: if the pointer landed (proven by version + fence
+  writer id + the segment's content hash) the commit is adopted and
+  ACKed as success; if definitively absent, the orphan body and WAL
+  segment are deleted first so the negative ACK stays true forever; only
+  when the store keeps failing does the session poison, with an error
+  message that explicitly says the write may become durable after
+  recovery. Found by the new RFC-034 shared-fate fault-injection test;
+  the hazard predates group commit (the inline commit path had it too).
+
 ## [2.3.0] - 2026-08-28
 
 **Added**
