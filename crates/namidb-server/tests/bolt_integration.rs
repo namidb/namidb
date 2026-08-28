@@ -370,6 +370,7 @@ async fn boot_bolt_config(
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -434,6 +435,7 @@ async fn boot_bolt_tokens(
         auth_token: None,
         auth_tokens_file: Some(tokens_path),
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -687,6 +689,7 @@ async fn bolt_create_then_match_roundtrip() {
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -778,6 +781,7 @@ async fn bolt_bad_token_yields_failure() {
         auth_token: Some("correct-token".into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -933,6 +937,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

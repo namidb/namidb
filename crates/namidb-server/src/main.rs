@@ -48,6 +48,13 @@ struct Cli {
     #[arg(long, env = "NAMIDB_NO_AUTH", default_value_t = false, action)]
     no_auth: bool,
 
+    /// Enable `POST /v0/admin/backup` and restrict its destinations: the
+    /// request's `to` URI must equal this prefix or extend it at a `/` (or
+    /// `?ns=` query) boundary, e.g. `s3://backups-bucket/namidb`. Unset =
+    /// the endpoint is disabled.
+    #[arg(long, env = "NAMIDB_BACKUP_TARGET_URI")]
+    backup_target_uri: Option<String>,
+
     /// Path to a JSON file of tokens, each with a `read-only` or `read-write`
     /// role, e.g. `{ "tokens": [{ "name": "ci", "token": "…", "role":
     /// "read-write" }, { "token": "…", "role": "read-only" }] }`. Takes
@@ -343,6 +350,7 @@ fn main() -> anyhow::Result<()> {
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
         no_auth: cli.no_auth,
+        backup_target_uri: cli.backup_target_uri,
         #[cfg(feature = "jwt")]
         jwt: cli
             .jwt_jwks_url

@@ -162,6 +162,32 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
+| `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (single-tenant; disabled unless `--backup-target-uri` is set) |
+
+### `POST /v0/admin/backup`
+
+Live-safe by design: the copy pins a manifest version with a durable
+retention lease the janitor honours, so no writer pause is needed and the
+writer lock is never taken. The result is a self-contained, openable
+namespace at the destination — point-in-time at the pinned version
+(committed-but-unflushed WAL included; writes after the pin excluded).
+
+```json
+{ "to": "s3://backups-bucket/namidb/nightly?ns=prod", "force": false, "verify": true }
+```
+
+Optional fields: `version` (pin an older manifest version), `force`
+(overwrite an existing destination pointer), `verify` (re-read and checksum
+every copied object). Returns `{"source_version", "objects_copied",
+"bytes_copied"}`.
+
+**The destination allowlist is the security boundary.** The server's
+ambient cloud credentials write wherever `to` points, so the endpoint is
+disabled (403) until the operator sets `--backup-target-uri` /
+`NAMIDB_BACKUP_TARGET_URI`; `to` must equal that prefix or extend it at a
+`/` (or `?ns=`) boundary. One backup runs at a time (waiters get a 503
+after 30 s). Restore stays CLI-only on purpose: it requires an offline
+destination, and the serving process *is* the writer.
 
 ### `POST /v0/cypher`
 

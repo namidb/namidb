@@ -126,6 +126,12 @@ pub struct Config {
     /// configured fails instead of silently serving open — an unset
     /// `NAMIDB_AUTH_TOKEN` in production should be a crash, not a log line.
     pub no_auth: bool,
+    /// Destination-URI allowlist prefix for `POST /v0/admin/backup`
+    /// (single-tenant only). `None` disables the endpoint: accepting a
+    /// client-supplied destination without an operator-configured allowlist
+    /// would let any read-write token exfiltrate the namespace anywhere the
+    /// server's ambient cloud credentials can write.
+    pub backup_target_uri: Option<String>,
     /// OIDC/JWT validation config. `None` = JWT auth disabled (static tokens
     /// or open mode). Only present under the `jwt` feature.
     #[cfg(feature = "jwt")]
@@ -312,6 +318,24 @@ pub struct AppState {
     /// automatic reopen ([`recovery`]) succeeds. Read lock-free by
     /// `/v0/health`.
     pub writer_health: Arc<WriterHealth>,
+    /// Source handles + operator-configured destination allowlist for the
+    /// admin backup endpoint. `None` = the endpoint is disabled — a
+    /// client-supplied destination URI would otherwise let any read-write
+    /// token exfiltrate the namespace anywhere the server's ambient cloud
+    /// credentials can write.
+    pub(crate) backup: Option<Arc<BackupHandles>>,
+}
+
+/// See [`AppState::backup`].
+pub(crate) struct BackupHandles {
+    store: Arc<dyn object_store::ObjectStore>,
+    paths: namidb_storage::NamespacePaths,
+    /// Destination URIs must equal this prefix or extend it at a `/` or
+    /// `?` boundary.
+    target_prefix: String,
+    /// Single-flight: one snapshot copy at a time; waiters are bounded by
+    /// [`ADMIN_FLUSH_WAIT`] and rejected 503 (slot economy, item 40).
+    permit: tokio::sync::Semaphore,
 }
 
 impl AppState {
@@ -348,7 +372,25 @@ impl AppState {
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
             authz: Arc::new(authz::NoOpAuthz),
             writer_health: WriterHealth::new(),
+            backup: None,
         }
+    }
+
+    /// Enable the admin backup endpoint (builder style): the namespace's
+    /// object-store handles plus the destination-URI allowlist prefix.
+    pub fn with_backup(
+        mut self,
+        store: Arc<dyn object_store::ObjectStore>,
+        paths: namidb_storage::NamespacePaths,
+        target_prefix: String,
+    ) -> Self {
+        self.backup = Some(Arc::new(BackupHandles {
+            store,
+            paths,
+            target_prefix,
+            permit: tokio::sync::Semaphore::new(1),
+        }));
+        self
     }
 
     /// Attach a pre-execution authorization hook (builder style). Defaults to
@@ -554,6 +596,7 @@ pub fn build_router(state: AppState) -> Router {
     // concurrency cap bounds clients waiting for that gate.
     let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
+        .route("/v0/admin/backup", post(admin_backup))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     limit_router(
@@ -925,6 +968,10 @@ pub async fn run_with_memory_max_bytes(
     // committed manifest itself without the writer lock. Built from the
     // same `(store, paths)` before `open` consumes them.
     let maint_manifest_store = ManifestStore::new(store.clone(), paths.clone());
+    let backup_handles = config
+        .backup_target_uri
+        .clone()
+        .map(|prefix| (store.clone(), paths.clone(), prefix));
     let writer = WriterSession::open(store, paths).await?;
 
     let state = AppState::new(writer, None, namespace)
@@ -938,6 +985,13 @@ pub async fn run_with_memory_max_bytes(
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_slow_query_threshold(config.slow_query_threshold);
+    let state = match backup_handles {
+        Some((backup_store, backup_paths, prefix)) => {
+            info!(prefix = %prefix, "admin backup endpoint enabled");
+            state.with_backup(backup_store, backup_paths, prefix)
+        }
+        None => state,
+    };
 
     // Periodic flush task — keeps the WAL bounded and L0 SSTs current.
     if config.flush_interval > Duration::ZERO {
@@ -3129,6 +3183,141 @@ fn admin_flush_busy_response() -> Response {
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct BackupRequest {
+    /// Destination namespace URI. Must sit inside the operator-configured
+    /// `--backup-target-uri` prefix.
+    to: String,
+    /// Source manifest version to pin; `None` = current committed.
+    #[serde(default)]
+    version: Option<u64>,
+    /// Overwrite an existing destination pointer.
+    #[serde(default)]
+    force: bool,
+    /// Re-read and checksum every copied object.
+    #[serde(default)]
+    verify: bool,
+}
+
+/// `to` equals the prefix, or extends it at a `/` or `?` boundary — so
+/// `s3://backups/namidb` admits `s3://backups/namidb/b1?ns=b1` but not
+/// `s3://backups/namidb-evil`.
+fn uri_within_prefix(uri: &str, prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches('/');
+    match uri.strip_prefix(trimmed) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/') || rest.starts_with('?'),
+        None => false,
+    }
+}
+
+/// `POST /v0/admin/backup` — copy a point-in-time snapshot of this
+/// namespace to an allowlisted destination. Live-safe by design: the copy
+/// pins a manifest version with a durable retention lease the janitor
+/// honours (see `namidb_storage::backup`), so no writer pause is needed and
+/// the writer lock is never taken. Single-tenant only.
+async fn admin_backup(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(req): Json<BackupRequest>,
+) -> Response {
+    // Same role gate as admin flush: an operator action, not a query.
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin backup is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(backup) = state.backup.clone() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "admin backup is disabled: set --backup-target-uri / \
+                        NAMIDB_BACKUP_TARGET_URI to allowlist destinations"
+                    .into(),
+            }),
+        )
+            .into_response();
+    };
+    // The allowlist is the security boundary: the server's ambient cloud
+    // credentials write wherever this URI says, so only operator-blessed
+    // prefixes are acceptable.
+    if !uri_within_prefix(&req.to, &backup.target_prefix) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: format!(
+                    "destination is outside the --backup-target-uri allowlist \
+                     (`{}`)",
+                    backup.target_prefix
+                ),
+            }),
+        )
+            .into_response();
+    }
+    let (dst_store, dst_paths) = match namidb_storage::parse_uri(&req.to) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: format!("invalid backup destination: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    // Single-flight with a bounded wait: this route sits outside the request
+    // timeout, so unbounded waiters would pin global concurrency slots
+    // (item 40's slot economy).
+    let Ok(Ok(_permit)) = tokio::time::timeout(ADMIN_FLUSH_WAIT, backup.permit.acquire()).await
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "another backup is already running; retry shortly".into(),
+            }),
+        )
+            .into_response();
+    };
+    match namidb_storage::copy_namespace_snapshot(
+        backup.store.clone(),
+        backup.paths.clone(),
+        dst_store,
+        dst_paths,
+        req.version,
+        req.force,
+        req.verify,
+    )
+    .await
+    {
+        Ok(report) => Json(serde_json::json!({
+            "source_version": report.source_version,
+            "objects_copied": report.objects_copied,
+            "bytes_copied": report.bytes_copied,
+        }))
+        .into_response(),
+        // Destination already has a pointer / version reclaimed mid-copy /
+        // verify mismatch: the caller's request cannot succeed as posed.
+        Err(namidb_storage::Error::Precondition(msg)) => {
+            (StatusCode::CONFLICT, Json(ErrorBody { error: msg })).into_response()
+        }
+        Err(e) if e.is_local_persistence() => {
+            persistence_degraded_response(&persistence_degraded_reason(&e))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("backup failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn run_admin_flush(state: AppState) -> Response {
     let Ok(flush_permit) =
         tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_flush_permit()).await
@@ -5220,6 +5409,176 @@ mod tests {
         };
         assert_eq!(flush("rkey").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(flush("wkey").await.status(), StatusCode::OK);
+    }
+
+    /// POST a JSON body to an admin path with a bearer token.
+    async fn post_admin_json(
+        app: &Router,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// NDB-12: without an operator allowlist the endpoint refuses — a
+    /// client-supplied destination would exfiltrate the namespace with the
+    /// server's ambient credentials.
+    #[tokio::test]
+    async fn admin_backup_disabled_without_allowlist() {
+        let app = fixture(Some("tok")).await;
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "tok",
+            serde_json::json!({ "to": "memory://anywhere" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = body_json(response).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("disabled"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_backup_enforces_allowlist_roles_and_round_trips() {
+        let scratch =
+            std::env::temp_dir().join(format!("namidb-backup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prefix = format!("file://{}", scratch.display());
+
+        let (store, paths) = namidb_storage::parse_uri("memory://backup-endpoint").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "backup-endpoint".into())
+            .with_backup(store, paths, prefix.clone());
+        let app = build_router(state);
+
+        // Seed one committed node so the copy carries real data.
+        let created = post_cypher(&app, Some("tok"), "CREATE (:B {k: 'v'})").await;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // Outside the allowlist: same string prefix but not at a boundary.
+        let evil = format!("{prefix}-evil?ns=x");
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "tok",
+            serde_json::json!({ "to": evil }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = body_json(response).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("allowlist"),
+            "{json}"
+        );
+
+        // Inside the allowlist: live round-trip, then the destination opens
+        // as a self-contained namespace with the data.
+        let dest = format!("{prefix}/b1?ns=b1");
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "tok",
+            serde_json::json!({ "to": dest }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(json["objects_copied"].as_u64().unwrap() > 0, "{json}");
+        assert!(json["bytes_copied"].as_u64().unwrap() > 0, "{json}");
+
+        let (dst_store, dst_paths) = namidb_storage::parse_uri(&dest).unwrap();
+        let restored = WriterSession::open(dst_store, dst_paths).await.unwrap();
+        let snap = restored.snapshot();
+        let plan =
+            namidb_query::lower(&namidb_query::parse("MATCH (b:B) RETURN b.k AS k").unwrap())
+                .unwrap();
+        let rows = namidb_query::execute(&plan, &snap, &namidb_query::Params::new())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "backup must carry the committed node");
+
+        // Re-running without force: destination already has a pointer → 409.
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "tok",
+            serde_json::json!({ "to": dest }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // With force: succeeds again.
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "tok",
+            serde_json::json!({ "to": dest, "force": true, "verify": true }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// A read-only token may not trigger a backup (same gate as flush).
+    #[tokio::test]
+    async fn admin_backup_forbids_read_only_tokens() {
+        let scratch = std::env::temp_dir().join(format!("namidb-backup-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prefix = format!("file://{}", scratch.display());
+
+        let tokens_path = std::env::temp_dir().join(format!(
+            "namidb-backup-ro-tokens-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&tokens_path, ROLE_TOKENS).unwrap();
+        let auth = crate::auth::AuthConfig::load_file(&tokens_path).unwrap();
+        std::fs::remove_file(&tokens_path).ok();
+
+        let (store, paths) = namidb_storage::parse_uri("memory://backup-ro").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "backup-ro".into())
+            .with_auth(Arc::new(auth))
+            .with_backup(store, paths, prefix);
+        let app = build_router(state);
+
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "rkey",
+            serde_json::json!({ "to": "memory://x" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = body_json(response).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("read-only"),
+            "{json}"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[tokio::test]
