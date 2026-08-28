@@ -981,6 +981,22 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP namidb_tuple_lookup_route_total Composite (multi-property) equality lookups \
+             by physical route; same reading as namidb_property_lookup_route_total."
+        );
+        let _ = writeln!(out, "# TYPE namidb_tuple_lookup_route_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_tuple_lookup_route_total{{route=\"native\"}} {}",
+            routes.tuple_native
+        );
+        let _ = writeln!(
+            out,
+            "namidb_tuple_lookup_route_total{{route=\"fallback\"}} {}",
+            routes.tuple_fallback
+        );
+        let _ = writeln!(
+            out,
             "# HELP namidb_search_workspace_enabled Whether the process-wide object-native search workspace has been initialized."
         );
         let _ = writeln!(out, "# TYPE namidb_search_workspace_enabled gauge");

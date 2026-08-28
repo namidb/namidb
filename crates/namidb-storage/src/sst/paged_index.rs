@@ -1944,8 +1944,41 @@ async fn probe_equality_limited_with_source(
     max_ids_per_value: Option<usize>,
 ) -> Result<(BTreeMap<String, Vec<[u8; 16]>>, PagedProbeStats)> {
     let keys: Vec<Vec<u8>> = values.iter().map(|v| v.as_bytes().to_vec()).collect();
+    let (found, stats) =
+        probe_equality_bytes_limited_with_source(source, &keys, max_ids_per_value).await?;
+    let mut out = BTreeMap::new();
+    for (key, ids) in found {
+        out.insert(
+            String::from_utf8(key)
+                .map_err(|e| Error::invariant(format!("equality index key utf8: {e}")))?,
+            ids,
+        );
+    }
+    Ok((out, stats))
+}
+
+/// Generation-pinned equality probe over raw byte keys.
+///
+/// Composite tuple sidecars key postings by [`TupleV1`] encodings, which
+/// are not UTF-8; this is the byte-transparent surface the String probes
+/// above wrap.
+///
+/// [`TupleV1`]: crate::manifest::CompositeKeyEncoding::TupleV1
+pub async fn probe_equality_bytes_limited_from_source(
+    source: &PinnedObjectRangeSource,
+    keys: &[Vec<u8>],
+    max_ids_per_value: Option<usize>,
+) -> Result<(BTreeMap<Vec<u8>, Vec<[u8; 16]>>, PagedProbeStats)> {
+    probe_equality_bytes_limited_with_source(source, keys, max_ids_per_value).await
+}
+
+async fn probe_equality_bytes_limited_with_source(
+    source: &dyn PagedRangeSource,
+    keys: &[Vec<u8>],
+    max_ids_per_value: Option<usize>,
+) -> Result<(BTreeMap<Vec<u8>, Vec<[u8; 16]>>, PagedProbeStats)> {
     let byte_limit = max_ids_per_value.map(|ids| ids.saturating_mul(16));
-    let (found, stats) = probe_source(source, PagedIndexKind::Equality, &keys, byte_limit).await?;
+    let (found, stats) = probe_source(source, PagedIndexKind::Equality, keys, byte_limit).await?;
     let mut out = BTreeMap::new();
     for (key, value) in found {
         if value.len() % 16 != 0 {
@@ -1961,11 +1994,7 @@ async fn probe_equality_limited_with_source(
                 id
             })
             .collect();
-        out.insert(
-            String::from_utf8(key)
-                .map_err(|e| Error::invariant(format!("equality index key utf8: {e}")))?,
-            ids,
-        );
+        out.insert(key, ids);
     }
     Ok((out, stats))
 }

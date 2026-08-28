@@ -1288,6 +1288,262 @@ impl<'mt> Snapshot<'mt> {
         )
     }
 
+    /// Return the live node ids matching EVERY member of a declared
+    /// composite equality index.
+    ///
+    /// `properties` and `values` are aligned and MUST be in the index's
+    /// DECLARATION order — the planner canonicalizes conjunct order through
+    /// the schema's `IndexDef` before calling. `Some(ids)` is authoritative
+    /// (including an empty vector): a composite index over exactly this
+    /// member list is declared, every relevant node SST advertised a usable
+    /// TupleV1 sidecar, memtable and writer-staged claimants were unioned
+    /// in, and each candidate was confirmed member-by-member against its
+    /// current last-write-wins node view. `None` means no such index, a
+    /// coverage/freshness gap (a pre-DDL SST still awaiting its backfill
+    /// rewrite, a declined paged build, an unreadable sidecar), or a
+    /// non-scalar member; callers must keep their exact scan fallback.
+    pub async fn indexed_node_ids_by_property_tuple(
+        &self,
+        label: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Result<Option<Vec<NodeId>>> {
+        namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_property_tuple");
+        if properties.len() < 2 || properties.len() != values.len() {
+            return Ok(None);
+        }
+        let declared = self
+            .manifest
+            .manifest
+            .schema
+            .indexes
+            .iter()
+            .any(|def| def.properties == properties);
+        if !declared {
+            return Ok(None);
+        }
+        // `member = NULL` never evaluates true in Cypher.
+        if values.iter().any(|value| matches!(value, Value::Null)) {
+            return Ok(Some(Vec::new()));
+        }
+        let value_refs: Vec<&Value> = values.iter().collect();
+        // Non-scalar members are never filed in the sidecar; only the exact
+        // scan can answer them.
+        let Some(probe_key) = crate::cache::encode_equality_tuple_key(&value_refs) else {
+            return Ok(None);
+        };
+        // The writer-private (RYOW) constraint machinery keys numerics
+        // TYPED, so a float probe would authoritatively miss integer
+        // holders Cypher considers equal (`30 = 30.0`). Decline to the
+        // exact scan in transactional snapshots instead.
+        if self.transactional_property_index.is_some()
+            && values
+                .iter()
+                .any(|value| matches!(value, Value::I64(_) | Value::F64(_)))
+        {
+            return Ok(None);
+        }
+
+        let mut candidates: Vec<NodeId>;
+        if let Some(ids) = self
+            .transactional_tuple_candidates(label, properties, &value_refs)
+            .await?
+        {
+            candidates = ids;
+        } else {
+            let all_node_ssts: Vec<usize> = self.manifest.index.node_descriptors();
+            let sst_idxs: Vec<usize> = all_node_ssts
+                .into_iter()
+                .filter(|idx| {
+                    label.is_empty()
+                        || node_sst_can_contain_label(&self.manifest.manifest, *idx, label)
+                })
+                .collect();
+            // The freshness rule: EVERY relevant SST must advertise a usable
+            // tuple sidecar for exactly this member list, or the whole lookup
+            // declines. An empty-path descriptor is a declined paged build —
+            // it satisfies the migration predicate but cannot serve reads.
+            let sidecars: Option<Vec<_>> = sst_idxs
+                .iter()
+                .map(|idx| {
+                    self.manifest.manifest.ssts[*idx]
+                        .composite_equality_indices
+                        .iter()
+                        .find(|desc| {
+                            desc.properties == properties
+                                && desc.mixed_type_complete
+                                && desc.key_encoding
+                                    == crate::manifest::CompositeKeyEncoding::TupleV1
+                                && !desc.path.is_empty()
+                        })
+                })
+                .collect();
+            let Some(sidecars) = sidecars else {
+                crate::route_telemetry::record_tuple(false);
+                return Ok(None);
+            };
+            candidates = self.memtable_tuple_claimants(label, properties, &probe_key)?;
+            for sidecar in sidecars {
+                let absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    sidecar.path
+                );
+                match self
+                    .probe_composite_property_sidecar(sidecar, &absolute, &probe_key)
+                    .await
+                {
+                    Ok(ids) => candidates.extend(ids),
+                    Err(error) if optional_accelerator_fallback(&error) => {
+                        tracing::warn!(
+                            path = %sidecar.path,
+                            error = %error,
+                            "tuple accelerator unavailable; falling back to exact scan"
+                        );
+                        crate::route_telemetry::record_tuple(false);
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+        }
+
+        // Confirmation makes staleness impossible: a posting from a
+        // superseded version, a tombstoned node, or a colliding label is
+        // dropped by re-checking every member on the current view.
+        let mut confirmed = Vec::with_capacity(candidates.len());
+        const CONFIRM_BATCH: usize = 256;
+        for batch in candidates.chunks(CONFIRM_BATCH) {
+            let views = self.batch_lookup_nodes(label, batch).await?;
+            for (id, view) in batch.iter().zip(views) {
+                if view.as_ref().is_some_and(|view| {
+                    properties.iter().zip(values).all(|(name, value)| {
+                        view.properties
+                            .get(name)
+                            .is_some_and(|stored| crate::cache::cypher_scalar_equal(stored, value))
+                    })
+                }) {
+                    confirmed.push(*id);
+                }
+            }
+        }
+        crate::route_telemetry::record_tuple(true);
+        Ok(Some(confirmed))
+    }
+
+    /// Memtable claimants of one exact TupleV1 key: every live upsert whose
+    /// members all encode to `probe_key`. A point scan rather than a cached
+    /// map — the committed claimant cache is String-keyed and single-property;
+    /// tuple lookups pay one memtable walk per probe instead.
+    fn memtable_tuple_claimants(
+        &self,
+        label: &str,
+        members: &[String],
+        probe_key: &[u8],
+    ) -> Result<Vec<NodeId>> {
+        let mut ids = Vec::new();
+        for (mk, entry) in self.node_entries() {
+            let MemKey::Node { id } = mk else {
+                continue;
+            };
+            let MemOp::Upsert(payload) = &entry.op else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            if !label.is_empty()
+                && !record_carries_label(&record, label, &self.manifest.manifest.label_dict)
+            {
+                continue;
+            }
+            let values: Option<Vec<&Value>> = members
+                .iter()
+                .map(|name| record.properties.get(name))
+                .collect();
+            let Some(values) = values else {
+                continue;
+            };
+            if crate::cache::encode_equality_tuple_key(&values).as_deref() == Some(probe_key) {
+                ids.push(*id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Tuple twin of [`Self::transactional_property_candidates`]: the
+    /// writer-private constraint machinery is already keyed by `(label,
+    /// names)` lists, so composite lookups reuse it verbatim.
+    async fn transactional_tuple_candidates(
+        &self,
+        label: &str,
+        properties: &[String],
+        values: &[&Value],
+    ) -> Result<Option<Vec<NodeId>>> {
+        let Some(index) = self.transactional_property_index else {
+            return Ok(None);
+        };
+        let names = properties.to_vec();
+        let Some(key) = crate::unique_index::encode_probe_key(values) else {
+            return Ok(None);
+        };
+        if let Some(ids) = index.probe_all(label, &names, &key) {
+            return Ok(Some(ids));
+        }
+        let views = if label.is_empty() {
+            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+                .await?
+        } else {
+            self.scan_label(label).await?
+        };
+        let entries = views.iter().map(|view| (view.id, &view.properties));
+        if self.transactional_property_index_staged {
+            index.populate_staged(label, &names, entries);
+        } else {
+            index.populate(label, &names, entries);
+        }
+        Ok(Some(
+            index
+                .probe_all(label, &names, &key)
+                .expect("transactional tuple map was just populated"),
+        ))
+    }
+
+    /// Point probe of one composite tuple sidecar. Composite descriptors are
+    /// PagedV1-only (no legacy body predates them), so a stale/partial paged
+    /// file is an invariant error rather than a fallback tier.
+    async fn probe_composite_property_sidecar(
+        &self,
+        descriptor: &crate::manifest::CompositeEqualityIndexDescriptor,
+        absolute: &str,
+        probe_key: &[u8],
+    ) -> Result<Vec<NodeId>> {
+        let source = self
+            .pinned_sidecar_source(absolute, Some(descriptor.size_bytes))
+            .await?;
+        let keys = vec![probe_key.to_vec()];
+        let (found, stats) =
+            crate::sst::paged_index::probe_equality_bytes_limited_from_source(&source, &keys, None)
+                .await?;
+        if stats.index_entries != descriptor.distinct_values {
+            return Err(Error::invariant(format!(
+                "paged composite entry count mismatch: manifest {}, header {}",
+                descriptor.distinct_values, stats.index_entries
+            )));
+        }
+        if let Some(cache) = &self.property_index_cache {
+            cache.record_equality_index_bytes_read(stats.bytes_read);
+        }
+        Ok(found
+            .get(probe_key)
+            .map(|ids| {
+                ids.iter()
+                    .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id)))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn indexed_node_ids_by_property_value_inner(
         &self,
         label: &str,
