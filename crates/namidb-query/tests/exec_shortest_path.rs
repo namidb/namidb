@@ -326,6 +326,70 @@ async fn multi_pair_shortest_paths_answer_every_bound_target() {
     );
 }
 
+/// The bidirectional route is ACTUALLY taken for single bound pairs — the
+/// reachability discipline: result parity alone would pass identically on
+/// the unidirectional route — and stays exact on odd lengths, undirected
+/// patterns, and unreachable pairs.
+#[tokio::test]
+async fn single_pair_shortest_path_takes_the_bidirectional_route() {
+    let mut writer = WriterSession::open(store(), paths("sp-bidi"))
+        .await
+        .unwrap();
+    let _ = build_graph(&mut writer).await;
+    // An isolated node: reachable by nothing.
+    writer
+        .upsert_node("Person", NodeId::new(), &person("Zoe"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+    let before = namidb_storage::route_telemetry::snapshot().shortest_bidirectional;
+
+    // Odd length, directed: Bob -> Carol -> Dave -> Eve.
+    let q = parse(
+        "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Eve'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS hops",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("hops"), Some(&RuntimeValue::Integer(3)));
+
+    // Undirected: Eve -- Alice -- Bob is 2 against the edge directions.
+    let q = parse(
+        "MATCH (a:Person {name: 'Eve'}), (b:Person {name: 'Bob'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]-(b)) \
+         RETURN length(p) AS hops",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("hops"), Some(&RuntimeValue::Integer(2)));
+
+    // Unreachable: no rows, no error.
+    let q = parse(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Zoe'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN length(p) AS hops",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+
+    let after = namidb_storage::route_telemetry::snapshot().shortest_bidirectional;
+    assert!(
+        after >= before + 3,
+        "all three single-pair queries must take the bidirectional route \
+         (before {before}, after {after})"
+    );
+}
+
 /// Dense layered graph: s → L1(40) → L2(40) → L3(40) → L4(40) → L5(40) → t,
 /// complete bipartite between consecutive layers. The walk-enumerating
 /// frontier holds 40^k entries at hop k (~102M Row clones by hop 5 — an

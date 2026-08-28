@@ -16,6 +16,13 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- `shortestPath` on a single bound pair now runs a bidirectional
+  meet-in-the-middle BFS (exactness kept via the classical stopping
+  criterion): the frontier is O(deg^(d/2)) per side instead of
+  O(deg^d). Multi-target groups, `allShortestPaths`, `min >= 2`, and
+  self-pairs keep the unidirectional visited BFS; the executor stamps
+  the route in telemetry (`shortest_bidirectional`) so tests and
+  operators can prove it engages.
 - The admin backup endpoint now serves multi-tenant deployments:
   `/:namespace/v0/admin/backup` (and the header-routed unprefixed form)
   with the same destination allowlist, a process-wide single-flight,
