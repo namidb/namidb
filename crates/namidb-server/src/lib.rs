@@ -5935,6 +5935,183 @@ mod tests {
         );
     }
 
+    /// RFC-034 shared fate: when the group's pointer CAS fails, every
+    /// waiter receives the SAME error, none of the group's rows are
+    /// durable, and the writer keeps serving once the store heals.
+    #[derive(Debug)]
+    struct FailingCasStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail_cas: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for FailingCasStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingCasStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailingCasStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.fail_cas.load(std::sync::atomic::Ordering::SeqCst)
+                && location.as_ref().contains("pointer/")
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FailingCasStore",
+                    source: "injected pointer CAS failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_cas_failure_shares_fate_and_recovers() {
+        let failing = Arc::new(FailingCasStore {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            fail_cas: std::sync::atomic::AtomicBool::new(false),
+        });
+        let paths = namidb_storage::NamespacePaths::new(
+            "tenants",
+            namidb_core::id::NamespaceId::new("group-cas").unwrap(),
+        );
+        let writer =
+            WriterSession::open(failing.clone() as Arc<dyn object_store::ObjectStore>, paths)
+                .await
+                .unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "group-cas".into())
+            .with_group_commit(Duration::from_millis(5));
+        tokio::spawn(group_committer_loop(state.clone()));
+        let app = build_router(state);
+
+        // Sanity: a grouped write commits while the store is healthy.
+        let ok = post_cypher(&app, Some("tok"), "CREATE (:S {phase: 'before'})").await;
+        let status = ok.status();
+        if status != StatusCode::OK {
+            panic!("sanity write failed: {status} {:?}", body_json(ok).await);
+        }
+
+        // Fail the pointer CAS: the whole group must fail together.
+        failing
+            .fail_cas
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let w1 = post_cypher(&app, Some("tok"), "CREATE (:S {phase: 'doomed1'})");
+        let w2 = post_cypher(&app, Some("tok"), "CREATE (:S {phase: 'doomed2'})");
+        let (r1, r2) = tokio::join!(w1, w2);
+        assert!(!r1.status().is_success(), "shared fate: {:?}", r1.status());
+        assert!(!r2.status().is_success(), "shared fate: {:?}", r2.status());
+        let b1 = body_json(r1).await;
+        let b2 = body_json(r2).await;
+        assert_eq!(b1, b2, "every waiter must receive the SAME group error");
+        assert!(
+            b1["error"]
+                .as_str()
+                .unwrap()
+                .contains("injected pointer CAS failure"),
+            "{b1}"
+        );
+
+        // Nothing from the failed group is durable or visible.
+        let read = post_cypher(
+            &app,
+            Some("tok"),
+            "MATCH (s:S) RETURN s.phase AS phase ORDER BY phase",
+        )
+        .await;
+        let json = body_json(read).await;
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([{ "phase": "before" }]),
+            "{json}"
+        );
+
+        // Heal the store: the namespace must SELF-heal — no restart. The
+        // committer's recovery (reopen attempts, degraded health) may still
+        // be settling right after the heal, so assert convergence within a
+        // bounded window rather than first-write success.
+        failing
+            .fail_cas
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut healed = false;
+        for _ in 0..50 {
+            let ok = post_cypher(&app, Some("tok"), "CREATE (:S {phase: 'after'})").await;
+            if ok.status() == StatusCode::OK {
+                healed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(healed, "writes must recover after the store heals");
+        let read = post_cypher(
+            &app,
+            Some("tok"),
+            "MATCH (s:S) RETURN s.phase AS phase ORDER BY phase",
+        )
+        .await;
+        let json = body_json(read).await;
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([{ "phase": "after" }, { "phase": "before" }]),
+            "the doomed group must stay gone after recovery: {json}"
+        );
+    }
+
     /// A read-only token may not trigger a backup (same gate as flush).
     #[tokio::test]
     async fn admin_backup_forbids_read_only_tokens() {

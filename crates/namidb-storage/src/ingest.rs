@@ -1782,10 +1782,23 @@ impl WriterSession {
         let (committed_seq, new_current) = match wal_result {
             Ok(_) => {
                 let pointer = body_result?;
-                let new_current = self
+                let probe = PointerCasProbe::for_manifest(&next);
+                let new_current = match self
                     .manifest_store
                     .cas_pointer(&self.fence, &self.current, next, pointer)
-                    .await?;
+                    .await
+                {
+                    Ok(current) => current,
+                    // Determinate outcomes (a competitor took the version /
+                    // we are fenced) keep today's semantics.
+                    Err(err @ (Error::Fenced { .. } | Error::ManifestCommitCas { .. })) => {
+                        return Err(err)
+                    }
+                    Err(cas_err) => {
+                        self.resolve_failed_pointer_cas(probe, base_seq, cas_err)
+                            .await?
+                    }
+                };
                 (base_seq, new_current)
             }
             Err(Error::Precondition(_)) => {
@@ -1915,15 +1928,115 @@ impl WriterSession {
     /// case fails fast as `ManifestCommitCas` before we ever PUT a WAL
     /// segment, so a doomed retry mints no new orphan WAL at `fresh`.
     /// `self.pending.seq` must already point at the fresh seq.
-    async fn commit_body_first(&self, next: Manifest) -> Result<LoadedManifest> {
+    async fn commit_body_first(&mut self, next: Manifest) -> Result<LoadedManifest> {
         let pointer = self
             .manifest_store
             .put_body(&self.fence, &self.current, &next)
             .await?;
         self.wal_store.append_segment(&self.pending).await?;
-        self.manifest_store
+        let probe = PointerCasProbe::for_manifest(&next);
+        let seq = self.pending.seq;
+        match self
+            .manifest_store
             .cas_pointer(&self.fence, &self.current, next, pointer)
             .await
+        {
+            Ok(current) => Ok(current),
+            Err(err @ (Error::Fenced { .. } | Error::ManifestCommitCas { .. })) => Err(err),
+            Err(cas_err) => self.resolve_failed_pointer_cas(probe, seq, cas_err).await,
+        }
+    }
+
+    /// A pointer-CAS transport failure is INDETERMINATE: the create may have
+    /// landed with only the response lost. Resolve before reporting — a
+    /// blind failure report can be falsified later by
+    /// `repair_stalled_commit`, which (correctly, by crash semantics)
+    /// publishes a dangling body+WAL as an interrupted commit: the client
+    /// would hold a negative ACK for rows that then become durable. Found
+    /// by the RFC-034 shared-fate fault-injection test; the hazard predates
+    /// group commit (the inline path had it too).
+    ///
+    /// Outcomes:
+    /// - **Landed** (the durable manifest is provably THIS commit's —
+    ///   version + fence writer id + the pending segment's content hash):
+    ///   adopt it and return success; the caller drains and ACKs.
+    /// - **Definitively absent**: delete the orphan body and WAL segment so
+    ///   nothing dangles for the repair to adopt, then return the original
+    ///   error — the negative ACK stays true forever.
+    /// - **Unresolvable** (the store keeps failing): poison the session and
+    ///   return an explicitly indeterminate error whose message says the
+    ///   write may still become durable via repair after reopen.
+    async fn resolve_failed_pointer_cas(
+        &mut self,
+        probe: PointerCasProbe,
+        wal_seq: u64,
+        cas_err: Error,
+    ) -> Result<LoadedManifest> {
+        let reloaded = match self.manifest_store.load_current().await {
+            Ok(m) => m,
+            Err(read_err) => {
+                self.poisoned = true;
+                return Err(Error::precondition(format!(
+                    "commit outcome indeterminate: the manifest pointer CAS failed \
+                     ({cas_err}) and the pointer could not be re-read ({read_err}); \
+                     the session is poisoned and the write MAY become durable when \
+                     the interrupted commit is repaired on reopen"
+                )));
+            }
+        };
+        if reloaded.manifest.epoch > self.fence.epoch {
+            self.poisoned = true;
+            return Err(Error::Fenced {
+                mine: self.fence.epoch.as_u64(),
+                current: reloaded.manifest.epoch.as_u64(),
+            });
+        }
+        let ours = reloaded.manifest.version == probe.version
+            && reloaded.manifest.writer_id == self.fence.writer_id
+            && probe.wal_xxh3.is_some()
+            && reloaded
+                .manifest
+                .wal_segments
+                .iter()
+                .any(|segment| segment.seq == wal_seq && segment.xxh3 == probe.wal_xxh3);
+        if ours {
+            // The create LANDED; only the response was lost. This commit
+            // SUCCEEDED — adopt the durable state so the caller drains and
+            // ACKs truthfully.
+            tracing::warn!(
+                version = probe.version,
+                "pointer CAS response lost but the commit landed; adopting it"
+            );
+            return Ok(reloaded);
+        }
+        if reloaded.manifest.version >= probe.version {
+            return Err(Error::ManifestCommitCas {
+                expected: probe.version.saturating_sub(1),
+                found: reloaded.manifest.version,
+            });
+        }
+        // Definitively absent. Neutralize the orphans (body first: deleting
+        // it kills the repair's "body exists, pointer does not" signature
+        // immediately; a WAL-only orphan is inert and janitor-swept).
+        let body_path = self.manifest_store.paths().manifest_version(probe.version);
+        let wal_path = self.wal_store.paths().wal_segment(wal_seq);
+        for path in [&body_path, &wal_path] {
+            use object_store::ObjectStoreExt as _;
+            match self.manifest_store.store().delete(path).await {
+                Ok(()) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(delete_err) => {
+                    self.poisoned = true;
+                    return Err(Error::precondition(format!(
+                        "commit failed ({cas_err}) and orphan cleanup at {path} \
+                         failed too ({delete_err}); the session is poisoned and \
+                         the write MAY become durable when the interrupted \
+                         commit is repaired on reopen"
+                    )));
+                }
+            }
+        }
+        Err(cas_err)
     }
 
     /// Persist the current memtable to `paths.memtable_snapshot()` so
@@ -2885,6 +2998,23 @@ impl WriterSession {
         // operation while the WAL/pending_payloads keep the full history.
         self.staged_memtable.apply(key, lsn, op);
         Ok(())
+    }
+}
+
+/// What [`WriterSession::resolve_failed_pointer_cas`] needs to prove a
+/// durable manifest is THIS commit's: the target version plus the pending
+/// WAL segment's content hash (stamped by `build_next`).
+struct PointerCasProbe {
+    version: u64,
+    wal_xxh3: Option<u64>,
+}
+
+impl PointerCasProbe {
+    fn for_manifest(next: &Manifest) -> Self {
+        Self {
+            version: next.version,
+            wal_xxh3: next.wal_segments.last().and_then(|segment| segment.xxh3),
+        }
     }
 }
 

@@ -710,6 +710,15 @@ isolation, solo rollback of a failed statement, Bolt-path ACK+RYOW. Fault-inject
 failure (shared fate) remains a test-harness follow-up; the error path reuses the
 inline path's discard+recover machinery.
 
+**Follow-up addendum — shared-fate test built, and it found a PRE-EXISTING
+durability bug.** Injecting a pointer-CAS transport failure showed NACKed rows
+RESURRECTING: the orphan WAL+body dangled, and repair_stalled_commit (correct for
+crashes) later published them. Fixed in storage: resolve_failed_pointer_cas —
+adopt-if-landed (version + fence writer_id + segment xxh3 ownership proof),
+delete-orphans-if-definitively-absent (the NACK stays true), poison-with-honest-
+indeterminate-message only when the store keeps failing. The inline commit path
+had the same hazard since forever; the group-commit test is what surfaced it.
+
 ### 53. [DONE — lands in 2.2.0] NDB-08: Docker image crash-loops on a named volume at /var/lib/namidb.
 
 Confirmed, with a nuance: /var/lib/namidb is not a coded default (--store is required)
