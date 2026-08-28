@@ -880,6 +880,27 @@ async fn run_cypher_inner(
 
     let catalog = StatsCatalog::from_manifest(&guard.snapshot().manifest().manifest);
     let plan = build_plan(&parsed, &catalog).map_err(lower_err_to_pyerr)?;
+
+    // `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan instead of
+    // executing — the same rendering (tree + `# route:` footer) the server
+    // serves. Without this check the embedded client silently EXECUTED the
+    // query, so an `EXPLAIN CREATE ...` wrote data.
+    if parsed.explain {
+        let snap = guard.snapshot();
+        let rows = namidb_query::explain_plan_lines(&parsed, &plan, &snap, &catalog)
+            .into_iter()
+            .map(|line| {
+                let mut row = Row::new();
+                row.set("plan", RuntimeValue::String(line));
+                row
+            })
+            .collect();
+        return Ok(QueryResult {
+            columns: vec!["plan".into()],
+            rows,
+        });
+    }
+
     let plan_columns = extract_column_order(&plan);
     let rows = if plan.contains_write() {
         let outcome = execute_write(&plan, guard, params)

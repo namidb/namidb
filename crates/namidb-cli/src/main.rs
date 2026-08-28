@@ -570,6 +570,18 @@ async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::R
     let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
     let plan = build_plan(&q, &catalog).map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan (real catalog +
+    // `# route:` footer, unlike the offline `explain` subcommand's empty
+    // catalog) instead of executing — an `EXPLAIN CREATE ...` must never
+    // write.
+    if q.explain {
+        let snap = writer.snapshot();
+        for line in namidb_query::explain_plan_lines(&q, &plan, &snap, &catalog) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     if plan.contains_write() {
         let outcome = execute_write(&plan, writer, &Params::new())
             .await
@@ -815,5 +827,39 @@ mod tests {
             .await
             .expect_err("bad second statement must fail the script");
         assert!(err.to_string().contains("statement 2/2"), "{err}");
+    }
+
+    /// `EXPLAIN` in a `run` script renders instead of executing: before
+    /// this interception the CLI silently EXECUTED the query, so an
+    /// `EXPLAIN CREATE ...` wrote a row (the same trap the server fixed
+    /// on its own surface).
+    #[tokio::test]
+    async fn explain_in_run_renders_and_never_executes() {
+        let ns = NamespaceId::new("cli-explain").unwrap();
+        let paths = NamespacePaths::new("tenants", ns);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+        run_statement(&mut writer, "CREATE INDEX pair FOR (x:X) ON (x.a, x.b)")
+            .await
+            .unwrap();
+        run_statement(&mut writer, "EXPLAIN CREATE (:X {a: 1, b: 2})")
+            .await
+            .unwrap();
+        let snap = writer.snapshot();
+        assert!(
+            snap.scan_label("X").await.unwrap().is_empty(),
+            "EXPLAIN of a write must create nothing"
+        );
+
+        // A covered composite conjunct EXPLAINs to the tuple operator
+        // (the shared renderer also appends its `# route:` note, asserted
+        // in the server's explain_surface test).
+        run_statement(
+            &mut writer,
+            "EXPLAIN MATCH (x:X) WHERE x.a = 1 AND x.b = 2 RETURN x",
+        )
+        .await
+        .unwrap();
     }
 }
