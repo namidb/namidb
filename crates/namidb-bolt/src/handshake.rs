@@ -55,8 +55,18 @@ impl std::fmt::Display for Version {
 
 /// Versions the server is willing to negotiate, highest preference
 /// first. Insertion order maps to preference order during matching.
-pub const SUPPORTED_VERSIONS: &[Version] =
-    &[Version::new(5, 4), Version::new(5, 0), Version::new(4, 4)];
+///
+/// 5.7 is the GQLSTATUS boundary: FAILURE metadata gains
+/// `gql_status`/`description`/`diagnostic_record` (see
+/// [`crate::message::Response::failure_with_gql`]). The other 5.5–5.7
+/// obligations are already met — TELEMETRY (5.5) is accepted and
+/// acknowledged, and unknown HELLO/RUN extra keys are ignored.
+pub const SUPPORTED_VERSIONS: &[Version] = &[
+    Version::new(5, 7),
+    Version::new(5, 4),
+    Version::new(5, 0),
+    Version::new(4, 4),
+];
 
 /// One client offer. `range` lets a client say "any minor between
 /// `minor - range` and `minor`" of `major`.
