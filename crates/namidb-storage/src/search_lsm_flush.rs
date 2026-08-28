@@ -1001,6 +1001,7 @@ fn search_segment_descriptor(
         bloom: None,
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
+        composite_equality_indices: Vec::new(),
         label_index: None,
         node_locator: None,
         per_label_property_stats: Vec::new(),

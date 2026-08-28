@@ -336,6 +336,11 @@ pub struct SstDescriptor {
     // SSTs and older manifests (`serde(default)`).
     #[serde(default)]
     pub equality_property_indices: Vec<EqualityIndexDescriptor>,
+    /// Composite (tuple) equality posting sidecars. `serde(default)` keeps
+    /// earlier manifests loading unchanged, and pre-composite readers
+    /// ignore the field entirely (rollback safety).
+    #[serde(default)]
+    pub composite_equality_indices: Vec<CompositeEqualityIndexDescriptor>,
     // Label-index side-car pointer (multi-label nodes). Once node SSTs stop
     // being partitioned by label, `scan_label(L)` can no longer just read the
     // SSTs whose scope is `L`; instead each node SST ships one sidecar mapping
@@ -490,6 +495,46 @@ pub struct EqualityIndexDescriptor {
     /// See [`UniquePropertyIndexDescriptor::paged_build_unsupported`].
     #[serde(default)]
     pub paged_build_unsupported: bool,
+}
+
+/// One composite (tuple) equality posting sidecar over `properties` in the
+/// index's DECLARATION order (the tuple key layout). A SEPARATE Vec from
+/// [`SstDescriptor::equality_property_indices`] ON PURPOSE: a rolled-back
+/// pre-composite reader ignores this field entirely instead of mis-probing
+/// a tuple sidecar as a single-property index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeEqualityIndexDescriptor {
+    /// Member properties in declaration order.
+    pub properties: Vec<String>,
+    /// Object-store path relative to the namespace prefix.
+    pub path: String,
+    /// On-disk size of the sidecar body.
+    pub size_bytes: u64,
+    /// Number of distinct tuples in the sidecar.
+    pub distinct_values: u64,
+    /// The collector harvested every row whose members were all present and
+    /// indexable; rows missing a member are (correctly) absent. Mirrors
+    /// [`EqualityIndexDescriptor::mixed_type_complete`]'s trust semantics.
+    #[serde(default)]
+    pub mixed_type_complete: bool,
+    #[serde(default)]
+    pub key_encoding: CompositeKeyEncoding,
+    #[serde(default)]
+    pub format: PropertyIndexFormat,
+    #[serde(default)]
+    pub paged: Option<PagedPropertyIndexDescriptor>,
+    #[serde(default)]
+    pub paged_build_unsupported: bool,
+}
+
+/// Composite-sidecar key format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeKeyEncoding {
+    /// Self-delimiting typed tuple encoded by
+    /// `cache::encode_equality_tuple_key`.
+    #[default]
+    TupleV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2883,6 +2928,7 @@ mod tests {
             }),
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            composite_equality_indices: Vec::new(),
             label_index: None,
             node_locator: None,
             per_label_property_stats: Vec::new(),
@@ -2918,6 +2964,7 @@ mod tests {
             bloom: None, // small SST → no side-car
             unique_property_indices: Vec::new(),
             equality_property_indices: Vec::new(),
+            composite_equality_indices: Vec::new(),
             label_index: None,
             node_locator: None,
             per_label_property_stats: Vec::new(),

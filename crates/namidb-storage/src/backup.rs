@@ -197,6 +197,9 @@ async fn copy_snapshot_pinned(
         for e in &sst.equality_property_indices {
             rels.push(e.path.clone());
         }
+        for c in &sst.composite_equality_indices {
+            rels.push(c.path.clone());
+        }
         if let Some(l) = &sst.label_index {
             rels.push(l.path.clone());
         }
@@ -247,6 +250,27 @@ async fn copy_snapshot_pinned(
                     objects_copied += 1;
                 }
                 None => equality.paged = None,
+            }
+            pin.renew_if_due().await?;
+        }
+        for composite in &mut sst.composite_equality_indices {
+            let Some(paged) = composite.paged.clone() else {
+                continue;
+            };
+            match copy_optional_accelerator(
+                src_store,
+                dst_store,
+                &src_prefix,
+                &dst_prefix,
+                &paged.path,
+            )
+            .await?
+            {
+                Some(size) => {
+                    bytes_copied += size;
+                    objects_copied += 1;
+                }
+                None => composite.paged = None,
             }
             pin.renew_if_due().await?;
         }

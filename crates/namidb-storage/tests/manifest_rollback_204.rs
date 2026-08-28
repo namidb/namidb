@@ -67,6 +67,7 @@ struct SstDescriptor204 {
     unique_property_indices: Vec<UniquePropertyIndexDescriptor204>,
     #[serde(default)]
     equality_property_indices: Vec<EqualityIndexDescriptor204>,
+    composite_equality_indices: Vec::new(),
     #[serde(default)]
     label_index: Option<LabelIndexDescriptor>,
     #[serde(default)]
@@ -116,6 +117,7 @@ fn descriptor(
         bloom: None,
         unique_property_indices: Vec::new(),
         equality_property_indices: Vec::new(),
+        composite_equality_indices: Vec::new(),
         label_index: None,
         node_locator: None,
         per_label_property_stats: Vec::new(),
