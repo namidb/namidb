@@ -957,6 +957,11 @@ fn prepare_node_pending(
     let (equality_property_indices, equality_sidecars) =
         prepare_equality_property_sidecars(paths, level.as_u32(), &id, "", label_def, rows)?;
     index_sidecars.extend(equality_sidecars);
+    // Composite (tuple) sidecars, one per declared composite index. Same
+    // stream, same coverage-marker rule.
+    let (composite_equality_indices, composite_sidecars) =
+        prepare_composite_property_sidecars(paths, level.as_u32(), &id, "", &schema.indexes, rows)?;
+    index_sidecars.extend(composite_sidecars);
 
     // The label index (`LabelId -> [NodeId, ...]`) replaces "the SST partition
     // IS the label index" now that one node SST spans every label.
@@ -1037,7 +1042,7 @@ fn prepare_node_pending(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
-        composite_equality_indices: Vec::new(),
+        composite_equality_indices,
         label_index,
         node_locator: Some(node_locator),
         per_label_property_stats: compute_per_label_property_stats(rows, schema, label_dict)?,
@@ -2019,6 +2024,195 @@ impl EqualitySidecarCollector {
         }
         Ok((descriptors, bodies))
     }
+}
+
+/// Streaming harvester for COMPOSITE (tuple) posting sidecars — the
+/// TupleV1 analogue of [`EqualitySidecarCollector`]. One sidecar per
+/// declared composite index (deduplicated by property list: the harvest is
+/// label-agnostic, mirroring the single-property doctrine that coverage
+/// follows the stored value and readers confirm candidates). A row is
+/// filed only when EVERY member is present and indexable — a missing or
+/// unindexable member makes the tuple unmatchable by an indexable probe,
+/// exactly like the transactional tuple probe's rules.
+#[derive(Debug)]
+pub(crate) struct CompositeSidecarCollector {
+    /// Deduplicated member lists, each in DECLARATION order.
+    tuples: Vec<Vec<String>>,
+    sorter: crate::sst::external_pairs::ExternalPairSorter,
+}
+
+impl CompositeSidecarCollector {
+    pub(crate) fn new(indexes: &[namidb_core::schema::IndexDef]) -> Result<Self> {
+        let mut tuples: Vec<Vec<String>> = Vec::new();
+        for index in indexes {
+            if !tuples.contains(&index.properties) {
+                tuples.push(index.properties.clone());
+            }
+        }
+        u32::try_from(tuples.len())
+            .map_err(|_| Error::invariant("composite index count exceeds u32"))?;
+        Ok(Self {
+            tuples,
+            sorter: crate::sst::external_pairs::ExternalPairSorter::from_env()?,
+        })
+    }
+
+    pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) -> Result<()> {
+        for (ordinal, members) in self.tuples.iter().enumerate() {
+            let values: Option<Vec<&namidb_core::Value>> = members
+                .iter()
+                .map(|name| rec.properties.get(name))
+                .collect();
+            let Some(values) = values else {
+                continue;
+            };
+            if let Some(key) = crate::cache::encode_equality_tuple_key(&values) {
+                self.sorter.push(ordinal as u32, &key, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialise one PagedV1 sidecar per composite index, INCLUDING an
+    /// empty one — the descriptor doubles as the coverage marker, exactly
+    /// like the single-property rule: readers prove completeness only when
+    /// every node SST advertises the tuple.
+    pub(crate) fn finish(
+        self,
+        paths: &NamespacePaths,
+        level: u32,
+        sst_id: &Uuid,
+        label: &str,
+    ) -> Result<CompositePropertySidecars> {
+        let mut sorted = self.sorter.finish()?;
+        let mut builders: Vec<_> = self
+            .tuples
+            .iter()
+            .map(|_| crate::sst::paged_index::SortedSpooledPagedIndexBuilder::equality())
+            .collect();
+        let mut distinct_counts = vec![0_u64; self.tuples.len()];
+        // Tuple sidecars have no legacy bincode body (they postdate the
+        // rolling-upgrade window that body served), so the legacy slots stay
+        // empty in the shared posting finisher.
+        let mut legacy: Vec<Option<LegacyMapSpool>> = self.tuples.iter().map(|_| None).collect();
+        let mut posting: Option<PendingExternalPosting> = None;
+        while let Some(pair) = sorted.next_pair()? {
+            if pair.property as usize >= builders.len() {
+                return Err(Error::invariant(
+                    "composite-index scratch ordinal is out of range",
+                ));
+            }
+            if posting
+                .as_ref()
+                .is_some_and(|active| active.property != pair.property || active.key != pair.key)
+            {
+                finish_external_posting(
+                    posting.take().expect("active posting checked above"),
+                    &mut builders,
+                    &mut distinct_counts,
+                    &mut legacy,
+                )?;
+            }
+            if posting.is_none() {
+                posting = Some(PendingExternalPosting::new(pair.property, pair.key)?);
+            }
+            posting
+                .as_mut()
+                .expect("posting initialized above")
+                .push(pair.id)?;
+        }
+        if let Some(posting) = posting {
+            finish_external_posting(posting, &mut builders, &mut distinct_counts, &mut legacy)?;
+        }
+
+        let mut descriptors = Vec::new();
+        let mut bodies = Vec::new();
+        for ((members, builder), distinct_values) in
+            self.tuples.into_iter().zip(builders).zip(distinct_counts)
+        {
+            let declined = builder.declined();
+            let slug = composite_sidecar_slug(&members);
+            if declined {
+                // No legacy fallback exists for tuples: record the decline so
+                // the migration predicate does not rewrite this SST forever,
+                // and readers fall back to the scan for it.
+                descriptors.push(crate::manifest::CompositeEqualityIndexDescriptor {
+                    properties: members,
+                    path: String::new(),
+                    size_bytes: 0,
+                    distinct_values,
+                    mixed_type_complete: true,
+                    key_encoding: crate::manifest::CompositeKeyEncoding::TupleV1,
+                    format: crate::manifest::PropertyIndexFormat::PagedV1,
+                    paged: None,
+                    paged_build_unsupported: true,
+                });
+                continue;
+            }
+            let upload = builder.finish()?;
+            let paged_name = format!(
+                "{}-{}-{}.eqtix_{}.pidx",
+                uuid_path_id(sst_id),
+                SstKind::Nodes.path_tag(),
+                label,
+                slug,
+            );
+            let paged_path = paths.sst_object(level, &paged_name);
+            let paged_relative = relative_sst_path(level, &paged_name);
+            descriptors.push(crate::manifest::CompositeEqualityIndexDescriptor {
+                properties: members,
+                path: paged_relative,
+                size_bytes: upload.size_bytes(),
+                distinct_values,
+                mixed_type_complete: true,
+                key_encoding: crate::manifest::CompositeKeyEncoding::TupleV1,
+                format: crate::manifest::PropertyIndexFormat::PagedV1,
+                paged: None,
+                paged_build_unsupported: false,
+            });
+            bodies.push((paged_path, SidecarPayload::Paged(upload)));
+        }
+        Ok((descriptors, bodies))
+    }
+}
+
+/// Filename slug for a composite sidecar: member names joined by `+`
+/// (identifier-safe by PropertyDef validation), hash-capped so a long
+/// member list cannot overflow filename limits.
+fn composite_sidecar_slug(members: &[String]) -> String {
+    let joined = members.join("+");
+    if joined.len() <= 96 {
+        joined
+    } else {
+        format!("{:016x}", xxhash_rust::xxh3::xxh3_64(joined.as_bytes()))
+    }
+}
+
+/// One composite index's harvested `tuple -> [id, ...]` postings plus the
+/// descriptor list, mirroring [`EqualityPropertySidecars`].
+pub(crate) type CompositePropertySidecars = (
+    Vec<crate::manifest::CompositeEqualityIndexDescriptor>,
+    Vec<(Path, SidecarPayload)>,
+);
+
+/// Harvest tuple sidecars for every declared composite index, feeding the
+/// same reconciled row stream the single-property harvest sees.
+pub(crate) fn prepare_composite_property_sidecars(
+    paths: &NamespacePaths,
+    level: u32,
+    sst_id: &Uuid,
+    label: &str,
+    indexes: &[namidb_core::schema::IndexDef],
+    rows: &[NodeRow],
+) -> Result<CompositePropertySidecars> {
+    let mut collector = CompositeSidecarCollector::new(indexes)?;
+    for row in rows {
+        if let MemOp::Upsert(payload) = &row.op {
+            let rec = NodeWriteRecord::decode(payload)?;
+            collector.observe(row.id, &rec)?;
+        }
+    }
+    collector.finish(paths, level, sst_id, label)
 }
 
 struct PendingExternalPosting {
