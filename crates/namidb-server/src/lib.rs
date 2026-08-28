@@ -400,6 +400,28 @@ impl AppState {
         self
     }
 
+    /// Spawn this state's [`group_committer_loop`] (no-op when group commit
+    /// is disabled). The cancel sender lives inside the task, so the loop
+    /// runs until process exit — single-tenant lifetime.
+    pub(crate) fn spawn_group_committer(&self) {
+        let Some(group) = self.group_commit.clone() else {
+            return;
+        };
+        let handles = CommitterHandles {
+            writer: self.writer.clone(),
+            snapshot: self.snapshot.clone(),
+            writer_health: self.writer_health.clone(),
+            namespace: self.namespace.clone(),
+            group,
+            memtable_bytes_gauge: Some(self.memtable_bytes_gauge.clone()),
+        };
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let _keep_alive = cancel_tx;
+            group_committer_loop(handles, cancel_rx).await;
+        });
+    }
+
     /// Assemble a single-namespace view over a multi-tenant namespace: the
     /// per-namespace handles come from the registry's
     /// [`crate::registry::NamespaceState`], the process-wide config from
@@ -433,10 +455,10 @@ impl AppState {
             metrics: shared.metrics.clone(),
             authz: shared.authz.clone(),
             writer_health: ns.writer_health.clone(),
-            // Group commit needs a per-namespace committer task; wiring that
-            // through the registry is a follow-up, so multi-tenant views
-            // stay on inline commits.
-            group_commit: None,
+            // The registry owns the per-namespace coordinator (and its
+            // committer task, cancelled on eviction); views share it so the
+            // Bolt multi-tenant path groups too.
+            group_commit: ns.group_commit.clone(),
             backup: None,
         }
     }
@@ -971,6 +993,7 @@ pub async fn run_with_memory_max_bytes(
             sweep_min_age: config.sweep_min_age,
             sweep_delete: config.sweep_delete,
             compaction_l0_trigger: config.compaction_l0_trigger,
+            group_commit_window: config.group_commit_window,
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1074,8 +1097,7 @@ pub async fn run_with_memory_max_bytes(
             window_ms = config.group_commit_window.as_millis() as u64,
             "group commit enabled"
         );
-        let committer_state = state.clone();
-        tokio::spawn(group_committer_loop(committer_state));
+        state.spawn_group_committer();
     }
     let state = match backup_handles {
         Some((backup_store, backup_paths, prefix)) => {
@@ -1900,7 +1922,7 @@ impl WriteFailure {
 }
 
 impl GroupCommit {
-    fn new(window: Duration) -> Self {
+    pub(crate) fn new(window: Duration) -> Self {
         Self {
             window,
             notify: tokio::sync::Notify::new(),
@@ -1953,21 +1975,42 @@ impl GroupCommit {
     }
 }
 
-/// The per-namespace committer task. Runs while the server lives; exits
-/// with the process. Never spawned when the window is zero.
-pub(crate) async fn group_committer_loop(state: AppState) {
-    let Some(group) = state.group_commit.clone() else {
-        return;
-    };
+/// Everything the committer needs, decoupled from [`AppState`] so the
+/// multi-tenant registry can run one per [`crate::registry::NamespaceState`].
+pub(crate) struct CommitterHandles {
+    pub(crate) writer: Arc<Mutex<WriterSession>>,
+    pub(crate) snapshot: Arc<SnapshotCell>,
+    pub(crate) writer_health: Arc<WriterHealth>,
+    pub(crate) namespace: String,
+    pub(crate) group: Arc<GroupCommit>,
+    /// Single-tenant only; the multi-tenant health path reads the writer.
+    pub(crate) memtable_bytes_gauge: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// The per-namespace committer task. Exits when `cancel` fires (namespace
+/// eviction) or its sender drops (process shutdown); any still-registered
+/// waiters are failed rather than left hanging.
+pub(crate) async fn group_committer_loop(
+    handles: CommitterHandles,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
-        group.notify.notified().await;
+        tokio::select! {
+            _ = handles.group.notify.notified() => {}
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+                continue;
+            }
+        }
         // Coalesce: writes arriving inside the window join this group. The
         // sleep happens OFF the writer lock, so stagers keep making
         // progress while the group accumulates.
-        if !group.window.is_zero() {
-            tokio::time::sleep(group.window).await;
+        if !handles.group.window.is_zero() {
+            tokio::time::sleep(handles.group.window).await;
         }
-        let mut writer = state.writer.lock().await;
+        let mut writer = handles.writer.lock().await;
         if writer.pending_len() == 0 {
             continue;
         }
@@ -1976,16 +2019,18 @@ pub(crate) async fn group_committer_loop(state: AppState) {
         };
         match writer.commit_batch().await {
             Ok(_) => {
-                state.writer_health.clear_persistence_degraded();
+                handles.writer_health.clear_persistence_degraded();
                 // ACK ordering (RFC-021): republish BEFORE waking, so a
                 // waiter's next read sees its committed rows.
-                state.snapshot.store(writer.owned_snapshot());
-                state.memtable_bytes_gauge.store(
-                    writer.memtable_bytes(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                handles.snapshot.store(writer.owned_snapshot());
+                if let Some(gauge) = &handles.memtable_bytes_gauge {
+                    gauge.store(
+                        writer.memtable_bytes(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 drop(writer);
-                group.wake_committed(watermark);
+                handles.group.wake_committed(watermark);
             }
             Err(e) => {
                 // Shared fate: the merged batch failed as a unit. Discard it
@@ -1996,17 +2041,25 @@ pub(crate) async fn group_committer_loop(state: AppState) {
                 let error = namidb_query::exec::ExecError::Storage(e);
                 recovery::recover_after_write_error(
                     &mut writer,
-                    &state.snapshot,
-                    &state.writer_health,
-                    &state.namespace,
+                    &handles.snapshot,
+                    &handles.writer_health,
+                    &handles.namespace,
                     &error,
                 )
                 .await;
                 drop(writer);
-                group.wake_all_err(SharedCommitError(Arc::new(error)));
+                handles
+                    .group
+                    .wake_all_err(SharedCommitError(Arc::new(error)));
             }
         }
     }
+    // Eviction/shutdown: fail any straggler instead of hanging it.
+    handles.group.wake_all_err(SharedCommitError(Arc::new(
+        namidb_query::exec::ExecError::Runtime(
+            "group commit coordinator stopped (namespace evicted or shutting down)".into(),
+        ),
+    )));
 }
 
 /// How long the periodic flush loop waits after a local-persistence flush
@@ -4076,36 +4129,93 @@ async fn run_cypher_multi(
             drop(writer);
             return namespace_retired_observation(started);
         }
-        let result =
-            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
-        let stall = match &result {
-            Ok(_) => {
-                ns_state.snapshot.store(writer.owned_snapshot());
-                let bytes = writer.memtable_bytes();
-                if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
-                    ns_state.flush_notify.notify_one();
+        let (result, stall) = if let Some(group) = ns_state.group_commit.clone() {
+            // RFC-034 grouped write, multi-tenant flavour: stage inside a
+            // request scope, register under the lock, and let this
+            // namespace's committer (spawned by the registry, cancelled on
+            // eviction) make the group durable with one commit.
+            let mark = writer.begin_staged_request();
+            match execute_write_staged_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                shared.write_deadline(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    writer.commit_staged_request();
+                    let lsn = writer.staged_last_lsn().unwrap_or(0);
+                    let ack = group.register(lsn);
+                    let bytes = writer.memtable_bytes();
+                    if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
+                        ns_state.flush_notify.notify_one();
+                    }
+                    let stall = shared.write_stall_for(writer.max_l0_bucket_len(), bytes);
+                    drop(writer);
+                    group.notify_committer();
+                    let result = match ack.await {
+                        Ok(Ok(())) => Ok(outcome),
+                        Ok(Err(shared_err)) => Err(WriteFailure::Shared(shared_err)),
+                        Err(_) => Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                            "group commit coordinator exited".into(),
+                        ))),
+                    };
+                    (result, stall)
                 }
-                shared.write_stall_for(writer.max_l0_bucket_len(), bytes)
+                Err(e) => {
+                    // Roll back ONLY this request; earlier group members'
+                    // staged rows survive. Never recover a retired
+                    // incarnation (see the inline arm).
+                    writer.rollback_staged_request(mark);
+                    if !ns_state.is_retired() {
+                        recovery::recover_after_write_error(
+                            &mut writer,
+                            &ns_state.snapshot,
+                            &ns_state.writer_health,
+                            &ns_state.namespace,
+                            &e,
+                        )
+                        .await;
+                    }
+                    drop(writer);
+                    (Err(WriteFailure::Own(e)), None)
+                }
             }
-            Err(e) => {
-                // Reopen a fenced/poisoned namespace writer in place, under
-                // the lock we already hold (mirrors the single-tenant path).
-                // Never recover a retired incarnation: doing so after
-                // eviction could claim a newer epoch and fence its successor.
-                if !ns_state.is_retired() {
-                    recovery::recover_after_write_error(
-                        &mut writer,
-                        &ns_state.snapshot,
-                        &ns_state.writer_health,
-                        &ns_state.namespace,
-                        e,
-                    )
+        } else {
+            let result =
+                execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline())
                     .await;
+            let stall = match &result {
+                Ok(_) => {
+                    ns_state.snapshot.store(writer.owned_snapshot());
+                    let bytes = writer.memtable_bytes();
+                    if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
+                        ns_state.flush_notify.notify_one();
+                    }
+                    shared.write_stall_for(writer.max_l0_bucket_len(), bytes)
                 }
-                None
-            }
+                Err(e) => {
+                    // Reopen a fenced/poisoned namespace writer in place, under
+                    // the lock we already hold (mirrors the single-tenant path).
+                    // Never recover a retired incarnation: doing so after
+                    // eviction could claim a newer epoch and fence its successor.
+                    if !ns_state.is_retired() {
+                        recovery::recover_after_write_error(
+                            &mut writer,
+                            &ns_state.snapshot,
+                            &ns_state.writer_health,
+                            &ns_state.namespace,
+                            e,
+                        )
+                        .await;
+                    }
+                    None
+                }
+            };
+            drop(writer);
+            (result.map_err(WriteFailure::Own), stall)
         };
-        drop(writer);
         let elapsed = started.elapsed();
         if let Some(delay) = stall {
             tokio::time::sleep(delay).await;
@@ -4126,11 +4236,11 @@ async fn run_cypher_multi(
                     .into_response(),
                 }
             }
-            Err(e) => ObservedQuery {
+            Err(failure) => ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
                 elapsed,
-                response: exec_failure_response("write execution failed", &e),
+                response: exec_failure_response("write execution failed", failure.as_exec()),
             },
         }
     } else {
@@ -5848,7 +5958,7 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, Some("tok".into()), "group-commit".into())
             .with_group_commit(Duration::from_millis(5));
-        tokio::spawn(group_committer_loop(state.clone()));
+        state.spawn_group_committer();
         let app = build_router(state.clone());
 
         let v0 = state.snapshot.load().manifest().manifest.version;
@@ -5888,7 +5998,7 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, Some("tok".into()), "group-merge".into())
             .with_group_commit(Duration::from_millis(5));
-        tokio::spawn(group_committer_loop(state.clone()));
+        state.spawn_group_committer();
         let app = build_router(state);
 
         let merge = |app: Router| async move {
@@ -5911,7 +6021,7 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, Some("tok".into()), "group-fail".into())
             .with_group_commit(Duration::from_millis(5));
-        tokio::spawn(group_committer_loop(state.clone()));
+        state.spawn_group_committer();
         let app = build_router(state);
 
         let good = post_cypher(&app, Some("tok"), "CREATE (:F {ok: 1})");
@@ -6037,7 +6147,7 @@ mod tests {
                 .unwrap();
         let state = AppState::new(writer, Some("tok".into()), "group-cas".into())
             .with_group_commit(Duration::from_millis(5));
-        tokio::spawn(group_committer_loop(state.clone()));
+        state.spawn_group_committer();
         let app = build_router(state);
 
         // Sanity: a grouped write commits while the store is healthy.
@@ -6849,6 +6959,97 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// RFC-034 multi-tenant: the registry spawns one committer per
+    /// namespace; grouped writes coalesce per namespace (manifest-version
+    /// counting), RYOW holds, and a sibling namespace is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_tenant_grouped_writes_coalesce_per_namespace() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-group").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig {
+                group_commit_window: Duration::from_millis(5),
+                ..Default::default()
+            },
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry.clone(),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "acme".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+
+        let post_json = |app: Router, uri: &'static str, query: String| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let app = app.clone();
+            handles.push(tokio::spawn(post_json(
+                app,
+                "/acme/v0/cypher",
+                format!("CREATE (:G {{i: {i}}})"),
+            )));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap().status(), StatusCode::OK);
+        }
+        // RYOW after the last ACK.
+        let read = post_json(
+            app.clone(),
+            "/acme/v0/cypher",
+            "MATCH (g:G) RETURN count(g) AS c".to_string(),
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK);
+        let json = body_json(read).await;
+        assert_eq!(json["rows"][0]["c"], 8, "{json}");
+        // The sibling namespace has its own committer and its own data.
+        let read = post_json(
+            app.clone(),
+            "/globex/v0/cypher",
+            "MATCH (g:G) RETURN count(g) AS c".to_string(),
+        )
+        .await;
+        let json = body_json(read).await;
+        assert_eq!(json["rows"][0]["c"], 0, "{json}");
+        // Coalescing per namespace: fewer manifest commits than writes.
+        let acme = registry.get_if_open("acme").await.expect("acme open");
+        let version = acme.snapshot.load().manifest().manifest.version;
+        assert!(version > 0);
+        assert!(
+            (version as usize) < 8,
+            "8 writes must share commits under a 5 ms window, got {version}"
+        );
     }
 
     #[tokio::test]

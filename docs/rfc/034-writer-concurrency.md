@@ -9,8 +9,11 @@
 `--group-commit-window`, default `0s` = inline commits — storage request
 scopes `begin/commit/rollback_staged_request` + request-scoped unique-index
 undo layer, one committer task per namespace, waiter registration under the
-writer lock, ACK after republish; auto-commit paths only, single-tenant;
-multi-tenant registry wiring and pipelined commit remain proposed)
+writer lock, ACK after republish; auto-commit paths, single- AND
+multi-tenant (one committer per registry namespace, cancelled on eviction);
+the shared-fate fault-injection test shipped and surfaced the pre-existing
+indeterminate-pointer-CAS resurrection bug, fixed in ingest
+(`resolve_failed_pointer_cas`); pipelined commit remains proposed)
 **Back-refs:** RFC-001 §"Write path"/§"Epoch fencing", RFC-021, RFC-026, RFC-027, RFC-029
 
 ## Summary

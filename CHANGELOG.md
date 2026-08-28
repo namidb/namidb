@@ -15,6 +15,12 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Added**
+- Group commit now covers multi-tenant namespaces: the registry spawns
+  one committer per namespace (cancelled on eviction, stragglers failed
+  rather than hung), `--group-commit-window` applies to the multi-tenant
+  HTTP and Bolt write paths, and grouping stays per-namespace.
+
 **Fixed**
 - A manifest pointer-CAS transport failure could falsify a negative ACK:
   the client was told the write failed, but the dangling WAL segment +
