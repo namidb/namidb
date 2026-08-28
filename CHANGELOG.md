@@ -15,6 +15,81 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-28
+
+Closes the second production field report (12 findings against 2.1.4).
+
+**Breaking**
+- Secure by default: the server now **refuses to start** when no auth
+  source is configured (`--auth-token` / `NAMIDB_AUTH_TOKEN`,
+  `--auth-tokens-file`, or a JWT config). Pass `--no-auth` /
+  `NAMIDB_NO_AUTH=1` to explicitly run open for local development.
+  Previously a missing token silently booted an anonymous read-write
+  server behind a log line.
+- `--bolt-listen` together with `--multi-tenant` now fails at startup.
+  The multi-tenant serve path never started the Bolt listener, so the
+  combination silently dropped the Bolt port; Bolt is single-namespace
+  (run one single-tenant server per namespace). Docs now carry the
+  HTTP-only caveat at every multi-tenant routing mention.
+- `shortestPath` endpoints must be bound by a previous `MATCH`; an
+  unbound endpoint is now a lowering error. Previously it was silently
+  accepted and returned ONE arbitrary reachable node per seed instead
+  of one row per (src, dst) pair.
+- `'text' + <map/node/list/...>` is now a type error instead of
+  concatenating the internal Debug representation into the result
+  (silent data corruption); the same applies to `toString()` on
+  non-scalar values. String `+` still coerces numbers, booleans, and
+  temporals (temporals render as ISO-8601). List `+` gains proper
+  Cypher semantics: `list + list` concatenates, `list + element`
+  appends, `element + list` prepends.
+- Bolt: query timeouts and result-limit errors now carry their own
+  FAILURE codes (`Neo.ClientError.Transaction.TransactionTimedOut`,
+  `Neo.ClientError.Statement.ResourceLimitExceeded`) instead of
+  `Neo.ClientError.Statement.ArgumentError`; deterministic search-cap
+  errors are no longer the auto-retried
+  `Neo.TransientError.General.DatabaseUnavailable`. Clients that
+  string-matched the old codes should switch to the new ones.
+
+**Added**
+- `reduce(acc = init, x IN list | expr)` — the canonical Cypher fold.
+  `reduce` stays usable as a plain identifier (soft keyword).
+- Statistical aggregates: `stdev`, `stdevp`, `percentileCont`,
+  `percentileDisc` (with `DISTINCT` support on the stdev family,
+  NULL-skipping, and typed errors on non-numeric input).
+- Machine-readable error taxonomy on HTTP: every statement failure now
+  carries `neo4j_code` and `gql_status` fields alongside `code`
+  (per-family GQLSTATUS/SQLSTATE-class values — `42001` syntax, `0A000`
+  unsupported, `22000` evaluation, `57014` timeout, `54000` result
+  limits, `53000` transient pressure; table in the server README).
+  Runtime evaluation errors (division by zero, missing `$param`) are
+  now 400 `eval_error` instead of a bare 500.
+- `RETURN DISTINCT <endpoint> [LIMIT n]` over a variable-length pattern
+  now runs as a visited-set BFS instead of enumerating every path:
+  each node is expanded once per seed and emitted once, and the LIMIT
+  stops the traversal early. Previously `DISTINCT ... LIMIT 200` cost
+  exactly the same as counting all paths (exponential in hops).
+- `shortestPath` with a minimum bound (`*2..N`) now prunes its frontier
+  (`(node, hop)` dedup) instead of enumerating every walk — the shape
+  previously hung on realistic graphs.
+
+**Fixed**
+- The official Docker image pre-creates `/var/lib/namidb` owned by its
+  non-root uid (65532), so a named volume mounted at the canonical
+  `file://` store path inherits the right ownership instead of
+  crash-looping with `Permission denied`. Bind mounts (and named
+  volumes created root-owned by older images) still need a one-time
+  `chown -R 65532:65532` — now documented.
+- `namidb backup` help no longer demands a quiescent source: the copy
+  has been live-safe since the retention-pin lease design (point-in-time
+  snapshot at the pinned manifest version; the janitor honours the
+  lease; the residual race fails loudly instead of truncating).
+- The stale claim that coordination uses "S3 conditional writes
+  (`If-Match`, `If-None-Match`, ETag)" is corrected everywhere: the
+  commit path depends on exactly one primitive — PUT-if-absent
+  (`If-None-Match: *`, RFC-029). `If-Match` is NOT required, which
+  re-qualifies stores that only implement the create precondition. The
+  README now states the object-store requirement explicitly.
+
 ## [2.1.4] - 2026-08-17
 
 **Added**
@@ -2652,7 +2727,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.1.4...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/namidb/namidb/compare/v2.1.4...v2.2.0
 [2.1.4]: https://github.com/namidb/namidb/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/namidb/namidb/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/namidb/namidb/compare/v2.1.1...v2.1.2

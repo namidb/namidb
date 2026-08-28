@@ -627,6 +627,25 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 distinct,
                 discard_input_bindings,
             } => {
+                // NDB-04: DISTINCT over endpoint-only projections of a
+                // var-length expand runs as a visited-set BFS instead of
+                // the exponential trail enumeration.
+                if *distinct {
+                    if let Some(rows) = try_execute_endpoint_distinct_project(
+                        input,
+                        items,
+                        *discard_input_bindings,
+                        snapshot,
+                        params,
+                        outer,
+                        routing,
+                        None,
+                    )
+                    .await?
+                    {
+                        return Ok(rows);
+                    }
+                }
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let projected = project_rows(&rows, items, *discard_input_bindings, params)?;
@@ -963,6 +982,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                         *back_reference,
                     ),
                     None,
+                    false,
                 )
                 .await
             }
@@ -1053,6 +1073,34 @@ fn execute_capped<'a>(
                 project_rows(&rows, items, *discard_input_bindings, params)
             }
 
+            // DISTINCT endpoints of a var-length expand (NDB-04): the
+            // endpoint BFS dedups globally, so the LIMIT budget crosses the
+            // distinct projection exactly. Any other distinct shape falls
+            // through to full execution (a capped prefix of a shrinking
+            // projection could under-produce).
+            LogicalPlan::Project {
+                input,
+                items,
+                distinct: true,
+                discard_input_bindings,
+            } => {
+                if let Some(rows) = try_execute_endpoint_distinct_project(
+                    input,
+                    items,
+                    *discard_input_bindings,
+                    snapshot,
+                    params,
+                    outer,
+                    routing,
+                    Some(cap),
+                )
+                .await?
+                {
+                    return Ok(rows);
+                }
+                execute_inner_with_routing(plan, snapshot, params, outer, routing).await
+            }
+
             LogicalPlan::Expand {
                 input,
                 source,
@@ -1094,6 +1142,7 @@ fn execute_capped<'a>(
                         *back_reference,
                     ),
                     Some(cap),
+                    false,
                 )
                 .await
             }
@@ -1182,6 +1231,87 @@ fn execute_capped<'a>(
 
 // ───────────────────────── Expand ────────────────────────────────────
 
+/// NDB-04: `RETURN DISTINCT <endpoint-only projections> [LIMIT n]` over a
+/// variable-length Expand. When every projected expression reads ONLY the
+/// expand's target binding, path multiplicity and seed identity are erased
+/// by the DISTINCT — so the exponential trail enumeration can be replaced
+/// by a visited-set BFS that emits each endpoint once (see `endpoint_bfs`
+/// in [`execute_expand`]). Returns `None` when the shape does not apply;
+/// the caller falls back to the ordinary path.
+#[allow(clippy::too_many_arguments)]
+async fn try_execute_endpoint_distinct_project(
+    input: &LogicalPlan,
+    items: &[crate::plan::ProjectionItem],
+    discard_input_bindings: bool,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    outer: Option<&Row>,
+    routing: &PlanRouting,
+    cap: Option<usize>,
+) -> Result<Option<Vec<Row>>, ExecError> {
+    let LogicalPlan::Expand {
+        input: expand_input,
+        source,
+        edge_type,
+        direction,
+        rel_alias,
+        target_alias,
+        target_labels,
+        length,
+        optional: false,
+        back_reference: false,
+        shortest: crate::plan::ShortestMode::None,
+        path_binding: None,
+    } = input
+    else {
+        return Ok(None);
+    };
+    if length.is_none() {
+        return Ok(None);
+    }
+    // Multiplicity is only unobservable when the projection reads nothing
+    // but the endpoint — any other referenced binding (the seed, a rel
+    // list) re-introduces per-path / per-seed visibility.
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    for item in items {
+        collect_referenced_variables(&item.expression, &mut referenced);
+    }
+    if referenced.is_empty() || !referenced.iter().all(|name| name == target_alias) {
+        return Ok(None);
+    }
+    let resolved = resolve_length(length, params)?;
+    let (min, max) = resolved.as_ref().map(|l| (l.min, l.max)).unwrap_or((1, 1));
+    if min > 1 || max <= 1 {
+        // A larger minimum needs longer-than-first-visit walks (first-visit
+        // dedup would under-return); a single hop has no multiplicity to
+        // erase.
+        return Ok(None);
+    }
+    let rows = execute_inner_with_routing(expand_input, snapshot, params, outer, routing).await?;
+    let expanded = execute_expand(
+        rows,
+        source,
+        edge_type.as_deref(),
+        *direction,
+        rel_alias.as_deref(),
+        target_alias,
+        target_labels,
+        resolved.clone(),
+        false,
+        false,
+        crate::plan::ShortestMode::None,
+        None,
+        snapshot,
+        routing.edge_read_mode(rel_alias.as_deref(), None),
+        should_skip_target_materialize(routing, target_alias, target_labels, None, resolved, false),
+        cap,
+        true,
+    )
+    .await?;
+    let projected = project_rows(&expanded, items, discard_input_bindings, params)?;
+    Ok(Some(dedup_rows(projected)))
+}
+
 /// Clamp an open-ended variable-length upper bound (`max == u32::MAX`, from a
 /// `*` / `*N..` pattern) to the configured hop cap. A finite bound passes
 /// through unchanged.
@@ -1252,6 +1382,7 @@ pub(crate) async fn execute_expand(
     edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
     cap: Option<usize>,
+    endpoint_distinct: bool,
 ) -> Result<Vec<Row>, ExecError> {
     namidb_core::profile_scope!("walker::execute_expand");
     let edge_types = resolve_edge_types(snapshot, edge_type);
@@ -1261,6 +1392,22 @@ pub(crate) async fn execute_expand(
     // any starred range — `*1..1` included) binds the LIST of traversed
     // relationships; only the unstarred fixed form binds a scalar.
     let bind_rel_list = length.is_some();
+    // Endpoint-distinct BFS (NDB-04): when the DISTINCT projection above
+    // reads ONLY the endpoint binding, path multiplicity and seed identity
+    // are unobservable, so the deg^hop trail enumeration collapses to a
+    // visited-set BFS — each node expanded once per seed, emitted once
+    // globally. Conditions re-checked defensively; the caller
+    // (`try_execute_endpoint_distinct_project`) guarantees them.
+    let endpoint_bfs = endpoint_distinct
+        && shortest == crate::plan::ShortestMode::None
+        && !back_reference
+        && path_binding.is_none()
+        && !optional
+        && min <= 1;
+    // Cross-seed emission dedup for the endpoint BFS. It is what makes a
+    // pushed LIMIT budget (`cap`) exact: the capped prefix of a
+    // globally-deduped stream is a prefix of the uncapped DISTINCT result.
+    let mut emitted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
     let mut out = Vec::new();
     for row in rows {
@@ -1349,7 +1496,7 @@ pub(crate) async fn execute_expand(
                     Some(existing) => starting == existing,
                     None => true,
                 };
-            if zero_keeps {
+            if zero_keeps && (!endpoint_bfs || emitted.insert(starting)) {
                 hop_results.push(zero_row);
                 matched_any = true;
             }
@@ -1393,11 +1540,26 @@ pub(crate) async fn execute_expand(
         // for `min <= 1`: a larger minimum needs longer-than-shortest walks,
         // which the exhaustive frontier still provides.
         let bfs_prune = shortest != crate::plan::ShortestMode::None && min <= 1;
+        let prune_visits = bfs_prune || endpoint_bfs;
+        // Shortest-mode pruning pre-visits the seed (a path back to it is
+        // never shortest); the endpoint BFS must NOT — the seed can be its
+        // own endpoint through a cycle within [min..max].
         let mut visited: std::collections::HashSet<NodeId> = if bfs_prune {
             std::collections::HashSet::from([starting])
         } else {
             std::collections::HashSet::new()
         };
+        // `*2..N` shortestPath needs walks longer than the shortest, which
+        // node-visited pruning would drop; dedup the frontier on (node, hop)
+        // instead so it stays O(V) per level rather than deg^hop. First-mode
+        // only: allShortestPaths must keep every distinct same-length path.
+        // (Theoretical corner: the kept walk at (node, hop) could be
+        // trail-blocked where a dropped one was not — accepted for "some
+        // shortest path" output over the previous exhaustive frontier, which
+        // simply hung on realistic graphs.)
+        let hop_keyed_prune = shortest == crate::plan::ShortestMode::First && min >= 2;
+        let mut visited_at_hop: std::collections::HashSet<(NodeId, u32)> =
+            std::collections::HashSet::new();
         let hop_start = min.max(1);
         let _ = hop_start;
         for hop in 1..=max {
@@ -1459,17 +1621,18 @@ pub(crate) async fn execute_expand(
             for (step, neighbours) in step_neighbours {
                 for edge in neighbours {
                     let target_id = partner_id(&edge, direction, step.tail);
-                    if bfs_prune {
+                    if prune_visits {
                         // Reached at an earlier level → any path through it now
-                        // is longer than shortest; skip both as a result and as
-                        // a frontier extension.
+                        // is longer than shortest (endpoint BFS: already
+                        // expanded and emitted at its first level); skip both
+                        // as a result and as a frontier extension.
                         if visited.contains(&target_id) {
                             continue;
                         }
-                        // One walk per node per level suffices for `First`;
-                        // `All` keeps every same-level arrival (each is a
-                        // distinct shortest path).
-                        if shortest == crate::plan::ShortestMode::First
+                        // One walk per node per level suffices for `First` and
+                        // for the endpoint BFS; `All` keeps every same-level
+                        // arrival (each is a distinct shortest path).
+                        if (shortest == crate::plan::ShortestMode::First || endpoint_bfs)
                             && !level_seen.insert(target_id)
                         {
                             continue;
@@ -1493,6 +1656,12 @@ pub(crate) async fn execute_expand(
                         if step.rels.contains(k) {
                             continue;
                         }
+                    }
+                    // (node, hop) dedup AFTER the trail check, so a walk the
+                    // trail rule rejects cannot consume the slot a valid
+                    // alternative arrival needed.
+                    if hop_keyed_prune && !visited_at_hop.insert((target_id, hop)) {
+                        continue;
                     }
                     // Back-reference fast path: skip the lookup_node
                     // (the binding's NodeView is already on the row).
@@ -1664,7 +1833,18 @@ pub(crate) async fn execute_expand(
             if matched_any && shortest != crate::plan::ShortestMode::None {
                 break;
             }
-            if bfs_prune {
+            // Endpoint BFS under a pushed LIMIT: globally-deduped emission
+            // makes the budget exact, so stop expanding once this seed's
+            // results satisfy it (the level already emitted may overshoot a
+            // little; TopN truncates exactly).
+            if endpoint_bfs {
+                if let Some(c) = cap {
+                    if out.len() + hop_results.len() >= c {
+                        break;
+                    }
+                }
+            }
+            if prune_visits {
                 // Seal the level: everything reached this hop is now at its
                 // final (minimal) depth. Deferred to level end so `All` mode
                 // admits every same-level arrival above.
@@ -5999,7 +6179,104 @@ fn aggregate_over(
             let vals = collect_non_null(rows, arg, *distinct, params)?;
             Ok(RuntimeValue::List(vals))
         }
+        AggregateExpr::Stdev {
+            arg,
+            distinct,
+            population,
+        } => {
+            let vals = collect_non_null(rows, arg, *distinct, params)?;
+            let name = if *population { "stdevp" } else { "stdev" };
+            let nums = numeric_values(&vals, name)?;
+            match nums.len() {
+                0 => Ok(RuntimeValue::Null),
+                1 => Ok(RuntimeValue::Float(0.0)),
+                n => {
+                    let mean = nums.iter().sum::<f64>() / n as f64;
+                    let ss: f64 = nums.iter().map(|v| (v - mean) * (v - mean)).sum();
+                    let denom = if *population {
+                        n as f64
+                    } else {
+                        (n - 1) as f64
+                    };
+                    Ok(RuntimeValue::Float((ss / denom).sqrt()))
+                }
+            }
+        }
+        AggregateExpr::Percentile {
+            arg,
+            percentile,
+            continuous,
+        } => {
+            let vals = collect_non_null(rows, arg, false, params)?;
+            if vals.is_empty() {
+                return Ok(RuntimeValue::Null);
+            }
+            let p = percentile_fraction(rows, percentile, params)?;
+            let name = if *continuous {
+                "percentileCont"
+            } else {
+                "percentileDisc"
+            };
+            // Both forms require numeric values (Neo4j parity), even though
+            // the discrete form returns one of the inputs unchanged.
+            let nums = numeric_values(&vals, name)?;
+            if *continuous {
+                let mut nums = nums;
+                nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                let rank = p * (nums.len() - 1) as f64;
+                let lo = rank.floor() as usize;
+                let hi = rank.ceil() as usize;
+                let frac = rank - lo as f64;
+                Ok(RuntimeValue::Float(nums[lo] + (nums[hi] - nums[lo]) * frac))
+            } else {
+                let mut sorted = vals;
+                sorted.sort_by(|a, b| order_for_sort(a, b, false));
+                // Nearest-rank: 1-based ceil(p * n), clamped into range so
+                // p = 0.0 yields the minimum.
+                let n = sorted.len();
+                let idx = ((p * n as f64).ceil() as usize).clamp(1, n) - 1;
+                Ok(sorted.swap_remove(idx))
+            }
+        }
     }
+}
+
+/// Coerce aggregate inputs to `f64`, erroring on non-numeric values.
+fn numeric_values(vals: &[RuntimeValue], fname: &str) -> Result<Vec<f64>, ExecError> {
+    vals.iter()
+        .map(|v| match v {
+            RuntimeValue::Integer(n) => Ok(*n as f64),
+            RuntimeValue::Float(f) => Ok(*f),
+            other => Err(ExecError::Runtime(format!(
+                "{fname}() requires numeric values, got {}",
+                other.type_name()
+            ))),
+        })
+        .collect()
+}
+
+/// Evaluate and validate the percentile argument (a number in `0.0..=1.0`).
+/// Evaluated against the group's first row, so a non-constant expression
+/// resolves per group like any other aggregate argument would.
+fn percentile_fraction(rows: &[Row], e: &Expression, params: &Params) -> Result<f64, ExecError> {
+    let default_row = Row::new();
+    let row = rows.first().unwrap_or(&default_row);
+    let p = match evaluate(e, row, params)? {
+        RuntimeValue::Integer(n) => n as f64,
+        RuntimeValue::Float(f) => f,
+        other => {
+            return Err(ExecError::Runtime(format!(
+                "percentile must be a number between 0.0 and 1.0, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
+        return Err(ExecError::Runtime(format!(
+            "percentile must be between 0.0 and 1.0, got {p}"
+        )));
+    }
+    Ok(p)
 }
 
 fn collect_non_null(
@@ -6666,6 +6943,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                         false,
                         None,
+                        false,
                     )
                     .await?;
                     return Ok(FactorRowSet::from_flat(out));
@@ -6758,6 +7036,25 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 distinct,
                 discard_input_bindings,
             } => {
+                // NDB-04: DISTINCT over endpoint-only projections of a
+                // var-length expand runs as a visited-set BFS instead of
+                // the exponential trail enumeration.
+                if *distinct {
+                    if let Some(rows) = try_execute_endpoint_distinct_project(
+                        input,
+                        items,
+                        *discard_input_bindings,
+                        snapshot,
+                        params,
+                        outer,
+                        routing,
+                        None,
+                    )
+                    .await?
+                    {
+                        return Ok(FactorRowSet::from_flat(rows));
+                    }
+                }
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
@@ -8118,6 +8415,16 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
                 collect_referenced_variables(v, out);
             }
         }
+        // reduce() is evaluated by the plain expression engine (never routed
+        // to a pattern branch), so the sink must carry everything its init,
+        // list, and body read. The local accumulator/variable are shadowed
+        // per element; collecting a same-named host binding over-collects,
+        // which is the safe direction for a thin row.
+        ExpressionKind::Reduce(r) => {
+            collect_referenced_variables(&r.init, out);
+            collect_referenced_variables(&r.list, out);
+            collect_referenced_variables(&r.expression, out);
+        }
         // Closed pattern forms — the binding reads they perform live
         // inside their own sub-plan, not in the host expression.
         ExpressionKind::Exists(_)
@@ -8477,8 +8784,15 @@ fn collect_plan_references(
                     | AggregateExpr::Avg { arg: e, .. }
                     | AggregateExpr::Min { arg: e }
                     | AggregateExpr::Max { arg: e }
+                    | AggregateExpr::Stdev { arg: e, .. }
                     | AggregateExpr::Collect { arg: e, .. } => {
                         collect_referenced_variables(e, out);
+                    }
+                    AggregateExpr::Percentile {
+                        arg, percentile, ..
+                    } => {
+                        collect_referenced_variables(arg, out);
+                        collect_referenced_variables(percentile, out);
                     }
                     AggregateExpr::Count { arg: None, .. } => {}
                 }

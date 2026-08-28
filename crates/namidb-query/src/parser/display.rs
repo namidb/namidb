@@ -621,6 +621,11 @@ impl fmt::Display for Expression {
                     kw, q.variable, q.list, q.predicate
                 )
             }
+            ExpressionKind::Reduce(r) => write!(
+                f,
+                "reduce({} = {}, {} IN {} | {})",
+                r.accumulator, r.init, r.variable, r.list, r.expression
+            ),
             ExpressionKind::Star => f.write_str("*"),
         }
     }

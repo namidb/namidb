@@ -216,6 +216,13 @@ fn visit_expression(expr: &Expression, out: &mut BTreeSet<String>) {
             visit_expression(&q.predicate, out);
             out.insert(q.variable.name.clone());
         }
+        ExpressionKind::Reduce(r) => {
+            visit_expression(&r.init, out);
+            visit_expression(&r.list, out);
+            visit_expression(&r.expression, out);
+            out.insert(r.accumulator.name.clone());
+            out.insert(r.variable.name.clone());
+        }
         ExpressionKind::PatternComprehension(pc) => {
             if let Some(b) = &pc.binding {
                 out.insert(b.name.clone());

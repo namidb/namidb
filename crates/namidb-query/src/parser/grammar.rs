@@ -2223,6 +2223,46 @@ impl<'src> Parser<'src> {
             && matches!(self.peek_at(2), Some(Token::In))
     }
 
+    /// `reduce` is a soft keyword: only `reduce(<ident> = ...` is the fold
+    /// form, so `reduce` stays usable as a variable and `reduce(a, b)` as a
+    /// plain (unsupported) function call.
+    fn looks_like_reduce(&self) -> bool {
+        self.check(&Token::LParen)
+            && matches!(
+                self.peek_at(1),
+                Some(Token::Ident(_)) | Some(Token::QuotedIdent(_))
+            )
+            && matches!(self.peek_at(2), Some(Token::Eq))
+    }
+
+    /// Parse the body of `reduce(acc = init, x IN list | expr)` starting at
+    /// the `(`. `start` is the byte offset of the `reduce` keyword.
+    fn parse_reduce_body(&mut self, start: usize) -> Result<Expression, ParseError> {
+        self.expect(&Token::LParen)?;
+        let accumulator = self.expect_identifier()?;
+        self.expect(&Token::Eq)?;
+        let init = self.parse_expression()?;
+        self.expect_in(&Token::Comma, "reduce(acc = init, x IN list | expr)")?;
+        let variable = self.expect_identifier()?;
+        self.expect(&Token::In)?;
+        let list = self.parse_expression()?;
+        self.expect_in(&Token::Pipe, "reduce(acc = init, x IN list | expr)")?;
+        let expression = self.parse_expression()?;
+        let rparen = self.expect_in(&Token::RParen, "reduce(acc = init, x IN list | expr)")?;
+        let span = SourceSpan::new(start, rparen.span.end);
+        Ok(Expression {
+            kind: ExpressionKind::Reduce(Box::new(Reduce {
+                accumulator,
+                init,
+                variable,
+                list,
+                expression,
+                span,
+            })),
+            span,
+        })
+    }
+
     /// Parse the body of a list quantifier starting at the `(`: `(x IN list
     /// WHERE pred)`. `start` is the byte offset of the quantifier keyword.
     fn parse_quantifier_body(
@@ -2277,6 +2317,9 @@ impl<'src> Parser<'src> {
                 if self.looks_like_quantifier() {
                     return self.parse_quantifier_body(kind, segments[0].span.start);
                 }
+            }
+            if segments[0].name.eq_ignore_ascii_case("reduce") && self.looks_like_reduce() {
+                return self.parse_reduce_body(segments[0].span.start);
             }
         }
 
@@ -2678,6 +2721,46 @@ mod tests {
                 }
                 other => panic!("expected list comprehension, got {:?}", other),
             },
+            _ => panic!(),
+        }
+    }
+
+    /// NDB-05: `reduce(acc = init, x IN list | expr)` parses; `reduce` stays
+    /// a soft keyword (a plain call or a variable named `reduce` is intact).
+    #[test]
+    fn reduce_folds_parse_and_display_round_trip() {
+        let q = ok("RETURN reduce(acc = 1.0, x IN [0.5, 0.8] | acc * x) AS peso");
+        match &q.head.clauses[0] {
+            Clause::Return(r) => match &r.items[0].expression.kind {
+                ExpressionKind::Reduce(rd) => {
+                    assert_eq!(rd.accumulator.name, "acc");
+                    assert_eq!(rd.variable.name, "x");
+                    // Display round-trips back through the parser.
+                    let rendered = format!("{}", r.items[0].expression);
+                    assert_eq!(rendered, "reduce(acc = 1.0, x IN [0.5, 0.8] | (acc * x))");
+                    ok(&format!("RETURN {rendered} AS peso"));
+                }
+                other => panic!("expected reduce, got {:?}", other),
+            },
+            _ => panic!(),
+        }
+
+        // Soft keyword: `reduce(a, b)` is still a plain function call and a
+        // variable named `reduce` still resolves as a variable.
+        let q = ok("RETURN reduce(1, 2) AS r");
+        match &q.head.clauses[0] {
+            Clause::Return(r) => assert!(matches!(
+                r.items[0].expression.kind,
+                ExpressionKind::FunctionCall { .. }
+            )),
+            _ => panic!(),
+        }
+        let q = ok("WITH 1 AS reduce RETURN reduce + 1 AS r");
+        match &q.head.clauses[1] {
+            Clause::Return(r) => assert!(matches!(
+                r.items[0].expression.kind,
+                ExpressionKind::Binary { .. }
+            )),
             _ => panic!(),
         }
     }

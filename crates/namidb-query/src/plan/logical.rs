@@ -711,6 +711,21 @@ pub enum AggregateExpr {
         arg: Expression,
         distinct: bool,
     },
+    /// `stdev(expr)` — sample standard deviation (n-1 denominator);
+    /// `population` selects the `stdevp` form (n denominator).
+    Stdev {
+        arg: Expression,
+        distinct: bool,
+        population: bool,
+    },
+    /// `percentileCont(expr, p)` (`continuous: true`, linear interpolation)
+    /// / `percentileDisc(expr, p)` (nearest-rank). `percentile` must
+    /// evaluate to a number in `0.0..=1.0`.
+    Percentile {
+        arg: Expression,
+        percentile: Expression,
+        continuous: bool,
+    },
 }
 
 /// One element of a `CREATE` / `MERGE` pattern.
@@ -810,6 +825,18 @@ impl AggregateExpr {
             AggregateExpr::Min { .. } => "min",
             AggregateExpr::Max { .. } => "max",
             AggregateExpr::Collect { .. } => "collect",
+            AggregateExpr::Stdev {
+                population: false, ..
+            } => "stdev",
+            AggregateExpr::Stdev {
+                population: true, ..
+            } => "stdevp",
+            AggregateExpr::Percentile {
+                continuous: true, ..
+            } => "percentileCont",
+            AggregateExpr::Percentile {
+                continuous: false, ..
+            } => "percentileDisc",
         }
     }
 
@@ -818,8 +845,11 @@ impl AggregateExpr {
             AggregateExpr::Count { distinct, .. }
             | AggregateExpr::Sum { distinct, .. }
             | AggregateExpr::Avg { distinct, .. }
+            | AggregateExpr::Stdev { distinct, .. }
             | AggregateExpr::Collect { distinct, .. } => *distinct,
-            AggregateExpr::Min { .. } | AggregateExpr::Max { .. } => false,
+            AggregateExpr::Min { .. }
+            | AggregateExpr::Max { .. }
+            | AggregateExpr::Percentile { .. } => false,
         }
     }
 }

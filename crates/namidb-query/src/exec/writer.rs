@@ -964,6 +964,7 @@ fn execute_write_inner_mode<'a>(
                     crate::exec::walker::EdgeReadMode::Properties,
                     false,
                     None,
+                    false,
                 )
                 .await
             }

@@ -191,16 +191,22 @@ async fn shortest_path_rejects_unbound_endpoint() {
          RETURN p",
     )
     .unwrap();
-    // `b` does have a binding (`b:Person`), but it's NEW — not in
-    // scope. shortestPath requires both endpoints to be already
-    // bound. We accept the binding form, so this test reflects what
-    // RFC-023 §Q-future says: the lower should reject `b` if it's
-    // not in scope. For now, the lower validates `head.binding` and
-    // `target.binding` exist; the "already bound" guarantee comes
-    // from `back_reference` flagging at the executor layer. Until
-    // that promotes into the lower, this test asserts the query at
-    // least lowers successfully (no false positive).
-    let _plan = lower(&q).expect("RFC-023 v0 accepts; back_reference fires at exec");
+    // `b` does have a binding (`b:Person`), but it's NEW — not in scope.
+    // Until 2.2.0 this lowered silently and `First` mode returned ONE
+    // arbitrary reachable node per seed instead of one row per (src, dst)
+    // pair — an openCypher divergence that read as data loss in the field
+    // (NDB-09). The lower now enforces the v0 previously-bound contract.
+    let err = lower(&q).expect_err("unbound shortestPath endpoint must be rejected");
+    assert!(
+        err.message.contains("must be bound by a previous MATCH"),
+        "error should name the previously-bound rule, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("`b`"),
+        "error should name the offending endpoint, got: {}",
+        err.message
+    );
 }
 
 /// Dense layered graph: s → L1(40) → L2(40) → L3(40) → L4(40) → L5(40) → t,
@@ -248,6 +254,24 @@ async fn shortest_path_survives_dense_layered_blowup() {
     let q = parse(
         "MATCH (a:Person {name: 's'}), (b:Person {name: 't'}) \
          MATCH p = shortestPath((a)-[:KNOWS*..8]->(b)) \
+         RETURN length(p) AS hops",
+    )
+    .unwrap();
+    let plan = lower(&q).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("hops") {
+        Some(RuntimeValue::Integer(n)) => assert_eq!(*n, (DEPTH + 1) as i64),
+        other => panic!("hops not integer: {:?}", other),
+    }
+
+    // NDB-09: `min >= 2` used to disable pruning entirely, reviving the
+    // 40^hop frontier (an effective hang). The (node, hop) frontier dedup
+    // bounds it at O(V) per level; completing at all is the regression
+    // assertion, and the shortest length is unchanged (already >= 2).
+    let q = parse(
+        "MATCH (a:Person {name: 's'}), (b:Person {name: 't'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*2..8]->(b)) \
          RETURN length(p) AS hops",
     )
     .unwrap();

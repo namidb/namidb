@@ -1450,9 +1450,7 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
     match e {
         ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
         ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
-        ExecError::Constraint(_) => {
-            ("Neo.ClientError.Schema.ConstraintValidationFailed", "23000")
-        }
+        ExecError::Constraint(_) => ("Neo.ClientError.Schema.ConstraintValidationFailed", "23000"),
         ExecError::Storage(
             namidb_storage::Error::SearchResultLimitExceeded { .. }
             | namidb_storage::Error::SearchDocumentLimitExceeded { .. },
@@ -4457,8 +4455,10 @@ mod tests {
     /// matching, on both the `code` and the Neo4j/GQL-shaped fields.
     #[tokio::test]
     async fn timeout_response_exposes_taxonomy_fields() {
-        let response =
-            exec_failure_response("read execution failed", &namidb_query::exec::ExecError::Timeout);
+        let response = exec_failure_response(
+            "read execution failed",
+            &namidb_query::exec::ExecError::Timeout,
+        );
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -4494,7 +4494,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "eval_error");
-        assert_eq!(json["neo4j_code"], "Neo.ClientError.Statement.ArgumentError");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.ClientError.Statement.ArgumentError"
+        );
         assert_eq!(json["gql_status"], "22000");
     }
 

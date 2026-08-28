@@ -960,6 +960,25 @@ fn format_aggregate(agg: &AggregateExpr) -> String {
         AggregateExpr::Min { arg } => format!("min({})", arg),
         AggregateExpr::Max { arg } => format!("max({})", arg),
         AggregateExpr::Collect { arg, distinct } => format_args("collect", arg, *distinct),
+        AggregateExpr::Stdev {
+            arg,
+            distinct,
+            population,
+        } => format_args(if *population { "stdevp" } else { "stdev" }, arg, *distinct),
+        AggregateExpr::Percentile {
+            arg,
+            percentile,
+            continuous,
+        } => format!(
+            "{}({}, {})",
+            if *continuous {
+                "percentileCont"
+            } else {
+                "percentileDisc"
+            },
+            arg,
+            percentile
+        ),
     }
 }
 

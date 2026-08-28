@@ -1518,12 +1518,10 @@ fn map_exec_err(e: ExecError) -> BackendError {
         // must be able to tell "this query is too expensive" from "this
         // query is malformed" without string-matching the message, and must
         // NOT auto-retry either (a re-run exceeds the same budget again).
-        ExecError::Timeout => {
-            BackendError::Timeout("query exceeded the configured timeout".into())
+        ExecError::Timeout => BackendError::Timeout("query exceeded the configured timeout".into()),
+        ExecError::RowCap(cap) => {
+            BackendError::ResourceLimit(format!("query exceeded the configured row cap of {cap}"))
         }
-        ExecError::RowCap(cap) => BackendError::ResourceLimit(format!(
-            "query exceeded the configured row cap of {cap}"
-        )),
         ExecError::Storage(err) => match err {
             // Deterministic search result caps: same query, same outcome —
             // ClientError, not the auto-retried TransientError bucket.

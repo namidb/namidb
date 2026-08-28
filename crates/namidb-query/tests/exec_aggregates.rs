@@ -227,6 +227,112 @@ async fn aggregate_semantics_on_memtable_and_flushed_routes() {
     assert_semantics(&writer).await;
 }
 
+/// NDB-10: statistical aggregates — stdev/stdevp (sample vs population
+/// denominator), percentileCont (linear interpolation) and percentileDisc
+/// (nearest-rank), with the standard NULL-skipping/empty-group envelope.
+async fn assert_statistical_semantics(writer: &WriterSession) {
+    // Ages present: [30, 40, 30]. Sample stdev vs population stdev.
+    let mean = (30.0_f64 + 40.0 + 30.0) / 3.0;
+    let ss = (30.0 - mean).powi(2) + (40.0 - mean).powi(2) + (30.0 - mean).powi(2);
+    for (q, expected) in [
+        (
+            "MATCH (p:Person) RETURN stdev(p.age) AS s",
+            (ss / 2.0).sqrt(),
+        ),
+        (
+            "MATCH (p:Person) RETURN stdevp(p.age) AS s",
+            (ss / 3.0).sqrt(),
+        ),
+        // DISTINCT: [30, 40] -> mean 35, ss 50, sample denominator 1.
+        (
+            "MATCH (p:Person) RETURN stdev(DISTINCT p.age) AS s",
+            50.0_f64.sqrt(),
+        ),
+        // Scores sorted [1.5, 2.0, 2.5, 4.0]: rank 0.5*3 = 1.5 -> 2.25.
+        (
+            "MATCH (p:Person) RETURN percentileCont(p.score, 0.5) AS s",
+            2.25,
+        ),
+    ] {
+        match one_value(writer, q).await {
+            RuntimeValue::Float(f) => {
+                assert!((f - expected).abs() < 1e-9, "{q}: {f} != {expected}")
+            }
+            other => panic!("{q}: expected float, got {other:?}"),
+        }
+    }
+
+    // Nearest-rank keeps the input value (and its type): ceil(0.5*4) = rank 2.
+    assert_eq!(
+        one_value(
+            writer,
+            "MATCH (p:Person) RETURN percentileDisc(p.score, 0.5) AS s"
+        )
+        .await,
+        RuntimeValue::Float(2.0)
+    );
+    assert_eq!(
+        one_value(
+            writer,
+            "MATCH (p:Person) RETURN percentileDisc(p.age, 1.0) AS s"
+        )
+        .await,
+        RuntimeValue::Integer(40)
+    );
+    assert_eq!(
+        one_value(
+            writer,
+            "MATCH (p:Person) RETURN percentileDisc(p.age, 0.0) AS s"
+        )
+        .await,
+        RuntimeValue::Integer(30),
+        "p = 0.0 clamps to the minimum"
+    );
+
+    // Empty group -> NULL; single value -> stdev 0.0.
+    assert_eq!(
+        one_value(writer, "MATCH (g:Ghost) RETURN stdev(g.age) AS s").await,
+        RuntimeValue::Null
+    );
+    let snap = writer.snapshot();
+    let plan = lower(
+        &parse("MATCH (p:Person) RETURN p.team AS team, stdev(p.age) AS s ORDER BY team").unwrap(),
+    )
+    .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    // Team a: [30, 40] -> sqrt(50); team b: NULL age skipped, single 30 -> 0.
+    match rows[0].get("s") {
+        Some(RuntimeValue::Float(f)) => assert!((f - 50.0_f64.sqrt()).abs() < 1e-9, "{f}"),
+        other => panic!("team a stdev: {other:?}"),
+    }
+    assert_eq!(rows[1].get("s"), Some(&RuntimeValue::Float(0.0)));
+
+    // Out-of-range percentile and non-numeric input are typed errors.
+    let plan =
+        lower(&parse("MATCH (p:Person) RETURN percentileCont(p.age, 1.5) AS s").unwrap()).unwrap();
+    let error = execute(&plan, &snap, &Params::new()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("percentile must be between"),
+        "{error}"
+    );
+    let plan = lower(&parse("MATCH (p:Person) RETURN stdev(p.team) AS s").unwrap()).unwrap();
+    let error = execute(&plan, &snap, &Params::new()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("requires numeric values"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn statistical_aggregates_on_memtable_and_flushed_routes() {
+    let (mut writer, schema) = corpus("agg-statistical").await;
+    assert_statistical_semantics(&writer).await;
+
+    writer.flush(schema).await.unwrap();
+    assert_statistical_semantics(&writer).await;
+}
+
 #[tokio::test]
 async fn integer_sum_overflow_is_a_typed_error_not_a_wrap() {
     let mut writer = WriterSession::open(store(), paths("agg-overflow"))
