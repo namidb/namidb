@@ -789,6 +789,8 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     let namespace_maintenance = Router::new()
         .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
+        .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
+        .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_auth_multi,
@@ -1019,7 +1021,11 @@ pub async fn run_with_memory_max_bytes(
             config.writer_lock_timeout,
             config.default_namespace.clone(),
         )
-        .with_authz(authz.clone());
+        .with_authz(authz.clone())
+        .with_backup_target(config.backup_target_uri.clone());
+        if shared.backup_target_prefix.is_some() {
+            info!("multi-tenant admin backup endpoint enabled");
+        }
         let app = build_multi_tenant_router(shared.clone());
 
         // TLS on the serving path.
@@ -3607,6 +3613,34 @@ async fn admin_backup(
         )
             .into_response();
     }
+    // Single-flight with a bounded wait: this route sits outside the request
+    // timeout, so unbounded waiters would pin global concurrency slots
+    // (item 40's slot economy).
+    let Ok(Ok(_permit)) = tokio::time::timeout(ADMIN_FLUSH_WAIT, backup.permit.acquire()).await
+    else {
+        return backup_busy_response();
+    };
+    run_backup_copy(backup.store.clone(), backup.paths.clone(), &req).await
+}
+
+fn backup_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "another backup is already running; retry shortly".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// The copy itself plus its error mapping, shared by the single-tenant and
+/// multi-tenant handlers. Gating (role, allowlist, single-flight) is the
+/// caller's job.
+async fn run_backup_copy(
+    src_store: Arc<dyn object_store::ObjectStore>,
+    src_paths: namidb_storage::NamespacePaths,
+    req: &BackupRequest,
+) -> Response {
     let (dst_store, dst_paths) = match namidb_storage::parse_uri(&req.to) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -3619,22 +3653,9 @@ async fn admin_backup(
                 .into_response();
         }
     };
-    // Single-flight with a bounded wait: this route sits outside the request
-    // timeout, so unbounded waiters would pin global concurrency slots
-    // (item 40's slot economy).
-    let Ok(Ok(_permit)) = tokio::time::timeout(ADMIN_FLUSH_WAIT, backup.permit.acquire()).await
-    else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                error: "another backup is already running; retry shortly".into(),
-            }),
-        )
-            .into_response();
-    };
     match namidb_storage::copy_namespace_snapshot(
-        backup.store.clone(),
-        backup.paths.clone(),
+        src_store,
+        src_paths,
         dst_store,
         dst_paths,
         req.version,
@@ -3665,6 +3686,88 @@ async fn admin_backup(
         )
             .into_response(),
     }
+}
+
+/// `/:namespace/v0/admin/backup` — the multi-tenant twin of
+/// [`admin_backup`]: same allowlist boundary, a PROCESS-WIDE single-flight
+/// (one multi-GB copy at a time across all namespaces), and per-namespace
+/// source paths resolved WITHOUT opening the namespace (the copy reads
+/// committed state only, so cold namespaces stay cold). Namespace-scoped
+/// tokens are enforced by `require_auth_multi` before this runs.
+async fn admin_backup_multi(
+    Path(namespace): Path<String>,
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    Json(req): Json<BackupRequest>,
+) -> Response {
+    dispatch_admin_backup_multi(&shared, &namespace, &principal, req).await
+}
+
+async fn admin_backup_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<BackupRequest>,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_backup_multi(&shared, &namespace, &principal, req).await
+}
+
+async fn dispatch_admin_backup_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    principal: &Principal,
+    req: BackupRequest,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin backup is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(prefix) = shared.backup_target_prefix.as_deref() else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "admin backup is disabled: set --backup-target-uri / \
+                        NAMIDB_BACKUP_TARGET_URI to allowlist destinations"
+                    .into(),
+            }),
+        )
+            .into_response();
+    };
+    if !uri_within_prefix(&req.to, prefix) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: format!(
+                    "destination is outside the --backup-target-uri allowlist (`{prefix}`)"
+                ),
+            }),
+        )
+            .into_response();
+    }
+    let (src_store, src_paths) = match shared.registry.backup_source(namespace) {
+        Ok(source) => source,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: format!("namespace `{namespace}`: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Ok(Ok(_permit)) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.backup_permit.acquire()).await
+    else {
+        return backup_busy_response();
+    };
+    run_backup_copy(src_store, src_paths, &req).await
 }
 
 async fn run_admin_flush(state: AppState) -> Response {
@@ -6959,6 +7062,110 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// Item 54 follow-up: the multi-tenant backup endpoint enforces the
+    /// same allowlist boundary, resolves per-namespace source paths, and
+    /// the destination reopens as a self-contained namespace.
+    #[tokio::test]
+    async fn multi_tenant_admin_backup_round_trips_with_allowlist() {
+        let scratch = std::env::temp_dir().join(format!("namidb-mt-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prefix = format!("file://{}", scratch.display());
+
+        let (store, _) = namidb_storage::parse_uri("memory://mt-backup").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry,
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "acme".to_string(),
+        )
+        .with_backup_target(Some(prefix.clone()));
+        let app = build_multi_tenant_router(shared);
+
+        // Seed a committed node in `acme`.
+        let seeded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/acme/v0/cypher")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &serde_json::json!({ "query": "CREATE (:B {k: 'mt'})" }),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeded.status(), StatusCode::OK);
+
+        // Outside the allowlist boundary: 403.
+        let evil = post_admin_json(
+            &app,
+            "/acme/v0/admin/backup",
+            "ignored-open-mode",
+            serde_json::json!({ "to": format!("{prefix}-evil?ns=x") }),
+        )
+        .await;
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+
+        // Inside: live round-trip; the destination reopens with the data.
+        let dest = format!("{prefix}/mt-b1?ns=mtb1");
+        let response = post_admin_json(
+            &app,
+            "/acme/v0/admin/backup",
+            "ignored-open-mode",
+            serde_json::json!({ "to": dest }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(json["objects_copied"].as_u64().unwrap() > 0, "{json}");
+
+        let (dst_store, dst_paths) = namidb_storage::parse_uri(&dest).unwrap();
+        let restored = WriterSession::open(dst_store, dst_paths).await.unwrap();
+        let snap = restored.snapshot();
+        let plan =
+            namidb_query::lower(&namidb_query::parse("MATCH (b:B) RETURN b.k AS k").unwrap())
+                .unwrap();
+        let rows = namidb_query::execute(&plan, &snap, &namidb_query::Params::new())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "backup must carry acme's committed node");
+
+        // An invalid namespace name is a client error, not a panic.
+        let bad = post_admin_json(
+            &app,
+            "/bad%2Fname/v0/admin/backup",
+            "ignored-open-mode",
+            serde_json::json!({ "to": format!("{prefix}/x?ns=x") }),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     /// RFC-034 multi-tenant: the registry spawns one committer per

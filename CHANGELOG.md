@@ -16,6 +16,11 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- The admin backup endpoint now serves multi-tenant deployments:
+  `/:namespace/v0/admin/backup` (and the header-routed unprefixed form)
+  with the same destination allowlist, a process-wide single-flight,
+  namespace-scoped token enforcement, and per-namespace source paths
+  resolved without opening the namespace (cold namespaces stay cold).
 - `namidb run` accepts `;`-separated multi-statement scripts: statements
   split outside strings/backticks/comments, run sequentially against one
   session, and stop at the first error (reported with its position). The

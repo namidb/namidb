@@ -55,6 +55,13 @@ pub struct SharedAppState {
     /// Pre-execution authorization hook (RFC-015 Wave B), shared across all
     /// namespaces. Defaults to allow-all ([`NoOpAuthz`]).
     pub authz: Arc<dyn AuthzHook>,
+    /// Destination-URI allowlist prefix for `/:namespace/v0/admin/backup`.
+    /// `None` disables the endpoint (see `Config::backup_target_uri`).
+    pub backup_target_prefix: Option<String>,
+    /// Process-wide single-flight for admin backups: one multi-GB copy at
+    /// a time regardless of namespace, keeping the global HTTP slot
+    /// economy honest (the admin routes sit outside the request timeout).
+    pub backup_permit: Arc<tokio::sync::Semaphore>,
 }
 
 impl SharedAppState {
@@ -126,6 +133,8 @@ impl SharedAppState {
             writer_lock_timeout,
             default_namespace,
             authz: Arc::new(NoOpAuthz),
+            backup_target_prefix: None,
+            backup_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -133,6 +142,13 @@ impl SharedAppState {
     /// allow-all ([`NoOpAuthz`]).
     pub fn with_authz(mut self, authz: Arc<dyn AuthzHook>) -> Self {
         self.authz = authz;
+        self
+    }
+
+    /// Enable the multi-tenant admin backup endpoint with a destination
+    /// allowlist prefix (builder style). `None` keeps it disabled.
+    pub fn with_backup_target(mut self, prefix: Option<String>) -> Self {
+        self.backup_target_prefix = prefix;
         self
     }
 
