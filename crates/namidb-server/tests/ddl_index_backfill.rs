@@ -27,6 +27,7 @@ async fn boot(store_uri: String) -> String {
         listen: http_addr,
         auth_token: Some(TOKEN.into()),
         auth_tokens_file: None,
+        no_auth: false,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

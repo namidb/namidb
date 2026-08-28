@@ -62,6 +62,7 @@ async fn serves_https_and_bolt_over_tls() {
         store_uri: "memory://tls-it".into(),
         listen: http,
         auth_token: None,
+        no_auth: true,
         auth_tokens_file: None,
         #[cfg(feature = "jwt")]
         jwt: None,

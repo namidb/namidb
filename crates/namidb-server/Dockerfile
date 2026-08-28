@@ -43,13 +43,18 @@ LABEL org.opencontainers.image.title="NamiDB Server" \
     org.opencontainers.image.version="${NAMIDB_VERSION}" \
     org.opencontainers.image.revision="${NAMIDB_REVISION}"
 
+# /var/lib/namidb has no in-image consumer: it is the canonical `file://`
+# store path from the docs, pre-created and owned by uid 65532 so a fresh
+# named volume mounted there inherits that ownership (Docker copy-on-first-use)
+# instead of being created root-owned and crash-looping the non-root server.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home namidb \
     && install -d -o namidb -g namidb -m 0700 /var/tmp/namidb-spool \
-    && install -d -o namidb -g namidb -m 0700 /var/cache/namidb-ranges
+    && install -d -o namidb -g namidb -m 0700 /var/cache/namidb-ranges \
+    && install -d -o namidb -g namidb -m 0700 /var/lib/namidb
 
 COPY --from=builder /build/target/release/namidb-server /usr/local/bin/namidb-server
 COPY --chmod=0555 crates/namidb-server/docker-healthcheck.sh /usr/local/bin/namidb-healthcheck

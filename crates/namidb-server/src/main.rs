@@ -37,10 +37,16 @@ struct Cli {
     listen: std::net::SocketAddr,
 
     /// Bearer token required for `/v0/cypher` and `/v0/admin/*`. Grants
-    /// read-write access. When unset (and no `--auth-tokens-file`), the server
-    /// starts in unauthenticated mode and logs a loud warning.
+    /// read-write access. When unset (and no `--auth-tokens-file` or JWT
+    /// config), the server refuses to start unless `--no-auth` is passed.
     #[arg(long, env = "NAMIDB_AUTH_TOKEN")]
     auth_token: Option<String>,
+
+    /// Explicitly run WITHOUT authentication: every request gets anonymous
+    /// read-write access. Required to boot when no auth source is configured;
+    /// never combine with a port exposed beyond localhost.
+    #[arg(long, env = "NAMIDB_NO_AUTH", default_value_t = false, action)]
+    no_auth: bool,
 
     /// Path to a JSON file of tokens, each with a `read-only` or `read-write`
     /// role, e.g. `{ "tokens": [{ "name": "ci", "token": "…", "role":
@@ -336,6 +342,7 @@ fn main() -> anyhow::Result<()> {
         listen: cli.listen,
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
+        no_auth: cli.no_auth,
         #[cfg(feature = "jwt")]
         jwt: cli
             .jwt_jwks_url

@@ -23,6 +23,12 @@ Container image (official, multi-arch amd64/arm64, from
 docker pull namidb/namidb-server:2
 ```
 
+The image runs as non-root (uid 65532) and pre-creates `/var/lib/namidb`
+(the canonical `file://` store path), so a fresh **named volume** mounted
+there inherits the right ownership and just works. A **bind mount** — or a
+named volume created root-owned by an image older than 2.2.0 — needs a
+one-time `chown -R 65532:65532 <dir>` on the host first.
+
 Or build it yourself from the repo root:
 
 ```bash
@@ -108,16 +114,20 @@ reclaims versions below the live-reader horizon after
 object-count growth observed during the first hours of a bulk load is bounded
 history under the default maintenance settings.
 
-If you don't set `--auth-token`, the server boots in **unauthenticated**
-mode and prints a loud warning. Don't expose that port to the public
-internet.
+If you don't configure any auth source, the server **refuses to start**
+(since 2.2.0). Pass `--no-auth` / `NAMIDB_NO_AUTH=1` to explicitly boot in
+unauthenticated mode for local development — it prints a loud warning, and
+every request gets anonymous read-write access. Don't expose that port to
+the public internet.
 
 ## Security & auth
 
-Auth is **off by default** — set one of the schemes below for any non-local
-deployment. All of them resolve a bearer token to a role (read-only vs
-read-write) and, optionally, a namespace scope, through one path, so HTTP and
-Bolt behave identically.
+A bearer token is **required by default** — configure one of the schemes
+below, or opt out explicitly with `--no-auth`. All of them resolve a bearer
+token to a role (read-only vs read-write) through one path, so HTTP and Bolt
+resolve the same role. Namespace *scoping* is enforced on **HTTP only**:
+Bolt is single-namespace, and a namespace-scoped token presented over Bolt
+reaches the server's one namespace regardless of its scope list.
 
 | Scheme | Flags | Notes |
 |---|---|---|
@@ -309,6 +319,12 @@ Pass `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`) to expose
 a Bolt 4.4 / 5.0 / 5.4 listener alongside the HTTP API. Both protocols
 share the same `WriterSession`, the same auth token, and the same
 single-writer-per-namespace invariant.
+
+Bolt is **single-namespace only** — there is no `X-NamiDB-Namespace`
+equivalent and no `db`-field routing (an RFC-022 non-goal). The listener
+serves the `?ns=` of `--store`, and combining `--bolt-listen` with
+`--multi-tenant` fails at startup; run one single-tenant server per
+namespace to serve tenants over Bolt.
 
 Authenticated Bolt messages are capped at 64 MiB by default. Override the
 exact-byte ceiling with `--bolt-max-message-bytes` or
