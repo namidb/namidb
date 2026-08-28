@@ -2048,6 +2048,36 @@ impl<'mt> Snapshot<'mt> {
         (covered, in_scope.len())
     }
 
+    /// Composite twin of [`Self::property_index_coverage`]: how many
+    /// in-scope node SSTs advertise a servable TupleV1 sidecar for exactly
+    /// this declaration-ordered member list. A declined paged build (empty
+    /// path) counts as NOT covered — the tuple probe declines it toward
+    /// the exact scan.
+    pub fn composite_index_coverage(&self, label: &str, properties: &[String]) -> (usize, usize) {
+        let in_scope: Vec<usize> = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .filter(|i| node_sst_can_contain_label(&self.manifest.manifest, *i, label))
+            .collect();
+        let covered = in_scope
+            .iter()
+            .filter(|i| {
+                self.manifest.manifest.ssts[**i]
+                    .composite_equality_indices
+                    .iter()
+                    .any(|desc| {
+                        desc.properties == properties
+                            && desc.mixed_type_complete
+                            && desc.key_encoding == crate::manifest::CompositeKeyEncoding::TupleV1
+                            && !desc.path.is_empty()
+                    })
+            })
+            .count();
+        (covered, in_scope.len())
+    }
+
     /// Point-lookup a node by a *unique* user property. The first call
     /// per (label, prop) pays a full label scan to populate the
     /// cross-snapshot cache; subsequent calls are `O(1)`. Caller is

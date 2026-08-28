@@ -218,3 +218,87 @@ async fn explain_renders_the_plan_and_its_physical_route_without_executing() {
         "fallback series must render"
     );
 }
+
+/// The `# route:` footer knows the composite tuple route: memtable note
+/// pre-flush, full-coverage index note once the flush materializes the
+/// tuple sidecar — and `EXPLAIN` itself never executes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explain_states_the_tuple_route_for_composite_lookups() {
+    let base = boot().await;
+
+    let (status, body) = cypher(
+        &base,
+        "CREATE INDEX pair IF NOT EXISTS FOR (c:City) ON (c.country, c.zip)",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = cypher(
+        &base,
+        "CREATE (:City {country: 'ec', zip: 170101}), (:City {country: 'pe', zip: 15001})",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Memtable-only: tuple operator + memtable route note.
+    let (status, body) = cypher(
+        &base,
+        "EXPLAIN MATCH (c:City) WHERE c.zip = 170101 AND c.country = 'ec' RETURN c",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("NodeByPropertyTuple"),
+        "covered conjuncts must plan the tuple operator: {body}"
+    );
+    assert!(
+        body.contains("route: City.(country, zip)") && body.contains("memtable"),
+        "memtable tuple route note expected: {body}"
+    );
+
+    // Flush materializes the tuple sidecar: full coverage, index note.
+    let flush = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/flush"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+    let (status, body) = cypher(
+        &base,
+        "EXPLAIN MATCH (c:City) WHERE c.country = 'ec' AND c.zip = 170101 RETURN c",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("route: City.(country, zip)")
+            && body.contains("→ index")
+            && body.contains("tuple lookup"),
+        "covered tuple route note expected after flush: {body}"
+    );
+
+    // And the real query serves through the tuple route.
+    let (status, body) = cypher(
+        &base,
+        "MATCH (c:City) WHERE c.country = 'ec' AND c.zip = 170101 RETURN c.zip AS zip",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("170101"), "{body}");
+    let metrics = reqwest::Client::new()
+        .get(format!("{base}/v0/metrics"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let native = metrics
+        .lines()
+        .find(|l| l.starts_with("namidb_tuple_lookup_route_total{route=\"native\"}"))
+        .expect("tuple native route counter must render");
+    assert!(
+        !native.trim_end().ends_with(" 0"),
+        "a covered tuple lookup must count as native: {native}"
+    );
+}

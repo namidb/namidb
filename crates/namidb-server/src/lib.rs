@@ -1774,81 +1774,17 @@ fn explain_observation(
 }
 
 /// The rendered EXPLAIN lines (plan tree + `# route:` footer), shared by
-/// the HTTP and Bolt surfaces.
+/// the HTTP and Bolt surfaces. The rendering itself lives in
+/// `namidb_query::explain_plan_lines` so the CLI's `run` and the embedded
+/// Python client emit the identical output.
 pub(crate) fn explain_plan_lines(
     parsed: &namidb_query::Query,
     plan: &namidb_query::LogicalPlan,
     owned: &namidb_storage::OwnedSnapshot,
     catalog: &StatsCatalog,
 ) -> Vec<String> {
-    let text = if parsed.explain_raw && parsed.explain_verbose {
-        namidb_query::explain_query_raw_verbose(parsed, catalog)
-            .unwrap_or_else(|e| format!("explain error: {e}"))
-    } else if parsed.explain_raw {
-        namidb_query::explain_query_raw(parsed).unwrap_or_else(|e| format!("explain error: {e}"))
-    } else if parsed.explain_verbose {
-        namidb_query::explain_verbose(plan, catalog)
-    } else {
-        namidb_query::explain(plan)
-    };
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    if !parsed.explain_raw {
-        let snapshot = owned.borrow();
-        collect_route_notes(plan, &snapshot, &mut lines);
-    }
-    lines
-}
-
-/// Append one `# route:` line per index-lookup operator in the plan.
-fn collect_route_notes(
-    plan: &namidb_query::LogicalPlan,
-    snapshot: &namidb_storage::Snapshot<'_>,
-    out: &mut Vec<String>,
-) {
-    if let namidb_query::LogicalPlan::NodeByPropertyValue {
-        label,
-        property,
-        value,
-        multi,
-        ..
-    } = plan
-    {
-        let shown = if label.is_empty() { "*" } else { label };
-        let kind = if *multi { "posting" } else { "unique" };
-        let numeric = matches!(
-            &value.kind,
-            namidb_query::parser::ast::ExpressionKind::Literal(
-                namidb_query::parser::ast::Literal::Integer(_)
-                    | namidb_query::parser::ast::Literal::Float(_)
-            )
-        );
-        let note = if numeric {
-            format!(
-                "# route: {shown}.{property} → scan \
-                 (numeric equality is not posting-indexed; only String/Bool are)"
-            )
-        } else {
-            let (covered, total) = snapshot.property_index_coverage(label, property);
-            if total == 0 {
-                format!("# route: {shown}.{property} → memtable ({kind} lookup; no SSTs in scope)")
-            } else if covered == total {
-                format!(
-                    "# route: {shown}.{property} → index \
-                     ({kind} lookup; posting sidecars {covered}/{total} SSTs)"
-                )
-            } else {
-                format!(
-                    "# route: {shown}.{property} → SCAN FALLBACK \
-                     (posting sidecars {covered}/{total} SSTs; \
-                     a compaction pass materializes the rest)"
-                )
-            }
-        };
-        out.push(note);
-    }
-    for child in plan.children() {
-        collect_route_notes(child, snapshot, out);
-    }
+    let snapshot = owned.borrow();
+    namidb_query::explain_plan_lines(parsed, plan, &snapshot, catalog)
 }
 
 fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Response {

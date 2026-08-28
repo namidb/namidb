@@ -1012,6 +1012,111 @@ fn format_args(name: &str, arg: &crate::parser::Expression, distinct: bool) -> S
     }
 }
 
+/// The complete rendered `EXPLAIN` output — plan tree plus one `# route:`
+/// footer line per index-lookup operator — shared by every surface that
+/// executes against a live snapshot (HTTP, Bolt, the CLI's `run`, and the
+/// embedded Python client). Non-RAW forms render the plan the optimizer
+/// actually produced against the real catalog; the footer then states the
+/// PHYSICAL access path, because posting-sidecar coverage decides
+/// index-vs-scan only at run time.
+pub fn explain_plan_lines(
+    parsed: &Query,
+    plan: &LogicalPlan,
+    snapshot: &namidb_storage::read::Snapshot<'_>,
+    catalog: &StatsCatalog,
+) -> Vec<String> {
+    let text = if parsed.explain_raw && parsed.explain_verbose {
+        explain_query_raw_verbose(parsed, catalog).unwrap_or_else(|e| format!("explain error: {e}"))
+    } else if parsed.explain_raw {
+        explain_query_raw(parsed).unwrap_or_else(|e| format!("explain error: {e}"))
+    } else if parsed.explain_verbose {
+        explain_verbose(plan, catalog)
+    } else {
+        explain(plan)
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if !parsed.explain_raw {
+        collect_route_notes(plan, snapshot, &mut lines);
+    }
+    lines
+}
+
+/// Append one `# route:` line per index-lookup operator in the plan.
+pub fn collect_route_notes(
+    plan: &LogicalPlan,
+    snapshot: &namidb_storage::read::Snapshot<'_>,
+    out: &mut Vec<String>,
+) {
+    use crate::parser::ast::{ExpressionKind, Literal};
+    match plan {
+        LogicalPlan::NodeByPropertyValue {
+            label,
+            property,
+            value,
+            multi,
+            ..
+        } => {
+            let shown = if label.is_empty() { "*" } else { label };
+            let kind = if *multi { "posting" } else { "unique" };
+            let numeric = matches!(
+                &value.kind,
+                ExpressionKind::Literal(Literal::Integer(_) | Literal::Float(_))
+            );
+            let note = if numeric {
+                format!(
+                    "# route: {shown}.{property} → scan \
+                     (numeric equality is not posting-indexed; only String/Bool are)"
+                )
+            } else {
+                let (covered, total) = snapshot.property_index_coverage(label, property);
+                if total == 0 {
+                    format!(
+                        "# route: {shown}.{property} → memtable ({kind} lookup; no SSTs in scope)"
+                    )
+                } else if covered == total {
+                    format!(
+                        "# route: {shown}.{property} → index \
+                         ({kind} lookup; posting sidecars {covered}/{total} SSTs)"
+                    )
+                } else {
+                    format!(
+                        "# route: {shown}.{property} → SCAN FALLBACK \
+                         (posting sidecars {covered}/{total} SSTs; \
+                         a compaction pass materializes the rest)"
+                    )
+                }
+            };
+            out.push(note);
+        }
+        LogicalPlan::NodeByPropertyTuple {
+            label, properties, ..
+        } => {
+            let shown = if label.is_empty() { "*" } else { label };
+            let members = properties.join(", ");
+            let (covered, total) = snapshot.composite_index_coverage(label, properties);
+            let note = if total == 0 {
+                format!("# route: {shown}.({members}) → memtable (tuple lookup; no SSTs in scope)")
+            } else if covered == total {
+                format!(
+                    "# route: {shown}.({members}) → index \
+                     (tuple lookup; posting sidecars {covered}/{total} SSTs)"
+                )
+            } else {
+                format!(
+                    "# route: {shown}.({members}) → SCAN FALLBACK \
+                     (tuple sidecars {covered}/{total} SSTs; \
+                     a compaction pass materializes the rest)"
+                )
+            };
+            out.push(note);
+        }
+        _ => {}
+    }
+    for child in plan.children() {
+        collect_route_notes(child, snapshot, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

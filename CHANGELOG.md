@@ -15,6 +15,16 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- `EXPLAIN` in the CLI's `run` and the embedded Python client rendered
+  nothing and silently EXECUTED the query — an `EXPLAIN CREATE ...`
+  wrote data (the same trap the HTTP surface fixed in 2.1.3). Both now
+  return the identical rendering the server serves: the optimized plan
+  against the real catalog plus the `# route:` physical-access footer.
+  The footer also learned the composite tuple route
+  (`# route: L.(a, b) → index (tuple lookup; ...)`), including the
+  memtable and scan-fallback coverage states.
+
 ## [2.4.0] - 2026-08-28
 
 **Added**
