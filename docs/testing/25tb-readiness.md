@@ -671,7 +671,7 @@ inherit ownership (copy-on-first-use); docs note the one-time `chown -R 65532:65
 for bind mounts and volumes created by older images. docker-compose.yml was never
 affected (S3/MinIO store).
 
-### 54. [PARTIALLY DONE — docs fixed; endpoint deferred with a design note] NDB-12: backup/restore CLI-only.
+### 54. [DONE — docs in 2.2.0; endpoint lands in 2.3.0] NDB-12: backup/restore CLI-only.
 
 "No admin HTTP endpoint" confirmed. But the implied offline-only limitation is wrong
 for backup: `copy_namespace_snapshot` is live-safe by design (durable retention-pin
@@ -683,6 +683,15 @@ a client-supplied destination URI is an SSRF/exfiltration vector using the serve
 ambient cloud credentials, so it needs an operator-configured target allowlist
 (NAMIDB_BACKUP_TARGET_URI prefix) plus the admin-flush single-flight/bounded-wait
 pattern — ~1 day, sized, not rushed into this release.
+
+**2.3.0 addendum:** POST /v0/admin/backup shipped with the design above: disabled
+(403) unless --backup-target-uri / NAMIDB_BACKUP_TARGET_URI allowlists destinations
+(boundary-aware prefix match, so `.../namidb-evil` cannot ride `.../namidb`);
+read-write role gate; single-flight with the 30 s bounded wait; Precondition→409,
+local-persistence→507; live round-trip + force/verify covered by in-lib tests.
+Restore stays CLI-only on purpose (offline destination required; the serving
+process IS the writer). Single-tenant only; multi-tenant needs per-namespace
+handles from the registry — roadmap note, hours.
 
 ### Retractions (RET-01..04) — recorded for the record
 

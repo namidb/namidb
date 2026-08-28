@@ -63,6 +63,7 @@ async fn serves_https_and_bolt_over_tls() {
         listen: http,
         auth_token: None,
         no_auth: true,
+        backup_target_uri: None,
         auth_tokens_file: None,
         #[cfg(feature = "jwt")]
         jwt: None,

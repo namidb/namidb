@@ -13,6 +13,7 @@ fn base_config(ns: &str) -> namidb_server::Config {
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

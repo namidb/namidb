@@ -23,6 +23,7 @@ async fn boot() -> String {
         auth_token: Some(TOKEN.into()),
         auth_tokens_file: None,
         no_auth: false,
+        backup_target_uri: None,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
