@@ -44,18 +44,10 @@ fn base_config(ns: &str) -> namidb_server::Config {
     }
 }
 
-#[tokio::test]
-async fn multi_tenant_with_bolt_listen_refuses_to_boot() {
-    let mut config = base_config("startup-mt-bolt");
-    config.multi_tenant = true;
-    config.bolt_listen = Some("127.0.0.1:0".parse().unwrap());
-    let err = namidb_server::run(config).await.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("--bolt-listen is not supported with --multi-tenant"),
-        "unexpected error: {err}"
-    );
-}
+// `--multi-tenant` + `--bolt-listen` is a SUPPORTED combination since
+// 2.3.0 (statements route by the Bolt `db` field); the 2.2.x fail-fast is
+// gone. The behaviour is covered end-to-end by
+// `bolt_integration::bolt_multi_tenant_routes_by_db_field`.
 
 #[tokio::test]
 async fn missing_auth_refuses_to_boot_without_explicit_no_auth() {

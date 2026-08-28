@@ -125,9 +125,10 @@ the public internet.
 A bearer token is **required by default** — configure one of the schemes
 below, or opt out explicitly with `--no-auth`. All of them resolve a bearer
 token to a role (read-only vs read-write) through one path, so HTTP and Bolt
-resolve the same role. Namespace *scoping* is enforced on **HTTP only**:
-Bolt is single-namespace, and a namespace-scoped token presented over Bolt
-reaches the server's one namespace regardless of its scope list.
+resolve the same role. Namespace *scoping* is enforced on both protocols:
+HTTP checks the routed namespace in its auth middleware, and multi-tenant
+Bolt (since 2.3.0) re-resolves the token against the namespace each
+statement routes to.
 
 | Scheme | Flags | Notes |
 |---|---|---|
@@ -381,11 +382,13 @@ a Bolt 4.4 / 5.0 / 5.4 listener alongside the HTTP API. Both protocols
 share the same `WriterSession`, the same auth token, and the same
 single-writer-per-namespace invariant.
 
-Bolt is **single-namespace only** — there is no `X-NamiDB-Namespace`
-equivalent and no `db`-field routing (an RFC-022 non-goal). The listener
-serves the `?ns=` of `--store`, and combining `--bolt-listen` with
-`--multi-tenant` fails at startup; run one single-tenant server per
-namespace to serve tenants over Bolt.
+In single-tenant mode the listener serves the `?ns=` of `--store`. Under
+`--multi-tenant` (since 2.3.0), statements route to the namespace named by
+the Bolt `db` field — `session(database="acme")` in the official drivers —
+falling back to `--default-namespace` when unset. An explicit transaction
+is pinned to the database named at BEGIN, and a namespace-scoped token is
+rejected (`Neo.ClientError.Security.Forbidden`) outside its scope, exactly
+like the HTTP middleware.
 
 Authenticated Bolt messages are capped at 64 MiB by default. Override the
 exact-byte ceiling with `--bolt-max-message-bytes` or

@@ -446,7 +446,7 @@ curl -s localhost:8080/v0/cypher \
 # {"columns":["n"],"rows":[{"n":42}]}
 ```
 
-Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree. Bolt serves exactly one namespace (the `?ns=` of `--store`): there is no per-request namespace selection over Bolt, and combining `--bolt-listen` with `--multi-tenant` fails at startup — run one single-tenant server per namespace to serve tenants over Bolt. Bolt keeps a fixed 64 KiB pre-authentication ceiling and defaults authenticated messages to 64 MiB. Before growing or decoding a data frame, all connections share a weighted memory budget and the server checks current RSS plus the request's projected working set. Nested PackStream values also have one cumulative decoded-heap/cardinality budget, and result values are converted only as each `PULL` page demands them.
+Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree. In single-tenant mode Bolt serves the `?ns=` of `--store`; under `--multi-tenant` (since 2.3.0) statements route to the namespace named by the driver's `database=` session parameter (the Bolt `db` field), with the same token namespace scoping HTTP enforces. Bolt keeps a fixed 64 KiB pre-authentication ceiling and defaults authenticated messages to 64 MiB. Before growing or decoding a data frame, all connections share a weighted memory budget and the server checks current RSS plus the request's projected working set. Nested PackStream values also have one cumulative decoded-heap/cardinality budget, and result values are converted only as each `PULL` page demands them.
 
 **Auth and authorization.** A bearer token is required by default — the server refuses to boot with no auth source configured; `--no-auth` is the explicit opt-out for local development. JWT and PDP stay optional:
 
@@ -456,7 +456,7 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
   --bolt-listen 0.0.0.0:7687 \
   --auth-token "$NAMIDB_AUTH_TOKEN" \                       # static bearer token
   --jwt-jwks-url "https://issuer/.well-known/jwks.json" \   # OIDC/JWT, group → role
-  --jwt-namespaces-claim tenants \                          # scope a token to namespaces (HTTP; Bolt is single-namespace)
+  --jwt-namespaces-claim tenants \                          # scope a token to namespaces (enforced on HTTP and Bolt)
   --pdp-url "http://opa:8181/v1/data/namidb/allow"          # external policy (OPA), fail-closed
 ```
 
@@ -470,7 +470,7 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 | `--no-auth` (`NAMIDB_NO_AUTH`) | Explicitly run without authentication (anonymous read-write). Without it, a boot with no auth configured fails instead of silently serving open. |
 | `--jwt-*` *(feature `jwt`)* | Validate OIDC JWTs against a JWKS, map a group claim to a role, scope by a namespaces claim. |
 | `--pdp-url` *(feature `pdp`)* | Send each query to an OPA-style policy endpoint; deny unless it allows (fail-closed). |
-| `--multi-tenant` / `--default-namespace` | Serve many namespaces over **HTTP**, routed by path (`/<ns>/v0/cypher`) or the `X-NamiDB-Namespace` header. HTTP-only: Bolt is single-namespace, and `--bolt-listen` with `--multi-tenant` fails at startup. |
+| `--multi-tenant` / `--default-namespace` | Serve many namespaces: HTTP routes by path (`/<ns>/v0/cypher`) or the `X-NamiDB-Namespace` header; Bolt (since 2.3.0) routes by the driver's `database=` session parameter. |
 
 > Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`), `text-index` (`CREATE FULLTEXT INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
 >

@@ -138,12 +138,15 @@ middleware resolves the target namespace **before** authenticating:
   the message `"missing or invalid bearer token, or token not scoped to this
   namespace"`.
 
-**Bolt is single-namespace only.** The Bolt `LOGON` path uses the
-namespace-agnostic `auth.principal_for` (`crates/namidb-server/src/bolt.rs:904`);
-there is no per-request namespace over Bolt. To serve namespace-per-tenant over
-Bolt you run **one server/port per namespace**. Since 2.2.0 the server
-enforces this at boot: `--bolt-listen` together with `--multi-tenant` fails
-startup instead of silently never opening the Bolt port.
+**Bolt routes by the `db` field (since 2.3.0).** In `--multi-tenant` mode the
+Bolt listener serves every namespace: a statement routes to the database named
+by the driver's `session(database="acme")` (the Bolt `db` field of RUN/BEGIN),
+falling back to `--default-namespace`. The token is re-resolved against the
+requested namespace per statement (`principal_for_in`), so namespace-scoped
+tokens are enforced over Bolt exactly like the HTTP middleware; an explicit
+transaction is pinned to the database named at BEGIN. (History: 2.2.x refused
+the flag combination at boot; earlier versions silently never opened the Bolt
+port.)
 
 ## Provisioning a namespace and a scoped token (Implemented)
 
@@ -397,9 +400,9 @@ lazy.
   Omit the key for an unscoped token.
 - **Boot-only static-token load.** A newly minted static token needs a server
   restart; only JWT keys rotate live.
-- **Bolt cannot be namespace-scoped per request.** Namespace-per-tenant over Bolt
-  means one server/port per tenant; `--bolt-listen` with `--multi-tenant` is
-  rejected at startup (2.2.0).
+- **Bolt multidatabase needs driver `database=` support.** Since 2.3.0 Bolt
+  routes per statement by the `db` field; clients that cannot set a session
+  database land on `--default-namespace`.
 - **Capacity and eviction.** In `--multi-tenant` mode, `--max-namespaces`
   (default 100) caps concurrently open namespaces and idle ones are evicted
   oldest-first (`registry.rs:128-165`); `--namespace-idle-timeout` (default 1h)

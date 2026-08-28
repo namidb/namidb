@@ -376,6 +376,43 @@ impl AppState {
         }
     }
 
+    /// Assemble a single-namespace view over a multi-tenant namespace: the
+    /// per-namespace handles come from the registry's
+    /// [`crate::registry::NamespaceState`], the process-wide config from
+    /// [`SharedAppState`]. Cheap (Arc clones); built per Bolt statement so
+    /// eviction/reopen always resolves to the current incarnation.
+    pub(crate) fn for_namespace(
+        shared: &SharedAppState,
+        ns: &Arc<crate::registry::NamespaceState>,
+    ) -> Self {
+        Self {
+            writer: ns.writer.clone(),
+            snapshot: ns.snapshot.clone(),
+            compaction_scheduler: ns.compaction_scheduler.clone(),
+            catalog_cache: ns.catalog_cache.clone(),
+            auth: shared.auth.clone(),
+            namespace: ns.namespace.clone(),
+            query_timeout: shared.query_timeout,
+            write_timeout: shared.write_timeout,
+            query_row_cap: shared.query_row_cap,
+            write_stall_l0: shared.write_stall_l0,
+            write_stall_delay: shared.write_stall_delay,
+            memtable_flush_bytes: shared.memtable_flush_bytes,
+            memtable_stall_bytes: shared.memtable_stall_bytes,
+            memory: shared.memory.clone(),
+            writer_lock_timeout: shared.writer_lock_timeout,
+            flush_notify: ns.flush_notify.clone(),
+            // Per-view gauge: the multi-tenant health path reports memtable
+            // bytes from the writer itself, so the gauge is only a
+            // single-tenant convenience.
+            memtable_bytes_gauge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            metrics: shared.metrics.clone(),
+            authz: shared.authz.clone(),
+            writer_health: ns.writer_health.clone(),
+            backup: None,
+        }
+    }
+
     /// Enable the admin backup endpoint (builder style): the namespace's
     /// object-store handles plus the destination-URI allowlist prefix.
     pub fn with_backup(
@@ -785,16 +822,6 @@ pub async fn run_with_memory_max_bytes(
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
     }
-    // Bolt is single-namespace: the multi-tenant serve path never starts the
-    // listener, so accepting both flags would silently drop the Bolt port.
-    if config.multi_tenant && config.bolt_listen.is_some() {
-        anyhow::bail!(
-            "--bolt-listen is not supported with --multi-tenant: Bolt is \
-             single-namespace (see docs/multi-tenancy.md). Run one \
-             single-tenant server per namespace, or omit --bolt-listen / \
-             NAMIDB_BOLT_LISTEN"
-        );
-    }
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
@@ -942,7 +969,7 @@ pub async fn run_with_memory_max_bytes(
             config.default_namespace.clone(),
         )
         .with_authz(authz.clone());
-        let app = build_multi_tenant_router(shared);
+        let app = build_multi_tenant_router(shared.clone());
 
         // TLS on the serving path.
         let tls_config: Option<Arc<rustls::ServerConfig>> =
@@ -951,6 +978,34 @@ pub async fn run_with_memory_max_bytes(
                 (None, None) => None,
                 _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
             };
+
+        // Multi-tenant Bolt (since 2.3.0): statements route to the namespace
+        // named by the Bolt `db` field (driver `session(database=...)`).
+        // Before this, the flag combination silently never opened the Bolt
+        // port and 2.2.x refused it at boot.
+        if let Some(bolt_addr) = config.bolt_listen {
+            let bolt_shared = shared.clone();
+            let bolt_auth = shared.auth.clone();
+            let tx_timeout = config.bolt_tx_timeout;
+            let bolt_shutdown = shutdown_rx.clone();
+            let bolt_tls = tls_config.clone().map(tls::acceptor);
+            let bolt_max_message_bytes = config.bolt_max_message_bytes;
+            tokio::spawn(async move {
+                if let Err(e) = bolt::serve_multi(
+                    bolt_shared,
+                    bolt_addr,
+                    bolt_auth,
+                    tx_timeout,
+                    bolt_max_message_bytes,
+                    bolt_shutdown,
+                    bolt_tls,
+                )
+                .await
+                {
+                    error!(error = %e, "multi-tenant bolt listener exited");
+                }
+            });
+        }
 
         info!(multi_tenant = true, "starting multi-tenant server");
         return serve_http(app, config, tls_config, shutdown_rx).await;

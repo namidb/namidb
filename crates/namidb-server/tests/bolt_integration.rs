@@ -148,6 +148,151 @@ async fn handshake(stream: &mut TcpStream) {
     assert_eq!(reply, [0, 0, 4, 5], "expected Bolt 5.4 negotiated");
 }
 
+/// Boot a MULTI-TENANT server with a Bolt listener and a tokens file.
+async fn boot_bolt_multi(
+    ns_prefix: &str,
+    tokens_json: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let tokens_path = std::env::temp_dir().join(format!("namidb-bolt-mt-tokens-{ns_prefix}.json"));
+    std::fs::write(&tokens_path, tokens_json).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+    let config = namidb_server::Config {
+        store_uri: format!("memory://{ns_prefix}"),
+        listen: http_addr,
+        auth_token: None,
+        auth_tokens_file: Some(tokens_path),
+        no_auth: false,
+        backup_target_uri: None,
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
+        flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
+        bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::from_secs(30),
+        write_timeout: Duration::from_secs(30),
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
+        memtable_flush_bytes: 0,
+        memtable_stall_bytes: 0,
+        writer_lock_timeout: Duration::from_secs(5),
+        tls_cert: None,
+        tls_key: None,
+        slow_query_threshold: Duration::ZERO,
+        multi_tenant: true,
+        default_namespace: format!("{ns_prefix}-default"),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = namidb_server::run(config).await {
+            eprintln!("server exited: {e}");
+        }
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(bolt_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (bolt_addr, task)
+}
+
+/// NDB-01 follow-up: Bolt in multi-tenant mode routes by the `db` field —
+/// per-namespace isolation, token namespace scoping, and tx pinning.
+#[tokio::test]
+async fn bolt_multi_tenant_routes_by_db_field() {
+    const TOKENS: &str = r#"{ "tokens": [
+        { "name": "root", "token": "rootkey", "role": "read-write" },
+        { "name": "acme", "token": "acmekey", "role": "read-write", "namespaces": ["acme"] }
+    ] }"#;
+    let (bolt_addr, task) = boot_bolt_multi("bolt-mt", TOKENS).await;
+
+    // Unscoped token: write one node into each of two namespaces.
+    let mut root = TcpStream::connect(bolt_addr).await.expect("connect");
+    handshake(&mut root).await;
+    hello_and_logon(&mut root, "rootkey").await;
+    pull_all_on(&mut root, "CREATE (:T {ns: 'acme'})", Some("acme")).await;
+    pull_all_on(&mut root, "CREATE (:T {ns: 'globex'})", Some("globex")).await;
+
+    // Isolation: each namespace sees exactly its own node; the default
+    // namespace (no db) sees none.
+    let (_, rows) = pull_all_on(&mut root, "MATCH (t:T) RETURN t.ns AS ns", Some("acme")).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("ns"), Some(&Value::String("acme".into())));
+    let (_, rows) = pull_all_on(&mut root, "MATCH (t:T) RETURN t.ns AS ns", Some("globex")).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("ns"), Some(&Value::String("globex".into())));
+    let (_, rows) = pull_all(&mut root, "MATCH (t:T) RETURN t.ns AS ns").await;
+    assert_eq!(rows.len(), 0, "default namespace must be empty: {rows:?}");
+
+    // Explicit transaction pinned to its BEGIN db.
+    let mut begin_extra = BTreeMap::new();
+    begin_extra.insert("db".to_string(), Value::String("acme".into()));
+    let begin = Value::Struct {
+        tag: struct_tag::BEGIN,
+        fields: vec![Value::Map(begin_extra)],
+    };
+    send_msg(&mut root, &pack(&begin)).await;
+    assert!(
+        matches!(recv_msg(&mut root).await, Response::Success(_)),
+        "BEGIN with db must succeed"
+    );
+    pull_all(&mut root, "CREATE (:T {ns: 'acme-tx'})").await;
+    let commit = Value::Struct {
+        tag: struct_tag::COMMIT,
+        fields: vec![],
+    };
+    send_msg(&mut root, &pack(&commit)).await;
+    assert!(matches!(recv_msg(&mut root).await, Response::Success(_)));
+    let (_, rows) = pull_all_on(&mut root, "MATCH (t:T) RETURN count(t) AS c", Some("acme")).await;
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(2)), "{rows:?}");
+    root.shutdown().await.ok();
+
+    // Scoped token: reaches its namespace, rejected elsewhere with the
+    // security class (same rule as the HTTP middleware).
+    let mut acme = TcpStream::connect(bolt_addr).await.expect("connect");
+    handshake(&mut acme).await;
+    hello_and_logon(&mut acme, "acmekey").await;
+    let (_, rows) = pull_all_on(&mut acme, "MATCH (t:T) RETURN count(t) AS c", Some("acme")).await;
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(2)));
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("MATCH (t:T) RETURN t".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map({
+                let mut m = BTreeMap::new();
+                m.insert("db".to_string(), Value::String("globex".into()));
+                m
+            }),
+        ],
+    };
+    send_msg(&mut acme, &pack(&run)).await;
+    match recv_msg(&mut acme).await {
+        Response::Failure(meta) => assert_eq!(
+            meta.get("code"),
+            Some(&Value::String("Neo.ClientError.Security.Forbidden".into())),
+            "{meta:?}"
+        ),
+        other => panic!("scoped token must be rejected outside its scope, got {other:?}"),
+    }
+    acme.shutdown().await.ok();
+    task.abort();
+}
+
 /// Handshake offering Bolt 5.7 (the GQLSTATUS boundary).
 async fn handshake_v57(stream: &mut TcpStream) {
     let bytes = [
@@ -882,12 +1027,26 @@ async fn bolt_bad_token_yields_failure() {
 /// of any size (including zero rows), where the per-record `PULL` loop
 /// in `run_pull` would over-send.
 async fn pull_all(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<RowMap>) {
+    pull_all_on(stream, cypher, None).await
+}
+
+/// Like [`pull_all`] but with the Bolt `db` routing field in RUN's extra —
+/// what an official driver sends for `session(database="...")`.
+async fn pull_all_on(
+    stream: &mut TcpStream,
+    cypher: &str,
+    db: Option<&str>,
+) -> (Vec<String>, Vec<RowMap>) {
+    let mut extra = BTreeMap::new();
+    if let Some(db) = db {
+        extra.insert("db".to_string(), Value::String(db.into()));
+    }
     let run = Value::Struct {
         tag: struct_tag::RUN,
         fields: vec![
             Value::String(cypher.into()),
             Value::Map(BTreeMap::new()),
-            Value::Map(BTreeMap::new()),
+            Value::Map(extra),
         ],
     };
     send_msg(stream, &pack(&run)).await;
