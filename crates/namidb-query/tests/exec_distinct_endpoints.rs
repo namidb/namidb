@@ -26,7 +26,9 @@ use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSes
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute, lower, parse, Params, RuntimeValue};
+use namidb_query::{
+    execute, execute_with_limits, lower, optimize, parse, Params, RuntimeValue, StatsCatalog,
+};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -75,7 +77,10 @@ async fn build_graph(writer: &mut WriterSession) {
 
 async fn names(writer: &WriterSession, q: &str, column: &str) -> Vec<String> {
     let snap = writer.snapshot();
-    let plan = lower(&parse(q).unwrap()).unwrap();
+    // Through the OPTIMIZER, exactly as the server executes — the optimized
+    // plan shape is what the BFS eligibility must match (the ORDER BY
+    // sandwich regression was invisible to `lower()`-only tests).
+    let plan = optimize(lower(&parse(q).unwrap()).unwrap(), &StatsCatalog::default());
     let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
     rows.iter()
         .map(|r| match r.get(column) {
@@ -246,4 +251,126 @@ async fn distinct_endpoints_survive_dense_layered_blowup() {
     )
     .await;
     assert_eq!(five.len(), 5);
+
+    // The bare-ORDER-BY lowering ("TopN keys under ProjectDistinct") — the
+    // exact shape that hung the 2.2.0 smoke test because the BFS
+    // eligibility only matched Project-directly-over-Expand. Must complete
+    // AND come back value-sorted (dedup_rows is order-preserving now).
+    let ordered = names(
+        &writer,
+        "MATCH (a:Person {name: 's'})-[:KNOWS*1..6]->(b) \
+         RETURN DISTINCT b.name AS name ORDER BY name",
+        "name",
+    )
+    .await;
+    assert_eq!(ordered.len(), WIDTH * DEPTH + 1);
+    let mut sorted = ordered.clone();
+    sorted.sort();
+    assert_eq!(ordered, sorted, "ORDER BY must survive the DISTINCT");
+}
+
+/// dedup_rows used to sort by fingerprint ("I10;" < "I2;"), so
+/// `RETURN DISTINCT x ORDER BY x` returned fingerprint order — a
+/// correctness bug independent of graphs. Now order-preserving.
+#[tokio::test]
+async fn distinct_order_by_returns_value_order() {
+    let writer = WriterSession::open(store(), paths("dist-order"))
+        .await
+        .unwrap();
+    let snap = writer.snapshot();
+    let plan = optimize(
+        lower(&parse("UNWIND [10, 2, 1, 20, 2] AS x RETURN DISTINCT x AS n ORDER BY n").unwrap())
+            .unwrap(),
+        &StatsCatalog::default(),
+    );
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    let got: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(n)) => *n,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![1, 2, 10, 20]);
+
+    // Descending too.
+    let plan = optimize(
+        lower(
+            &parse("UNWIND [10, 2, 1, 20, 2] AS x RETURN DISTINCT x AS n ORDER BY n DESC").unwrap(),
+        )
+        .unwrap(),
+        &StatsCatalog::default(),
+    );
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    let got: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.get("n") {
+            Some(RuntimeValue::Integer(n)) => *n,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![20, 10, 2, 1]);
+}
+
+/// A shape the BFS must NOT take (the projection reads the seed) over a
+/// dense graph must hit the deadline / row cap INSIDE the traversal —
+/// before these in-loop guards, one seed enumerated millions of walks with
+/// no budget probe and the query hung past its 30 s budget.
+#[tokio::test]
+async fn ineligible_dense_expand_hits_budget_instead_of_hanging() {
+    let mut writer = WriterSession::open(store(), paths("dist-budget"))
+        .await
+        .unwrap();
+    // Complete digraph over 16 nodes: ~3.6M six-hop trails from one seed.
+    let ids: Vec<NodeId> = (0..16).map(|_| NodeId::new()).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("Person", id, &person(&format!("n{i}")))
+            .unwrap();
+    }
+    for &a in &ids {
+        for &b in &ids {
+            if a != b {
+                writer.upsert_edge("KNOWS", a, b, &edge()).unwrap();
+            }
+        }
+    }
+    writer.commit_batch().await.unwrap();
+    let snap = writer.snapshot();
+    let plan = optimize(
+        lower(
+            &parse(
+                "MATCH (a:Person {name: 'n0'})-[:KNOWS*1..6]->(b) \
+                 RETURN DISTINCT a.name AS seed, b.name AS name",
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        &StatsCatalog::default(),
+    );
+
+    // Row cap: must fire mid-seed, typed.
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(10_000))
+        .await
+        .expect_err("the dense expansion must hit the row cap");
+    assert!(
+        err.to_string().contains("row cap"),
+        "expected a row-cap error, got: {err}"
+    );
+
+    // Deadline: 200 ms budget must abort the same expansion promptly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), Some(deadline), None)
+        .await
+        .expect_err("the dense expansion must hit the deadline");
+    assert!(
+        err.to_string().contains("timeout"),
+        "expected a timeout error, got: {err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "deadline abort took {:?} — the in-loop guard is not firing",
+        started.elapsed()
+    );
 }
