@@ -107,6 +107,23 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             req.record_property(alias, property);
             collect_from_expr(value, req);
         }
+        LogicalPlan::NodeByPropertyTuple {
+            input,
+            alias,
+            properties,
+            values,
+            ..
+        } => {
+            collect_from_plan(input, req);
+            // Every member column must survive — the executor re-confirms
+            // the full tuple against the hydrated view.
+            for property in properties {
+                req.record_property(alias, property);
+            }
+            for value in values {
+                collect_from_expr(value, req);
+            }
+        }
         LogicalPlan::Expand {
             input,
             source,
@@ -597,6 +614,19 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             property,
             value,
             multi,
+        },
+        LogicalPlan::NodeByPropertyTuple {
+            input,
+            label,
+            alias,
+            properties,
+            values,
+        } => LogicalPlan::NodeByPropertyTuple {
+            input: Box::new(rewrite(*input, req)),
+            label,
+            alias,
+            properties,
+            values,
         },
         LogicalPlan::Expand {
             input,

@@ -16,6 +16,21 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- Composite indexes: `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label)
+  ON (n.a, n.b, ...)` now builds a real tuple posting index instead of
+  falling back to a scan. Declarations are schema DDL (durable in the
+  manifest, visible in `SHOW INDEXES`, accepted over HTTP, Bolt, and the
+  CLI); flush materializes one paged `tuple -> [node ids]` sidecar per
+  declared index and DDL-triggered compaction backfills pre-existing
+  SSTs. The planner routes `WHERE n.a = ... AND n.b = ...` conjuncts
+  (any order; extras stay as residual filters) through the new
+  `NodeByPropertyTuple` operator, with a unique-property conjunct still
+  taking priority and an exact scan fallback whenever coverage or
+  freshness cannot be proven — results never depend on the sidecar.
+  Numeric members follow Cypher equality (`30 = 30.0` matches through
+  the index). Route observability:
+  `namidb_tuple_lookup_route_total{route="native"|"fallback"}` on
+  `/metrics`.
 - `shortestPath` on a single bound pair now runs a bidirectional
   meet-in-the-middle BFS (exactness kept via the classical stopping
   criterion): the frontier is O(deg^(d/2)) per side instead of

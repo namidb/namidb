@@ -335,7 +335,8 @@ fn plan_has_stats(plan: &LogicalPlan, catalog: &StatsCatalog) -> bool {
         LogicalPlan::NodeById { label, .. } => label
             .as_deref()
             .is_none_or(|l| catalog.label(l).map(|x| x.node_count > 0).unwrap_or(false)),
-        LogicalPlan::NodeByPropertyValue { label, .. } => {
+        LogicalPlan::NodeByPropertyValue { label, .. }
+        | LogicalPlan::NodeByPropertyTuple { label, .. } => {
             if label.is_empty() {
                 catalog.total_nodes() > 0
             } else {
@@ -401,6 +402,27 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 out,
                 "NodeByPropertyValue label={} alias={} {}={}",
                 label, alias, property, value
+            );
+        }
+        LogicalPlan::NodeByPropertyTuple {
+            label,
+            alias,
+            properties,
+            values,
+            ..
+        } => {
+            let label = if label.is_empty() { "*" } else { label };
+            let rendered: Vec<String> = properties
+                .iter()
+                .zip(values)
+                .map(|(p, v)| format!("{p}={v}"))
+                .collect();
+            let _ = write!(
+                out,
+                "NodeByPropertyTuple label={} alias={} ({})",
+                label,
+                alias,
+                rendered.join(", ")
             );
         }
         LogicalPlan::Expand {

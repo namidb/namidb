@@ -35,6 +35,10 @@ pub struct StatsCatalog {
     /// `vector_search` rewrite looks a descriptor up by `(label, property,
     /// metric)` to decide whether a KNN shape can use the index.
     vector_indexes: Vec<VectorIndexDescriptor>,
+    /// Declared composite equality indexes (`schema.indexes`). The
+    /// composite-lookup rewrite matches a scan's equality conjuncts against
+    /// these member lists (declaration order is the tuple key layout).
+    composite_indexes: Vec<namidb_core::schema::IndexDef>,
 }
 
 /// Per-label aggregate stats.
@@ -118,7 +122,16 @@ impl StatsCatalog {
             total_nodes,
             total_edges: 0,
             vector_indexes: Vec::new(),
+            composite_indexes: Vec::new(),
         }
+    }
+
+    /// Declare composite indexes on a hand-built catalog. Unit tests use
+    /// this to exercise the composite-lookup rewrite without a manifest.
+    #[doc(hidden)]
+    pub fn with_composite_indexes(mut self, indexes: Vec<namidb_core::schema::IndexDef>) -> Self {
+        self.composite_indexes = indexes;
+        self
     }
 
     /// Build a catalog from a committed [`Manifest`].
@@ -267,6 +280,7 @@ impl StatsCatalog {
             total_nodes,
             total_edges,
             vector_indexes: m.vector_indexes.clone(),
+            composite_indexes: m.schema.indexes.clone(),
         }
     }
 
@@ -282,6 +296,11 @@ impl StatsCatalog {
         self.vector_indexes
             .iter()
             .find(|d| d.matches(label, property, metric))
+    }
+
+    /// Every declared composite equality index, in declaration order.
+    pub fn composite_indexes(&self) -> &[namidb_core::schema::IndexDef] {
+        &self.composite_indexes
     }
 
     pub fn label(&self, name: &str) -> Option<&LabelStats> {

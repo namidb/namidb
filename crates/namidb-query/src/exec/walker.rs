@@ -432,6 +432,40 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 Ok(out)
             }
 
+            LogicalPlan::NodeByPropertyTuple {
+                input,
+                label,
+                alias,
+                properties,
+                values,
+            } => {
+                let input_rows =
+                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
+                let mut out = Vec::new();
+                for row in input_rows {
+                    let member_values = values
+                        .iter()
+                        .map(|value| evaluate(value, &row, params))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for view in lookup_nodes_by_property_tuple_via_scan(
+                        snapshot,
+                        label,
+                        properties,
+                        &member_values,
+                    )
+                    .await?
+                    {
+                        let mut new_row = row.clone();
+                        new_row.set(
+                            alias.clone(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
+
             LogicalPlan::NodeByPropertyValue {
                 input,
                 label,
@@ -7171,6 +7205,84 @@ fn node_property_equals(
 /// Convert the scalar types whose physical equality is identical to Cypher's
 /// equality into a storage-index probe. Numeric values are excluded because
 /// Cypher intentionally compares integers and floats across physical types.
+/// Resolve a composite tuple lookup: the declared-index posting route when
+/// storage can serve it authoritatively, the exact scan otherwise. Mirrors
+/// [`lookup_nodes_by_property_via_scan`]'s contract — results NEVER depend
+/// on sidecar coverage, only the route taken does.
+pub(crate) async fn lookup_nodes_by_property_tuple_via_scan(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    properties: &[String],
+    values: &[RuntimeValue],
+) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    // `member = NULL` is NULL (never true) under three-valued logic.
+    if values.iter().any(RuntimeValue::is_null) {
+        return Ok(Vec::new());
+    }
+    let core: Option<Vec<namidb_core::Value>> =
+        values.iter().map(tuple_member_core_value).collect();
+    if let Some(core) = core {
+        if let Some(ids) = snapshot
+            .indexed_node_ids_by_property_tuple(label, properties, &core)
+            .await
+            .map_err(ExecError::from)?
+        {
+            if label.is_empty() {
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(view) = snapshot
+                        .lookup_node_by_id(id)
+                        .await
+                        .map_err(ExecError::from)?
+                    {
+                        out.push(view);
+                    }
+                }
+                return Ok(out);
+            }
+            return snapshot
+                .batch_lookup_nodes(label, &ids)
+                .await
+                .map(|views| views.into_iter().flatten().collect())
+                .map_err(ExecError::from);
+        }
+    }
+    // Exact fallback: Cypher equality per member over the scan.
+    let all = if label.is_empty() {
+        snapshot
+            .scan_all_nodes_with_predicates_and_projection(&[], None)
+            .await
+            .map_err(ExecError::from)?
+    } else {
+        snapshot.scan_label(label).await.map_err(ExecError::from)?
+    };
+    Ok(all
+        .into_iter()
+        .filter(|view| {
+            properties
+                .iter()
+                .zip(values)
+                .all(|(property, value)| node_property_equals(view, property, value))
+        })
+        .collect())
+}
+
+/// Scalar runtime value -> storable core value for a tuple member probe.
+/// Unlike [`non_numeric_index_value`], numerics ARE included — TupleV1
+/// canonicalizes them to match Cypher's coercing equality.
+fn tuple_member_core_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
+    match value {
+        RuntimeValue::Bool(value) => Some(namidb_core::Value::Bool(*value)),
+        RuntimeValue::Integer(value) => Some(namidb_core::Value::I64(*value)),
+        RuntimeValue::Float(value) => Some(namidb_core::Value::F64(*value)),
+        RuntimeValue::String(value) => Some(namidb_core::Value::Str(value.clone())),
+        RuntimeValue::Bytes(value) => Some(namidb_core::Value::Bytes(value.clone())),
+        RuntimeValue::Date(value) => Some(namidb_core::Value::Date(*value)),
+        RuntimeValue::DateTime(value) => Some(namidb_core::Value::DateTime(*value)),
+        _ => None,
+    }
+}
+
 fn non_numeric_index_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
     match value {
         RuntimeValue::Bool(value) => Some(namidb_core::Value::Bool(*value)),
@@ -7337,6 +7449,14 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     arena: next_arena,
                     leaves: out_leaves,
                 })
+            }
+
+            // Composite tuple lookup: not factor-ported yet — run the flat
+            // implementation and wrap the result.
+            LogicalPlan::NodeByPropertyTuple { .. } => {
+                let rows =
+                    execute_inner_with_routing(plan, snapshot, params, outer, routing).await?;
+                Ok(FactorRowSet::from_flat(rows))
             }
 
             LogicalPlan::NodeByPropertyValue {
@@ -9397,6 +9517,11 @@ fn collect_plan_references(
         }
         LogicalPlan::NodeByPropertyValue { value, .. } => {
             collect_referenced_variables(value, out);
+        }
+        LogicalPlan::NodeByPropertyTuple { values, .. } => {
+            for value in values {
+                collect_referenced_variables(value, out);
+            }
         }
         LogicalPlan::VectorSearch { query, .. } => {
             collect_referenced_variables(query, out);

@@ -85,6 +85,19 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             value,
             multi,
         },
+        LogicalPlan::NodeByPropertyTuple {
+            input,
+            label,
+            alias,
+            properties,
+            values,
+        } => LogicalPlan::NodeByPropertyTuple {
+            input: Box::new(rewrite(*input, catalog)),
+            label,
+            alias,
+            properties,
+            values,
+        },
         LogicalPlan::Expand {
             input,
             source,

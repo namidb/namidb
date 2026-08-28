@@ -3,6 +3,11 @@
 //!
 //! - `a.<prop> == <literal>` → `NodeByPropertyValue` when `<prop>` is
 //!   declared `unique` in the schema (see `PropertyDef::unique`).
+//! - `a.<m1> == <lit> AND a.<m2> == <lit> [AND ...]` → `NodeByPropertyTuple`
+//!   when the conjuncts cover EVERY member of a declared composite index
+//!   (`Schema::indexes`). Priority: unique single-property first (at most
+//!   one row), then the longest covered composite, then non-unique
+//!   single-property postings.
 //! - `elementId(a) == <expr>` / `id(a) == <expr>` → `NodeById` (a UUID
 //!   point lookup), with or without a label on the scan. This is what
 //!   turns a GUI's `MATCH (n) WHERE elementId(n) = $id` node fetch and
@@ -54,24 +59,45 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             } = input.as_ref()
             {
                 if predicates.is_empty() && projection.is_none() {
-                    if let Some(indexed) =
-                        extract_indexed_conjunct(&predicate, alias, label.as_deref(), catalog, None)
-                    {
-                        let lookup = LogicalPlan::NodeByPropertyValue {
-                            input: Box::new(LogicalPlan::Empty),
-                            label: indexed.label,
-                            alias: alias.clone(),
-                            property: indexed.property,
-                            value: indexed.value,
-                            multi: indexed.multi,
-                        };
-                        return match indexed.residual {
-                            Some(residual) => LogicalPlan::Filter {
-                                input: Box::new(lookup),
-                                predicate: residual,
-                            },
-                            None => lookup,
-                        };
+                    // Lookup priority: a unique single-property conjunct
+                    // (at most one row) beats a declared composite index,
+                    // which beats a non-unique single-property posting (the
+                    // composite consumes MORE conjuncts, so its posting set
+                    // is a subset of any member's).
+                    let single = extract_indexed_conjunct(
+                        &predicate,
+                        alias,
+                        label.as_deref(),
+                        catalog,
+                        None,
+                    );
+                    if let Some(indexed) = &single {
+                        if !indexed.multi {
+                            return finish_single_lookup(single.expect("checked above"), alias);
+                        }
+                    }
+                    if let Some(label) = label.as_deref() {
+                        if let Some(composite) =
+                            extract_composite_conjuncts(&predicate, alias, label, catalog)
+                        {
+                            let lookup = LogicalPlan::NodeByPropertyTuple {
+                                input: Box::new(LogicalPlan::Empty),
+                                label: label.to_owned(),
+                                alias: alias.clone(),
+                                properties: composite.properties,
+                                values: composite.values,
+                            };
+                            return match composite.residual {
+                                Some(residual) => LogicalPlan::Filter {
+                                    input: Box::new(lookup),
+                                    predicate: residual,
+                                },
+                                None => lookup,
+                            };
+                        }
+                    }
+                    if let Some(indexed) = single {
+                        return finish_single_lookup(indexed, alias);
                     }
                 }
             }
@@ -199,6 +225,19 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             property,
             value,
             multi,
+        },
+        LogicalPlan::NodeByPropertyTuple {
+            input,
+            label,
+            alias,
+            properties,
+            values,
+        } => LogicalPlan::NodeByPropertyTuple {
+            input: Box::new(rewrite(*input, catalog)),
+            label,
+            alias,
+            properties,
+            values,
         },
         LogicalPlan::Expand {
             input,
@@ -485,6 +524,139 @@ pub(super) fn extract_indexed_conjunct(
         multi,
         residual,
     })
+}
+
+/// Build the `NodeByPropertyValue` (+ residual filter) for a matched
+/// single-property conjunct — the tail the two priority branches share.
+fn finish_single_lookup(indexed: IndexedConjunct, alias: &str) -> LogicalPlan {
+    let lookup = LogicalPlan::NodeByPropertyValue {
+        input: Box::new(LogicalPlan::Empty),
+        label: indexed.label,
+        alias: alias.to_owned(),
+        property: indexed.property,
+        value: indexed.value,
+        multi: indexed.multi,
+    };
+    match indexed.residual {
+        Some(residual) => LogicalPlan::Filter {
+            input: Box::new(lookup),
+            predicate: residual,
+        },
+        None => lookup,
+    }
+}
+
+/// A matched composite-index lookup: members in DECLARATION order with
+/// their aligned value expressions, plus whatever conjuncts remain.
+struct CompositeConjunct {
+    properties: Vec<String>,
+    values: Vec<Expression>,
+    residual: Option<Expression>,
+}
+
+/// Match the scan's top-level equality conjuncts against the declared
+/// composite indexes. Fires only when EVERY member of a declared index has
+/// an uncorrelated `alias.<member> = <expr>` conjunct; among matches the
+/// longest member list wins (most conjuncts consumed). The matched values
+/// are reordered to declaration order — the tuple key layout — and every
+/// consumed conjunct leaves the residual.
+fn extract_composite_conjuncts(
+    predicate: &Expression,
+    scan_alias: &str,
+    label: &str,
+    catalog: &StatsCatalog,
+) -> Option<CompositeConjunct> {
+    let mut conjuncts = Vec::new();
+    collect_top_level_conjuncts(predicate, &mut conjuncts);
+
+    // First equality conjunct per property; a duplicate (`a=1 AND a=2`)
+    // stays in the residual and keeps filtering.
+    let mut equalities: std::collections::BTreeMap<String, (usize, Expression)> =
+        std::collections::BTreeMap::new();
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let Some((property, value)) = extract_eq_on_prop(conjunct, scan_alias) else {
+            continue;
+        };
+        if !expression_aliases(&value).is_empty() {
+            continue;
+        }
+        equalities.entry(property).or_insert((index, value));
+    }
+    if equalities.len() < 2 {
+        return None;
+    }
+
+    let mut best: Option<&namidb_core::schema::IndexDef> = None;
+    for def in catalog.composite_indexes() {
+        if def.label != label {
+            continue;
+        }
+        if !def
+            .properties
+            .iter()
+            .all(|member| equalities.contains_key(member))
+        {
+            continue;
+        }
+        if best.is_none_or(|b| def.properties.len() > b.properties.len()) {
+            best = Some(def);
+        }
+    }
+    let def = best?;
+
+    let mut used = BTreeSet::new();
+    let mut values = Vec::with_capacity(def.properties.len());
+    for member in &def.properties {
+        let (index, value) = &equalities[member];
+        used.insert(*index);
+        values.push(value.clone());
+    }
+    let mut leaf_index = 0usize;
+    let residual = remove_top_level_conjunct_set(predicate, &used, &mut leaf_index);
+    debug_assert_eq!(
+        leaf_index,
+        conjuncts.len(),
+        "conjunction traversal must assign stable leaf ordinals"
+    );
+    Some(CompositeConjunct {
+        properties: def.properties.clone(),
+        values,
+        residual,
+    })
+}
+
+/// Set-removal twin of [`remove_top_level_conjunct`]: drop every leaf whose
+/// ordinal is in `remove`, preserving the remaining tree shape.
+fn remove_top_level_conjunct_set(
+    expr: &Expression,
+    remove: &BTreeSet<usize>,
+    next_index: &mut usize,
+) -> Option<Expression> {
+    if let ExpressionKind::Binary {
+        op: crate::parser::ast::BinaryOp::And,
+        left,
+        right,
+    } = &expr.kind
+    {
+        let left = remove_top_level_conjunct_set(left, remove, next_index);
+        let right = remove_top_level_conjunct_set(right, remove, next_index);
+        return match (left, right) {
+            (Some(left), Some(right)) => Some(Expression {
+                span: expr.span,
+                kind: ExpressionKind::Binary {
+                    op: crate::parser::ast::BinaryOp::And,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            }),
+            (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        };
+    }
+
+    let index = *next_index;
+    *next_index += 1;
+    (!remove.contains(&index)).then(|| expr.clone())
 }
 
 fn collect_top_level_conjuncts<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
