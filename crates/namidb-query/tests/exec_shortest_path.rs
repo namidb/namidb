@@ -209,6 +209,123 @@ async fn shortest_path_rejects_unbound_endpoint() {
     );
 }
 
+/// RFC-023 trail correctness: `nodes(p)` must carry the ACTUAL intermediate
+/// nodes. The back-reference emission used to fill every hop with the
+/// pre-bound endpoint value, so a 2-hop path returned ["n0", "n2", "n2"].
+#[tokio::test]
+async fn shortest_path_trail_carries_intermediate_nodes() {
+    let mut writer = WriterSession::open(store(), paths("sp-trail"))
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("Person", id, &person(&format!("n{i}")))
+            .unwrap();
+    }
+    for pair in ids.windows(2) {
+        writer
+            .upsert_edge("KNOWS", pair[0], pair[1], &edge())
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+    let q = parse(
+        "MATCH (a:Person {name: 'n0'}), (b:Person {name: 'n2'}) \
+         MATCH p = shortestPath((a)-[:KNOWS*..4]->(b)) \
+         RETURN [n IN nodes(p) | n.name] AS names",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("names") {
+        Some(RuntimeValue::List(items)) => {
+            let names: Vec<&str> = items
+                .iter()
+                .map(|v| match v {
+                    RuntimeValue::String(s) => s.as_str(),
+                    other => panic!("non-string name: {other:?}"),
+                })
+                .collect();
+            assert_eq!(names, ["n0", "n1", "n2"]);
+        }
+        other => panic!("names not a list: {other:?}"),
+    }
+}
+
+/// NDB-09 follow-up: many (src, dst) pairs sharing a source run ONE
+/// multi-target BFS. 40 bound targets over the layered graph — the per-seed
+/// executor redid the whole BFS 40 times; the grouped run answers each pair
+/// exactly once with its shortest length.
+#[tokio::test]
+async fn multi_pair_shortest_paths_answer_every_bound_target() {
+    let mut writer = WriterSession::open(store(), paths("sp-multipair"))
+        .await
+        .unwrap();
+    const WIDTH: usize = 20;
+    let s = NodeId::new();
+    writer.upsert_node("Person", s, &person("s")).unwrap();
+    let l0: Vec<NodeId> = (0..WIDTH).map(|_| NodeId::new()).collect();
+    let l1: Vec<NodeId> = (0..WIDTH).map(|_| NodeId::new()).collect();
+    for (ni, &id) in l0.iter().enumerate() {
+        writer
+            .upsert_node("Person", id, &person(&format!("a{ni}")))
+            .unwrap();
+    }
+    for (ni, &id) in l1.iter().enumerate() {
+        writer
+            .upsert_node("Person", id, &person(&format!("b{ni}")))
+            .unwrap();
+    }
+    for &a in &l0 {
+        writer.upsert_edge("KNOWS", s, a, &edge()).unwrap();
+        for &b in &l1 {
+            writer.upsert_edge("KNOWS", a, b, &edge()).unwrap();
+        }
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    // First mode: one row per (s, b*) pair, each at its shortest length (2).
+    let q = parse(
+        "MATCH (a:Person {name: 's'}) MATCH (b:Person) WHERE b.name STARTS WITH 'b' \
+         MATCH p = shortestPath((a)-[:KNOWS*..5]->(b)) \
+         RETURN b.name AS name, length(p) AS hops",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), WIDTH, "one row per bound target");
+    for row in &rows {
+        assert_eq!(
+            row.get("hops"),
+            Some(&RuntimeValue::Integer(2)),
+            "{:?}",
+            row.get("name")
+        );
+    }
+
+    // All mode: every same-length arrival, per target — WIDTH distinct
+    // 2-hop paths reach each b* (one through each a*).
+    let q = parse(
+        "MATCH (a:Person {name: 's'}) MATCH (b:Person {name: 'b0'}) \
+         MATCH p = allShortestPaths((a)-[:KNOWS*..5]->(b)) \
+         RETURN count(p) AS n",
+    )
+    .unwrap();
+    let rows = execute(&lower(&q).unwrap(), &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&RuntimeValue::Integer(WIDTH as i64)),
+        "allShortestPaths must keep every same-level arrival"
+    );
+}
+
 /// Dense layered graph: s → L1(40) → L2(40) → L3(40) → L4(40) → L5(40) → t,
 /// complete bipartite between consecutive layers. The walk-enumerating
 /// frontier holds 40^k entries at hop k (~102M Row clones by hop 5 — an

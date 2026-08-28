@@ -558,7 +558,7 @@ HTTP request and `AuthPolicy::Open` on Bolt. Fix: boot REFUSES to start with no 
 source unless `--no-auth` / `NAMIDB_NO_AUTH=1` is passed explicitly (check sits at the
 `is_open()` point so JWT-only configs keep booting). Breaking change, release-noted.
 
-### 45. [DONE — lands in 2.2.0] NDB-03: error taxonomy collapse.
+### 45. [DONE — taxonomy in 2.2.0; wire GQLSTATUS in 2.3.0] NDB-03: error taxonomy collapse.
 
 Recon corrected two details: `50N42` is a driver-side polyfill (Bolt ≤5.4 carries no
 GQLSTATUS; the string appears nowhere in the repo), and HTTP already distinguished
@@ -570,6 +570,14 @@ budget re-run fails identically); deterministic search caps moved out of the
 auto-retried TransientError bucket; HTTP bodies now carry `neo4j_code` + `gql_status`
 per family (table in the server README); eval errors are 400 not 500. Bolt ≥5.7
 GQLSTATUS-on-the-wire: roadmap (~2-3 days: negotiate 5.7, extend FAILURE metadata).
+
+**2.3.0 addendum:** Bolt 5.7 negotiated; on >= 5.7 sessions every FAILURE carries
+gql_status/description/diagnostic_record AND neo4j_code — 5.7 renamed the code key,
+and the official Python driver reads only the new name (found live-testing: without
+it the driver fell back to UnknownError). All failures funnel through write_failure,
+so one version check upgraded every site; TELEMETRY (5.5) was already handled.
+Live-validated with the official driver: timeout => TransactionTimedOut + gql 57014
+(previously the 50N42 polyfill), non-retriable.
 
 ### 46. [DONE — BFS in 2.2.0; ORDER BY sandwich + in-loop budgets in 2.2.1] NDB-04: var-length traversal enumerates all paths under DISTINCT+LIMIT.
 
@@ -604,7 +612,7 @@ and factor executors) — before, one seed's deg^hop enumeration ran unbounded p
 30 s budget because both guards only probed at seed boundaries. The
 exec_distinct_endpoints suite now runs every plan through `optimize()`.
 
-### 47. [PARTIALLY DONE — mechanism refuted; two real gaps fixed, one deferred] NDB-09: shortestPath blows the 1M row cap.
+### 47. [DONE — 2.2.0 gaps + 2.3.0 seed-grouping and trail fix] NDB-09: shortestPath blows the 1M row cap.
 
 The claimed mechanism ("expands then trims") is REFUTED on 2.1.4: shortestPath lowers
 onto the Expand with ShortestMode and the executor early-stops (BFS visited pruning
@@ -622,6 +630,16 @@ shortest path" output vs the previous effective hang); (b) unbound endpoints now
 at lowering with the previously-bound rule spelled out. Deferred (sized): seed-grouping
 (one BFS per distinct source serving all its bound targets, 1-2 days) and bidirectional
 meet-in-the-middle for single pairs.
+
+**2.3.0 addendum:** seed-grouping shipped — consecutive seed rows sharing a source
+(the CrossProduct's row-major pairs) run ONE multi-target BFS
+(execute_expand_shortest_grouped): per-target first-reached-level bookkeeping
+preserves First (one row per pair) and All (every same-level arrival) semantics,
+row order preserved, engaged only when uncapped so LIMIT-pushdown prefix semantics
+stay untouched. Implementing it surfaced ANOTHER pre-existing trail bug: nodes(p)
+filled every intermediate hop with the pre-bound endpoint value (a 2-hop path
+returned ["n0","n2","n2"]) — fixed in both the grouped and per-seed paths by looking
+up the node actually reached. Bidirectional meet-in-the-middle stays roadmap.
 
 ### 48. [DONE — lands in 2.2.0] NDB-05: reduce() does not parse.
 
