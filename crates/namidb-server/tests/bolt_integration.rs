@@ -148,6 +148,21 @@ async fn handshake(stream: &mut TcpStream) {
     assert_eq!(reply, [0, 0, 4, 5], "expected Bolt 5.4 negotiated");
 }
 
+/// Handshake offering Bolt 5.7 (the GQLSTATUS boundary).
+async fn handshake_v57(stream: &mut TcpStream) {
+    let bytes = [
+        0x60, 0x60, 0xB0, 0x17, // magic
+        0x00, 0x00, 0x07, 0x05, // 5.7
+        0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0x00, //
+    ];
+    stream.write_all(&bytes).await.expect("handshake send");
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.expect("handshake read");
+    assert_eq!(reply, [0, 0, 7, 5], "expected Bolt 5.7 negotiated");
+}
+
 async fn hello_and_logon(stream: &mut TcpStream, token: &str) {
     // HELLO {} (v5 carries no auth here)
     let hello = Value::Struct {
@@ -1347,6 +1362,66 @@ async fn bolt_row_cap_failure_has_resource_limit_code() {
             assert!(message.contains("row cap"), "message: {message}")
         }
         other => panic!("FAILURE missing message: {other:?}"),
+    }
+
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+/// Bolt >= 5.7: FAILURE carries real GQL fields per family instead of the
+/// driver-side 50N42 polyfill; <= 5.4 keeps the exact two-key shape (the
+/// other tests in this file pin 5.4 and assert that implicitly).
+#[tokio::test]
+async fn bolt_57_failure_carries_gql_status() {
+    let (bolt_addr, task) = boot_bolt_row_cap("bolt-gql", 1).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake_v57(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    for query in [
+        "CREATE (:Person {name: 'Ada'})",
+        "CREATE (:Person {name: 'Bo'})",
+    ] {
+        pull_all(&mut stream, query).await;
+    }
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("MATCH (p:Person) RETURN p.name AS name".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let meta = match recv_msg(&mut stream).await {
+        Response::Failure(meta) => meta,
+        other => panic!("expected FAILURE, got {other:?}"),
+    };
+    // 5.7 renamed the code key; official drivers read `neo4j_code` only.
+    for key in ["neo4j_code", "code"] {
+        assert_eq!(
+            meta.get(key),
+            Some(&Value::String(
+                "Neo.ClientError.Statement.ResourceLimitExceeded".into()
+            )),
+            "{key} missing: {meta:?}"
+        );
+    }
+    assert_eq!(
+        meta.get("gql_status"),
+        Some(&Value::String("54000".into())),
+        "row cap must map to the result-limit GQL family: {meta:?}"
+    );
+    assert!(
+        matches!(meta.get("description"), Some(Value::String(d)) if d.starts_with("error: ")),
+        "description missing: {meta:?}"
+    );
+    match meta.get("diagnostic_record") {
+        Some(Value::Map(diag)) => {
+            assert!(diag.contains_key("OPERATION"), "{diag:?}");
+            assert!(diag.contains_key("CURRENT_SCHEMA"), "{diag:?}");
+        }
+        other => panic!("diagnostic_record missing: {other:?}"),
     }
 
     stream.shutdown().await.ok();

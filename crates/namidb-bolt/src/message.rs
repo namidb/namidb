@@ -287,9 +287,67 @@ impl Response {
         Response::Failure(m)
     }
 
+    /// Bolt >= 5.7: `FAILURE` additionally carries the GQL error fields —
+    /// `gql_status` (per-family, from [`gql_status_for_code`]),
+    /// `description`, and a `diagnostic_record` with the spec's default
+    /// keys. GQL-aware drivers (5.23+) surface these instead of the 50N42
+    /// polyfill they apply to older protocol versions.
+    pub fn failure_with_gql(code: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let mut m = BTreeMap::new();
+        // 5.7 renamed the FAILURE code key to `neo4j_code` — official
+        // drivers on a >= 5.7 session read ONLY that key and fall back to
+        // UnknownError when it is absent (observed with the Python driver).
+        // Keep `code` too: harmless, and raw-protocol consumers that
+        // negotiated 5.7 but read the old key keep working.
+        m.insert("neo4j_code".into(), Value::String(code.into()));
+        m.insert("code".into(), Value::String(code.into()));
+        m.insert("message".into(), Value::String(message.clone()));
+        m.insert(
+            "gql_status".into(),
+            Value::String(gql_status_for_code(code).into()),
+        );
+        m.insert(
+            "description".into(),
+            Value::String(format!("error: {message}")),
+        );
+        let mut diag = BTreeMap::new();
+        diag.insert("OPERATION".into(), Value::String(String::new()));
+        diag.insert("OPERATION_CODE".into(), Value::String("0".into()));
+        diag.insert("CURRENT_SCHEMA".into(), Value::String("/".into()));
+        m.insert("diagnostic_record".into(), Value::Map(diag));
+        Response::Failure(m)
+    }
+
     /// Convenience: build an empty `SUCCESS {}`.
     pub fn success_empty() -> Self {
         Response::Success(BTreeMap::new())
+    }
+}
+
+/// GQLSTATUS for a dotted Neo4j-shaped failure code (Bolt >= 5.7).
+/// Class-accurate GQL/SQLSTATE families, mirroring the HTTP body taxonomy:
+/// 42001 syntax, 42000 semantic, 0A000 not supported, 22000 evaluation,
+/// 23000 constraint, 57014 timeout, 54000 deterministic result limits,
+/// 53000 transient resource pressure, 28000 unauthenticated, 42501
+/// insufficient privilege, 08000 protocol misuse — and 50N42 for anything
+/// unclassified, the same value GQL-aware drivers polyfill on older
+/// protocol versions.
+pub fn gql_status_for_code(code: &str) -> &'static str {
+    match code {
+        "Neo.ClientError.Statement.SyntaxError" => "42001",
+        "Neo.ClientError.Statement.SemanticError" => "42000",
+        "Neo.ClientError.Statement.NotSupported" => "0A000",
+        "Neo.ClientError.Statement.ArgumentError" => "22000",
+        "Neo.ClientError.Schema.ConstraintValidationFailed" => "23000",
+        "Neo.ClientError.Transaction.TransactionTimedOut" => "57014",
+        "Neo.ClientError.Statement.ResourceLimitExceeded" => "54000",
+        "Neo.TransientError.General.DatabaseUnavailable"
+        | "Neo.TransientError.Transaction.LockClientStopped" => "53000",
+        "Neo.ClientError.Security.Unauthorized" => "28000",
+        "Neo.ClientError.Security.Forbidden" => "42501",
+        "Neo.ClientError.Request.Invalid" => "08000",
+        _ => "50N42",
     }
 }
 

@@ -1671,7 +1671,16 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
     }
 
     async fn write_failure(&mut self, code: &str, message: impl Into<String>) -> Result<()> {
-        self.write_response(Response::failure(code, message)).await
+        // Every FAILURE funnels through here, so the negotiated-version
+        // check upgrades all of them at once: >= 5.7 carries the GQL error
+        // fields, older protocols keep the exact two-key shape.
+        let supports_gql = self.version.is_some_and(|v| (v.major, v.minor) >= (5, 7));
+        let resp = if supports_gql {
+            Response::failure_with_gql(code, message)
+        } else {
+            Response::failure(code, message)
+        };
+        self.write_response(resp).await
     }
 
     async fn write_response(&mut self, resp: Response) -> Result<()> {
