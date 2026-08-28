@@ -15,6 +15,30 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Added**
+- `POST /v0/admin/backup`: copy a live, point-in-time snapshot of the
+  namespace to an operator-allowlisted destination (retention-pin lease;
+  no writer pause). Disabled unless `--backup-target-uri` /
+  `NAMIDB_BACKUP_TARGET_URI` allowlists destinations — the server's
+  ambient cloud credentials write wherever the request says, so the
+  allowlist is the security boundary. Restore stays CLI-only (offline
+  destination required). Single-tenant only.
+- GQLSTATUS on the Bolt wire: protocol 5.7 is negotiated, and FAILURE
+  metadata carries `gql_status` (per-family, mirroring the HTTP
+  taxonomy), `description`, `diagnostic_record`, and `neo4j_code`.
+  GQL-aware drivers now show e.g. `57014` for a timeout instead of the
+  `50N42` polyfill. Older protocol versions keep the exact legacy
+  FAILURE shape.
+- `shortestPath` seed grouping: consecutive seed rows sharing a source
+  (the all-pairs `MATCH (a), (b)` shape) run one multi-target BFS
+  instead of one identical BFS per row.
+
+**Fixed**
+- `nodes(p)` on a `shortestPath` binding returned the endpoint value at
+  every intermediate hop (a 2-hop path came back as
+  `["n0", "n2", "n2"]`). The trail now carries the node actually
+  reached at each hop.
+
 ## [2.2.1] - 2026-08-28
 
 Found smoke-testing the released 2.2.0 artifacts against a dense graph.

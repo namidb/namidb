@@ -1436,6 +1436,32 @@ pub(crate) async fn execute_expand(
     // globally-deduped stream is a prefix of the uncapped DISTINCT result.
     let mut emitted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
+    // Seed-grouped shortest path (NDB-09 follow-up): consecutive seed rows
+    // sharing a source (the CrossProduct's row-major (a, b) pairs) run ONE
+    // multi-target BFS instead of one identical BFS per row — a 24k-pair
+    // workload previously redid the whole-graph BFS 24k times. Lowering
+    // guarantees back_reference for shortest mode; the uncapped requirement
+    // keeps the LIMIT-pushdown prefix semantics untouched.
+    if shortest != crate::plan::ShortestMode::None && back_reference && cap.is_none() {
+        return execute_expand_shortest_grouped(
+            rows,
+            source,
+            &edge_types,
+            direction,
+            rel_alias,
+            target_alias,
+            target_labels,
+            min,
+            max,
+            optional,
+            shortest,
+            path_binding,
+            snapshot,
+            edge_read_mode,
+        )
+        .await;
+    }
+
     let mut out = Vec::new();
     for row in rows {
         // Deadline + row-cap guards: a multi-seed (or variable-length)
@@ -1782,11 +1808,22 @@ pub(crate) async fn execute_expand(
                         if let Some(view) = target_view_opt.as_ref() {
                             Some(NodeValue::from(view.clone()))
                         } else if back_reference {
-                            // Back-reference uses the pre-bound NodeView from
-                            // the existing target_alias on the seed row.
-                            match row.get(target_alias) {
-                                Some(RuntimeValue::Node(n)) => Some(n.as_ref().clone()),
-                                _ => None,
+                            if materialise_trail && Some(target_id) != existing_target_id {
+                                // The trail must carry the node actually
+                                // reached at THIS hop. The pre-bound value is
+                                // only correct at the final target; reusing
+                                // it for intermediates made `nodes(p)` repeat
+                                // the endpoint (["n0", "n2", "n2"]).
+                                scan_node_for_id(snapshot, target_id)
+                                    .await?
+                                    .map(NodeValue::from)
+                            } else {
+                                // Back-reference uses the pre-bound NodeView
+                                // from the existing target_alias on the row.
+                                match row.get(target_alias) {
+                                    Some(RuntimeValue::Node(n)) => Some(n.as_ref().clone()),
+                                    _ => None,
+                                }
                             }
                         } else if skip_target_materialize {
                             Some(NodeValue {
@@ -1916,6 +1953,264 @@ pub(crate) async fn execute_expand(
             }
             out.push(empty);
         }
+    }
+    Ok(out)
+}
+
+/// Seed-grouped shortestPath/allShortestPaths execution: one pruned
+/// multi-target BFS per run of consecutive seed rows sharing a source node,
+/// serving every bound target of the run. Row order (and therefore output
+/// order) is preserved — hits are emitted per seed row in input order.
+///
+/// Semantics mirror the per-seed loop in [`execute_expand`]: `First` emits
+/// one row per (src, dst) at dst's first-reached level; `All` emits every
+/// arrival at dst's first-reached level; trail (`p`) and rel-list bindings
+/// are materialised per hit, with the trail carrying the ACTUAL node
+/// reached at each hop.
+#[allow(clippy::too_many_arguments)]
+async fn execute_expand_shortest_grouped(
+    rows: Vec<Row>,
+    source: &str,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    rel_alias: Option<&str>,
+    target_alias: &str,
+    target_labels: &[String],
+    min: u32,
+    max: u32,
+    optional: bool,
+    shortest: crate::plan::ShortestMode,
+    path_binding: Option<&str>,
+    snapshot: &Snapshot<'_>,
+    edge_read_mode: EdgeReadMode,
+) -> Result<Vec<Row>, ExecError> {
+    namidb_core::profile_scope!("walker::execute_expand_shortest_grouped");
+    use std::collections::{HashMap, HashSet};
+    let materialise_trail = path_binding.is_some();
+    // One emitted path per hit: its trail and its relationship list.
+    type PathHit = (Vec<RuntimeValue>, Vec<RuntimeValue>);
+    let mut out: Vec<Row> = Vec::new();
+    let mut i = 0usize;
+    while i < rows.len() {
+        crate::exec::limits::check_deadline()?;
+        crate::exec::limits::check_row_cap(out.len())?;
+        let starting = match rows[i].get(source) {
+            Some(RuntimeValue::Node(n)) => n.id,
+            _ => {
+                return Err(ExecError::Runtime(format!(
+                    "Expand source `{}` is not a Node",
+                    source
+                )))
+            }
+        };
+        let mut j = i + 1;
+        while j < rows.len() {
+            match rows[j].get(source) {
+                Some(RuntimeValue::Node(n)) if n.id == starting => j += 1,
+                _ => break,
+            }
+        }
+        let run = &rows[i..j];
+
+        // Per-row bound target, mirroring the ungrouped back-reference
+        // handling (NULL target = no match; label mismatch = no match).
+        let mut row_targets: Vec<Option<NodeId>> = Vec::with_capacity(run.len());
+        let mut remaining: HashSet<NodeId> = HashSet::new();
+        for row in run {
+            match row.get(target_alias) {
+                Some(RuntimeValue::Node(n)) => {
+                    if target_labels.iter().all(|l| n.labels.contains(l)) {
+                        remaining.insert(n.id);
+                        row_targets.push(Some(n.id));
+                    } else {
+                        row_targets.push(None);
+                    }
+                }
+                Some(RuntimeValue::Null) => row_targets.push(None),
+                other => {
+                    return Err(ExecError::Runtime(format!(
+                        "Expand back-reference target `{}` is not a Node (got {:?})",
+                        target_alias, other
+                    )))
+                }
+            }
+        }
+
+        // Hits per target: (trail, rel_values) per emitted path.
+        let mut hits: HashMap<NodeId, Vec<PathHit>> = HashMap::new();
+        let initial_trail = if materialise_trail {
+            match run[0].get(source) {
+                Some(RuntimeValue::Node(n)) => vec![RuntimeValue::Node(n.clone())],
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        // Zero hop: the source is its own (label-checked, since `remaining`
+        // only holds label-ok targets) endpoint. Its shortest length is 0,
+        // so it takes no longer hit.
+        if min == 0 && remaining.remove(&starting) {
+            hits.entry(starting)
+                .or_default()
+                .push((initial_trail.clone(), Vec::new()));
+        }
+
+        struct PathState {
+            tail: NodeId,
+            trail: Vec<RuntimeValue>,
+            rels: Vec<(String, NodeId, NodeId)>,
+            rel_values: Vec<RuntimeValue>,
+        }
+        let bfs_prune = min <= 1;
+        let hop_keyed_prune = shortest == crate::plan::ShortestMode::First && min >= 2;
+        let mut visited: HashSet<NodeId> = if bfs_prune {
+            HashSet::from([starting])
+        } else {
+            HashSet::new()
+        };
+        let mut visited_at_hop: HashSet<(NodeId, u32)> = HashSet::new();
+        let bind_rels = rel_alias.is_some();
+        let mut frontier: Vec<PathState> = vec![PathState {
+            tail: starting,
+            trail: initial_trail,
+            rels: Vec::new(),
+            rel_values: Vec::new(),
+        }];
+        for hop in 1..=max {
+            if remaining.is_empty() || frontier.is_empty() {
+                break;
+            }
+            crate::exec::limits::check_deadline()?;
+            crate::exec::limits::check_row_cap(out.len() + frontier.len())?;
+            let mut guard_tick: u32 = 0;
+            let mut next_frontier: Vec<PathState> = Vec::new();
+            let mut level_seen: HashSet<NodeId> = HashSet::new();
+            let mut level_hit: HashSet<NodeId> = HashSet::new();
+            let mut step_neighbours: Vec<(PathState, Vec<EdgeView>)> =
+                Vec::with_capacity(frontier.len());
+            for state in frontier.drain(..) {
+                crate::exec::limits::check_deadline()?;
+                let neighbours =
+                    neighbours_of_any(snapshot, edge_types, direction, state.tail, edge_read_mode)
+                        .await?;
+                step_neighbours.push((state, neighbours));
+            }
+            for (state, neighbours) in step_neighbours {
+                for edge in neighbours {
+                    guard_tick = guard_tick.wrapping_add(1);
+                    if guard_tick % 4096 == 0 {
+                        crate::exec::limits::check_deadline()?;
+                        crate::exec::limits::check_row_cap(out.len() + next_frontier.len())?;
+                    }
+                    let target_id = partner_id(&edge, direction, state.tail);
+                    // Trail semantics first, then the frontier dedups (same
+                    // ordering rationale as the per-seed loop).
+                    let edge_key = if max > 1 {
+                        Some((edge.edge_type.clone(), edge.src, edge.dst))
+                    } else {
+                        None
+                    };
+                    if let Some(k) = &edge_key {
+                        if state.rels.contains(k) {
+                            continue;
+                        }
+                    }
+                    if bfs_prune {
+                        if visited.contains(&target_id) {
+                            continue;
+                        }
+                        if shortest == crate::plan::ShortestMode::First
+                            && !level_seen.insert(target_id)
+                        {
+                            continue;
+                        }
+                    }
+                    if hop_keyed_prune && !visited_at_hop.insert((target_id, hop)) {
+                        continue;
+                    }
+                    let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge)));
+                    let mut new_trail = state.trail.clone();
+                    if materialise_trail {
+                        new_trail.push(rel_value.clone());
+                        // The ACTUAL node reached at this hop (a pre-bound
+                        // endpoint value is only correct at the endpoint).
+                        match scan_node_for_id(snapshot, target_id).await? {
+                            Some(v) => {
+                                new_trail.push(RuntimeValue::Node(Box::new(NodeValue::from(v))))
+                            }
+                            None => new_trail.push(RuntimeValue::Null),
+                        }
+                    }
+                    let mut new_rel_values = state.rel_values.clone();
+                    if bind_rels {
+                        new_rel_values.push(rel_value);
+                    }
+                    let mut new_rels = state.rels.clone();
+                    if let Some(k) = edge_key {
+                        new_rels.push(k);
+                    }
+                    if hop >= min.max(1) && remaining.contains(&target_id) {
+                        hits.entry(target_id)
+                            .or_default()
+                            .push((new_trail.clone(), new_rel_values.clone()));
+                        level_hit.insert(target_id);
+                        if shortest == crate::plan::ShortestMode::First {
+                            // One path per (src, dst); later arrivals (even
+                            // same-level) are surplus.
+                            remaining.remove(&target_id);
+                        }
+                    }
+                    next_frontier.push(PathState {
+                        tail: target_id,
+                        trail: new_trail,
+                        rels: new_rels,
+                        rel_values: new_rel_values,
+                    });
+                }
+            }
+            if shortest == crate::plan::ShortestMode::All {
+                // Seal this level's finds: every arrival at the target's
+                // first-reached level was emitted; longer paths are not
+                // shortest.
+                for t in level_hit {
+                    remaining.remove(&t);
+                }
+            }
+            if bfs_prune {
+                for state in &next_frontier {
+                    visited.insert(state.tail);
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        // Emit per seed row in input order.
+        for (row, target) in run.iter().zip(row_targets) {
+            let row_hits = target.and_then(|t| hits.get(&t));
+            match row_hits {
+                Some(list) if !list.is_empty() => {
+                    for (trail, rel_values) in list {
+                        let mut hit = row.clone();
+                        if let Some(name) = rel_alias {
+                            hit.set(name.to_string(), RuntimeValue::List(rel_values.clone()));
+                        }
+                        if let Some(name) = path_binding {
+                            hit.set(name.to_string(), RuntimeValue::Path(trail.clone()));
+                        }
+                        out.push(hit);
+                    }
+                }
+                _ if optional => {
+                    let mut empty = row.clone();
+                    if let Some(name) = rel_alias {
+                        empty.set(name, RuntimeValue::Null);
+                    }
+                    out.push(empty);
+                }
+                _ => {}
+            }
+        }
+        i = j;
     }
     Ok(out)
 }
