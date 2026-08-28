@@ -686,7 +686,7 @@ impl ServerBackend {
                 .await;
         }
         if let Some(c) = parsed.as_create_index() {
-            let properties = [c.property.name.clone()];
+            let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
             return self
                 .run_create_property_ddl(
                     c.name.as_ref().map(|n| n.name.as_str()),

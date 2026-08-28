@@ -451,14 +451,17 @@ pub struct CreateConstraintClause {
     pub span: SourceSpan,
 }
 
-/// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.prop)` (and the
-/// legacy `ON :Label(prop)` form). A standalone schema command executed
-/// out-of-band by the server (see [`Query::as_create_index`]).
+/// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a[, n.b, …])`
+/// (and the legacy `ON :Label(a[, b, …])` form). A standalone schema
+/// command executed out-of-band by the server (see
+/// [`Query::as_create_index`]). One property = the classic equality index;
+/// two or more = a composite (tuple) index in declaration order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateIndexClause {
     pub name: Option<Identifier>,
     pub label: Identifier,
-    pub property: Identifier,
+    /// Properties in declaration order. Length >= 1.
+    pub properties: Vec<Identifier>,
     pub if_not_exists: bool,
     pub span: SourceSpan,
 }

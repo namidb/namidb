@@ -849,15 +849,19 @@ async fn run_cypher_inner(
         return Ok(empty_query_result());
     }
     if let Some(c) = parsed.as_create_index() {
-        guard
-            .create_property_index_named(
-                c.name.as_ref().map(|n| n.name.as_str()),
-                &c.label.name,
-                &c.property.name,
-                c.if_not_exists,
-            )
-            .await
-            .map_err(map_storage_err)?;
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
+        let name = c.name.as_ref().map(|n| n.name.as_str());
+        if properties.len() > 1 {
+            guard
+                .create_composite_index_named(name, &c.label.name, &properties, c.if_not_exists)
+                .await
+                .map_err(map_storage_err)?;
+        } else {
+            guard
+                .create_property_index_named(name, &c.label.name, &properties[0], c.if_not_exists)
+                .await
+                .map_err(map_storage_err)?;
+        }
         return Ok(empty_query_result());
     }
     if let Some(c) = parsed.as_show_schema() {

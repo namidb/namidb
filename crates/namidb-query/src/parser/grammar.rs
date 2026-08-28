@@ -886,27 +886,35 @@ impl<'src> Parser<'src> {
         self.expect_soft_keyword("INDEX")?;
         let name = self.parse_optional_ddl_name();
         let if_not_exists = self.parse_if_not_exists()?;
-        let (label, property, end);
+        let (label, properties, end);
         if self.eat(&Token::On).is_some() {
-            // Legacy: ON :Label(prop)
+            // Legacy: ON :Label(a[, b, …])
             self.expect(&Token::Colon)?;
             label = self.expect_identifier()?;
             self.expect(&Token::LParen)?;
-            property = self.expect_identifier()?;
+            let mut props = vec![self.expect_identifier()?];
+            while self.eat(&Token::Comma).is_some() {
+                props.push(self.expect_identifier()?);
+            }
+            properties = props;
             end = self.expect_in(&Token::RParen, "index target")?.span.end;
         } else {
-            // Modern: FOR (n:Label) ON (n.prop)
+            // Modern: FOR (n:Label) ON (n.a[, n.b, …])
             self.expect_soft_keyword("FOR")?;
             label = self.parse_ddl_node_target()?;
             self.expect_in(&Token::On, "index requires `ON (n.prop)`")?;
             self.expect(&Token::LParen)?;
-            property = self.parse_ddl_property_ref()?;
+            let mut props = vec![self.parse_ddl_property_ref()?];
+            while self.eat(&Token::Comma).is_some() {
+                props.push(self.parse_ddl_property_ref()?);
+            }
+            properties = props;
             end = self.expect_in(&Token::RParen, "index target")?.span.end;
         }
         Ok(CreateIndexClause {
             name,
             label,
-            property,
+            properties,
             if_not_exists,
             span: SourceSpan::new(start, end),
         })
@@ -2725,6 +2733,38 @@ mod tests {
         }
     }
 
+    /// Composite `CREATE INDEX ... ON (n.a, n.b)` parses in both forms and
+    /// round-trips through Display; the single-property form is unchanged.
+    #[test]
+    fn create_index_accepts_property_lists() {
+        let q = ok("CREATE INDEX pair IF NOT EXISTS FOR (p:Person) ON (p.city, p.age)");
+        let ix = q.as_create_index().expect("create index");
+        assert_eq!(ix.name.as_ref().unwrap().name, "pair");
+        assert_eq!(
+            ix.properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["city", "age"],
+            "declaration order must be preserved"
+        );
+        let rendered = format!("{}", q.head.clauses[0]);
+        assert!(
+            rendered.contains("ON (n.city, n.age)"),
+            "display: {rendered}"
+        );
+        ok(&rendered);
+
+        // Legacy form with a list.
+        let q = ok("CREATE INDEX ON :Person(city, age)");
+        let ix = q.as_create_index().unwrap();
+        assert_eq!(ix.properties.len(), 2);
+
+        // Single property: exactly as before.
+        let q = ok("CREATE INDEX FOR (p:Person) ON (p.city)");
+        assert_eq!(q.as_create_index().unwrap().properties.len(), 1);
+    }
+
     /// NDB-05: `reduce(acc = init, x IN list | expr)` parses; `reduce` stays
     /// a soft keyword (a plain call or a variable named `reduce` is intact).
     #[test]
@@ -3631,7 +3671,7 @@ mod tests {
             _ => panic!(),
         };
         assert!(c.if_not_exists);
-        assert_eq!(c.property.name, "email");
+        assert_eq!(c.properties[0].name, "email");
     }
 
     #[test]

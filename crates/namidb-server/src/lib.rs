@@ -2938,6 +2938,25 @@ async fn apply_create_index(
     Ok(version)
 }
 
+/// Apply a composite `CREATE INDEX ... ON (n.a, n.b, ...)` (length >= 2)
+/// and republish the snapshot. Records a named `IndexDef` in the schema;
+/// the DDL-triggered compaction then materializes the tuple posting
+/// sidecars on existing SSTs.
+async fn apply_create_composite_index(
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    name: Option<&str>,
+    label: &str,
+    properties: &[String],
+    if_not_exists: bool,
+) -> Result<u64, namidb_storage::Error> {
+    let version = writer
+        .create_composite_index_named(name, label, properties, if_not_exists)
+        .await?;
+    snapshot.store(writer.owned_snapshot());
+    Ok(version)
+}
+
 /// HTTP shape for `CREATE CONSTRAINT`/`CREATE INDEX`: gate on role + authz, run
 /// the schema DDL, return an empty `CypherResponse`. Mirrors the vector/fulltext
 /// DDL handlers. These are always-on (no Cargo feature).
@@ -2976,6 +2995,9 @@ async fn run_create_property_ddl(
     let op = if unique {
         authz::SchemaOp::CreateConstraint { label, properties }
     } else {
+        // A composite index reports its first member to the policy hook;
+        // the SchemaOp shape predates composites and widening it is a
+        // policy-API change to take deliberately.
         authz::SchemaOp::CreateIndex {
             label,
             property: &properties[0],
@@ -3010,6 +3032,8 @@ async fn run_create_property_ddl(
     }
     let result = if unique {
         apply_create_constraint(&mut w, snapshot, name, label, properties, if_not_exists).await
+    } else if properties.len() > 1 {
+        apply_create_composite_index(&mut w, snapshot, name, label, properties, if_not_exists).await
     } else {
         apply_create_index(&mut w, snapshot, name, label, &properties[0], if_not_exists).await
     };
@@ -3219,7 +3243,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         .await;
     }
     if let Some(c) = parsed.as_create_index() {
-        let properties = [c.property.name.clone()];
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
         return run_create_property_ddl(
             &state.writer,
             &state.snapshot,
@@ -4101,7 +4125,7 @@ async fn run_cypher_multi(
         .await;
     }
     if let Some(c) = parsed.as_create_index() {
-        let properties = [c.property.name.clone()];
+        let properties: Vec<String> = c.properties.iter().map(|p| p.name.clone()).collect();
         return run_create_property_ddl(
             &ns_state.writer,
             &ns_state.snapshot,
