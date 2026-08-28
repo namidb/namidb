@@ -498,7 +498,14 @@ impl StatementType {
 
 /// Errors a backend can surface. The session translates them to
 /// dotted Neo4j error codes via [`backend_error_code`].
+///
+/// Retry semantics are encoded in the code's second segment, which official
+/// Neo4j drivers classify on: `Neo.TransientError.*` is auto-retried,
+/// `Neo.ClientError.*` is not. Deterministic limits (timeout, row cap) are
+/// therefore ClientError on purpose — a driver auto-retrying a query that
+/// will exceed the same budget again is a retry livelock.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BackendError {
     /// Parser rejected the input.
     Syntax(String),
@@ -515,6 +522,12 @@ pub enum BackendError {
     /// The authenticated principal is not allowed to run this statement (e.g.
     /// a read-only token attempting a write).
     Forbidden(String),
+    /// The query ran past its configured wall-clock budget. A re-run would
+    /// time out again, so this is deliberately NOT a transient error.
+    Timeout(String),
+    /// The query exceeded a configured deterministic result limit (row cap,
+    /// search result caps). Also deliberately not transient.
+    ResourceLimit(String),
     /// Anything else.
     Other(String),
 }
@@ -529,6 +542,8 @@ impl BackendError {
             BackendError::Storage(_) => "Neo.TransientError.General.DatabaseUnavailable",
             BackendError::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
             BackendError::Forbidden(_) => "Neo.ClientError.Security.Forbidden",
+            BackendError::Timeout(_) => "Neo.ClientError.Transaction.TransactionTimedOut",
+            BackendError::ResourceLimit(_) => "Neo.ClientError.Statement.ResourceLimitExceeded",
             BackendError::Other(_) => "Neo.DatabaseError.General.UnknownError",
         }
     }
@@ -542,6 +557,8 @@ impl BackendError {
             | BackendError::Storage(s)
             | BackendError::Constraint(s)
             | BackendError::Forbidden(s)
+            | BackendError::Timeout(s)
+            | BackendError::ResourceLimit(s)
             | BackendError::Other(s) => s,
         }
     }

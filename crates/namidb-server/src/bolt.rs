@@ -1514,16 +1514,30 @@ fn map_exec_err(e: ExecError) -> BackendError {
         // A constraint violation has its own Neo4j error class so drivers
         // can distinguish it from an ordinary evaluation error.
         ExecError::Constraint(m) => BackendError::Constraint(m),
-        // The rest are opaque from outside the crate; format and bucket as
-        // either an eval or a storage error on a best-effort substring match.
-        other => {
-            let text = format!("{other}");
-            if text.contains("storage") || text.contains("manifest") {
-                BackendError::Storage(text)
-            } else {
-                BackendError::Eval(text)
-            }
+        // Deterministic budgets get their own ClientError classes: a driver
+        // must be able to tell "this query is too expensive" from "this
+        // query is malformed" without string-matching the message, and must
+        // NOT auto-retry either (a re-run exceeds the same budget again).
+        ExecError::Timeout => {
+            BackendError::Timeout("query exceeded the configured timeout".into())
         }
+        ExecError::RowCap(cap) => BackendError::ResourceLimit(format!(
+            "query exceeded the configured row cap of {cap}"
+        )),
+        ExecError::Storage(err) => match err {
+            // Deterministic search result caps: same query, same outcome —
+            // ClientError, not the auto-retried TransientError bucket.
+            namidb_storage::Error::SearchResultLimitExceeded { .. }
+            | namidb_storage::Error::SearchDocumentLimitExceeded { .. } => {
+                BackendError::ResourceLimit(format!("storage: {err}"))
+            }
+            // Genuinely transient conditions (cache/workspace pressure,
+            // backend unavailability) stay TransientError so official
+            // drivers auto-retry them.
+            other => BackendError::Storage(format!("storage: {other}")),
+        },
+        ExecError::Eval(err) => BackendError::Eval(err.to_string()),
+        ExecError::Runtime(m) => BackendError::Eval(format!("runtime: {m}")),
     }
 }
 
