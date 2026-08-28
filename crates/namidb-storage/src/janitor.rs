@@ -320,6 +320,12 @@ pub async fn sweep_orphans(
                     referenced.insert(paged.path.clone());
                 }
             }
+            for c in &desc.composite_equality_indices {
+                referenced.insert(c.path.clone());
+                if let Some(paged) = &c.paged {
+                    referenced.insert(paged.path.clone());
+                }
+            }
             if let Some(li) = &desc.label_index {
                 referenced.insert(li.path.clone());
             }

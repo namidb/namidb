@@ -176,6 +176,47 @@ pub fn encode_equality_property_value(value: &Value) -> Option<String> {
     Some(out)
 }
 
+/// Canonical, SELF-DELIMITING key for TupleV1 composite posting sidecars.
+///
+/// Each part is `tag byte + u32-le length + canonical part bytes`, in the
+/// index's DECLARATION order. Part semantics follow
+/// [`encode_equality_property_value`] and the transactional tuple probe
+/// (`unique_index::UniqueKeyPart`): typed tags keep `I64(1)` and `F64(1.0)`
+/// distinct, `-0.0` folds into `0.0`, and a NaN / Null / non-scalar member
+/// makes the whole tuple unindexable (`None`) — such a row is never filed
+/// and such a probe falls back to the scan, so the sidecar cannot diverge
+/// from the flat scan. Unlike ScalarV1's raw strings, the length prefix
+/// makes the key unambiguous: no member byte pattern can alias another
+/// member or a part boundary (`("a","bc")` != `("ab","c")`, and a raw
+/// string `"b:1"` member cannot collide with a Bool member).
+pub fn encode_equality_tuple_key(values: &[&Value]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for value in values {
+        let (tag, bytes): (u8, Vec<u8>) = match value {
+            Value::Str(s) => (b's', s.as_bytes().to_vec()),
+            Value::Bool(v) => (b'b', vec![u8::from(*v)]),
+            Value::I64(v) => (b'i', v.to_be_bytes().to_vec()),
+            Value::F64(v) if !v.is_nan() => {
+                let normalized = if *v == 0.0 { 0.0 } else { *v };
+                (b'f', normalized.to_bits().to_be_bytes().to_vec())
+            }
+            Value::Bytes(bytes) => (b'x', bytes.clone()),
+            Value::Date(v) => (b'd', v.to_be_bytes().to_vec()),
+            Value::DateTime(v) => (b't', v.to_be_bytes().to_vec()),
+            Value::Null
+            | Value::F64(_)
+            | Value::Vec(_)
+            | Value::VecI8 { .. }
+            | Value::List(_)
+            | Value::Map(_) => return None,
+        };
+        out.push(tag);
+        out.extend_from_slice(&(u32::try_from(bytes.len()).ok()?).to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone)]
 enum DecodedPropertySidecar {
     Unique(Arc<UniquePropertySidecar>),
@@ -3501,5 +3542,58 @@ mod tests {
             cache.usage(),
             raw_total / 2
         );
+    }
+}
+
+#[cfg(test)]
+mod tuple_key_tests {
+    use super::*;
+
+    fn key(values: &[&Value]) -> Option<Vec<u8>> {
+        encode_equality_tuple_key(values)
+    }
+
+    /// The adversarial aliasing rows of the composite test matrix: no
+    /// member byte pattern may alias another member, a part boundary, or a
+    /// different type carrying the same surface bytes.
+    #[test]
+    fn tuple_keys_are_unambiguous_and_typed() {
+        // Boundary shifting: ("a","bc") != ("ab","c").
+        let a_bc = key(&[&Value::Str("a".into()), &Value::Str("bc".into())]).unwrap();
+        let ab_c = key(&[&Value::Str("ab".into()), &Value::Str("c".into())]).unwrap();
+        assert_ne!(a_bc, ab_c);
+        // A raw string that looks like the scalar Bool tag cannot collide
+        // with an actual Bool member.
+        let fake = key(&[&Value::Str("b:1".into()), &Value::I64(7)]).unwrap();
+        let real = key(&[&Value::Bool(true), &Value::I64(7)]).unwrap();
+        assert_ne!(fake, real);
+        // Typed members: I64(1) and F64(1.0) stay distinct (Value::PartialEq
+        // semantics), while -0.0 folds into 0.0.
+        let int = key(&[&Value::I64(1), &Value::Str("x".into())]).unwrap();
+        let float = key(&[&Value::F64(1.0), &Value::Str("x".into())]).unwrap();
+        assert_ne!(int, float);
+        let pos = key(&[&Value::F64(0.0)]).unwrap();
+        let neg = key(&[&Value::F64(-0.0)]).unwrap();
+        assert_eq!(pos, neg);
+        // Order matters: declaration order IS the layout.
+        let xy = key(&[&Value::Str("x".into()), &Value::Str("y".into())]).unwrap();
+        let yx = key(&[&Value::Str("y".into()), &Value::Str("x".into())]).unwrap();
+        assert_ne!(xy, yx);
+        // Deterministic across calls.
+        assert_eq!(
+            key(&[&Value::Date(123), &Value::DateTime(456)]),
+            key(&[&Value::Date(123), &Value::DateTime(456)])
+        );
+    }
+
+    /// A NaN / Null / non-scalar member poisons the whole tuple: the row is
+    /// never filed and the probe must fall back — mirroring the flat scan
+    /// (NaN != NaN) and the transactional tuple probe's Unindexable answer.
+    #[test]
+    fn unindexable_members_poison_the_tuple() {
+        assert!(key(&[&Value::Str("x".into()), &Value::Null]).is_none());
+        assert!(key(&[&Value::F64(f64::NAN), &Value::Str("x".into())]).is_none());
+        assert!(key(&[&Value::List(Vec::new()), &Value::I64(1)]).is_none());
+        assert!(key(&[&Value::Map(Default::default()), &Value::I64(1)]).is_none());
     }
 }
