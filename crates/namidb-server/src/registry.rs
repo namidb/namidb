@@ -48,6 +48,9 @@ pub struct MaintenanceConfig {
     /// L0-count high-water mark per bucket that triggers a reactive
     /// compaction on flush. `0` disables it.
     pub compaction_l0_trigger: usize,
+    /// RFC-034 group-commit coalescing window per namespace. Zero (the
+    /// default) keeps inline per-request commits.
+    pub group_commit_window: Duration,
 }
 
 impl Default for MaintenanceConfig {
@@ -58,6 +61,7 @@ impl Default for MaintenanceConfig {
             sweep_min_age: Duration::ZERO,
             sweep_delete: false,
             compaction_l0_trigger: 0,
+            group_commit_window: Duration::ZERO,
         }
     }
 }
@@ -253,6 +257,11 @@ impl NamespaceRegistry {
             retired: std::sync::atomic::AtomicBool::new(false),
             writer_health: WriterHealth::new(),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
+            group_commit: (!self.maintenance.group_commit_window.is_zero()).then(|| {
+                Arc::new(crate::GroupCommit::new(
+                    self.maintenance.group_commit_window,
+                ))
+            }),
         });
 
         // Spawn per-namespace background maintenance (flush / compaction /
@@ -282,6 +291,27 @@ impl NamespaceRegistry {
     fn spawn_maintenance(&self, state: Arc<NamespaceState>, paths: NamespacePaths) {
         let maint = self.maintenance;
         let maint_store = Arc::new(ManifestStore::new(self.store.clone(), paths));
+
+        // RFC-034 group committer: one per namespace, cancelled on eviction
+        // like the other maintenance loops (an in-flight commit finishes
+        // first; stragglers are failed, not hung).
+        if let Some(group) = state.group_commit.clone() {
+            let handles = crate::CommitterHandles {
+                writer: state.writer.clone(),
+                snapshot: state.snapshot.clone(),
+                writer_health: state.writer_health.clone(),
+                namespace: state.namespace.clone(),
+                group,
+                memtable_bytes_gauge: None,
+            };
+            let cancel = state.cancel_tx.subscribe();
+            let handle = tokio::spawn(crate::group_committer_loop(handles, cancel));
+            state
+                .maintenance_tasks
+                .lock()
+                .expect("maintenance tasks lock poisoned")
+                .push(handle);
+        }
 
         // Periodic flush (+ reactive compaction on L0 high-water).
         if maint.flush_interval > Duration::ZERO {
@@ -532,6 +562,10 @@ pub struct NamespaceState {
     /// Wakes this namespace's flush task early when a committed write
     /// crosses the memtable byte threshold (see `SharedAppState`).
     pub flush_notify: Arc<tokio::sync::Notify>,
+    /// RFC-034 group commit coordinator for this namespace. `None` =
+    /// inline commits; `Some` pairs with a committer task spawned by
+    /// `spawn_maintenance` and cancelled on eviction.
+    pub(crate) group_commit: Option<Arc<crate::GroupCommit>>,
 }
 
 impl NamespaceState {

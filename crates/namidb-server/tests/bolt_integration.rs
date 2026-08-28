@@ -274,7 +274,9 @@ async fn boot_bolt_multi(
         auth_tokens_file: Some(tokens_path),
         no_auth: false,
         backup_target_uri: None,
-        group_commit_window: Duration::ZERO,
+        // Grouped on purpose: the multi-tenant Bolt test then exercises the
+        // registry-spawned per-namespace committers end to end.
+        group_commit_window: Duration::from_millis(2),
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

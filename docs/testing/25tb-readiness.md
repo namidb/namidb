@@ -702,8 +702,10 @@ A-moves-tuple-then-B-touches-it case is regression-tested). The server runs one
 committer per namespace: requests stage under the writer lock, register a waiter keyed
 by their last staged LSN while still holding the lock (no stage/commit race), and ACK
 only after the merged commit is durable and the snapshot republished. Wired into the
-single-tenant HTTP and Bolt auto-commit paths; multi-tenant + a per-namespace committer
-in the registry is the sized follow-up. Default window 0s = inline commits, bit-for-bit
+single-tenant HTTP and Bolt auto-commit paths; the multi-tenant follow-up shipped next:
+the registry spawns one committer per namespace (cancelled on eviction), the window
+reaches MaintenanceConfig, and both the multi-tenant HTTP arm and the Bolt
+for_namespace views group. Default window 0s = inline commits, bit-for-bit
 today's behaviour — the knob is the rollout kill-switch RFC-034 asked for. Tests follow
 the RFC's plan: commit coalescing proven by manifest-version counting, concurrent-MERGE
 isolation, solo rollback of a failed statement, Bolt-path ACK+RYOW. Fault-injected CAS
