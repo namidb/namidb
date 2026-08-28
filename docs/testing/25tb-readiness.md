@@ -755,8 +755,10 @@ pattern — ~1 day, sized, not rushed into this release.
 read-write role gate; single-flight with the 30 s bounded wait; Precondition→409,
 local-persistence→507; live round-trip + force/verify covered by in-lib tests.
 Restore stays CLI-only on purpose (offline destination required; the serving
-process IS the writer). Single-tenant only; multi-tenant needs per-namespace
-handles from the registry — roadmap note, hours.
+process IS the writer). The multi-tenant twin shipped next:
+/:namespace/v0/admin/backup with the same allowlist, process-wide single-flight,
+and cold-namespace-safe source resolution (the copy reads committed state, so
+no writer opens).
 
 ### Retractions (RET-01..04) — recorded for the record
 

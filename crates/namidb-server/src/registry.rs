@@ -137,6 +137,22 @@ impl NamespaceRegistry {
         self.max_namespaces != 0 && len >= self.max_namespaces
     }
 
+    /// The shared store handle plus this namespace's paths, for a
+    /// point-in-time backup of COMMITTED state. Deliberately does NOT open
+    /// the namespace: the copy reads the durable manifest closure directly,
+    /// so a cold namespace stays cold.
+    pub(crate) fn backup_source(
+        &self,
+        namespace: &str,
+    ) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), RegistryError> {
+        let ns_id = NamespaceId::new(namespace)
+            .map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
+        Ok((
+            self.store.clone(),
+            NamespacePaths::new(self.root.clone(), ns_id),
+        ))
+    }
+
     /// Return an already-open namespace without recovering or allocating a
     /// new writer. Used by pressure-relief operations at the hard RSS limit:
     /// flushing a live memtable can free memory, while opening a cold

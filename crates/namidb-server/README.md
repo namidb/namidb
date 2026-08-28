@@ -163,7 +163,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
-| `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (single-tenant; disabled unless `--backup-target-uri` is set) |
+| `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
 
 ### `POST /v0/admin/backup`
 
@@ -186,9 +186,13 @@ every copied object). Returns `{"source_version", "objects_copied",
 ambient cloud credentials write wherever `to` points, so the endpoint is
 disabled (403) until the operator sets `--backup-target-uri` /
 `NAMIDB_BACKUP_TARGET_URI`; `to` must equal that prefix or extend it at a
-`/` (or `?ns=`) boundary. One backup runs at a time (waiters get a 503
-after 30 s). Restore stays CLI-only on purpose: it requires an offline
-destination, and the serving process *is* the writer.
+`/` (or `?ns=`) boundary. One backup runs at a time — process-wide in
+multi-tenant mode, where `/:namespace/v0/admin/backup` resolves the
+namespace's committed state without opening it (cold namespaces stay
+cold) and namespace-scoped tokens are enforced by the auth middleware —
+with waiters getting a 503 after 30 s. Restore stays CLI-only on
+purpose: it requires an offline destination, and the serving process
+*is* the writer.
 
 ### `POST /v0/cypher`
 
