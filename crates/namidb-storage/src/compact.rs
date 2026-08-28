@@ -350,7 +350,19 @@ fn any_bucket_plans(manifest: &crate::manifest::Manifest, base_bytes: u64, ratio
                         properties: Vec::new(),
                     })
             };
-            plan_node_bucket(sources, base_bytes, ratio, &required, rebuild_search).is_some()
+            plan_node_bucket(
+                sources,
+                base_bytes,
+                ratio,
+                &required,
+                if scope.is_empty() {
+                    &manifest.schema.indexes
+                } else {
+                    &[]
+                },
+                rebuild_search,
+            )
+            .is_some()
         } else {
             plan_bucket_merge(sources, base_bytes, ratio).is_some()
         }
@@ -500,6 +512,7 @@ fn plan_node_bucket<'a>(
     base: u64,
     ratio: u64,
     required: &LabelDef,
+    composite: &[namidb_core::schema::IndexDef],
     force_search_rebuild: bool,
 ) -> Option<BucketPlan<'a>> {
     if let Some(plan) = plan_bucket_merge(sources, base, ratio) {
@@ -508,7 +521,7 @@ fn plan_node_bucket<'a>(
     let needs_migration = force_search_rebuild
         || sources
             .iter()
-            .any(|desc| node_descriptor_needs_migration(desc, required));
+            .any(|desc| node_descriptor_needs_migration(desc, required, composite));
     if !needs_migration || sources.is_empty() {
         return None;
     }
@@ -525,10 +538,14 @@ fn plan_node_bucket<'a>(
     })
 }
 
-fn node_descriptor_needs_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
+fn node_descriptor_needs_migration(
+    desc: &SstDescriptor,
+    required: &LabelDef,
+    composite: &[namidb_core::schema::IndexDef],
+) -> bool {
     !crate::manifest::node_locator_has_exact_records(desc)
         || !node_descriptor_has_property_pages(desc)
-        || node_descriptor_needs_non_record_migration(desc, required)
+        || node_descriptor_needs_non_record_migration(desc, required, composite)
 }
 
 fn node_descriptor_has_property_pages(desc: &SstDescriptor) -> bool {
@@ -539,7 +556,11 @@ fn node_descriptor_has_property_pages(desc: &SstDescriptor) -> bool {
     })
 }
 
-fn node_descriptor_needs_non_record_migration(desc: &SstDescriptor, required: &LabelDef) -> bool {
+fn node_descriptor_needs_non_record_migration(
+    desc: &SstDescriptor,
+    required: &LabelDef,
+    composite: &[namidb_core::schema::IndexDef],
+) -> bool {
     let required_equality: Vec<&str> = required
         .properties
         .iter()
@@ -567,6 +588,17 @@ fn node_descriptor_needs_non_record_migration(desc: &SstDescriptor, required: &L
                 && (index.format == crate::manifest::PropertyIndexFormat::PagedV1
                     || index.paged.is_some()
                     || index.paged_build_unsupported)
+        })
+        // The DDL-backfill arm for composite indexes (mirrors item 38's
+        // single-property arm): a declared composite index whose exact
+        // DECLARATION-ordered tuple has no sidecar on this SST forces the
+        // full-bucket rewrite, which is what makes CompactionTrigger::Ddl
+        // materialize tuple postings on pre-existing data for free.
+    }) || composite.iter().any(|declared| {
+        !desc.composite_equality_indices.iter().any(|index| {
+            index.properties == declared.properties
+                && index.mixed_type_complete
+                && (!index.path.is_empty() || index.paged_build_unsupported)
         })
     })
 }
@@ -1298,9 +1330,18 @@ async fn prepare_leveled(
         } else {
             label_def.clone()
         };
-        let Some(plan) =
-            plan_node_bucket(&sources, base_bytes, ratio, &sidecar_def, rebuild_search)
-        else {
+        let Some(plan) = plan_node_bucket(
+            &sources,
+            base_bytes,
+            ratio,
+            &sidecar_def,
+            if label.is_empty() {
+                &schema.indexes
+            } else {
+                &[]
+            },
+            rebuild_search,
+        ) else {
             continue;
         };
         // A lone, otherwise-current legacy SST needs only its access bundle
@@ -1312,7 +1353,15 @@ async fn prepare_leveled(
         if plan.inputs.len() == 1
             && (!crate::manifest::node_locator_has_exact_records(plan.inputs[0])
                 || !node_descriptor_has_property_pages(plan.inputs[0]))
-            && !node_descriptor_needs_non_record_migration(plan.inputs[0], &sidecar_def)
+            && !node_descriptor_needs_non_record_migration(
+                plan.inputs[0],
+                &sidecar_def,
+                if label.is_empty() {
+                    &schema.indexes
+                } else {
+                    &[]
+                },
+            )
             && !rebuild_search
         {
             let source = (*plan.inputs[0]).clone();
@@ -2942,6 +2991,7 @@ fn partition_index_build_memory(aggregate: usize, collector_count: usize) -> Res
 struct NodeSidecarHarvest {
     unique: UniqueSidecarCollector,
     equality: EqualitySidecarCollector,
+    composite: crate::flush::CompositeSidecarCollector,
     label_index: LabelIndexCollector,
     node_locator_upload: crate::sst::paged_index::NodeLocatorRecordUpload,
     property_pages_upload: crate::sst::nodes::property_pages::NodePropertyPageUpload,
@@ -3020,6 +3070,14 @@ fn merge_node_sources(
     let mut writer = IncrementalNodeSstWriter::new(label_def, options, merge_chunk_rows())?;
     let mut unique = UniqueSidecarCollector::new(sidecar_def)?;
     let mut equality = EqualitySidecarCollector::new(sidecar_def)?;
+    // Composite tuple sidecars are an id-primary concern (flush harvests
+    // them on that path only); legacy per-label buckets carry none.
+    let composite_defs: &[namidb_core::schema::IndexDef] = if bucket_scope.is_empty() {
+        &schema.indexes
+    } else {
+        &[]
+    };
+    let mut composite = crate::flush::CompositeSidecarCollector::new(composite_defs)?;
     let mut label_index = LabelIndexCollector::new()?;
     let mut node_locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
     let mut property_pages = crate::sst::nodes::property_pages::NodePropertyPageBuilder::new_bound(
@@ -3110,6 +3168,7 @@ fn merge_node_sources(
                 if let Some(rec) = &rec {
                     unique.observe(row.id, rec)?;
                     equality.observe(row.id, rec)?;
+                    composite.observe(row.id, rec)?;
                     label_index.observe(row.id, rec)?;
                     stats.observe(rec);
                     #[cfg(feature = "vector-index")]
@@ -3163,6 +3222,7 @@ fn merge_node_sources(
         sidecars: NodeSidecarHarvest {
             unique,
             equality,
+            composite,
             label_index,
             node_locator_upload,
             property_pages_upload,
@@ -3828,6 +3888,13 @@ async fn put_node_sst_leveled(
             .equality
             .finish(paths, level.as_u32(), &id, label)?;
     index_sidecars.extend(equality_sidecars);
+    // Composite tuple sidecars are re-emitted from the same reconciled
+    // winner stream, superseding the input SSTs' partials.
+    let (composite_equality_indices, composite_sidecars) =
+        sidecars
+            .composite
+            .finish(paths, level.as_u32(), &id, label)?;
+    index_sidecars.extend(composite_sidecars);
     // Rebuild the label-index sidecar from the reconciled rows. id-primary
     // buckets (scope == "") carry per-row label sets, so this re-emits the
     // `LabelId -> [NodeId]` postings (with per-label counts) the cost model
@@ -3883,7 +3950,7 @@ async fn put_node_sst_leveled(
         bloom: bloom_descriptor,
         unique_property_indices,
         equality_property_indices,
-        composite_equality_indices: Vec::new(),
+        composite_equality_indices,
         label_index,
         node_locator: Some(node_locator),
         // Per-(label, property) stats recomputed off the winner stream so
@@ -6762,7 +6829,7 @@ mod tests {
             .collect();
         let required = crate::flush::union_indexed_props(&sc);
         assert!(
-            plan_node_bucket(&incomplete_refs, u64::MAX, 10, &required, false).is_some(),
+            plan_node_bucket(&incomplete_refs, u64::MAX, 10, &required, &[], false).is_some(),
             "an incomplete-coverage marker must force a one-time rewrite"
         );
 
@@ -6794,7 +6861,7 @@ mod tests {
             .collect();
         let required = crate::flush::union_indexed_props(&sc);
         let migration =
-            plan_node_bucket(&refs, u64::MAX, 10, &required, false).expect("migration plan");
+            plan_node_bucket(&refs, u64::MAX, 10, &required, &[], false).expect("migration plan");
         assert_eq!(migration.inputs.len(), 1);
         assert_eq!(migration.target_level, 1);
 
@@ -6844,7 +6911,7 @@ mod tests {
 
         let upgraded_refs = vec![upgraded];
         assert!(
-            plan_node_bucket(&upgraded_refs, u64::MAX, 10, &required, false).is_none(),
+            plan_node_bucket(&upgraded_refs, u64::MAX, 10, &required, &[], false).is_none(),
             "migration must not rewrite the same L1 again"
         );
     }
@@ -6954,7 +7021,7 @@ mod tests {
 
         let required = crate::flush::union_indexed_props(&sc);
         assert!(
-            plan_node_bucket(&[upgraded], u64::MAX, 10, &required, false).is_none(),
+            plan_node_bucket(&[upgraded], u64::MAX, 10, &required, &[], false).is_none(),
             "the completed access bundle must not schedule another migration"
         );
     }
@@ -7012,7 +7079,7 @@ mod tests {
             .filter(|sst| sst.kind == SstKind::Nodes)
             .collect();
         let required = crate::flush::union_indexed_props(&indexed_schema);
-        assert!(plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_some());
+        assert!(plan_node_bucket(&refs, u64::MAX, 10, &required, &[], false).is_some());
 
         let out = compact_leveled(&ms, &fence, &ddl, &indexed_schema, u64::MAX, 10)
             .await
@@ -7030,7 +7097,7 @@ mod tests {
             .any(|index| index.property == "name" && index.paged.is_some()));
         let refs = vec![node];
         assert!(
-            plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_none(),
+            plan_node_bucket(&refs, u64::MAX, 10, &required, &[], false).is_none(),
             "the DDL migration must be a one-time rewrite"
         );
     }
@@ -7092,7 +7159,7 @@ mod tests {
         let refs = vec![node];
         let required = crate::flush::union_indexed_props(&indexed_schema);
         assert!(
-            plan_node_bucket(&refs, u64::MAX, 10, &required, false).is_none(),
+            plan_node_bucket(&refs, u64::MAX, 10, &required, &[], false).is_none(),
             "unsupported PagedV1 key must not trigger endless maintenance"
         );
     }
