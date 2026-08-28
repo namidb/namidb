@@ -1155,6 +1155,50 @@ impl WriterSession {
         self.pending.records.len()
     }
 
+    /// Open a request scope over the staged batch (group commit, RFC-034):
+    /// capture the batch position and start the unique index's request
+    /// journal, so a FAILED statement can be rolled back alone
+    /// ([`Self::rollback_staged_request`]) while earlier requests' staged
+    /// rows survive for the group's single [`Self::commit_batch`].
+    pub fn begin_staged_request(&mut self) -> StageMark {
+        self.unique_index.begin_request();
+        StageMark {
+            records: self.pending.records.len(),
+            payloads: self.pending_payloads.len(),
+            node_mutations: self.pending_node_mutations,
+        }
+    }
+
+    /// Close the request scope keeping its rows in the batch. The unique
+    /// index's request journal merges into the batch journal preserving
+    /// first-touch pre-batch values, so a later full [`Self::discard_batch`]
+    /// still restores committed state.
+    pub fn commit_staged_request(&mut self) {
+        self.unique_index.merge_request();
+    }
+
+    /// Roll back everything staged since `mark`, leaving earlier requests'
+    /// staged rows intact. The RYOW overlay memtable is rebuilt by replaying
+    /// the surviving payloads — it is a pure fold over them — and the unique
+    /// index restores the touched tuples to their at-request-start values.
+    pub fn rollback_staged_request(&mut self, mark: StageMark) {
+        self.pending.records.truncate(mark.records);
+        self.pending_payloads.truncate(mark.payloads);
+        self.pending_node_mutations = mark.node_mutations;
+        let mut rebuilt = Memtable::new();
+        for (key, lsn, op) in &self.pending_payloads {
+            rebuilt.apply(key.clone(), *lsn, op.clone());
+        }
+        self.staged_memtable = rebuilt;
+        self.unique_index.rollback_request();
+    }
+
+    /// Highest staged (not yet durable) LSN — the group-commit waiter
+    /// watermark. `None` when nothing is staged.
+    pub fn staged_last_lsn(&self) -> Option<u64> {
+        self.pending.records.last().map(|r| r.lsn)
+    }
+
     /// Distinct keys in the incrementally maintained RYOW overlay.
     ///
     /// Normally equal to `pending_len`; lower when a transaction rewrites the
@@ -2842,6 +2886,16 @@ impl WriterSession {
         self.staged_memtable.apply(key, lsn, op);
         Ok(())
     }
+}
+
+/// Staged-batch position at a request boundary (group commit, RFC-034).
+/// Returned by [`WriterSession::begin_staged_request`] and consumed by
+/// [`WriterSession::rollback_staged_request`].
+#[derive(Debug, Clone, Copy)]
+pub struct StageMark {
+    records: usize,
+    payloads: usize,
+    node_mutations: bool,
 }
 
 /// Convenience: the WAL payload bytes a `WalEntry` produces. Useful

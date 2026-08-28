@@ -247,6 +247,33 @@ struct ConstraintUndo {
 struct IndexState {
     maps: HashMap<ConstraintId, ConstraintMap>,
     undo: HashMap<ConstraintId, ConstraintUndo>,
+    /// Group-commit request scope (RFC-034): while `Some`, staged
+    /// maintenance journals first-touch state HERE instead of `undo`, so a
+    /// FAILED statement can be rolled back to its request boundary — the
+    /// journaled values are the at-request-start (possibly already-staged)
+    /// tuples, not the pre-batch ones. On request success the layer merges
+    /// into `undo` keeping the OLDEST first-touch entry per node, which
+    /// preserves the pre-batch restore of a full [`discard`] later.
+    request_undo: Option<HashMap<ConstraintId, ConstraintUndo>>,
+}
+
+impl IndexState {
+    /// Split borrow: the maps plus whichever journal staged maintenance
+    /// must write (the request layer when a scope is open, else the batch
+    /// journal).
+    fn maps_and_journal(
+        &mut self,
+    ) -> (
+        &mut HashMap<ConstraintId, ConstraintMap>,
+        &mut HashMap<ConstraintId, ConstraintUndo>,
+    ) {
+        let IndexState {
+            maps,
+            undo,
+            request_undo,
+        } = self;
+        (maps, request_undo.as_mut().unwrap_or(undo))
+    }
 }
 
 /// The per-writer index: `(label, sorted property names) → ConstraintMap`.
@@ -368,12 +395,16 @@ impl UniqueConstraintIndex {
         let mut state = self.state.lock().expect("unique index lock");
         state.maps.insert(identity.clone(), map);
         if staged {
-            let undo = state.undo.entry(identity).or_default();
+            let (_, journal) = state.maps_and_journal();
+            let undo = journal.entry(identity).or_default();
             undo.created_in_batch = true;
             undo.by_node.clear();
             undo.known_misses.clear();
         } else {
             state.undo.remove(&identity);
+            if let Some(request) = state.request_undo.as_mut() {
+                request.remove(&identity);
+            }
         }
     }
 
@@ -397,7 +428,11 @@ impl UniqueConstraintIndex {
             return;
         }
         debug_assert!(
-            !state.undo.contains_key(&identity),
+            !state.undo.contains_key(&identity)
+                && !state
+                    .request_undo
+                    .as_ref()
+                    .is_some_and(|request| request.contains_key(&identity)),
             "committed key seeding must happen before staged mutations"
         );
         let map = state.maps.entry(identity).or_default();
@@ -439,7 +474,7 @@ impl UniqueConstraintIndex {
         }
 
         let created_in_batch = !state.maps.contains_key(&identity);
-        let IndexState { maps, undo } = &mut *state;
+        let (maps, undo) = state.maps_and_journal();
         let map = maps.entry(identity.clone()).or_default();
         let rollback = undo.entry(identity).or_default();
         if created_in_batch {
@@ -492,7 +527,7 @@ impl UniqueConstraintIndex {
         props: &BTreeMap<String, Value>,
     ) {
         let mut state = self.state.lock().expect("unique index lock");
-        let IndexState { maps, undo } = &mut *state;
+        let (maps, undo) = state.maps_and_journal();
         for (identity @ (clabel, cnames), map) in maps.iter_mut() {
             let rollback = undo.entry(identity.clone()).or_default();
             if !rollback.created_in_batch {
@@ -533,7 +568,7 @@ impl UniqueConstraintIndex {
     /// Maintain every populated map for a staged node tombstone.
     pub(crate) fn apply_tombstone(&self, id: NodeId) {
         let mut state = self.state.lock().expect("unique index lock");
-        let IndexState { maps, undo } = &mut *state;
+        let (maps, undo) = state.maps_and_journal();
         for (identity, map) in maps.iter_mut() {
             let rollback = undo.entry(identity.clone()).or_default();
             if !rollback.created_in_batch {
@@ -557,7 +592,61 @@ impl UniqueConstraintIndex {
     /// Promote the current staged view to committed state. The populated maps
     /// already contain those mutations, so only the rollback journal changes.
     pub(crate) fn commit_staged(&self) {
-        self.state.lock().expect("unique index lock").undo = HashMap::new();
+        let mut state = self.state.lock().expect("unique index lock");
+        state.undo = HashMap::new();
+        // A dangling request scope is a caller bug, but its journal is
+        // obsolete either way once the batch is durable.
+        state.request_undo = None;
+    }
+
+    /// Open a group-commit request scope (RFC-034): staged maintenance
+    /// journals into a request-local layer whose entries capture the
+    /// AT-REQUEST-START values, so a failed statement rolls back alone.
+    pub(crate) fn begin_request(&self) {
+        let mut state = self.state.lock().expect("unique index lock");
+        debug_assert!(state.request_undo.is_none(), "request scope already open");
+        state.request_undo = Some(HashMap::new());
+    }
+
+    /// Close the request scope keeping its mutations: merge the request
+    /// journal into the batch journal, keeping the OLDEST first-touch entry
+    /// per node/key so a later full [`Self::rollback_staged`] still restores
+    /// the pre-BATCH state.
+    pub(crate) fn merge_request(&self) {
+        let mut state = self.state.lock().expect("unique index lock");
+        let Some(request) = state.request_undo.take() else {
+            return;
+        };
+        for (identity, from_request) in request {
+            match state.undo.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(from_request);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    // The batch entry predates this request, so its
+                    // created_in_batch flag and existing first-touch values
+                    // win; only genuinely new touches merge in.
+                    let batch = slot.get_mut();
+                    for (id, old_key) in from_request.by_node {
+                        batch.by_node.entry(id).or_insert(old_key);
+                    }
+                    for (key, was_known_miss) in from_request.known_misses {
+                        batch.known_misses.entry(key).or_insert(was_known_miss);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Roll back ONLY the open request scope's mutations, restoring every
+    /// touched map to its at-request-start (possibly staged-by-earlier-
+    /// requests) state. Earlier requests in the batch survive.
+    pub(crate) fn rollback_request(&self) {
+        let mut state = self.state.lock().expect("unique index lock");
+        let Some(request) = state.request_undo.take() else {
+            return;
+        };
+        Self::restore(&mut state, request);
     }
 
     /// Restore every populated map to its pre-batch committed state without a
@@ -565,7 +654,16 @@ impl UniqueConstraintIndex {
     /// touched in the discarded batch, not to the stored graph size.
     pub(crate) fn rollback_staged(&self) {
         let mut state = self.state.lock().expect("unique index lock");
+        // A dangling request scope rolls back first (its journal holds the
+        // newest deltas), then the batch journal restores to pre-batch.
+        if let Some(request) = state.request_undo.take() {
+            Self::restore(&mut state, request);
+        }
         let undo = std::mem::take(&mut state.undo);
+        Self::restore(&mut state, undo);
+    }
+
+    fn restore(state: &mut IndexState, undo: HashMap<ConstraintId, ConstraintUndo>) {
         for (identity, rollback) in undo {
             if rollback.created_in_batch {
                 state.maps.remove(&identity);

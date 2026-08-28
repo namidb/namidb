@@ -42,8 +42,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use namidb_query::{
-    execute_with_limits, execute_write_with_deadline, parse as cypher_parse, plan as build_plan,
-    Params, RuntimeValue, StatsCatalog, WriteOutcome,
+    execute_with_limits, execute_write_staged_with_deadline, execute_write_with_deadline,
+    parse as cypher_parse, plan as build_plan, Params, RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
 
@@ -126,6 +126,14 @@ pub struct Config {
     /// configured fails instead of silently serving open — an unset
     /// `NAMIDB_AUTH_TOKEN` in production should be a crash, not a log line.
     pub no_auth: bool,
+    /// RFC-034 group commit coalescing window. Zero (the default) keeps
+    /// inline per-request commits — identical behaviour to every release
+    /// before it. A small window (1-5 ms) lets concurrently arriving writes
+    /// share one WAL append + manifest CAS, lifting the interactive write
+    /// floor (~1/commit-RTT) to roughly `group size / commit-RTT`, at the
+    /// cost of up to `window` extra latency for a lone write. Single-tenant
+    /// only for now.
+    pub group_commit_window: Duration,
     /// Destination-URI allowlist prefix for `POST /v0/admin/backup`
     /// (single-tenant only). `None` disables the endpoint: accepting a
     /// client-supplied destination without an operator-configured allowlist
@@ -318,6 +326,10 @@ pub struct AppState {
     /// automatic reopen ([`recovery`]) succeeds. Read lock-free by
     /// `/v0/health`.
     pub writer_health: Arc<WriterHealth>,
+    /// RFC-034 group commit coordinator. `None` = inline per-request
+    /// commits (the default, and always the case for multi-tenant
+    /// namespace views for now).
+    pub(crate) group_commit: Option<Arc<GroupCommit>>,
     /// Source handles + operator-configured destination allowlist for the
     /// admin backup endpoint. `None` = the endpoint is disabled — a
     /// client-supplied destination URI would otherwise let any read-write
@@ -372,8 +384,20 @@ impl AppState {
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
             authz: Arc::new(authz::NoOpAuthz),
             writer_health: WriterHealth::new(),
+            group_commit: None,
             backup: None,
         }
+    }
+
+    /// Enable RFC-034 group commit with the given coalescing window
+    /// (builder style). A zero window leaves inline commits in place. The
+    /// caller must also spawn [`group_committer_loop`] on the finished
+    /// state — without it, grouped writes would wait forever.
+    pub fn with_group_commit(mut self, window: Duration) -> Self {
+        if !window.is_zero() {
+            self.group_commit = Some(Arc::new(GroupCommit::new(window)));
+        }
+        self
     }
 
     /// Assemble a single-namespace view over a multi-tenant namespace: the
@@ -409,6 +433,10 @@ impl AppState {
             metrics: shared.metrics.clone(),
             authz: shared.authz.clone(),
             writer_health: ns.writer_health.clone(),
+            // Group commit needs a per-namespace committer task; wiring that
+            // through the registry is a follow-up, so multi-tenant views
+            // stay on inline commits.
+            group_commit: None,
             backup: None,
         }
     }
@@ -1039,7 +1067,16 @@ pub async fn run_with_memory_max_bytes(
         .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
-        .with_slow_query_threshold(config.slow_query_threshold);
+        .with_slow_query_threshold(config.slow_query_threshold)
+        .with_group_commit(config.group_commit_window);
+    if state.group_commit.is_some() {
+        info!(
+            window_ms = config.group_commit_window.as_millis() as u64,
+            "group commit enabled"
+        );
+        let committer_state = state.clone();
+        tokio::spawn(group_committer_loop(committer_state));
+    }
     let state = match backup_handles {
         Some((backup_store, backup_paths, prefix)) => {
             info!(prefix = %prefix, "admin backup endpoint enabled");
@@ -1818,6 +1855,158 @@ pub(crate) async fn lock_writer_bounded(
         return Some(writer.lock().await);
     }
     tokio::time::timeout(timeout, writer.lock()).await.ok()
+}
+
+/// Group commit (RFC-034): one committer per namespace amortizes the
+/// two object-store round-trips of `commit_batch` across concurrently
+/// arriving writes. Requests stage under the writer lock inside a request
+/// scope (`begin_staged_request`), register a waiter keyed by their last
+/// staged LSN — still under the lock, so the committer cannot slip between
+/// staging and registration — and are ACKed only after the group's single
+/// commit is durable AND the snapshot republished (RFC-021/026 preserved).
+/// A `window` of zero disables the whole path: writes take today's inline
+/// stage+commit, which is the shipped default.
+pub(crate) struct GroupCommit {
+    pub(crate) window: Duration,
+    notify: tokio::sync::Notify,
+    #[allow(clippy::type_complexity)]
+    waiters: std::sync::Mutex<
+        Vec<(
+            u64,
+            tokio::sync::oneshot::Sender<Result<(), SharedCommitError>>,
+        )>,
+    >,
+}
+
+/// The one commit error a whole group shares (shared fate: a merged WAL
+/// segment cannot be partially durable).
+#[derive(Clone)]
+pub(crate) struct SharedCommitError(pub(crate) Arc<namidb_query::exec::ExecError>);
+
+/// A write's failure on either commit path: its own statement error, or the
+/// shared error of the group whose commit it joined.
+pub(crate) enum WriteFailure {
+    Own(namidb_query::exec::ExecError),
+    Shared(SharedCommitError),
+}
+
+impl WriteFailure {
+    pub(crate) fn as_exec(&self) -> &namidb_query::exec::ExecError {
+        match self {
+            WriteFailure::Own(e) => e,
+            WriteFailure::Shared(shared) => shared.0.as_ref(),
+        }
+    }
+}
+
+impl GroupCommit {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            notify: tokio::sync::Notify::new(),
+            waiters: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a waiter for the staged rows up to `lsn`. MUST be called
+    /// while still holding the writer lock (see the struct docs).
+    pub(crate) fn register(
+        &self,
+        lsn: u64,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), SharedCommitError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters
+            .lock()
+            .expect("group commit waiters lock poisoned")
+            .push((lsn, tx));
+        rx
+    }
+
+    pub(crate) fn notify_committer(&self) {
+        self.notify.notify_one();
+    }
+
+    fn wake_committed(&self, watermark: u64) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("group commit waiters lock poisoned");
+        let mut keep = Vec::new();
+        for (lsn, tx) in waiters.drain(..) {
+            if lsn <= watermark {
+                let _ = tx.send(Ok(()));
+            } else {
+                keep.push((lsn, tx));
+            }
+        }
+        *waiters = keep;
+    }
+
+    fn wake_all_err(&self, error: SharedCommitError) {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("group commit waiters lock poisoned");
+        for (_, tx) in waiters.drain(..) {
+            let _ = tx.send(Err(error.clone()));
+        }
+    }
+}
+
+/// The per-namespace committer task. Runs while the server lives; exits
+/// with the process. Never spawned when the window is zero.
+pub(crate) async fn group_committer_loop(state: AppState) {
+    let Some(group) = state.group_commit.clone() else {
+        return;
+    };
+    loop {
+        group.notify.notified().await;
+        // Coalesce: writes arriving inside the window join this group. The
+        // sleep happens OFF the writer lock, so stagers keep making
+        // progress while the group accumulates.
+        if !group.window.is_zero() {
+            tokio::time::sleep(group.window).await;
+        }
+        let mut writer = state.writer.lock().await;
+        if writer.pending_len() == 0 {
+            continue;
+        }
+        let Some(watermark) = writer.staged_last_lsn() else {
+            continue;
+        };
+        match writer.commit_batch().await {
+            Ok(_) => {
+                state.writer_health.clear_persistence_degraded();
+                // ACK ordering (RFC-021): republish BEFORE waking, so a
+                // waiter's next read sees its committed rows.
+                state.snapshot.store(writer.owned_snapshot());
+                state.memtable_bytes_gauge.store(
+                    writer.memtable_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                drop(writer);
+                group.wake_committed(watermark);
+            }
+            Err(e) => {
+                // Shared fate: the merged batch failed as a unit. Discard it
+                // (nothing is durable until the pointer CAS), recover a
+                // fenced/poisoned session in place, and hand every waiter
+                // the same error.
+                writer.discard_batch();
+                let error = namidb_query::exec::ExecError::Storage(e);
+                recovery::recover_after_write_error(
+                    &mut writer,
+                    &state.snapshot,
+                    &state.writer_health,
+                    &state.namespace,
+                    &error,
+                )
+                .await;
+                drop(writer);
+                group.wake_all_err(SharedCommitError(Arc::new(error)));
+            }
+        }
+    }
 }
 
 /// How long the periodic flush loop waits after a local-persistence flush
@@ -3090,33 +3279,85 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 response: writer_busy_response(),
             };
         };
-        let result =
-            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
-        // Sample the soft write-stall decision while still holding the lock
-        // (RFC-027 P5), then release it and sleep — backpressure applies to
-        // this request, not to the writer mutex other connections need.
-        let stall = match &result {
-            Ok(_) => {
-                // Refresh the published snapshot so subsequent reads see the
-                // just-committed records (RFC-021).
-                state.snapshot.store(writer.owned_snapshot());
-                state.after_commit_backpressure(&writer)
+        let (result, stall) = if let Some(group) = state.group_commit.clone() {
+            // RFC-034 group commit: stage inside a request scope and let the
+            // namespace committer make the whole group durable with ONE
+            // commit. The waiter registers while still holding the lock so
+            // the committer cannot slip between staging and registration;
+            // the ACK arrives only after the merged commit is durable and
+            // the snapshot republished (RFC-021 preserved).
+            let mark = writer.begin_staged_request();
+            match execute_write_staged_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                state.write_deadline(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    writer.commit_staged_request();
+                    let lsn = writer.staged_last_lsn().unwrap_or(0);
+                    let ack = group.register(lsn);
+                    let stall = state.after_commit_backpressure(&writer);
+                    drop(writer);
+                    group.notify_committer();
+                    let result = match ack.await {
+                        Ok(Ok(())) => Ok(outcome),
+                        Ok(Err(shared)) => Err(WriteFailure::Shared(shared)),
+                        Err(_) => Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                            "group commit coordinator exited".into(),
+                        ))),
+                    };
+                    (result, stall)
+                }
+                Err(e) => {
+                    // Roll back ONLY this request; earlier group members'
+                    // staged rows survive for their commit.
+                    writer.rollback_staged_request(mark);
+                    recovery::recover_after_write_error(
+                        &mut writer,
+                        &state.snapshot,
+                        &state.writer_health,
+                        &state.namespace,
+                        &e,
+                    )
+                    .await;
+                    drop(writer);
+                    (Err(WriteFailure::Own(e)), None)
+                }
             }
-            Err(e) => {
-                // A fenced/poisoned session would fail every later write;
-                // reopen it in place under the lock we already hold.
-                recovery::recover_after_write_error(
-                    &mut writer,
-                    &state.snapshot,
-                    &state.writer_health,
-                    &state.namespace,
-                    e,
-                )
-                .await;
-                None
-            }
+        } else {
+            let result =
+                execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline())
+                    .await;
+            // Sample the soft write-stall decision while still holding the lock
+            // (RFC-027 P5), then release it and sleep — backpressure applies to
+            // this request, not to the writer mutex other connections need.
+            let stall = match &result {
+                Ok(_) => {
+                    // Refresh the published snapshot so subsequent reads see the
+                    // just-committed records (RFC-021).
+                    state.snapshot.store(writer.owned_snapshot());
+                    state.after_commit_backpressure(&writer)
+                }
+                Err(e) => {
+                    // A fenced/poisoned session would fail every later write;
+                    // reopen it in place under the lock we already hold.
+                    recovery::recover_after_write_error(
+                        &mut writer,
+                        &state.snapshot,
+                        &state.writer_health,
+                        &state.namespace,
+                        e,
+                    )
+                    .await;
+                    None
+                }
+            };
+            drop(writer);
+            (result.map_err(WriteFailure::Own), stall)
         };
-        drop(writer);
         // Stop the clock before the backpressure sleep: the stall is
         // intentional throttling, not query cost, so it must not inflate the
         // latency histogram or trip the slow-query log.
@@ -3140,11 +3381,11 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     .into_response(),
                 }
             }
-            Err(e) => ObservedQuery {
+            Err(failure) => ObservedQuery {
                 kind: Some(QueryKind::Write),
                 ok: false,
                 elapsed,
-                response: exec_failure_response("write execution failed", &e),
+                response: exec_failure_response("write execution failed", failure.as_exec()),
             },
         }
     } else {
@@ -5594,6 +5835,104 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// RFC-034 group commit: N concurrent writes coalesce into fewer
+    /// manifest commits (each `commit_batch` bumps the manifest version by
+    /// exactly one — counting versions counts commits, no store
+    /// instrumentation needed), every write ACKs only after durability, and
+    /// an immediately following read sees all of them (RFC-021 RYOW).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_writes_coalesce_commits_and_stay_readable() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-commit").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "group-commit".into())
+            .with_group_commit(Duration::from_millis(5));
+        tokio::spawn(group_committer_loop(state.clone()));
+        let app = build_router(state.clone());
+
+        let v0 = state.snapshot.load().manifest().manifest.version;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                post_cypher(&app, Some("tok"), &format!("CREATE (:G {{i: {i}}})")).await
+            }));
+        }
+        for handle in handles {
+            let response = handle.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // RYOW across the group: a read AFTER the last ACK sees every row.
+        let response = post_cypher(&app, Some("tok"), "MATCH (g:G) RETURN count(g) AS c").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rows"][0]["c"], 8, "{json}");
+        // Coalescing: strictly fewer commits than writes.
+        let v1 = state.snapshot.load().manifest().manifest.version;
+        assert!(v1 > v0);
+        assert!(
+            v1 - v0 < 8,
+            "8 writes must share commits under a 5 ms window, got {} commits",
+            v1 - v0
+        );
+    }
+
+    /// RFC-034 isolation (RFC-026): concurrent MERGEs on the same value in
+    /// one group must yield exactly one node — the second stager's read
+    /// sub-plan sees the first's staged rows through the overlay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_concurrent_merges_yield_one_node() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-merge").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "group-merge".into())
+            .with_group_commit(Duration::from_millis(5));
+        tokio::spawn(group_committer_loop(state.clone()));
+        let app = build_router(state);
+
+        let merge = |app: Router| async move {
+            post_cypher(&app, Some("tok"), "MERGE (u:U {email: 'x@x'})").await
+        };
+        let (a, b) = tokio::join!(merge(app.clone()), merge(app.clone()));
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let response = post_cypher(&app, Some("tok"), "MATCH (u:U) RETURN count(u) AS c").await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rows"][0]["c"], 1, "{json}");
+    }
+
+    /// A statement failure under group commit rolls back alone: the failed
+    /// request's rows vanish, concurrent successful writes commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_statement_failure_rolls_back_alone() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-fail").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "group-fail".into())
+            .with_group_commit(Duration::from_millis(5));
+        tokio::spawn(group_committer_loop(state.clone()));
+        let app = build_router(state);
+
+        let good = post_cypher(&app, Some("tok"), "CREATE (:F {ok: 1})");
+        // Stages a node, then fails evaluating 1/0 — the whole statement
+        // must roll back without touching the concurrent good write.
+        let bad = post_cypher(
+            &app,
+            Some("tok"),
+            "CREATE (:F {ok: 0}) WITH 1/0 AS x RETURN x",
+        );
+        let (good, bad) = tokio::join!(good, bad);
+        assert_eq!(good.status(), StatusCode::OK);
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let response = post_cypher(&app, Some("tok"), "MATCH (f:F) RETURN f.ok AS ok").await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([{ "ok": 1 }]),
+            "only the good write may be durable: {json}"
+        );
     }
 
     /// A read-only token may not trigger a backup (same gate as flush).

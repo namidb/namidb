@@ -1,10 +1,16 @@
 # RFC 034: Writer concurrency — the single-writer-per-namespace mutex
 
-**Status:** draft
+**Status:** partially implemented (2.3.0)
 **Author(s):** Matías Fonseca <info@namidb.com>
 **Created:** 2026-06-26
-**Updated:** 2026-06-26
-**Implements:** writer-lock-wait/held instrumentation (proposed, behaviour-preserving); group/pipelined commit (proposed)
+**Updated:** 2026-08-28
+**Implements:** writer-lock-wait instrumentation (shipped earlier as
+`namidb_writer_lock_wait_seconds`); group commit (shipped 2.3.0:
+`--group-commit-window`, default `0s` = inline commits — storage request
+scopes `begin/commit/rollback_staged_request` + request-scoped unique-index
+undo layer, one committer task per namespace, waiter registration under the
+writer lock, ACK after republish; auto-commit paths only, single-tenant;
+multi-tenant registry wiring and pipelined commit remain proposed)
 **Back-refs:** RFC-001 §"Write path"/§"Epoch fencing", RFC-021, RFC-026, RFC-027, RFC-029
 
 ## Summary

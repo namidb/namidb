@@ -24,6 +24,7 @@ async fn boot() -> String {
         auth_tokens_file: None,
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

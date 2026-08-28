@@ -64,6 +64,7 @@ async fn serves_https_and_bolt_over_tls() {
         auth_token: None,
         no_auth: true,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         auth_tokens_file: None,
         #[cfg(feature = "jwt")]
         jwt: None,
