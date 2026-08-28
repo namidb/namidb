@@ -679,17 +679,36 @@ STRING and MAP` type error; list `+` gains real Cypher semantics (list+list conc
 list+element append, element+list prepend — previously `'a' + [1]` produced garbage
 text); toString(non-scalar) errors. Behavior change, release-noted.
 
-### 51. [ROADMAP — group commit, RFC-034] NDB-06: explicit transactions hold the writer lock through think-time.
+### 51. [PARTIALLY ADDRESSED — auto-commit group commit in 2.3.0; explicit-tx lock unchanged by design] NDB-06: explicit transactions hold the writer lock through think-time.
 
 Accurate by design today (single writer per namespace; BEGIN holds it to COMMIT,
-NAMIDB_BOLT_MAX_TX_LIFETIME caps it). The fix is group commit (RFC-034) — staged
-batches + one commit pipeline — which also addresses item 52. Weeks, not this cycle.
+NAMIDB_BOLT_MAX_TX_LIFETIME caps it). RFC-034's own resolution for explicit
+transactions stands: they remain a serialized, think-time-bounded path on purpose —
+group commit targets the auto-commit paths (shipped in 2.3.0, see item 52). The
+per-tenant mitigation stays "keep transactions short / make the graph rebuildable",
+which the field team had already adopted.
 
-### 52. [ROADMAP — same RFC-034 work] NDB-07: serialized commit floor ~309 nodes/s at batch 1.
+### 52. [DONE — group commit lands in 2.3.0, opt-in window] NDB-07: serialized commit floor ~309 nodes/s at batch 1.
 
 Accurate: ~3 ms/commit = two object-store round trips, so throughput scales only with
 batch size (their own table shows 63.9k nodes/s at batch 5000). Not a defect of the
 ingest path (which batches by design); interactive single-row writes need group commit.
+
+**2.3.0 addendum — group commit shipped (RFC-034 "many stagers, one committer").**
+Storage grew request scopes over the staged batch (begin/commit/rollback_staged_request:
+mark-based truncation, RYOW-overlay rebuild by replay, and a request-scoped unique-index
+undo layer whose merge preserves first-touch pre-batch values — the subtle
+A-moves-tuple-then-B-touches-it case is regression-tested). The server runs one
+committer per namespace: requests stage under the writer lock, register a waiter keyed
+by their last staged LSN while still holding the lock (no stage/commit race), and ACK
+only after the merged commit is durable and the snapshot republished. Wired into the
+single-tenant HTTP and Bolt auto-commit paths; multi-tenant + a per-namespace committer
+in the registry is the sized follow-up. Default window 0s = inline commits, bit-for-bit
+today's behaviour — the knob is the rollout kill-switch RFC-034 asked for. Tests follow
+the RFC's plan: commit coalescing proven by manifest-version counting, concurrent-MERGE
+isolation, solo rollback of a failed statement, Bolt-path ACK+RYOW. Fault-injected CAS
+failure (shared fate) remains a test-harness follow-up; the error path reuses the
+inline path's discard+recover machinery.
 
 ### 53. [DONE — lands in 2.2.0] NDB-08: Docker image crash-loops on a named volume at /var/lib/namidb.
 

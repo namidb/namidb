@@ -148,6 +148,112 @@ async fn handshake(stream: &mut TcpStream) {
     assert_eq!(reply, [0, 0, 4, 5], "expected Bolt 5.4 negotiated");
 }
 
+/// Boot with RFC-034 group commit enabled (2 ms window) — exercises the
+/// committer task `run()` spawns plus the Bolt grouped auto-commit path.
+async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bolt_addr = listener.local_addr().unwrap();
+    drop(listener);
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    drop(http_listener);
+    let config = namidb_server::Config {
+        store_uri: format!("memory://{ns}"),
+        listen: http_addr,
+        auth_token: Some("test-token".into()),
+        auth_tokens_file: None,
+        no_auth: false,
+        backup_target_uri: None,
+        group_commit_window: Duration::from_millis(2),
+        #[cfg(feature = "jwt")]
+        jwt: None,
+        #[cfg(feature = "pdp")]
+        pdp_url: None,
+        flush_interval: Duration::ZERO,
+        compaction_interval: Duration::ZERO,
+        sweep_min_age: Duration::ZERO,
+        sweep_delete: false,
+        bolt_listen: Some(bolt_addr),
+        bolt_max_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        bolt_tx_timeout: Duration::ZERO,
+        query_timeout: Duration::from_secs(30),
+        write_timeout: Duration::from_secs(30),
+        query_row_cap: 0,
+        compaction_l0_trigger: 0,
+        write_stall_l0: 0,
+        write_stall_delay: Duration::ZERO,
+        memtable_flush_bytes: 0,
+        memtable_stall_bytes: 0,
+        writer_lock_timeout: Duration::from_secs(5),
+        tls_cert: None,
+        tls_key: None,
+        slow_query_threshold: Duration::ZERO,
+        multi_tenant: false,
+        default_namespace: ns.to_string(),
+        max_namespaces: 100,
+        namespace_idle_timeout: Duration::from_secs(3600),
+    };
+    let task = tokio::spawn(async move {
+        if let Err(e) = namidb_server::run(config).await {
+            eprintln!("server exited: {e}");
+        }
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(bolt_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (bolt_addr, task)
+}
+
+/// RFC-034 over Bolt: grouped auto-commit writes ACK durable and are
+/// immediately readable on the same connection; a failing statement rolls
+/// back alone and later writes keep working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bolt_grouped_writes_ack_and_stay_readable() {
+    let (bolt_addr, task) = boot_bolt_grouped("bolt-grouped").await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    for i in 0..5 {
+        pull_all(&mut stream, &format!("CREATE (:G {{i: {i}}})")).await;
+    }
+    let (_, rows) = pull_all(&mut stream, "MATCH (g:G) RETURN count(g) AS c").await;
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(5)), "{rows:?}");
+
+    // A failing statement (staged rows + eval error) rolls back alone.
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("CREATE (:G {i: 99}) WITH 1/0 AS x RETURN x".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    assert!(
+        matches!(recv_msg(&mut stream).await, Response::Failure(_)),
+        "the failing statement must FAIL"
+    );
+    let reset = Value::Struct {
+        tag: struct_tag::RESET,
+        fields: vec![],
+    };
+    send_msg(&mut stream, &pack(&reset)).await;
+    assert!(matches!(recv_msg(&mut stream).await, Response::Success(_)));
+    let (_, rows) = pull_all(&mut stream, "MATCH (g:G) RETURN count(g) AS c").await;
+    assert_eq!(
+        rows[0].get("c"),
+        Some(&Value::Int(5)),
+        "the failed statement's row must not be durable: {rows:?}"
+    );
+
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
 /// Boot a MULTI-TENANT server with a Bolt listener and a tokens file.
 async fn boot_bolt_multi(
     ns_prefix: &str,
@@ -168,6 +274,7 @@ async fn boot_bolt_multi(
         auth_tokens_file: Some(tokens_path),
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -531,6 +638,7 @@ async fn boot_bolt_config(
         auth_tokens_file: None,
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -596,6 +704,7 @@ async fn boot_bolt_tokens(
         auth_tokens_file: Some(tokens_path),
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -850,6 +959,7 @@ async fn bolt_create_then_match_roundtrip() {
         auth_tokens_file: None,
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -942,6 +1052,7 @@ async fn bolt_bad_token_yields_failure() {
         auth_tokens_file: None,
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
@@ -1112,6 +1223,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         auth_tokens_file: None,
         no_auth: false,
         backup_target_uri: None,
+        group_commit_window: Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]

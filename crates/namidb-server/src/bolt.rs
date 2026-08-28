@@ -813,6 +813,17 @@ impl ServerBackend {
             // below is deliberately NOT selected against cancellation — once
             // WAL/manifest publication starts it must run to a definite
             // outcome before this guard can be released.
+            // RFC-034: under group commit, a statement failure or a client
+            // disconnect rolls back ONLY this request's staged rows —
+            // `discard_batch` would take earlier group members' rows with it.
+            let group = self.state.group_commit.clone();
+            let mark = group.as_ref().map(|_| writer.begin_staged_request());
+            let discard_request = |writer: &mut namidb_storage::WriterSession| match mark {
+                Some(mark) => writer.rollback_staged_request(mark),
+                None => {
+                    writer.discard_batch();
+                }
+            };
             let staged = {
                 let apply = execute_write_staged_with_deadline(
                     &plan,
@@ -829,7 +840,7 @@ impl ServerBackend {
             let outcome = match staged {
                 Some(Ok(outcome)) => outcome,
                 Some(Err(error)) => {
-                    writer.discard_batch();
+                    discard_request(&mut writer);
                     crate::recovery::recover_after_write_error(
                         &mut writer,
                         &self.state.snapshot,
@@ -846,16 +857,57 @@ impl ServerBackend {
                     };
                 }
                 None => {
-                    writer.discard_batch();
+                    discard_request(&mut writer);
                     drop(writer);
                     return disconnected_observation(started, Some(QueryKind::Write));
                 }
             };
 
             if cancellation.is_cancelled() {
-                writer.discard_batch();
+                discard_request(&mut writer);
                 drop(writer);
                 return disconnected_observation(started, Some(QueryKind::Write));
+            }
+
+            if let Some(group) = group {
+                // Grouped durability: register while still holding the lock,
+                // release, and await the group's single commit. Once
+                // registered the rows belong to the group — a disconnect no
+                // longer revokes them, mirroring the inline path's
+                // non-cancellable commit tail.
+                writer.commit_staged_request();
+                let lsn = writer.staged_last_lsn().unwrap_or(0);
+                let ack = group.register(lsn);
+                let stall = self.state.after_commit_backpressure(&writer);
+                drop(writer);
+                group.notify_committer();
+                let acked = ack.await;
+                let elapsed = started.elapsed();
+                let result = match acked {
+                    Ok(Ok(())) => Ok(write_run_outcome(outcome)),
+                    Ok(Err(shared)) => Err(map_exec_err_ref(shared.0.as_ref())),
+                    Err(_) => Err(BackendError::Other(
+                        "group commit coordinator exited".into(),
+                    )),
+                };
+                if result.is_ok() {
+                    if let Some(delay) = stall {
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancellation.cancelled() => {
+                                return disconnected_observation(
+                                    started,
+                                    Some(QueryKind::Write),
+                                );
+                            }
+                        }
+                    }
+                }
+                return RunObservation {
+                    kind: Some(QueryKind::Write),
+                    elapsed,
+                    result,
+                };
             }
 
             match writer.commit_batch().await {
@@ -1502,6 +1554,12 @@ fn map_lower_err(e: LowerError) -> BackendError {
 }
 
 fn map_exec_err(e: ExecError) -> BackendError {
+    map_exec_err_ref(&e)
+}
+
+/// [`map_exec_err`] over a borrowed error — group commit hands every waiter
+/// the same `Arc`'d failure, which cannot be moved out.
+fn map_exec_err_ref(e: &ExecError) -> BackendError {
     // A deliberately-unsupported feature surfaces as the typed
     // `BackendError::Unsupported` (Neo.ClientError.Statement.NotSupported),
     // not a generic eval/storage bucket — so a driver can tell "not
@@ -1513,7 +1571,7 @@ fn map_exec_err(e: ExecError) -> BackendError {
     match e {
         // A constraint violation has its own Neo4j error class so drivers
         // can distinguish it from an ordinary evaluation error.
-        ExecError::Constraint(m) => BackendError::Constraint(m),
+        ExecError::Constraint(m) => BackendError::Constraint(m.clone()),
         // Deterministic budgets get their own ClientError classes: a driver
         // must be able to tell "this query is too expensive" from "this
         // query is malformed" without string-matching the message, and must

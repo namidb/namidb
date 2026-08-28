@@ -302,6 +302,20 @@ wire (GQL-aware drivers show the `50N42` polyfill for every failure); the
 | `Rel`                 | `{"_kind": "rel", "edge_type", "src", "dst", "properties"}` |
 | `Path`                | array of alternating node/rel objects |
 
+## Group commit (RFC-034)
+
+`--group-commit-window` / `NAMIDB_GROUP_COMMIT_WINDOW` (default `0s` =
+disabled) coalesces concurrently arriving auto-commit writes into one WAL
+append + one manifest CAS: requests stage under the writer lock, register a
+waiter, and are ACKed only after the group's single commit is durable and
+the snapshot republished — read-your-own-writes is preserved, and a
+statement failure rolls back alone. With the window at zero every write
+commits inline, exactly as before. On real object storage (5-15 ms per
+commit round-trip same-region) a `2ms`-`5ms` window lifts the interactive
+write floor from ~1/commit-RTT to roughly group-size/commit-RTT; grouped
+writes share fate on a commit failure (one merged WAL segment cannot be
+partially durable). Single-tenant only for now.
+
 ## Concurrency model
 
 `namidb-server` opens one `WriterSession` per process and serialises

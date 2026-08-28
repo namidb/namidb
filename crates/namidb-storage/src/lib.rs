@@ -70,7 +70,7 @@ pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
 pub use ingest::{
-    clear_shared_caches, prune_shared_caches, CommitOutcome, SessionCaches, StagedValue,
+    clear_shared_caches, prune_shared_caches, CommitOutcome, SessionCaches, StageMark, StagedValue,
     WriterSession,
 };
 pub use janitor::{sweep_orphans, JanitorReport};

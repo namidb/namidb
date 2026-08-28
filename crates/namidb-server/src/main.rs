@@ -48,6 +48,19 @@ struct Cli {
     #[arg(long, env = "NAMIDB_NO_AUTH", default_value_t = false, action)]
     no_auth: bool,
 
+    /// Group-commit coalescing window (RFC-034): concurrently arriving
+    /// writes share one WAL append + manifest CAS, lifting the interactive
+    /// write floor at the cost of up to this much extra latency per lone
+    /// write. `0s` (the default) keeps inline per-request commits.
+    /// Recommended starting point on real object storage: `2ms`-`5ms`.
+    #[arg(
+        long,
+        env = "NAMIDB_GROUP_COMMIT_WINDOW",
+        default_value = "0s",
+        value_parser = humantime::parse_duration,
+    )]
+    group_commit_window: Duration,
+
     /// Enable `POST /v0/admin/backup` and restrict its destinations: the
     /// request's `to` URI must equal this prefix or extend it at a `/` (or
     /// `?ns=` query) boundary, e.g. `s3://backups-bucket/namidb`. Unset =
@@ -350,6 +363,7 @@ fn main() -> anyhow::Result<()> {
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
         no_auth: cli.no_auth,
+        group_commit_window: cli.group_commit_window,
         backup_target_uri: cli.backup_target_uri,
         #[cfg(feature = "jwt")]
         jwt: cli

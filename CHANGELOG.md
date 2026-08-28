@@ -16,6 +16,15 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- Group commit (RFC-034): `--group-commit-window` /
+  `NAMIDB_GROUP_COMMIT_WINDOW` (default `0s` = off, inline commits exactly
+  as before) coalesces concurrently arriving writes into one WAL append +
+  one manifest CAS. Writes ACK only after the group's commit is durable
+  and the snapshot republished (read-your-own-writes preserved); a
+  statement failure rolls back alone; grouped writes share fate on a
+  commit failure. Lifts the interactive write floor — previously ~1
+  commit-round-trip per request (~309 nodes/s at 3 ms RTT in the field
+  report) — to roughly group-size per round-trip. Single-tenant only.
 - Multi-tenant Bolt: with `--multi-tenant`, the Bolt listener now starts
   and statements route to the namespace named by the driver's
   `database=` session parameter (the Bolt `db` field of RUN/BEGIN),
