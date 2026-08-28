@@ -656,7 +656,12 @@ row order preserved, engaged only when uncapped so LIMIT-pushdown prefix semanti
 stay untouched. Implementing it surfaced ANOTHER pre-existing trail bug: nodes(p)
 filled every intermediate hop with the pre-bound endpoint value (a 2-hop path
 returned ["n0","n2","n2"]) — fixed in both the grouped and per-seed paths by looking
-up the node actually reached. Bidirectional meet-in-the-middle stays roadmap.
+up the node actually reached. Bidirectional meet-in-the-middle shipped next:
+single bound pairs in First mode expand the smaller frontier from either end
+(reverse side flips the pattern direction), with first-arrival parent maps for
+reconstruction, the classical df+db >= best stopping criterion for exactness, and
+a route-telemetry counter so tests assert the route actually engages (parity alone
+would pass on the unidirectional route too).
 
 ### 48. [DONE — lands in 2.2.0] NDB-05: reduce() does not parse.
 

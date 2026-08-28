@@ -19,6 +19,7 @@ static VECTOR_NATIVE: AtomicU64 = AtomicU64::new(0);
 static VECTOR_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static PROPERTY_NATIVE: AtomicU64 = AtomicU64::new(0);
 static PROPERTY_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static SHORTEST_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one text index search outcome: `native = true` when the index
 /// served the answer, `false` when it declined (freshness gate, missing or
@@ -55,6 +56,14 @@ pub fn record_property(native: bool) {
     }
 }
 
+/// Record one bidirectional (meet-in-the-middle) shortestPath execution.
+/// Same reachability rationale: a single-pair `shortestPath` silently taking
+/// the unidirectional route instead would be invisible to result-parity
+/// tests, so the executor stamps the route it actually took.
+pub fn record_shortest_bidirectional() {
+    SHORTEST_BIDIRECTIONAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A monotonic snapshot of every route counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteTelemetrySnapshot {
@@ -64,6 +73,7 @@ pub struct RouteTelemetrySnapshot {
     pub vector_fallback: u64,
     pub property_native: u64,
     pub property_fallback: u64,
+    pub shortest_bidirectional: u64,
 }
 
 pub fn snapshot() -> RouteTelemetrySnapshot {
@@ -74,6 +84,7 @@ pub fn snapshot() -> RouteTelemetrySnapshot {
         vector_fallback: VECTOR_FALLBACK.load(Ordering::Relaxed),
         property_native: PROPERTY_NATIVE.load(Ordering::Relaxed),
         property_fallback: PROPERTY_FALLBACK.load(Ordering::Relaxed),
+        shortest_bidirectional: SHORTEST_BIDIRECTIONAL.load(Ordering::Relaxed),
     }
 }
 

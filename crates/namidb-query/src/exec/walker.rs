@@ -1957,6 +1957,195 @@ pub(crate) async fn execute_expand(
     Ok(out)
 }
 
+/// Flip a pattern direction for the reverse side of a bidirectional BFS.
+fn flip_direction(direction: RelationshipDirection) -> RelationshipDirection {
+    match direction {
+        RelationshipDirection::Right => RelationshipDirection::Left,
+        RelationshipDirection::Left => RelationshipDirection::Right,
+        RelationshipDirection::Both => RelationshipDirection::Both,
+    }
+}
+
+/// Meet-in-the-middle BFS for one `(src, dst)` pair in `First` mode.
+/// Expands the SMALLER frontier each round (the reverse side flips the
+/// pattern direction), records first-arrival parents per side, and keeps
+/// expanding until the classical stopping criterion (`df + db >= best
+/// total`) proves the best meet is exactly shortest. A shortest walk is
+/// necessarily simple, so relationship-uniqueness holds by construction.
+/// Returns the `(trail, rel_values)` hit, or `None` when unreachable
+/// within `max` hops.
+#[allow(clippy::too_many_arguments)]
+async fn bidirectional_first_path(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    src: NodeId,
+    dst: NodeId,
+    max: u32,
+    edge_read_mode: EdgeReadMode,
+    materialise_trail: bool,
+    src_value: Option<RuntimeValue>,
+    dst_value: Option<NodeValue>,
+) -> Result<Option<(Vec<RuntimeValue>, Vec<RuntimeValue>)>, ExecError> {
+    use std::collections::HashMap;
+    struct Side {
+        depth: u32,
+        frontier: Vec<NodeId>,
+        visited: HashMap<NodeId, u32>,
+        parents: HashMap<NodeId, (NodeId, EdgeView)>,
+    }
+    async fn expand_level(
+        side: &mut Side,
+        other: &Side,
+        snapshot: &Snapshot<'_>,
+        edge_types: &[String],
+        dir: RelationshipDirection,
+        edge_read_mode: EdgeReadMode,
+        best: &mut Option<(u32, NodeId)>,
+    ) -> Result<(), ExecError> {
+        let new_depth = side.depth + 1;
+        let mut next = Vec::new();
+        for index in 0..side.frontier.len() {
+            crate::exec::limits::check_deadline()?;
+            let node = side.frontier[index];
+            let neighbours =
+                neighbours_of_any(snapshot, edge_types, dir, node, edge_read_mode).await?;
+            for edge in neighbours {
+                let partner = partner_id(&edge, dir, node);
+                if side.visited.contains_key(&partner) {
+                    continue;
+                }
+                side.visited.insert(partner, new_depth);
+                side.parents.insert(partner, (node, edge));
+                if let Some(&other_depth) = other.visited.get(&partner) {
+                    let total = new_depth + other_depth;
+                    if best.is_none_or(|(current, _)| total < current) {
+                        *best = Some((total, partner));
+                    }
+                }
+                next.push(partner);
+            }
+        }
+        side.frontier = next;
+        side.depth = new_depth;
+        Ok(())
+    }
+
+    let mut fwd = Side {
+        depth: 0,
+        frontier: vec![src],
+        visited: HashMap::from([(src, 0)]),
+        parents: HashMap::new(),
+    };
+    let mut bwd = Side {
+        depth: 0,
+        frontier: vec![dst],
+        visited: HashMap::from([(dst, 0)]),
+        parents: HashMap::new(),
+    };
+    let flipped = flip_direction(direction);
+    let mut best: Option<(u32, NodeId)> = None;
+    loop {
+        let reach = fwd.depth + bwd.depth;
+        if let Some((total, _)) = best {
+            if reach >= total {
+                break;
+            }
+        }
+        if reach >= max || fwd.frontier.is_empty() || bwd.frontier.is_empty() {
+            break;
+        }
+        if fwd.frontier.len() <= bwd.frontier.len() {
+            expand_level(
+                &mut fwd,
+                &bwd,
+                snapshot,
+                edge_types,
+                direction,
+                edge_read_mode,
+                &mut best,
+            )
+            .await?;
+        } else {
+            expand_level(
+                &mut bwd,
+                &fwd,
+                snapshot,
+                edge_types,
+                flipped,
+                edge_read_mode,
+                &mut best,
+            )
+            .await?;
+        }
+    }
+    let Some((total, meet)) = best else {
+        return Ok(None);
+    };
+    if total > max || total == 0 {
+        return Ok(None);
+    }
+
+    // Reconstruct src -> dst: walk parents from the meet outward on both
+    // sides. The reverse side's edges were traversed against the pattern
+    // direction, but carry their STORED orientation, so the rel values are
+    // correct as-is.
+    let mut nodes: Vec<NodeId> = vec![meet];
+    let mut edges: Vec<EdgeView> = Vec::new();
+    let mut cursor = meet;
+    while cursor != src {
+        let (parent, edge) = fwd
+            .parents
+            .get(&cursor)
+            .expect("forward parent chain")
+            .clone();
+        edges.push(edge);
+        nodes.push(parent);
+        cursor = parent;
+    }
+    nodes.reverse();
+    edges.reverse();
+    let mut cursor = meet;
+    while cursor != dst {
+        let (parent, edge) = bwd
+            .parents
+            .get(&cursor)
+            .expect("backward parent chain")
+            .clone();
+        edges.push(edge);
+        nodes.push(parent);
+        cursor = parent;
+    }
+    debug_assert_eq!(edges.len() as u32, total);
+
+    let rel_values: Vec<RuntimeValue> = edges
+        .into_iter()
+        .map(|edge| RuntimeValue::Rel(Box::new(RelValue::from(edge))))
+        .collect();
+    let trail = if materialise_trail {
+        let mut trail = Vec::with_capacity(nodes.len() * 2 - 1);
+        for (index, node) in nodes.iter().enumerate() {
+            if index > 0 {
+                trail.push(rel_values[index - 1].clone());
+            }
+            let value = if *node == src {
+                src_value.clone()
+            } else if *node == dst {
+                dst_value.clone().map(|nv| RuntimeValue::Node(Box::new(nv)))
+            } else {
+                scan_node_for_id(snapshot, *node)
+                    .await?
+                    .map(|view| RuntimeValue::Node(Box::new(NodeValue::from(view))))
+            };
+            trail.push(value.unwrap_or(RuntimeValue::Null));
+        }
+        trail
+    } else {
+        Vec::new()
+    };
+    Ok(Some((trail, rel_values)))
+}
+
 /// Seed-grouped shortestPath/allShortestPaths execution: one pruned
 /// multi-target BFS per run of consecutive seed rows sharing a source node,
 /// serving every bound target of the run. Row order (and therefore output
@@ -2053,6 +2242,47 @@ async fn execute_expand_shortest_grouped(
             hits.entry(starting)
                 .or_default()
                 .push((initial_trail.clone(), Vec::new()));
+        }
+
+        // NDB-09 final follow-up: ONE bound pair in `First` mode takes the
+        // bidirectional meet-in-the-middle BFS — O(deg^(d/2)) frontier per
+        // side instead of O(deg^d) — with exactness guaranteed by the
+        // classical stopping criterion (expand until df + db >= best meet).
+        // Multi-target groups, `All` mode, `min >= 2`, and self-pairs keep
+        // the unidirectional visited BFS below.
+        if shortest == crate::plan::ShortestMode::First
+            && min <= 1
+            && max > 1
+            && remaining.len() == 1
+        {
+            let target = *remaining.iter().next().expect("len checked");
+            if target != starting {
+                namidb_storage::route_telemetry::record_shortest_bidirectional();
+                let src_value = run[0].get(source).cloned();
+                let dst_value = run.iter().find_map(|row| match row.get(target_alias) {
+                    Some(RuntimeValue::Node(n)) if n.id == target => Some(n.as_ref().clone()),
+                    _ => None,
+                });
+                if let Some(hit) = bidirectional_first_path(
+                    snapshot,
+                    edge_types,
+                    direction,
+                    starting,
+                    target,
+                    max,
+                    edge_read_mode,
+                    materialise_trail,
+                    src_value,
+                    dst_value,
+                )
+                .await?
+                {
+                    hits.insert(target, vec![hit]);
+                }
+                // Found or not, the pair is answered: the unidirectional
+                // loop below exits immediately on an empty `remaining`.
+                remaining.clear();
+            }
         }
 
         struct PathState {
