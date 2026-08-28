@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-08-28
+
 **Fixed**
 - `EXPLAIN` in the CLI's `run` and the embedded Python client rendered
   nothing and silently EXECUTED the query — an `EXPLAIN CREATE ...`
@@ -2860,7 +2862,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/namidb/namidb/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/namidb/namidb/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/namidb/namidb/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/namidb/namidb/compare/v2.2.0...v2.2.1
