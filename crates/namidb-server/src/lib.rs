@@ -1428,8 +1428,85 @@ fn exec_error_classification(
             (StatusCode::PAYLOAD_TOO_LARGE, Some("search_document_limit"))
         }
         other if other.is_unsupported() => (StatusCode::BAD_REQUEST, Some("unsupported")),
+        // A runtime evaluation error (division by zero, missing $parameter,
+        // type mismatch) is the caller's program being wrong, not a server
+        // fault — a 400, not a 500.
+        ExecError::Eval(_) => (StatusCode::BAD_REQUEST, Some("eval_error")),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
     }
+}
+
+/// Wire-stable error taxonomy for HTTP bodies, mirroring the Bolt FAILURE
+/// codes: a dotted Neo4j-shaped class (retry semantics live in the second
+/// segment — `TransientError` is safe to retry, `ClientError` is not) and a
+/// GQLSTATUS/SQLSTATE-class status per error family (42001 syntax, 42000
+/// semantic, 0A000 not supported, 22000 evaluation, 23000 constraint,
+/// 57014 timeout, 54000 result-limit, 53000 insufficient resources, 50N42
+/// unclassified). Bolt <= 5.4 cannot carry GQLSTATUS on the wire — GQL-aware
+/// drivers polyfill every FAILURE with 50N42 — so the HTTP body is where a
+/// client reads the per-family status today.
+fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'static str) {
+    use namidb_query::exec::ExecError;
+    match e {
+        ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+        ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
+        ExecError::Constraint(_) => {
+            ("Neo.ClientError.Schema.ConstraintValidationFailed", "23000")
+        }
+        ExecError::Storage(
+            namidb_storage::Error::SearchResultLimitExceeded { .. }
+            | namidb_storage::Error::SearchDocumentLimitExceeded { .. },
+        ) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
+        ExecError::Storage(_) => ("Neo.TransientError.General.DatabaseUnavailable", "53000"),
+        other if other.is_unsupported() => ("Neo.ClientError.Statement.NotSupported", "0A000"),
+        ExecError::Eval(_) => ("Neo.ClientError.Statement.ArgumentError", "22000"),
+        ExecError::Runtime(_) => ("Neo.DatabaseError.General.UnknownError", "50N42"),
+    }
+}
+
+/// 400 response for a statement rejected before execution (parse or plan),
+/// carrying the same machine-readable taxonomy fields as executor failures.
+fn statement_rejected_response(
+    error: String,
+    code: &'static str,
+    neo4j_code: &'static str,
+    gql_status: &'static str,
+) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": error,
+            "code": code,
+            "neo4j_code": neo4j_code,
+            "gql_status": gql_status,
+        })),
+    )
+        .into_response()
+}
+
+fn parse_error_response(error: String) -> Response {
+    statement_rejected_response(
+        error,
+        "parse_error",
+        "Neo.ClientError.Statement.SyntaxError",
+        "42001",
+    )
+}
+
+fn plan_error_response(e: &namidb_query::LowerError) -> Response {
+    let (code, neo4j_code, gql_status) = match e.kind {
+        namidb_query::LowerErrorKind::UnsupportedFeature => (
+            "unsupported",
+            "Neo.ClientError.Statement.NotSupported",
+            "0A000",
+        ),
+        _ => (
+            "plan_error",
+            "Neo.ClientError.Statement.SemanticError",
+            "42000",
+        ),
+    };
+    statement_rejected_response(format!("plan error: {e}"), code, neo4j_code, gql_status)
 }
 
 /// Build an HTTP error response from an executor failure, classifying it so a
@@ -1604,10 +1681,22 @@ fn collect_route_notes(
 
 fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Response {
     let (status, code) = exec_error_classification(e);
+    let (neo4j_code, gql_status) = exec_error_taxonomy(e);
     let error = format!("{prefix}: {e}");
+    // `code` stays absent on unclassified 500s (loose clients see no new
+    // requirement there); the taxonomy fields are additive everywhere.
     let body = match code {
-        Some(c) => Json(serde_json::json!({ "error": error, "code": c })),
-        None => Json(serde_json::json!({ "error": error })),
+        Some(c) => Json(serde_json::json!({
+            "error": error,
+            "code": c,
+            "neo4j_code": neo4j_code,
+            "gql_status": gql_status,
+        })),
+        None => Json(serde_json::json!({
+            "error": error,
+            "neo4j_code": neo4j_code,
+            "gql_status": gql_status,
+        })),
     };
     (status, body).into_response()
 }
@@ -2664,13 +2753,10 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 kind: None,
                 ok: false,
                 elapsed: started.elapsed(),
-                response: (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody {
-                        error: format!("parse error: {} at {}", first.message, first.span),
-                    }),
-                )
-                    .into_response(),
+                response: parse_error_response(format!(
+                    "parse error: {} at {}",
+                    first.message, first.span
+                )),
             };
         }
     };
@@ -2837,13 +2923,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 kind: None,
                 ok: false,
                 elapsed: started.elapsed(),
-                response: (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody {
-                        error: format!("plan error: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: plan_error_response(&e),
             };
         }
     };
@@ -3271,13 +3351,10 @@ async fn run_cypher_multi(
                 kind: None,
                 ok: false,
                 elapsed: started.elapsed(),
-                response: (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody {
-                        error: format!("parse error: {} at {}", first.message, first.span),
-                    }),
-                )
-                    .into_response(),
+                response: parse_error_response(format!(
+                    "parse error: {} at {}",
+                    first.message, first.span
+                )),
             };
         }
     };
@@ -3445,13 +3522,7 @@ async fn run_cypher_multi(
                 kind: None,
                 ok: false,
                 elapsed: started.elapsed(),
-                response: (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody {
-                        error: format!("plan error: {e}"),
-                    }),
-                )
-                    .into_response(),
+                response: plan_error_response(&e),
             };
         }
     };
@@ -4379,6 +4450,65 @@ mod tests {
         assert!(json["error"]
             .as_str()
             .is_some_and(|message| message.contains("NAMIDB_BM25_MAX_DOCUMENT_BYTES")));
+    }
+
+    /// NDB-03: resource exhaustion carries its own taxonomy — a client must
+    /// be able to tell "too expensive" from "malformed" without string
+    /// matching, on both the `code` and the Neo4j/GQL-shaped fields.
+    #[tokio::test]
+    async fn timeout_response_exposes_taxonomy_fields() {
+        let response =
+            exec_failure_response("read execution failed", &namidb_query::exec::ExecError::Timeout);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "timeout");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.ClientError.Transaction.TransactionTimedOut"
+        );
+        assert_eq!(json["gql_status"], "57014");
+
+        let response = exec_failure_response(
+            "read execution failed",
+            &namidb_query::exec::ExecError::RowCap(1_000_000),
+        );
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "row_cap");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.ClientError.Statement.ResourceLimitExceeded"
+        );
+        assert_eq!(json["gql_status"], "54000");
+    }
+
+    /// NDB-03: a runtime evaluation error is the caller's program being
+    /// wrong — a 400 with the argument-error taxonomy, not a bare 500.
+    #[tokio::test]
+    async fn division_by_zero_is_a_client_error_with_taxonomy() {
+        let app = fixture(None).await;
+        let response = post_cypher(&app, None, "RETURN 1/0 AS x").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "eval_error");
+        assert_eq!(json["neo4j_code"], "Neo.ClientError.Statement.ArgumentError");
+        assert_eq!(json["gql_status"], "22000");
+    }
+
+    /// NDB-03: parse errors carry the syntax taxonomy in the HTTP body.
+    #[tokio::test]
+    async fn parse_error_carries_syntax_taxonomy() {
+        let app = fixture(None).await;
+        let response = post_cypher(&app, None, "MATCH (").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "parse_error");
+        assert_eq!(json["neo4j_code"], "Neo.ClientError.Statement.SyntaxError");
+        assert_eq!(json["gql_status"], "42001");
     }
 
     /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the

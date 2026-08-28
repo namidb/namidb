@@ -321,6 +321,21 @@ async fn boot_bolt_full(
     .await
 }
 
+/// Like [`boot_bolt`] but with a finite query row cap.
+async fn boot_bolt_row_cap(
+    ns: &str,
+    query_row_cap: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_config(
+        ns,
+        Duration::ZERO,
+        Duration::ZERO,
+        DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        query_row_cap,
+    )
+    .await
+}
+
 /// Like [`boot_bolt_full`] with an explicit authenticated-message ceiling.
 /// Keeping the limit in `Config` makes the test deterministic without mutating
 /// process-global environment variables while the integration suite runs in
@@ -330,6 +345,17 @@ async fn boot_bolt_with_message_limit(
     tx_timeout: Duration,
     query_timeout: Duration,
     bolt_max_message_bytes: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_config(ns, tx_timeout, query_timeout, bolt_max_message_bytes, 0).await
+}
+
+/// Bottom-level boot: every knob the taxonomy/limit tests need.
+async fn boot_bolt_config(
+    ns: &str,
+    tx_timeout: Duration,
+    query_timeout: Duration,
+    bolt_max_message_bytes: usize,
+    query_row_cap: usize,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bolt_addr = listener.local_addr().unwrap();
@@ -357,7 +383,7 @@ async fn boot_bolt_with_message_limit(
         bolt_tx_timeout: tx_timeout,
         query_timeout,
         write_timeout: query_timeout,
-        query_row_cap: 0,
+        query_row_cap,
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
         write_stall_delay: Duration::ZERO,
@@ -1255,12 +1281,66 @@ async fn bolt_read_query_times_out() {
     };
     send_msg(&mut stream, &pack(&run)).await;
     let resp = recv_msg(&mut stream).await;
-    assert!(
-        matches!(resp, Response::Failure(_)),
-        "a read past its 1ns budget must fail, got {resp:?}"
+    let meta = match resp {
+        Response::Failure(meta) => meta,
+        other => panic!("a read past its 1ns budget must fail, got {other:?}"),
+    };
+    // The typed taxonomy: a timeout is its own ClientError class (a re-run
+    // would time out again, so drivers must NOT auto-retry it), never the
+    // Statement.ArgumentError bucket a malformed query gets.
+    assert_eq!(
+        meta.get("code"),
+        Some(&Value::String(
+            "Neo.ClientError.Transaction.TransactionTimedOut".into()
+        )),
+        "timeout FAILURE code: {meta:?}"
     );
 
     // Session is FAILED after the error; just drop the connection.
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+#[tokio::test]
+async fn bolt_row_cap_failure_has_resource_limit_code() {
+    // Row cap 1: any two-row read exceeds it deterministically.
+    let (bolt_addr, task) = boot_bolt_row_cap("bolt-rowcap", 1).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    for query in ["CREATE (:Person {name: 'Ada'})", "CREATE (:Person {name: 'Bo'})"] {
+        pull_all(&mut stream, query).await;
+    }
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("MATCH (p:Person) RETURN p.name AS name".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let resp = recv_msg(&mut stream).await;
+    let meta = match resp {
+        Response::Failure(meta) => meta,
+        other => panic!("a read past the row cap must fail, got {other:?}"),
+    };
+    assert_eq!(
+        meta.get("code"),
+        Some(&Value::String(
+            "Neo.ClientError.Statement.ResourceLimitExceeded".into()
+        )),
+        "row-cap FAILURE code: {meta:?}"
+    );
+    match meta.get("message") {
+        Some(Value::String(message)) => {
+            assert!(message.contains("row cap"), "message: {message}")
+        }
+        other => panic!("FAILURE missing message: {other:?}"),
+    }
+
     stream.shutdown().await.ok();
     task.abort();
 }

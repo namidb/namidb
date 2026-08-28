@@ -221,6 +221,41 @@ curl -s -X POST http://127.0.0.1:8080/v0/cypher \
   | jq .
 ```
 
+### Error taxonomy
+
+Failed statements return a JSON body with machine-readable fields (since
+2.2.0) so a client can decide "fix the query" vs "back off" vs "retry"
+without string-matching the message:
+
+```json
+{
+  "error": "read execution failed: query exceeded the configured timeout",
+  "code": "timeout",
+  "neo4j_code": "Neo.ClientError.Transaction.TransactionTimedOut",
+  "gql_status": "57014"
+}
+```
+
+| Condition | HTTP | `code` | `neo4j_code` | `gql_status` |
+|---|---|---|---|---|
+| Syntax error | 400 | `parse_error` | `Neo.ClientError.Statement.SyntaxError` | `42001` |
+| Semantic/plan error | 400 | `plan_error` | `Neo.ClientError.Statement.SemanticError` | `42000` |
+| Feature not supported | 400 | `unsupported` | `Neo.ClientError.Statement.NotSupported` | `0A000` |
+| Runtime evaluation error (division by zero, missing `$param`, type mismatch) | 400 | `eval_error` | `Neo.ClientError.Statement.ArgumentError` | `22000` |
+| Unique-constraint violation | 409 | `constraint` | `Neo.ClientError.Schema.ConstraintValidationFailed` | `23000` |
+| Query timeout | 504 | `timeout` | `Neo.ClientError.Transaction.TransactionTimedOut` | `57014` |
+| Row cap / search result caps | 413 | `row_cap`, `search_result_limit`, `search_document_limit` | `Neo.ClientError.Statement.ResourceLimitExceeded` | `54000` |
+| Transient resource pressure | 503 | `search_index_cache_capacity`, `search_workspace_capacity` | `Neo.TransientError.General.DatabaseUnavailable` | `53000` |
+| Unclassified server fault | 500 | — | `Neo.DatabaseError.General.UnknownError` | `50N42` |
+
+The same classes drive the Bolt `FAILURE` code, so official Neo4j drivers —
+which auto-retry `Neo.TransientError.*` and nothing else — retry exactly the
+transient conditions. Deterministic budgets (timeout, row cap) are
+`ClientError` **on purpose**: a re-run exceeds the same budget again, so
+auto-retrying them is a retry livelock. Bolt ≤ 5.4 has no GQLSTATUS on the
+wire (GQL-aware drivers show the `50N42` polyfill for every failure); the
+`gql_status` field in the HTTP body is the per-family status.
+
 ## Type mapping (JSON and Cypher)
 
 | Cypher `RuntimeValue` | JSON |
