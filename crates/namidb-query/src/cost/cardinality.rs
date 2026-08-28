@@ -203,6 +203,38 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
+        LogicalPlan::NodeByPropertyTuple {
+            input,
+            label,
+            alias,
+            properties,
+            ..
+        } => {
+            let child = estimate_inner(input, catalog);
+            // A tuple lookup is at least as selective as its most selective
+            // member; multiplying member selectivities would assume
+            // independence the stats cannot prove, so take the min fanout.
+            let fanout = properties
+                .iter()
+                .map(|property| property_lookup_fanout(catalog, label, property))
+                .fold(f64::INFINITY, f64::min);
+            let fanout = if fanout.is_finite() { fanout } else { 1.0 };
+            let rows = child.rows * fanout;
+            let mut bindings = child.bindings.clone();
+            bindings.insert(
+                alias.clone(),
+                BindingMeta {
+                    label: (!label.is_empty()).then(|| label.clone()),
+                    ..Default::default()
+                },
+            );
+            Cardinality {
+                rows,
+                bindings,
+                children: vec![child],
+                operator: plan.operator_name(),
+            }
+        }
         LogicalPlan::Expand {
             input,
             edge_type,

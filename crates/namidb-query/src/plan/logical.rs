@@ -106,6 +106,26 @@ pub enum LogicalPlan {
         multi: bool,
     },
 
+    /// Fan-out lookup through a declared composite equality index
+    /// (`CREATE INDEX ON :L(a, b)`). `optimize::composite_lookup` emits
+    /// this when a scan's top-level equality conjuncts cover EVERY member
+    /// of a declared index; the executor probes
+    /// `Snapshot::indexed_node_ids_by_property_tuple` and keeps an exact
+    /// scan fallback for freshness declines, so results never depend on
+    /// sidecar coverage.
+    NodeByPropertyTuple {
+        input: Box<LogicalPlan>,
+        /// Explicit label scope (the declared index's label).
+        label: String,
+        alias: String,
+        /// Members in DECLARATION order — the tuple key layout, which is
+        /// why the rewrite reorders the matched conjuncts to the index
+        /// definition rather than source order.
+        properties: Vec<String>,
+        /// Member value expressions, aligned with `properties`.
+        values: Vec<Expression>,
+    },
+
     /// Expand `source` across an edge to produce `target_alias`.
     Expand {
         input: Box<LogicalPlan>,
@@ -513,6 +533,7 @@ impl LogicalPlan {
             }
             LogicalPlan::NodeById { input, .. }
             | LogicalPlan::NodeByPropertyValue { input, .. }
+            | LogicalPlan::NodeByPropertyTuple { input, .. }
             | LogicalPlan::Expand { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
@@ -570,6 +591,7 @@ impl LogicalPlan {
             LogicalPlan::NodeScan { .. } => "NodeScan",
             LogicalPlan::NodeById { .. } => "NodeById",
             LogicalPlan::NodeByPropertyValue { .. } => "NodeByPropertyValue",
+            LogicalPlan::NodeByPropertyTuple { .. } => "NodeByPropertyTuple",
             LogicalPlan::Expand { optional, .. } => {
                 if *optional {
                     "OptionalExpand"

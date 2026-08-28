@@ -517,6 +517,22 @@ any customer needs search on the managed tier.
   (`EqualityKeyEncoding::TupleV1` + flush/compaction harvesters +
   read-side tuple probe + planner conjunct-cover detection). Sized at
   ~3-4 weeks; roadmap.
+  **Follow-up shipped (2026-08-28, unreleased):** composite `CREATE
+  INDEX` is end-to-end. Schema DDL (`Schema::indexes` / `IndexDef`,
+  every surface incl. `SHOW INDEXES` and the CLI), TupleV1 posting
+  sidecars harvested at flush and re-emitted by compaction (whose
+  migration predicate makes DDL-triggered sweeps backfill pre-existing
+  SSTs), `Snapshot::indexed_node_ids_by_property_tuple` with the
+  freshness/authoritative-or-decline contract, and the
+  `NodeByPropertyTuple` planner rewrite (declaration-order
+  canonicalization, unique-conjunct priority, residual filters, exact
+  scan fallback). One deliberate semantic upgrade over the single-
+  property route: TupleV1 canonicalizes numeric members to f64 keys and
+  confirms with Cypher-coercing equality, so `30 = 30.0` matches
+  through the index — the executor's `is_equal` coerces, and typed keys
+  would have broken index/scan parity. Route observability:
+  `tuple_native`/`tuple_fallback` counters +
+  `namidb_tuple_lookup_route_total` on `/metrics`.
 - The OFFICIAL artifacts all ship `vector-index,text-index`: release
   binaries (release-binaries.yml `features:` line), the Docker image
   (Dockerfile bakes them), and the wheels (pyproject maturin features).

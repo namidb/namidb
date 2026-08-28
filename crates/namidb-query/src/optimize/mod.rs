@@ -314,7 +314,8 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
             out.insert(alias.clone());
         }
         LogicalPlan::NodeById { input, alias, .. }
-        | LogicalPlan::NodeByPropertyValue { input, alias, .. } => {
+        | LogicalPlan::NodeByPropertyValue { input, alias, .. }
+        | LogicalPlan::NodeByPropertyTuple { input, alias, .. } => {
             collect_produced(input, out);
             out.insert(alias.clone());
         }

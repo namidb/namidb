@@ -28,7 +28,7 @@ NamiDB is a graph engine built on object storage. You write Cypher; it lays your
 What you get out of the box:
 
 - **A property graph** you query with Cypher / GQL — `CALL { … }` subqueries (correlated and uncorrelated), `EXISTS { … }`, `FOREACH`, label disjunction `(n:A|B)`, and open-ended / parameterised variable-length paths (`*`, `*1..$n`).
-- **Schema when you want it** — `CREATE CONSTRAINT` for uniqueness (single- *and* multi-property), `NOT NULL`, and `CREATE INDEX` for equality lookups, with `IF NOT EXISTS` and `SHOW CONSTRAINTS` / `SHOW INDEXES`. Schema-optional: the engine enforces only what you declare.
+- **Schema when you want it** — `CREATE CONSTRAINT` for uniqueness (single- *and* multi-property), `NOT NULL`, and `CREATE INDEX` for equality lookups on one property or a composite tuple, with `IF NOT EXISTS` and `SHOW CONSTRAINTS` / `SHOW INDEXES`. Schema-optional: the engine enforces only what you declare.
 - **Vector search** — store embeddings as node properties and rank with
   `cosine_similarity`, or build a range-readable clustered ANN index for
   cosine, dot, *and* Euclidean. Full-precision vectors are fetched only for a
@@ -207,6 +207,10 @@ CREATE CONSTRAINT cfg_uq IF NOT EXISTS
 
 -- An equality index for fast point lookups.
 CREATE INDEX FOR (d:Doc) ON (d.slug);
+
+-- …or a composite index: `WHERE d.tenant = $t AND d.slug = $s` (either
+-- order) routes through one tuple lookup instead of a scan.
+CREATE INDEX doc_ts IF NOT EXISTS FOR (d:Doc) ON (d.tenant, d.slug);
 
 -- Introspect what's declared.
 SHOW CONSTRAINTS;

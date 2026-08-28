@@ -683,6 +683,45 @@ fn execute_write_inner_mode<'a>(
                 Ok(out)
             }
 
+            // Commit-first composite tuple lookup. The transactional overlay
+            // declines numeric tuples storage-side, and the helper keeps an
+            // exact scan fallback, so read-your-own-writes results stay
+            // exact regardless of sidecar coverage.
+            LogicalPlan::NodeByPropertyTuple {
+                input,
+                label,
+                alias,
+                properties,
+                values,
+            } => {
+                let input_rows =
+                    execute_write_inner(input, writer, params, outcome, routing).await?;
+                let snap = snapshot_for_write_read(writer, routing);
+                let mut out = Vec::new();
+                for row in input_rows {
+                    let member_values = values
+                        .iter()
+                        .map(|value| evaluate(value, &row, params))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for view in crate::exec::walker::lookup_nodes_by_property_tuple_via_scan(
+                        &snap,
+                        label,
+                        properties,
+                        &member_values,
+                    )
+                    .await?
+                    {
+                        let mut new_row = row.clone();
+                        new_row.set(
+                            alias.clone(),
+                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                        );
+                        out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
+
             // Same shape as NodeById: writes commit first, then the
             // unique-property lookup runs against the post-write snapshot.
             LogicalPlan::NodeByPropertyValue {
