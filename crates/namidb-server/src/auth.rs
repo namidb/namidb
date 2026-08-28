@@ -137,7 +137,7 @@ impl AuthConfig {
     ///
     /// `role` defaults to `read-write` and `name` to `token-<i>`. A file with
     /// an empty `tokens` array is rejected — that would silently disable auth;
-    /// omit the flag to run open on purpose.
+    /// omit the flag and pass `--no-auth` to run open on purpose.
     #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
     pub fn load_file(path: &Path) -> anyhow::Result<Self> {
         let body = std::fs::read_to_string(path)
@@ -146,7 +146,8 @@ impl AuthConfig {
             .map_err(|e| anyhow::anyhow!("parsing auth tokens file {}: {e}", path.display()))?;
         if file.tokens.is_empty() {
             anyhow::bail!(
-                "auth tokens file {} has no tokens; omit --auth-tokens-file to run without auth",
+                "auth tokens file {} has no tokens; add at least one, or omit \
+                 --auth-tokens-file and pass --no-auth to run without auth",
                 path.display()
             );
         }

@@ -105,6 +105,16 @@ process or host termination while S3/R2 still owns uploaded parts.
 | `file:///abs/dir?ns=<ns>` | Local filesystem (Create-only pointer CAS via `O_CREAT\|O_EXCL`) |
 | `memory://<ns>` | In-process, ephemeral — for tests and demos |
 
+**Object store requirements.** NamiDB needs exactly one conditional-write
+capability from the bucket: **PUT-if-absent** (`If-None-Match: *`) — the
+compare-and-swap behind every manifest, pointer, and WAL commit (RFC-029).
+AWS S3 (native since Aug 2024), GCS, Azure Blob, Cloudflare R2, Tigris, and
+current MinIO all support it. Conditional *overwrite* (`If-Match`) is **not**
+required for writes. An "S3-compatible" service that ignores
+`If-None-Match: *` preconditions cannot host NamiDB safely — two writers
+could both believe they committed. Eventually-consistent LIST is tolerated
+(the versioned pointer probe closes that window).
+
 <br />
 
 ## Quick win: your Obsidian vault as a graph
@@ -403,14 +413,30 @@ The official image is on [Docker Hub](https://hub.docker.com/r/namidb/namidb-ser
 # Official image, plain HTTP on :8080.
 docker run --rm -p 8080:8080 \
   -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -e NAMIDB_AUTH_TOKEN="$(openssl rand -hex 32)" \
   namidb/namidb-server:2 --store "s3://my-bucket?ns=prod&region=us-west-2"
+```
+
+A token (or `--no-auth`) is required: since 2.2.0 the server refuses to boot
+with no auth configured instead of silently serving open. For a local
+`file://` store, mount a **named volume** at `/var/lib/namidb` — the image
+pre-creates it owned by its non-root uid (65532), so the volume inherits the
+right ownership. A **bind mount** needs a one-time
+`chown -R 65532:65532 <hostdir>` first (that also fixes named volumes created
+root-owned by images before 2.2.0):
+
+```bash
+docker run --rm -p 8080:8080 -v namidb-data:/var/lib/namidb \
+  -e NAMIDB_AUTH_TOKEN=... \
+  namidb/namidb-server:2 --store "file:///var/lib/namidb?ns=prod"
 ```
 
 For a full self-hosted stack (server + MinIO as the bucket) see [`docker-compose.yml`](docker-compose.yml). Or run it from source:
 
 ```bash
-# Plain HTTP on :8080.
-cargo run --release -p namidb-server -- --store "s3://my-bucket?ns=prod&region=us-west-2"
+# Plain HTTP on :8080. --no-auth is for local dev only;
+# set --auth-token / NAMIDB_AUTH_TOKEN before exposing the port.
+cargo run --release -p namidb-server -- --no-auth --store "s3://my-bucket?ns=prod&region=us-west-2"
 ```
 
 ```bash
@@ -420,9 +446,9 @@ curl -s localhost:8080/v0/cypher \
 # {"columns":["n"],"rows":[{"n":42}]}
 ```
 
-Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree. Bolt keeps a fixed 64 KiB pre-authentication ceiling and defaults authenticated messages to 64 MiB. Before growing or decoding a data frame, all connections share a weighted memory budget and the server checks current RSS plus the request's projected working set. Nested PackStream values also have one cumulative decoded-heap/cardinality budget, and result values are converted only as each `PULL` page demands them.
+Add `--bolt-listen 0.0.0.0:7687` and point any Neo4j driver or `cypher-shell` at `bolt://localhost:7687`. Both protocols share one writer per namespace, so they never disagree. Bolt serves exactly one namespace (the `?ns=` of `--store`): there is no per-request namespace selection over Bolt, and combining `--bolt-listen` with `--multi-tenant` fails at startup — run one single-tenant server per namespace to serve tenants over Bolt. Bolt keeps a fixed 64 KiB pre-authentication ceiling and defaults authenticated messages to 64 MiB. Before growing or decoding a data frame, all connections share a weighted memory budget and the server checks current RSS plus the request's projected working set. Nested PackStream values also have one cumulative decoded-heap/cardinality budget, and result values are converted only as each `PULL` page demands them.
 
-**Auth and authorization**, all optional and off by default:
+**Auth and authorization.** A bearer token is required by default — the server refuses to boot with no auth source configured; `--no-auth` is the explicit opt-out for local development. JWT and PDP stay optional:
 
 ```bash
 cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
@@ -430,7 +456,7 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
   --bolt-listen 0.0.0.0:7687 \
   --auth-token "$NAMIDB_AUTH_TOKEN" \                       # static bearer token
   --jwt-jwks-url "https://issuer/.well-known/jwks.json" \   # OIDC/JWT, group → role
-  --jwt-namespaces-claim tenants \                          # scope a token to namespaces
+  --jwt-namespaces-claim tenants \                          # scope a token to namespaces (HTTP; Bolt is single-namespace)
   --pdp-url "http://opa:8181/v1/data/namidb/allow"          # external policy (OPA), fail-closed
 ```
 
@@ -440,10 +466,11 @@ cargo run --release -p namidb-server --features jwt,pdp,vector-index -- \
 | `--listen` (`NAMIDB_LISTEN`) | HTTP bind, default `0.0.0.0:8080`. |
 | `--bolt-listen` (`NAMIDB_BOLT_LISTEN`) | Enable the Bolt listener (e.g. `0.0.0.0:7687`). |
 | `--bolt-max-message-bytes` (`NAMIDB_BOLT_MAX_MESSAGE_BYTES`) | Authenticated Bolt message cap, default 64 MiB; the pre-auth cap stays fixed at 64 KiB. |
-| `--auth-token` / `--auth-tokens-file` | Static bearer token(s) with per-token roles + namespace scopes. |
+| `--auth-token` / `--auth-tokens-file` | Static bearer token(s) with per-token roles + namespace scopes. One of these (or a JWT config) is required unless `--no-auth` is set. |
+| `--no-auth` (`NAMIDB_NO_AUTH`) | Explicitly run without authentication (anonymous read-write). Without it, a boot with no auth configured fails instead of silently serving open. |
 | `--jwt-*` *(feature `jwt`)* | Validate OIDC JWTs against a JWKS, map a group claim to a role, scope by a namespaces claim. |
 | `--pdp-url` *(feature `pdp`)* | Send each query to an OPA-style policy endpoint; deny unless it allows (fail-closed). |
-| `--multi-tenant` / `--default-namespace` | Serve many namespaces, routed by path (`/<ns>/v0/cypher`) or the `X-NamiDB-Namespace` header. |
+| `--multi-tenant` / `--default-namespace` | Serve many namespaces over **HTTP**, routed by path (`/<ns>/v0/cypher`) or the `X-NamiDB-Namespace` header. HTTP-only: Bolt is single-namespace, and `--bolt-listen` with `--multi-tenant` fails at startup. |
 
 > Build features: `jwt` (OIDC), `pdp` (external policy), `vector-index` (`CREATE VECTOR INDEX`), `text-index` (`CREATE FULLTEXT INDEX`). Omit them for a smaller binary; the default build is static-token auth only.
 >

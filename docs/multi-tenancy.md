@@ -141,7 +141,9 @@ middleware resolves the target namespace **before** authenticating:
 **Bolt is single-namespace only.** The Bolt `LOGON` path uses the
 namespace-agnostic `auth.principal_for` (`crates/namidb-server/src/bolt.rs:904`);
 there is no per-request namespace over Bolt. To serve namespace-per-tenant over
-Bolt you run **one server/port per namespace**.
+Bolt you run **one server/port per namespace**. Since 2.2.0 the server
+enforces this at boot: `--bolt-listen` together with `--multi-tenant` fails
+startup instead of silently never opening the Bolt port.
 
 ## Provisioning a namespace and a scoped token (Implemented)
 
@@ -396,7 +398,8 @@ lazy.
 - **Boot-only static-token load.** A newly minted static token needs a server
   restart; only JWT keys rotate live.
 - **Bolt cannot be namespace-scoped per request.** Namespace-per-tenant over Bolt
-  means one server/port per tenant.
+  means one server/port per tenant; `--bolt-listen` with `--multi-tenant` is
+  rejected at startup (2.2.0).
 - **Capacity and eviction.** In `--multi-tenant` mode, `--max-namespaces`
   (default 100) caps concurrently open namespaces and idle ones are evicted
   oldest-first (`registry.rs:128-165`); `--namespace-idle-timeout` (default 1h)

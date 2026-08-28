@@ -344,7 +344,7 @@ iterator from day one so the swap is a one-line change.
 `LOGON` carries `{scheme: "basic" | "bearer" | "none", principal?,
 credentials?}`. v0 maps:
 
-- `none` — accepted iff `--auth-token` is unset (parity with REST).
+- `none` — accepted iff the server runs open (`--no-auth`; parity with REST).
 - `basic` — `principal` is ignored, `credentials` is checked against
   `--auth-token`. Constant-time comparison, same as `require_auth`.
 - `bearer` — `credentials` is the token, same comparison.

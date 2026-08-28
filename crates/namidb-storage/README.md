@@ -6,8 +6,12 @@ node SSTs, a custom edge-SST format with CSR adjacency, and tiered caches
 for cross-snapshot reuse.
 
 This crate is the **source of truth on disk**. Coordination between
-writers and readers comes from S3 conditional writes (`If-Match`,
-`If-None-Match`, ETag) rather than an external consensus service.
+writers and readers comes from a single object-store conditional-write
+primitive — PUT-if-absent (`If-None-Match: *`, `PutMode::Create`; RFC-029)
+on write-once manifest bodies, versioned pointers, and WAL segments —
+rather than an external consensus service. Conditional *overwrite*
+(`If-Match`) is **not** required; the read path uses ETags only for
+conditional GETs.
 
 ## What lives here
 

@@ -145,8 +145,12 @@ enum Cmd {
     /// All are immutable, so the snapshot is consistent by construction. The
     /// destination is left as a self-contained, openable namespace.
     ///
-    /// Run against a quiescent source: a concurrent compaction + orphan sweep
-    /// could delete a pinned object mid-copy.
+    /// Safe against a LIVE source: the copy pins a manifest version with a
+    /// durable retention lease that the server's janitor honours, so a
+    /// concurrent compaction + orphan sweep cannot reclaim pinned objects;
+    /// the result is a point-in-time snapshot at the pinned version. The
+    /// residual pin/sweep race fails loudly (NotFound) rather than
+    /// truncating — just re-run the backup.
     Backup {
         /// Source namespace URI to back up (see `run --help` for schemes).
         #[arg(long)]

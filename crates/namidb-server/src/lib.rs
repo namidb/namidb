@@ -112,15 +112,20 @@ fn http_cypher_wire_bytes(
 pub struct Config {
     pub store_uri: String,
     pub listen: std::net::SocketAddr,
-    /// `None` means "no auth"; the server will log a loud warning at
-    /// boot and accept every request. Production callers should set a
-    /// long random secret. A single token grants read-write access; for
-    /// read-only tokens or several tokens, use `auth_tokens_file`.
+    /// Bearer token granting read-write access. Production callers should
+    /// set a long random secret. For read-only tokens or several tokens, use
+    /// `auth_tokens_file`. When no auth source is configured at all, the
+    /// server refuses to boot unless `no_auth` is set.
     pub auth_token: Option<String>,
     /// Path to a JSON file of tokens, each with a `read-only` or
     /// `read-write` role. Takes precedence over `auth_token` when set. `None`
-    /// falls back to `auth_token` (or no auth when that is also `None`).
+    /// falls back to `auth_token`.
     pub auth_tokens_file: Option<std::path::PathBuf>,
+    /// Explicit opt-in to run without any authentication (every request is
+    /// anonymous read-write). Without this, a boot with no auth source
+    /// configured fails instead of silently serving open — an unset
+    /// `NAMIDB_AUTH_TOKEN` in production should be a crash, not a log line.
+    pub no_auth: bool,
     /// OIDC/JWT validation config. `None` = JWT auth disabled (static tokens
     /// or open mode). Only present under the `jwt` feature.
     #[cfg(feature = "jwt")]
@@ -737,15 +742,26 @@ pub async fn run_with_memory_max_bytes(
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
     }
+    // Bolt is single-namespace: the multi-tenant serve path never starts the
+    // listener, so accepting both flags would silently drop the Bolt port.
+    if config.multi_tenant && config.bolt_listen.is_some() {
+        anyhow::bail!(
+            "--bolt-listen is not supported with --multi-tenant: Bolt is \
+             single-namespace (see docs/multi-tenancy.md). Run one \
+             single-tenant server per namespace, or omit --bolt-listen / \
+             NAMIDB_BOLT_LISTEN"
+        );
+    }
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
         (Some(path), _) => AuthConfig::load_file(path)?,
         // Refuse an empty `--auth-token`: it logs as "auth enabled" but a
-        // `Bearer ` request would match the empty secret. Omit it to run open.
+        // `Bearer ` request would match the empty secret.
         (None, Some(secret)) if secret.is_empty() => {
             anyhow::bail!(
-                "--auth-token is empty; omit it (and NAMIDB_AUTH_TOKEN) to run without auth"
+                "--auth-token is empty; set a real secret, or pass --no-auth \
+                 to run without auth on purpose"
             )
         }
         (None, Some(secret)) => AuthConfig::single_read_write(secret.clone()),
@@ -769,11 +785,22 @@ pub async fn run_with_memory_max_bytes(
         info!("JWT auth enabled (JWKS refreshes hourly)");
     }
     if auth.is_open() {
+        // Secure by default: an open server must be an explicit decision,
+        // never the silent consequence of a missing env var. This check sits
+        // AFTER the JWT attach on purpose — under the `jwt` feature a JWKS
+        // URL alone is a valid auth configuration.
+        if !config.no_auth {
+            anyhow::bail!(
+                "no auth configured: set --auth-token / NAMIDB_AUTH_TOKEN or \
+                 --auth-tokens-file, or pass --no-auth / NAMIDB_NO_AUTH=1 to \
+                 run without auth on purpose"
+            );
+        }
         warn!(
-            "⚠️  namidb-server is running WITHOUT auth. Anyone who can reach \
-             {} can issue arbitrary Cypher queries. Set --auth-token (or env \
-             NAMIDB_AUTH_TOKEN), or --auth-tokens-file for per-token roles, \
-             before exposing this port beyond localhost.",
+            "⚠️  namidb-server is running WITHOUT auth (--no-auth). Anyone \
+             who can reach {} can issue arbitrary Cypher queries. Set \
+             --auth-token (or env NAMIDB_AUTH_TOKEN), or --auth-tokens-file \
+             for per-token roles, before exposing this port beyond localhost.",
             config.listen
         );
     } else {
