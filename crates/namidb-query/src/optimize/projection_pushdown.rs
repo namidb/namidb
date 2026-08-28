@@ -303,7 +303,14 @@ fn collect_from_aggregate(agg: &AggregateExpr, req: &mut RequiredSet) {
         | AggregateExpr::Avg { arg: e, .. }
         | AggregateExpr::Min { arg: e }
         | AggregateExpr::Max { arg: e }
+        | AggregateExpr::Stdev { arg: e, .. }
         | AggregateExpr::Collect { arg: e, .. } => collect_from_expr(e, req),
+        AggregateExpr::Percentile {
+            arg, percentile, ..
+        } => {
+            collect_from_expr(arg, req);
+            collect_from_expr(percentile, req);
+        }
         AggregateExpr::Count { arg: None, .. } => {}
     }
 }
@@ -467,6 +474,11 @@ fn collect_from_expr(expr: &Expression, req: &mut RequiredSet) {
         ExpressionKind::Quantifier(q) => {
             collect_from_expr(&q.list, req);
             collect_from_expr(&q.predicate, req);
+        }
+        ExpressionKind::Reduce(r) => {
+            collect_from_expr(&r.init, req);
+            collect_from_expr(&r.list, req);
+            collect_from_expr(&r.expression, req);
         }
         ExpressionKind::PatternComprehension(pc) => {
             collect_from_pattern_element(&pc.pattern, req);

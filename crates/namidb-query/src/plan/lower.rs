@@ -854,6 +854,11 @@ fn reject_nested_pattern_comprehension(expr: &Expression) -> Result<(), LowerErr
             reject_nested_pattern_comprehension(&q.list)?;
             reject_nested_pattern_comprehension(&q.predicate)
         }
+        ExpressionKind::Reduce(r) => {
+            reject_nested_pattern_comprehension(&r.init)?;
+            reject_nested_pattern_comprehension(&r.list)?;
+            reject_nested_pattern_comprehension(&r.expression)
+        }
         ExpressionKind::Exists(_)
         | ExpressionKind::ExistsSubquery(_)
         | ExpressionKind::Star
@@ -877,7 +882,7 @@ fn lower_pattern_part(
         })
         .unwrap_or(ShortestMode::None);
     if shortest != ShortestMode::None {
-        validate_shortest_path_pattern_v0(part, &part.element)?;
+        validate_shortest_path_pattern_v0(part, &part.element, ctx)?;
         // shortestPath: the executor materialises the path trail
         // directly into the named binding, so the lower does NOT
         // emit a Project + build_path_constructor (which would
@@ -963,6 +968,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
 fn validate_shortest_path_pattern_v0(
     part: &PatternPart,
     elem: &PatternElement,
+    ctx: &LowerCtx,
 ) -> Result<(), LowerError> {
     // 1. path binding required.
     if part.binding.is_none() {
@@ -1013,6 +1019,27 @@ fn validate_shortest_path_pattern_v0(
             "shortestPath target must reference a previously bound node",
             target.span,
         ));
+    }
+    // 5. Both endpoints PREVIOUSLY bound, not merely named. An unbound
+    //    endpoint used to be silently accepted; `First` mode then returned
+    //    ONE arbitrary reachable node per seed instead of one row per
+    //    (src, dst) pair — an openCypher divergence that read as data loss
+    //    in the field (NDB-09). Erroring here makes the v0 contract loud.
+    for ident in [
+        elem.head.binding.as_ref().expect("checked above"),
+        target.binding.as_ref().expect("checked above"),
+    ] {
+        if !ctx.bindings.contains(&ident.name) {
+            return Err(LowerError::new(
+                LowerErrorKind::UnsupportedFeature,
+                format!(
+                    "shortestPath endpoint `{}` must be bound by a previous MATCH in v0 \
+                     (e.g. `MATCH (a:...), (b:...) MATCH p = shortestPath((a)-[*..15]-(b))`)",
+                    ident.name
+                ),
+                ident.span,
+            ));
+        }
     }
     Ok(())
 }
@@ -2086,6 +2113,34 @@ fn try_aggregate(expr: &Expression) -> Result<Option<AggregateExpr>, LowerError>
                 distinct,
             })
         }),
+        "stdev" => single_arg(name, &args, expr.span).map(|arg| {
+            Some(AggregateExpr::Stdev {
+                arg: arg.clone(),
+                distinct,
+                population: false,
+            })
+        }),
+        "stdevp" => single_arg(name, &args, expr.span).map(|arg| {
+            Some(AggregateExpr::Stdev {
+                arg: arg.clone(),
+                distinct,
+                population: true,
+            })
+        }),
+        "percentilecont" => two_arg(name, &args, expr.span).map(|(arg, p)| {
+            Some(AggregateExpr::Percentile {
+                arg: arg.clone(),
+                percentile: p.clone(),
+                continuous: true,
+            })
+        }),
+        "percentiledisc" => two_arg(name, &args, expr.span).map(|(arg, p)| {
+            Some(AggregateExpr::Percentile {
+                arg: arg.clone(),
+                percentile: p.clone(),
+                continuous: false,
+            })
+        }),
         _ => Ok(None),
     }
 }
@@ -2100,6 +2155,21 @@ fn single_arg<'a>(
         _ => Err(LowerError::new(
             LowerErrorKind::InvalidPattern,
             format!("{} takes exactly 1 argument", name.joined()),
+            span,
+        )),
+    }
+}
+
+fn two_arg<'a>(
+    name: &QualifiedName,
+    args: &'a [Expression],
+    span: SourceSpan,
+) -> Result<(&'a Expression, &'a Expression), LowerError> {
+    match args {
+        [first, second] => Ok((first, second)),
+        _ => Err(LowerError::new(
+            LowerErrorKind::InvalidPattern,
+            format!("{} takes exactly 2 arguments", name.joined()),
             span,
         )),
     }
@@ -2559,6 +2629,12 @@ fn check_expression_bindings(expr: &Expression, ctx: &LowerCtx) -> Result<(), Lo
             // Only the list is checked against the outer scope; the predicate
             // references the quantifier's local variable, not yet in ctx.
             check_expression_bindings(&q.list, ctx)
+        }
+        ExpressionKind::Reduce(r) => {
+            // init and list run in the outer scope; the body references the
+            // local accumulator/variable, not yet in ctx.
+            check_expression_bindings(&r.init, ctx)?;
+            check_expression_bindings(&r.list, ctx)
         }
         ExpressionKind::PatternComprehension(_) => Ok(()),
     }

@@ -530,3 +530,149 @@ any customer needs search on the managed tier.
   splitting in namidb-cli (~hours); server-side scripts (sequential,
   stop-on-first-error, per-statement writer lock) are ~2-4 days.
   Roadmap.
+
+## Second field report (2026-08-27) — contactability platform, 24.6k-node graph, Bolt via official Neo4j driver
+
+Twelve engine limits reproduced against the running 2.1.4 instance (NDB-01..12), four
+self-retracted complaints (RET-01..04). Recon corrected the mechanism of four before any
+fix landed. Items 43–54, one per NDB finding.
+
+### 43. [DONE — lands in 2.2.0] NDB-01: `--multi-tenant` silently never starts Bolt.
+
+Confirmed exactly as reported: the multi-tenant serve path `return serve_http(...)`
+(lib.rs) executes before the only `config.bolt_listen` consultation, no warning. This is
+architectural (bolt::serve takes a single-namespace AppState; RFC-022 lists
+multidatabase as a non-goal). Fix: fail-fast at boot when both flags are set, in the
+validation block of `run_with_memory_max_bytes` (covers binary + embedded callers) +
+HTTP-only caveats at every doc site that lacked them (README flags table and Bolt
+paragraph, server README auth/Bolt sections, ARCHITECTURE multi-tenancy — the dedicated
+multi-tenancy.md guide already documented it). Full Bolt-in-multitenant is sized
+roadmap: plumb the Bolt 5 `db` field of RUN/BEGIN `extra` through the namidb-bolt
+Backend trait (currently discarded), per-namespace WriterSession from the registry, tx
+pinned to one namespace, `principal_for_in` at first RUN/BEGIN — roughly 3-5 days.
+
+### 44. [DONE — lands in 2.2.0] NDB-02: no token → server boots open, warn-only.
+
+Confirmed: `(None, None) => AuthConfig::open()` + `Principal::anonymous_rw()` on every
+HTTP request and `AuthPolicy::Open` on Bolt. Fix: boot REFUSES to start with no auth
+source unless `--no-auth` / `NAMIDB_NO_AUTH=1` is passed explicitly (check sits at the
+`is_open()` point so JWT-only configs keep booting). Breaking change, release-noted.
+
+### 45. [DONE — lands in 2.2.0] NDB-03: error taxonomy collapse.
+
+Recon corrected two details: `50N42` is a driver-side polyfill (Bolt ≤5.4 carries no
+GQLSTATUS; the string appears nowhere in the repo), and HTTP already distinguished
+timeout (504) from row cap (413). The real defect was Bolt-only: `map_exec_err`
+substring-bucketed every non-constraint error, landing Timeout and RowCap in
+`Statement.ArgumentError`. Fix: typed `BackendError::Timeout` / `ResourceLimit`
+(ClientError on purpose — drivers auto-retry TransientError.* only, and a deterministic
+budget re-run fails identically); deterministic search caps moved out of the
+auto-retried TransientError bucket; HTTP bodies now carry `neo4j_code` + `gql_status`
+per family (table in the server README); eval errors are 400 not 500. Bolt ≥5.7
+GQLSTATUS-on-the-wire: roadmap (~2-3 days: negotiate 5.7, extend FAILURE metadata).
+
+### 46. [DONE — lands in 2.2.0] NDB-04: var-length traversal enumerates all paths under DISTINCT+LIMIT.
+
+Confirmed end to end: only shortest-mode had visited pruning; `execute_capped`'s
+whitelist excluded `Project{distinct:true}`, so DISTINCT+LIMIT got zero pushdown; the
+cap was honoured only at seed boundaries. Fix (executor-side shape detection, no plan
+field): `try_execute_endpoint_distinct_project` intercepts `Project{distinct:true}`
+directly over a var-length Expand when every projected expression reads ONLY the
+endpoint binding — then the deg^hop trail enumeration collapses to a visited-set BFS
+(each node expanded once per seed, emitted once globally across seeds), and the LIMIT
+budget crosses the distinct projection exactly (globally-deduped emission makes a
+capped prefix valid). Intercepted in both the flat and factor executors + the capped
+path. Regression proof: dense-layered 30^5-walk graph completes; parity vs the
+per-seed route asserted on memtable + flushed routes, including the seed-reachable-
+through-a-cycle endpoint. Not covered (falls back to the exhaustive route, correct but
+slow): a Filter between Expand and DISTINCT, projections referencing the seed or rel
+list, `min >= 2`.
+
+### 47. [PARTIALLY DONE — mechanism refuted; two real gaps fixed, one deferred] NDB-09: shortestPath blows the 1M row cap.
+
+The claimed mechanism ("expands then trims") is REFUTED on 2.1.4: shortestPath lowers
+onto the Expand with ShortestMode and the executor early-stops (BFS visited pruning
+shipped in 666ef82, ancestor of v2.1.4; regression test covers the 40^5 shape). What
+CAN reproduce the symptom: all-pairs seeding (`MATCH (a:L), (b:L)` → CrossProduct
+row-cap at 24k² pairs — correct behaviour, the query requests 576M rows),
+allShortestPaths' combinatorial same-length output, `*2..N` (pruning was disabled for
+min ≥ 2 → exhaustive frontier → hang), and the silently-accepted unbound endpoint
+(First mode returned ONE arbitrary endpoint per seed — an openCypher divergence that
+pushed users to the plain var-length rewrite that genuinely blows the cap). Fixed in
+2.2.0: (a) `(node, hop)` frontier dedup for First-mode `min >= 2` (placed after the
+trail check so a rejected walk cannot consume the slot; documented theoretical corner:
+the kept walk could be trail-blocked where a dropped one was not — accepted for "some
+shortest path" output vs the previous effective hang); (b) unbound endpoints now error
+at lowering with the previously-bound rule spelled out. Deferred (sized): seed-grouping
+(one BFS per distinct source serving all its bound targets, 1-2 days) and bidirectional
+meet-in-the-middle for single pairs.
+
+### 48. [DONE — lands in 2.2.0] NDB-05: reduce() does not parse.
+
+Confirmed: no production existed; `acc = 1.0` parsed as Eq inside generic call args and
+died at `|`. Fix: soft-keyword production (lookahead `reduce(<ident> =` keeps
+`reduce` usable as a variable/function name), fold evaluation mirroring
+eval_list_comprehension, arms added at every exhaustive ExpressionKind match
+(display round-trip, optimizer alias collection, projection pushdown, lower walkers,
+factor sink variable collection — compiler-enforced, no wildcard traps found).
+
+### 49. [DONE — lands in 2.2.0] NDB-10: no statistical aggregates.
+
+Confirmed: closed 6-entry registry in try_aggregate. Added stdev/stdevp (two-pass,
+n-1 / n denominators, single value → 0.0, empty → NULL, numeric-only typed error) and
+percentileCont/percentileDisc (two-arg, p validated in [0,1], linear interpolation vs
+nearest-rank keeping input type), collect-then-compute like Collect. NULL-skipping,
+DISTINCT, grouping asserted on memtable + flushed routes.
+
+### 50. [DONE — lands in 2.2.0] NDB-11: `'texto' + {a:1}` leaks Debug repr.
+
+Confirmed and broader than reported: every non-scalar (map, node, rel, list, bytes,
+vector, path) stringified through `format!("{:?}")` when added to a string, and
+toString() shared the helper. Fix: scalar-only rendering (ints, floats, bools, strings,
+temporals as ISO-8601); string + structural value is now the `cannot apply + between
+STRING and MAP` type error; list `+` gains real Cypher semantics (list+list concat,
+list+element append, element+list prepend — previously `'a' + [1]` produced garbage
+text); toString(non-scalar) errors. Behavior change, release-noted.
+
+### 51. [ROADMAP — group commit, RFC-034] NDB-06: explicit transactions hold the writer lock through think-time.
+
+Accurate by design today (single writer per namespace; BEGIN holds it to COMMIT,
+NAMIDB_BOLT_MAX_TX_LIFETIME caps it). The fix is group commit (RFC-034) — staged
+batches + one commit pipeline — which also addresses item 52. Weeks, not this cycle.
+
+### 52. [ROADMAP — same RFC-034 work] NDB-07: serialized commit floor ~309 nodes/s at batch 1.
+
+Accurate: ~3 ms/commit = two object-store round trips, so throughput scales only with
+batch size (their own table shows 63.9k nodes/s at batch 5000). Not a defect of the
+ingest path (which batches by design); interactive single-row writes need group commit.
+
+### 53. [DONE — lands in 2.2.0] NDB-08: Docker image crash-loops on a named volume at /var/lib/namidb.
+
+Confirmed, with a nuance: /var/lib/namidb is not a coded default (--store is required)
+but it IS the canonical example path in --help, storage error text, and every file://
+doc example. The image now pre-creates it owned by uid 65532 so fresh named volumes
+inherit ownership (copy-on-first-use); docs note the one-time `chown -R 65532:65532`
+for bind mounts and volumes created by older images. docker-compose.yml was never
+affected (S3/MinIO store).
+
+### 54. [PARTIALLY DONE — docs fixed; endpoint deferred with a design note] NDB-12: backup/restore CLI-only.
+
+"No admin HTTP endpoint" confirmed. But the implied offline-only limitation is wrong
+for backup: `copy_namespace_snapshot` is live-safe by design (durable retention-pin
+lease honoured by the janitor; the residual race fails loudly with NotFound instead of
+truncating; committed-but-unflushed WAL captured). The CLI help said "run against a
+quiescent source" — stale, now corrected. Restore genuinely requires an offline
+destination (no fencing). The POST /v0/admin/backup endpoint is deferred deliberately:
+a client-supplied destination URI is an SSRF/exfiltration vector using the server's
+ambient cloud credentials, so it needs an operator-configured target allowlist
+(NAMIDB_BACKUP_TARGET_URI prefix) plus the admin-flush single-flight/bounded-wait
+pattern — ~1 day, sized, not rushed into this release.
+
+### Retractions (RET-01..04) — recorded for the record
+
+RET-02 matters to us: their docs claimed NamiDB needs If-Match and discarded Garage on
+that basis. Our own crates/namidb-storage README had the SAME stale claim ("If-Match,
+If-None-Match, ETag") — now corrected everywhere: the commit path needs exactly ONE
+conditional-write primitive, PUT-if-absent (`If-None-Match: *`, RFC-029); README gained
+an object-store requirements note (an "S3-compatible" that ignores the precondition
+cannot host NamiDB safely). RET-01/03/04 need no engine action.

@@ -71,6 +71,7 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
     let span = expr.span;
     match &expr.kind {
         ExpressionKind::Literal(l) => Ok(literal_to_runtime(l)),
+        ExpressionKind::Reduce(r) => eval_reduce(r, row, params),
         ExpressionKind::Star => Err(EvalError::new("`*` is only valid inside `count(*)`", span)),
         ExpressionKind::Variable(id) => row
             .get(&id.name)
@@ -373,21 +374,53 @@ fn arith(
         (RuntimeValue::String(x), RuntimeValue::String(y)) if string_concat => {
             Ok(RuntimeValue::String(format!("{}{}", x, y)))
         }
-        (RuntimeValue::String(x), other) if string_concat => Ok(RuntimeValue::String(format!(
-            "{}{}",
-            x,
-            runtime_to_string_concat(other)
-        ))),
-        (other, RuntimeValue::String(y)) if string_concat => Ok(RuntimeValue::String(format!(
-            "{}{}",
-            runtime_to_string_concat(other),
-            y
-        ))),
+        // List `+` follows Cypher: list + list concatenates, list + element
+        // appends, element + list prepends. These arms sit before the mixed
+        // string arms so `'a' + [1]` is a list, not a string.
         (RuntimeValue::List(xs), RuntimeValue::List(ys)) if string_concat => {
             let mut out = xs.clone();
             out.extend_from_slice(ys);
             Ok(RuntimeValue::List(out))
         }
+        (RuntimeValue::List(xs), y) if string_concat => {
+            let mut out = xs.clone();
+            out.push(y.clone());
+            Ok(RuntimeValue::List(out))
+        }
+        (x, RuntimeValue::List(ys)) if string_concat => {
+            let mut out = Vec::with_capacity(ys.len() + 1);
+            out.push(x.clone());
+            out.extend_from_slice(ys);
+            Ok(RuntimeValue::List(out))
+        }
+        // String + scalar coerces; string + structural value (map, node,
+        // relationship, ...) is a type error — the old fallback rendered the
+        // internal Debug representation into the result, silently corrupting
+        // data instead of failing.
+        (RuntimeValue::String(x), other) if string_concat => match scalar_to_string(other) {
+            Some(rendered) => Ok(RuntimeValue::String(format!("{x}{rendered}"))),
+            None => Err(EvalError::new(
+                format!(
+                    "cannot apply `{}` between {} and {}",
+                    op_label,
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span,
+            )),
+        },
+        (other, RuntimeValue::String(y)) if string_concat => match scalar_to_string(other) {
+            Some(rendered) => Ok(RuntimeValue::String(format!("{rendered}{y}"))),
+            None => Err(EvalError::new(
+                format!(
+                    "cannot apply `{}` between {} and {}",
+                    op_label,
+                    a.type_name(),
+                    b.type_name()
+                ),
+                span,
+            )),
+        },
         _ => Err(EvalError::new(
             format!(
                 "cannot apply `{}` between {} and {}",
@@ -451,14 +484,26 @@ fn arith_pow(
     }
 }
 
-fn runtime_to_string_concat(v: &RuntimeValue) -> String {
+/// Scalar rendering for string `+` concatenation and `toString()`. Temporal
+/// values render as ISO-8601 (mirroring what `date()`/`datetime()` parse).
+/// Structural values (map, list, node, relationship, path, bytes, vectors)
+/// return `None` so callers surface a type error instead of leaking the
+/// internal Debug representation into query results.
+fn scalar_to_string(v: &RuntimeValue) -> Option<String> {
     match v {
-        RuntimeValue::Null => "".to_string(),
-        RuntimeValue::Integer(n) => n.to_string(),
-        RuntimeValue::Float(f) => f.to_string(),
-        RuntimeValue::String(s) => s.clone(),
-        RuntimeValue::Bool(b) => b.to_string(),
-        _ => format!("{:?}", v),
+        RuntimeValue::Integer(n) => Some(n.to_string()),
+        RuntimeValue::Float(f) => Some(f.to_string()),
+        RuntimeValue::Bool(b) => Some(b.to_string()),
+        RuntimeValue::String(s) => Some(s.clone()),
+        RuntimeValue::Date(days) => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+            epoch
+                .checked_add_signed(chrono::Duration::days(*days as i64))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+        }
+        RuntimeValue::DateTime(micros) => chrono::DateTime::from_timestamp_micros(*micros)
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        _ => None,
     }
 }
 
@@ -759,9 +804,18 @@ fn call_scalar_function(
         "substring" => str_substring(args, span),
         "replace" => str_replace(args, span),
         "split" => str_split(args, span),
-        "tostring" => single_arg(name, args, span).map(|v| match v {
-            RuntimeValue::Null => RuntimeValue::Null,
-            other => RuntimeValue::String(runtime_to_string_concat(&other)),
+        "tostring" => single_arg(name, args, span).and_then(|v| match v {
+            RuntimeValue::Null => Ok(RuntimeValue::Null),
+            other => match scalar_to_string(&other) {
+                Some(rendered) => Ok(RuntimeValue::String(rendered)),
+                None => Err(EvalError::new(
+                    format!(
+                        "toString() expects a scalar value, got {}",
+                        other.type_name()
+                    ),
+                    span,
+                )),
+            },
         }),
         "tointeger" => single_arg(name, args, span).map(|v| match v {
             RuntimeValue::Integer(n) => RuntimeValue::Integer(n),
@@ -1395,6 +1449,34 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
     Ok(RuntimeValue::List(out))
 }
 
+/// Evaluate `reduce(acc = init, x IN list | expr)`: fold `list` into a
+/// single value, rebinding `acc` to the body's result per element.
+fn eval_reduce(
+    r: &crate::parser::ast::Reduce,
+    row: &Row,
+    params: &Params,
+) -> Result<RuntimeValue, EvalError> {
+    let list_v = evaluate(&r.list, row, params)?;
+    let items = match list_v {
+        RuntimeValue::List(items) => items,
+        RuntimeValue::Null => return Ok(RuntimeValue::Null),
+        other => {
+            return Err(EvalError::new(
+                format!("reduce() requires a list, got {}", other.type_name()),
+                r.list.span,
+            ));
+        }
+    };
+    let mut acc = evaluate(&r.init, row, params)?;
+    for item in items {
+        let mut local = row.clone();
+        local.set(r.accumulator.name.clone(), acc);
+        local.set(r.variable.name.clone(), item);
+        acc = evaluate(&r.expression, &local, params)?;
+    }
+    Ok(acc)
+}
+
 fn eval_list_comprehension(
     lc: &crate::parser::ListComprehension,
     row: &Row,
@@ -1669,6 +1751,136 @@ mod tests {
             eval_str("'hello' + ' ' + 'world'", &Row::new(), &Params::new()),
             RuntimeValue::String("hello world".into())
         );
+    }
+
+    /// Evaluate an expression expecting an error; returns the message.
+    fn eval_err(src: &str) -> String {
+        let q = parse(&format!("RETURN {} AS r", src)).unwrap();
+        let item = match &q.head.clauses[0] {
+            crate::parser::Clause::Return(r) => &r.items[0].expression,
+            _ => panic!(),
+        };
+        evaluate(item, &Row::new(), &Params::new())
+            .unwrap_err()
+            .message
+    }
+
+    /// NDB-11: string + structural value is a type error, never the Debug
+    /// representation leaking into the result as silently corrupt data.
+    #[test]
+    fn string_plus_scalar_coerces_and_structural_errors() {
+        assert_eq!(
+            eval_str("'a' + 1", &Row::new(), &Params::new()),
+            RuntimeValue::String("a1".into())
+        );
+        assert_eq!(
+            eval_str("1 + 'a'", &Row::new(), &Params::new()),
+            RuntimeValue::String("1a".into())
+        );
+        assert_eq!(
+            eval_str("'a' + true", &Row::new(), &Params::new()),
+            RuntimeValue::String("atrue".into())
+        );
+        assert_eq!(
+            eval_str("'v' + 1.5", &Row::new(), &Params::new()),
+            RuntimeValue::String("v1.5".into())
+        );
+        let msg = eval_err("'texto' + {a: 1}");
+        assert!(
+            msg.contains("cannot apply `+` between STRING and MAP"),
+            "{msg}"
+        );
+        // NULL propagation is unchanged.
+        assert_eq!(
+            eval_str("'a' + NULL", &Row::new(), &Params::new()),
+            RuntimeValue::Null
+        );
+    }
+
+    #[test]
+    fn list_plus_follows_cypher_concat_semantics() {
+        assert_eq!(
+            eval_str("[1] + [2, 3]", &Row::new(), &Params::new()),
+            RuntimeValue::List(vec![
+                RuntimeValue::Integer(1),
+                RuntimeValue::Integer(2),
+                RuntimeValue::Integer(3)
+            ])
+        );
+        assert_eq!(
+            eval_str("[1] + 2", &Row::new(), &Params::new()),
+            RuntimeValue::List(vec![RuntimeValue::Integer(1), RuntimeValue::Integer(2)])
+        );
+        assert_eq!(
+            eval_str("'a' + [1]", &Row::new(), &Params::new()),
+            RuntimeValue::List(vec![
+                RuntimeValue::String("a".into()),
+                RuntimeValue::Integer(1)
+            ])
+        );
+    }
+
+    /// NDB-05: reduce() folds with the accumulator rebound per element.
+    #[test]
+    fn reduce_folds_lists() {
+        assert_eq!(
+            eval_str(
+                "reduce(acc = 1.0, x IN [0.5, 0.8] | acc * x)",
+                &Row::new(),
+                &Params::new()
+            ),
+            RuntimeValue::Float((1.0_f64 * 0.5) * 0.8)
+        );
+        assert_eq!(
+            eval_str(
+                "reduce(s = 0, x IN [1, 2, 3] | s + x)",
+                &Row::new(),
+                &Params::new()
+            ),
+            RuntimeValue::Integer(6)
+        );
+        // Empty list -> init untouched; NULL list -> NULL.
+        assert_eq!(
+            eval_str(
+                "reduce(s = 42, x IN [] | s + x)",
+                &Row::new(),
+                &Params::new()
+            ),
+            RuntimeValue::Integer(42)
+        );
+        assert_eq!(
+            eval_str(
+                "reduce(s = 0, x IN NULL | s + x)",
+                &Row::new(),
+                &Params::new()
+            ),
+            RuntimeValue::Null
+        );
+        // String building works through the concat rules.
+        assert_eq!(
+            eval_str(
+                "reduce(s = '', w IN ['a', 'b', 'c'] | s + w)",
+                &Row::new(),
+                &Params::new()
+            ),
+            RuntimeValue::String("abc".into())
+        );
+        let msg = eval_err("reduce(s = 0, x IN 7 | s + x)");
+        assert!(msg.contains("reduce() requires a list"), "{msg}");
+    }
+
+    #[test]
+    fn tostring_scalars_only_iso_for_temporals() {
+        assert_eq!(
+            eval_str("toString(date('2026-08-28'))", &Row::new(), &Params::new()),
+            RuntimeValue::String("2026-08-28".into())
+        );
+        assert_eq!(
+            eval_str("'d: ' + date('2026-08-28')", &Row::new(), &Params::new()),
+            RuntimeValue::String("d: 2026-08-28".into())
+        );
+        let msg = eval_err("toString({a: 1})");
+        assert!(msg.contains("toString() expects a scalar"), "{msg}");
     }
 
     #[test]

@@ -854,6 +854,9 @@ pub enum ExpressionKind {
     /// List quantifier predicate: `all(x IN list WHERE pred)` and its
     /// `any`/`none`/`single` siblings. Returns a boolean.
     Quantifier(Box<Quantifier>),
+    /// `reduce(acc = init, x IN list | expr)` — fold `list` into a single
+    /// value: `acc` starts at `init` and is rebound to `expr` per element.
+    Reduce(Box<Reduce>),
     /// `*` projection placeholder. Reserved — RFC-004 §Open question Q1.
     Star,
 }
@@ -879,6 +882,18 @@ pub struct Quantifier {
     pub variable: Identifier,
     pub list: Expression,
     pub predicate: Expression,
+    pub span: SourceSpan,
+}
+
+/// `reduce(<accumulator> = <init>, <variable> IN <list> | <expression>)`.
+/// `accumulator` and `variable` are local bindings scoped to `expression`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reduce {
+    pub accumulator: Identifier,
+    pub init: Expression,
+    pub variable: Identifier,
+    pub list: Expression,
+    pub expression: Expression,
     pub span: SourceSpan,
 }
 

@@ -1309,7 +1309,10 @@ async fn bolt_row_cap_failure_has_resource_limit_code() {
     handshake(&mut stream).await;
     hello_and_logon(&mut stream, "test-token").await;
 
-    for query in ["CREATE (:Person {name: 'Ada'})", "CREATE (:Person {name: 'Bo'})"] {
+    for query in [
+        "CREATE (:Person {name: 'Ada'})",
+        "CREATE (:Person {name: 'Bo'})",
+    ] {
         pull_all(&mut stream, query).await;
     }
 
