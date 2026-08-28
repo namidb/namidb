@@ -1547,6 +1547,11 @@ fn map_exec_err(e: ExecError) -> BackendError {
 struct TokenAuthenticator {
     auth: Arc<AuthConfig>,
     principal: Arc<std::sync::Mutex<Option<Principal>>>,
+    /// Multi-tenant only: the presented credentials, retained so the
+    /// backend can re-resolve the principal against each requested
+    /// namespace (`principal_for_in`) — a [`Principal`] does not carry its
+    /// scope list. `None` for single-tenant connections (nothing retained).
+    credentials_out: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 #[async_trait]
@@ -1568,9 +1573,215 @@ impl Authenticator for TokenAuthenticator {
         match str_field("credentials").and_then(|c| self.auth.principal_for(c)) {
             Some(p) => {
                 *self.principal.lock().expect("bolt principal lock poisoned") = Some(p);
+                if let Some(slot) = &self.credentials_out {
+                    *slot.lock().expect("bolt credentials lock poisoned") =
+                        str_field("credentials").map(str::to_string);
+                }
                 Ok(())
             }
             None => Err("invalid credentials".into()),
+        }
+    }
+}
+
+/// Multi-tenant Bolt adapter (NDB-01 follow-up): routes each statement to
+/// the namespace named by the Bolt `db` field — `session(database="acme")`
+/// in the official drivers — falling back to the default namespace, and
+/// enforcing the token's namespace scope per statement exactly like the
+/// HTTP `require_auth_multi` middleware.
+///
+/// Execution delegates to a fresh single-namespace [`ServerBackend`] view
+/// per auto-commit statement (Arc-cheap; always resolves the registry's
+/// CURRENT namespace incarnation, so eviction/reopen behaves like HTTP). An
+/// explicit transaction pins one delegate — and therefore one namespace and
+/// its writer — from BEGIN to COMMIT/ROLLBACK; statements inside it carry
+/// no `db` of their own.
+pub struct MultiTenantBackend {
+    shared: crate::shared::SharedAppState,
+    principal: Arc<std::sync::Mutex<Option<Principal>>>,
+    credentials: Arc<std::sync::Mutex<Option<String>>>,
+    tx_delegate: Mutex<Option<Arc<ServerBackend>>>,
+}
+
+impl MultiTenantBackend {
+    pub fn new(
+        shared: crate::shared::SharedAppState,
+        principal: Arc<std::sync::Mutex<Option<Principal>>>,
+        credentials: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            shared,
+            principal,
+            credentials,
+            tx_delegate: Mutex::new(None),
+        }
+    }
+
+    /// Resolve `db` to a single-namespace delegate: enforce the token's
+    /// namespace scope, open (or fetch) the namespace, and wrap its state.
+    async fn delegate_for(&self, db: Option<&str>) -> Result<Arc<ServerBackend>, BackendError> {
+        let namespace = db
+            .unwrap_or(self.shared.default_namespace.as_str())
+            .to_string();
+        // Scope gate, HTTP parity: open mode grants anonymous read-write in
+        // every namespace; an authenticated token must be scoped to (or
+        // unscoped for) the requested namespace.
+        let scoped: Option<Principal> = if self.shared.auth.is_open() {
+            None
+        } else {
+            let creds = self
+                .credentials
+                .lock()
+                .expect("bolt credentials lock poisoned")
+                .clone();
+            let Some(creds) = creds else {
+                return Err(BackendError::Forbidden("not authenticated".into()));
+            };
+            match self.shared.auth.principal_for_in(&creds, &namespace) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(BackendError::Forbidden(format!(
+                        "token not scoped to namespace `{namespace}`"
+                    )))
+                }
+            }
+        };
+        let ns_state = self
+            .shared
+            .registry
+            .get_or_open(&namespace)
+            .await
+            .map_err(|e| BackendError::Other(format!("namespace `{namespace}`: {e}")))?;
+        let state = crate::AppState::for_namespace(&self.shared, &ns_state);
+        Ok(Arc::new(ServerBackend::new(
+            state,
+            Arc::new(std::sync::Mutex::new(scoped)),
+        )))
+    }
+
+    async fn open_tx_delegate(&self) -> Result<Arc<ServerBackend>, BackendError> {
+        self.tx_delegate
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| BackendError::Other("no open transaction".into()))
+    }
+}
+
+#[async_trait]
+impl Backend for MultiTenantBackend {
+    async fn admit_request_decode(
+        &self,
+        wire_bytes: usize,
+    ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError> {
+        let projected = MessageMemoryBudget::estimated_bytes_for_wire(wire_bytes);
+        let reservation = self
+            .shared
+            .memory
+            .reserve_query_headroom(projected)
+            .await
+            .map_err(memory_pressure_error)?;
+        Ok(Some(Box::new(reservation)))
+    }
+
+    async fn run(
+        &self,
+        cypher: &str,
+        params: Params,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.delegate_for(None).await?.run(cypher, params).await
+    }
+
+    async fn run_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.run_with_cancellation_on(None, cypher, params, cancellation)
+            .await
+    }
+
+    async fn run_with_cancellation_on(
+        &self,
+        db: Option<&str>,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.delegate_for(db)
+            .await?
+            .run_with_cancellation(cypher, params, cancellation)
+            .await
+    }
+
+    async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
+        self.begin_tx_on(None).await
+    }
+
+    async fn begin_tx_on(&self, db: Option<&str>) -> std::result::Result<(), BackendError> {
+        let delegate = self.delegate_for(db).await?;
+        delegate.begin_tx().await?;
+        *self.tx_delegate.lock().await = Some(delegate);
+        Ok(())
+    }
+
+    async fn run_in_tx(
+        &self,
+        cypher: &str,
+        params: Params,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.open_tx_delegate()
+            .await?
+            .run_in_tx(cypher, params)
+            .await
+    }
+
+    async fn run_in_tx_with_cancellation(
+        &self,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        self.open_tx_delegate()
+            .await?
+            .run_in_tx_with_cancellation(cypher, params, cancellation)
+            .await
+    }
+
+    async fn commit_tx(&self) -> std::result::Result<(), BackendError> {
+        // The delegate stays in the slot through COMMIT so the bookmark
+        // read that follows resolves against the committed namespace; the
+        // next BEGIN replaces it.
+        self.open_tx_delegate().await?.commit_tx().await
+    }
+
+    async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
+        // ROLLBACK must be idempotent-ish for session unwinding: with no
+        // open transaction it is a no-op, mirroring the default Backend.
+        let delegate = self.tx_delegate.lock().await.take();
+        match delegate {
+            Some(d) => d.rollback_tx().await,
+            None => Ok(()),
+        }
+    }
+
+    async fn current_bookmark(&self) -> Option<String> {
+        match self.tx_delegate.lock().await.clone() {
+            Some(d) => d.current_bookmark().await,
+            None => None,
+        }
+    }
+
+    async fn logoff(&self) {
+        *self.principal.lock().expect("bolt principal lock poisoned") = None;
+        *self
+            .credentials
+            .lock()
+            .expect("bolt credentials lock poisoned") = None;
+        let delegate = self.tx_delegate.lock().await.take();
+        if let Some(d) = delegate {
+            let _ = d.rollback_tx().await;
         }
     }
 }
@@ -1582,12 +1793,23 @@ fn make_policy(
     auth: &Arc<AuthConfig>,
     principal: Arc<std::sync::Mutex<Option<Principal>>>,
 ) -> AuthPolicy {
+    make_policy_with_credentials(auth, principal, None)
+}
+
+/// [`make_policy`] variant that also captures the presented credentials for
+/// the multi-tenant backend's per-namespace scope checks.
+fn make_policy_with_credentials(
+    auth: &Arc<AuthConfig>,
+    principal: Arc<std::sync::Mutex<Option<Principal>>>,
+    credentials_out: Option<Arc<std::sync::Mutex<Option<String>>>>,
+) -> AuthPolicy {
     if auth.is_open() {
         AuthPolicy::Open
     } else {
         AuthPolicy::Custom(Arc::new(TokenAuthenticator {
             auth: auth.clone(),
             principal,
+            credentials_out,
         }))
     }
 }
@@ -1635,6 +1857,70 @@ pub async fn serve(
     auth: Arc<AuthConfig>,
     tx_timeout: std::time::Duration,
     post_auth_message_bytes: usize,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> anyhow::Result<()> {
+    serve_tenancy(
+        BoltTenancy::Single(state),
+        listen,
+        auth,
+        tx_timeout,
+        post_auth_message_bytes,
+        shutdown,
+        tls,
+    )
+    .await
+}
+
+/// Multi-tenant Bolt listener: statements route to the namespace named by
+/// the Bolt `db` field (driver `session(database=...)`), defaulting to the
+/// shared state's default namespace. See [`MultiTenantBackend`].
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_multi(
+    shared: crate::shared::SharedAppState,
+    listen: std::net::SocketAddr,
+    auth: Arc<AuthConfig>,
+    tx_timeout: std::time::Duration,
+    post_auth_message_bytes: usize,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> anyhow::Result<()> {
+    serve_tenancy(
+        BoltTenancy::Multi(shared),
+        listen,
+        auth,
+        tx_timeout,
+        post_auth_message_bytes,
+        shutdown,
+        tls,
+    )
+    .await
+}
+
+/// What a Bolt listener serves: one namespace, or the whole registry routed
+/// by the Bolt `db` field.
+#[derive(Clone)]
+enum BoltTenancy {
+    Single(AppState),
+    Multi(crate::shared::SharedAppState),
+}
+
+impl BoltTenancy {
+    fn memory(&self) -> &Arc<crate::memory::MemoryGovernor> {
+        match self {
+            BoltTenancy::Single(state) => &state.memory,
+            BoltTenancy::Multi(shared) => &shared.memory,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_tenancy(
+    tenancy: BoltTenancy,
+    listen: std::net::SocketAddr,
+    auth: Arc<AuthConfig>,
+    tx_timeout: std::time::Duration,
+    post_auth_message_bytes: usize,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> anyhow::Result<()> {
@@ -1642,7 +1928,7 @@ pub async fn serve(
         anyhow::bail!("Bolt post-auth message limit must be greater than zero");
     }
     let message_memory_budget_bytes = bolt_message_memory_budget_bytes(
-        state.memory.max_bytes(),
+        tenancy.memory().max_bytes(),
         std::env::var("NAMIDB_BOLT_MEMORY_BUDGET_BYTES")
             .ok()
             .as_deref(),
@@ -1726,13 +2012,21 @@ pub async fn serve(
         if let Err(e) = socket.set_nodelay(true) {
             warn!(error = %e, %peer, "set_nodelay failed");
         }
-        let state = state.clone();
+        let tenancy = tenancy.clone();
         let message_memory_budget = Arc::clone(&message_memory_budget);
         // One principal cell per connection, shared between the authenticator
         // (which sets it at LOGON) and the backend (which reads it on every
         // write). `None` until authenticated; open mode leaves it `None`.
+        // Multi-tenant additionally captures the presented credentials so
+        // the backend can scope-check each requested namespace.
         let principal = Arc::new(std::sync::Mutex::new(None));
-        let policy = make_policy(&auth, principal.clone());
+        let credentials = Arc::new(std::sync::Mutex::new(None));
+        let policy = match &tenancy {
+            BoltTenancy::Single(_) => make_policy(&auth, principal.clone()),
+            BoltTenancy::Multi(_) => {
+                make_policy_with_credentials(&auth, principal.clone(), Some(credentials.clone()))
+            }
+        };
         let info = ServerInfo {
             agent: agent.clone(),
             connection_id: Uuid::now_v7().to_string(),
@@ -1742,7 +2036,12 @@ pub async fn serve(
             // Hold the permit for the whole connection lifetime; dropping the
             // task (any exit path) releases it back to the semaphore.
             let _permit = permit;
-            let backend: Arc<dyn Backend> = Arc::new(ServerBackend::new(state, principal));
+            let backend: Arc<dyn Backend> = match tenancy {
+                BoltTenancy::Single(state) => Arc::new(ServerBackend::new(state, principal)),
+                BoltTenancy::Multi(shared) => {
+                    Arc::new(MultiTenantBackend::new(shared, principal, credentials))
+                }
+            };
             let run_config = SessionRunConfig {
                 tx_idle_timeout,
                 handshake_timeout,

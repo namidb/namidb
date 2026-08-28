@@ -537,7 +537,7 @@ Twelve engine limits reproduced against the running 2.1.4 instance (NDB-01..12),
 self-retracted complaints (RET-01..04). Recon corrected the mechanism of four before any
 fix landed. Items 43–54, one per NDB finding.
 
-### 43. [DONE — lands in 2.2.0] NDB-01: `--multi-tenant` silently never starts Bolt.
+### 43. [DONE — fail-fast in 2.2.0; full Bolt multi-tenant in 2.3.0] NDB-01: `--multi-tenant` silently never starts Bolt.
 
 Confirmed exactly as reported: the multi-tenant serve path `return serve_http(...)`
 (lib.rs) executes before the only `config.bolt_listen` consultation, no warning. This is
@@ -550,6 +550,17 @@ multi-tenancy.md guide already documented it). Full Bolt-in-multitenant is sized
 roadmap: plumb the Bolt 5 `db` field of RUN/BEGIN `extra` through the namidb-bolt
 Backend trait (currently discarded), per-namespace WriterSession from the registry, tx
 pinned to one namespace, `principal_for_in` at first RUN/BEGIN — roughly 3-5 days.
+
+**2.3.0 addendum — full Bolt multi-tenant shipped.** Route resolution went where
+drivers actually send the database — the `db` field of RUN/BEGIN extra, not HELLO —
+plumbed through the namidb-bolt Backend trait as defaulted `*_on` methods (zero churn
+for embedders/test backends). The server side is a wrapper (MultiTenantBackend) that
+resolves the namespace per statement (scope re-check via principal_for_in, registry
+get_or_open for the CURRENT incarnation, AppState::for_namespace Arc-view) and
+delegates to an untouched single-namespace ServerBackend; an explicit tx pins one
+delegate from BEGIN to COMMIT/ROLLBACK. The 2.2.0 startup bail is gone. Validated
+end-to-end with the official Python driver: session(database=...) isolation, pinned
+tx, and Security.Forbidden outside a token's scope.
 
 ### 44. [DONE — lands in 2.2.0] NDB-02: no token → server boots open, warn-only.
 

@@ -70,7 +70,10 @@ Out-of-scope for v0:
 - Routing tier (`ROUTE` message returns a one-server cluster). Multi-
   server routing lives with Cloud.
 - Multidatabase (`db` field in HELLO). One namespace per session, the
-  field is accepted and ignored.
+  field is accepted and ignored. *(Superseded in 2.3.0: the `db` field of
+  RUN/BEGIN — where drivers actually send it — routes statements to the
+  named namespace when the server runs `--multi-tenant`; single-tenant
+  servers keep ignoring it.)*
 - TLS termination inside `namidb-bolt`. Terminate at a reverse proxy
   (caddy / nginx / envoy) for v0; native TLS lands with RFC-024
   alongside JWT auth.

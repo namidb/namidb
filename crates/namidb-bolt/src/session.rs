@@ -610,6 +610,24 @@ pub trait Backend: Send + Sync {
         self.run(cypher, params).await
     }
 
+    /// Auto-commit RUN carrying the Bolt `db` routing field from the
+    /// message's `extra` map (`Some("acme")` when the driver session was
+    /// opened with `database="acme"`; `None` otherwise). The default ignores
+    /// the database and delegates, so single-namespace embedders and test
+    /// backends keep working unchanged; a multi-tenant backend overrides
+    /// this to route the statement to the named namespace.
+    async fn run_with_cancellation_on(
+        &self,
+        db: Option<&str>,
+        cypher: &str,
+        params: Params,
+        cancellation: RunCancellation,
+    ) -> std::result::Result<RunOutcome, BackendError> {
+        let _ = db;
+        self.run_with_cancellation(cypher, params, cancellation)
+            .await
+    }
+
     /// Begin an explicit transaction. Subsequent [`Backend::run_in_tx`]
     /// calls stage into it; [`Backend::commit_tx`] makes them durable and
     /// [`Backend::rollback_tx`] discards them. The default is a no-op so a
@@ -617,6 +635,16 @@ pub trait Backend: Send + Sync {
     /// just behave like auto-commit).
     async fn begin_tx(&self) -> std::result::Result<(), BackendError> {
         Ok(())
+    }
+
+    /// BEGIN carrying the Bolt `db` routing field from the message's
+    /// `extra` map. The transaction is pinned to that database for its
+    /// whole lifetime (statements inside it carry no `db` of their own).
+    /// The default ignores the database and delegates to
+    /// [`Backend::begin_tx`].
+    async fn begin_tx_on(&self, db: Option<&str>) -> std::result::Result<(), BackendError> {
+        let _ = db;
+        self.begin_tx().await
     }
 
     /// Execute one statement inside the open explicit transaction. The
@@ -671,6 +699,17 @@ pub trait Backend: Send + Sync {
     /// subsequent RESET (which returns the connection to `Ready`) cannot
     /// resume executing as the logged-off principal.
     async fn logoff(&self) {}
+}
+
+/// The Bolt `db` routing field of a RUN/BEGIN `extra` map. An absent key or
+/// an empty string both mean "the default database" (drivers send `""` for
+/// an unset session database on some protocol versions) — normalised to
+/// `None`.
+fn db_from_extra(extra: &BTreeMap<String, Value>) -> Option<String> {
+    match extra.get("db") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Bound valid Bolt pipelining while a long RUN is in flight. A normal driver
@@ -1190,15 +1229,22 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             Request::Run {
                 cypher,
                 params,
-                extra: _,
-            } => self.execute_run(&cypher, params, element_mode, false).await,
-            Request::Begin(_) => match self.backend.begin_tx().await {
-                Ok(()) => {
-                    self.state = State::TxReady;
-                    self.write_response(Response::success_empty()).await
+                extra,
+            } => {
+                let db = db_from_extra(&extra);
+                self.execute_run(&cypher, params, element_mode, false, db)
+                    .await
+            }
+            Request::Begin(extra) => {
+                let db = db_from_extra(&extra);
+                match self.backend.begin_tx_on(db.as_deref()).await {
+                    Ok(()) => {
+                        self.state = State::TxReady;
+                        self.write_response(Response::success_empty()).await
+                    }
+                    Err(e) => self.fail_request(e.code(), e.message().to_string()).await,
                 }
-                Err(e) => self.fail_request(e.code(), e.message().to_string()).await,
-            },
+            }
             Request::Route { .. } => self.respond_route().await,
             Request::Logoff => {
                 // Drop any per-connection identity the embedder bound out of
@@ -1228,11 +1274,16 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         element_mode: ElementIdMode,
     ) -> Result<()> {
         match req {
+            // In-tx statements carry no `db` of their own — the transaction
+            // was pinned to its database at BEGIN.
             Request::Run {
                 cypher,
                 params,
                 extra: _,
-            } => self.execute_run(&cypher, params, element_mode, true).await,
+            } => {
+                self.execute_run(&cypher, params, element_mode, true, None)
+                    .await
+            }
             Request::Commit => self.commit(element_mode).await,
             Request::Rollback => match self.backend.rollback_tx().await {
                 Ok(()) => {
@@ -1336,12 +1387,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_run(
         &mut self,
         cypher: &str,
         bolt_params: BTreeMap<String, Value>,
         _element_mode: ElementIdMode,
         inside_tx: bool,
+        db: Option<String>,
     ) -> Result<()> {
         let params = params_from_bolt_map_owned(bolt_params);
         // Inside an explicit transaction the statement stages into the open
@@ -1358,7 +1411,12 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         let run = if inside_tx {
             Box::pin(backend.run_in_tx_with_cancellation(cypher, params, cancellation.clone()))
         } else {
-            Box::pin(backend.run_with_cancellation(cypher, params, cancellation.clone()))
+            Box::pin(backend.run_with_cancellation_on(
+                db.as_deref(),
+                cypher,
+                params,
+                cancellation.clone(),
+            ))
         };
         tokio::pin!(run);
         let run_result = loop {
@@ -3142,6 +3200,7 @@ mod tests {
                 BTreeMap::new(),
                 ElementIdMode::Include,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3246,6 +3305,7 @@ mod tests {
                 BTreeMap::new(),
                 ElementIdMode::Include,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3294,6 +3354,7 @@ mod tests {
                 BTreeMap::new(),
                 ElementIdMode::Include,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3336,6 +3397,7 @@ mod tests {
                 BTreeMap::new(),
                 ElementIdMode::Include,
                 true,
+                None,
             )
             .await
             .unwrap();

@@ -16,6 +16,14 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- Multi-tenant Bolt: with `--multi-tenant`, the Bolt listener now starts
+  and statements route to the namespace named by the driver's
+  `database=` session parameter (the Bolt `db` field of RUN/BEGIN),
+  falling back to `--default-namespace`. Namespace-scoped tokens are
+  enforced per statement exactly like the HTTP middleware
+  (`Neo.ClientError.Security.Forbidden` outside the scope), and an
+  explicit transaction is pinned to the database named at BEGIN. The
+  2.2.x startup refusal of `--bolt-listen` + `--multi-tenant` is gone.
 - `POST /v0/admin/backup`: copy a live, point-in-time snapshot of the
   namespace to an operator-allowlisted destination (retention-pin lease;
   no writer pause). Disabled unless `--backup-target-uri` /
