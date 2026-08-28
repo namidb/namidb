@@ -195,10 +195,18 @@ pub fn encode_equality_tuple_key(values: &[&Value]) -> Option<Vec<u8>> {
         let (tag, bytes): (u8, Vec<u8>) = match value {
             Value::Str(s) => (b's', s.as_bytes().to_vec()),
             Value::Bool(v) => (b'b', vec![u8::from(*v)]),
-            Value::I64(v) => (b'i', v.to_be_bytes().to_vec()),
+            // Numerics share one canonical tag: Cypher equality coerces
+            // integer = float (`30 = 30.0` is TRUE, mirrored from the
+            // executor's `is_equal`), so members that compare equal MUST
+            // produce identical keys or the index route silently drops rows
+            // the scan route returns. `i64 -> f64` loses precision above
+            // 2^53, so distinct integers may share a posting — safe, because
+            // the read path re-confirms every candidate member-by-member
+            // with [`cypher_scalar_equal`].
+            Value::I64(v) => (b'n', (*v as f64).to_bits().to_be_bytes().to_vec()),
             Value::F64(v) if !v.is_nan() => {
                 let normalized = if *v == 0.0 { 0.0 } else { *v };
-                (b'f', normalized.to_bits().to_be_bytes().to_vec())
+                (b'n', normalized.to_bits().to_be_bytes().to_vec())
             }
             Value::Bytes(bytes) => (b'x', bytes.clone()),
             Value::Date(v) => (b'd', v.to_be_bytes().to_vec()),
@@ -215,6 +223,21 @@ pub fn encode_equality_tuple_key(values: &[&Value]) -> Option<Vec<u8>> {
         out.extend_from_slice(&bytes);
     }
     Some(out)
+}
+
+/// Cypher scalar equality — the confirmation twin of
+/// [`encode_equality_tuple_key`]. Mirrors the executor's `is_equal` for the
+/// scalar subset: `NULL` equals nothing (itself included), integer = float
+/// compares mathematically, everything else compares typed. Any two values
+/// this accepts as equal encode identical tuple members, and every key
+/// collision the lossy numeric canonicalization introduces is separated
+/// here.
+pub fn cypher_scalar_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::I64(x), Value::F64(y)) | (Value::F64(y), Value::I64(x)) => (*x as f64) == *y,
+        _ => a == b,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3567,14 +3590,33 @@ mod tuple_key_tests {
         let fake = key(&[&Value::Str("b:1".into()), &Value::I64(7)]).unwrap();
         let real = key(&[&Value::Bool(true), &Value::I64(7)]).unwrap();
         assert_ne!(fake, real);
-        // Typed members: I64(1) and F64(1.0) stay distinct (Value::PartialEq
-        // semantics), while -0.0 folds into 0.0.
+        // Numeric members canonicalize: Cypher's `1 = 1.0` is TRUE, so both
+        // encodings MUST collide (the scan route would return the row; the
+        // index route must never lose it). -0.0 folds into 0.0, and integer
+        // zero joins them.
         let int = key(&[&Value::I64(1), &Value::Str("x".into())]).unwrap();
         let float = key(&[&Value::F64(1.0), &Value::Str("x".into())]).unwrap();
-        assert_ne!(int, float);
+        assert_eq!(int, float);
         let pos = key(&[&Value::F64(0.0)]).unwrap();
         let neg = key(&[&Value::F64(-0.0)]).unwrap();
+        let zero = key(&[&Value::I64(0)]).unwrap();
         assert_eq!(pos, neg);
+        assert_eq!(pos, zero);
+        // Above 2^53 the canonicalization is lossy: DISTINCT integers may
+        // share a posting (both round to the same f64). That is a false
+        // POSITIVE only — confirmation separates them, because same-type
+        // integers compare exactly; false negatives remain impossible.
+        let big_a = key(&[&Value::I64((1 << 53) + 1)]).unwrap();
+        let big_b = key(&[&Value::I64(1 << 53)]).unwrap();
+        assert_eq!(big_a, big_b);
+        assert!(!cypher_scalar_equal(
+            &Value::I64((1 << 53) + 1),
+            &Value::I64(1 << 53)
+        ));
+        // The confirmation twin agrees with the executor's coercion.
+        assert!(cypher_scalar_equal(&Value::I64(30), &Value::F64(30.0)));
+        assert!(!cypher_scalar_equal(&Value::I64(30), &Value::F64(30.5)));
+        assert!(!cypher_scalar_equal(&Value::Null, &Value::Null));
         // Order matters: declaration order IS the layout.
         let xy = key(&[&Value::Str("x".into()), &Value::Str("y".into())]).unwrap();
         let yx = key(&[&Value::Str("y".into()), &Value::Str("x".into())]).unwrap();

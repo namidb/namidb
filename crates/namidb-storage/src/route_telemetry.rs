@@ -19,6 +19,8 @@ static VECTOR_NATIVE: AtomicU64 = AtomicU64::new(0);
 static VECTOR_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static PROPERTY_NATIVE: AtomicU64 = AtomicU64::new(0);
 static PROPERTY_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static TUPLE_NATIVE: AtomicU64 = AtomicU64::new(0);
+static TUPLE_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static SHORTEST_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one text index search outcome: `native = true` when the index
@@ -56,6 +58,17 @@ pub fn record_property(native: bool) {
     }
 }
 
+/// Record one composite tuple-lookup outcome; same contract as
+/// [`record_property`], for `WHERE a = ... AND b = ...` conjuncts served
+/// through a declared composite index's tuple posting sidecars.
+pub fn record_tuple(native: bool) {
+    if native {
+        TUPLE_NATIVE.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TUPLE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Record one bidirectional (meet-in-the-middle) shortestPath execution.
 /// Same reachability rationale: a single-pair `shortestPath` silently taking
 /// the unidirectional route instead would be invisible to result-parity
@@ -73,6 +86,8 @@ pub struct RouteTelemetrySnapshot {
     pub vector_fallback: u64,
     pub property_native: u64,
     pub property_fallback: u64,
+    pub tuple_native: u64,
+    pub tuple_fallback: u64,
     pub shortest_bidirectional: u64,
 }
 
@@ -84,6 +99,8 @@ pub fn snapshot() -> RouteTelemetrySnapshot {
         vector_fallback: VECTOR_FALLBACK.load(Ordering::Relaxed),
         property_native: PROPERTY_NATIVE.load(Ordering::Relaxed),
         property_fallback: PROPERTY_FALLBACK.load(Ordering::Relaxed),
+        tuple_native: TUPLE_NATIVE.load(Ordering::Relaxed),
+        tuple_fallback: TUPLE_FALLBACK.load(Ordering::Relaxed),
         shortest_bidirectional: SHORTEST_BIDIRECTIONAL.load(Ordering::Relaxed),
     }
 }
@@ -101,6 +118,8 @@ mod tests {
         super::record_vector(false);
         super::record_property(true);
         super::record_property(false);
+        super::record_tuple(true);
+        super::record_tuple(false);
         let after = super::snapshot();
         assert!(after.text_native > before.text_native);
         assert!(after.text_fallback > before.text_fallback);
@@ -108,5 +127,7 @@ mod tests {
         assert!(after.vector_fallback > before.vector_fallback);
         assert!(after.property_native > before.property_native);
         assert!(after.property_fallback > before.property_fallback);
+        assert!(after.tuple_native > before.tuple_native);
+        assert!(after.tuple_fallback > before.tuple_fallback);
     }
 }
