@@ -42,6 +42,24 @@ crates.io release will establish and document that API explicitly.
   their LOGON principal (documented in docs/multi-tenancy.md).
 
 **Fixed**
+- A write's durability tail (WAL PUT + manifest body PUT + pointer CAS +
+  orphan retries) ran OUTSIDE the scope of both `--write-timeout` and
+  `--writer-lock-timeout` on every foreground path — and Bolt has no
+  outer request timeout, which is how a production log showed a
+  24.5-minute write completing with status ok under 30s timeouts (a
+  store stall or retry storm that eventually succeeded). The commit now
+  probes the deadline (and the admin cancel flag) at its DETERMINATE
+  boundaries — before any object write, and before the orphan-WAL
+  retry — with the pending batch preserved on abort; it is never
+  interrupted between the WAL PUT and the pointer CAS, so outcomes stay
+  definite. The HTTP write deadline scope now covers the commit, Bolt
+  re-arms it around its commits, the group-commit ACK wait is bounded
+  by the write deadline (elapsing yields an honest
+  outcome-unknown error without cancelling the committer), commits
+  slower than 10s log a warn naming the durability tail, and optional
+  `NAMIDB_STORE_REQUEST_TIMEOUT` / `NAMIDB_STORE_RETRY_TIMEOUT` /
+  `NAMIDB_STORE_MAX_RETRIES` bound individual object-store ops
+  (defaults unchanged).
 - The Bolt per-message decode guard rejected legitimate small-row
   batches: its fixed allowance was 64 KiB on top of 8x the message's own
   wire size, so ~889 single-key row maps (~13x heap-to-wire

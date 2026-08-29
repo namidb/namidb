@@ -157,7 +157,11 @@ pub async fn execute_write_with_deadline(
             return Err(e);
         }
     };
-    if let Err(e) = writer.commit_batch().await {
+    // The deadline covers the durability tail too (item 59): commit_batch
+    // probes it at its determinate boundaries, so a deadline that expired
+    // during staging fails the commit before any object write instead of
+    // riding an unbounded PUT/CAS/retry sequence.
+    if let Err(e) = crate::exec::limits::with_limits(deadline, None, writer.commit_batch()).await {
         // The commit failed and this statement is aborted. `commit_batch`
         // preserves the pending batch on error (so an internal retry is
         // possible), but this writer is long-lived and shared: if we return

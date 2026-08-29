@@ -1163,7 +1163,6 @@ impl QueryRegistry {
             None => false,
         }
     }
-
 }
 
 /// RAII registration: deregisters on Drop; exposes the cancel flag for the

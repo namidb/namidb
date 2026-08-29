@@ -1867,6 +1867,43 @@ pub(crate) async fn lock_writer_bounded(
     tokio::time::timeout(timeout, writer.lock()).await.ok()
 }
 
+/// Outcome of awaiting a group-commit ACK under the write deadline.
+pub(crate) enum GroupAck {
+    Committed,
+    Shared(SharedCommitError),
+    CoordinatorExited,
+    /// The deadline elapsed while the group's commit was still in flight.
+    /// The committer is untouched — the write MAY still become durable —
+    /// so the waiter stops lying about latency and says so.
+    Indeterminate,
+}
+
+pub(crate) const GROUP_ACK_INDETERMINATE: &str = "group commit still in flight past the write \
+     timeout; outcome unknown — the write may yet become durable, verify before retrying";
+
+/// Await a group-commit ACK, bounded by the write deadline when one is
+/// configured. Never cancels the committer: one slow disk must not turn
+/// into shared-fate false failures for the whole group.
+pub(crate) async fn bounded_group_ack(
+    ack: tokio::sync::oneshot::Receiver<Result<(), SharedCommitError>>,
+    deadline: Option<std::time::Instant>,
+) -> GroupAck {
+    let wait = async move {
+        match ack.await {
+            Ok(Ok(())) => GroupAck::Committed,
+            Ok(Err(shared)) => GroupAck::Shared(shared),
+            Err(_) => GroupAck::CoordinatorExited,
+        }
+    };
+    match deadline {
+        None => wait.await,
+        Some(at) => match tokio::time::timeout_at(tokio::time::Instant::from_std(at), wait).await {
+            Ok(acked) => acked,
+            Err(_) => GroupAck::Indeterminate,
+        },
+    }
+}
+
 /// Group commit (RFC-034): one committer per namespace amortizes the
 /// two object-store round-trips of `commit_batch` across concurrently
 /// arriving writes. Requests stage under the writer lock inside a request
@@ -1890,7 +1927,7 @@ pub(crate) struct GroupCommit {
 
 /// The one commit error a whole group shares (shared fate: a merged WAL
 /// segment cannot be partially durable).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SharedCommitError(pub(crate) Arc<namidb_query::exec::ExecError>);
 
 /// A write's failure on either commit path: its own statement error, or the
@@ -3378,12 +3415,17 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     let stall = state.after_commit_backpressure(&writer);
                     drop(writer);
                     group.notify_committer();
-                    let result = match ack.await {
-                        Ok(Ok(())) => Ok(outcome),
-                        Ok(Err(shared)) => Err(WriteFailure::Shared(shared)),
-                        Err(_) => Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
-                            "group commit coordinator exited".into(),
-                        ))),
+                    let result = match bounded_group_ack(ack, state.write_deadline()).await {
+                        GroupAck::Committed => Ok(outcome),
+                        GroupAck::Shared(shared) => Err(WriteFailure::Shared(shared)),
+                        GroupAck::CoordinatorExited => {
+                            Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                                "group commit coordinator exited".into(),
+                            )))
+                        }
+                        GroupAck::Indeterminate => Err(WriteFailure::Own(
+                            namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
+                        )),
                     };
                     (result, stall)
                 }
@@ -4388,12 +4430,17 @@ async fn run_cypher_multi(
                     let stall = shared.write_stall_for(writer.max_l0_bucket_len(), bytes);
                     drop(writer);
                     group.notify_committer();
-                    let result = match ack.await {
-                        Ok(Ok(())) => Ok(outcome),
-                        Ok(Err(shared_err)) => Err(WriteFailure::Shared(shared_err)),
-                        Err(_) => Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
-                            "group commit coordinator exited".into(),
-                        ))),
+                    let result = match bounded_group_ack(ack, shared.write_deadline()).await {
+                        GroupAck::Committed => Ok(outcome),
+                        GroupAck::Shared(shared_err) => Err(WriteFailure::Shared(shared_err)),
+                        GroupAck::CoordinatorExited => {
+                            Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                                "group commit coordinator exited".into(),
+                            )))
+                        }
+                        GroupAck::Indeterminate => Err(WriteFailure::Own(
+                            namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
+                        )),
                     };
                     (result, stall)
                 }
@@ -5094,6 +5141,38 @@ mod tests {
                 "{method} {uri} must be write-role gated"
             );
         }
+    }
+
+    /// Item 59: the group-commit waiter is bounded by the write deadline —
+    /// a stalled committer yields the honest indeterminate outcome instead
+    /// of an unbounded wait, and the committer itself is never cancelled
+    /// (the sender stays alive; a later resolution is still deliverable).
+    #[tokio::test(start_paused = true)]
+    async fn group_ack_times_out_indeterminate_without_touching_the_committer() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SharedCommitError>>();
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        let waiter = tokio::spawn(bounded_group_ack(rx, Some(deadline)));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(waiter.await.unwrap(), GroupAck::Indeterminate));
+        // The committer side is untouched: a late resolution simply finds
+        // the waiter gone (send returns the value back), never a panic or a
+        // poisoned coordinator.
+        let _ = tx.send(Ok(()));
+
+        // A resolved ack inside the deadline maps through unchanged.
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SharedCommitError>>();
+        tx.send(Ok(())).unwrap();
+        assert!(matches!(
+            bounded_group_ack(rx, Some(std::time::Instant::now() + Duration::from_secs(5))).await,
+            GroupAck::Committed
+        ));
+        // No deadline configured = today's unbounded wait, resolved acks only.
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SharedCommitError>>();
+        drop(tx);
+        assert!(matches!(
+            bounded_group_ack(rx, None).await,
+            GroupAck::CoordinatorExited
+        ));
     }
 
     /// Plan item 28: the HTTP JSON parameter route had no unit tests and no

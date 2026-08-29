@@ -174,6 +174,55 @@ fn parse_file(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriEr
     ))
 }
 
+/// Optional client tuning for the HTTP-backed stores (S3/GCS/Azure), from
+/// env. UNSET = object_store's defaults (30s/request, 180s retry budget) —
+/// shipped behavior is unchanged. Item 59's residual window is a single
+/// in-flight op (the commit path aborts BETWEEN ops at its deadline), so an
+/// operator who saw a multi-minute retry storm can bound it here:
+/// `NAMIDB_STORE_REQUEST_TIMEOUT` / `NAMIDB_STORE_RETRY_TIMEOUT` (seconds,
+/// or `<n>ms`) and `NAMIDB_STORE_MAX_RETRIES`. Applies to every op on the
+/// store, maintenance included — size generously.
+fn env_duration(name: &str) -> Option<std::time::Duration> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim();
+    let parsed = if let Some(ms) = raw.strip_suffix("ms") {
+        ms.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else {
+        let secs = raw.strip_suffix('s').unwrap_or(raw).trim();
+        secs.parse::<u64>().ok().map(std::time::Duration::from_secs)
+    };
+    if parsed.is_none() {
+        tracing::warn!(env = name, value = raw, "unparseable duration ignored");
+    }
+    parsed
+}
+
+fn store_retry_config() -> Option<object_store::RetryConfig> {
+    let retry_timeout = env_duration("NAMIDB_STORE_RETRY_TIMEOUT");
+    let max_retries = std::env::var("NAMIDB_STORE_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    if retry_timeout.is_none() && max_retries.is_none() {
+        return None;
+    }
+    let mut config = object_store::RetryConfig::default();
+    if let Some(t) = retry_timeout {
+        config.retry_timeout = t;
+    }
+    if let Some(n) = max_retries {
+        config.max_retries = n;
+    }
+    Some(config)
+}
+
+fn store_client_options() -> Option<object_store::ClientOptions> {
+    env_duration("NAMIDB_STORE_REQUEST_TIMEOUT")
+        .map(|t| object_store::ClientOptions::new().with_timeout(t))
+}
+
 fn parse_s3(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriError> {
     let parsed = url::Url::parse(uri).map_err(|e| UriError::Malformed {
         uri: uri.to_string(),
@@ -220,6 +269,12 @@ fn parse_s3(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriErro
     }
     if allow_http {
         builder = builder.with_allow_http(true);
+    }
+    if let Some(options) = store_client_options() {
+        builder = builder.with_client_options(options);
+    }
+    if let Some(retry) = store_retry_config() {
+        builder = builder.with_retry(retry);
     }
     let store = builder.build().map_err(|e| UriError::BackendInit {
         uri: uri.to_string(),
@@ -268,6 +323,12 @@ fn parse_gcs(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriErr
         object_store::gcp::GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
     if let Some(p) = service_account {
         builder = builder.with_service_account_path(p);
+    }
+    if let Some(options) = store_client_options() {
+        builder = builder.with_client_options(options);
+    }
+    if let Some(retry) = store_retry_config() {
+        builder = builder.with_retry(retry);
     }
     let store = builder.build().map_err(|e| UriError::BackendInit {
         uri: uri.to_string(),
@@ -337,6 +398,12 @@ fn parse_azure(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriE
     }
     if use_emulator {
         builder = builder.with_use_emulator(true);
+    }
+    if let Some(options) = store_client_options() {
+        builder = builder.with_client_options(options);
+    }
+    if let Some(retry) = store_retry_config() {
+        builder = builder.with_retry(retry);
     }
     let store = builder.build().map_err(|e| UriError::BackendInit {
         uri: uri.to_string(),

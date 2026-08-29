@@ -881,14 +881,17 @@ impl ServerBackend {
                 let stall = self.state.after_commit_backpressure(&writer);
                 drop(writer);
                 group.notify_committer();
-                let acked = ack.await;
+                let acked = crate::bounded_group_ack(ack, self.state.write_deadline()).await;
                 let elapsed = started.elapsed();
                 let result = match acked {
-                    Ok(Ok(())) => Ok(write_run_outcome(outcome)),
-                    Ok(Err(shared)) => Err(map_exec_err_ref(shared.0.as_ref())),
-                    Err(_) => Err(BackendError::Other(
+                    crate::GroupAck::Committed => Ok(write_run_outcome(outcome)),
+                    crate::GroupAck::Shared(shared) => Err(map_exec_err_ref(shared.0.as_ref())),
+                    crate::GroupAck::CoordinatorExited => Err(BackendError::Other(
                         "group commit coordinator exited".into(),
                     )),
+                    crate::GroupAck::Indeterminate => {
+                        Err(BackendError::Other(crate::GROUP_ACK_INDETERMINATE.into()))
+                    }
                 };
                 if result.is_ok() {
                     if let Some(delay) = stall {
@@ -910,7 +913,16 @@ impl ServerBackend {
                 };
             }
 
-            match writer.commit_batch().await {
+            // Item 59: Bolt has no outer request timeout, so this was the one
+            // path where a stalled store could produce a 24-minute ok write.
+            // The deadline re-arms for the commit tail; commit_batch aborts
+            // at its determinate boundaries only.
+            match namidb_storage::cancel::with_deadline(
+                self.state.write_deadline(),
+                writer.commit_batch(),
+            )
+            .await
+            {
                 Ok(_) => {
                     self.state.snapshot.store(writer.owned_snapshot());
                     // Soft write stall (RFC-027 P5): sample under the lock,
@@ -1446,7 +1458,12 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
         // One manifest CAS makes the whole transaction durable; then
         // republish so reads see it. Dropping `tx` releases the writer lock.
-        match tx.writer.commit_batch().await {
+        match namidb_storage::cancel::with_deadline(
+            self.state.write_deadline(),
+            tx.writer.commit_batch(),
+        )
+        .await
+        {
             Ok(_) => {
                 self.state.snapshot.store(tx.writer.owned_snapshot());
                 Ok(())
