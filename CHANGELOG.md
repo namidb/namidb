@@ -15,6 +15,19 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- Server boolean flags now accept `1/0/true/false/yes/no/on/off` on the
+  CLI (`--multi-tenant=1`) and through their env vars
+  (`NAMIDB_MULTI_TENANT=1`, `NAMIDB_NO_AUTH=1`, `NAMIDB_SWEEP_DELETE=0`)
+  — previously only the literal strings `true`/`false` parsed, and
+  `--multi-tenant=true` was rejected outright. Unrecognized values stay
+  hard errors, so junk can never silently disable auth.
+- Multi-tenant mode no longer demands `?ns=` in `--store`: the value was
+  parsed, validated, and thrown away (an operator writing `?ns=main`
+  silently got fallback namespace `default`). The parameter is now
+  optional; if present it is ignored with a boot warning naming
+  `--default-namespace` as the real source of the fallback tenant.
+
 ## [2.4.1] - 2026-08-28
 
 **Fixed**

@@ -45,7 +45,17 @@ struct Cli {
     /// Explicitly run WITHOUT authentication: every request gets anonymous
     /// read-write access. Required to boot when no auth source is configured;
     /// never combine with a port exposed beyond localhost.
-    #[arg(long, env = "NAMIDB_NO_AUTH", default_value_t = false, action)]
+    /// Accepts `1/0/true/false/yes/no/on/off` (bare `--no-auth` means true).
+    #[arg(
+        long,
+        env = "NAMIDB_NO_AUTH",
+        default_value_t = false,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     no_auth: bool,
 
     /// Group-commit coalescing window (RFC-034): concurrently arriving
@@ -162,7 +172,8 @@ struct Cli {
         long,
         env = "NAMIDB_SWEEP_DELETE",
         default_value_t = true,
-        action = clap::ArgAction::Set
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
     )]
     sweep_delete: bool,
 
@@ -321,7 +332,18 @@ struct Cli {
     /// Multi-tenant mode: when `true`, the server accepts a namespace via path
     /// parameter (`/:namespace/v0/...`) or header (`X-NamiDB-Namespace`) and
     /// routes to a per-namespace WriterSession.
-    #[arg(long, env = "NAMIDB_MULTI_TENANT", default_value_t = false, action)]
+    /// Accepts `1/0/true/false/yes/no/on/off` (bare `--multi-tenant` means
+    /// true).
+    #[arg(
+        long,
+        env = "NAMIDB_MULTI_TENANT",
+        default_value_t = false,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     multi_tenant: bool,
 
     /// Default namespace for backward compatibility. When `multi_tenant` is
@@ -414,4 +436,88 @@ fn main() -> anyhow::Result<()> {
         config,
         memory_max_bytes,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use clap::Parser;
+
+    /// The three boolean flags accept `1/0/yes/no/on/off` on the CLI and —
+    /// the field-report case — through their env vars, while garbage stays
+    /// an error (NAMIDB_NO_AUTH must never coerce junk to true).
+    #[test]
+    fn boolean_flags_accept_boolish_values() {
+        Cli::command().debug_assert();
+        let base = ["namidb-server", "--store", "memory://t"];
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+
+        // Bare switches keep meaning true.
+        assert!(parse(&["--no-auth"]).unwrap().no_auth);
+        assert!(parse(&["--multi-tenant"]).unwrap().multi_tenant);
+        // `=value` forms, previously rejected outright.
+        for (value, expected) in [
+            ("1", true),
+            ("0", false),
+            ("true", true),
+            ("false", false),
+            ("yes", true),
+            ("no", false),
+            ("TRUE", true),
+            ("off", false),
+        ] {
+            let cli = parse(&[&format!("--multi-tenant={value}")]).unwrap();
+            assert_eq!(cli.multi_tenant, expected, "--multi-tenant={value}");
+        }
+        assert!(parse(&["--multi-tenant=maybe"]).is_err());
+        assert!(
+            parse(&["--no-auth=garbage"]).is_err(),
+            "junk must never disable auth"
+        );
+        // Space-separated values were never accepted for the switches and
+        // must stay rejected so a following token cannot be swallowed.
+        assert!(parse(&["--multi-tenant", "true"]).is_err());
+        // --sweep-delete keeps its required value, both spellings.
+        assert!(!parse(&["--sweep-delete", "0"]).unwrap().sweep_delete);
+        assert!(!parse(&["--sweep-delete=no"]).unwrap().sweep_delete);
+        assert!(parse(&["--sweep-delete", "false"])
+            .map(|c| !c.sweep_delete)
+            .unwrap());
+        assert!(parse(&["--sweep-delete", "sometimes"]).is_err());
+    }
+
+    /// The env-var forms the field report used (`NAMIDB_MULTI_TENANT=1`).
+    /// Serialized: env is process-global.
+    #[test]
+    fn boolean_envs_accept_boolish_values() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = ["namidb-server", "--store", "memory://t"];
+        for (value, expected) in [("1", true), ("0", false), ("yes", true), ("off", false)] {
+            std::env::set_var("NAMIDB_MULTI_TENANT", value);
+            let cli = Cli::try_parse_from(base).unwrap();
+            assert_eq!(cli.multi_tenant, expected, "NAMIDB_MULTI_TENANT={value}");
+        }
+        std::env::set_var("NAMIDB_MULTI_TENANT", "garbage");
+        assert!(Cli::try_parse_from(base).is_err());
+        std::env::remove_var("NAMIDB_MULTI_TENANT");
+
+        std::env::set_var("NAMIDB_NO_AUTH", "1");
+        assert!(Cli::try_parse_from(base).unwrap().no_auth);
+        std::env::set_var("NAMIDB_NO_AUTH", "junk");
+        assert!(
+            Cli::try_parse_from(base).is_err(),
+            "junk must never disable auth"
+        );
+        std::env::remove_var("NAMIDB_NO_AUTH");
+
+        std::env::set_var("NAMIDB_SWEEP_DELETE", "0");
+        assert!(!Cli::try_parse_from(base).unwrap().sweep_delete);
+        std::env::remove_var("NAMIDB_SWEEP_DELETE");
+    }
 }

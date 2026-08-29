@@ -217,9 +217,13 @@ namespace is the empty-string sentinel `""`, which bypasses the scope check —
 
 ### Worked example (HTTP, namespace-per-tenant)
 
-Start a multi-tenant server. Note that in `--multi-tenant` mode the `?ns=` part
-of `--store` is ignored — the registry uses the bucket/root and routes each
-namespace under a flat layout (`lib.rs:501-519`):
+Start a multi-tenant server. In `--multi-tenant` mode the `?ns=` part of
+`--store` is **optional** (since 2.5.0; earlier versions demanded it and then
+discarded the value) — the registry uses the bucket/root and routes each
+namespace under a flat layout. If you do pass one it is ignored with a boot
+warning: the fallback tenant is named by `--default-namespace`, never by the
+URI. Boolean flags/envs accept `1/0/true/false/yes/no/on/off`
+(`NAMIDB_MULTI_TENANT=1` works):
 
 ```bash
 namidb-server \

@@ -81,6 +81,31 @@ pub fn parse_uri(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), Ur
     Err(UriError::UnsupportedScheme(uri.to_string()))
 }
 
+/// Parse a storage URI into just the object-store handle, WITHOUT
+/// requiring the `?ns=` parameter.
+///
+/// Multi-tenant boot uses this: namespaces come from requests (and
+/// `--default-namespace`), so the URI's `ns` is meaningless there — the
+/// old code still demanded it and then threw it away. Store construction
+/// is delegated to [`parse_uri`] verbatim (a placeholder namespace
+/// satisfies the shared parser when the URI carries none), so the two
+/// entry points can never drift on endpoint/credential handling. A
+/// present `?ns=` remains accepted and ignored.
+pub fn parse_store(uri: &str) -> Result<Arc<dyn ObjectStore>, UriError> {
+    match parse_uri(uri) {
+        Ok((store, _)) => Ok(store),
+        Err(UriError::MissingParam { param: "ns", .. }) => {
+            let synthetic = if uri.contains('?') {
+                format!("{uri}&ns=default")
+            } else {
+                format!("{uri}?ns=default")
+            };
+            parse_uri(&synthetic).map(|(store, _)| store)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn parse_memory(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriError> {
     let rest = uri
         .strip_prefix("memory://")
@@ -348,6 +373,28 @@ mod tests {
         assert!(matches!(
             parse_uri(&uri),
             Err(UriError::MissingParam { param: "ns", .. })
+        ));
+    }
+
+    /// Multi-tenant boot path: the store opens without `?ns=`, a present
+    /// one stays accepted, and `parse_uri` keeps requiring it (pinned by
+    /// [`file_requires_ns`] above — single-tenant is unchanged).
+    #[test]
+    fn parse_store_does_not_require_ns() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = format!("file://{}", dir.path().display());
+        assert!(parse_store(&bare).is_ok());
+        assert!(parse_store(&format!("{bare}?ns=acme")).is_ok());
+        assert!(matches!(
+            parse_store("ftp://nope"),
+            Err(UriError::UnsupportedScheme(_))
+        ));
+        // memory:// takes its namespace from the authority; an empty one
+        // stays malformed even for the store-only entry point.
+        assert!(parse_store("memory://demo").is_ok());
+        assert!(matches!(
+            parse_store("memory://"),
+            Err(UriError::Malformed { .. })
         ));
     }
 
