@@ -14,7 +14,12 @@ use crate::error::{BoltError, Result};
 use crate::message::DEFAULT_POST_AUTH_MESSAGE_BYTES;
 
 /// Fixed decoded/container allowance charged to every data message.
-pub const MESSAGE_MEMORY_BASE_BYTES: usize = 64 * 1024;
+///
+/// Kept in lockstep with the codec's [`DECODE_HEAP_BASE_BYTES`] floor so the
+/// shared semaphore charges at least what the decoder may admit per message.
+///
+/// [`DECODE_HEAP_BASE_BYTES`]: crate::codec::DECODE_HEAP_BASE_BYTES
+pub const MESSAGE_MEMORY_BASE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Estimated peak resident bytes charged per byte of authenticated Bolt body.
 ///

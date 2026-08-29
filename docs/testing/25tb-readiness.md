@@ -789,3 +789,86 @@ If-None-Match, ETag") — now corrected everywhere: the commit path needs exactl
 conditional-write primitive, PUT-if-absent (`If-None-Match: *`, RFC-029); README gained
 an object-store requirements note (an "S3-compatible" that ignores the precondition
 cannot host NamiDB safely). RET-01/03/04 need no engine action.
+
+## Third field report (2026-08-29) — four minor findings + one unreproduced
+
+Recon-before-fix, as with the first two cycles (and again worth it: two of
+five mechanisms as reported were wrong, one "unreproducible" turned out to
+be a confirmed design gap).
+
+### 55. [CORRECTED — fixed in 2.5.0] Bolt message cap "small, shape-dependent, and moves between runs"
+
+Real failure, wrong mechanism. Not the boot-logged budget
+(message_memory_budget_bytes is a different guard with a different error):
+the per-message DecodeBudget allowed 64 KiB + 8x the message's own wire
+bytes of estimated decoded heap. Tiny one-key row maps amplify at ~13x
+heap-to-wire (128 B/map entry + 32 B/list slot + payload on ~13 wire
+bytes), so the base absorbed the deficit for exactly ~889 rows; 4-field
+rows (~6x, not "<20/row" — they cost ~650 est. bytes but ride under the
+8x ratio) passed at any count. "Moves between runs" = the limit tracks
+each message's own size (161200 = 65536 + 8x11958; 111936 = 65536 +
+8x5800) — deterministic, no live state. Fix: base -> 2 MiB as a
+documented client contract (any message whose estimated decoded heap fits
+2 MiB decodes regardless of shape; ~11k tiny rows), shared semaphore base
+in lockstep, and the rejection now names estimated bytes / limit / wire
+size / formula. Amplification stays rejected; require_minimum_wire
+already forces real bytes per declared entry.
+
+### 56. [CONFIRMED — in progress] No way to list or cancel an in-flight query
+
+Tracking today is one AtomicI64 gauge; the slow-query log is post-hoc.
+The useful discovery: cooperative cancellation PLUMBING already exists
+end-to-end — a task-local deadline polled at ~75 executor/storage
+chokepoints (writes included) plus Bolt's RunCancellation — it is just
+not operator-reachable. Fix: widen the cancel task-local to
+{deadline, flag}, a guard-based QueryRegistry at the four existing
+in-flight chokepoints, GET /v0/admin/queries + POST
+/v0/admin/queries/:id/cancel (auth + write-role gated; statements are
+operator-visible), cancellation surfacing as an executor error so the
+existing discard/recovery path handles cleanup.
+
+### 57. [CORRECTED — fixed in 2.5.0] --multi-tenant rejects 1; ns "named in two sites"
+
+Env bool parse confirmed exactly (clap bare-`action` SetTrue =>
+BoolValueParser on env values; --no-auth and --sweep-delete shared it,
+and our own docs instructed NAMIDB_NO_AUTH=1). But the ns half was
+WORSE than reported, not a duplicate name: in multi-tenant mode ?ns=
+was parsed, validated, and DISCARDED — an operator writing ?ns=main
+silently got fallback namespace "default" (the flag, not the URI, was
+always the source). Fixed: BoolishValueParser on the three flags
+(1/0/yes/no/on/off; junk stays a hard error so nothing coerces
+--no-auth), parse_store() makes ?ns= optional in multi-tenant boot with
+a warning when a dead one is present.
+
+### 58. [CONFIRMED — in progress] Auth tokens file has no hot reload
+
+Loaded once at boot, frozen in an Arc cloned by HTTP, Bolt, and shared
+state — so the swap must be interior to AuthConfig (an Arc replacement
+would miss the clones). Fix follows the in-repo JWKS precedent
+(jwt.rs spawn_refresh): content-compare poll task, atomic swap of the
+token set only, fail-to-last-good on malformed files (a reload can
+never widen access or flip auth open). To document: revocation does not
+kill live single-tenant Bolt sessions (LOGON-cached principal);
+multi-tenant Bolt re-resolves per statement.
+
+### 59. [CONFIRMED — in progress] 24.5-minute write with status=ok under 30s timeouts (reporter could not reproduce)
+
+Confirmed as a design gap without needing the repro: NEITHER timeout
+ever covered the durability tail. --writer-lock-timeout bounds only the
+writer-mutex wait; --write-timeout becomes a deadline armed around plan
+STAGING only — writer.commit_batch() (WAL PUT + manifest body PUT +
+pointer CAS + orphan-WAL re-seq + CAS resolution) runs after the
+deadline scope on every foreground path, riding object_store client
+defaults (S3: up to 180s retry budget x10 per op; file://: no timeout
+at all). HTTP cannot log the signature (120s TimeoutLayer drops the
+handler); Bolt has no outer bound — lock <=30s + staging <=30s + commit
+unbounded, elapsed includes it: the reporter's write was a Bolt write
+through a store stall that eventually succeeded. The 24-min-lock-wait
+theory is refuted (lock wait is capped; maintenance convoys produce
+503s, not slow oks). Fix plan: probe cancellation at commit_batch's
+determinate boundaries (pre-PUT, pre-retry — never between WAL PUT and
+CAS), move commit inside the deadline scope (HTTP) and wrap it (Bolt),
+explicit store client timeouts, bound the group-commit ack wait with an
+honest indeterminate error, and slow-log lock/staging/commit
+sub-durations. Adjacent hazard recorded: the HTTP TimeoutLayer can
+cancel a commit mid-durability at 120s — to bound, not drop.

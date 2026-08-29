@@ -986,8 +986,25 @@ pub async fn run_with_memory_max_bytes(
     // Multi-tenant mode: create a registry and build the multi-tenant router.
     // The registry lazily creates WriterSessions per namespace on first access.
     if config.multi_tenant {
-        let (store, _) = namidb_storage::parse_uri(&config.store_uri)
+        // `?ns=` is not required here: namespaces come from requests and the
+        // fallback from `--default-namespace`. Accept-and-ignore a present
+        // one (existing command lines keep booting) but say so, because an
+        // operator writing `?ns=main` believes they named the default tenant.
+        let store = namidb_storage::parse_store(&config.store_uri)
             .map_err(|e| anyhow::anyhow!("invalid --store: {e}"))?;
+        if let Some(query) = config.store_uri.split_once('?').map(|(_, q)| q) {
+            if query
+                .split('&')
+                .filter_map(|pair| pair.split('=').next())
+                .any(|key| key == "ns" || key == "namespace")
+            {
+                tracing::warn!(
+                    default_namespace = %config.default_namespace,
+                    "--store `?ns=` is ignored in multi-tenant mode; the \
+                     fallback namespace comes from --default-namespace"
+                );
+            }
+        }
         let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), config.slow_query_threshold);
         let maintenance = registry::MaintenanceConfig {
             flush_interval: config.flush_interval,
@@ -6997,6 +7014,55 @@ mod tests {
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)
+    }
+
+    /// FR3 finding 3, half two: a multi-tenant store URI needs no `?ns=`
+    /// (its value was always discarded), and requests without a namespace
+    /// land on `--default-namespace` — the flag, not the URI.
+    #[tokio::test]
+    async fn multi_tenant_store_uri_needs_no_ns_and_default_comes_from_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = format!("file://{}", dir.path().display());
+        let store = namidb_storage::parse_store(&bare).unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry,
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "coop-central".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+        // No path prefix, no header: the fallback namespace serves.
+        let status = mt_cypher(&app, "/v0/cypher", None, "RETURN 1 AS one").await;
+        assert_eq!(status, StatusCode::OK);
+        // The write lands under the flag-named namespace on disk.
+        let status = mt_cypher(&app, "/v0/cypher", None, "CREATE (:T {a: 1})").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            listed.iter().any(|name| name.contains("coop-central")),
+            "default namespace must come from the flag, got {listed:?}"
+        );
     }
 
     async fn mt_cypher(

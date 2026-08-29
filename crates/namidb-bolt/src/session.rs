@@ -398,7 +398,9 @@ fn requires_decode_admission(body: &[u8]) -> bool {
 fn is_frame_memory_rejection(error: &BoltError) -> bool {
     matches!(
         error,
-        BoltError::TooLarge { .. } | BoltError::MemoryBudgetExhausted { .. }
+        BoltError::TooLarge { .. }
+            | BoltError::DecodedTooLarge { .. }
+            | BoltError::MemoryBudgetExhausted { .. }
     )
 }
 
@@ -2269,10 +2271,13 @@ mod tests {
     #[tokio::test]
     async fn partial_data_frame_does_not_block_other_data_and_releases_budget_at_deadline() {
         let wire_bytes = CONTROL_FRAME_MAX_BYTES + 1024;
+        // Two concurrent messages each carry the fixed base charge, so the
+        // shared budget needs two full estimates (the partial frame's
+        // framing charge plus the unrelated RUN's decode charge).
         let budget = Arc::new(
-            MessageMemoryBudget::try_new(MessageMemoryBudget::estimated_bytes_for_wire(
-                wire_bytes * 2,
-            ))
+            MessageMemoryBudget::try_new(
+                MessageMemoryBudget::estimated_bytes_for_wire(wire_bytes) * 2,
+            )
             .unwrap(),
         );
         let available_before = budget.available_bytes();

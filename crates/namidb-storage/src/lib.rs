@@ -113,5 +113,5 @@ pub use sst::{
     NodeSstWriter, NodeSstWriterOptions, PropertyColumnStats, StatScalar,
 };
 pub use unique_index::UniqueProbe;
-pub use uri::{parse_uri, UriError};
+pub use uri::{parse_store, parse_uri, UriError};
 pub use wal::{WalRecord, WalSegment, WalSegmentRef, WalStore};
