@@ -16,6 +16,21 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Added**
+- Operators can now see and kill in-flight queries: `GET /v0/admin/queries`
+  lists them (id, protocol, namespace, sanitized statement, elapsed) and
+  `POST /v0/admin/queries/:id/cancel` aborts one at the executor's
+  cooperative probe points — the same ~hundred sites the query timeout
+  uses, covering reads and writes over HTTP and Bolt, single- and
+  multi-tenant (namespace-scoped: a tenant token can neither see nor
+  cancel another tenant's queries). A cancelled write surfaces
+  "query cancelled by administrator" (HTTP 409 `cancelled`,
+  Bolt `Neo.TransientError.Transaction.Terminated`), discards its staged
+  batch through the same recovery path an error takes, and leaves the
+  writer immediately usable. Both routes sit behind auth and the
+  write-role gate; statement text never reaches unauthenticated
+  `/v0/metrics`. Found along the way: a bare giant `UNWIND range(...)`
+  expansion had no cooperative probes at all — it could neither time out
+  nor be cancelled; the loops now probe like every other operator.
 - The static auth tokens file hot-reloads: the server re-reads
   `--auth-tokens-file` on `--auth-tokens-reload-interval` (default 10s,
   `0s` disables) and swaps the token set atomically, so onboarding or

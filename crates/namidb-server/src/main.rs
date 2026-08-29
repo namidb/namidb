@@ -457,11 +457,16 @@ mod tests {
     use clap::CommandFactory;
     use clap::Parser;
 
+    /// Both tests parse the environment, so they serialize on one lock —
+    /// clap reads the NAMIDB_* vars on every try_parse_from.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The three boolean flags accept `1/0/yes/no/on/off` on the CLI and —
     /// the field-report case — through their env vars, while garbage stays
     /// an error (NAMIDB_NO_AUTH must never coerce junk to true).
     #[test]
     fn boolean_flags_accept_boolish_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
         Cli::command().debug_assert();
         let base = ["namidb-server", "--store", "memory://t"];
         let parse = |extra: &[&str]| {
@@ -508,7 +513,6 @@ mod tests {
     /// Serialized: env is process-global.
     #[test]
     fn boolean_envs_accept_boolish_values() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let base = ["namidb-server", "--store", "memory://t"];
         for (value, expected) in [("1", true), ("0", false), ("yes", true), ("off", false)] {

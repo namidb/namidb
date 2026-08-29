@@ -57,10 +57,11 @@ pub(crate) async fn with_limits<F: Future>(
 /// scoped.
 #[inline]
 pub(crate) fn check_deadline() -> Result<(), ExecError> {
-    if namidb_storage::cancel::deadline_exceeded() {
-        Err(ExecError::Timeout)
-    } else {
-        Ok(())
+    use namidb_storage::cancel::Interrupt;
+    match namidb_storage::cancel::interrupted() {
+        None => Ok(()),
+        Some(Interrupt::Timeout) => Err(ExecError::Timeout),
+        Some(Interrupt::Cancelled) => Err(ExecError::Cancelled),
     }
 }
 

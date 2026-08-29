@@ -530,6 +530,10 @@ pub enum BackendError {
     /// The query exceeded a configured deterministic result limit (row cap,
     /// search result caps). Also deliberately not transient.
     ResourceLimit(String),
+    /// An administrator cancelled this execution. Transient by Neo4j
+    /// convention (Transaction.Terminated): the STATEMENT may be retried —
+    /// whether it should be is the operator's conversation to have.
+    Cancelled(String),
     /// Anything else.
     Other(String),
 }
@@ -545,6 +549,7 @@ impl BackendError {
             BackendError::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
             BackendError::Forbidden(_) => "Neo.ClientError.Security.Forbidden",
             BackendError::Timeout(_) => "Neo.ClientError.Transaction.TransactionTimedOut",
+            BackendError::Cancelled(_) => "Neo.TransientError.Transaction.Terminated",
             BackendError::ResourceLimit(_) => "Neo.ClientError.Statement.ResourceLimitExceeded",
             BackendError::Other(_) => "Neo.DatabaseError.General.UnknownError",
         }
@@ -561,6 +566,7 @@ impl BackendError {
             | BackendError::Forbidden(s)
             | BackendError::Timeout(s)
             | BackendError::ResourceLimit(s)
+            | BackendError::Cancelled(s)
             | BackendError::Other(s) => s,
         }
     }
