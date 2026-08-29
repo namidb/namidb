@@ -86,6 +86,18 @@ struct Cli {
     #[arg(long, env = "NAMIDB_AUTH_TOKENS_FILE")]
     auth_tokens_file: Option<std::path::PathBuf>,
 
+    /// How often to re-read `--auth-tokens-file` and hot-swap the token set
+    /// without a restart (write the file atomically: temp + rename). A
+    /// malformed or emptied file keeps the current set serving. `0s`
+    /// disables the reload task.
+    #[arg(
+        long,
+        env = "NAMIDB_AUTH_TOKENS_RELOAD_INTERVAL",
+        default_value = "10s",
+        value_parser = humantime::parse_duration,
+    )]
+    auth_tokens_reload_interval: Duration,
+
     // ── OIDC/JWT auth (only compiled with the `jwt` feature) ──────────
     /// JWKS URL to fetch signing keys for bearer-token JWT validation.
     /// Setting `--jwt-jwks-url` enables JWT auth: a bearer token is first
@@ -384,6 +396,7 @@ fn main() -> anyhow::Result<()> {
         listen: cli.listen,
         auth_token: cli.auth_token,
         auth_tokens_file: cli.auth_tokens_file,
+        auth_tokens_reload_interval: cli.auth_tokens_reload_interval,
         no_auth: cli.no_auth,
         group_commit_window: cli.group_commit_window,
         backup_target_uri: cli.backup_target_uri,

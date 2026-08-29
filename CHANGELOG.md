@@ -15,6 +15,17 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Added**
+- The static auth tokens file hot-reloads: the server re-reads
+  `--auth-tokens-file` on `--auth-tokens-reload-interval` (default 10s,
+  `0s` disables) and swaps the token set atomically, so onboarding or
+  rotating a tenant's token no longer restarts every namespace. Change
+  detection is content-compare (rename-safe); a malformed, truncated, or
+  emptied file keeps the last good set serving — a reload can never
+  widen access or flip auth open. Revocation applies to new requests and
+  new Bolt LOGONs immediately; live single-tenant Bolt sessions keep
+  their LOGON principal (documented in docs/multi-tenancy.md).
+
 **Fixed**
 - The Bolt per-message decode guard rejected legitimate small-row
   batches: its fixed allowance was 64 KiB on top of 8x the message's own

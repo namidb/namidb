@@ -29,6 +29,7 @@ async fn boot() -> String {
         listen: http_addr,
         auth_token: Some(TOKEN.into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,

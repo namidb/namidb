@@ -66,6 +66,7 @@ async fn serves_https_and_bolt_over_tls() {
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         #[cfg(feature = "jwt")]
         jwt: None,
         #[cfg(feature = "pdp")]
