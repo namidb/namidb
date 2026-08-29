@@ -332,6 +332,7 @@ pub struct Metrics {
     bolt: ProtoMetrics,
     writer_locks: [WriterLockMetrics; WriterLockKind::ALL.len()],
     compactions: [CompactionMetrics; CompactionTrigger::ALL.len()],
+    queries: Arc<QueryRegistry>,
 }
 
 impl Metrics {
@@ -348,7 +349,13 @@ impl Metrics {
             bolt: ProtoMetrics::new(),
             writer_locks: std::array::from_fn(|_| WriterLockMetrics::new()),
             compactions: std::array::from_fn(|_| CompactionMetrics::new()),
+            queries: Arc::new(QueryRegistry::default()),
         })
+    }
+
+    /// The in-flight query registry (list + cancel admin surface).
+    pub fn queries(&self) -> &Arc<QueryRegistry> {
+        &self.queries
     }
 
     fn proto(&self, protocol: Protocol) -> &ProtoMetrics {
@@ -1047,6 +1054,142 @@ impl Metrics {
 
 /// RAII guard returned by [`Metrics::track_in_flight`]; decrements the
 /// in-flight gauge on drop.
+/// One in-flight query visible to operators: registered when a statement
+/// enters a serving path, deregistered by RAII when it finishes (guard drop
+/// is airtight through panic and early return). The cancel flag is the
+/// operator's handle into the executor's cooperative probe sites.
+struct QueryEntry {
+    protocol: Protocol,
+    namespace: String,
+    statement: String,
+    started: Instant,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A listed in-flight query, as served by `GET /v0/admin/queries`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryInfo {
+    pub id: u64,
+    pub protocol: &'static str,
+    pub namespace: String,
+    pub statement: String,
+    pub elapsed_ms: u64,
+}
+
+/// Registry of in-flight queries (field report 3, item 56). Lives on
+/// [`Metrics`] because every serving path already holds it; statement text
+/// is operator-visible, so the routes exposing this sit behind auth and the
+/// write-role gate.
+#[derive(Default)]
+pub struct QueryRegistry {
+    next_id: AtomicU64,
+    entries: std::sync::Mutex<std::collections::HashMap<u64, QueryEntry>>,
+}
+
+impl std::fmt::Debug for QueryRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryRegistry").finish_non_exhaustive()
+    }
+}
+
+impl QueryRegistry {
+    /// Register one query; the returned guard deregisters on Drop and
+    /// carries the cancel flag to scope over the execution.
+    pub fn register(
+        self: &Arc<Self>,
+        protocol: Protocol,
+        namespace: &str,
+        statement: &str,
+    ) -> RegisteredQuery {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.entries.lock().expect("query registry lock").insert(
+            id,
+            QueryEntry {
+                protocol,
+                namespace: namespace.to_string(),
+                statement: sanitize_query(statement),
+                started: Instant::now(),
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        RegisteredQuery {
+            registry: Arc::clone(self),
+            id,
+            cancel,
+        }
+    }
+
+    /// Snapshot of in-flight queries, longest-running first. `None` lists
+    /// every namespace (the single-tenant admin surface); `Some(ns)` scopes
+    /// the view to one tenant so a namespace-scoped token can never read
+    /// another tenant's statements.
+    pub fn list(&self, namespace: Option<&str>) -> Vec<QueryInfo> {
+        let entries = self.entries.lock().expect("query registry lock");
+        let mut out: Vec<QueryInfo> = entries
+            .iter()
+            .filter(|(_, e)| namespace.is_none_or(|ns| e.namespace == ns))
+            .map(|(id, e)| QueryInfo {
+                id: *id,
+                protocol: match e.protocol {
+                    Protocol::Http => "http",
+                    Protocol::Bolt => "bolt",
+                },
+                namespace: e.namespace.clone(),
+                statement: e.statement.clone(),
+                elapsed_ms: e.started.elapsed().as_millis() as u64,
+            })
+            .collect();
+        out.sort_by_key(|q| std::cmp::Reverse(q.elapsed_ms));
+        out
+    }
+
+    /// Flip a query's cancel flag. `false` = unknown id (already finished
+    /// or never existed) — cancel is NOT retroactive and cannot cross into
+    /// another query by construction: the flag lives on the entry's own Arc
+    /// and the entry leaves the map when the query completes.
+    pub fn cancel(&self, id: u64, namespace: Option<&str>) -> bool {
+        let entries = self.entries.lock().expect("query registry lock");
+        match entries
+            .get(&id)
+            .filter(|e| namespace.is_none_or(|ns| e.namespace == ns))
+        {
+            Some(entry) => {
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+}
+
+/// RAII registration: deregisters on Drop; exposes the cancel flag for the
+/// execution scope.
+pub struct RegisteredQuery {
+    registry: Arc<QueryRegistry>,
+    id: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RegisteredQuery {
+    pub fn cancel_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+}
+
+impl Drop for RegisteredQuery {
+    fn drop(&mut self) {
+        self.registry
+            .entries
+            .lock()
+            .expect("query registry lock")
+            .remove(&self.id);
+    }
+}
+
 pub struct InFlightGuard(Arc<Metrics>);
 
 impl Drop for InFlightGuard {

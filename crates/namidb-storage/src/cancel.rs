@@ -14,41 +14,109 @@
 //! its baseline cost.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
 
+/// What interrupted a cooperative probe: the wall clock, or an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupt {
+    Timeout,
+    Cancelled,
+}
+
+/// The guards a task runs under: an optional wall-clock deadline and an
+/// optional operator-flippable cancel flag. Both are probed by the same
+/// ~hundred cooperative check sites, so an admin cancel aborts exactly
+/// where a timeout would.
+#[derive(Debug, Clone, Default)]
+struct CancelCtx {
+    deadline: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
 tokio::task_local! {
-    static DEADLINE: Instant;
+    static CTX: CancelCtx;
 }
 
 /// Run `fut` with `deadline` scoped on the current task, so any read this
-/// task performs can probe it. `None` runs `fut` unguarded: no task-local is
-/// installed, so [`check`] and [`deadline_exceeded`] stay no-ops.
+/// task performs can probe it. `None` runs `fut` unguarded (an
+/// already-scoped cancel flag from an enclosing [`with_cancel_flag`] stays
+/// visible). A `Some` deadline inherits any enclosing cancel flag rather
+/// than masking it.
 pub async fn with_deadline<F: Future>(deadline: Option<Instant>, fut: F) -> F::Output {
     match deadline {
-        Some(at) => DEADLINE.scope(at, fut).await,
+        Some(at) => {
+            let cancel = CTX.try_with(|ctx| ctx.cancel.clone()).ok().flatten();
+            CTX.scope(
+                CancelCtx {
+                    deadline: Some(at),
+                    cancel,
+                },
+                fut,
+            )
+            .await
+        }
         None => fut.await,
     }
 }
 
-/// `true` when a deadline is in scope and has passed.
-#[inline]
-pub fn deadline_exceeded() -> bool {
-    DEADLINE
-        .try_with(|at| Instant::now() >= *at)
-        .unwrap_or(false)
+/// Run `fut` with an operator cancel flag scoped on the current task. The
+/// server registers one per in-flight query; flipping it makes every
+/// cooperative probe under this scope return [`Error::Cancelled`]. Inherits
+/// any enclosing deadline; an inner [`with_deadline`] inherits this flag.
+pub async fn with_cancel_flag<F: Future>(flag: Arc<AtomicBool>, fut: F) -> F::Output {
+    let deadline = CTX.try_with(|ctx| ctx.deadline).ok().flatten();
+    CTX.scope(
+        CancelCtx {
+            deadline,
+            cancel: Some(flag),
+        },
+        fut,
+    )
+    .await
 }
 
-/// `Err(Error::Timeout)` when a deadline is in scope and has passed, else
-/// `Ok(())`. Call it periodically inside a long CPU-bound loop so the work
-/// aborts cooperatively instead of pinning a worker until it returns.
+/// The active interrupt, if any. Operator cancel wins over the clock so the
+/// surfaced error names the actual cause.
+#[inline]
+pub fn interrupted() -> Option<Interrupt> {
+    CTX.try_with(|ctx| {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            Some(Interrupt::Cancelled)
+        } else if ctx.deadline.is_some_and(|at| Instant::now() >= at) {
+            Some(Interrupt::Timeout)
+        } else {
+            None
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// `true` when a guard is in scope and has fired (deadline passed OR the
+/// query was cancelled). The historical name predates operator cancel.
+#[inline]
+pub fn deadline_exceeded() -> bool {
+    interrupted().is_some()
+}
+
+/// `Err(Error::Timeout)` / `Err(Error::Cancelled)` when a guard in scope has
+/// fired, else `Ok(())`. Call it periodically inside a long CPU-bound loop
+/// so the work aborts cooperatively instead of pinning a worker until it
+/// returns.
 #[inline]
 pub fn check() -> Result<()> {
-    if deadline_exceeded() {
-        Err(Error::Timeout)
-    } else {
-        Ok(())
+    match interrupted() {
+        None => Ok(()),
+        Some(Interrupt::Timeout) => Err(Error::Timeout),
+        Some(Interrupt::Cancelled) => Err(Error::Cancelled),
     }
 }
 

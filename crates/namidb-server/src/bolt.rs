@@ -1252,7 +1252,17 @@ impl ServerBackend {
         }
 
         let _in_flight = self.state.metrics.track_in_flight();
-        let obs = self.run_query(cypher, params, &cancellation).await;
+        let registered = self.state.metrics.queries().register(
+            crate::metrics::Protocol::Bolt,
+            &self.state.namespace,
+            cypher,
+        );
+        let obs = namidb_storage::cancel::with_cancel_flag(
+            registered.cancel_flag(),
+            self.run_query(cypher, params, &cancellation),
+        )
+        .await;
+        drop(registered);
         self.state.metrics.observe_query(
             Protocol::Bolt,
             obs.kind,
@@ -1294,7 +1304,17 @@ impl ServerBackend {
         }
 
         let _in_flight = self.state.metrics.track_in_flight();
-        let obs = self.run_query_in_tx(cypher, params, &cancellation).await;
+        let registered = self.state.metrics.queries().register(
+            crate::metrics::Protocol::Bolt,
+            &self.state.namespace,
+            cypher,
+        );
+        let obs = namidb_storage::cancel::with_cancel_flag(
+            registered.cancel_flag(),
+            self.run_query_in_tx(cypher, params, &cancellation),
+        )
+        .await;
+        drop(registered);
         self.state.metrics.observe_query(
             Protocol::Bolt,
             obs.kind,
@@ -1577,6 +1597,9 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
         // query is malformed" without string-matching the message, and must
         // NOT auto-retry either (a re-run exceeds the same budget again).
         ExecError::Timeout => BackendError::Timeout("query exceeded the configured timeout".into()),
+        ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
+            BackendError::Cancelled("query cancelled by administrator".into())
+        }
         ExecError::RowCap(cap) => {
             BackendError::ResourceLimit(format!("query exceeded the configured row cap of {cap}"))
         }

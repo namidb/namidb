@@ -52,6 +52,12 @@ pub enum Error {
     #[error("read query exceeded its deadline")]
     Timeout,
 
+    /// The query was cancelled by an administrator while this crate was
+    /// decoding or merging (same cooperative probes as [`Self::Timeout`],
+    /// different cause — see [`crate::cancel::with_cancel_flag`]).
+    #[error("query cancelled by administrator")]
+    Cancelled,
+
     /// A valid monolithic search accelerator cannot fit inside the configured
     /// decoded-index cache pool. This is intentionally not treated as
     /// "index absent": silently selecting the exact O(corpus) fallback would

@@ -43,6 +43,10 @@ pub enum ExecError {
     /// configured query timeout). Surfaced from the scan / expand loops and
     /// at operator boundaries; never raised when no deadline is in scope.
     Timeout,
+    /// The query was cancelled by an administrator (the server's cancel
+    /// flag, probed at the same cooperative sites as the deadline). Never
+    /// raised when no flag is in scope.
+    Cancelled,
     /// A read query tried to materialise more rows in one operator than the
     /// server's configured row cap allows. Carries the cap. Never raised
     /// when no cap is in scope.
@@ -57,6 +61,7 @@ impl fmt::Display for ExecError {
             ExecError::Runtime(m) => write!(f, "runtime: {}", m),
             ExecError::Constraint(m) => write!(f, "constraint violation: {}", m),
             ExecError::Timeout => write!(f, "query exceeded the configured timeout"),
+            ExecError::Cancelled => write!(f, "query cancelled by administrator"),
             ExecError::RowCap(cap) => {
                 write!(f, "query exceeded the configured row cap of {cap}")
             }
@@ -954,10 +959,18 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::new();
                 for row in rows {
+                    // A huge `UNWIND range(...)` is a pure-CPU expansion with
+                    // no scan underneath — without a probe here it could
+                    // neither time out nor be cancelled (found by the item-56
+                    // cancel test).
+                    crate::exec::limits::check_deadline()?;
                     let v = evaluate(list, &row, params)?;
                     match v {
                         RuntimeValue::List(items) => {
                             for item in items {
+                                if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
+                                    crate::exec::limits::check_deadline()?;
+                                }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
@@ -7958,10 +7971,15 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_rows = input_set.materialize_all(None);
                 let mut out = Vec::new();
                 for row in input_rows {
+                    // Same cancellation probes as the flat Unwind arm.
+                    crate::exec::limits::check_deadline()?;
                     let v = evaluate(list, &row, params)?;
                     match v {
                         RuntimeValue::List(items) => {
                             for item in items {
+                                if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
+                                    crate::exec::limits::check_deadline()?;
+                                }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);

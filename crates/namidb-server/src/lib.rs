@@ -688,6 +688,8 @@ pub fn build_router(state: AppState) -> Router {
     let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
         .route("/v0/admin/backup", post(admin_backup))
+        .route("/v0/admin/queries", get(admin_queries))
+        .route("/v0/admin/queries/:id/cancel", post(admin_cancel_query))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     limit_router(
@@ -795,6 +797,11 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
         .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
         .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
+        .route("/:namespace/v0/admin/queries", get(admin_queries_multi))
+        .route(
+            "/:namespace/v0/admin/queries/:id/cancel",
+            post(admin_cancel_query_multi),
+        )
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_auth_multi,
@@ -1616,6 +1623,9 @@ fn exec_error_classification(
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+        ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
+            (StatusCode::CONFLICT, Some("cancelled"))
+        }
         ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
         // A unique-constraint violation is a client error (duplicate value), not
         // a server fault — surface it as 409 Conflict.
@@ -1656,6 +1666,9 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+        ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
+            ("Neo.TransientError.Transaction.Terminated", "57014")
+        }
         ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
         ExecError::Constraint(_) => ("Neo.ClientError.Schema.ConstraintValidationFailed", "23000"),
         ExecError::Storage(
@@ -3078,9 +3091,20 @@ async fn cypher(
     Json(req): Json<CypherRequest>,
 ) -> Response {
     // The guard drops at the end of the handler, so the in-flight gauge is
-    // correct even on an early error return.
+    // correct even on an early error return. The registration guard does the
+    // same for the operator-visible query list, and its cancel flag scopes
+    // the whole run so /v0/admin/queries/:id/cancel aborts it cooperatively.
     let _in_flight = state.metrics.track_in_flight();
-    let obs = run_cypher(&state, &req, &principal).await;
+    let registered = state
+        .metrics
+        .queries()
+        .register(Protocol::Http, &state.namespace, &req.query);
+    let obs = namidb_storage::cancel::with_cancel_flag(
+        registered.cancel_flag(),
+        run_cypher(&state, &req, &principal),
+    )
+    .await;
+    drop(registered);
     state
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -3485,6 +3509,111 @@ struct FlushResponse {
     ssts_written: usize,
     bloom_sidecars_written: usize,
     manifest_version: u64,
+}
+
+/// `GET /v0/admin/queries` — the in-flight query list (item 56). Role-gated
+/// like the other admin routes, and NEVER on the unauthenticated /v0/metrics:
+/// entries carry statement text.
+async fn admin_queries(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; the query list is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "queries": state.metrics.queries().list(None) })).into_response()
+}
+
+/// `POST /v0/admin/queries/:id/cancel` — flip one in-flight query's cancel
+/// flag. The query aborts at its next cooperative probe with "query
+/// cancelled by administrator" and its writer/session recovers through the
+/// same discard path an error takes. 404 = already finished or never
+/// existed (cancel is never retroactive).
+async fn admin_cancel_query(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; query cancel is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    if state.metrics.queries().cancel(id, None) {
+        Json(serde_json::json!({ "cancelled": id })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("no in-flight query with id {id}"),
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// Multi-tenant twins: the view and the cancel are scoped to the request's
+/// namespace, so a tenant-scoped token can neither read nor kill another
+/// tenant's queries.
+async fn admin_queries_multi(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(namespace): axum::extract::Path<String>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; the query list is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "queries": shared.metrics.queries().list(Some(namespace.as_str()))
+    }))
+    .into_response()
+}
+
+async fn admin_cancel_query_multi(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path((namespace, id)): axum::extract::Path<(String, u64)>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; query cancel is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    if shared
+        .metrics
+        .queries()
+        .cancel(id, Some(namespace.as_str()))
+    {
+        Json(serde_json::json!({ "cancelled": id })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("no in-flight query with id {id} in this namespace"),
+            }),
+        )
+            .into_response()
+    }
 }
 
 async fn admin_flush(
@@ -3959,7 +4088,16 @@ async fn dispatch_cypher_multi(
         }
     };
 
-    let obs = run_cypher_multi(&ns_state, shared, &req, principal).await;
+    let registered = shared
+        .metrics
+        .queries()
+        .register(Protocol::Http, namespace, &req.query);
+    let obs = namidb_storage::cancel::with_cancel_flag(
+        registered.cancel_flag(),
+        run_cypher_multi(&ns_state, shared, &req, principal),
+    )
+    .await;
+    drop(registered);
     shared
         .metrics
         .observe_query(Protocol::Http, obs.kind, obs.ok, obs.elapsed, &req.query);
@@ -4688,6 +4826,274 @@ mod tests {
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, auth_token.map(|s| s.to_string()), "test".into());
         build_router(state)
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header(axum::http::header::CONTENT_LENGTH, bytes.len().to_string())
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Item 56 end-to-end: a runaway write is listed with its statement and
+    /// growing elapsed, POST cancel aborts it with the cancelled error, the
+    /// writer is immediately usable, no partial rows leak, and the registry
+    /// drains to empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_can_list_and_cancel_a_runaway_write() {
+        let app = fixture(None).await;
+
+        let runaway = "UNWIND range(1, 4000000) AS i CREATE (:Runaway {v: i})";
+        let app_for_write = app.clone();
+        let write = tokio::spawn(async move {
+            post_json(
+                &app_for_write,
+                "/v0/cypher",
+                serde_json::json!({ "query": runaway }),
+            )
+            .await
+        });
+
+        // Poll until the write shows up in the list.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            let (status, body) = get_json(&app, "/v0/admin/queries").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let queries = parsed["queries"].as_array().unwrap();
+            if let Some(entry) = queries
+                .iter()
+                .find(|q| q["statement"].as_str().unwrap().contains("Runaway"))
+            {
+                assert_eq!(entry["protocol"], "http");
+                break entry["id"].as_u64().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runaway write never appeared in the list"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        let (status, body) = post_json(
+            &app,
+            &format!("/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = write.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "cancelled write: {body}");
+        assert!(
+            body.contains("cancelled") && body.contains("Terminated"),
+            "cancel must be named with its taxonomy: {body}"
+        );
+
+        // No partial rows: the staged batch was discarded, not committed.
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "MATCH (r:Runaway) RETURN count(r) AS n" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"n\":0"), "no partial rows may leak: {body}");
+
+        // The writer is immediately usable and the registry drains.
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "CREATE (:After {ok: true})" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = get_json(&app, "/v0/admin/queries").await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed["queries"].as_array().unwrap().is_empty(),
+            "registry must drain: {body}"
+        );
+
+        // Cancelling a finished id is a 404, never a cross-query kill.
+        let (status, _) = post_json(
+            &app,
+            &format!("/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Multi-tenant scoping: a namespace's admin surface neither lists nor
+    /// cancels another tenant's queries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_tenant_query_admin_is_namespace_scoped() {
+        let app = multi_tenant_app("default").await;
+
+        let runaway = "UNWIND range(1, 4000000) AS i CREATE (:Runaway {v: i})";
+        let app_for_write = app.clone();
+        let write = tokio::spawn(async move {
+            post_json(
+                &app_for_write,
+                "/acme/v0/cypher",
+                serde_json::json!({ "query": runaway }),
+            )
+            .await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            let (_, body) = get_json(&app, "/acme/v0/admin/queries").await;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(entry) = parsed["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["statement"].as_str().unwrap().contains("Runaway"))
+            {
+                assert_eq!(entry["namespace"], "acme");
+                break entry["id"].as_u64().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "write never listed in its namespace"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Another namespace sees nothing and cannot cancel it.
+        let (_, body) = get_json(&app, "/beta/v0/admin/queries").await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["queries"].as_array().unwrap().is_empty(), "{body}");
+        let (status, _) = post_json(
+            &app,
+            &format!("/beta/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-namespace cancel must 404"
+        );
+
+        // The owning namespace can.
+        let (status, _) = post_json(
+            &app,
+            &format!("/acme/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = write.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    /// A long READ cancels through the same probes (the scan/expand loops).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_can_cancel_a_runaway_read() {
+        let app = fixture(None).await;
+        let runaway =
+            "UNWIND range(1, 4000) AS a UNWIND range(1, 4000) AS b RETURN count(a * b) AS n";
+        let app_for_read = app.clone();
+        let read = tokio::spawn(async move {
+            post_json(
+                &app_for_read,
+                "/v0/cypher",
+                serde_json::json!({ "query": runaway }),
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            let (_, body) = get_json(&app, "/v0/admin/queries").await;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(entry) = parsed["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["statement"].as_str().unwrap().contains("UNWIND"))
+            {
+                break entry["id"].as_u64().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read never appeared in the list"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let (status, _) = post_json(
+            &app,
+            &format!("/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = read.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("cancelled"), "{body}");
+    }
+
+    /// The query list carries statement text: read-only tokens get 403 on
+    /// both routes, and the unauthenticated /v0/metrics never exposes it.
+    #[tokio::test]
+    async fn query_admin_requires_the_write_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        std::fs::write(
+            &path,
+            r#"{ "tokens": [{ "name": "ro", "token": "ro-key", "role": "read-only" }] }"#,
+        )
+        .unwrap();
+        let auth = Arc::new(AuthConfig::load_file(&path).unwrap());
+        let app = multi_tenant_app_auth(auth, "default").await;
+        for (method, uri) in [
+            ("GET", "/acme/v0/admin/queries"),
+            ("POST", "/acme/v0/admin/queries/1/cancel"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", "Bearer ro-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must be write-role gated"
+            );
+        }
     }
 
     /// Plan item 28: the HTTP JSON parameter route had no unit tests and no
