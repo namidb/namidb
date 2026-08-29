@@ -1769,6 +1769,14 @@ impl WriterSession {
         // If the WAL append fails, the body PUT is harmless: the
         // pointer never moves, the next manifest commit overwrites
         // the reference, and the janitor sweeps the orphan.
+        // Determinate abort point (item 59): nothing has been sent yet, so a
+        // write deadline that expired during staging (or an operator cancel)
+        // fails the commit HERE with the pending batch preserved — instead of
+        // starting an unbounded durability tail. Never probe between the WAL
+        // PUT and the pointer CAS: that zone must run to a definite outcome
+        // (the CAS resolver owns its indeterminacy).
+        crate::cancel::check()?;
+        let commit_started = std::time::Instant::now();
         let next = self.build_next(base_seq, last_lsn);
 
         let (wal_result, body_result) = tokio::join!(
@@ -1810,6 +1818,11 @@ impl WriterSession {
                 // common "base+1 already taken" case fails fast as
                 // `ManifestCommitCas` without minting a new WAL orphan.
                 let _ = body_result;
+                // Second determinate abort point: before the orphan-WAL
+                // re-seq retry (a LIST plus a fresh body-first commit). A
+                // retry storm against a throttling store now stops at the
+                // deadline instead of compounding.
+                crate::cancel::check()?;
                 let listed = self.wal_store.list_segments().await?;
                 let fresh = listed
                     .last()
@@ -1833,6 +1846,18 @@ impl WriterSession {
             }
             Err(other) => return Err(other),
         };
+
+        // Honest attribution for the next field report: a durability tail
+        // that ran long (store throttling, retries, a stalled disk) is the
+        // exact signature item 59 could only infer post-hoc.
+        let commit_elapsed = commit_started.elapsed();
+        if commit_elapsed >= std::time::Duration::from_secs(10) {
+            tracing::warn!(
+                commit_ms = commit_elapsed.as_millis() as u64,
+                seq = committed_seq,
+                "write durability tail was slow (object-store latency or retries)"
+            );
+        }
 
         // Durability achieved. Drain the queued payloads into the
         // memtable in LSN order (they are already in insertion order

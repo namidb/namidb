@@ -872,3 +872,12 @@ explicit store client timeouts, bound the group-commit ack wait with an
 honest indeterminate error, and slow-log lock/staging/commit
 sub-durations. Adjacent hazard recorded: the HTTP TimeoutLayer can
 cancel a commit mid-durability at 120s — to bound, not drop.
+**Follow-up shipped (2.5.0):** all of the plan above except the
+TimeoutLayer hazard (deferred, recorded here): determinate-boundary
+probes in commit_batch (pre-PUT and pre-orphan-retry only; the
+PUT-to-CAS zone stays uninterruptible), deadline scope over the HTTP
+commit and re-armed around both Bolt commits, bounded group-ACK wait
+with the outcome-unknown error, >10s durability-tail warn, and opt-in
+store client bounds via NAMIDB_STORE_{REQUEST_TIMEOUT,RETRY_TIMEOUT,
+MAX_RETRIES}. The admin cancel flag (item 56) rides the same probes, so
+a stuck-but-probing commit is also operator-killable pre-PUT.
