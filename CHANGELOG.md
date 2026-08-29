@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-29
+
 **Added**
 - Operators can now see and kill in-flight queries: `GET /v0/admin/queries`
   lists them (id, protocol, namespace, sanitized statement, elapsed) and
@@ -2933,7 +2935,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.4.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/namidb/namidb/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/namidb/namidb/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/namidb/namidb/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/namidb/namidb/compare/v2.2.1...v2.3.0
