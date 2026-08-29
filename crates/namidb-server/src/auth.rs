@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -96,9 +97,15 @@ impl std::fmt::Debug for AuthToken {
 }
 
 /// The process's accepted tokens. Empty = open (no auth).
+///
+/// The token set lives behind interior mutability: every consumer (HTTP
+/// state, Bolt accept loop, shared multi-tenant state) holds a clone of the
+/// same boot-time `Arc<AuthConfig>`, so a hot reload must swap INSIDE the
+/// config — replacing the outer Arc would never reach those clones. Clones
+/// of `AuthConfig` therefore share one token cell by design.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-    tokens: Vec<AuthToken>,
+    tokens: Arc<std::sync::RwLock<Arc<Vec<AuthToken>>>>,
     /// Optional OIDC/JWT validator. When present, a bearer token is first
     /// attempted as a JWT (mapped from a group claim); static tokens are the
     /// fallback. Only compiled under the `jwt` feature.
@@ -115,15 +122,29 @@ impl AuthConfig {
     /// A single read-write token — the back-compat `--auth-token` path.
     #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
     pub fn single_read_write(secret: impl Into<String>) -> Self {
+        Self::from_tokens(vec![AuthToken {
+            name: "auth-token".into(),
+            secret: Arc::from(secret.into()),
+            role: Role::ReadWrite,
+            namespaces: None,
+        }])
+    }
+
+    #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
+    fn from_tokens(tokens: Vec<AuthToken>) -> Self {
         Self {
-            tokens: vec![AuthToken {
-                name: "auth-token".into(),
-                secret: Arc::from(secret.into()),
-                role: Role::ReadWrite,
-                namespaces: None,
-            }],
+            tokens: Arc::new(std::sync::RwLock::new(Arc::new(tokens))),
             ..Default::default()
         }
+    }
+
+    /// The current token set, cloned out under a short read lock so the
+    /// constant-time walk never holds it.
+    fn current_tokens(&self) -> Arc<Vec<AuthToken>> {
+        self.tokens
+            .read()
+            .expect("auth token lock poisoned")
+            .clone()
     }
 
     /// Load tokens from a JSON file:
@@ -138,11 +159,17 @@ impl AuthConfig {
     /// `role` defaults to `read-write` and `name` to `token-<i>`. A file with
     /// an empty `tokens` array is rejected — that would silently disable auth;
     /// omit the flag and pass `--no-auth` to run open on purpose.
-    #[allow(clippy::needless_update)] // `..Default::default()` fills the jwt field under the `jwt` feature
     pub fn load_file(path: &Path) -> anyhow::Result<Self> {
         let body = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading auth tokens file {}: {e}", path.display()))?;
-        let file: TokenFile = serde_json::from_str(&body)
+        Ok(Self::from_tokens(Self::parse_tokens(path, &body)?))
+    }
+
+    /// Parse + validate a tokens-file body. Shared by boot and reload so a
+    /// reload can never accept what boot would reject — in particular an
+    /// empty token set (silently open) or an empty secret (`Bearer `).
+    fn parse_tokens(path: &Path, body: &str) -> anyhow::Result<Vec<AuthToken>> {
+        let file: TokenFile = serde_json::from_str(body)
             .map_err(|e| anyhow::anyhow!("parsing auth tokens file {}: {e}", path.display()))?;
         if file.tokens.is_empty() {
             anyhow::bail!(
@@ -151,8 +178,7 @@ impl AuthConfig {
                 path.display()
             );
         }
-        let tokens = file
-            .tokens
+        file.tokens
             .into_iter()
             .enumerate()
             .map(|(i, e)| {
@@ -169,11 +195,73 @@ impl AuthConfig {
                     namespaces: e.namespaces,
                 })
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self {
-            tokens,
-            ..Default::default()
-        })
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    /// Re-read `path` and swap the token set. On ANY error the current set
+    /// keeps serving (fail to last-good): a truncated mid-write file, a
+    /// malformed edit, or an emptied set can only be a no-op, never an
+    /// accidental auth widening or shutdown. Only the token cell is touched
+    /// — the JWT validator and the boot open/closed decision are immutable.
+    pub fn reload_from(&self, path: &Path) -> anyhow::Result<usize> {
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading auth tokens file {}: {e}", path.display()))?;
+        let tokens = Self::parse_tokens(path, &body)?;
+        let count = tokens.len();
+        *self.tokens.write().expect("auth token lock poisoned") = Arc::new(tokens);
+        Ok(count)
+    }
+
+    /// Poll `path` every `interval` and apply changes — the static-token
+    /// twin of the JWKS `spawn_refresh`. Content-compare, not mtime, so
+    /// rename(2) swaps and coarse clocks are immune; a zero interval
+    /// disables the task. HTTP picks a reload up on the next request;
+    /// multi-tenant Bolt on the next statement outside an explicit
+    /// transaction. Revocation does NOT terminate live single-tenant Bolt
+    /// sessions (their principal is cached at LOGON) — kill the connection
+    /// if immediate revocation is required.
+    pub fn spawn_file_reload(self: &Arc<Self>, path: std::path::PathBuf, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let auth = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut last_applied: Option<Vec<u8>> = None;
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "auth tokens file unreadable; keeping the current set"
+                        );
+                        continue;
+                    }
+                };
+                if last_applied.as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
+                match auth.reload_from(&path) {
+                    Ok(count) => {
+                        last_applied = Some(bytes);
+                        tracing::info!(tokens = count, "auth tokens file reloaded");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "auth tokens file invalid; keeping the current set"
+                        );
+                        // Do not record the bytes: a later tick retries until
+                        // the file parses (covers partial writes healing).
+                    }
+                }
+            }
+        });
     }
 
     /// Attach a JWT validator. Bearer tokens are then first interpreted as
@@ -188,7 +276,7 @@ impl AuthConfig {
     /// the server runs open.
     pub fn is_open(&self) -> bool {
         let jwt_active = self.jwt_active();
-        self.tokens.is_empty() && !jwt_active
+        self.current_tokens().is_empty() && !jwt_active
     }
 
     #[cfg(feature = "jwt")]
@@ -242,8 +330,9 @@ impl AuthConfig {
     /// name, groups empty), honouring the namespace scope.
     fn token_principal(&self, presented: &str, namespace: &str) -> Option<Principal> {
         let single_tenant = namespace.is_empty();
+        let tokens = self.current_tokens();
         let mut granted: Option<&AuthToken> = None;
-        for t in &self.tokens {
+        for t in tokens.iter() {
             if constant_time_eq(presented.as_bytes(), t.secret.as_bytes())
                 && (single_tenant
                     || t.namespaces
@@ -287,8 +376,9 @@ impl AuthConfig {
                 return Some(role);
             }
         }
+        let tokens = self.current_tokens();
         let mut granted = None;
-        for t in &self.tokens {
+        for t in tokens.iter() {
             if constant_time_eq(presented.as_bytes(), t.secret.as_bytes())
                 && (single_tenant
                     || t.namespaces
@@ -303,7 +393,7 @@ impl AuthConfig {
 
     /// Number of configured tokens, for the boot log.
     pub(crate) fn len(&self) -> usize {
-        self.tokens.len()
+        self.current_tokens().len()
     }
 }
 
@@ -381,29 +471,26 @@ mod tests {
     #[allow(clippy::needless_update)]
     fn role_for_in_enforces_namespace_scope() {
         // acme-key is scoped to ["acme"]; beta-key to ["beta"]; any-key unscoped.
-        let c = AuthConfig {
-            tokens: vec![
-                AuthToken {
-                    name: "acme".into(),
-                    secret: Arc::from("acme-key"),
-                    role: Role::ReadWrite,
-                    namespaces: Some(vec!["acme".into()]),
-                },
-                AuthToken {
-                    name: "beta".into(),
-                    secret: Arc::from("beta-key"),
-                    role: Role::ReadOnly,
-                    namespaces: Some(vec!["beta".into()]),
-                },
-                AuthToken {
-                    name: "any".into(),
-                    secret: Arc::from("any-key"),
-                    role: Role::ReadWrite,
-                    namespaces: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let c = AuthConfig::from_tokens(vec![
+            AuthToken {
+                name: "acme".into(),
+                secret: Arc::from("acme-key"),
+                role: Role::ReadWrite,
+                namespaces: Some(vec!["acme".into()]),
+            },
+            AuthToken {
+                name: "beta".into(),
+                secret: Arc::from("beta-key"),
+                role: Role::ReadOnly,
+                namespaces: Some(vec!["beta".into()]),
+            },
+            AuthToken {
+                name: "any".into(),
+                secret: Arc::from("any-key"),
+                role: Role::ReadWrite,
+                namespaces: None,
+            },
+        ]);
 
         // acme-key reaches acme but not beta.
         assert_eq!(c.role_for_in("acme-key", "acme"), Some(Role::ReadWrite));
@@ -425,23 +512,20 @@ mod tests {
     #[test]
     #[allow(clippy::needless_update)]
     fn role_for_distinguishes_read_only_and_read_write() {
-        let c = AuthConfig {
-            tokens: vec![
-                AuthToken {
-                    name: "rw".into(),
-                    secret: Arc::from("write-key"),
-                    role: Role::ReadWrite,
-                    namespaces: None,
-                },
-                AuthToken {
-                    name: "ro".into(),
-                    secret: Arc::from("read-key"),
-                    role: Role::ReadOnly,
-                    namespaces: None,
-                },
-            ],
-            ..Default::default()
-        };
+        let c = AuthConfig::from_tokens(vec![
+            AuthToken {
+                name: "rw".into(),
+                secret: Arc::from("write-key"),
+                role: Role::ReadWrite,
+                namespaces: None,
+            },
+            AuthToken {
+                name: "ro".into(),
+                secret: Arc::from("read-key"),
+                role: Role::ReadOnly,
+                namespaces: None,
+            },
+        ]);
         assert_eq!(c.role_for("write-key"), Some(Role::ReadWrite));
         assert_eq!(c.role_for("read-key"), Some(Role::ReadOnly));
         assert_eq!(c.role_for("nope"), None);
@@ -474,6 +558,118 @@ mod tests {
         let path = dir.join(format!("namidb-auth-empty-{}.json", std::process::id()));
         std::fs::write(&path, r#"{ "tokens": [] }"#).unwrap();
         assert!(AuthConfig::load_file(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn temp_tokens_file(tag: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("namidb-auth-{tag}-{}.json", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Item 58: a reload swaps grants in place — new token serves with its
+    /// new role, the removed one stops.
+    #[test]
+    fn reload_swaps_token_set() {
+        let path = temp_tokens_file(
+            "swap",
+            r#"{ "tokens": [{ "name": "old", "token": "old-key", "role": "read-write" }] }"#,
+        );
+        let c = AuthConfig::load_file(&path).unwrap();
+        assert_eq!(c.role_for("old-key"), Some(Role::ReadWrite));
+        std::fs::write(
+            &path,
+            r#"{ "tokens": [{ "name": "new", "token": "new-key", "role": "read-only" }] }"#,
+        )
+        .unwrap();
+        assert_eq!(c.reload_from(&path).unwrap(), 1);
+        assert_eq!(c.role_for("new-key"), Some(Role::ReadOnly));
+        assert_eq!(c.role_for("old-key"), None, "revoked token must stop");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fail to last-good: truncated JSON, an emptied set, and an empty
+    /// secret each error AND keep the original token serving — a reload
+    /// can never widen access or flip auth open.
+    #[test]
+    fn reload_keeps_old_set_on_malformed_file() {
+        let path = temp_tokens_file(
+            "malformed",
+            r#"{ "tokens": [{ "name": "good", "token": "good-key" }] }"#,
+        );
+        let c = AuthConfig::load_file(&path).unwrap();
+        for bad in [
+            r#"{ "tokens": [{ "name": "trunc""#,
+            r#"{ "tokens": [] }"#,
+            r#"{ "tokens": [{ "name": "empty", "token": "" }] }"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(c.reload_from(&path).is_err(), "{bad}");
+            assert_eq!(
+                c.role_for("good-key"),
+                Some(Role::ReadWrite),
+                "old set must keep serving after: {bad}"
+            );
+            assert!(!c.is_open(), "a bad reload must never open the server");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Every consumer holds a clone of the boot Arc<AuthConfig>; the swap
+    /// is interior, so a reload through one handle must be visible through
+    /// all clones. Pins the design against a naive replace-the-Arc
+    /// regression.
+    #[test]
+    fn clones_share_reloads() {
+        let path = temp_tokens_file(
+            "clones",
+            r#"{ "tokens": [{ "name": "a", "token": "a-key" }] }"#,
+        );
+        let boot = AuthConfig::load_file(&path).unwrap();
+        let http_state = boot.clone();
+        let bolt_loop = boot.clone();
+        std::fs::write(
+            &path,
+            r#"{ "tokens": [{ "name": "b", "token": "b-key" }] }"#,
+        )
+        .unwrap();
+        boot.reload_from(&path).unwrap();
+        for (label, handle) in [("http", &http_state), ("bolt", &bolt_loop)] {
+            assert_eq!(handle.role_for("b-key"), Some(Role::ReadWrite), "{label}");
+            assert_eq!(handle.role_for("a-key"), None, "{label}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The poll task end-to-end: an on-disk edit is picked up within a few
+    /// intervals, and a later malformed write leaves the last good set.
+    #[tokio::test]
+    async fn spawn_file_reload_applies_disk_edits() {
+        let path = temp_tokens_file(
+            "poll",
+            r#"{ "tokens": [{ "name": "first", "token": "first-key" }] }"#,
+        );
+        let auth = Arc::new(AuthConfig::load_file(&path).unwrap());
+        auth.spawn_file_reload(path.clone(), Duration::from_millis(25));
+        std::fs::write(
+            &path,
+            r#"{ "tokens": [{ "name": "second", "token": "second-key" }] }"#,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while auth.role_for("second-key").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reload never picked up the edit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(auth.role_for("first-key"), None);
+        // A malformed overwrite keeps the second set serving.
+        std::fs::write(&path, "not json").unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(auth.role_for("second-key"), Some(Role::ReadWrite));
         std::fs::remove_file(&path).ok();
     }
 }

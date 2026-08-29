@@ -121,6 +121,10 @@ pub struct Config {
     /// `read-write` role. Takes precedence over `auth_token` when set. `None`
     /// falls back to `auth_token`.
     pub auth_tokens_file: Option<std::path::PathBuf>,
+    /// How often to re-read `auth_tokens_file` and hot-swap the token set
+    /// (content-compare; malformed files keep the current set). Zero
+    /// disables the reload task.
+    pub auth_tokens_reload_interval: Duration,
     /// Explicit opt-in to run without any authentication (every request is
     /// anonymous read-write). Without this, a boot with no auth source
     /// configured fails instead of silently serving open — an unset
@@ -900,6 +904,18 @@ pub async fn run_with_memory_max_bytes(
         None => (auth, None),
     };
     let auth = Arc::new(auth);
+    // Hot-reload the static token set so onboarding/rotating a tenant's
+    // token no longer requires restarting everyone's namespaces (third
+    // field report, item 58).
+    if let Some(path) = &config.auth_tokens_file {
+        auth.spawn_file_reload(path.clone(), config.auth_tokens_reload_interval);
+        if !config.auth_tokens_reload_interval.is_zero() {
+            info!(
+                interval = ?config.auth_tokens_reload_interval,
+                "auth tokens file hot-reload enabled"
+            );
+        }
+    }
     // Refresh the JWKS hourly so keys can rotate without a restart.
     #[cfg(feature = "jwt")]
     if let Some(v) = &jwt_validator {
@@ -7617,6 +7633,87 @@ mod tests {
             default_ns.to_string(),
         );
         build_multi_tenant_router(shared)
+    }
+
+    /// Item 58 end-to-end over the real middleware: onboarding a tenant is
+    /// an atomic file rewrite + one poll interval — 401 before, 200 after —
+    /// and revocation flows the other way, with namespace scoping intact.
+    #[tokio::test]
+    async fn tokens_file_hot_reload_onboards_and_revokes_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        std::fs::write(
+            &path,
+            r#"{ "tokens": [{ "name": "acme", "token": "acme-key", "role": "read-write", "namespaces": ["acme"] }] }"#,
+        )
+        .unwrap();
+        let auth = Arc::new(AuthConfig::load_file(&path).unwrap());
+        auth.spawn_file_reload(path.clone(), Duration::from_millis(25));
+        let app = multi_tenant_app_auth(Arc::clone(&auth), "acme").await;
+
+        assert_eq!(
+            mt_cypher_token(&app, "/acme/v0/cypher", None, "acme-key", "RETURN 1 AS one").await,
+            StatusCode::OK
+        );
+        // The cooperative not yet onboarded: 401.
+        assert_eq!(
+            mt_cypher_token(&app, "/coop/v0/cypher", None, "coop-key", "RETURN 1 AS one").await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Onboard via atomic rewrite (temp + rename, as the docs instruct).
+        let tmp = dir.path().join("tokens.json.tmp");
+        std::fs::write(
+            &tmp,
+            r#"{ "tokens": [
+                { "name": "acme", "token": "acme-key", "role": "read-write", "namespaces": ["acme"] },
+                { "name": "coop", "token": "coop-key", "role": "read-write", "namespaces": ["coop"] }
+            ] }"#,
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status =
+                mt_cypher_token(&app, "/coop/v0/cypher", None, "coop-key", "RETURN 1 AS one").await;
+            if status == StatusCode::OK {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "onboarded token never took effect, last status {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Scoping still enforced for the new token: outside its namespace
+        // the token resolves no principal at all (401, matching the
+        // pre-reload middleware semantics pinned in the scoped-token tests).
+        assert_eq!(
+            mt_cypher_token(&app, "/acme/v0/cypher", None, "coop-key", "RETURN 1 AS one").await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Revocation: rewrite without acme; next requests 401.
+        let tmp = dir.path().join("tokens.json.tmp");
+        std::fs::write(
+            &tmp,
+            r#"{ "tokens": [{ "name": "coop", "token": "coop-key", "role": "read-write", "namespaces": ["coop"] }] }"#,
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status =
+                mt_cypher_token(&app, "/acme/v0/cypher", None, "acme-key", "RETURN 1 AS one").await;
+            if status == StatusCode::UNAUTHORIZED {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revocation never took effect, last status {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn mt_cypher_token(

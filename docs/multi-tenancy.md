@@ -336,12 +336,28 @@ for any namespace not in `tenants`. Mint and rotate it in your IdP — NamiDB on
 verifies it, and refreshes the JWKS hourly so key rotation needs no restart
 (`crates/namidb-server/src/lib.rs:461-465`).
 
-### Adding or rotating a static token requires a restart
+### Adding or rotating a static token: hot reload (since 2.5.0)
 
-`AuthConfig::load_file` runs once at boot (`lib.rs:437-438`); there is no SIGHUP
-reload for the static-token file. To add or rotate a static token: write the new
-entry, restart the server, then remove the old entry on a later restart. (JWT
-key rotation does *not* need a restart — the JWKS refreshes on a timer.)
+The server re-reads `--auth-tokens-file` on an interval
+(`--auth-tokens-reload-interval`, default `10s`, `0s` disables) and swaps the
+token set atomically — onboarding or rotating a tenant no longer restarts
+anyone. Semantics to rely on:
+
+- **Write the file atomically** (write a temp file, then `rename(2)`; keep it
+  `0600`). A partial or malformed file is rejected and the LAST GOOD set keeps
+  serving — a bad reload can never widen access, empty the set, or flip the
+  server open. The next tick picks up the completed write.
+- HTTP requests see a reload on the **next request** (both single- and
+  multi-tenant). Multi-tenant Bolt re-resolves the principal **per statement**
+  (pinned for the life of an explicit transaction).
+- **Revocation does not terminate live single-tenant Bolt sessions**: their
+  principal is cached at LOGON. Kill the connection (or restart) if immediate
+  revocation of an active session is required; fresh LOGONs with the revoked
+  token are refused as soon as the reload lands.
+- Change detection is content-compare, not mtime, so `rename(2)` swaps and
+  ConfigMap-style updates are picked up reliably.
+
+(JWT key rotation likewise needs no restart — the JWKS refreshes on a timer.)
 
 ## Proposed / Future
 
@@ -387,8 +403,6 @@ lazy.
   serving a JWKS — a new trust boundary, RFC-sized.
 - **Explicit namespace lifecycle.** A real create/list/delete API instead of
   lazy `get_or_open`, so provisioning and de-provisioning are first-class.
-- **Static-token hot-reload.** A SIGHUP / file-watch reload so a minted token
-  takes effect without a restart.
 - **PDP namespace input.** The external-PDP request document advertises an
   `input.namespace` field (`crates/namidb-server/src/pdp.rs:19-26`) but
   `plan_input` does not currently emit it (`pdp.rs:138-151`), so OPA policies

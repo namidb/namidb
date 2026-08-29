@@ -162,6 +162,7 @@ async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::Join
         listen: http_addr,
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::from_millis(2),
@@ -304,6 +305,7 @@ async fn boot_bolt_multi(
         default_namespace: format!("{ns_prefix}-default"),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -638,6 +640,7 @@ async fn boot_bolt_config(
         listen: http_addr,
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,
@@ -734,6 +737,7 @@ async fn boot_bolt_tokens(
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -959,6 +963,7 @@ async fn bolt_create_then_match_roundtrip() {
         listen: http_addr,
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,
@@ -1052,6 +1057,7 @@ async fn bolt_bad_token_yields_failure() {
         listen: http_addr,
         auth_token: Some("correct-token".into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,
@@ -1223,6 +1229,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         listen: http_addr,
         auth_token: Some("test-token".into()),
         auth_tokens_file: None,
+        auth_tokens_reload_interval: std::time::Duration::ZERO,
         no_auth: false,
         backup_target_uri: None,
         group_commit_window: Duration::ZERO,
