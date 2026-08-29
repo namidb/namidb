@@ -16,6 +16,20 @@ crates.io release will establish and document that API explicitly.
 ## [Unreleased]
 
 **Fixed**
+- The Bolt per-message decode guard rejected legitimate small-row
+  batches: its fixed allowance was 64 KiB on top of 8x the message's own
+  wire size, so ~889 single-key row maps (~13x heap-to-wire
+  amplification) failed while larger multi-field rows passed at any
+  count — and because the limit tracked each message's size, the
+  reported maximum looked like it moved between runs. The fixed
+  allowance is now 2 MiB, a documented client contract: any message
+  whose estimated decoded heap fits 2 MiB always decodes regardless of
+  shape (roughly 11,000 tiny row maps), stable across runs. The
+  shared Bolt memory semaphore's base charge moved in lockstep, and the
+  rejection now reports actionable units — estimated decoded bytes, the
+  limit, the message's wire size, and the formula — instead of
+  "decoded Map heap length". Amplification attacks stay rejected
+  (declared lengths still require bytes actually present on the wire).
 - Server boolean flags now accept `1/0/true/false/yes/no/on/off` on the
   CLI (`--multi-tenant=1`) and through their env vars
   (`NAMIDB_MULTI_TENANT=1`, `NAMIDB_NO_AUTH=1`, `NAMIDB_SWEEP_DELETE=0`)

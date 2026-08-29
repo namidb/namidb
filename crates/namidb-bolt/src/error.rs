@@ -30,6 +30,19 @@ pub enum BoltError {
     },
 
     #[error(
+        "message too large to decode: estimated decoded memory {estimated} \
+         bytes exceeds the per-message limit {max} bytes (message body \
+         {wire_bytes} wire bytes; limit = 2 MiB + 8 x body bytes; split the \
+         batch or send fewer rows per message)"
+    )]
+    DecodedTooLarge {
+        what: &'static str,
+        estimated: usize,
+        max: usize,
+        wire_bytes: usize,
+    },
+
+    #[error(
         "temporary memory pressure: {what} needs {requested} bytes, \
          but only {available} of {capacity} bytes are available"
     )]

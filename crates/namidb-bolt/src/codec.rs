@@ -65,7 +65,18 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// wire bytes. The fixed allowance keeps ordinary HELLO/RUN metadata working
 /// while the proportional budget below prevents a short, malicious frame from
 /// declaring a corpus-sized container.
-const DECODE_HEAP_BASE_BYTES: usize = 64 * 1024;
+///
+/// The size is a CLIENT CONTRACT (field report 3, finding 1): any message
+/// whose estimated decoded heap fits in this base always decodes regardless
+/// of its heap-to-wire ratio — a guaranteed floor of roughly 11,000
+/// single-key small-string row maps (~181 estimated bytes each), stable
+/// across runs and message shapes. The old 64 KiB base made the breaking
+/// point ~889 such rows and, because the rest of the limit is proportional
+/// to each message's own wire size, the reported maximum looked like it
+/// "moved between runs". Raising the base is safe: [`require_minimum_wire`]
+/// already demands bytes actually present per declared entry, so the base
+/// only admits genuinely transmitted content.
+pub const DECODE_HEAP_BASE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum decoded heap growth per byte present in the message body.
 ///
@@ -86,6 +97,7 @@ const MAP_ENTRY_HEAP_BYTES: usize = 128;
 struct DecodeBudget {
     used: usize,
     max: usize,
+    wire_bytes: usize,
 }
 
 impl DecodeBudget {
@@ -95,16 +107,20 @@ impl DecodeBudget {
         Self {
             used: 0,
             max: DECODE_HEAP_BASE_BYTES.saturating_add(proportional),
+            wire_bytes: bounded_wire,
         }
     }
 
     fn charge(&mut self, what: &'static str, bytes: usize) -> Result<()> {
         let next = self.used.saturating_add(bytes);
         if next > self.max {
-            return Err(BoltError::TooLarge {
+            // Client-actionable units: the estimate, the limit, and the
+            // formula inputs — not an internal counter name.
+            return Err(BoltError::DecodedTooLarge {
                 what,
-                len: next,
+                estimated: next,
                 max: self.max,
+                wire_bytes: self.wire_bytes,
             });
         }
         self.used = next;
@@ -723,7 +739,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BoltError::TooLarge {
+                BoltError::DecodedTooLarge {
                     what: "decoded List heap",
                     ..
                 }
@@ -737,7 +753,9 @@ mod tests {
         // A complete map with tiny duplicate keys is cheap on the wire but
         // still asks the decoder to construct/replace thousands of tree
         // entries. Charge the declared entry work before entering that loop.
-        const ENTRIES: usize = 10_000;
+        // Sized past the 2 MiB base floor: 40k entries charge 5.12 MB
+        // against a limit of 2 MiB + 8 x ~80 KB wire.
+        const ENTRIES: usize = 40_000;
         let mut map = Vec::with_capacity(5 + ENTRIES * 2);
         map.push(0xDA);
         map.extend_from_slice(&(ENTRIES as u32).to_be_bytes());
@@ -750,7 +768,7 @@ mod tests {
         assert!(
             matches!(
                 map_err,
-                BoltError::TooLarge {
+                BoltError::DecodedTooLarge {
                     what: "decoded Map heap",
                     ..
                 }
@@ -758,26 +776,97 @@ mod tests {
             "unexpected map error: {map_err:?}"
         );
 
-        // Struct16 has the same amplification vector through its field Vec.
-        const FIELDS: usize = 30_000;
-        let mut strukt = Vec::with_capacity(4 + FIELDS);
-        strukt.push(0xDD);
-        strukt.extend_from_slice(&(FIELDS as u16).to_be_bytes());
-        strukt.push(0x42);
-        strukt.resize(4 + FIELDS, 0xC0);
+        // Structs have the same amplification vector through their field
+        // Vecs; a Struct16 alone cannot clear the floor (u16 field cap), so
+        // a list of tiny one-field structs carries the cumulative charge
+        // past the limit and the tipping charge is the struct's.
+        const STRUCTS: usize = 150_000;
+        let mut strukt = Vec::with_capacity(5 + STRUCTS * 3);
+        strukt.push(0xD6);
+        strukt.extend_from_slice(&(STRUCTS as u32).to_be_bytes());
+        for _ in 0..STRUCTS {
+            strukt.extend_from_slice(&[0xB1, 0x42, 0xC0]);
+        }
         let mut struct_slice: &[u8] = &strukt;
         let struct_err = decode_with_limit(&mut struct_slice, DEFAULT_MAX_LEN)
-            .expect_err("dense struct must obey the decoded heap budget");
+            .expect_err("dense structs must obey the decoded heap budget");
         assert!(
             matches!(
                 struct_err,
-                BoltError::TooLarge {
+                BoltError::DecodedTooLarge {
                     what: "decoded Struct heap",
                     ..
                 }
             ),
             "unexpected struct error: {struct_err:?}"
         );
+    }
+
+    /// Field report 3, finding 1 regression: a batch of tiny one-key row
+    /// maps has ~13x heap-to-wire amplification and used to hit the 64 KiB
+    /// base at exactly ~889 rows. The 2 MiB base is a client contract — a
+    /// guaranteed floor of ~11,000 such rows — so 10,000 must decode.
+    #[test]
+    fn ten_thousand_tiny_row_maps_decode_under_the_floor() {
+        const ROWS: usize = 10_000;
+        let mut body = Vec::new();
+        body.push(0xD6);
+        body.extend_from_slice(&(ROWS as u32).to_be_bytes());
+        for _ in 0..ROWS {
+            body.push(0xA1); // map, 1 entry
+            body.push(0x88); // str8 key, 8 bytes
+            body.extend_from_slice(b"batchkey");
+            body.push(0x8C); // str12 value
+            body.extend_from_slice(b"1000-0-abcde");
+        }
+        let mut slice: &[u8] = &body;
+        let decoded = decode_with_limit(&mut slice, DEFAULT_MAX_LEN)
+            .expect("10k tiny row maps sit under the documented floor");
+        match decoded {
+            Value::List(items) => assert_eq!(items.len(), ROWS),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    /// Pins the budget formula (base + 8 x wire) exactly: a null list whose
+    /// estimate lands ON the limit decodes; one more item tips it. Any
+    /// drift in either constant breaks this test.
+    #[test]
+    fn decode_budget_boundary_is_exact() {
+        // est = 32*N; wire = 5+N; pass while 32N <= BASE + 8*(5+N).
+        let base = DECODE_HEAP_BASE_BYTES;
+        let at_limit = (base + 40) / 24;
+        for (items, expect_ok) in [(at_limit, true), (at_limit + 1, false)] {
+            let mut body = Vec::with_capacity(5 + items);
+            body.push(0xD6);
+            body.extend_from_slice(&(items as u32).to_be_bytes());
+            body.resize(5 + items, 0xC0);
+            let mut slice: &[u8] = &body;
+            let result = decode_with_limit(&mut slice, DEFAULT_MAX_LEN);
+            assert_eq!(result.is_ok(), expect_ok, "items={items}");
+        }
+    }
+
+    /// The rejection names client-actionable units: bytes, the limit, the
+    /// message's own wire size, and the formula — not an internal counter.
+    #[test]
+    fn decode_budget_error_is_client_actionable() {
+        const ITEMS: usize = 100_000;
+        let mut body = Vec::with_capacity(5 + ITEMS);
+        body.push(0xD6);
+        body.extend_from_slice(&(ITEMS as u32).to_be_bytes());
+        body.resize(5 + ITEMS, 0xC0);
+        let mut slice: &[u8] = &body;
+        let err = decode_with_limit(&mut slice, DEFAULT_MAX_LEN).unwrap_err();
+        let text = err.to_string();
+        for needle in [
+            "estimated decoded memory",
+            "per-message limit",
+            "wire bytes",
+            "2 MiB + 8 x body bytes",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
     }
 
     #[test]
