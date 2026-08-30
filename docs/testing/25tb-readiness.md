@@ -814,7 +814,7 @@ in lockstep, and the rejection now names estimated bytes / limit / wire
 size / formula. Amplification stays rejected; require_minimum_wire
 already forces real bytes per declared entry.
 
-### 56. [CONFIRMED — in progress] No way to list or cancel an in-flight query
+### 56. [CONFIRMED — shipped in 2.5.0] No way to list or cancel an in-flight query
 
 Tracking today is one AtomicI64 gauge; the slow-query log is post-hoc.
 The useful discovery: cooperative cancellation PLUMBING already exists
@@ -840,7 +840,7 @@ always the source). Fixed: BoolishValueParser on the three flags
 --no-auth), parse_store() makes ?ns= optional in multi-tenant boot with
 a warning when a dead one is present.
 
-### 58. [CONFIRMED — in progress] Auth tokens file has no hot reload
+### 58. [CONFIRMED — shipped in 2.5.0] Auth tokens file has no hot reload
 
 Loaded once at boot, frozen in an Arc cloned by HTTP, Bolt, and shared
 state — so the swap must be interior to AuthConfig (an Arc replacement
@@ -851,7 +851,7 @@ never widen access or flip auth open). To document: revocation does not
 kill live single-tenant Bolt sessions (LOGON-cached principal);
 multi-tenant Bolt re-resolves per statement.
 
-### 59. [CONFIRMED — in progress] 24.5-minute write with status=ok under 30s timeouts (reporter could not reproduce)
+### 59. [CONFIRMED — shipped in 2.5.0, one hazard deferred] 24.5-minute write with status=ok under 30s timeouts (reporter could not reproduce)
 
 Confirmed as a design gap without needing the repro: NEITHER timeout
 ever covered the durability tail. --writer-lock-timeout bounds only the
