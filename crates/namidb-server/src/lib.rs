@@ -802,6 +802,11 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
             "/:namespace/v0/admin/queries/:id/cancel",
             post(admin_cancel_query_multi),
         )
+        .route("/v0/admin/queries", get(admin_queries_multi_unprefixed))
+        .route(
+            "/v0/admin/queries/:id/cancel",
+            post(admin_cancel_query_multi_unprefixed),
+        )
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_auth_multi,
@@ -3148,6 +3153,117 @@ async fn cypher(
     obs.response
 }
 
+/// Outcome of the shielded write section.
+enum WriteSection {
+    /// The bounded writer-lock wait timed out.
+    Busy,
+    Done {
+        result: Result<namidb_query::exec::WriteOutcome, WriteFailure>,
+        stall: Option<Duration>,
+    },
+}
+
+/// The single-tenant HTTP write section — lock, stage, commit, recover —
+/// factored out so [`run_cypher`] can run it on a SHIELDED task: hyper
+/// drops the handler future on client disconnect and the request
+/// TimeoutLayer drops it at its deadline, and a drop mid-durability would
+/// cancel a commit in flight (the hazard deferred from item 59). On its own
+/// task the section always reaches a definite outcome and releases the
+/// writer cleanly; the abandoned handler simply never reads the result.
+async fn run_write_section(
+    state: AppState,
+    plan: namidb_query::LogicalPlan,
+    params: Params,
+) -> WriteSection {
+    let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
+        return WriteSection::Busy;
+    };
+    let (result, stall) = if let Some(group) = state.group_commit.clone() {
+        // RFC-034 group commit: stage inside a request scope and let the
+        // namespace committer make the whole group durable with ONE
+        // commit. The waiter registers while still holding the lock so
+        // the committer cannot slip between staging and registration;
+        // the ACK arrives only after the merged commit is durable and
+        // the snapshot republished (RFC-021 preserved).
+        let mark = writer.begin_staged_request();
+        match execute_write_staged_with_deadline(
+            &plan,
+            &mut writer,
+            &params,
+            state.write_deadline(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                writer.commit_staged_request();
+                let lsn = writer.staged_last_lsn().unwrap_or(0);
+                let ack = group.register(lsn);
+                let stall = state.after_commit_backpressure(&writer);
+                drop(writer);
+                group.notify_committer();
+                let result = match bounded_group_ack(ack, state.write_deadline()).await {
+                    GroupAck::Committed => Ok(outcome),
+                    GroupAck::Shared(shared) => Err(WriteFailure::Shared(shared)),
+                    GroupAck::CoordinatorExited => {
+                        Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                            "group commit coordinator exited".into(),
+                        )))
+                    }
+                    GroupAck::Indeterminate => Err(WriteFailure::Own(
+                        namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
+                    )),
+                };
+                (result, stall)
+            }
+            Err(e) => {
+                // Roll back ONLY this request; earlier group members'
+                // staged rows survive for their commit.
+                writer.rollback_staged_request(mark);
+                recovery::recover_after_write_error(
+                    &mut writer,
+                    &state.snapshot,
+                    &state.writer_health,
+                    &state.namespace,
+                    &e,
+                )
+                .await;
+                drop(writer);
+                (Err(WriteFailure::Own(e)), None)
+            }
+        }
+    } else {
+        let result =
+            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
+        // Sample the soft write-stall decision while still holding the lock
+        // (RFC-027 P5), then release it and sleep — backpressure applies to
+        // this request, not to the writer mutex other connections need.
+        let stall = match &result {
+            Ok(_) => {
+                // Refresh the published snapshot so subsequent reads see the
+                // just-committed records (RFC-021).
+                state.snapshot.store(writer.owned_snapshot());
+                state.after_commit_backpressure(&writer)
+            }
+            Err(e) => {
+                // A fenced/poisoned session would fail every later write;
+                // reopen it in place under the lock we already hold.
+                recovery::recover_after_write_error(
+                    &mut writer,
+                    &state.snapshot,
+                    &state.writer_health,
+                    &state.namespace,
+                    e,
+                )
+                .await;
+                None
+            }
+        };
+        drop(writer);
+        (result.map_err(WriteFailure::Own), stall)
+    };
+    WriteSection::Done { result, stall }
+}
+
 /// Run one HTTP Cypher request and classify it for metrics. Mirrors the Bolt
 /// `ServerBackend::run` path; the two do not share a chokepoint, so the
 /// parse/plan/execute logic is intentionally parallel.
@@ -3384,97 +3500,44 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 response: rejection,
             };
         }
-        let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
-            return ObservedQuery {
-                kind: Some(QueryKind::Write),
-                ok: false,
-                elapsed: started.elapsed(),
-                response: writer_busy_response(),
-            };
+        // Shielded from handler drop (client disconnect / TimeoutLayer): the
+        // commit reaches a definite outcome even if nobody is left to read
+        // it. The operator-cancel flag is re-scoped onto the task because
+        // task-locals do not cross tokio::spawn.
+        let cancel_flag = namidb_storage::cancel::current_cancel_flag();
+        let section = {
+            let state = state.clone();
+            let plan = plan.clone();
+            let params = params.clone();
+            tokio::spawn(async move {
+                match cancel_flag {
+                    Some(flag) => {
+                        namidb_storage::cancel::with_cancel_flag(
+                            flag,
+                            run_write_section(state, plan, params),
+                        )
+                        .await
+                    }
+                    None => run_write_section(state, plan, params).await,
+                }
+            })
         };
-        let (result, stall) = if let Some(group) = state.group_commit.clone() {
-            // RFC-034 group commit: stage inside a request scope and let the
-            // namespace committer make the whole group durable with ONE
-            // commit. The waiter registers while still holding the lock so
-            // the committer cannot slip between staging and registration;
-            // the ACK arrives only after the merged commit is durable and
-            // the snapshot republished (RFC-021 preserved).
-            let mark = writer.begin_staged_request();
-            match execute_write_staged_with_deadline(
-                &plan,
-                &mut writer,
-                &params,
-                state.write_deadline(),
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    writer.commit_staged_request();
-                    let lsn = writer.staged_last_lsn().unwrap_or(0);
-                    let ack = group.register(lsn);
-                    let stall = state.after_commit_backpressure(&writer);
-                    drop(writer);
-                    group.notify_committer();
-                    let result = match bounded_group_ack(ack, state.write_deadline()).await {
-                        GroupAck::Committed => Ok(outcome),
-                        GroupAck::Shared(shared) => Err(WriteFailure::Shared(shared)),
-                        GroupAck::CoordinatorExited => {
-                            Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
-                                "group commit coordinator exited".into(),
-                            )))
-                        }
-                        GroupAck::Indeterminate => Err(WriteFailure::Own(
-                            namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
-                        )),
-                    };
-                    (result, stall)
-                }
-                Err(e) => {
-                    // Roll back ONLY this request; earlier group members'
-                    // staged rows survive for their commit.
-                    writer.rollback_staged_request(mark);
-                    recovery::recover_after_write_error(
-                        &mut writer,
-                        &state.snapshot,
-                        &state.writer_health,
-                        &state.namespace,
-                        &e,
-                    )
-                    .await;
-                    drop(writer);
-                    (Err(WriteFailure::Own(e)), None)
-                }
+        let (result, stall) = match section.await {
+            Ok(WriteSection::Done { result, stall }) => (result, stall),
+            Ok(WriteSection::Busy) => {
+                return ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: writer_busy_response(),
+                };
             }
-        } else {
-            let result =
-                execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline())
-                    .await;
-            // Sample the soft write-stall decision while still holding the lock
-            // (RFC-027 P5), then release it and sleep — backpressure applies to
-            // this request, not to the writer mutex other connections need.
-            let stall = match &result {
-                Ok(_) => {
-                    // Refresh the published snapshot so subsequent reads see the
-                    // just-committed records (RFC-021).
-                    state.snapshot.store(writer.owned_snapshot());
-                    state.after_commit_backpressure(&writer)
-                }
-                Err(e) => {
-                    // A fenced/poisoned session would fail every later write;
-                    // reopen it in place under the lock we already hold.
-                    recovery::recover_after_write_error(
-                        &mut writer,
-                        &state.snapshot,
-                        &state.writer_health,
-                        &state.namespace,
-                        e,
-                    )
-                    .await;
-                    None
-                }
-            };
-            drop(writer);
-            (result.map_err(WriteFailure::Own), stall)
+            Err(join_error) => (
+                Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                    format!("write section task failed: {join_error}"),
+                ))),
+                None,
+            ),
         };
         // Stop the clock before the backpressure sleep: the stall is
         // intentional throttling, not query cost, so it must not inflate the
@@ -3625,6 +3688,38 @@ async fn admin_queries_multi(
         "queries": shared.metrics.queries().list(Some(namespace.as_str()))
     }))
     .into_response()
+}
+
+/// Header/default-namespace twins, matching every other admin route (an
+/// operator polling `/v0/admin/queries` on a multi-tenant server got a 404
+/// before these existed — third field report follow-up).
+async fn admin_queries_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    admin_queries_multi(
+        State(shared),
+        Extension(principal),
+        axum::extract::Path(namespace),
+    )
+    .await
+}
+
+async fn admin_cancel_query_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    admin_cancel_query_multi(
+        State(shared),
+        Extension(principal),
+        axum::extract::Path((namespace, id)),
+    )
+    .await
 }
 
 async fn admin_cancel_query_multi(
@@ -4146,9 +4241,137 @@ async fn dispatch_cypher_multi(
     obs.response
 }
 
+/// Multi-tenant twin of [`WriteSection`].
+enum WriteSectionMulti {
+    Busy,
+    Retired,
+    Done {
+        result: Result<namidb_query::exec::WriteOutcome, WriteFailure>,
+        stall: Option<Duration>,
+    },
+}
+
+/// Multi-tenant twin of [`run_write_section`] — same drop-shield rationale.
+async fn run_write_section_multi(
+    ns_state: Arc<NamespaceState>,
+    shared: SharedAppState,
+    plan: namidb_query::LogicalPlan,
+    params: Params,
+) -> WriteSectionMulti {
+    let lock_started = std::time::Instant::now();
+    let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
+    shared.metrics.observe_writer_lock(
+        WriterLockKind::Http,
+        lock_started.elapsed(),
+        writer.is_some(),
+    );
+    let Some(mut writer) = writer else {
+        return WriteSectionMulti::Busy;
+    };
+    // Eviction marks the incarnation retired before it waits for this
+    // mutex. Revalidate only after acquisition: an Arc cloned before
+    // eviction may have spent arbitrary time in the mutex's FIFO queue.
+    if ns_state.is_retired() {
+        drop(writer);
+        return WriteSectionMulti::Retired;
+    }
+    let (result, stall) = if let Some(group) = ns_state.group_commit.clone() {
+        // RFC-034 grouped write, multi-tenant flavour: stage inside a
+        // request scope, register under the lock, and let this
+        // namespace's committer (spawned by the registry, cancelled on
+        // eviction) make the group durable with one commit.
+        let mark = writer.begin_staged_request();
+        match execute_write_staged_with_deadline(
+            &plan,
+            &mut writer,
+            &params,
+            shared.write_deadline(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                writer.commit_staged_request();
+                let lsn = writer.staged_last_lsn().unwrap_or(0);
+                let ack = group.register(lsn);
+                let bytes = writer.memtable_bytes();
+                if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
+                    ns_state.flush_notify.notify_one();
+                }
+                let stall = shared.write_stall_for(writer.max_l0_bucket_len(), bytes);
+                drop(writer);
+                group.notify_committer();
+                let result = match bounded_group_ack(ack, shared.write_deadline()).await {
+                    GroupAck::Committed => Ok(outcome),
+                    GroupAck::Shared(shared_err) => Err(WriteFailure::Shared(shared_err)),
+                    GroupAck::CoordinatorExited => {
+                        Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                            "group commit coordinator exited".into(),
+                        )))
+                    }
+                    GroupAck::Indeterminate => Err(WriteFailure::Own(
+                        namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
+                    )),
+                };
+                (result, stall)
+            }
+            Err(e) => {
+                // Roll back ONLY this request; earlier group members'
+                // staged rows survive. Never recover a retired
+                // incarnation (see the inline arm).
+                writer.rollback_staged_request(mark);
+                if !ns_state.is_retired() {
+                    recovery::recover_after_write_error(
+                        &mut writer,
+                        &ns_state.snapshot,
+                        &ns_state.writer_health,
+                        &ns_state.namespace,
+                        &e,
+                    )
+                    .await;
+                }
+                drop(writer);
+                (Err(WriteFailure::Own(e)), None)
+            }
+        }
+    } else {
+        let result =
+            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
+        let stall = match &result {
+            Ok(_) => {
+                ns_state.snapshot.store(writer.owned_snapshot());
+                let bytes = writer.memtable_bytes();
+                if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
+                    ns_state.flush_notify.notify_one();
+                }
+                shared.write_stall_for(writer.max_l0_bucket_len(), bytes)
+            }
+            Err(e) => {
+                // Reopen a fenced/poisoned namespace writer in place, under
+                // the lock we already hold (mirrors the single-tenant path).
+                // Never recover a retired incarnation: doing so after
+                // eviction could claim a newer epoch and fence its successor.
+                if !ns_state.is_retired() {
+                    recovery::recover_after_write_error(
+                        &mut writer,
+                        &ns_state.snapshot,
+                        &ns_state.writer_health,
+                        &ns_state.namespace,
+                        e,
+                    )
+                    .await;
+                }
+                None
+            }
+        };
+        drop(writer);
+        (result.map_err(WriteFailure::Own), stall)
+    };
+    WriteSectionMulti::Done { result, stall }
+}
+
 /// Run one HTTP Cypher request in multi-tenant mode.
 async fn run_cypher_multi(
-    ns_state: &NamespaceState,
+    ns_state: &Arc<NamespaceState>,
     shared: &SharedAppState,
     req: &CypherRequest,
     principal: &Principal,
@@ -4383,119 +4606,43 @@ async fn run_cypher_multi(
                 response: rejection,
             };
         }
-        let lock_started = std::time::Instant::now();
-        let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
-        shared.metrics.observe_writer_lock(
-            WriterLockKind::Http,
-            lock_started.elapsed(),
-            writer.is_some(),
-        );
-        let Some(mut writer) = writer else {
-            return ObservedQuery {
-                kind: Some(QueryKind::Write),
-                ok: false,
-                elapsed: started.elapsed(),
-                response: writer_busy_response(),
-            };
+        // Shielded from handler drop, mirroring the single-tenant path.
+        let cancel_flag = namidb_storage::cancel::current_cancel_flag();
+        let section = {
+            let ns_state = Arc::clone(ns_state);
+            let shared = shared.clone();
+            let plan = plan.clone();
+            let params = params.clone();
+            tokio::spawn(async move {
+                match cancel_flag {
+                    Some(flag) => {
+                        namidb_storage::cancel::with_cancel_flag(
+                            flag,
+                            run_write_section_multi(ns_state, shared, plan, params),
+                        )
+                        .await
+                    }
+                    None => run_write_section_multi(ns_state, shared, plan, params).await,
+                }
+            })
         };
-        // Eviction marks the incarnation retired before it waits for this
-        // mutex. Revalidate only after acquisition: an Arc cloned before
-        // eviction may have spent arbitrary time in the mutex's FIFO queue.
-        if ns_state.is_retired() {
-            drop(writer);
-            return namespace_retired_observation(started);
-        }
-        let (result, stall) = if let Some(group) = ns_state.group_commit.clone() {
-            // RFC-034 grouped write, multi-tenant flavour: stage inside a
-            // request scope, register under the lock, and let this
-            // namespace's committer (spawned by the registry, cancelled on
-            // eviction) make the group durable with one commit.
-            let mark = writer.begin_staged_request();
-            match execute_write_staged_with_deadline(
-                &plan,
-                &mut writer,
-                &params,
-                shared.write_deadline(),
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    writer.commit_staged_request();
-                    let lsn = writer.staged_last_lsn().unwrap_or(0);
-                    let ack = group.register(lsn);
-                    let bytes = writer.memtable_bytes();
-                    if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
-                        ns_state.flush_notify.notify_one();
-                    }
-                    let stall = shared.write_stall_for(writer.max_l0_bucket_len(), bytes);
-                    drop(writer);
-                    group.notify_committer();
-                    let result = match bounded_group_ack(ack, shared.write_deadline()).await {
-                        GroupAck::Committed => Ok(outcome),
-                        GroupAck::Shared(shared_err) => Err(WriteFailure::Shared(shared_err)),
-                        GroupAck::CoordinatorExited => {
-                            Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
-                                "group commit coordinator exited".into(),
-                            )))
-                        }
-                        GroupAck::Indeterminate => Err(WriteFailure::Own(
-                            namidb_query::exec::ExecError::Runtime(GROUP_ACK_INDETERMINATE.into()),
-                        )),
-                    };
-                    (result, stall)
-                }
-                Err(e) => {
-                    // Roll back ONLY this request; earlier group members'
-                    // staged rows survive. Never recover a retired
-                    // incarnation (see the inline arm).
-                    writer.rollback_staged_request(mark);
-                    if !ns_state.is_retired() {
-                        recovery::recover_after_write_error(
-                            &mut writer,
-                            &ns_state.snapshot,
-                            &ns_state.writer_health,
-                            &ns_state.namespace,
-                            &e,
-                        )
-                        .await;
-                    }
-                    drop(writer);
-                    (Err(WriteFailure::Own(e)), None)
-                }
+        let (result, stall) = match section.await {
+            Ok(WriteSectionMulti::Done { result, stall }) => (result, stall),
+            Ok(WriteSectionMulti::Busy) => {
+                return ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: writer_busy_response(),
+                };
             }
-        } else {
-            let result =
-                execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline())
-                    .await;
-            let stall = match &result {
-                Ok(_) => {
-                    ns_state.snapshot.store(writer.owned_snapshot());
-                    let bytes = writer.memtable_bytes();
-                    if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
-                        ns_state.flush_notify.notify_one();
-                    }
-                    shared.write_stall_for(writer.max_l0_bucket_len(), bytes)
-                }
-                Err(e) => {
-                    // Reopen a fenced/poisoned namespace writer in place, under
-                    // the lock we already hold (mirrors the single-tenant path).
-                    // Never recover a retired incarnation: doing so after
-                    // eviction could claim a newer epoch and fence its successor.
-                    if !ns_state.is_retired() {
-                        recovery::recover_after_write_error(
-                            &mut writer,
-                            &ns_state.snapshot,
-                            &ns_state.writer_health,
-                            &ns_state.namespace,
-                            e,
-                        )
-                        .await;
-                    }
-                    None
-                }
-            };
-            drop(writer);
-            (result.map_err(WriteFailure::Own), stall)
+            Ok(WriteSectionMulti::Retired) => return namespace_retired_observation(started),
+            Err(join_error) => (
+                Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
+                    format!("write section task failed: {join_error}"),
+                ))),
+                None,
+            ),
         };
         let elapsed = started.elapsed();
         if let Some(delay) = stall {
@@ -5033,6 +5180,26 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
 
+        // The unprefixed (header/default-ns) admin route exists too — an
+        // operator polling /v0/admin/queries on a multi-tenant server got a
+        // 404 before the twins were added.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v0/admin/queries")
+                    .header("x-namidb-namespace", "acme")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "unprefixed multi-tenant query admin must route"
+        );
+
         // Another namespace sees nothing and cannot cancel it.
         let (_, body) = get_json(&app, "/beta/v0/admin/queries").await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5141,6 +5308,58 @@ mod tests {
                 "{method} {uri} must be write-role gated"
             );
         }
+    }
+
+    /// Item 59's deferred hazard, now closed: hyper dropping the handler
+    /// future (client disconnect, request TimeoutLayer) must NOT cancel a
+    /// write mid-durability. The section runs on a shielded task, so the
+    /// commit reaches its definite outcome and the writer is released
+    /// cleanly even when nobody is left to read the response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_write_handler_still_reaches_a_definite_outcome() {
+        let app = fixture(None).await;
+        let write = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "UNWIND range(1, 200000) AS i CREATE (:D {v: i})" }),
+        );
+        // Drop the request future mid-write — exactly what the TimeoutLayer
+        // or a vanished client does.
+        let _ = tokio::time::timeout(Duration::from_millis(30), write).await;
+
+        // The shielded section still commits; poll until the full batch is
+        // visible (bounded).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = post_json(
+                &app,
+                "/v0/cypher",
+                serde_json::json!({ "query": "MATCH (d:D) RETURN count(d) AS n" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body.contains("\"n\":200000") {
+                break;
+            }
+            assert!(
+                body.contains("\"n\":0"),
+                "no partial state may ever be visible: {body}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned write never completed: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // And the writer is immediately usable (no stuck lock, no leaked
+        // staged rows sealed into the next commit).
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "CREATE (:After {ok: true})" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// Item 59: the group-commit waiter is bounded by the write deadline —

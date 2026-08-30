@@ -86,7 +86,14 @@ impl ExecError {
 
 impl From<EvalError> for ExecError {
     fn from(e: EvalError) -> Self {
-        ExecError::Eval(e)
+        // Interrupts that fired INSIDE expression evaluation keep the same
+        // taxonomy as every other probe site (409 cancelled / 504 timeout),
+        // instead of masquerading as a client argument error.
+        match e.kind {
+            crate::exec::expr::EvalErrorKind::Timeout => ExecError::Timeout,
+            crate::exec::expr::EvalErrorKind::Cancelled => ExecError::Cancelled,
+            _ => ExecError::Eval(e),
+        }
     }
 }
 
@@ -970,6 +977,12 @@ pub(crate) fn execute_inner_with_routing<'a>(
                             for item in items {
                                 if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
                                     crate::exec::limits::check_deadline()?;
+                                    // Incremental: the cap must bound MEMORY,
+                                    // not merely veto the result after the
+                                    // full expansion materialised (item 60 —
+                                    // the post-loop check let a 4 GB
+                                    // container OOM between 3M and 5M rows).
+                                    crate::exec::limits::check_row_cap(out.len())?;
                                 }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
@@ -7979,6 +7992,12 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                             for item in items {
                                 if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
                                     crate::exec::limits::check_deadline()?;
+                                    // Incremental: the cap must bound MEMORY,
+                                    // not merely veto the result after the
+                                    // full expansion materialised (item 60 —
+                                    // the post-loop check let a 4 GB
+                                    // container OOM between 3M and 5M rows).
+                                    crate::exec::limits::check_row_cap(out.len())?;
                                 }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);

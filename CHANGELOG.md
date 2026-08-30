@@ -15,6 +15,32 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- A single `UNWIND range(1, N)` read could OOM-kill the whole process:
+  `range()` materialised its full list and the unwind loop expanded every
+  row BEFORE the row cap was evaluated, so on a 4 GB container ~3M rows
+  errored cleanly, ~4M dropped the connection, and ~5M died with exit
+  137 — a full write outage from one statement. Two guards close the
+  class: when a row cap is in scope, `range()` longer than the cap is
+  rejected before it allocates (with the interrupt taxonomy preserved —
+  a timeout/cancel that fires inside a long range build surfaces as
+  timeout/cancelled, not an argument error), and the unwind expansion
+  checks the cap incrementally so memory is bounded at cap + one stride
+  for any N. Embedded/CLI use without a scoped cap is unchanged.
+- The item-59 deferred hazard is closed: the HTTP write section (lock →
+  stage → commit → recovery) now runs on a shielded task, so the request
+  TimeoutLayer firing or the client disconnecting can no longer drop the
+  handler future mid-durability — the commit reaches its definite
+  outcome, the snapshot republishes, and the writer is released cleanly
+  even when nobody is left to read the response. The admin cancel flag
+  is re-scoped onto the shielded task, so item-56 cancellation still
+  works.
+- Multi-tenant deployments gained the unprefixed
+  (`X-NamiDB-Namespace`/default-namespace) twins of
+  `/v0/admin/queries[/:id/cancel]` — polling the bare path returned 404
+  while every other admin route accepted the header form.
+
+
 ## [2.5.0] - 2026-08-29
 
 **Added**
