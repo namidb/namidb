@@ -68,6 +68,13 @@ pub(crate) fn check_deadline() -> Result<(), ExecError> {
 /// `Err(ExecError::RowCap)` when a row cap is in scope and `len` exceeds it,
 /// `Ok(())` otherwise. `len` is the row count an operator produced (or is
 /// about to produce). A no-op when no cap is scoped.
+/// The row cap in scope, if any — for expression-level materialization
+/// guards (a `range()` longer than the cap is rejected before it allocates).
+#[inline]
+pub(crate) fn scoped_row_cap() -> Option<usize> {
+    ROW_CAP.try_with(|cap| *cap).ok()
+}
+
 #[inline]
 pub(crate) fn check_row_cap(len: usize) -> Result<(), ExecError> {
     ROW_CAP

@@ -23,6 +23,23 @@ pub enum EvalErrorKind {
     /// A feature the engine does not support (unknown function, unsupported
     /// expression form). Maps to a "not supported" error on every transport.
     Unsupported,
+    /// The query deadline fired inside expression evaluation (a long
+    /// `range()` build). Converted to [`ExecError::Timeout`] so the
+    /// taxonomy matches every other timeout site.
+    Timeout,
+    /// The operator cancel flag fired inside expression evaluation.
+    /// Converted to [`ExecError::Cancelled`].
+    Cancelled,
+}
+
+impl EvalError {
+    pub(crate) fn interrupted(kind: EvalErrorKind, span: SourceSpan) -> Self {
+        Self {
+            message: "expression evaluation interrupted".into(),
+            span,
+            kind,
+        }
+    }
 }
 
 /// Runtime error returned by expression / executor code. Carries a span
@@ -1434,11 +1451,45 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
     if step == 0 {
         return Err(EvalError::new("range(): step must be non-zero", span));
     }
+    // Deterministic materialization guard (field report 3 follow-up, item
+    // 60): `range()` allocates its whole list before any operator-level
+    // check can run, so a single `UNWIND range(1, huge)` used to OOM the
+    // process before the row cap fired. When a cap is in scope, a range
+    // longer than the cap is rejected BEFORE it allocates — such a list
+    // could never be unwound legally anyway, and the cap's contract is a
+    // bound on what one statement may materialise.
+    if let Some(cap) = crate::exec::limits::scoped_row_cap() {
+        let distance = i128::from(end) - i128::from(start);
+        let steps = distance / i128::from(step);
+        // Opposite-direction ranges are empty; same-direction ones hold
+        // `steps + 1` items.
+        let len: u128 = if steps < 0 { 0 } else { steps as u128 + 1 };
+        if len > cap as u128 {
+            return Err(EvalError::new(
+                format!(
+                    "range() of {len} items exceeds the configured row cap of {cap}; \
+                     use a smaller range or batch the work"
+                ),
+                span,
+            ));
+        }
+    }
     let mut out = Vec::new();
     let mut i = start;
     loop {
         if (step > 0 && i > end) || (step < 0 && i < end) {
             break;
+        }
+        if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
+            match namidb_storage::cancel::interrupted() {
+                None => {}
+                Some(namidb_storage::cancel::Interrupt::Timeout) => {
+                    return Err(EvalError::interrupted(EvalErrorKind::Timeout, span));
+                }
+                Some(namidb_storage::cancel::Interrupt::Cancelled) => {
+                    return Err(EvalError::interrupted(EvalErrorKind::Cancelled, span));
+                }
+            }
         }
         out.push(RuntimeValue::Integer(i));
         match i.checked_add(step) {

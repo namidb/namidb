@@ -125,3 +125,74 @@ async fn row_cap_rejects_a_cross_product_before_materialising() {
         .expect_err("a cross product over the cap must abort");
     assert!(matches!(err, ExecError::RowCap(5)), "got {err:?}");
 }
+
+/// Item 60: the row cap must bound MEMORY, not merely veto the result
+/// after the full expansion — a bare `UNWIND range(1, 5M)` used to
+/// materialise every row (and the whole range list) before the cap was
+/// evaluated, OOM-killing a 4 GB container. The range() guard now rejects
+/// the list before it allocates, and the unwind loop checks incrementally.
+#[tokio::test]
+async fn giant_unwind_range_is_rejected_before_it_materialises() {
+    let writer = seed("unwind-cap").await;
+    let snap = writer.snapshot();
+
+    // The range() materialization guard fires first: the list itself would
+    // exceed the cap, so nothing multi-million-sized is ever allocated.
+    let plan =
+        lower(&parse("UNWIND range(1, 5000000) AS i RETURN count(i) AS n").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Eval(e) if e.message.contains("row cap")),
+        "range() must be rejected at construction: {err:?}"
+    );
+
+    // Per-row lists individually UNDER the cap still trip the INCREMENTAL
+    // unwind check once the produced rows multiply past it: 3 rows x
+    // 400-item lists = 1200 produced rows against a 1000 cap (each range()
+    // passes its own construction guard).
+    let plan =
+        lower(&parse("MATCH (p:Person) UNWIND range(1, 400) AS i RETURN count(i) AS n").unwrap())
+            .unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ExecError::RowCap(1000)), "got {err:?}");
+
+    // Without a cap in scope (embedded / CLI), behavior is unchanged.
+    let plan = lower(&parse("UNWIND range(1, 5000) AS i RETURN count(i) AS n").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+/// The guard extends to non-UNWIND range() uses when a cap is scoped: a
+/// list the statement may not materialise as rows may not be materialised
+/// as one giant value either.
+#[tokio::test]
+async fn range_materialization_respects_the_scoped_cap() {
+    let writer = seed("range-cap").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("RETURN size(range(1, 100000)) AS n").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExecError::Eval(e) if e.message.contains("row cap")),
+        "{err:?}"
+    );
+    // Under the cap: exact size still returned.
+    let plan = lower(&parse("RETURN size(range(1, 500)) AS n").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // Opposite-direction ranges are empty, never rejected.
+    let plan = lower(&parse("RETURN size(range(10, 1)) AS n").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(5))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}

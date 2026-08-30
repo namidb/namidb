@@ -79,6 +79,12 @@ pub async fn with_cancel_flag<F: Future>(flag: Arc<AtomicBool>, fut: F) -> F::Ou
     .await
 }
 
+/// The operator cancel flag in scope, if any — for re-scoping onto a
+/// spawned task (task-locals do not cross `tokio::spawn`).
+pub fn current_cancel_flag() -> Option<Arc<AtomicBool>> {
+    CTX.try_with(|ctx| ctx.cancel.clone()).ok().flatten()
+}
+
 /// The active interrupt, if any. Operator cancel wins over the clock so the
 /// surfaced error names the actual cause.
 #[inline]

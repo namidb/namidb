@@ -873,7 +873,10 @@ honest indeterminate error, and slow-log lock/staging/commit
 sub-durations. Adjacent hazard recorded: the HTTP TimeoutLayer can
 cancel a commit mid-durability at 120s — to bound, not drop.
 **Follow-up shipped (2.5.0):** all of the plan above except the
-TimeoutLayer hazard (deferred, recorded here): determinate-boundary
+TimeoutLayer hazard (closed in 2.5.1: the HTTP write section runs on a
+shielded task — handler drops, whether from the TimeoutLayer or a client
+disconnect, can no longer cancel a commit mid-durability; the cancel flag
+re-scopes onto the task): determinate-boundary
 probes in commit_batch (pre-PUT and pre-orphan-retry only; the
 PUT-to-CAS zone stays uninterruptible), deadline scope over the HTTP
 commit and re-armed around both Bolt commits, bounded group-ACK wait
@@ -881,3 +884,22 @@ with the outcome-unknown error, >10s durability-tail warn, and opt-in
 store client bounds via NAMIDB_STORE_{REQUEST_TIMEOUT,RETRY_TIMEOUT,
 MAX_RETRIES}. The admin cancel flag (item 56) rides the same probes, so
 a stuck-but-probing commit is also operator-killable pre-PUT.
+
+### 60. [CONFIRMED — fixed in 2.5.1] One `UNWIND range(N)` read OOM-kills the process past ~4M
+
+Reported against 2.5.0 (4 GB container): range(3M) → clean
+ResourceLimitExceeded at 2.2s; range(4M) → connection dropped; range(5M)
+→ exit 137 at 10.5s. Reproduced: the row cap (default 1M) was evaluated
+only AFTER the unwind loop fully materialised its output, and `range()`
+itself allocated the whole list before any operator check — so the cap
+vetoed the result without ever bounding memory, and headroom decided
+whether the process survived. (The 2.5.0 probes added under item 56 were
+deadline/cancel probes only — the cap stayed post-loop.) Fixed with two
+guards: `range()` longer than a scoped row cap is rejected before
+allocating (interrupt taxonomy preserved through EvalErrorKind::
+Timeout/Cancelled → ExecError), and the unwind expansion checks the cap
+incrementally at the standard stride, bounding memory at cap + stride for
+any N. Also from this report follow-up: the multi-tenant unprefixed
+`/v0/admin/queries` twins existed for flush/backup but not queries —
+added (the reporter's "never appeared in the list" is otherwise
+unreproduced: HTTP single-tenant listing verified live at 3M/5M).
