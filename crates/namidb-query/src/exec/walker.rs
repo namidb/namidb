@@ -1810,6 +1810,7 @@ pub(crate) async fn execute_expand(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
+                max == 1 && !target_labels.is_empty(),
             )
             .await?;
             for (step, neighbours) in step_neighbours {
@@ -1882,15 +1883,25 @@ pub(crate) async fn execute_expand(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        if !target_membership
-                            .as_ref()
-                            .and_then(|membership| membership.get(&target_id))
-                            .copied()
-                            .unwrap_or(false)
-                        {
+                        if !match &target_membership {
+                            ExpandTargets::Membership(membership) => {
+                                membership.get(&target_id).copied().unwrap_or(false)
+                            }
+                            _ => false,
+                        } {
                             continue;
                         }
                         None
+                    } else if let ExpandTargets::Views(views) = &target_membership {
+                        // Single-hop labelled expansion: the hop's own
+                        // materialisation answers directly, so a large
+                        // fan-out no longer depends on cache retention.
+                        match views.get(&target_id) {
+                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v.clone())
+                            }
+                            _ => continue,
+                        }
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
                             // Multi-hop: traverse through any existing node; the
@@ -1999,13 +2010,20 @@ pub(crate) async fn execute_expand(
                     if let Some(k) = &edge_key {
                         new_rels.push(k.clone());
                     }
-                    next_frontier.push(Step {
-                        tail: target_id,
-                        row: new_row.clone(),
-                        trail: new_trail.clone(),
-                        rels: new_rels,
-                        rel_values: new_rel_values.clone(),
-                    });
+                    // A single-hop expansion never runs another round, so the
+                    // frontier entry is dead on arrival — and it costs a DEEP
+                    // clone of the row (every binding, whole node values
+                    // included) per matched edge. At a 53k-degree hub that was
+                    // hundreds of MB of pure waste (sixth field report).
+                    if max > 1 {
+                        next_frontier.push(Step {
+                            tail: target_id,
+                            row: new_row.clone(),
+                            trail: new_trail.clone(),
+                            rels: new_rels,
+                            rel_values: new_rel_values.clone(),
+                        });
+                    }
                     if hop >= min.max(1) {
                         let keeps = bound_target_matches_labels
                             && target_is_result
@@ -6429,14 +6447,48 @@ fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId)
 /// exact dangling-node/label semantics. For value-consuming targets this
 /// merely prewarms the point cache, including typeless expansions that
 /// previously repeated one cold lookup per relationship.
+/// What [`prepare_expand_targets`] resolved for one hop.
+pub(crate) enum ExpandTargets {
+    /// Identity-only route: membership per distinct endpoint.
+    Membership(HashMap<NodeId, bool>),
+    /// Value-consuming route: the hop's endpoint views, materialised ONCE
+    /// and consumed directly. Previously this batch was thrown away and
+    /// every edge re-read its endpoint through the shared node cache —
+    /// which collapsed once a hop's distinct targets outgrew that cache,
+    /// because eviction is FIFO and the prewarm evicted its own earliest
+    /// entries before the per-edge loop reached them (sixth field report:
+    /// instant at degree 3.8k, fatal at 53k — a step function at a capacity
+    /// boundary, arriving EARLIER when the CSR cache is enabled because
+    /// that shrinks the node cache's share of the budget).
+    Views(HashMap<NodeId, namidb_storage::NodeView>),
+    /// Nothing prepared: each edge resolves its own endpoint.
+    Cold,
+}
+
+/// Upper bound on endpoint views held for one hop. Beyond it the batch is
+/// skipped entirely rather than materialised and thrown away: a set that
+/// large cannot be retained by any cache either, so the per-edge path is
+/// the honest route and the churn is pure loss.
+fn expand_target_view_budget() -> usize {
+    std::env::var("NAMIDB_EXPAND_TARGET_VIEW_BUDGET")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(250_000)
+}
+
 async fn prepare_expand_targets(
     snapshot: &Snapshot<'_>,
     target_labels: &[String],
     unique_targets: &[NodeId],
     skip_target_materialize: bool,
-) -> Result<Option<HashMap<NodeId, bool>>, ExecError> {
+    views_usable: bool,
+) -> Result<ExpandTargets, ExecError> {
     if unique_targets.is_empty() {
-        return Ok(skip_target_materialize.then(HashMap::new));
+        return Ok(if skip_target_materialize {
+            ExpandTargets::Membership(HashMap::new())
+        } else {
+            ExpandTargets::Cold
+        });
     }
     if skip_target_materialize {
         let matches = match snapshot
@@ -6465,12 +6517,28 @@ async fn prepare_expand_targets(
                 "batched endpoint membership returned a misaligned result".into(),
             ));
         }
-        return Ok(Some(unique_targets.iter().copied().zip(matches).collect()));
+        return Ok(ExpandTargets::Membership(
+            unique_targets.iter().copied().zip(matches).collect(),
+        ));
     }
 
     let label = target_labels.first().map_or("", String::as_str);
-    let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
-    Ok(None)
+    // Only a SINGLE-HOP labelled expansion may consume the batch directly:
+    // the batch is label-scoped, while a variable-length traversal must be
+    // able to walk THROUGH nodes carrying other labels.
+    if !views_usable || unique_targets.len() > expand_target_view_budget() {
+        let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
+        return Ok(ExpandTargets::Cold);
+    }
+    let views = snapshot.batch_lookup_nodes(label, unique_targets).await?;
+    Ok(ExpandTargets::Views(
+        unique_targets
+            .iter()
+            .copied()
+            .zip(views)
+            .filter_map(|(id, view)| view.map(|view| (id, view)))
+            .collect(),
+    ))
 }
 
 /// Decide whether an Expand target may be represented by an id-only stub.
@@ -8618,6 +8686,7 @@ async fn execute_expand_factor(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
+                max == 1 && !target_labels.is_empty(),
             )
             .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
@@ -8652,15 +8721,25 @@ async fn execute_expand_factor(
                     let target_view_opt = if back_reference {
                         None
                     } else if skip_target_materialize {
-                        if !target_membership
-                            .as_ref()
-                            .and_then(|membership| membership.get(&target_id))
-                            .copied()
-                            .unwrap_or(false)
-                        {
+                        if !match &target_membership {
+                            ExpandTargets::Membership(membership) => {
+                                membership.get(&target_id).copied().unwrap_or(false)
+                            }
+                            _ => false,
+                        } {
                             continue;
                         }
                         None
+                    } else if let ExpandTargets::Views(views) = &target_membership {
+                        // Single-hop labelled expansion: the hop's own
+                        // materialisation answers directly, so a large
+                        // fan-out no longer depends on cache retention.
+                        match views.get(&target_id) {
+                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v.clone())
+                            }
+                            _ => continue,
+                        }
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
                             match scan_node_for_id(snapshot, target_id).await? {

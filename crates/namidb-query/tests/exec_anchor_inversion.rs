@@ -360,3 +360,139 @@ async fn disjunction_source_anchors_at_the_dated_target() {
         "{rows:?}"
     );
 }
+
+/// Fifth/sixth field report: `WITH v, p.cod_item AS c WHERE c = '…'` is the
+/// same query as the in-pattern spelling, but the alias hid the equality
+/// above a Project, so the anchor was never visible and the plan scanned
+/// the whole source label (the reporter's 160k-row scan that killed the
+/// process, while the in-pattern form finished instantly). The predicate
+/// must now substitute back through the projection, anchor, and return
+/// identical rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_alias_predicate_still_anchors_at_the_indexed_target() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("alias-anchor").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+    // 20 products; 200 sales spread over them and over 5 dates.
+    let mut productos = Vec::new();
+    for i in 0..20 {
+        let id = NodeId::new();
+        productos.push(id);
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("cod_item".into(), CoreValue::Str(format!("cod-{i}")));
+        writer
+            .upsert_node(
+                "PRODUCTO",
+                id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let mut fechas = Vec::new();
+    for d in 0..5 {
+        let id = NodeId::new();
+        fechas.push(id);
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("fecha".into(), CoreValue::Str(format!("f{d}")));
+        writer
+            .upsert_node(
+                "FECHA",
+                id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let edge = EdgeWriteRecord {
+        properties: BTreeMap::new(),
+        schema_version: 1,
+    };
+    for i in 0..200usize {
+        let v = NodeId::new();
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("venta_neta".into(), CoreValue::I64((i % 7) as i64 + 1));
+        writer
+            .upsert_node(
+                "VENTA",
+                v,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        writer
+            .upsert_edge("VENTA_DE_PRODUCTO", v, productos[i % 20], &edge)
+            .unwrap();
+        writer
+            .upsert_edge("VENTA_EN_FECHA", v, fechas[i % 5], &edge)
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .create_unique_constraint("PRODUCTO", "cod_item")
+        .await
+        .unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let with_alias = "MATCH (v:VENTA)-[:VENTA_DE_PRODUCTO]->(p:PRODUCTO) \
+                      WITH v, p.cod_item AS c WHERE c = 'cod-3' \
+                      MATCH (v)-[:VENTA_EN_FECHA]->(f:FECHA) \
+                      RETURN f.fecha AS fecha, sum(v.venta_neta) AS total \
+                      ORDER BY fecha";
+    let in_pattern = "MATCH (v:VENTA)-[:VENTA_DE_PRODUCTO]->(p:PRODUCTO {cod_item: 'cod-3'}) \
+                      MATCH (v)-[:VENTA_EN_FECHA]->(f:FECHA) \
+                      RETURN f.fecha AS fecha, sum(v.venta_neta) AS total \
+                      ORDER BY fecha";
+
+    fn anchors_at_producto(plan: &LogicalPlan) -> bool {
+        matches!(
+            plan,
+            LogicalPlan::NodeByPropertyValue { label, .. } if label == "PRODUCTO"
+        ) || plan.children().into_iter().any(anchors_at_producto)
+    }
+    fn scans_ventas(plan: &LogicalPlan) -> bool {
+        matches!(
+            plan,
+            LogicalPlan::NodeScan { label: Some(l), .. } if l == "VENTA"
+        ) || plan.children().into_iter().any(scans_ventas)
+    }
+
+    let aliased_plan = optimize(lower(&parse(with_alias).unwrap()).unwrap(), &catalog);
+    assert!(
+        anchors_at_producto(&aliased_plan),
+        "the WITH-aliased predicate must anchor at PRODUCTO: {aliased_plan:?}"
+    );
+    assert!(
+        !scans_ventas(&aliased_plan),
+        "the whole-VENTA scan must be gone: {aliased_plan:?}"
+    );
+
+    // Same rows as the in-pattern spelling, which already anchored.
+    let rows_aliased = execute(&aliased_plan, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    let pattern_plan = optimize(lower(&parse(in_pattern).unwrap()).unwrap(), &catalog);
+    let rows_pattern = execute(&pattern_plan, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    let fmt = |rows: &[namidb_query::Row]| {
+        rows.iter()
+            .map(|r| format!("{:?}|{:?}", r.get("fecha"), r.get("total")))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fmt(&rows_aliased), fmt(&rows_pattern));
+    assert!(!rows_aliased.is_empty());
+}

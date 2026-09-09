@@ -193,6 +193,7 @@ async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::Join
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -306,6 +307,7 @@ async fn boot_bolt_multi(
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
+        http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -671,6 +673,7 @@ async fn boot_bolt_config(
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -738,6 +741,7 @@ async fn boot_bolt_tokens(
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
+        http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
@@ -994,6 +998,7 @@ async fn bolt_create_then_match_roundtrip() {
         default_namespace: "bolt-test".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
 
     let server_task = tokio::spawn(async move {
@@ -1088,6 +1093,7 @@ async fn bolt_bad_token_yields_failure() {
         default_namespace: "bolt-bad-auth".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
 
     let server_task = tokio::spawn(async move {
@@ -1260,6 +1266,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         default_namespace: "bolt-introspect".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
     let server_task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

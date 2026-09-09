@@ -262,3 +262,62 @@ async fn topology_fallback_matches_property_route_partners_without_hydration() {
     expected.sort();
     assert_eq!(slim_partners, expected, "tombstone dropped, delta included");
 }
+
+/// Sixth field report: `batch_lookup_nodes` sized every intermediate to the
+/// WHOLE id list, so one hop over a 53k-degree endpoint set allocated
+/// hundreds of megabytes at once. It now resolves in chunks — with the
+/// caller's order, duplicates, and misses preserved exactly.
+#[tokio::test]
+async fn batch_lookup_nodes_chunks_without_changing_results() {
+    std::env::set_var("NAMIDB_BATCH_LOOKUP_CHUNK", "7");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("chunked").unwrap());
+    let mut w = WriterSession::open(store, paths).await.unwrap();
+
+    let mut ids = Vec::new();
+    for seq in 0..40i64 {
+        let id = NodeId::new();
+        ids.push(id);
+        w.upsert_node("Person", id, &person("team", seq)).unwrap();
+    }
+    w.commit_batch().await.unwrap();
+    let schema = w.snapshot().manifest().manifest.schema.clone();
+    w.flush(schema).await.unwrap();
+    let missing = NodeId::new();
+
+    // Interleave duplicates and a miss across several chunk boundaries.
+    let mut probe: Vec<NodeId> = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        probe.push(*id);
+        if i % 5 == 0 {
+            probe.push(*id);
+        }
+        if i % 11 == 0 {
+            probe.push(missing);
+        }
+    }
+    let snap = w.snapshot();
+    let views = snap.batch_lookup_nodes("Person", &probe).await.unwrap();
+    assert_eq!(views.len(), probe.len(), "one slot per requested id");
+    for (requested, view) in probe.iter().zip(&views) {
+        if *requested == missing {
+            assert!(view.is_none(), "a missing id stays None in its own slot");
+        } else {
+            assert_eq!(
+                view.as_ref().map(|v| v.id),
+                Some(*requested),
+                "each slot must hold ITS id"
+            );
+        }
+    }
+    // The chunked result equals the single-pass result.
+    std::env::set_var("NAMIDB_BATCH_LOOKUP_CHUNK", "100000");
+    let single = snap.batch_lookup_nodes("Person", &probe).await.unwrap();
+    let ids_of = |vs: &[Option<namidb_storage::NodeView>]| {
+        vs.iter()
+            .map(|v| v.as_ref().map(|v| v.id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids_of(&views), ids_of(&single));
+    std::env::remove_var("NAMIDB_BATCH_LOOKUP_CHUNK");
+}
