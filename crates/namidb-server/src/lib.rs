@@ -689,10 +689,14 @@ pub fn build_router(state: AppState) -> Router {
     // the same gate as new Cypher work can leave a large memtable with no
     // operator escape hatch. It is excluded from the request timeout; the
     // handler has its own process-wide single-flight gate, while the storage
-    // flush restores its frozen memtable on cancellation. The outer global
+    // flush restores its frozen memtable on cancellation. Compaction is
+    // excluded for the same reason and one more: draining a post-bulk-load L0
+    // legitimately runs for minutes, so the outer 120s ceiling would cut every
+    // call that was worth making. The outer global
     // concurrency cap bounds clients waiting for that gate.
     let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
+        .route("/v0/admin/compact", post(admin_compact))
         .route("/v0/admin/backup", post(admin_backup))
         .route("/v0/admin/queries", get(admin_queries))
         .route("/v0/admin/queries/:id/cancel", post(admin_cancel_query))
@@ -867,6 +871,8 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     let namespace_maintenance = Router::new()
         .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
+        .route("/:namespace/v0/admin/compact", post(admin_compact_multi))
+        .route("/v0/admin/compact", post(admin_compact_multi_unprefixed))
         .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
         .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
         .route("/:namespace/v0/admin/queries", get(admin_queries_multi))
@@ -4016,6 +4022,135 @@ async fn admin_cancel_query_multi(
     }
 }
 
+/// `POST /v0/admin/compact` — drain L0 and block until it is done.
+///
+/// The periodic scheduler is deliberately incremental (one bucket per
+/// tick), which is right for steady state and wrong right after a bulk
+/// load: L0 sat hundreds of files deep and the NEXT load ran an order of
+/// magnitude slower (449.9s vs 45.8s for the same writes) with no way to
+/// ask the server to catch up. Excluded from the request timeout like the
+/// admin flush, and single-flighted through the same permit so two
+/// operators cannot prepare the same merges twice.
+async fn admin_compact(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin compact is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let Ok(_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_flush_permit()).await
+    else {
+        return admin_compact_busy_response();
+    };
+    match maintenance::drain_compaction(
+        &state.writer,
+        &state.snapshot,
+        &state.writer_health,
+        &state.namespace,
+        &state.metrics,
+        None,
+    )
+    .await
+    {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("compaction failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn admin_compact_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "another flush or compaction is already running; retry shortly".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// Multi-tenant twins, including the header/default-namespace form every
+/// other admin route accepts.
+async fn admin_compact_multi(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(namespace): axum::extract::Path<String>,
+) -> Response {
+    dispatch_admin_compact_multi(&shared, &namespace, &principal).await
+}
+
+async fn admin_compact_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_compact_multi(&shared, &namespace, &principal).await
+}
+
+async fn dispatch_admin_compact_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    principal: &Principal,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin compact is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let ns_state = match shared.registry.get_or_open(namespace).await {
+        Ok(ns) => ns,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Ok(_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.memory.admin_flush_permit()).await
+    else {
+        return admin_compact_busy_response();
+    };
+    match maintenance::drain_compaction(
+        &ns_state.writer,
+        &ns_state.snapshot,
+        &ns_state.writer_health,
+        &ns_state.namespace,
+        &shared.metrics,
+        None,
+    )
+    .await
+    {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("compaction failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn admin_flush(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -7017,6 +7152,100 @@ mod tests {
         };
         assert_eq!(flush("rkey").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(flush("wkey").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_compact_stays_authenticated_and_forbids_read_only_tokens() {
+        let app = fixture_with_tokens("authz-compact", ROLE_TOKENS).await;
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/compact")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let compact = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v0/admin/compact")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(compact("rkey").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(compact("wkey").await.status(), StatusCode::OK);
+    }
+
+    /// The endpoint that finding #5 asked for: after a bulk load leaves L0
+    /// hundreds of files deep, one blocking call brings it back to zero. The
+    /// reported 10x write regression (449.9s at L0=439 vs 45.8s clean) had no
+    /// operator remedy before this — only waiting for periodic ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_compact_drains_l0_and_returns_the_summary() {
+        let (store, paths) = namidb_storage::parse_uri("memory://http-compact-drain").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "http-compact-drain".into());
+        for i in 0..4 {
+            let mut writer = state.writer.lock().await;
+            writer
+                .upsert_node(
+                    "Bulk",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: std::collections::BTreeMap::from([(
+                            "i".to_string(),
+                            namidb_core::value::Value::I64(i),
+                        )]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            writer
+                .flush(namidb_core::schema::Schema::empty())
+                .await
+                .unwrap();
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        assert_eq!(state.writer.lock().await.max_l0_bucket_len(), 4);
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/compact")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["l0_before"], 4);
+        assert_eq!(body["l0_after"], 0);
+        assert_eq!(body["truncated"], false);
+        assert!(body["passes"].as_u64().unwrap() >= 1);
+        assert!(body["source_ssts_removed"].as_u64().unwrap() >= 4);
+        assert_eq!(
+            state.writer.lock().await.max_l0_bucket_len(),
+            0,
+            "the call must block until the drain it reports has actually landed"
+        );
     }
 
     /// POST a JSON body to an admin path with a bearer token.

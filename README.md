@@ -736,7 +736,23 @@ container/cgroup limit or correctly-sized headroom for an already-running
 operation. The official Compose example supplies a 4 GiB hard limit and uses
 `auto`, so both safeguards are active by default there. The setting belongs to
 `namidb-server`; embedded Rust and Python
-clients do not install this admission governor. For example, pair
+clients do not install this admission governor.
+
+Authenticated `POST /v0/admin/compact` is the companion catch-up operation: it
+drains L0 completely and blocks until the drain has landed, rather than waiting
+for the incremental periodic scheduler. Run it after a bulk load. Background
+compaction is deliberately one bucket per tick, which is right for steady state
+and wrong immediately after an ingest: an L0 left hundreds of files deep makes
+the *next* load an order of magnitude slower, because every write re-reads a
+taller stack. The response is a JSON summary — `passes`, `l0_before`,
+`l0_after`, `source_ssts_removed`, `new_ssts_written`, `manifest_version`, and
+`truncated` (true only when the drain hit its 128-pass bound and should be run
+again). Like flush, the route sits outside the HTTP request timeout — a real
+drain legitimately runs for minutes — is gated on the write role, and shares
+the same process-wide single-flight permit, so a second caller gets `503` with
+a retryable message instead of preparing the same merges twice. The
+multi-tenant twins are `POST /:namespace/v0/admin/compact` and the
+default-namespace `POST /v0/admin/compact`. For example, pair
 `NAMIDB_MEMORY_MAX_BYTES=3758096384` (3.5 GiB admission) with
 `docker run --memory=4g ...` (4 GiB hard containment).
 
