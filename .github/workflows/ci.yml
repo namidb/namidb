@@ -56,10 +56,14 @@ jobs:
       # the only job that compiles it is `test (vector-index + text-index)`,
       # which takes minutes to get there and reports it as a build failure
       # among test output. Type-check that configuration cheaply and early.
+      # Exactly the package set and features of the `test (vector-index +
+      # text-index)` job below, so this lints the same compilation it is meant
+      # to guard. Adding a package that does not define both features changes
+      # how cargo resolves them for the others and lints a different build.
       - name: clippy (vector-index + text-index)
         run: |
           cargo clippy --locked -p namidb-storage -p namidb-query -p namidb-server \
-            -p namidb-bench --lib --tests --features vector-index,text-index \
+            --lib --tests --features vector-index,text-index \
             -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
