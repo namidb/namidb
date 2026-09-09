@@ -1700,3 +1700,162 @@ async fn prefix_expansion_beyond_the_cap_is_identical_on_every_route() {
         "a prefix under the cap returns every matching term"
     );
 }
+
+/// Fourth field report, item 66: schema introspection must work through the
+/// ENGINE dispatch (every surface), not only the Bolt pre-parse shim.
+#[tokio::test]
+async fn db_introspection_procedures_serve_from_the_engine() {
+    let mut writer = WriterSession::open(store(), paths("call-db"))
+        .await
+        .unwrap();
+    let mut props: BTreeMap<String, namidb_core::value::Value> = BTreeMap::new();
+    props.insert("name".into(), namidb_core::value::Value::Str("ana".into()));
+    let a = NodeId::new();
+    let b = NodeId::new();
+    writer
+        .upsert_node(
+            "Person",
+            a,
+            &NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.upsert_node("City", b, &node()).unwrap();
+    writer.upsert_edge("LIVES_IN", a, b, &edge()).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let rows = run(&snapshot, "CALL db.labels() YIELD label").await;
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|r| match r.get("label") {
+            Some(RuntimeValue::String(s)) => s.clone(),
+            other => panic!("label must be a string, got {other:?}"),
+        })
+        .collect();
+    assert!(labels.contains(&"Person".to_string()), "{labels:?}");
+    assert!(labels.contains(&"City".to_string()), "{labels:?}");
+
+    let rows = run(&snapshot, "CALL db.relationshipTypes()").await;
+    assert!(rows.iter().any(|r| matches!(
+        r.get("relationshipType"),
+        Some(RuntimeValue::String(t)) if t == "LIVES_IN"
+    )));
+
+    let rows = run(&snapshot, "CALL db.propertyKeys() YIELD propertyKey AS key").await;
+    assert!(
+        rows.iter().any(|r| matches!(
+            r.get("key"),
+            Some(RuntimeValue::String(k)) if k == "name"
+        )),
+        "YIELD aliasing must project the canonical column"
+    );
+
+    // visualization: one row, virtual nodes carry the label + stable ids,
+    // rels connect the endpoint labels' virtual nodes.
+    let rows = run(&snapshot, "CALL db.schema.visualization()").await;
+    assert_eq!(rows.len(), 1);
+    let nodes = match rows[0].get("nodes") {
+        Some(RuntimeValue::List(nodes)) => nodes.clone(),
+        other => panic!("nodes must be a list, got {other:?}"),
+    };
+    let mut label_to_id: BTreeMap<String, namidb_core::id::NodeId> = BTreeMap::new();
+    for n in &nodes {
+        match n {
+            RuntimeValue::Node(node) => {
+                let label = node.labels.iter().next().unwrap().clone();
+                label_to_id.insert(label, node.id);
+            }
+            other => panic!("virtual node expected, got {other:?}"),
+        }
+    }
+    assert!(label_to_id.contains_key("Person") && label_to_id.contains_key("City"));
+    match rows[0].get("relationships") {
+        Some(RuntimeValue::List(rels)) => {
+            let rel = rels
+                .iter()
+                .find_map(|r| match r {
+                    RuntimeValue::Rel(rel) if rel.edge_type == "LIVES_IN" => Some(rel),
+                    _ => None,
+                })
+                .expect("LIVES_IN must appear");
+            assert_eq!(rel.src, label_to_id["Person"]);
+            assert_eq!(rel.dst, label_to_id["City"]);
+        }
+        other => panic!("relationships must be a list, got {other:?}"),
+    }
+
+    // Stable ids across calls (tooling diffs successive draws).
+    let again = run(&snapshot, "CALL db.schema.visualization()").await;
+    assert_eq!(rows[0].get("nodes"), again[0].get("nodes"));
+}
+
+/// Item 67c: a database whose only declarations are unique constraints must
+/// not report `SHOW INDEXES` as `[]` — the unique property IS index-backed
+/// (one equality sidecar) and tooling discovers keys through this surface.
+/// Composite unique constraints stay absent: tuple-scan enforced, no
+/// backing lookup structure to advertise.
+#[tokio::test]
+async fn show_indexes_lists_constraint_backed_entries() {
+    let mut writer = WriterSession::open(store(), paths("show-cx"))
+        .await
+        .unwrap();
+    let mut props: BTreeMap<String, namidb_core::value::Value> = BTreeMap::new();
+    props.insert("email".into(), namidb_core::value::Value::Str("a@x".into()));
+    props.insert("a".into(), namidb_core::value::Value::Str("1".into()));
+    props.insert("b".into(), namidb_core::value::Value::Str("2".into()));
+    writer
+        .upsert_node(
+            "Person",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer
+        .create_unique_constraint_named(Some("person_email"), "Person", &["email".into()], false)
+        .await
+        .unwrap();
+    writer
+        .create_unique_constraint_named(
+            Some("person_pair"),
+            "Person",
+            &["a".into(), "b".into()],
+            false,
+        )
+        .await
+        .unwrap();
+
+    let snap = writer.snapshot();
+    let rows = namidb_query::show_indexes_rows(&snap.manifest().manifest);
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| match r.get("name") {
+            Some(RuntimeValue::String(n)) => n.clone(),
+            other => panic!("name must be a string: {other:?}"),
+        })
+        .collect();
+    assert!(
+        names.contains(&"person_email".to_string()),
+        "the unique constraint's backing index must be listed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"person_pair".to_string()),
+        "composite unique constraints have no backing structure: {names:?}"
+    );
+    let email_row = rows
+        .iter()
+        .find(|r| matches!(r.get("name"), Some(RuntimeValue::String(n)) if n == "person_email"))
+        .unwrap();
+    assert!(matches!(
+        email_row.get("type"),
+        Some(RuntimeValue::String(t)) if t == "RANGE"
+    ));
+}

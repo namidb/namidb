@@ -75,12 +75,31 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
     let mut entries: Vec<(String, &'static str, String, Vec<String>)> = Vec::new();
     for (label, def) in &manifest.schema.labels {
         for p in &def.properties {
-            if p.indexed {
+            // A unique property IS index-backed (flush unions
+            // `indexed || unique` into one equality sidecar and the planner
+            // point-lookup relies on it), so it belongs in SHOW INDEXES —
+            // previously a database with only unique constraints reported
+            // `[]` and tooling could not discover its keys. One sidecar,
+            // one row: the constraint-named row wins over the flag row.
+            if p.unique {
+                let props = vec![p.name.clone()];
+                let name = manifest
+                    .schema
+                    .constraint_matching(label, &props, ConstraintKind::Unique)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| {
+                        Constraint::default_name(label, &props, ConstraintKind::Unique)
+                    });
+                entries.push((name, "RANGE", label.clone(), props));
+            } else if p.indexed {
                 let name = format!("index_{label}_{}", p.name);
                 entries.push((name, "RANGE", label.clone(), vec![p.name.clone()]));
             }
         }
     }
+    // Composite UNIQUE constraints are deliberately absent: they are
+    // enforced by tuple scan on write and have no backing lookup structure,
+    // so listing them would advertise a plan route that does not exist.
     // Composite equality indexes carry their persisted name and their
     // DECLARATION-ordered property list.
     for index in &manifest.schema.indexes {

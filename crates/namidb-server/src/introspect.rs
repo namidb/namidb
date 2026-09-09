@@ -295,6 +295,10 @@ fn show_procedures() -> RunOutcome {
         ),
         ("db.propertyKeys", "db.propertyKeys() :: (propertyKey :: STRING)"),
         (
+            "db.schema.visualization",
+            "db.schema.visualization() :: (nodes :: LIST, relationships :: LIST)",
+        ),
+        (
             "apoc.meta.nodeTypeProperties",
             "apoc.meta.nodeTypeProperties() :: (nodeType :: STRING, nodeLabels :: LIST, propertyName :: STRING, propertyTypes :: LIST, mandatory :: BOOLEAN)",
         ),
@@ -489,6 +493,10 @@ fn mg_procedures() -> RunOutcome {
         (
             "schema.rel_type_properties",
             "schema.rel_type_properties() :: (relType :: STRING, mandatory :: BOOLEAN, propertyName :: STRING, propertyTypes :: STRING)",
+        ),
+        (
+            "db.schema.visualization",
+            "db.schema.visualization() :: (nodes :: LIST, relationships :: LIST)",
         ),
         ("mg.procedures", "mg.procedures() :: (name :: STRING, signature :: STRING)"),
         ("mg.functions", "mg.functions() :: (name :: STRING, signature :: STRING)"),

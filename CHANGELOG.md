@@ -15,6 +15,27 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Added**
+- Schema introspection now works on every surface: `CALL db.labels()`,
+  `CALL db.relationshipTypes()`, `CALL db.propertyKeys()`, and
+  `CALL db.schema.visualization()` are dispatched in the query engine
+  (previously the first three existed only as a Bolt connection shim and
+  HTTP/Python/CLI/MCP got "unknown procedure namespace `db`";
+  visualization existed nowhere). Served from manifest-cheap snapshot
+  data — no scans; visualization emits virtual nodes with stable ids so
+  tooling can diff successive draws; propertyKeys includes unflushed
+  memtable data. The CLI also gained `SHOW CONSTRAINTS` / `SHOW INDEXES`
+  interception (previously errored).
+
+**Fixed**
+- `SHOW INDEXES` returned `[]` on a database whose only declarations are
+  unique constraints, so tooling could not discover the keys. A
+  single-property unique constraint IS index-backed (one equality
+  sidecar); it now appears as its backing `RANGE` index under the
+  constraint's name. Composite unique constraints stay absent on
+  purpose: they are enforced by tuple scan on write and have no backing
+  lookup structure to advertise.
+
 ## [2.5.1] - 2026-08-30
 
 **Fixed**
