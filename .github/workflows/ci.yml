@@ -50,6 +50,17 @@ jobs:
       # criterion and the other bench-only dev-deps into the lint gate.
       # Benches are exercised on demand via `cargo bench`, not in CI.
       - run: cargo clippy --locked --workspace --lib --tests -- -D warnings -A clippy::doc_lazy_continuation
+      # The lint above builds the DEFAULT feature set, so a test body behind
+      # `#[cfg(feature = "vector-index")]` is never even type-checked here.
+      # A stale call inside one sat broken on main across several commits:
+      # the only job that compiles it is `test (vector-index + text-index)`,
+      # which takes minutes to get there and reports it as a build failure
+      # among test output. Type-check that configuration cheaply and early.
+      - name: clippy (vector-index + text-index)
+        run: |
+          cargo clippy --locked -p namidb-storage -p namidb-query -p namidb-server \
+            --lib --tests --features vector-index,text-index \
+            -- -D warnings -A clippy::doc_lazy_continuation
 
   test:
     name: test (${{ matrix.os }})
