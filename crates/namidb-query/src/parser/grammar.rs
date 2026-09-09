@@ -3304,11 +3304,9 @@ mod tests {
         // The Neo4j 5 spelling maps onto the identical clause its native
         // twin produces — field by field (spans aside).
         let native = ok("CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16");
-        let neo = ok(
-            "CREATE VECTOR INDEX doc_emb FOR (d:Doc) ON d.emb \
+        let neo = ok("CREATE VECTOR INDEX doc_emb FOR (d:Doc) ON d.emb \
              OPTIONS {indexConfig: {`vector.dimensions`: 16, \
-             `vector.similarity_function`: 'cosine'}}",
-        );
+             `vector.similarity_function`: 'cosine'}}");
         let (n, m) = match (&native.head.clauses[0], &neo.head.clauses[0]) {
             (Clause::CreateVectorIndex(n), Clause::CreateVectorIndex(m)) => (n, m),
             other => panic!("expected two CreateVectorIndex clauses, got {other:?}"),
@@ -3373,7 +3371,11 @@ mod tests {
             let errs = parse(src).expect_err("incomplete vector DDL must not parse");
             assert_eq!(errs[0].code, ErrorCode::UnexpectedToken, "{src}");
             assert!(
-                errs[0].help.as_deref().unwrap_or("").contains("vector.dimensions"),
+                errs[0]
+                    .help
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("vector.dimensions"),
                 "help must list the required options, got: {:?}",
                 errs[0].help
             );
@@ -3404,10 +3406,8 @@ mod tests {
     fn create_fulltext_index_neo4j_form_roundtrips_via_display() {
         // Display renders the canonical native spelling; re-parsing it must
         // yield the same two-property clause the ON EACH list produced.
-        let neo = ok(
-            "CREATE FULLTEXT INDEX body_ix IF NOT EXISTS \
-             FOR (d:Doc) ON EACH [d.title, d.body]",
-        );
+        let neo = ok("CREATE FULLTEXT INDEX body_ix IF NOT EXISTS \
+             FOR (d:Doc) ON EACH [d.title, d.body]");
         let c = match &neo.head.clauses[0] {
             Clause::CreateFulltextIndex(c) => c,
             other => panic!("expected CreateFulltextIndex, got {other:?}"),

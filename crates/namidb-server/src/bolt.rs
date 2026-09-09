@@ -975,7 +975,23 @@ impl ServerBackend {
             // Read path: borrow a short-lived `Snapshot` from the owned
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
-            let _scan_permit = crate::acquire_scan_permit(&plan).await;
+            let admission = tokio::select! {
+                admission = crate::acquire_read_admission(&plan) => admission,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
+            let Some(_admission) = admission else {
+                return RunObservation {
+                    kind: Some(QueryKind::Read),
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Storage(
+                        "too many concurrent queries; the read admission queue is full — \
+                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                            .into(),
+                    )),
+                };
+            };
             let snap = owned.borrow();
             let read = execute_with_limits(
                 &plan,
@@ -1207,7 +1223,23 @@ impl ServerBackend {
                     };
                 }
             };
-            let _scan_permit = crate::acquire_scan_permit(&plan).await;
+            let admission = tokio::select! {
+                admission = crate::acquire_read_admission(&plan) => admission,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
+            let Some(_admission) = admission else {
+                return RunObservation {
+                    kind: Some(QueryKind::Read),
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Storage(
+                        "too many concurrent queries; the read admission queue is full — \
+                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                            .into(),
+                    )),
+                };
+            };
             let snap = tx.writer.overlay_snapshot();
             let read = execute_with_limits(
                 &plan,

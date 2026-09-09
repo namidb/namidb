@@ -2415,12 +2415,12 @@ mod tests {
             &PinnedObjectGeneration::ETag("etag-at-head".into())
         );
         let error = source.read_range(0..16).await.unwrap_err();
+        // With the shared range cache enabled (on by default), the store's
+        // Precondition error surfaces wrapped in the fetch pipeline's
+        // Generic error — assert the CAUSE, not the outermost variant.
         assert!(
-            matches!(
-                error,
-                crate::error::Error::ObjectStore(object_store::Error::Precondition { .. })
-            ),
-            "expected a Precondition failure, got {error:?}"
+            format!("{error:?}").contains("precondition"),
+            "expected a Precondition failure in the chain, got {error:?}"
         );
         let seen = spy.seen_if_match.lock().unwrap().clone();
         assert_eq!(seen, vec![Some("etag-at-head".to_string())]);

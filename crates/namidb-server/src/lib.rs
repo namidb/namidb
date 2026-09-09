@@ -1868,6 +1868,90 @@ pub(crate) fn plan_contains_node_scan(plan: &namidb_query::LogicalPlan) -> bool 
         || plan.children().into_iter().any(plan_contains_node_scan)
 }
 
+/// Process-wide bound on CONCURRENT READ EXECUTION (fourth field report,
+/// item 64): nine parallel large aggregations exhausted a container that
+/// handled them fine serialized, and nothing bounded them — the memory
+/// governor defaults off, the scan gate meters only plans containing a
+/// `NodeScan` (lookup+expand aggregations pass free), and the row cap
+/// bounds rows, not concurrency. Every read acquires a permit here (the
+/// scan gate stays nested inside for its own O(label) reasons); waiting
+/// longer than the bounded window returns the retryable 503 so clients
+/// get server-side admission instead of each implementing a queue.
+///
+/// `NAMIDB_MAX_CONCURRENT_QUERIES` overrides the default of
+/// `max(4, available cores)`; `0` disables the gate.
+fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Option<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let default = std::thread::available_parallelism()
+            .map(|n| n.get().max(4))
+            .unwrap_or(4);
+        let permits = std::env::var("NAMIDB_MAX_CONCURRENT_QUERIES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(default);
+        (permits > 0).then(|| tokio::sync::Semaphore::new(permits))
+    })
+    .as_ref()
+}
+
+/// How long a read may queue for admission before the retryable 503
+/// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000). Bounded chiefly for
+/// Bolt, which has no outer request-timeout layer.
+fn read_admission_wait() -> Duration {
+    Duration::from_millis(
+        std::env::var("NAMIDB_QUERY_ADMISSION_WAIT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(5_000),
+    )
+}
+
+/// Guards a read holds for its whole execution: the admission permit and,
+/// when the plan scans, the nested scan permit.
+#[doc(hidden)]
+pub struct ReadAdmission {
+    _admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    _scan: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+/// Admit one read: bounded wait on the concurrency gate, then the scan
+/// gate when the plan needs it. `None` = the admission window elapsed —
+/// the caller returns the retryable too-many-queries rejection.
+#[doc(hidden)]
+pub async fn acquire_read_admission(plan: &namidb_query::LogicalPlan) -> Option<ReadAdmission> {
+    let admission = match read_admission_gate() {
+        None => None,
+        Some(gate) => match tokio::time::timeout(read_admission_wait(), gate.acquire()).await {
+            Ok(permit) => Some(permit.expect("read admission gate is never closed")),
+            Err(_) => return None,
+        },
+    };
+    let scan = acquire_scan_permit(plan).await;
+    Some(ReadAdmission {
+        _admission: admission,
+        _scan: scan,
+    })
+}
+
+/// Retryable 503 for a read that could not be admitted within the window.
+pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> ObservedQuery {
+    ObservedQuery {
+        kind: Some(QueryKind::Read),
+        ok: false,
+        elapsed: started.elapsed(),
+        response: (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "too many concurrent queries; the read admission queue is full — retry \
+                        (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                    .into(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// Acquire a scan permit when the plan needs one. Holding the returned
 /// guard for the duration of execution is the whole contract.
 pub(crate) async fn acquire_scan_permit(
@@ -3669,7 +3753,9 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let _scan_permit = acquire_scan_permit(&plan).await;
+        let Some(_admission) = acquire_read_admission(&plan).await else {
+            return admission_exhausted_observation(started);
+        };
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,
@@ -4769,7 +4855,9 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let _scan_permit = acquire_scan_permit(&plan).await;
+        let Some(_admission) = acquire_read_admission(&plan).await else {
+            return admission_exhausted_observation(started);
+        };
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,

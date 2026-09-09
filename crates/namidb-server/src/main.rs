@@ -563,7 +563,10 @@ mod tests {
         // An explicit flag overrides, and `0s` still means unbounded.
         let cli = parse(&["--write-timeout", "5m"]);
         assert_eq!(cli.write_timeout, Duration::from_secs(300));
-        assert_eq!(parse(&["--write-timeout", "0s"]).write_timeout, Duration::ZERO);
+        assert_eq!(
+            parse(&["--write-timeout", "0s"]).write_timeout,
+            Duration::ZERO
+        );
         // The env-var form overrides the default too.
         std::env::set_var("NAMIDB_WRITE_TIMEOUT", "2m");
         assert_eq!(parse(&[]).write_timeout, Duration::from_secs(120));

@@ -27,6 +27,19 @@ crates.io release will establish and document that API explicitly.
   memtable data. The CLI also gained `SHOW CONSTRAINTS` / `SHOW INDEXES`
   interception (previously errored).
 
+**Added**
+- Server-side read admission (fourth field report, item 64): every read
+  acquires a process-wide concurrency permit
+  (`NAMIDB_MAX_CONCURRENT_QUERIES`, default `max(4, cores)`, `0`
+  disables) with a bounded queue wait
+  (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000) before executing;
+  waiting past the window returns a retryable 503 (Bolt: transient
+  error) naming the knob — nine parallel large aggregations used to
+  exhaust a container that handled them serialized, with nothing
+  bounding them. The scan gate stays nested inside; writes are
+  unaffected (they serialize on the writer); Bolt admission waits are
+  raced against client disconnect.
+
 **Fixed**
 - `file://` stores on macOS bind mounts (Docker Desktop's gRPC-FUSE) no
   longer fail reads with `Request precondition failure`. The local
