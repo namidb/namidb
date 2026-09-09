@@ -6985,7 +6985,7 @@ fn aggregate_over(
                 let mut count: i64 = 0;
                 let mut seen = BTreeSet::new();
                 for row in rows {
-                    let v = evaluate(e, row, params)?;
+                    let v = evaluate_agg_arg(e, row, params)?;
                     if v.is_null() {
                         continue;
                     }
@@ -7135,6 +7135,26 @@ fn percentile_fraction(rows: &[Row], e: &Expression, params: &Params) -> Result<
     Ok(p)
 }
 
+/// Evaluate an aggregate argument, BORROWING the row's binding when the
+/// expression is a bare variable. `count(DISTINCT p)` used to deep-clone
+/// the whole `NodeValue` — property map, embedding vectors and all — once
+/// per input row just to fingerprint 16 bytes of identity (fifth field
+/// report follow-up; ~1GB of transient allocation on a 160k-row
+/// aggregation over vector-bearing nodes). The fallback preserves
+/// `evaluate`'s exact semantics for every other shape.
+fn evaluate_agg_arg<'r>(
+    arg: &Expression,
+    row: &'r Row,
+    params: &Params,
+) -> Result<std::borrow::Cow<'r, RuntimeValue>, ExecError> {
+    if let ExpressionKind::Variable(id) = &arg.kind {
+        if let Some(value) = row.get(&id.name) {
+            return Ok(std::borrow::Cow::Borrowed(value));
+        }
+    }
+    Ok(std::borrow::Cow::Owned(evaluate(arg, row, params)?))
+}
+
 fn collect_non_null(
     rows: &[Row],
     arg: &Expression,
@@ -7144,7 +7164,7 @@ fn collect_non_null(
     let mut out = Vec::with_capacity(rows.len());
     let mut seen = BTreeSet::new();
     for row in rows {
-        let v = evaluate(arg, row, params)?;
+        let v = evaluate_agg_arg(arg, row, params)?;
         if v.is_null() {
             continue;
         }
@@ -7154,7 +7174,9 @@ fn collect_non_null(
                 continue;
             }
         }
-        out.push(v);
+        // Only kept values pay the clone; distinct-dropped duplicates never
+        // materialise an owned copy.
+        out.push(v.into_owned());
     }
     Ok(out)
 }
@@ -9996,6 +10018,37 @@ mod tests {
             ],
             "numeric equality stays residual because Cypher equates integer and float"
         );
+    }
+
+    #[test]
+    /// Nodes and rels fingerprint by IDENTITY, never by deep value: the
+    /// same node id with different property maps (one carrying a large
+    /// vector) is ONE distinct entity — `count(DISTINCT p)` must not
+    /// clone or compare property maps (fifth field report follow-up).
+    fn identity_fingerprint_ignores_properties() {
+        let id = namidb_core::id::NodeId::new();
+        let slim = RuntimeValue::Node(Box::new(NodeValue {
+            id,
+            labels: std::collections::BTreeSet::from(["A".to_string()]),
+            properties: BTreeMap::new(),
+        }));
+        let mut fat_props = BTreeMap::new();
+        fat_props.insert(
+            "embedding".to_string(),
+            RuntimeValue::Vector(vec![0.5; 768]),
+        );
+        let fat = RuntimeValue::Node(Box::new(NodeValue {
+            id,
+            labels: std::collections::BTreeSet::from(["A".to_string()]),
+            properties: fat_props,
+        }));
+        assert_eq!(fingerprint_value(&slim), fingerprint_value(&fat));
+        let other = RuntimeValue::Node(Box::new(NodeValue {
+            id: namidb_core::id::NodeId::new(),
+            labels: std::collections::BTreeSet::new(),
+            properties: BTreeMap::new(),
+        }));
+        assert_ne!(fingerprint_value(&slim), fingerprint_value(&other));
     }
 
     #[test]

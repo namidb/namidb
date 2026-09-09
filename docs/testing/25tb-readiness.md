@@ -1003,3 +1003,44 @@ shipped in 2.6.0: single-property unique constraints appear as their
 backing RANGE index (constraint-named; one sidecar one row); composite
 unique constraints deliberately absent (tuple-scan enforced, no backing
 structure).
+
+## Fifth field report (2026-09-09) — "¿está solucionado en esta versión?"
+
+### 68. [VERIFIED FIXED in 2.6.0 + two residuals shipped in 2.6.1] count(DISTINCT) deaths and per-edge grouping cost
+
+Reported (measured pre-2.6.0): `RETURN p.forma, sum(v.venta_neta)` 0.0s
+vs `+ count(DISTINCT p)` 230s+death vs `+ count(DISTINCT p.cod_item)`
+117s+death over ~160k rows; and `(o:OFERTA|PROMOCION)-[:VIGENTE_EN]->
+(f:FECHA) RETURN f.fecha, count(o)` at ~1.15ms/edge (156s, death), with
+the per-date anchored form WORSE (20s each).
+
+Live repro on published 2.6.0 (4GB container, 160k rows / 40k distinct /
+768-float embeddings on 10k nodes, memtable AND SST tiers): NO
+differential and no deaths — baseline 5.8s, scalar-DISTINCT 6.4s,
+node-DISTINCT 7.6s; the f.fecha grouping 1.0s (~9µs/edge); anchored
+per-date 1.2s. Recon verdicts:
+- count(DISTINCT) was NEVER quadratic (BTreeSet over serialized
+  fingerprints since the first OSS release) and node dedup was ALWAYS by
+  identity (id-only fingerprint), so the reported differential cannot
+  come from the aggregate on any release. The 230s/117s match the
+  pre-#168 per-row lookup arithmetic (~1.4ms x 160k) exactly; the
+  process kill was the pre-#169 unbounded/unattributed memory-pressure
+  path. The claimed 0.0s baseline is not explainable by any release's
+  code (identical input materialization with or without DISTINCT) —
+  warm-cache measurement, almost certainly.
+- The 156s/1ms-per-edge grouping was the Topology-without-CSR
+  property-hydrating fallback + per-tail overheads, removed by #168's
+  edge_lookup_topology; target-node materialization was ALWAYS batched
+  per distinct target (prewarm dates to v0.10.0).
+
+Residuals found by the recon and shipped in 2.6.1:
+- Label-disjunction sources defeated anchor_inversion (the o:A|B scan
+  hides behind an OR filter) — every per-date query re-scanned the
+  namespace; now inverted with the OR filter re-attached above the
+  anchor (sum-of-disjuncts stats gate).
+- count(DISTINCT p) deep-cloned the full node (embeddings included) per
+  row to fingerprint 16 bytes; bare-variable aggregate args now borrow.
+- Recorded, deferred: an identity-only RequiredProps tier so bare-node
+  aggregate refs stop forcing All-columns projection (the remaining
+  memory exposure on vector-bearing nodes); the row cap counts rows,
+  not bytes (noted under item 64).

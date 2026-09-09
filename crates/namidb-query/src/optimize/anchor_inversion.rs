@@ -309,19 +309,48 @@ fn try_invert(
         RelationshipDirection::Both => RelationshipDirection::Both,
     };
     // Source side must be a completely unselective scan; anything filtered
-    // would need a real cost comparison to pick a side.
-    let LogicalPlan::NodeScan {
-        label: source_label,
-        alias: source_alias,
-        predicates,
-        projection,
-    } = expand_input.as_ref()
-    else {
-        return None;
-    };
-    if !predicates.is_empty() || projection.is_some() {
-        return None;
-    }
+    // would need a real cost comparison to pick a side. One exception sees
+    // through the veil: a label DISJUNCTION source `(o:A|B)` lowers to an
+    // unlabeled scan behind a pure `__label_eq OR __label_eq` filter — its
+    // selectivity is exactly as knowable as a labeled scan's (the sum of
+    // the disjunct labels), and without this arm every anchored query over
+    // a disjunction source re-scans the whole namespace per anchor value
+    // (fifth field report: 20s per date, worse than the unanchored form).
+    // (alias, single label, label-disjunction filter + its labels).
+    type SourceShape<'p> = (
+        &'p String,
+        Option<String>,
+        Option<(crate::parser::Expression, Vec<String>)>,
+    );
+    let (source_alias, source_label, source_disjunction): SourceShape<'_> =
+        match expand_input.as_ref() {
+            LogicalPlan::NodeScan {
+                label,
+                alias,
+                predicates,
+                projection,
+            } if predicates.is_empty() && projection.is_none() => (alias, label.clone(), None),
+            LogicalPlan::Filter {
+                predicate: label_pred,
+                input: scan,
+            } => {
+                let LogicalPlan::NodeScan {
+                    label: None,
+                    alias,
+                    predicates,
+                    projection,
+                } = scan.as_ref()
+                else {
+                    return None;
+                };
+                if !predicates.is_empty() || projection.is_some() {
+                    return None;
+                }
+                let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;
+                (alias, None, Some((label_pred.clone(), labels)))
+            }
+            _ => return None,
+        };
     debug_assert_eq!(source, source_alias);
     // The equality must pin the expand TARGET under its declared label. A
     // multi-label (conjunctive) target keeps the scan-side plan: the lookup
@@ -341,12 +370,20 @@ fn try_invert(
     }
     if indexed.multi {
         // A posting-list anchor fans out; only take it when the target label
-        // is provably no larger than the label we would otherwise scan.
+        // is provably no larger than the label(s) we would otherwise scan —
+        // a disjunction source counts as the SUM of its disjunct labels.
         let target_count = catalog.label(target_label).map(|stats| stats.node_count);
-        let source_count = source_label
-            .as_deref()
-            .and_then(|label| catalog.label(label))
-            .map(|stats| stats.node_count);
+        let source_count = match &source_disjunction {
+            Some((_, labels)) => labels.iter().try_fold(0u64, |total, label| {
+                catalog
+                    .label(label)
+                    .map(|stats| total.saturating_add(stats.node_count))
+            }),
+            None => source_label
+                .as_deref()
+                .and_then(|label| catalog.label(label))
+                .map(|stats| stats.node_count),
+        };
         match (target_count, source_count) {
             (Some(target), Some(source)) if target <= source => {}
             _ => return None,
@@ -368,20 +405,33 @@ fn try_invert(
         direction: inverted_direction,
         rel_alias: rel_alias.clone(),
         target_alias: source_alias.clone(),
-        target_labels: source_label.iter().cloned().collect(),
+        // A disjunction cannot ride the conjunctive target_labels field; its
+        // OR-filter re-attaches below and now runs over the anchor's small
+        // neighbourhood instead of the whole namespace.
+        target_labels: match &source_disjunction {
+            Some(_) => Vec::new(),
+            None => source_label.iter().cloned().collect(),
+        },
         length: None,
         optional: false,
         back_reference: false,
         shortest: crate::plan::ShortestMode::None,
         path_binding: None,
     };
-    Some(match indexed.residual {
-        Some(residual) => LogicalPlan::Filter {
+    let mut result = match source_disjunction {
+        Some((label_pred, _)) => LogicalPlan::Filter {
             input: Box::new(inverted),
-            predicate: residual,
+            predicate: label_pred,
         },
         None => inverted,
-    })
+    };
+    if let Some(residual) = indexed.residual {
+        result = LogicalPlan::Filter {
+            input: Box::new(result),
+            predicate: residual,
+        };
+    }
+    Some(result)
 }
 
 #[cfg(test)]
@@ -553,6 +603,120 @@ mod tests {
         assert!(
             find_inverted(&plan).is_none(),
             "a filtered source keeps the lowered anchor"
+        );
+    }
+
+    /// Fifth field report: a label-DISJUNCTION source `(o:A|B)` hides its
+    /// scan behind an OR-filter, which used to defeat the inversion — every
+    /// anchored per-date query re-scanned the whole namespace. The pass now
+    /// sees through a PURE label disjunction (and only that).
+    #[test]
+    fn disjunction_source_inverts_with_label_filter_reattached() {
+        let mut cat = StatsCatalog::empty();
+        let mut fecha_props = BTreeMap::new();
+        fecha_props.insert(
+            "fecha".to_string(),
+            PropStats {
+                unique: true,
+                ..Default::default()
+            },
+        );
+        cat.__test_insert_label(LabelStats {
+            name: "FECHA".into(),
+            node_count: 271,
+            properties: fecha_props,
+        });
+        cat.__test_insert_label(LabelStats {
+            name: "OFERTA".into(),
+            node_count: 400,
+            properties: BTreeMap::new(),
+        });
+        cat.__test_insert_label(LabelStats {
+            name: "PROMOCION".into(),
+            node_count: 100,
+            properties: BTreeMap::new(),
+        });
+
+        let plan = rewrite_query(
+            "MATCH (o:OFERTA|PROMOCION)-[:VIGENTE_EN]->(f:FECHA {fecha: 'x'}) RETURN count(o)",
+            &cat,
+        );
+        // The anchor fired: a NodeByPropertyValue on f feeds an inverted
+        // expand whose target is o with NO conjunctive labels...
+        fn find(plan: &LogicalPlan) -> Option<(String, String, usize)> {
+            if let LogicalPlan::Expand {
+                input,
+                source,
+                target_alias,
+                target_labels,
+                ..
+            } = plan
+            {
+                if let LogicalPlan::NodeByPropertyValue { alias, .. } = input.as_ref() {
+                    if alias == source {
+                        return Some((source.clone(), target_alias.clone(), target_labels.len()));
+                    }
+                }
+            }
+            plan.children().into_iter().find_map(find)
+        }
+        let (source, target, labels) = find(&plan).expect("disjunction source must invert");
+        assert_eq!(source, "f");
+        assert_eq!(target, "o");
+        assert_eq!(
+            labels, 0,
+            "the disjunction cannot ride conjunctive target_labels"
+        );
+        // ...and the OR label filter survives ABOVE the inverted expand.
+        fn has_label_or_filter(plan: &LogicalPlan) -> bool {
+            if let LogicalPlan::Filter { predicate, .. } = plan {
+                if crate::optimize::extract_label_disjunction(predicate, "o")
+                    .is_some_and(|labels| labels == ["OFERTA", "PROMOCION"])
+                {
+                    return true;
+                }
+            }
+            plan.children().into_iter().any(has_label_or_filter)
+        }
+        assert!(has_label_or_filter(&plan), "{plan:?}");
+    }
+
+    /// A non-label filter over the source is NOT a disjunction veil: the
+    /// pass must keep refusing filtered sources it cannot cost.
+    #[test]
+    fn arbitrary_source_filter_still_blocks_inversion() {
+        let cat = catalog(true, false, 6, 60);
+        let plan = rewrite_query(
+            "MATCH (p:Person)-[:WORKS_AT]->(c:Company {cid: 'x'}) \
+             WHERE p.name = 'ana' RETURN count(p)",
+            &cat,
+        );
+        // Pushdown has not run inside this pass; the WHERE sits as a Filter
+        // over the scan only if lowering placed it there. Either way the
+        // assertion is: no inverted expand whose input is the cid anchor
+        // AND whose source filter was a non-label predicate got consumed.
+        fn anchor_count(plan: &LogicalPlan) -> usize {
+            let here = usize::from(matches!(
+                plan,
+                LogicalPlan::NodeByPropertyValue { alias, .. } if alias == "c"
+            ));
+            here + plan.children().into_iter().map(anchor_count).sum::<usize>()
+        }
+        // The plain shape (no source filter) in `catalog` tests already
+        // inverts; here we only require the pass didn't DROP the name
+        // predicate if it fired through some path.
+        fn has_name_filter(plan: &LogicalPlan) -> bool {
+            if let LogicalPlan::Filter { predicate, .. } = plan {
+                if format!("{predicate:?}").contains("name") {
+                    return true;
+                }
+            }
+            plan.children().into_iter().any(has_name_filter)
+        }
+        assert!(anchor_count(&plan) <= 1);
+        assert!(
+            has_name_filter(&plan),
+            "the name predicate must survive: {plan:?}"
         );
     }
 }

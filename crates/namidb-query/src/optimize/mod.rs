@@ -519,6 +519,54 @@ pub(crate) fn is_synthetic_label_eq(predicate: &Expression, alias: &str, label: 
     false
 }
 
+/// The label a synthetic `__label_eq(alias, "Label")` leaf pins, when
+/// `predicate` is exactly that call over `alias`.
+pub(crate) fn synthetic_label_eq_label(predicate: &Expression, alias: &str) -> Option<String> {
+    if let ExpressionKind::FunctionCall { name, args, .. } = &predicate.kind {
+        let name_matches = name
+            .segments
+            .first()
+            .map(|s| s.name.eq_ignore_ascii_case("__label_eq"))
+            .unwrap_or(false);
+        if !name_matches || args.len() != 2 {
+            return None;
+        }
+        if !matches!(
+            &args[0].kind,
+            ExpressionKind::Variable(id) if id.name == alias
+        ) {
+            return None;
+        }
+        if let ExpressionKind::Literal(crate::parser::ast::Literal::String(label)) = &args[1].kind {
+            return Some(label.clone());
+        }
+    }
+    None
+}
+
+/// The label set of a pure label DISJUNCTION over `alias` — every `OR`
+/// leaf is a synthetic `__label_eq(alias, ...)`, the shape lowering emits
+/// for `(n:A|B)` sources. `None` for anything else (a single leaf counts:
+/// one label). Anchor inversion uses this to see through the filter a
+/// disjunction source hides its scan behind.
+pub(crate) fn extract_label_disjunction(
+    predicate: &Expression,
+    alias: &str,
+) -> Option<Vec<String>> {
+    match &predicate.kind {
+        ExpressionKind::Binary {
+            op: crate::parser::ast::BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let mut labels = extract_label_disjunction(left, alias)?;
+            labels.extend(extract_label_disjunction(right, alias)?);
+            Some(labels)
+        }
+        _ => synthetic_label_eq_label(predicate, alias).map(|label| vec![label]),
+    }
+}
+
 /// True iff `predicate` is a cross-side equality `lhs = rhs` where one
 /// side's aliases are entirely on the left subtree and the other side's
 /// entirely on the right. Used by EXPLAIN to flag join candidates after
