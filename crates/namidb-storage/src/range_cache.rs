@@ -1556,10 +1556,22 @@ impl PinnedObjectRangeSource {
     /// Open a NamiDB create-only UUID object, preferring a backend generation
     /// token and falling back to the explicit immutable-path invariant only
     /// when metadata exposes neither version nor ETag.
+    ///
+    /// A store registered through [`mark_store_paths_immutable`] asserts the
+    /// path-level invariant for every object it holds, so the backend token
+    /// adds no safety there — and a stat-derived local ETag actively fails
+    /// healthy reads on FUSE-backed bind mounts, whose synthetic inode churns
+    /// under an unmodified file. Marked stores therefore open with
+    /// [`Self::from_immutable_meta`] semantics (shared cache on, no remote
+    /// precondition) unless `NAMIDB_LOCAL_ETAG_PIN=1|true` restores the
+    /// generation pin.
     pub async fn from_create_only_meta(
         store: Arc<dyn ObjectStore>,
         meta: ObjectMeta,
     ) -> crate::error::Result<Self> {
+        if store_paths_marked_immutable(&store) && !local_etag_pin_forced() {
+            return Self::from_immutable_meta(store, meta).await;
+        }
         match PinnedObjectGeneration::from_meta(&meta) {
             Ok(generation) => {
                 let range_cache = resolved_shared_range_cache(&meta).await?;
@@ -1837,6 +1849,54 @@ fn store_instance_token(store: &Arc<dyn ObjectStore>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     map.insert(pointer, (id, Arc::downgrade(store)));
     id
+}
+
+/// Store instances (by [`store_instance_token`]) whose object paths are all
+/// create-only. Tokens are process-unique and never reused, so an entry that
+/// outlives its store can never match a later instance; the set grows by one
+/// `u64` per marked store and needs no reclamation.
+static IMMUTABLE_PATH_STORE_TOKENS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<u64>>,
+> = std::sync::OnceLock::new();
+
+/// Declare that every object path in `store` is create-only: written once
+/// under a fresh name (tmp + atomic rename, PUT-if-absent) and never modified
+/// in place. [`PinnedObjectRangeSource::from_create_only_meta`] then pins
+/// reads on the immutable path instead of the backend generation token. That
+/// keeps reads working where the token is a stat: `LocalFileSystem` ETags are
+/// `{inode:x}-{mtime:x}-{size:x}`, and FUSE-backed bind mounts (macOS Docker
+/// Desktop gRPC-FUSE) churn the synthetic inode under an unmodified file, so
+/// an `If-Match` pin fails healthy reads. The shared range cache stays on for
+/// marked stores — its keys are already scoped per store instance.
+pub fn mark_store_paths_immutable(store: &Arc<dyn ObjectStore>) {
+    let token = store_instance_token(store);
+    IMMUTABLE_PATH_STORE_TOKENS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(token);
+}
+
+fn store_paths_marked_immutable(store: &Arc<dyn ObjectStore>) -> bool {
+    let Some(tokens) = IMMUTABLE_PATH_STORE_TOKENS.get() else {
+        return false;
+    };
+    let token = store_instance_token(store);
+    tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&token)
+}
+
+/// `NAMIDB_LOCAL_ETAG_PIN=1|true` makes marked stores keep pinning the
+/// backend generation token (`If-Match` on the stat-derived local ETag), the
+/// behavior before stores could be marked create-only. Escape hatch only;
+/// sampled at every source open so no restart is needed to flip it.
+fn local_etag_pin_forced() -> bool {
+    std::env::var("NAMIDB_LOCAL_ETAG_PIN").is_ok_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 static SHARED_RANGE_CACHE: tokio::sync::OnceCell<Option<ImmutableRangeCache>> =
@@ -2218,6 +2278,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.read_range(0..16).await.unwrap(), second);
+    }
+
+    /// Simulates a FUSE-backed local filesystem whose stat-derived ETag has
+    /// churned between HEAD and GET for an unmodified file: `head` reports
+    /// one tag, data reads enforce another and reject any other `If-Match`
+    /// with `Precondition`, exactly as `LocalFileSystem` does. Every data
+    /// read's `If-Match` option is recorded.
+    #[derive(Debug)]
+    struct ChurnedEtagStore {
+        inner: Arc<dyn ObjectStore>,
+        head_etag: &'static str,
+        current_etag: &'static str,
+        seen_if_match: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ChurnedEtagStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                head_etag: "etag-at-head",
+                current_etag: "etag-after-fuse-churn",
+                seen_if_match: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl fmt::Display for ChurnedEtagStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ChurnedEtagStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ChurnedEtagStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                let mut result = self.inner.get_opts(location, options).await?;
+                result.meta.e_tag = Some(self.head_etag.to_string());
+                return Ok(result);
+            }
+            self.seen_if_match
+                .lock()
+                .unwrap()
+                .push(options.if_match.clone());
+            if let Some(condition) = options.if_match.as_deref() {
+                if condition != self.current_etag {
+                    return Err(object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: format!("{} does not match {condition}", self.current_etag).into(),
+                    });
+                }
+            }
+            // The inner InMemory etag matches neither synthetic tag; strip
+            // the condition so it serves the (unchanged) bytes.
+            let mut passthrough = options;
+            passthrough.if_match = None;
+            let mut result = self.inner.get_opts(location, passthrough).await?;
+            result.meta.e_tag = Some(self.current_etag.to_string());
+            Ok(result)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// Baseline contract for an UNMARKED store: the ETag from HEAD is pinned
+    /// and a data read whose stat-derived ETag has since churned fails with
+    /// `Precondition` — the failure mode marked stores exist to avoid.
+    #[tokio::test]
+    async fn unmarked_store_etag_pin_fails_when_the_stat_etag_churns() {
+        let spy = ChurnedEtagStore::new();
+        let store: Arc<dyn ObjectStore> = spy.clone();
+        let location = ObjectPath::from(format!("immutable/{}/unmarked", uuid::Uuid::now_v7()));
+        let body = Bytes::from_static(b"0123456789abcdef");
+        store
+            .put(&location, PutPayload::from_bytes(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        assert_eq!(meta.e_tag.as_deref(), Some("etag-at-head"));
+
+        let source = PinnedObjectRangeSource::from_create_only_meta(store, meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.generation(),
+            &PinnedObjectGeneration::ETag("etag-at-head".into())
+        );
+        let error = source.read_range(0..16).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::error::Error::ObjectStore(object_store::Error::Precondition { .. })
+            ),
+            "expected a Precondition failure, got {error:?}"
+        );
+        let seen = spy.seen_if_match.lock().unwrap().clone();
+        assert_eq!(seen, vec![Some("etag-at-head".to_string())]);
+    }
+
+    /// The same churned store, registered create-only: the pin degrades to
+    /// the immutable path, no `If-Match` reaches the store, and the read
+    /// succeeds despite the churned ETag.
+    #[tokio::test]
+    async fn marked_store_reads_without_if_match_despite_churned_etag() {
+        let spy = ChurnedEtagStore::new();
+        let store: Arc<dyn ObjectStore> = spy.clone();
+        mark_store_paths_immutable(&store);
+        let location = ObjectPath::from(format!("immutable/{}/marked", uuid::Uuid::now_v7()));
+        let body = Bytes::from_static(b"0123456789abcdef");
+        store
+            .put(&location, PutPayload::from_bytes(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        assert_eq!(meta.e_tag.as_deref(), Some("etag-at-head"));
+
+        let source = PinnedObjectRangeSource::from_create_only_meta(store, meta)
+            .await
+            .unwrap();
+        assert_eq!(source.generation(), &PinnedObjectGeneration::ImmutablePath);
+        assert_eq!(source.read_range(0..16).await.unwrap(), body);
+        let seen = spy.seen_if_match.lock().unwrap().clone();
+        assert_eq!(seen, vec![None::<String>]);
     }
 
     #[tokio::test]

@@ -435,6 +435,15 @@ docker run --rm -p 8080:8080 -v namidb-data:/var/lib/namidb \
   namidb/namidb-server:2 --store "file:///var/lib/namidb?ns=prod"
 ```
 
+FUSE-backed bind mounts (macOS Docker Desktop's gRPC-FUSE, some network
+filesystems) are tolerated for `file://` stores: local objects are written
+exactly once under fresh UUID names, so reads pin the immutable path rather
+than sending `If-Match` on the stat-derived ETag — whose synthetic inode
+field such filesystems churn even for unmodified files, which used to fail
+reads with `Request precondition failure`. Set `NAMIDB_LOCAL_ETAG_PIN=1` to
+restore the ETag pin (e.g. if something other than NamiDB rewrites files
+under the store directory in place).
+
 For a full self-hosted stack (server + MinIO as the bucket) see [`docker-compose.yml`](docker-compose.yml). Or run it from source:
 
 ```bash

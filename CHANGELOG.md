@@ -28,6 +28,15 @@ crates.io release will establish and document that API explicitly.
   interception (previously errored).
 
 **Fixed**
+- `file://` stores on macOS bind mounts (Docker Desktop's gRPC-FUSE) no
+  longer fail reads with `Request precondition failure`. The local
+  backend's ETag is stat-derived (`{inode:x}-{mtime:x}-{size:x}`) and
+  gRPC-FUSE churns the synthetic inode even for unmodified files, so the
+  `If-Match` pin on every SST range read rejected healthy data. Local
+  objects are create-only (written once under a fresh UUID name, never
+  modified), so `file://` reads now pin the immutable path instead of the
+  ETag — the shared range cache stays on, keyed per store instance.
+  `NAMIDB_LOCAL_ETAG_PIN=1` restores the previous ETag pin.
 - A dying server could exit 0 in near silence (fourth field report,
   item 61). Shutdown is now attributed: the signal handler logs
   SIGINT/SIGTERM at WARN with resident/max memory bytes and the
