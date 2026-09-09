@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-09-09
+
 **Added**
 - Schema introspection now works on every surface: `CALL db.labels()`,
   `CALL db.relationshipTypes()`, `CALL db.propertyKeys()`, and
@@ -3068,7 +3070,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.5.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/namidb/namidb/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/namidb/namidb/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/namidb/namidb/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/namidb/namidb/compare/v2.4.0...v2.4.1
