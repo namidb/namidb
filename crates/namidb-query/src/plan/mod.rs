@@ -18,5 +18,7 @@ pub use explain::{
     explain_query_tree, explain_query_tree_verbose, explain_query_verbose, explain_tree,
     explain_tree_verbose, explain_verbose, ExplainNode, RuntimeStats,
 };
-pub use logical::{AggregateExpr, LogicalPlan, OrderKey, ProjectionItem, RowCount, ShortestMode};
+pub use logical::{
+    output_columns, AggregateExpr, LogicalPlan, OrderKey, ProjectionItem, RowCount, ShortestMode,
+};
 pub use lower::{lower, LowerError, LowerErrorKind};

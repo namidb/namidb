@@ -46,9 +46,51 @@ pub use plan::{
     collect_route_notes, explain, explain_plan_lines, explain_query, explain_query_raw,
     explain_query_raw_tree, explain_query_raw_tree_verbose, explain_query_raw_verbose,
     explain_query_tree, explain_query_tree_verbose, explain_query_verbose, explain_tree,
-    explain_tree_verbose, explain_verbose, lower, AggregateExpr, ExplainNode, LogicalPlan,
-    LowerError, LowerErrorKind, RuntimeStats,
+    explain_tree_verbose, explain_verbose, lower, output_columns, AggregateExpr, ExplainNode,
+    LogicalPlan, LowerError, LowerErrorKind, RuntimeStats,
 };
+
+/// The result column list for a finished statement, in `RETURN` order.
+///
+/// Rows are `BTreeMap`s, so the column list read off a row is sorted by name:
+/// `RETURN 3 AS c, 1 AS a, 2 AS b` reported `[a, b, c]`. Only the plan
+/// remembers the clause order, so it is the authority — but only ever to
+/// REORDER. If the plan's names are not exactly the row's names, the plan is
+/// not describing these rows and the row keys stay authoritative.
+///
+/// With no rows the plan is the only description of the result shape, and
+/// reporting that shape beats reporting an empty column list.
+pub fn result_columns(plan: &LogicalPlan, rows: &[Row]) -> Vec<String> {
+    let from_rows = || -> Vec<String> {
+        rows.first()
+            .map(|row| row.bindings.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let Some(ordered) = output_columns(plan) else {
+        return from_rows();
+    };
+    // A duplicate alias (`RETURN n AS x, n AS x`) makes the plan list a
+    // multiset while a row is a set, so no comparison against the row can be
+    // trusted: with `ordered = [x, x]` and bindings `{x, y}` a length-plus-
+    // containment test passes while silently dropping `y`. Hand those back to
+    // the row keys, which are at least self-consistent.
+    let distinct: std::collections::BTreeSet<&String> = ordered.iter().collect();
+    if distinct.len() != ordered.len() {
+        return from_rows();
+    }
+    match rows.first() {
+        None => ordered,
+        Some(first) => {
+            let describes_rows = distinct.len() == first.bindings.len()
+                && ordered.iter().all(|name| first.bindings.contains_key(name));
+            if describes_rows {
+                ordered
+            } else {
+                from_rows()
+            }
+        }
+    }
+}
 
 /// Lower + optimize. The convenience entry point that the executor and
 /// CLI use by default. Tests that need the raw lowering should call

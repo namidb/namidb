@@ -1699,8 +1699,6 @@ fn is_cjk(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Seek as _, Write as _};
-
     use super::*;
     use crate::sst::text::{build_body, TextIndex};
     use crate::text::{parse_query, tokenize};

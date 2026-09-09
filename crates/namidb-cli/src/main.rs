@@ -575,7 +575,7 @@ async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::R
             ShowKind::Constraints => namidb_query::show_constraints_rows(&manifest.schema),
             ShowKind::Indexes => namidb_query::show_indexes_rows(manifest),
         };
-        print_rows(&rows);
+        print_rows(None, &rows);
         return Ok(());
     }
 
@@ -600,13 +600,13 @@ async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::R
         let outcome = execute_write(&plan, writer, &Params::new())
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        print_write_outcome(&outcome);
+        print_write_outcome(Some(&plan), &outcome);
     } else {
         let snap = writer.snapshot();
         let rows = execute(&plan, &snap, &Params::new())
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        print_rows(&rows);
+        print_rows(Some(&plan), &rows);
     }
     Ok(())
 }
@@ -703,7 +703,7 @@ fn parse_err(errs: &[namidb_query::ParseError]) -> anyhow::Error {
     anyhow::anyhow!("{:?}: {} at {}", first.code, first.message, first.span)
 }
 
-fn print_write_outcome(outcome: &WriteOutcome) {
+fn print_write_outcome(plan: Option<&namidb_query::LogicalPlan>, outcome: &WriteOutcome) {
     println!("{}", "─".repeat(48));
     println!("nodes created : {}", outcome.nodes_created);
     println!("edges created : {}", outcome.edges_created);
@@ -712,15 +712,23 @@ fn print_write_outcome(outcome: &WriteOutcome) {
     println!("properties set : {}", outcome.properties_set);
     println!("returned rows : {}", outcome.rows.len());
     println!("{}", "─".repeat(48));
-    print_rows(&outcome.rows);
+    print_rows(plan, &outcome.rows);
 }
 
-fn print_rows(rows: &[namidb_query::Row]) {
+/// `plan` supplies the RETURN-clause column order; `None` is for the `SHOW`
+/// surfaces, which never lower to a plan and name their own columns. Reading
+/// the order off `rows[0].bindings` (a `BTreeMap`) sorts it alphabetically,
+/// which is what the HTTP and Bolt surfaces used to do too.
+fn print_rows(plan: Option<&namidb_query::LogicalPlan>, rows: &[namidb_query::Row]) {
     if rows.is_empty() {
         println!("(no rows)");
         return;
     }
-    let columns: Vec<&String> = rows[0].bindings.keys().collect();
+    let ordered: Vec<String> = match plan {
+        Some(plan) => namidb_query::result_columns(plan, rows),
+        None => rows[0].bindings.keys().cloned().collect(),
+    };
+    let columns: Vec<&String> = ordered.iter().collect();
     println!(
         "{}",
         columns

@@ -668,6 +668,11 @@ impl AppState {
 /// intentionally excluded from the auth check (a healthcheck probe or a
 /// Prometheus scraper carries no token).
 pub fn build_router(state: AppState) -> Router {
+    // The governor names the statements holding memory when it refuses an
+    // admission; this is the one place where the state is final.
+    state
+        .memory
+        .attach_query_registry(Arc::clone(state.metrics.queries()));
     let public = Router::new()
         .route("/v0/livez", get(livez))
         .route("/v0/health", get(health))
@@ -689,10 +694,14 @@ pub fn build_router(state: AppState) -> Router {
     // the same gate as new Cypher work can leave a large memtable with no
     // operator escape hatch. It is excluded from the request timeout; the
     // handler has its own process-wide single-flight gate, while the storage
-    // flush restores its frozen memtable on cancellation. The outer global
+    // flush restores its frozen memtable on cancellation. Compaction is
+    // excluded for the same reason and one more: draining a post-bulk-load L0
+    // legitimately runs for minutes, so the outer 120s ceiling would cut every
+    // call that was worth making. The outer global
     // concurrency cap bounds clients waiting for that gate.
     let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
+        .route("/v0/admin/compact", post(admin_compact))
         .route("/v0/admin/backup", post(admin_backup))
         .route("/v0/admin/queries", get(admin_queries))
         .route("/v0/admin/queries/:id/cancel", post(admin_cancel_query))
@@ -837,7 +846,11 @@ where
 /// Private endpoints (auth required):
 /// - `/:namespace/v0/cypher` - execute Cypher queries
 /// - `/:namespace/v0/admin/flush` - manual flush
+/// - `/:namespace/v0/admin/compact` - drain L0 and block until done
 pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
+    shared
+        .memory
+        .attach_query_registry(Arc::clone(shared.metrics.queries()));
     let public = Router::new()
         .route("/v0/version", get(version))
         .route("/v0/metrics", get(metrics_handler_multi));
@@ -867,6 +880,8 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     let namespace_maintenance = Router::new()
         .route("/:namespace/v0/admin/flush", post(admin_flush_multi))
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
+        .route("/:namespace/v0/admin/compact", post(admin_compact_multi))
+        .route("/v0/admin/compact", post(admin_compact_multi_unprefixed))
         .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
         .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
         .route("/:namespace/v0/admin/queries", get(admin_queries_multi))
@@ -3684,7 +3699,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 namidb_query::show_indexes_rows(manifest)
             }
         };
-        let (_columns, json_rows) = rows_to_json(&rows);
+        let json_rows = row_values(&rows);
         let columns = namidb_query::show_schema_columns();
         return ObservedQuery {
             kind: Some(QueryKind::Read),
@@ -3810,7 +3825,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         match result {
             Ok(outcome) => {
                 let summary = WriteSummary::from(&outcome);
-                let (columns, rows) = rows_to_json(&outcome.rows);
+                let (columns, rows) = rows_to_json(&plan, &outcome.rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Write),
                     ok: true,
@@ -3849,7 +3864,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
-                let (columns, rows) = rows_to_json(&rows);
+                let (columns, rows) = rows_to_json(&plan, &rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Read),
                     ok: true,
@@ -4013,6 +4028,170 @@ async fn admin_cancel_query_multi(
             }),
         )
             .into_response()
+    }
+}
+
+/// `POST /v0/admin/compact` — drain L0 and block until it is done.
+///
+/// The periodic scheduler is deliberately incremental (one bucket per
+/// tick), which is right for steady state and wrong right after a bulk
+/// load: L0 sat hundreds of files deep and the NEXT load ran an order of
+/// magnitude slower (449.9s vs 45.8s for the same writes) with no way to
+/// ask the server to catch up. Excluded from the request timeout like the
+/// admin flush, and single-flighted through the same permit so two
+/// operators cannot prepare the same merges twice.
+async fn admin_compact(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin compact is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    // Its OWN gate: a drain legitimately runs for minutes, and sharing the
+    // flush gate would hold the memory-pressure escape hatch shut for all of
+    // it. Bound to a named permit so it lives for the whole drain — `_` would
+    // drop it immediately and defeat the single-flight entirely.
+    let Ok(_compact_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_compact_permit()).await
+    else {
+        return admin_compact_busy_response();
+    };
+    match maintenance::drain_compaction(
+        &state.compaction_scheduler,
+        &state.writer,
+        &state.snapshot,
+        &state.writer_health,
+        &state.namespace,
+        &state.metrics,
+        None,
+    )
+    .await
+    {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("compaction failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn admin_compact_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: "another flush or compaction is already running; retry shortly".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// Multi-tenant twins, including the header/default-namespace form every
+/// other admin route accepts.
+async fn admin_compact_multi(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(namespace): axum::extract::Path<String>,
+) -> Response {
+    dispatch_admin_compact_multi(&shared, &namespace, &principal).await
+}
+
+async fn admin_compact_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_compact_multi(&shared, &namespace, &principal).await
+}
+
+async fn dispatch_admin_compact_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    principal: &Principal,
+) -> Response {
+    if !principal.allows_write() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: "this token is read-only; admin compact is forbidden".into(),
+            }),
+        )
+            .into_response();
+    }
+    let Ok(_compact_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.memory.admin_compact_permit()).await
+    else {
+        return admin_compact_busy_response();
+    };
+    // This route bypasses query admission, so refresh the gauge and refuse to
+    // recover a COLD namespace while over the ceiling: unlike a flush, a drain
+    // releases nothing, so opening a cold writer here would only add memory
+    // while the process is already refusing work.
+    let _ = shared.memory.sample();
+    let ns_state = if shared.memory.over_limit() {
+        match shared.registry.get_if_open(namespace).await {
+            Some(ns) => ns,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: format!(
+                            "process memory pressure: namespace '{namespace}' is not open; \
+                             refusing to recover a cold writer for admin compact"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match shared.registry.get_or_open(namespace).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    // A namespace retired while we waited for the permit must not be revived
+    // by this drain: the replacement writer owns the manifest now, and
+    // compacting through the retired handle would install over it.
+    if ns_state.is_retired() {
+        return namespace_retired_response();
+    }
+    match maintenance::drain_compaction(
+        &ns_state.compaction_scheduler,
+        &ns_state.writer,
+        &ns_state.snapshot,
+        &ns_state.writer_health,
+        &ns_state.namespace,
+        &shared.metrics,
+        None,
+    )
+    .await
+    {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("compaction failed: {e}"),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -4794,7 +4973,7 @@ async fn run_cypher_multi(
                 namidb_query::show_indexes_rows(manifest)
             }
         };
-        let (_columns, json_rows) = rows_to_json(&rows);
+        let json_rows = row_values(&rows);
         return ObservedQuery {
             kind: Some(QueryKind::Read),
             ok: true,
@@ -4914,7 +5093,7 @@ async fn run_cypher_multi(
         match result {
             Ok(outcome) => {
                 let summary = WriteSummary::from(&outcome);
-                let (columns, rows) = rows_to_json(&outcome.rows);
+                let (columns, rows) = rows_to_json(&plan, &outcome.rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Write),
                     ok: true,
@@ -4951,7 +5130,7 @@ async fn run_cypher_multi(
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
-                let (columns, rows) = rows_to_json(&rows);
+                let (columns, rows) = rows_to_json(&plan, &rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Read),
                     ok: true,
@@ -5170,22 +5349,23 @@ fn json_to_runtime(v: &serde_json::Value) -> Result<RuntimeValue, String> {
 }
 
 fn rows_to_json(
+    plan: &namidb_query::LogicalPlan,
     rows: &[namidb_query::Row],
 ) -> (Vec<String>, Vec<serde_json::Map<String, serde_json::Value>>) {
-    let columns: Vec<String> = rows
-        .first()
-        .map(|r| r.bindings.keys().cloned().collect())
-        .unwrap_or_default();
-    let json_rows: Vec<_> = rows
-        .iter()
+    (namidb_query::result_columns(plan, rows), row_values(rows))
+}
+
+/// Row bodies without a column list, for the `SHOW` surfaces that name their
+/// own canonical columns and never lower to a plan.
+fn row_values(rows: &[namidb_query::Row]) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    rows.iter()
         .map(|r| {
             r.bindings
                 .iter()
                 .map(|(k, v)| (k.clone(), runtime_to_json(v)))
                 .collect::<serde_json::Map<_, _>>()
         })
-        .collect();
-    (columns, json_rows)
+        .collect()
 }
 
 fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
@@ -6311,6 +6491,61 @@ mod tests {
         assert_eq!(json["gql_status"], "42001");
     }
 
+    /// The `columns` array is the positional contract: clients zip it with
+    /// row data, Bolt drivers index records by it, and Arrow/pandas carry it
+    /// into a dataframe. It used to be read off a row's `BTreeMap`, so it came
+    /// back sorted by name — `RETURN 3 AS c, 1 AS a, 2 AS b` reported
+    /// `[a, b, c]` and every positional reader silently took the wrong column.
+    #[tokio::test]
+    async fn result_columns_follow_the_return_clause() {
+        let app = fixture(None).await;
+
+        for (query, expected) in [
+            ("RETURN 3 AS c, 1 AS a, 2 AS b", vec!["c", "a", "b"]),
+            ("RETURN 1 AS zeta, 2 AS alpha", vec!["zeta", "alpha"]),
+            // Unaliased expressions take their generated names, still in
+            // clause order.
+            ("RETURN 2, 1", vec!["2", "1"]),
+        ] {
+            let resp = post_cypher(&app, None, query).await;
+            assert_eq!(resp.status(), StatusCode::OK, "query: {query}");
+            let body = body_json(resp).await;
+            let columns: Vec<String> = body["columns"]
+                .as_array()
+                .expect("columns array")
+                .iter()
+                .map(|c| c.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(columns, expected, "column order for: {query}");
+        }
+    }
+
+    /// Ordering and limiting sit above the projection, so the clause order has
+    /// to survive them — this is the shape a reporting query actually takes.
+    #[tokio::test]
+    async fn result_columns_survive_order_by_and_limit() {
+        let app = fixture(None).await;
+        let resp = post_cypher(
+            &app,
+            None,
+            "UNWIND [3, 1, 2] AS n RETURN n AS zulu, n * 2 AS alpha ORDER BY zulu DESC LIMIT 2",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let columns: Vec<String> = body["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(columns, vec!["zulu".to_string(), "alpha".to_string()]);
+        // And the ordering itself still applies.
+        let first = &body["rows"][0];
+        assert_eq!(first["zulu"], 3);
+        assert_eq!(first["alpha"], 6);
+    }
+
     /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the
     /// real `--auth-tokens-file` path), exercising per-token roles.
     async fn fixture_with_tokens(ns: &str, tokens_json: &str) -> Router {
@@ -7017,6 +7252,100 @@ mod tests {
         };
         assert_eq!(flush("rkey").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(flush("wkey").await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_compact_stays_authenticated_and_forbids_read_only_tokens() {
+        let app = fixture_with_tokens("authz-compact", ROLE_TOKENS).await;
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/compact")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let compact = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v0/admin/compact")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(compact("rkey").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(compact("wkey").await.status(), StatusCode::OK);
+    }
+
+    /// The endpoint that finding #5 asked for: after a bulk load leaves L0
+    /// hundreds of files deep, one blocking call brings it back to zero. The
+    /// reported 10x write regression (449.9s at L0=439 vs 45.8s clean) had no
+    /// operator remedy before this — only waiting for periodic ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_compact_drains_l0_and_returns_the_summary() {
+        let (store, paths) = namidb_storage::parse_uri("memory://http-compact-drain").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "http-compact-drain".into());
+        for i in 0..4 {
+            let mut writer = state.writer.lock().await;
+            writer
+                .upsert_node(
+                    "Bulk",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: std::collections::BTreeMap::from([(
+                            "i".to_string(),
+                            namidb_core::value::Value::I64(i),
+                        )]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            writer
+                .flush(namidb_core::schema::Schema::empty())
+                .await
+                .unwrap();
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        assert_eq!(state.writer.lock().await.max_l0_bucket_len(), 4);
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/compact")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["l0_before"], 4);
+        assert_eq!(body["l0_after"], 0);
+        assert_eq!(body["truncated"], false);
+        assert!(body["passes"].as_u64().unwrap() >= 1);
+        assert!(body["source_ssts_removed"].as_u64().unwrap() >= 4);
+        assert_eq!(
+            state.writer.lock().await.max_l0_bucket_len(),
+            0,
+            "the call must block until the drain it reports has actually landed"
+        );
     }
 
     /// POST a JSON body to an admin path with a bearer token.

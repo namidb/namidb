@@ -2640,7 +2640,6 @@ fn read_u64_io(reader: &mut impl Read) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
 

@@ -104,16 +104,23 @@ pub enum CompactionTrigger {
     /// on already-flushed SSTs immediately instead of waiting for the next
     /// periodic tick (item 38 of the 25 TB readiness plan).
     Ddl = 2,
+    /// Requested by an operator through `POST /v0/admin/compact`, which
+    /// drains L0 and blocks until it is done — the "catch up before you
+    /// serve" step after a bulk load, where waiting for periodic ticks left
+    /// L0 hundreds of files deep and made the NEXT load an order of
+    /// magnitude slower.
+    Admin = 3,
 }
 
 impl CompactionTrigger {
-    const ALL: [Self; 3] = [Self::Periodic, Self::Reactive, Self::Ddl];
+    const ALL: [Self; 4] = [Self::Periodic, Self::Reactive, Self::Ddl, Self::Admin];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Periodic => "periodic",
             Self::Reactive => "reactive",
             Self::Ddl => "ddl",
+            Self::Admin => "admin",
         }
     }
 }

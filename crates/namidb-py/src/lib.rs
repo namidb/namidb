@@ -26,8 +26,8 @@ use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute, execute_write, parse as cypher_parse, plan as build_plan, show_constraints_rows,
-    show_indexes_rows, show_schema_columns, ExecError, LogicalPlan, LowerError, Params, ParseError,
-    Row, RuntimeValue, StatsCatalog,
+    show_indexes_rows, show_schema_columns, ExecError, LowerError, Params, ParseError, Row,
+    RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
     CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, NodeView, NodeWriteRecord, SstCache,
@@ -901,7 +901,6 @@ async fn run_cypher_inner(
         });
     }
 
-    let plan_columns = extract_column_order(&plan);
     let rows = if plan.contains_write() {
         let outcome = execute_write(&plan, guard, params)
             .await
@@ -913,35 +912,10 @@ async fn run_cypher_inner(
             .await
             .map_err(exec_err_to_pyerr)?
     };
-    // Prefer the column order declared by the RETURN / WITH projection;
-    // fall back to the first row's BTreeMap order if the plan top is
-    // some shape we don't recognise (e.g. a future operator).
-    let columns: Vec<String> = plan_columns.unwrap_or_else(|| {
-        rows.first()
-            .map(|r| r.bindings.keys().cloned().collect())
-            .unwrap_or_default()
-    });
+    // One shared implementation across the embedded client, HTTP and Bolt:
+    // three surfaces disagreeing about column order is its own bug.
+    let columns = namidb_query::result_columns(&plan, &rows);
     Ok(QueryResult { columns, rows })
-}
-
-/// Walk down the plan top through order-preserving wrappers
-/// (`Distinct`, `TopN`) until we hit a `Project` and return its
-/// projected alias order. Returns `None` if no `Project` is reached
-/// (which would be unusual for a lowered Cypher query — the parser
-/// only emits `RETURN` clauses, and `RETURN` always lowers to
-/// `Project`).
-fn extract_column_order(plan: &LogicalPlan) -> Option<Vec<String>> {
-    let mut current = plan;
-    loop {
-        match current {
-            LogicalPlan::Project { items, .. } => {
-                return Some(items.iter().map(|i| i.alias.clone()).collect());
-            }
-            LogicalPlan::Distinct { input } => current = input,
-            LogicalPlan::TopN { input, .. } => current = input,
-            _ => return None,
-        }
-    }
 }
 
 // ── QueryResult ───────────────────────────────────────────────────────

@@ -10039,7 +10039,13 @@ mod tests {
         equality.paged = None;
         equality.paged_build_unsupported = false;
         let required = crate::flush::union_indexed_props(&schema);
-        assert!(node_descriptor_needs_non_record_migration(node, &required));
+        // `required` is the union over every label, so this mirrors the
+        // unlabeled production call, which supplies the whole composite set.
+        assert!(node_descriptor_needs_non_record_migration(
+            node,
+            &required,
+            &schema.indexes
+        ));
 
         let migrated = compact_leveled(&ms, &fence, &legacy_paged, &schema, u64::MAX, 10)
             .await
