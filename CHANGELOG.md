@@ -15,6 +15,39 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- A predicate on a WITH-renamed property stranded the index anchor and
+  forced a full-label scan: `MATCH (v:VENTA)-[:R]->(p:PRODUCTO) WITH v,
+  p.cod_item AS c WHERE c = '…'` planned a scan of every VENTA, while the
+  identical query written with the equality inside the pattern anchored
+  at PRODUCTO and finished instantly (sixth field report: the scan form
+  ran 120s+ and took the process with it). Predicate pushdown now
+  substitutes a projection alias back to the expression it binds and
+  pushes the rewritten conjunct below the projection, so the existing
+  anchor machinery sees it on the next fixpoint round. Computed aliases
+  and DISTINCT projections are deliberately not substituted.
+- Reverse expansion into a very high-degree node failed as a CLIFF, not a
+  slowdown (instant at degree ~3.9k, fatal at ~53k) — and enabling
+  `NAMIDB_ADJACENCY` made it arrive EARLIER. The hop prewarmed all
+  distinct endpoints into the shared node cache and then re-read each one
+  through it; once the endpoint set outgrew that cache the FIFO eviction
+  discarded the prewarm's own earliest entries before the per-edge loop
+  reached them, collapsing the hit rate to ~0% and leaving tens of
+  thousands of sequential cold point reads. Three changes: a single-hop
+  labelled expansion now consumes its own materialisation directly
+  (bounded by `NAMIDB_EXPAND_TARGET_VIEW_BUDGET`, default 250k
+  endpoints), `batch_lookup_nodes` resolves in chunks
+  (`NAMIDB_BATCH_LOOKUP_CHUNK`, default 8192) so peak memory no longer
+  scales with fan-out, and a single-hop expansion stops deep-cloning
+  every matched row into a frontier that is never read.
+- Two request deadlines overlapped silently: the outer HTTP ceiling
+  (120s, env-only) could sit BELOW `--query-timeout`, so a query
+  configured for 300s still died at 120s with a 408 instead of its own
+  504. The ceiling is now a documented flag (`--http-request-timeout`,
+  `0s` disables), its default is derived so it can never truncate the
+  configured query/write budgets, and setting it at or below them warns
+  at boot.
+
 ## [2.6.1] - 2026-09-09
 
 **Fixed**

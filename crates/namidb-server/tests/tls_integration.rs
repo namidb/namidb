@@ -94,6 +94,7 @@ async fn serves_https_and_bolt_over_tls() {
         default_namespace: "tls-it".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
         let _ = namidb_server::run(config).await;

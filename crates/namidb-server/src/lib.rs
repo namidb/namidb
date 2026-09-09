@@ -222,6 +222,12 @@ pub struct Config {
     /// flush/compaction/recovery always wait as long as it takes.
     /// `Duration::ZERO` disables the bound.
     pub writer_lock_timeout: Duration,
+    /// Ceiling on a whole HTTP request (body read + handler). `None` derives
+    /// a default that can never truncate the configured query/write budgets;
+    /// `ZERO` disables the layer. An explicit value BELOW `query_timeout` or
+    /// `write_timeout` silently converts those 504/timeout outcomes into a
+    /// 408 at this ceiling, so boot warns about it.
+    pub http_request_timeout: Option<Duration>,
     /// PEM certificate-chain file enabling TLS on the HTTP and Bolt
     /// listeners. Must be set together with `tls_key`; when both are `None`
     /// the server serves plaintext.
@@ -705,11 +711,71 @@ pub fn build_router(state: AppState) -> Router {
 /// may run so a slow/stuck client cannot pin a task indefinitely; the
 /// concurrency limit caps total in-flight requests so slow connections cannot
 /// accumulate without bound and starve the server. Overridable via env.
+static HTTP_REQUEST_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Headroom the derived default leaves above the largest query budget, so a
+/// statement that legitimately runs to its own deadline reports ITS outcome
+/// (504 timeout / 200) instead of being cut by this outer ceiling (408).
+const HTTP_TIMEOUT_HEADROOM: Duration = Duration::from_secs(30);
+
+/// Baseline ceiling when nothing else is configured.
+const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Resolve the HTTP request ceiling ONCE at boot, from the explicit setting
+/// when given, else derived so it never truncates the configured query and
+/// write budgets. Two overlapping deadlines returning different status codes
+/// (504 from ours, 408 from the outer layer) was a real field-report
+/// confusion: `--query-timeout 300s` still failed at 120s with a 408.
+pub(crate) fn resolve_http_request_timeout(config: &Config) -> Duration {
+    let explicit = config.http_request_timeout.or_else(|| {
+        std::env::var("NAMIDB_HTTP_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|s| humantime::parse_duration(&s).ok())
+    });
+    let resolved = match explicit {
+        Some(explicit) => {
+            for (name, budget) in [
+                ("--query-timeout", config.query_timeout),
+                ("--write-timeout", config.write_timeout),
+            ] {
+                if !explicit.is_zero() && budget > Duration::ZERO && explicit <= budget {
+                    warn!(
+                        http_request_timeout = ?explicit,
+                        budget_flag = name,
+                        budget = ?budget,
+                        "the HTTP request ceiling is at or below a query budget; \
+                         statements will be cut with 408 before their own timeout \
+                         reports 504 — raise --http-request-timeout"
+                    );
+                }
+            }
+            explicit
+        }
+        None => {
+            let largest = config.query_timeout.max(config.write_timeout);
+            if largest.is_zero() {
+                // Budgets disabled: keep the historical ceiling rather than
+                // deriving an unbounded one.
+                DEFAULT_HTTP_REQUEST_TIMEOUT
+            } else {
+                DEFAULT_HTTP_REQUEST_TIMEOUT.max(largest.saturating_add(HTTP_TIMEOUT_HEADROOM))
+            }
+        }
+    };
+    let _ = HTTP_REQUEST_TIMEOUT.set(resolved);
+    resolved
+}
+
 fn http_request_timeout() -> Duration {
+    if let Some(resolved) = HTTP_REQUEST_TIMEOUT.get() {
+        return *resolved;
+    }
+    // Router built outside `serve` (tests, embedded harnesses): keep the
+    // historical env-or-default behaviour.
     std::env::var("NAMIDB_HTTP_REQUEST_TIMEOUT")
         .ok()
         .and_then(|s| humantime::parse_duration(&s).ok())
-        .unwrap_or_else(|| Duration::from_secs(120))
+        .unwrap_or(DEFAULT_HTTP_REQUEST_TIMEOUT)
 }
 
 fn http_max_concurrency() -> usize {
@@ -729,9 +795,15 @@ fn timeout_router<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let timeout = http_request_timeout();
+    if timeout.is_zero() {
+        // Explicitly disabled: the per-query and per-write deadlines remain
+        // the only bounds, and they report their own status codes.
+        return router;
+    }
     router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
         axum::http::StatusCode::REQUEST_TIMEOUT,
-        http_request_timeout(),
+        timeout,
     ))
 }
 
@@ -890,6 +962,15 @@ pub async fn run_with_memory_max_bytes(
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
     }
+    // Resolve the outer HTTP ceiling before any router is built, so it can be
+    // derived from (and never silently truncate) the query/write budgets.
+    let http_timeout = resolve_http_request_timeout(&config);
+    info!(
+        http_request_timeout = ?http_timeout,
+        query_timeout = ?config.query_timeout,
+        write_timeout = ?config.write_timeout,
+        "resolved request deadlines"
+    );
     // Resolve the auth configuration: a tokens file (with roles) wins, else a
     // single read-write `--auth-token`, else open.
     let auth = match (&config.auth_tokens_file, &config.auth_token) {
@@ -5247,6 +5328,7 @@ mod tests {
         Config {
             store_uri: format!("memory://{ns}"),
             listen: "127.0.0.1:0".parse().unwrap(),
+            http_request_timeout: None,
             auth_token: None,
             auth_tokens_file: None,
             auth_tokens_reload_interval: Duration::ZERO,
@@ -5625,6 +5707,61 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Sixth field report: two deadlines used to overlap silently — a
+    /// `--query-timeout 300s` still died at 120s with a 408 from the outer
+    /// HTTP layer instead of its own 504. The derived default must always
+    /// clear the configured budgets, and an explicit value is honoured
+    /// (with a boot warning when it would truncate them).
+    #[test]
+    fn http_request_timeout_never_silently_truncates_query_budgets() {
+        let base = |query: Duration, write: Duration, explicit: Option<Duration>| {
+            let mut config = shutdown_test_config("http-timeout");
+            config.query_timeout = query;
+            config.write_timeout = write;
+            config.http_request_timeout = explicit;
+            config
+        };
+        // Derived: comfortably above the largest budget.
+        let derived = resolve_http_request_timeout(&base(
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            None,
+        ));
+        assert!(
+            derived > Duration::from_secs(300),
+            "a 300s query budget must not be cut by the outer layer, got {derived:?}"
+        );
+        // Small budgets keep the historical 120s floor.
+        assert_eq!(
+            resolve_http_request_timeout(&base(
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                None
+            )),
+            Duration::from_secs(120)
+        );
+        // Disabled budgets keep the floor too (not an unbounded ceiling).
+        assert_eq!(
+            resolve_http_request_timeout(&base(Duration::ZERO, Duration::ZERO, None)),
+            Duration::from_secs(120)
+        );
+        // Explicit wins, including the disable sentinel.
+        assert_eq!(
+            resolve_http_request_timeout(&base(
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Some(Duration::from_secs(5))
+            )),
+            Duration::from_secs(5)
+        );
+        assert!(resolve_http_request_timeout(&base(
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Some(Duration::ZERO)
+        ))
+        .is_zero());
     }
 
     /// Item 59: the group-commit waiter is bounded by the write deadline —

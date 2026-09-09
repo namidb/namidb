@@ -1758,7 +1758,7 @@ fn lower_projection(
 /// rewritten) item expression. `keep_as_var` lists alias names that
 /// must be left as plain variables — typically because they are
 /// already materialised on the row (e.g. group keys after Aggregate).
-fn substitute_aliases(
+pub(crate) fn substitute_aliases(
     expr: &Expression,
     alias_map: &BTreeMap<String, Expression>,
     keep_as_var: &BTreeSet<String>,

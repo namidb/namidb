@@ -1062,3 +1062,51 @@ that expansion — the one pathology behind all four sightings (items
 node prewarm, batched non-unique lookups; item 61/64's fixes for the
 death mode). Their 52s ≈ 53k x ~1ms is the pre-#168 arithmetic once
 more.
+
+## Sixth field report (2026-09-09, second batch) — items 70-72
+
+### 70. [CONFIRMED — fixed in 2.6.2] WITH-renamed predicate strands the index anchor
+
+Reported as "the planner chooses badly in this concrete shape", and that
+is exactly right. Reproduced with EXPLAIN on the published 2.6.1 image:
+`... WITH v, p.cod_item AS c WHERE c = '…' ...` plans
+`Aggregate <- Expand(v->f) <- Filter(c=…) <- Project[c=p.cod_item] <-
+Expand(v->p) <- NodeScan(VENTA)` — a full scan of the 160k-row label —
+while the identical query with the equality inside the pattern plans
+`NodeByPropertyValue(PRODUCTO) -> reverse Expand`. Nothing substituted
+the alias back, so neither unique_lookup nor anchor_inversion ever saw
+an anchorable equality. Fixed in predicate pushdown: aliases bound to
+pure variable/property expressions are substituted and the rewritten
+conjunct pushed below the projection (computed aliases and DISTINCT
+projections excluded); the optimizer's fixpoint loop then re-plans it as
+an anchored lookup.
+
+### 71. [CORRECTED — fixed in 2.6.2] The reverse-expansion cliff is a node-cache capacity boundary, not a CSR budget
+
+Reported: degree 3,871 instant, degree ~53,000 fatal, "not gradual",
+even with adjacency enabled. The CSR theory is refuted — the CSR is per
+(edge_type, direction) for the WHOLE type, so it is either retained for
+both probes or neither. The real step function: the hop prewarms every
+distinct endpoint via one `batch_lookup_nodes` and then re-reads each
+endpoint through the shared NodeViewCache, whose eviction is FIFO; once
+the endpoint set outgrows that cache the prewarm evicts its own earliest
+entries before the consumer reaches them, so the hit rate collapses from
+~100% to ~0% and the fallback is N sequential cold point reads. Verified
+in the field: enabling NAMIDB_ADJACENCY adds a 512 MiB request to the
+proportional split and SHRANK the node cache from 86 MiB to 73.8 MiB at
+the same cap — the cliff arrives earlier with the CSR on, exactly as
+reported. Fixes: single-hop labelled expands consume their own
+materialisation (no cache dependency; budgeted), batch_lookup_nodes is
+chunked (peak memory no longer scales with fan-out), and the dead
+frontier clone on single-hop expands is gone. Recorded, deferred: the
+row cap still counts rows, not bytes (item 64), and multi-hop traversals
+keep the per-edge path because the batch is label-scoped.
+
+### 72. [CONFIRMED — fixed in 2.6.2] Two overlapping request deadlines with different status codes
+
+`--query-timeout 60s` failed at 62s with 504 (ours, correct);
+`--query-timeout 300s` failed at 120s with 408 — the outer HTTP
+TimeoutLayer, whose only knob was an undocumented env var. Now a real
+flag (`--http-request-timeout`, `0s` disables) whose default is derived
+to clear the largest configured query/write budget, with a boot warning
+when an explicit value would truncate them.

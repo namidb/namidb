@@ -62,6 +62,7 @@ async fn boot() -> String {
         default_namespace: NS.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     };
     tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {

@@ -8,7 +8,7 @@
 //! Distinct/TopN/write operators are barriers — pending predicates are
 //! materialised as a `Filter` above them rather than crossed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::parquet_pushdown::classify_pending_for_scan;
 use super::{and_chain, apply_filters, expression_aliases, produced_aliases, split_and_terms};
@@ -294,7 +294,18 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
             discard_input_bindings,
         } => {
             let preserved = identity_projection_aliases(&items);
-            let (pushable, stay) = partition_by_alias_subset(pending, &preserved);
+            let (mut pushable, stay) = partition_by_alias_subset(pending, &preserved);
+            // A WITH that RENAMES a property (`WITH v, p.cod_item AS c
+            // WHERE c = '…'`) used to strand the predicate above this
+            // Project, so the index anchor on `p` was never visible to
+            // unique_lookup / anchor_inversion and the plan degenerated to
+            // scanning the whole source label (fifth field report: a 160k
+            // scan where the in-pattern spelling of the SAME query anchors
+            // and finishes instantly). Substitute the alias back to its
+            // bound expression and push the rewritten conjunct down; the
+            // fixpoint loop then re-plans it as an anchored lookup.
+            let (substituted, stay) = partition_substitutable(stay, &items, distinct);
+            pushable.extend(substituted);
             let new_input = pushdown_at(*input, pushable);
             apply_filters(
                 LogicalPlan::Project {
@@ -595,6 +606,80 @@ fn partition_by_alias_subset(
     (pushable, stay)
 }
 
+/// Split predicates that can be pushed BELOW an aliasing projection by
+/// substituting each referenced alias with the expression the projection
+/// binds it to. Returns `(rewritten_pushable, stay)`.
+///
+/// Only pure property/variable bindings substitute: a computed alias could
+/// hide a function call whose evaluation count would change, and an
+/// aggregate cannot be evaluated below its own projection. A conjunct is
+/// pushed only when EVERY alias it references resolves, and no substituted
+/// expression mentions a name this projection rebinds (`WITH p.x AS p`
+/// means `p` below is a different value).
+fn partition_substitutable(
+    pending: Vec<Expression>,
+    items: &[crate::plan::logical::ProjectionItem],
+    distinct: bool,
+) -> (Vec<Expression>, Vec<Expression>) {
+    // A DISTINCT projection dedups before the filter; pushing a predicate
+    // below it would change how often a non-deterministic term is
+    // evaluated, so leave those alone.
+    if distinct {
+        return (Vec::new(), pending);
+    }
+    let mut substitutions: BTreeMap<String, Expression> = BTreeMap::new();
+    let mut rebound: BTreeSet<String> = BTreeSet::new();
+    for item in items {
+        let identity = matches!(
+            &item.expression.kind,
+            ExpressionKind::Variable(id) if id.name == item.alias
+        );
+        if !identity {
+            // This name means something different above than below.
+            rebound.insert(item.alias.clone());
+        }
+        if is_substitutable_projection(&item.expression) && !identity {
+            substitutions.insert(item.alias.clone(), item.expression.clone());
+        }
+    }
+    let preserved = identity_projection_aliases(items);
+    let keep_as_var = BTreeSet::new();
+    let mut pushable = Vec::new();
+    let mut stay = Vec::new();
+    for term in pending {
+        let refs = expression_aliases(&term);
+        let resolvable = refs
+            .iter()
+            .all(|alias| preserved.contains(alias) || substitutions.contains_key(alias));
+        if !resolvable {
+            stay.push(term);
+            continue;
+        }
+        let rewritten = crate::plan::lower::substitute_aliases(&term, &substitutions, &keep_as_var);
+        // The rewritten predicate must only mention names whose meaning is
+        // the same below this projection.
+        if expression_aliases(&rewritten)
+            .iter()
+            .any(|alias| rebound.contains(alias))
+        {
+            stay.push(term);
+            continue;
+        }
+        pushable.push(rewritten);
+    }
+    (pushable, stay)
+}
+
+/// A projection expression safe to evaluate below its own projection: a
+/// bare variable or a property access chain rooted at one.
+fn is_substitutable_projection(expr: &Expression) -> bool {
+    match &expr.kind {
+        ExpressionKind::Variable(_) => true,
+        ExpressionKind::Property(access) => is_substitutable_projection(&access.target),
+        _ => false,
+    }
+}
+
 fn identity_projection_aliases(items: &[crate::plan::logical::ProjectionItem]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for it in items {
@@ -892,8 +977,11 @@ mod tests {
     }
 
     #[test]
-    fn keeps_filter_above_project_when_alias_renamed() {
-        // Filter(x.age > 30) over Project [x=a] — `x` doesn't exist below.
+    fn pushes_filter_through_a_renaming_projection() {
+        // Filter(x.age > 30) over Project [x=a]: `WITH a AS x WHERE …` is
+        // the same query as filtering `a.age` below, so the predicate now
+        // substitutes the alias and sinks into the scan. Leaving it above
+        // stranded index anchors behind a WITH (sixth field report).
         let pred = binop(BinaryOp::Gt, prop("x", "age"), int(30));
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Project {
@@ -908,8 +996,62 @@ mod tests {
             predicate: pred,
         };
         let optimized = predicate_pushdown(plan);
-        // Filter must remain on top because `x` is the projected name.
+        // The Project is now the root and the rewritten predicate lives
+        // below it (absorbed by the scan or as a Filter under the Project).
+        let LogicalPlan::Project { input, .. } = &optimized else {
+            panic!("expected Project at root, got {optimized:?}");
+        };
+        let rendered = format!("{input:?}");
+        assert!(
+            rendered.contains("\"a\"") && rendered.contains("age"),
+            "the alias must be substituted back to a.age below the Project: {rendered}"
+        );
+    }
+
+    #[test]
+    fn keeps_filter_above_project_for_a_computed_alias() {
+        // Filter(x > 30) over Project [x = a.age * 2]: a computed binding is
+        // deliberately NOT substituted — only pure variable/property
+        // bindings are, so the pass never duplicates arbitrary evaluation
+        // below its own projection.
+        let pred = binop(BinaryOp::Gt, var("x"), int(30));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(scan("Person", "a")),
+                items: vec![ProjectionItem {
+                    expression: binop(BinaryOp::Mul, prop("a", "age"), int(2)),
+                    alias: "x".into(),
+                }],
+                distinct: false,
+                discard_input_bindings: true,
+            }),
+            predicate: pred,
+        };
+        let optimized = predicate_pushdown(plan);
         assert!(matches!(optimized, LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn keeps_filter_above_a_distinct_projection() {
+        // DISTINCT dedups before the filter; pushing below would change how
+        // often a non-deterministic term is evaluated, so the pass declines.
+        let pred = binop(BinaryOp::Gt, prop("x", "age"), int(30));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(scan("Person", "a")),
+                items: vec![ProjectionItem {
+                    expression: var("a"),
+                    alias: "x".into(),
+                }],
+                distinct: true,
+                discard_input_bindings: true,
+            }),
+            predicate: pred,
+        };
+        assert!(matches!(
+            predicate_pushdown(plan),
+            LogicalPlan::Filter { .. }
+        ));
     }
 
     #[test]

@@ -3797,12 +3797,40 @@ impl<'mt> Snapshot<'mt> {
     /// attached) so already-resolved ids skip the SST scan entirely.
     /// Fresh resolutions populate L1 and L2 on the way out.
     #[instrument(skip(self, ids), fields(label = label, ids_len = ids.len()))]
+    /// Batched point lookups, CHUNKED so peak memory is proportional to the
+    /// chunk rather than the whole id list. Every intermediate inside the
+    /// inner pass (per-id output map, pending sets, decoded winners, and the
+    /// three live copies each view briefly has on its way to the caches) is
+    /// sized to the batch, so one hop over a 53k-degree endpoint set used to
+    /// allocate hundreds of megabytes at once — a step change in RSS that a
+    /// memory-capped container did not survive (sixth field report). Results
+    /// keep the caller's order: chunks are contiguous slices concatenated in
+    /// order.
     pub async fn batch_lookup_nodes(
         &self,
         label: &str,
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeView>>> {
         namidb_core::profile_scope!("Snapshot::batch_lookup_nodes");
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chunk = batch_lookup_chunk_size();
+        if ids.len() > chunk {
+            let mut out = Vec::with_capacity(ids.len());
+            for slice in ids.chunks(chunk) {
+                out.extend(self.batch_lookup_nodes_chunk(label, slice).await?);
+            }
+            return Ok(out);
+        }
+        self.batch_lookup_nodes_chunk(label, ids).await
+    }
+
+    async fn batch_lookup_nodes_chunk(
+        &self,
+        label: &str,
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeView>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -9484,6 +9512,17 @@ fn equality_sidecar_key(
             _ => None,
         },
     }
+}
+
+/// Ids resolved per inner batch pass. Large enough that the batched
+/// row-group and locator reads keep their vectorised advantage, small
+/// enough that peak transient memory stays bounded regardless of fan-out.
+fn batch_lookup_chunk_size() -> usize {
+    std::env::var("NAMIDB_BATCH_LOOKUP_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8192)
 }
 
 /// Conservative overlap test for descriptor key ranges. Invalid/reversed

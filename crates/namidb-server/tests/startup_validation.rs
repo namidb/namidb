@@ -43,6 +43,7 @@ fn base_config(ns: &str) -> namidb_server::Config {
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        http_request_timeout: None,
     }
 }
 

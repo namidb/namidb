@@ -323,6 +323,19 @@ struct Cli {
     )]
     writer_lock_timeout: Duration,
 
+    /// Ceiling on a whole HTTP request (body read + handler), returning 408.
+    /// Unset derives a value that can never truncate `--query-timeout` /
+    /// `--write-timeout` (their own deadlines report 504 instead); `0s`
+    /// disables this outer layer entirely. Setting it AT OR BELOW either
+    /// budget is accepted but warns at boot: statements would be cut here
+    /// with 408 before their own timeout could report 504.
+    #[arg(
+        long,
+        env = "NAMIDB_HTTP_REQUEST_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    http_request_timeout: Option<Duration>,
+
     /// PEM certificate-chain file. Set together with `--tls-key` to serve the
     /// HTTP and Bolt listeners over TLS; omit both to serve plaintext.
     #[arg(long, env = "NAMIDB_TLS_CERT")]
@@ -433,6 +446,7 @@ fn main() -> anyhow::Result<()> {
         memtable_flush_bytes: cli.memtable_flush_bytes,
         memtable_stall_bytes: cli.memtable_stall_bytes,
         writer_lock_timeout: cli.writer_lock_timeout,
+        http_request_timeout: cli.http_request_timeout,
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,
         slow_query_threshold: cli.slow_query_threshold,
