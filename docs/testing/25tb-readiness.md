@@ -1044,3 +1044,21 @@ Residuals found by the recon and shipped in 2.6.1:
   aggregate refs stop forcing All-columns projection (the remaining
   memory exposure on vector-bearing nodes); the row cap counts rows,
   not bytes (noted under item 64).
+
+### 69. [VERIFIED FIXED in 2.6.0 — verification only, no code change] 53k-degree hub expansion with property reads (408@120s / 162s / 52s)
+
+Sixth sighting of the same access path, reported as "the planner doesn't
+pick expansion direction by cardinality". Live repro on published 2.6.0
+(53,473-degree LOCAL hub, unique cod_local anchor, SST-backed, 4GB
+container) with the reporter's three formulations: WHERE-after-pattern
+1.1s (was 408 at 120s), WITH-intermediate 1.8s (was 162s), aggregate-by-
+code 0.6s (was 52s) — 100-160x, no failures. EXPLAIN confirms the plan
+is IDENTICAL to the reported one (NodeByPropertyValue LOCAL anchor →
+reverse Expand → aggregate): seeding at LOCAL was always the right
+direction (the alternative scans every VENTA row for the same 53k+
+matches); what was broken pre-2.6.0 was the per-edge/per-target COST of
+that expansion — the one pathology behind all four sightings (items
+62/63's fixes: slim topology partner route, expand partner memo, batched
+node prewarm, batched non-unique lookups; item 61/64's fixes for the
+death mode). Their 52s ≈ 53k x ~1ms is the pre-#168 arithmetic once
+more.
