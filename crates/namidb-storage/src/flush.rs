@@ -1443,11 +1443,8 @@ type UniquePropertySidecars = (
     Vec<(Path, SidecarPayload)>,
 );
 
-/// Explicit rolling-upgrade mode for old readers that require the monolithic
-/// bincode property map. Zero/default emits only PagedV2. A positive cap is a
-/// hard per-sidecar bound: crossing it fails the flush/compaction rather than
-/// silently dropping either authoritative representation.
-/// Size cap for the legacy bincode property sidecar.
+/// Size cap for the legacy bincode property sidecar (rolling-upgrade
+/// compatibility for pre-paged readers).
 ///
 /// The legacy body stays authoritative by default: it is the only shape a key
 /// too large to page can fall back to, and dropping it would leave such a

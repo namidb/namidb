@@ -460,6 +460,15 @@ pub fn shared_cache_capacities() -> CacheCapacities {
             adjacency_cache_bytes = capacities.adjacency_capacity_bytes(),
             "resolved process-wide cache capacities"
         );
+        // adjacency_cache_bytes=0 reads like a budget-split bug in the field
+        // (fourth field report, item 62); it is the opt-in tier's request.
+        if capacities.adjacency_capacity_bytes() == 0 {
+            tracing::info!(
+                "adjacency (CSR) cache disabled: it is opt-in by object-native \
+                 design; set NAMIDB_ADJACENCY=1 to enable and the split will \
+                 assign it a proportional share"
+            );
+        }
         capacities
     })
 }
