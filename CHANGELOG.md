@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-09-09
+
 **Fixed**
 - A label-disjunction source defeated the anchor inversion: `MATCH
   (o:OFERTA|PROMOCION)-[:VIGENTE_EN]->(f:FECHA {fecha: X})` re-scanned
@@ -3093,7 +3095,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.1...HEAD
+[2.6.1]: https://github.com/namidb/namidb/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/namidb/namidb/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/namidb/namidb/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/namidb/namidb/compare/v2.4.1...v2.5.0
