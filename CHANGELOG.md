@@ -28,6 +28,21 @@ crates.io release will establish and document that API explicitly.
   interception (previously errored).
 
 **Fixed**
+- A dying server could exit 0 in near silence (fourth field report,
+  item 61). Shutdown is now attributed: the signal handler logs
+  SIGINT/SIGTERM at WARN with resident/max memory bytes and the
+  rejected-query count on the same line, so "shutdown under memory
+  pressure" is greppable. The shutdown channel closing without a real
+  signal — previously indistinguishable from a clean SIGTERM — now logs
+  at ERROR and exits nonzero, and a failed signal-handler registration
+  is logged once and never mistaken for a received signal. In-flight
+  Bolt sessions, which used to be abandoned the moment HTTP finished
+  draining, are drained behind a bounded permit barrier (25s, with the
+  abandoned count logged on timeout) before the process may return.
+  Memory-governor admission rejections, previously mute 503s/Bolt
+  failures, log at WARN rate-limited to one line per second, and a boot
+  with the governor disabled inside a container that has a finite
+  cgroup memory limit now warns to set `NAMIDB_MEMORY_MAX_BYTES=auto`.
 - Non-unique `CREATE INDEX` point lookups were ~70x slower than unique
   constraints on identical data (fourth field report: 14.1ms vs 0.2ms,
   33min vs 47s for a 160k-fact load — and the load-time churn inflated
