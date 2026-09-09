@@ -2564,10 +2564,17 @@ async fn flat_call_procedure(
     if namespace == Some("db.index.vector") {
         return db_index_vector_procedure(name, args, yield_items, snapshot, params).await;
     }
+    // Neo4j-compatible schema introspection. These serve every surface
+    // (HTTP, Bolt, embedded Python, CLI, MCP) from the same manifest-cheap
+    // observed_* snapshot methods the Bolt pre-parse shim uses, so a GUI
+    // that draws the schema no longer needs the graph model out of band.
+    if matches!(namespace, Some("db") | Some("db.schema")) {
+        return db_schema_procedure(namespace, name, args, yield_items, snapshot).await;
+    }
     if !matches!(namespace, Some("algo") | None) {
         return Err(proc_unsupported(format!(
             "unknown procedure namespace `{}` \
-             (supported: `algo`, `search`, `db.index.vector`)",
+             (supported: `algo`, `db`, `db.schema`, `db.index.vector`, `search`)",
             namespace.unwrap_or("")
         )));
     }
@@ -2811,6 +2818,133 @@ async fn flat_call_procedure(
     };
 
     project_proc_rows(&format!("algo.{name}"), &cols, raw, yield_items)
+}
+
+/// Deterministic virtual node id for one schema entity, so
+/// `db.schema.visualization()` emits stable ids across calls and releases
+/// without touching storage. Plain FNV-1a folded into 128 bits.
+fn virtual_schema_node_id(label: &str) -> NodeId {
+    let mut lo: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hi: u64 = 0x8422_2325_cbf2_9ce4;
+    for b in label.bytes() {
+        lo = (lo ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        hi = (hi ^ u64::from(b).rotate_left(17)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    NodeId::from_uuid(uuid::Uuid::from_u64_pair(hi, lo))
+}
+
+/// `CALL db.*` / `CALL db.schema.*` — Neo4j-style schema introspection.
+/// All manifest-cheap (label dict, schema, SST scopes; one sampled edge per
+/// type for endpoint inference); no data scans.
+async fn db_schema_procedure(
+    namespace: Option<&str>,
+    name: &str,
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+) -> Result<Vec<Row>, ExecError> {
+    let qualified = format!("{}.{name}", namespace.unwrap_or(""));
+    if !args.is_empty() {
+        return Err(proc_unsupported(format!(
+            "procedure `{qualified}` takes no arguments"
+        )));
+    }
+    let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match (namespace, name) {
+        (Some("db"), "labels") => (
+            vec!["label"],
+            snapshot
+                .observed_labels()
+                .into_iter()
+                .map(|l| vec![RuntimeValue::String(l)])
+                .collect(),
+        ),
+        (Some("db"), "relationshipTypes") => (
+            vec!["relationshipType"],
+            snapshot
+                .observed_edge_types()
+                .into_iter()
+                .map(|t| vec![RuntimeValue::String(t)])
+                .collect(),
+        ),
+        (Some("db"), "propertyKeys") => (
+            vec!["propertyKey"],
+            snapshot
+                .observed_property_keys()
+                .map_err(ExecError::Storage)?
+                .into_iter()
+                .map(|k| vec![RuntimeValue::String(k)])
+                .collect(),
+        ),
+        (Some("db.schema"), "visualization") => {
+            let schema = &snapshot.manifest().manifest.schema;
+            let nodes: Vec<RuntimeValue> = snapshot
+                .observed_labels()
+                .into_iter()
+                .map(|label| {
+                    let mut properties = std::collections::BTreeMap::new();
+                    properties.insert("name".to_string(), RuntimeValue::String(label.clone()));
+                    let indexes: Vec<RuntimeValue> = schema
+                        .labels
+                        .get(&label)
+                        .map(|def| {
+                            def.properties
+                                .iter()
+                                .filter(|p| p.indexed)
+                                .map(|p| RuntimeValue::String(p.name.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let constraints: Vec<RuntimeValue> = schema
+                        .constraints()
+                        .iter()
+                        .filter(|c| c.label == label)
+                        .map(|c| RuntimeValue::String(c.name.clone()))
+                        .collect();
+                    properties.insert("indexes".to_string(), RuntimeValue::List(indexes));
+                    properties.insert("constraints".to_string(), RuntimeValue::List(constraints));
+                    RuntimeValue::Node(Box::new(NodeValue {
+                        id: virtual_schema_node_id(&label),
+                        labels: BTreeSet::from([label]),
+                        properties,
+                    }))
+                })
+                .collect();
+            let endpoints = snapshot
+                .observed_edge_endpoints()
+                .await
+                .map_err(ExecError::Storage)?;
+            let relationships: Vec<RuntimeValue> = endpoints
+                .into_iter()
+                .filter_map(|e| {
+                    // A rel needs both endpoint labels; a type whose sample
+                    // could not be resolved is omitted rather than pointed
+                    // at a fabricated label.
+                    let src = e.src_label?;
+                    let dst = e.dst_label?;
+                    Some(RuntimeValue::Rel(Box::new(RelValue {
+                        edge_type: e.edge_type,
+                        src: virtual_schema_node_id(&src),
+                        dst: virtual_schema_node_id(&dst),
+                        properties: std::collections::BTreeMap::new(),
+                    })))
+                })
+                .collect();
+            (
+                vec!["nodes", "relationships"],
+                vec![vec![
+                    RuntimeValue::List(nodes),
+                    RuntimeValue::List(relationships),
+                ]],
+            )
+        }
+        _ => {
+            return Err(proc_unsupported(format!(
+                "unknown procedure `{qualified}` (available: db.labels, \
+                 db.relationshipTypes, db.propertyKeys, db.schema.visualization)"
+            )));
+        }
+    };
+    project_proc_rows(&qualified, &cols, raw, yield_items)
 }
 
 /// Project a procedure's canonical columns (`cols`) and per-row values (`raw`)

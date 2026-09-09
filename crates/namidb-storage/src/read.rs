@@ -3276,6 +3276,30 @@ impl<'mt> Snapshot<'mt> {
     /// rather than into typed columns, so the manifest has no type
     /// information to surface. Schema-introspection callers that need
     /// those still have to sample the actual data.
+    /// Every property key observable through this snapshot: declared schema
+    /// properties, SST column stats, and the memtable delta (a key written
+    /// but never flushed still counts — `db.propertyKeys()` serves this).
+    pub fn observed_property_keys(&self) -> Result<Vec<String>> {
+        use std::collections::BTreeSet;
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for label in self.observed_labels() {
+            for key in self.observed_property_types_for_label(&label).keys() {
+                set.insert(key.clone());
+            }
+        }
+        for (key, entry) in self.node_entries() {
+            let MemKey::Node { .. } = key else { continue };
+            let MemOp::Upsert(payload) = &entry.op else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            for key in record.properties.keys() {
+                set.insert(key.clone());
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
     pub fn observed_property_types_for_label(
         &self,
         label: &str,

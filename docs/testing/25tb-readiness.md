@@ -903,3 +903,103 @@ any N. Also from this report follow-up: the multi-tenant unprefixed
 `/v0/admin/queries` twins existed for flush/backup but not queries —
 added (the reporter's "never appeared in the list" is otherwise
 unreproduced: HTTP single-tenant listing verified live at 3M/5M).
+
+## Fourth field report (2026-09-09) — seven findings
+
+Recon-before-fix once more; verdicts: three CORRECTED on mechanism, the
+rest confirmed. Fix cycle targets 2.6.0.
+
+### 61. [CORRECTED — fix in progress] Process dies silently: exit 0, no log, restarts cluster in write bursts
+
+The binary has NO self-exit path and NO exit-under-memory-pressure path
+(panic=abort → 134; kernel OOM → 137/OOMKilled). Exit 0 is reachable ONLY
+through graceful shutdown, so 29 clean exits = something external (a
+userspace OOM responder / autoheal restarter) sends SIGTERM when memory
+climbs. What IS ours: that drain is near-silent (info-level only, no
+cause, no RSS/governor telemetry), always exits 0 even for a non-signal
+shutdown (swallowed ctrl_c registration errors, closed watch channels),
+and ABANDONS in-flight Bolt sessions (detached spawns nobody joins —
+the embedding-ingest path, hence "mid-query during write bursts"). And
+the documented memory-pressure 503 rail is opt-in
+(NAMIDB_MEMORY_MAX_BYTES defaults to 0=disabled) and mute (counters, no
+logs). Fix: ShutdownCause attribution at WARN with governor telemetry;
+exit 1 for non-signal shutdowns; a bounded Bolt drain barrier (connection
+permits) + awaiting the listener handle; rate-limited warns on pressure
+rejections; boot WARN when the governor is disabled under a finite
+cgroup limit.
+
+### 62. [CORRECTED — fix in progress] adjacency_cache_bytes=0; 53k-degree reverse expand doesn't finish in 300s
+
+The 0 is deliberate: adjacency is the only OPT-IN cache tier
+(NAMIDB_ADJACENCY, requests 0 bytes unless enabled) by object-native
+design; the proportional split is correct and reproduces the boot log to
+the byte. The 300s is mostly ALGORITHMIC: execute_expand re-fetches and
+re-property-decodes the full partner list per input row with no
+memoization (159,804 rows x degree 53,473 ≈ 8.5e9 row-decodes — the same
+pattern NDB-09 fixed for shortestPath), and the no-CSR inverse fallback
+hydrates O(deg) property rows even for topology-only queries. Fix: boot
+log names the disabled tier + env var; per-operator-invocation partner
+memo in both expand paths; topology-mode skips property hydration in
+edge_lookup_via_sst.
+
+### 63. [CONFIRMED — fix in progress] CREATE INDEX point lookup 70x slower than unique constraint; 4.8GB vs 574MB store
+
+The unique arm batches an entire statement into ONE storage call
+(claimant pass + one multi-value paged probe + one batch confirm); the
+non-unique arm runs PER ROW, and each lookup pays a fresh store.head() +
+a new pinned source + 4-5 SEQUENTIAL page reads with the shared range
+cache OFF by default — ~6-9 round trips per lookup, zero cross-lookup
+reuse. The 8.4x store size is CHURN FROM THE SLOWNESS itself (33min vs
+47s of periodic flush/compaction generations retained until the sweep
+horizon), not per-SST index bytes (unique writes the identical dual
+legacy+paged sidecar set). Fix: cache pinned sidecar sources per
+snapshot (kills the per-call HEAD); default-on 64MiB RAM range cache;
+batch the multi arm like the unique arm. Legacy-body default flip
+deferred (2.0.4 rollback contract); flush.rs doc contradiction fixed.
+
+### 64. [CONFIRMED — fix in progress] Nine parallel read aggregations kill the server; no admission queue
+
+No bound on concurrent query execution exists in the default config: the
+memory governor defaults OFF, the scan gate (4) meters only plans
+containing NodeScan (lookup+expand aggregations pass free), row cap is
+per-operator rows not bytes. Fix: --max-concurrent-queries semaphore
+(default max(4, cores); 0 disables) at the four read chokepoints with a
+bounded wait then retryable 503 (HTTP) / transient Bolt error; scan-gate
+waits raced against client cancellation while there.
+
+### 65. [CORRECTED — fix in progress] file:// on macOS bind mounts: Precondition failures
+
+Real, but the unstable field is the INODE, not the size (etag format is
+{inode:x}-{mtime:x}-{size:x}; the failing pair differs in field one —
+gRPC-FUSE synthesizes inode numbers and churns them across attr-cache
+evictions). Our objects are create-only UUID paths (temp+rename, never
+appended), so etag pinning adds nothing there: fix marks local stores'
+pinned sources as ImmutablePath (no If-Match), keeping the manifest-size
+integrity check and the shared cache; escape hatch env to restore
+pinning.
+
+### 66. [CORRECTED — shipped in 2.6.0] No schema introspection
+
+db.labels()/relationshipTypes()/propertyKeys() already existed — but
+only as a Bolt pre-parse shim; HTTP/Python/CLI/MCP got "unknown
+procedure namespace db", and db.schema.visualization() existed nowhere.
+Now dispatched in the ENGINE (one chokepoint serves every surface) from
+manifest-cheap observed_* snapshot data, with stable virtual node ids;
+propertyKeys unions the memtable delta.
+
+### 67. [minor gaps — fixes staged] Docker features, write-timeout, SHOW INDEXES
+
+(a) REFUTED as packaging: every 2.x tag's Dockerfile bakes
+vector-index,text-index (verified per tag), and CALL even lists
+db.index.vector on the reported image. The parse error is DIALECT: our
+DDL grammar is `CREATE VECTOR INDEX name ON :Label(prop) ...`; the
+Neo4j spelling `... FOR (n:L) ON n.prop OPTIONS {...}` fails at
+expect(ON). Fix: accept the Neo4j form too + a feature-aware message
+when built without the feature. (b) --write-timeout has no own default
+(inherits --query-timeout=30s); gets its own 60s default + README rows
+(the durability tail is bounded since 2.5.x, so a longer default is
+safe). (c) SHOW INDEXES returned [] when only unique constraints exist —
+shipped in 2.6.0: single-property unique constraints appear as their
+backing RANGE index (constraint-named; one sidecar one row); composite
+unique constraints deliberately absent (tuple-scan enforced, no backing
+structure).

@@ -565,6 +565,20 @@ async fn run_statement(writer: &mut WriterSession, statement: &str) -> anyhow::R
         return Ok(());
     }
 
+    // SHOW CONSTRAINTS / SHOW INDEXES never lower to a plan; intercept them
+    // like every other surface does (the CLI previously errored on them).
+    if let Some(c) = q.as_show_schema() {
+        use namidb_query::parser::ast::ShowKind;
+        let snap = writer.snapshot();
+        let manifest = &snap.manifest().manifest;
+        let rows = match c.kind {
+            ShowKind::Constraints => namidb_query::show_constraints_rows(&manifest.schema),
+            ShowKind::Indexes => namidb_query::show_indexes_rows(manifest),
+        };
+        print_rows(&rows);
+        return Ok(());
+    }
+
     // The catalog is rebuilt per statement: an earlier DDL or write in the
     // same script changes what the optimizer should know.
     let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
