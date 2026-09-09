@@ -846,6 +846,7 @@ where
 /// Private endpoints (auth required):
 /// - `/:namespace/v0/cypher` - execute Cypher queries
 /// - `/:namespace/v0/admin/flush` - manual flush
+/// - `/:namespace/v0/admin/compact` - drain L0 and block until done
 pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     shared
         .memory
@@ -4052,12 +4053,17 @@ async fn admin_compact(
         )
             .into_response();
     }
-    let Ok(_permit) =
-        tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_flush_permit()).await
+    // Its OWN gate: a drain legitimately runs for minutes, and sharing the
+    // flush gate would hold the memory-pressure escape hatch shut for all of
+    // it. Bound to a named permit so it lives for the whole drain — `_` would
+    // drop it immediately and defeat the single-flight entirely.
+    let Ok(_compact_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_compact_permit()).await
     else {
         return admin_compact_busy_response();
     };
     match maintenance::drain_compaction(
+        &state.compaction_scheduler,
         &state.writer,
         &state.snapshot,
         &state.writer_health,
@@ -4121,24 +4127,54 @@ async fn dispatch_admin_compact_multi(
         )
             .into_response();
     }
-    let ns_state = match shared.registry.get_or_open(namespace).await {
-        Ok(ns) => ns,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let Ok(_permit) =
-        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.memory.admin_flush_permit()).await
+    let Ok(_compact_permit) =
+        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.memory.admin_compact_permit()).await
     else {
         return admin_compact_busy_response();
     };
+    // This route bypasses query admission, so refresh the gauge and refuse to
+    // recover a COLD namespace while over the ceiling: unlike a flush, a drain
+    // releases nothing, so opening a cold writer here would only add memory
+    // while the process is already refusing work.
+    let _ = shared.memory.sample();
+    let ns_state = if shared.memory.over_limit() {
+        match shared.registry.get_if_open(namespace).await {
+            Some(ns) => ns,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: format!(
+                            "process memory pressure: namespace '{namespace}' is not open; \
+                             refusing to recover a cold writer for admin compact"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match shared.registry.get_or_open(namespace).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    // A namespace retired while we waited for the permit must not be revived
+    // by this drain: the replacement writer owns the manifest now, and
+    // compacting through the retired handle would install over it.
+    if ns_state.is_retired() {
+        return namespace_retired_response();
+    }
     match maintenance::drain_compaction(
+        &ns_state.compaction_scheduler,
         &ns_state.writer,
         &ns_state.snapshot,
         &ns_state.writer_health,

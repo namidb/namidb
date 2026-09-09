@@ -680,9 +680,24 @@ pub struct ProjectionItem {
 /// `DiscardResult` statements), leaving the caller on its existing fallback.
 pub fn output_columns(plan: &LogicalPlan) -> Option<Vec<String>> {
     match plan {
-        LogicalPlan::Project { items, .. } => {
-            Some(items.iter().map(|item| item.alias.clone()).collect())
-        }
+        // Only a RETURN projection describes the whole result. A WITH
+        // (`discard_input_bindings: false`) deliberately keeps the input's
+        // bindings live alongside its own, so its item list is a subset of
+        // the row and naming it as the result would drop columns.
+        LogicalPlan::Project {
+            items,
+            discard_input_bindings: true,
+            ..
+        } => Some(items.iter().map(|item| item.alias.clone()).collect()),
+        // `CALL … YIELD a, b` binds the yielded names in clause order. An
+        // empty yield list means "the procedure's canonical columns", which
+        // are not known here, so the caller keeps its fallback.
+        LogicalPlan::CallProcedure { yield_items, .. } if !yield_items.is_empty() => Some(
+            yield_items
+                .iter()
+                .map(|(_source, binding)| binding.clone())
+                .collect(),
+        ),
         // Ordering, deduplication and filtering rearrange or drop rows; none
         // of them adds, removes or renames a column.
         LogicalPlan::TopN { input, .. }

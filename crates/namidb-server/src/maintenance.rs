@@ -348,6 +348,12 @@ pub(crate) struct DrainSummary {
     /// True when the drain stopped on its pass bound rather than because
     /// nothing was left to merge — the caller should run it again.
     pub truncated: bool,
+    /// Set when a pass failed after earlier passes had already committed. The
+    /// committed work is real and is reported; the caller decides whether to
+    /// retry. Reporting a 500 here would throw away a true account of what
+    /// landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Bound on passes for one drain request, so a pathological churn rate
@@ -362,6 +368,7 @@ const MAX_DRAIN_PASSES: usize = 128;
 /// periodic scheduler is deliberately incremental (one bucket per tick), so
 /// there was no way to ask for it.
 pub(crate) async fn drain_compaction(
+    scheduler: &CompactionScheduler,
     writer: &Mutex<WriterSession>,
     snapshot: &SnapshotCell,
     writer_health: &WriterHealth,
@@ -371,7 +378,17 @@ pub(crate) async fn drain_compaction(
 ) -> namidb_storage::Result<DrainSummary> {
     let mut summary = DrainSummary::default();
     for pass in 0..MAX_DRAIN_PASSES {
-        match run_compaction_pass(
+        // Same exclusion the scheduler takes around every pass. Without it a
+        // concurrent orphan sweep can delete an object this pass is about to
+        // reference: the drain reaches the same storage by the same route, so
+        // it needs the same guard. Re-acquired per pass so a queued janitor
+        // is not starved for the whole drain.
+        let _maintenance_guard = scheduler.compaction_guard().await;
+        if is_cancelled(cancel) {
+            summary.observe_idle(writer).await;
+            return Ok(summary);
+        }
+        let attempt = run_compaction_pass(
             CompactionTrigger::Admin,
             writer,
             snapshot,
@@ -380,13 +397,13 @@ pub(crate) async fn drain_compaction(
             metrics,
             cancel,
         )
-        .await?
-        {
-            CompactionPass::Applied {
+        .await;
+        match attempt {
+            Ok(CompactionPass::Applied {
                 outcome,
                 l0_before,
                 l0_after,
-            } => {
+            }) => {
                 if pass == 0 {
                     summary.l0_before = l0_before;
                 }
@@ -396,20 +413,41 @@ pub(crate) async fn drain_compaction(
                 summary.new_ssts_written += outcome.new_ssts_written;
                 summary.manifest_version = outcome.committed.manifest.version;
             }
-            CompactionPass::Noop | CompactionPass::Cancelled => {
-                if pass == 0 {
-                    let guard = writer.lock().await;
-                    let basis = guard.compaction_basis();
-                    summary.l0_before = basis.max_l0_bucket_len();
-                    summary.l0_after = summary.l0_before;
-                    summary.manifest_version = guard.snapshot().manifest().manifest.version;
-                }
+            Ok(CompactionPass::Noop | CompactionPass::Cancelled) => {
+                // Read the depth back rather than trusting the last applied
+                // pass: concurrent flushes may have refilled L0 since, and a
+                // script that polls until `l0_after == 0` must not be told 0
+                // while files are already stacking up again.
+                summary.observe_idle(writer).await;
                 return Ok(summary);
             }
+            // A pass can lose the manifest install race to a concurrent
+            // writer. Whatever earlier passes committed is durable and real,
+            // so report it instead of turning the whole drain into a 500 that
+            // implies nothing happened.
+            Err(error) if summary.passes > 0 => {
+                summary.error = Some(error.to_string());
+                summary.observe_idle(writer).await;
+                return Ok(summary);
+            }
+            Err(error) => return Err(error),
         }
     }
     summary.truncated = true;
     Ok(summary)
+}
+
+impl DrainSummary {
+    /// Record the L0 depth and manifest version actually visible now.
+    async fn observe_idle(&mut self, writer: &Mutex<WriterSession>) {
+        let guard = writer.lock().await;
+        let observed = guard.compaction_basis().max_l0_bucket_len();
+        if self.passes == 0 {
+            self.l0_before = observed;
+        }
+        self.l0_after = observed;
+        self.manifest_version = guard.snapshot().manifest().manifest.version;
+    }
 }
 
 /// Run one compaction attempt without holding the writer mutex across its
@@ -984,7 +1022,9 @@ mod tests {
         }
         assert_eq!(state.writer.lock().await.max_l0_bucket_len(), 4);
 
+        let scheduler = CompactionScheduler::new();
         let summary = drain_compaction(
+            &scheduler,
             &state.writer,
             &state.snapshot,
             &state.writer_health,
@@ -1037,7 +1077,9 @@ mod tests {
         let state = AppState::new(writer, None, "maintenance-drain-clean".into());
         commit_and_flush(&state, NodeId::new(), "only").await;
 
+        let scheduler = CompactionScheduler::new();
         let summary = drain_compaction(
+            &scheduler,
             &state.writer,
             &state.snapshot,
             &state.writer_health,
@@ -1073,7 +1115,9 @@ mod tests {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         cancel_tx.send_replace(true);
+        let scheduler = CompactionScheduler::new();
         let summary = drain_compaction(
+            &scheduler,
             &state.writer,
             &state.snapshot,
             &state.writer_health,
@@ -1087,5 +1131,63 @@ mod tests {
         assert_eq!(summary.passes, 0);
         assert_eq!(summary.l0_before, 4, "the observed depth is still reported");
         assert!(!summary.truncated);
+    }
+
+    /// The drain must take the same janitor exclusion the scheduler takes.
+    /// Without it an orphan sweep can delete an object a pass is about to
+    /// reference — the drain reaches the same storage by the same route, so
+    /// it needs the same guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_drain_waits_for_an_in_progress_orphan_sweep() {
+        let (store, paths) = namidb_storage::parse_uri("memory://maintenance-drain-sweep").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = Arc::new(AppState::new(
+            writer,
+            None,
+            "maintenance-drain-sweep".into(),
+        ));
+        for i in 0..4 {
+            commit_and_flush(&state, NodeId::new(), &format!("n{i}")).await;
+        }
+        let scheduler = Arc::new(CompactionScheduler::new());
+
+        // Hold the sweep (write) guard, as a janitor listing orphans would.
+        let sweep = scheduler.sweep_guard().await;
+
+        let drain_state = Arc::clone(&state);
+        let drain_scheduler = Arc::clone(&scheduler);
+        let drain = tokio::spawn(async move {
+            drain_compaction(
+                &drain_scheduler,
+                &drain_state.writer,
+                &drain_state.snapshot,
+                &drain_state.writer_health,
+                &drain_state.namespace,
+                &drain_state.metrics,
+                None,
+            )
+            .await
+        });
+
+        // While the sweep holds the gate the drain must not compact.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !drain.is_finished(),
+            "the drain must wait for the orphan sweep instead of compacting under it"
+        );
+        assert_eq!(
+            state.writer.lock().await.max_l0_bucket_len(),
+            4,
+            "no pass may have installed while the sweep held the gate"
+        );
+
+        drop(sweep);
+        let summary = tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("the drain must proceed once the sweep releases")
+            .expect("drain task must not panic")
+            .expect("drain must succeed");
+        assert_eq!(summary.l0_after, 0);
+        assert!(summary.passes >= 1);
     }
 }

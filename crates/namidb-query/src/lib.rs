@@ -50,9 +50,6 @@ pub use plan::{
     LogicalPlan, LowerError, LowerErrorKind, RuntimeStats,
 };
 
-/// Lower + optimize. The convenience entry point that the executor and
-/// CLI use by default. Tests that need the raw lowering should call
-/// [`lower`] directly. RFC-011 §1.
 /// The result column list for a finished statement, in `RETURN` order.
 ///
 /// Rows are `BTreeMap`s, so the column list read off a row is sorted by name:
@@ -72,10 +69,19 @@ pub fn result_columns(plan: &LogicalPlan, rows: &[Row]) -> Vec<String> {
     let Some(ordered) = output_columns(plan) else {
         return from_rows();
     };
+    // A duplicate alias (`RETURN n AS x, n AS x`) makes the plan list a
+    // multiset while a row is a set, so no comparison against the row can be
+    // trusted: with `ordered = [x, x]` and bindings `{x, y}` a length-plus-
+    // containment test passes while silently dropping `y`. Hand those back to
+    // the row keys, which are at least self-consistent.
+    let distinct: std::collections::BTreeSet<&String> = ordered.iter().collect();
+    if distinct.len() != ordered.len() {
+        return from_rows();
+    }
     match rows.first() {
         None => ordered,
         Some(first) => {
-            let describes_rows = ordered.len() == first.bindings.len()
+            let describes_rows = distinct.len() == first.bindings.len()
                 && ordered.iter().all(|name| first.bindings.contains_key(name));
             if describes_rows {
                 ordered
@@ -86,6 +92,9 @@ pub fn result_columns(plan: &LogicalPlan, rows: &[Row]) -> Vec<String> {
     }
 }
 
+/// Lower + optimize. The convenience entry point that the executor and
+/// CLI use by default. Tests that need the raw lowering should call
+/// [`lower`] directly. RFC-011 §1.
 pub fn plan(query: &Query, catalog: &StatsCatalog) -> Result<LogicalPlan, LowerError> {
     Ok(optimize(lower(query)?, catalog))
 }

@@ -59,7 +59,7 @@ jobs:
       - name: clippy (vector-index + text-index)
         run: |
           cargo clippy --locked -p namidb-storage -p namidb-query -p namidb-server \
-            --lib --tests --features vector-index,text-index \
+            -p namidb-bench --lib --tests --features vector-index,text-index \
             -- -D warnings -A clippy::doc_lazy_continuation
 
   test:

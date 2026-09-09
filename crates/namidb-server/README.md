@@ -163,6 +163,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `GET`  | `/v0/metrics`      | public  | Prometheus metrics (text exposition) |
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
+| `POST` | `/v0/admin/compact` | bearer | Drain L0 completely and block until done; outside the request timeout, single-flighted on its own permit. Run it after a bulk load |
 | `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
 
 ### `POST /v0/admin/backup`

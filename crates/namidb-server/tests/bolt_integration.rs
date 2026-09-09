@@ -526,6 +526,62 @@ async fn run_pull(stream: &mut TcpStream, cypher: &str) -> (Vec<String>, Vec<Row
     }
 }
 
+/// Send `RUN` + `PULL` and return `(fields, raw_record_values)` WITHOUT
+/// re-keying by name.
+///
+/// [`run_pull`] zips fields with values into a map, which makes every test
+/// blind to the one property Bolt actually guarantees: that `fields[i]` names
+/// `record[i]`. A change that reorders the field list without reordering the
+/// values would keep every existing Bolt test green while handing drivers
+/// correctly-labelled headers over mismatched data.
+async fn run_pull_positional(
+    stream: &mut TcpStream,
+    cypher: &str,
+) -> (Vec<String>, Vec<Vec<Value>>) {
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String(cypher.into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(stream, &pack(&run)).await;
+    let fields = match recv_msg(stream).await {
+        Response::Success(meta) => match meta.get("fields") {
+            Some(Value::List(items)) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("head SUCCESS missing fields list"),
+        },
+        other => panic!("expected head SUCCESS, got {other:?}"),
+    };
+    let pull = Value::Struct {
+        tag: struct_tag::PULL,
+        fields: vec![Value::Map({
+            let mut m = BTreeMap::new();
+            m.insert("n".into(), Value::Int(-1));
+            m
+        })],
+    };
+    send_msg(stream, &pack(&pull)).await;
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    loop {
+        match recv_msg(stream).await {
+            Response::Record(values) => rows.push(values),
+            Response::Success(_) => return (fields, rows),
+            other => panic!("unexpected message during PULL stream: {other:?}"),
+        }
+        if rows.len() > 10_000 {
+            panic!("runaway result set");
+        }
+    }
+}
+
 async fn goodbye(stream: &mut TcpStream) {
     let bye = Value::Struct {
         tag: struct_tag::GOODBYE,
@@ -1973,5 +2029,45 @@ async fn bolt_neo4j_type_introspection_and_counters() {
 
     goodbye(&mut stream).await;
     stream.shutdown().await.ok();
+    task.abort();
+}
+
+/// Bolt guarantees `fields[i]` names `record[i]`. The field list is now
+/// ordered by the RETURN clause rather than by a `BTreeMap`'s key order, so
+/// this asserts the values moved with it — reading raw record positions
+/// instead of re-keying by name, which is what hid the question until now.
+#[tokio::test]
+async fn bolt_fields_are_return_order_and_values_line_up_positionally() {
+    let (bolt_addr, task) = boot_bolt("bolt-field-order", Duration::ZERO).await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    // Deliberately anti-alphabetical: sorted order would be [a, b, c] and
+    // would pair every value with the wrong name.
+    let (fields, rows) = run_pull_positional(&mut stream, "RETURN 3 AS c, 1 AS a, 2 AS b").await;
+    assert_eq!(
+        fields,
+        vec!["c".to_string(), "a".to_string(), "b".to_string()],
+        "fields must follow the RETURN clause"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        vec![Value::Int(3), Value::Int(1), Value::Int(2)],
+        "record values must be in the same order as the fields that name them"
+    );
+
+    // The same property with ORDER BY / LIMIT above the projection, and with
+    // values that make a desync unambiguous.
+    let (fields, rows) = run_pull_positional(
+        &mut stream,
+        "UNWIND [10, 20] AS n RETURN n AS zulu, n * 100 AS alpha ORDER BY zulu DESC LIMIT 1",
+    )
+    .await;
+    assert_eq!(fields, vec!["zulu".to_string(), "alpha".to_string()]);
+    assert_eq!(rows[0], vec![Value::Int(20), Value::Int(2000)]);
+
+    goodbye(&mut stream).await;
     task.abort();
 }

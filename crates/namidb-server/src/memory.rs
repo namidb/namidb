@@ -34,9 +34,27 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 /// How long an unbroken run of refused admissions has to last before it stops
 /// reading as a transient spike and starts being logged as an outage.
 const SUSTAINED_PRESSURE_SECS: u64 = 10;
+/// A rejection run ends when nothing has been refused for this long. Sized
+/// well above the one-second logging window so an ordinary retry cadence
+/// keeps a genuine outage's run alive.
+const STREAK_GAP_SECS: u64 = 5;
 /// How many in-flight statements a pressure line names, and how much of each.
 const PRESSURE_HOLDERS_LOGGED: usize = 3;
 const PRESSURE_STATEMENT_CHARS: usize = 160;
+
+/// Cut a statement to at most [`PRESSURE_STATEMENT_CHARS`] CHARACTERS.
+///
+/// `String::truncate` takes a BYTE offset and panics when it lands inside a
+/// multi-byte character — and the release profile sets `panic = "abort"`, so
+/// on a non-ASCII statement that would have killed the process from the
+/// memory-rejection path: a crash introduced by the very diagnostic meant to
+/// explain crashes. Counting characters cannot land mid-character.
+fn clamp_statement(statement: &str) -> String {
+    match statement.char_indices().nth(PRESSURE_STATEMENT_CHARS) {
+        Some((byte_offset, _)) => format!("{}…", &statement[..byte_offset]),
+        None => statement.to_string(),
+    }
+}
 
 /// Parse an exact-byte process ceiling or resolve `auto` from the current
 /// container's finite cgroup memory limit.
@@ -199,6 +217,9 @@ pub struct MemoryGovernor {
     /// [`SUSTAINED_PRESSURE_SECS`] stops being a transient spike and starts
     /// being an outage, and is logged as one.
     rejection_streak_started_secs: AtomicU64,
+    /// When the last refusal arrived, so a run can expire on a quiet gap
+    /// rather than on a single successful admission.
+    last_rejection_secs: AtomicU64,
     /// In-flight statements, for naming the queries that are actually holding
     /// the memory when an admission is refused. Set once at server start;
     /// absent in embedded/unit contexts, which simply log without statements.
@@ -207,6 +228,12 @@ pub struct MemoryGovernor {
     /// passed RSS admission but have not finished decode/execution yet.
     reserved_headroom_bytes: AtomicUsize,
     admin_flush_gate: Arc<tokio::sync::Semaphore>,
+    /// Compaction drains get their OWN single-flight gate. Sharing the flush
+    /// gate would let an operator drain — which legitimately runs for minutes
+    /// — hold the memory-pressure escape hatch shut for its whole duration,
+    /// so the one operation that relieves pressure would be unavailable
+    /// exactly while the server was under it.
+    admin_compact_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// RAII reservation against [`MemoryGovernor`]'s total-memory ceiling.
@@ -248,9 +275,11 @@ impl MemoryGovernor {
             created_at: Instant::now(),
             last_rejection_warn_secs: AtomicU64::new(0),
             rejection_streak_started_secs: AtomicU64::new(0),
+            last_rejection_secs: AtomicU64::new(0),
             query_registry: std::sync::OnceLock::new(),
             reserved_headroom_bytes: AtomicUsize::new(0),
             admin_flush_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            admin_compact_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -281,7 +310,6 @@ impl MemoryGovernor {
             self.note_rejection(&pressure);
             return Err(pressure);
         }
-        self.clear_rejection_streak();
         Ok(())
     }
 
@@ -335,10 +363,28 @@ impl MemoryGovernor {
     }
 
     /// Extend the current rejection run and return its length in seconds.
-    /// Claiming 0 -> now starts a run; a racing caller reads the winner's
-    /// start instead of resetting it, so a burst cannot keep the run at zero.
+    ///
+    /// A run continues only while refusals keep ARRIVING: if nothing was
+    /// refused for [`STREAK_GAP_SECS`], the next refusal starts a fresh run.
+    /// Two failure modes make that the right rule rather than the obvious
+    /// ones. Ending the run on any successful admission looks correct and
+    /// isn't: under partial pressure some requests still succeed, so a real
+    /// outage would be reset continuously and never escalate. Never expiring
+    /// it is equally wrong in the other direction: one transient refusal, then
+    /// hours of healthy service, then a second refusal would be reported as a
+    /// multi-hour sustained outage. Gap-based expiry is the only one of the
+    /// three that reports both cases honestly.
     fn note_rejection_streak(&self) -> u64 {
         let now = self.now_secs();
+        let previous = self.last_rejection_secs.swap(now, Ordering::Relaxed);
+        let continuing = previous != 0 && now.saturating_sub(previous) <= STREAK_GAP_SECS;
+        if !continuing {
+            self.rejection_streak_started_secs
+                .store(now, Ordering::Relaxed);
+            return 0;
+        }
+        // Claiming 0 -> now starts a run; a racing caller reads the winner's
+        // start instead of resetting it, so a burst cannot pin the run at zero.
         match self.rejection_streak_started_secs.compare_exchange(
             0,
             now,
@@ -348,12 +394,6 @@ impl MemoryGovernor {
             Ok(_) => 0,
             Err(started) => now.saturating_sub(started),
         }
-    }
-
-    /// End the current rejection run: the ceiling is admitting work again.
-    fn clear_rejection_streak(&self) {
-        self.rejection_streak_started_secs
-            .store(0, Ordering::Relaxed);
     }
 
     /// The longest-running in-flight statements, which are the ones actually
@@ -371,9 +411,13 @@ impl MemoryGovernor {
             .into_iter()
             .take(PRESSURE_HOLDERS_LOGGED)
             .map(|q| {
-                let mut statement = q.statement;
-                statement.truncate(PRESSURE_STATEMENT_CHARS);
-                format!("[{}ms {} {}]", q.elapsed_ms, q.protocol, statement)
+                format!(
+                    "[{}ms {} {} {}]",
+                    q.elapsed_ms,
+                    q.protocol,
+                    q.namespace,
+                    clamp_statement(&q.statement)
+                )
             })
             .collect();
         if total > named.len() {
@@ -459,7 +503,6 @@ impl MemoryGovernor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.clear_rejection_streak();
                     return Ok(MemoryHeadroomReservation {
                         governor: Arc::clone(self),
                         bytes: additional_bytes,
@@ -651,6 +694,18 @@ impl MemoryGovernor {
                 }
             }
         })
+    }
+
+    /// Serialize operator-requested compaction drains process-wide, on a gate
+    /// of their own so a minutes-long drain never blocks the flush that
+    /// relieves memory pressure.
+    pub(crate) async fn admin_compact_permit(
+        self: &Arc<Self>,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.admin_compact_gate)
+            .acquire_owned()
+            .await
+            .expect("admin compact gate is never closed")
     }
 
     /// Serialize operator-requested flushes process-wide.
@@ -1168,30 +1223,122 @@ mod tests {
         );
     }
 
-    /// The run starts at zero and grows; a successful admission ends it, so a
-    /// recovered server does not keep logging at ERROR.
+    /// A run starts at zero and is measured from its start, not restarted by
+    /// each new refusal.
     #[test]
-    fn rejection_streak_starts_at_zero_and_clears_on_admission() {
+    fn rejection_streak_starts_at_zero_and_measures_from_its_start() {
         let governor = MemoryGovernor::new(1);
         assert_eq!(governor.note_rejection_streak(), 0, "a new run starts at 0");
-        // A second refusal within the same second is still the same run, and
-        // still measured from the run's start rather than restarting it.
-        assert_eq!(governor.note_rejection_streak(), 0);
-        assert_ne!(
-            governor
-                .rejection_streak_started_secs
-                .load(Ordering::Relaxed),
-            0,
-            "an active run must record its start"
-        );
+        let started = governor
+            .rejection_streak_started_secs
+            .load(Ordering::Relaxed);
+        assert_ne!(started, 0, "an active run must record its start");
 
-        governor.clear_rejection_streak();
+        // A second refusal within the gap is the SAME run: the start is
+        // preserved, so the run can grow to the escalation threshold.
+        assert_eq!(governor.note_rejection_streak(), 0);
         assert_eq!(
             governor
                 .rejection_streak_started_secs
                 .load(Ordering::Relaxed),
+            started,
+            "a continuing refusal must not restart the run"
+        );
+    }
+
+    /// A quiet gap ends a run. One transient refusal, a long healthy period,
+    /// then another refusal must NOT be reported as a multi-hour outage.
+    #[test]
+    fn a_quiet_gap_ends_the_rejection_run() {
+        let governor = MemoryGovernor::new(1);
+        assert_eq!(governor.note_rejection_streak(), 0);
+        let first_start = governor
+            .rejection_streak_started_secs
+            .load(Ordering::Relaxed);
+
+        // Backdate both clocks well past the gap, as an idle hour would.
+        let long_ago = governor.now_secs().saturating_sub(3_600);
+        governor
+            .rejection_streak_started_secs
+            .store(long_ago, Ordering::Relaxed);
+        governor
+            .last_rejection_secs
+            .store(long_ago, Ordering::Relaxed);
+
+        assert_eq!(
+            governor.note_rejection_streak(),
             0,
-            "admitting work again must end the run"
+            "a refusal after a long quiet gap starts a NEW run, not a 3600s one"
+        );
+        assert!(
+            governor
+                .rejection_streak_started_secs
+                .load(Ordering::Relaxed)
+                >= first_start,
+            "the new run must be stamped now, not left in the past"
+        );
+    }
+
+    /// A successful admission must NOT end a run: under partial pressure some
+    /// requests still succeed, and resetting on those would mean a real
+    /// outage never escalates.
+    #[tokio::test]
+    async fn a_successful_admission_does_not_end_the_rejection_run() {
+        // Ceiling 0 disables the governor, so admission always succeeds.
+        let governor = Arc::new(MemoryGovernor::new(0));
+        governor.note_rejection_streak();
+        let started = governor
+            .rejection_streak_started_secs
+            .load(Ordering::Relaxed);
+        assert_ne!(started, 0);
+
+        governor
+            .admit_query()
+            .await
+            .expect("disabled governor admits");
+        let _reservation = governor
+            .reserve_query_headroom(1)
+            .await
+            .expect("disabled governor reserves");
+
+        assert_eq!(
+            governor
+                .rejection_streak_started_secs
+                .load(Ordering::Relaxed),
+            started,
+            "an interleaved success must leave the run intact"
+        );
+    }
+
+    /// The statement clamp counts CHARACTERS. `String::truncate` takes a byte
+    /// offset and panics inside a multi-byte character, and release builds
+    /// abort on panic — so a Spanish statement would have killed the process
+    /// from the memory-rejection path.
+    #[test]
+    fn statement_clamp_never_splits_a_multibyte_character() {
+        // Every character is multi-byte, so a byte-offset cut is near-certain
+        // to land mid-character.
+        let statement = "ñ".repeat(PRESSURE_STATEMENT_CHARS * 2);
+        let clamped = clamp_statement(&statement);
+        assert!(clamped.ends_with('…'), "an elided statement must say so");
+        assert_eq!(
+            clamped.chars().filter(|c| *c == 'ñ').count(),
+            PRESSURE_STATEMENT_CHARS
+        );
+
+        // A realistic accented query, and the boundary cases.
+        let accented = format!(
+            "MATCH (p:PRODUCTO) WHERE p.descripción = 'ñandú' RETURN p{}",
+            "á".repeat(PRESSURE_STATEMENT_CHARS)
+        );
+        assert!(clamp_statement(&accented).ends_with('…'));
+        assert_eq!(clamp_statement("corta"), "corta");
+        assert_eq!(clamp_statement(""), "");
+        let exact = "é".repeat(PRESSURE_STATEMENT_CHARS);
+        assert_eq!(
+            clamp_statement(&exact),
+            exact,
+            "a statement exactly at the limit is not elided"
         );
     }
 }

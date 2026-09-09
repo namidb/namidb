@@ -15,6 +15,47 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- `POST /v0/admin/compact` drains L0 completely and blocks until the drain has
+  landed, with `POST /:namespace/v0/admin/compact` and default-namespace twins.
+  Background compaction is deliberately incremental (one bucket per tick),
+  which is right in steady state and wrong right after a bulk load: an L0 left
+  hundreds of files deep makes the next load an order of magnitude slower, and
+  there was no way to ask the server to catch up. Write-role gated,
+  single-flighted on its own permit, and registered outside the HTTP request
+  timeout because a real drain runs for minutes. Responds with a JSON summary
+  (`passes`, `l0_before`, `l0_after`, `source_ssts_removed`,
+  `new_ssts_written`, `manifest_version`, `truncated`, and `error` when a pass
+  failed after earlier ones had already committed).
+- Compaction metrics gained an `admin` trigger label, so operator-requested
+  drains are attributable in `/v0/metrics` alongside `periodic`/`reactive`/`ddl`.
+
+### Fixed
+
+- **Result columns now follow the `RETURN` clause instead of being sorted by
+  name.** Rows are a `BTreeMap`, and every surface derived its column list by
+  iterating one, so `RETURN 3 AS c, 1 AS a, 2 AS b` reported `[a, b, c]`. Bolt
+  is positional by protocol and the Python client's `to_arrow`/`to_pandas`/
+  `to_polars` carry the order into a dataframe, so any client reading a result
+  positionally received the wrong column. The order is now taken from the
+  plan's projection and applied defensively — it can only reorder, never
+  rename or drop. HTTP, Bolt, the embedded Python client and the CLI now share
+  one implementation. Statements with no rows report the result shape instead
+  of an empty column list.
+- Sustained memory-pressure rejection now logs at ERROR and names the
+  longest-running in-flight statements. A run of refusals that lasts is an
+  outage rather than a spike, and previously every pressure diagnostic was a
+  WARN phrased without the words an operator greps for, so a memory-driven
+  restart looked like a process that died for no reason. The refused query is
+  usually innocent; the statements already inside are what hold the memory.
+- A feature-gated compaction test called
+  `node_descriptor_needs_non_record_migration` with a stale argument count.
+  Only the `vector-index`+`text-index` job compiled it, so it broke that job
+  across several commits while the default jobs stayed green; clippy now
+  type-checks that feature combination too.
+
+
 ## [2.6.2] - 2026-09-09
 
 **Fixed**
