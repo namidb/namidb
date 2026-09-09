@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.3] - 2026-09-09
+
 ### Added
 
 - `POST /v0/admin/compact` drains L0 completely and blocks until the drain has
@@ -3171,7 +3173,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.2...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.3...HEAD
+[2.6.3]: https://github.com/namidb/namidb/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/namidb/namidb/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/namidb/namidb/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/namidb/namidb/compare/v2.5.1...v2.6.0
