@@ -15,6 +15,29 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+**Fixed**
+- A label-disjunction source defeated the anchor inversion: `MATCH
+  (o:OFERTA|PROMOCION)-[:VIGENTE_EN]->(f:FECHA {fecha: X})` re-scanned
+  the WHOLE namespace and walked every edge per date (a fifth field
+  report measured 20s per date — worse than the unanchored 156s form),
+  because the disjunction lowers to an unlabeled scan behind an OR
+  label filter the pass refused to cost. The inversion now sees through
+  a PURE label disjunction (its selectivity is the sum of the disjunct
+  labels — as knowable as a labeled scan), anchors at the dated target,
+  and re-attaches the OR filter over the anchor's small neighbourhood.
+  Arbitrary source filters still block the inversion as before.
+- `count(DISTINCT p)` deep-cloned the whole node value — property map,
+  embedding vectors and all — once per input row just to fingerprint 16
+  bytes of identity (~1GB of transient allocation on a 160k-row
+  aggregation over vector-bearing nodes). Bare-variable aggregate
+  arguments now borrow the row's binding; dedup semantics are unchanged
+  and were already by IDENTITY (same node id with different property
+  maps is one distinct entity — now pinned by test). The fifth field
+  report's 230s/117s `count(DISTINCT ...)` deaths themselves were the
+  pre-2.6.0 per-row lookup pathology (fixed in 2.6.0 by #168/#169) —
+  verified unreproducible on 2.6.0 across cardinalities, value shapes,
+  and storage tiers.
+
 ## [2.6.0] - 2026-09-09
 
 **Added**

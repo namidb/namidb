@@ -265,3 +265,98 @@ async fn static_path_assembly_is_identical_across_spellings() {
     );
     let _ = fast;
 }
+
+/// Fifth field report: `(o:OFERTA|PROMOCION)-[:VIGENTE_EN]->(f:FECHA
+/// {fecha: X})` used to re-scan the whole namespace per date because the
+/// label-disjunction source hid its scan behind an OR filter the anchor
+/// inversion refused. The full pipeline must now plan the f-anchor, keep
+/// the disjunction as a residual filter, and match the un-inverted
+/// results exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disjunction_source_anchors_at_the_dated_target() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("anchor-disj").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    let mut fechas = Vec::new();
+    for d in 0..30 {
+        let id = NodeId::new();
+        fechas.push(id);
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("fecha".into(), CoreValue::Str(format!("d{d}")));
+        writer
+            .upsert_node(
+                "FECHA",
+                id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let edge = EdgeWriteRecord {
+        properties: BTreeMap::new(),
+        schema_version: 1,
+    };
+    // 40 ofertas + 20 promociones, each valid on (ordinal % 30).
+    for ordinal in 0..60 {
+        let label = if ordinal < 40 { "OFERTA" } else { "PROMOCION" };
+        let id = NodeId::new();
+        writer
+            .upsert_node(
+                label,
+                id,
+                &NodeWriteRecord {
+                    properties: BTreeMap::new(),
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        writer
+            .upsert_edge("VIGENTE_EN", id, fechas[ordinal % 30], &edge)
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .create_unique_constraint("FECHA", "fecha")
+        .await
+        .unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let query = "MATCH (o:OFERTA|PROMOCION)-[:VIGENTE_EN]->(f:FECHA {fecha: 'd7'}) \
+                 RETURN count(o) AS n";
+    let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+    fn has_f_anchor(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::NodeByPropertyValue { alias, .. } if alias == "f")
+            || plan.children().into_iter().any(has_f_anchor)
+    }
+    fn has_unlabeled_scan(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::NodeScan { label: None, .. })
+            || plan.children().into_iter().any(has_unlabeled_scan)
+    }
+    assert!(
+        has_f_anchor(&plan),
+        "the dated target must anchor the disjunction pattern: {plan:?}"
+    );
+    assert!(
+        !has_unlabeled_scan(&plan),
+        "the whole-namespace scan must be gone: {plan:?}"
+    );
+
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    // ordinal % 30 == 7 -> ordinals 7 and 37: both OFERTA. Plus none from
+    // PROMOCION (40..59 -> %30 in 10..29): 37 is OFERTA, 47 -> d17. So d7
+    // matches ordinals 7 and 37 = 2.
+    assert!(
+        matches!(
+            rows[0].get("n"),
+            Some(namidb_query::RuntimeValue::Integer(2))
+        ),
+        "{rows:?}"
+    );
+}
