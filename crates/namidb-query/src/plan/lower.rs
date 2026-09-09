@@ -245,38 +245,66 @@ fn lower_clause_seq(
             }
             // `CREATE VECTOR INDEX` is schema DDL, not a query operator: the
             // server intercepts a standalone one before lowering (see
-            // `Query::as_create_vector_index`). Reaching this arm means the
-            // DDL was combined with other clauses or lowered directly via the
-            // library API — reject it rather than silently dropping it.
+            // `Query::as_create_vector_index`). With the feature compiled in,
+            // reaching this arm means the DDL was combined with other clauses
+            // or lowered directly via the library API — reject it rather than
+            // silently dropping it. With the feature compiled OUT the server
+            // hook does not exist, so even a sole statement lands here: name
+            // the missing build feature instead of implying a mis-combined
+            // query (the official images/binaries ship with both features).
             Clause::CreateVectorIndex(_) => {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,
-                    "CREATE VECTOR INDEX is a schema command and must be the \
-                     sole statement; it cannot be lowered to a query plan",
+                    if cfg!(feature = "vector-index") {
+                        "CREATE VECTOR INDEX is a schema command and must be the \
+                         sole statement; it cannot be lowered to a query plan"
+                    } else {
+                        "this server was built without the vector-index feature; \
+                         the official Docker image and release binaries include \
+                         it — rebuild with --features vector-index"
+                    },
                     clause.span(),
                 ));
             }
             Clause::CreateFulltextIndex(_) => {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,
-                    "CREATE FULLTEXT INDEX is a schema command and must be the \
-                     sole statement; it cannot be lowered to a query plan",
+                    if cfg!(feature = "text-index") {
+                        "CREATE FULLTEXT INDEX is a schema command and must be the \
+                         sole statement; it cannot be lowered to a query plan"
+                    } else {
+                        "this server was built without the text-index feature; \
+                         the official Docker image and release binaries include \
+                         it — rebuild with --features text-index"
+                    },
                     clause.span(),
                 ));
             }
             Clause::DropVectorIndex(_) => {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,
-                    "DROP VECTOR INDEX is a schema command and must be the \
-                     sole statement; it cannot be lowered to a query plan",
+                    if cfg!(feature = "vector-index") {
+                        "DROP VECTOR INDEX is a schema command and must be the \
+                         sole statement; it cannot be lowered to a query plan"
+                    } else {
+                        "this server was built without the vector-index feature; \
+                         the official Docker image and release binaries include \
+                         it — rebuild with --features vector-index"
+                    },
                     clause.span(),
                 ));
             }
             Clause::DropFulltextIndex(_) => {
                 return Err(LowerError::new(
                     LowerErrorKind::UnsupportedFeature,
-                    "DROP INDEX is a schema command and must be the sole \
-                     statement; it cannot be lowered to a query plan",
+                    if cfg!(feature = "text-index") {
+                        "DROP INDEX is a schema command and must be the sole \
+                         statement; it cannot be lowered to a query plan"
+                    } else {
+                        "this server was built without the text-index feature; \
+                         the official Docker image and release binaries include \
+                         it — rebuild with --features text-index"
+                    },
                     clause.span(),
                 ));
             }

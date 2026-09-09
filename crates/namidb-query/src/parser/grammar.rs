@@ -595,8 +595,13 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// `CREATE VECTOR INDEX <name> ON :<Label>(<property>) METRIC <m>
-    /// DIMENSION <n> [WITH { r: …, l_build: …, alpha: … }]` (RFC-030).
+    /// `CREATE VECTOR INDEX <name> [IF NOT EXISTS] ON :<Label>(<property>)
+    /// METRIC <m> DIMENSION <n> [WITH { r: …, l_build: …, alpha: … }]`
+    /// (RFC-030), or the Neo4j 5 dialect
+    /// `CREATE VECTOR INDEX <name> [IF NOT EXISTS] FOR (<var>:<Label>) ON
+    /// <var>.<property> OPTIONS {indexConfig: {vector.dimensions: <n>,
+    /// vector.similarity_function: '<m>'}}` — drivers and tutorials emit the
+    /// Neo4j spelling verbatim, and both forms produce the same clause.
     ///
     /// A standalone schema command — `parse_clause` only routes here for the
     /// `CREATE VECTOR` two-token prefix. The parsed clause never reaches the
@@ -607,9 +612,14 @@ impl<'src> Parser<'src> {
         self.expect_soft_keyword("VECTOR")?;
         self.expect_soft_keyword("INDEX")?;
         let name = self.expect_identifier()?;
-        // Optional `IF NOT EXISTS` (after the name, before `ON`) — the next token
-        // is either `IF` (Ident) or the hard `Token::On`, so this is unambiguous.
+        // Optional `IF NOT EXISTS` (after the name, before the target) — the
+        // next token is `IF` (Ident), the soft keyword `FOR`, or the hard
+        // `Token::On`, so this is unambiguous.
         let if_not_exists = self.parse_if_not_exists()?;
+        // Dialect fork: `ON` opens the native target, `FOR` the Neo4j one.
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("FOR")) {
+            return self.parse_create_vector_index_neo4j(start, name, if_not_exists);
+        }
         self.expect_in(&Token::On, "vector-index target")?;
         self.expect(&Token::Colon)?;
         let label = self.expect_identifier()?;
@@ -654,17 +664,203 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// `CREATE FULLTEXT INDEX <name> ON :Label(prop1[, prop2, …])`. Routed here
-    /// off the `CREATE FULLTEXT` two-token prefix. Never reaches the lowerer; the
-    /// server intercepts it via `Query::as_create_fulltext_index`.
+    /// Tail of the Neo4j-5 vector-index spelling: `FOR (<var>:<Label>) ON
+    /// <var>.<property> OPTIONS {…}` (the property is also accepted
+    /// parenthesized, matching `CREATE INDEX … ON (n.prop)`). Maps onto the
+    /// same [`CreateVectorIndexClause`] as the native form; the metric and
+    /// dimension have no defaults, so an OPTIONS map that omits them is an
+    /// error rather than a guess. The Vamana build overrides stay at their
+    /// engine defaults — Neo4j has no vocabulary for them.
+    fn parse_create_vector_index_neo4j(
+        &mut self,
+        start: usize,
+        name: Identifier,
+        if_not_exists: bool,
+    ) -> Result<CreateVectorIndexClause, ParseError> {
+        self.expect_soft_keyword("FOR")?;
+        let label = self.parse_ddl_node_target()?;
+        self.expect_in(&Token::On, "vector-index target")?;
+        let property = if self.eat(&Token::LParen).is_some() {
+            let p = self.parse_ddl_property_ref()?;
+            self.expect_in(&Token::RParen, "vector-index target")?;
+            p
+        } else {
+            self.parse_ddl_property_ref()?
+        };
+        let (metric, dim) = self.parse_vector_index_options()?;
+        let end = self
+            .tokens
+            .get(self.pos.wrapping_sub(1))
+            .map(|s| s.span.end)
+            .unwrap_or(start);
+        Ok(CreateVectorIndexClause {
+            name,
+            label,
+            property,
+            dim,
+            metric,
+            r: None,
+            l_build: None,
+            alpha: None,
+            quantization: crate::parser::ast::VectorQuantization::None,
+            if_not_exists,
+            span: SourceSpan::new(start, end),
+        })
+    }
+
+    /// `OPTIONS { … }` on the Neo4j vector-index form. The recognised keys —
+    /// bare, backtick-quoted, or nested one level under `indexConfig` as
+    /// Neo4j writes them — are `vector.dimensions` (an integer) and
+    /// `vector.similarity_function` (the native `METRIC` vocabulary). Both
+    /// are required, so a missing OPTIONS map is itself the error.
+    fn parse_vector_index_options(&mut self) -> Result<(VectorMetric, u32), ParseError> {
+        let options_span = self.peek_span();
+        let mut metric = None;
+        let mut dim = None;
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPTIONS")) {
+            self.bump(); // OPTIONS
+            self.parse_vector_options_map(&mut metric, &mut dim)?;
+        }
+        match (metric, dim) {
+            (Some(m), Some(d)) => Ok((m, d)),
+            _ => Err(ParseError::new(
+                ErrorCode::UnexpectedToken,
+                "vector index needs a dimension and a similarity function",
+                options_span,
+            )
+            .with_help(
+                "add OPTIONS {indexConfig: {`vector.dimensions`: <n>, \
+                 `vector.similarity_function`: 'cosine'}}, or use the native \
+                 `… ON :Label(prop) METRIC <m> DIMENSION <n>` form",
+            )),
+        }
+    }
+
+    /// One `{ … }` map of Neo4j vector-index options; `indexConfig` nests
+    /// the real keys one map deeper, so this recurses one level. `{}` is
+    /// accepted (the missing-key diagnostic fires afterwards).
+    fn parse_vector_options_map(
+        &mut self,
+        metric: &mut Option<VectorMetric>,
+        dim: &mut Option<u32>,
+    ) -> Result<(), ParseError> {
+        self.expect(&Token::LBrace)?;
+        if self.eat(&Token::RBrace).is_some() {
+            return Ok(());
+        }
+        loop {
+            let key = self.parse_vector_option_key()?;
+            match key.name.to_ascii_lowercase().as_str() {
+                "indexconfig" => self.parse_vector_options_map(metric, dim)?,
+                "vector.dimensions" => *dim = Some(self.parse_dimension()?),
+                "vector.similarity_function" => *metric = Some(self.parse_similarity_function()?),
+                other => {
+                    return Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        format!(
+                            "unknown vector-index option `{other}` (expected \
+                             indexConfig, vector.dimensions, or \
+                             vector.similarity_function)"
+                        ),
+                        key.span,
+                    ));
+                }
+            }
+            if self.eat(&Token::Comma).is_some() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(())
+    }
+
+    /// A Neo4j option key up to its `:`. The dotted tail of a bare
+    /// `vector.dimensions` is folded into one name so it compares equal to
+    /// the backtick-quoted spelling (one `QuotedIdent` token).
+    fn parse_vector_option_key(&mut self) -> Result<Identifier, ParseError> {
+        let mut key = self.expect_identifier()?;
+        while self.eat(&Token::Dot).is_some() {
+            let seg = self.expect_identifier()?;
+            key = Identifier::new(
+                format!("{}.{}", key.name, seg.name),
+                SourceSpan::new(key.span.start, seg.span.end),
+            );
+        }
+        self.expect(&Token::Colon)?;
+        Ok(key)
+    }
+
+    /// `vector.similarity_function` value — Neo4j writes a quoted string
+    /// (`'cosine'`); a bare word is accepted too. Same vocabulary as the
+    /// native `METRIC` (see [`parse_vector_metric`](Self::parse_vector_metric)).
+    fn parse_similarity_function(&mut self) -> Result<VectorMetric, ParseError> {
+        let next = self.bump().ok_or_else(|| {
+            ParseError::new(
+                ErrorCode::UnexpectedEof,
+                "expected a similarity function (cosine, dot, or euclidean), \
+                 found end of input",
+                SourceSpan::point(self.src.len()),
+            )
+        })?;
+        let word = match &next.value {
+            Token::String(s) => Some(s.as_str()),
+            Token::Ident(s) => Some(s.as_str()),
+            _ => None,
+        };
+        if let Some(m) = word.and_then(VectorMetric::from_keyword) {
+            return Ok(m);
+        }
+        Err(ParseError::new(
+            ErrorCode::UnexpectedToken,
+            format!(
+                "expected a similarity function (cosine, dot, or euclidean), \
+                 found `{}`",
+                next.value.label()
+            ),
+            next.span,
+        ))
+    }
+
+    /// `CREATE FULLTEXT INDEX <name> [IF NOT EXISTS] ON :Label(prop1[, prop2,
+    /// …])`, or the Neo4j 5 dialect `CREATE FULLTEXT INDEX <name> [IF NOT
+    /// EXISTS] FOR (<var>:<Label>) ON EACH [<var>.prop1[, <var>.prop2, …]]` —
+    /// both forms produce the same clause. Routed here off the `CREATE
+    /// FULLTEXT` two-token prefix. Never reaches the lowerer; the server
+    /// intercepts it via `Query::as_create_fulltext_index`.
     fn parse_create_fulltext_index(&mut self) -> Result<CreateFulltextIndexClause, ParseError> {
         let start = self.peek_span().start;
         self.expect(&Token::Create)?;
         self.expect_soft_keyword("FULLTEXT")?;
         self.expect_soft_keyword("INDEX")?;
         let name = self.expect_identifier()?;
-        // Optional `IF NOT EXISTS` (after the name, before `ON`).
+        // Optional `IF NOT EXISTS` (after the name, before the target).
         let if_not_exists = self.parse_if_not_exists()?;
+        // Dialect fork, as for the vector index: `FOR` opens the Neo4j form.
+        if matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("FOR")) {
+            self.bump(); // FOR
+            let label = self.parse_ddl_node_target()?;
+            self.expect_in(&Token::On, "fulltext-index target")?;
+            self.expect_soft_keyword("EACH")?;
+            self.expect(&Token::LBracket)?;
+            let mut properties = vec![self.parse_ddl_property_ref()?];
+            while self.eat(&Token::Comma).is_some() {
+                properties.push(self.parse_ddl_property_ref()?);
+            }
+            self.expect_in(&Token::RBracket, "fulltext-index property list")?;
+            let end = self
+                .tokens
+                .get(self.pos.wrapping_sub(1))
+                .map(|s| s.span.end)
+                .unwrap_or(start);
+            return Ok(CreateFulltextIndexClause {
+                name,
+                label,
+                properties,
+                if_not_exists,
+                span: SourceSpan::new(start, end),
+            });
+        }
         self.expect_in(&Token::On, "fulltext-index target")?;
         self.expect(&Token::Colon)?;
         let label = self.expect_identifier()?;
@@ -3101,6 +3297,135 @@ mod tests {
             q.as_create_vector_index().is_none(),
             "a non-standalone DDL must not be intercepted"
         );
+    }
+
+    #[test]
+    fn create_vector_index_neo4j_form_matches_native() {
+        // The Neo4j 5 spelling maps onto the identical clause its native
+        // twin produces — field by field (spans aside).
+        let native = ok("CREATE VECTOR INDEX doc_emb ON :Doc(emb) METRIC cosine DIMENSION 16");
+        let neo = ok(
+            "CREATE VECTOR INDEX doc_emb FOR (d:Doc) ON d.emb \
+             OPTIONS {indexConfig: {`vector.dimensions`: 16, \
+             `vector.similarity_function`: 'cosine'}}",
+        );
+        let (n, m) = match (&native.head.clauses[0], &neo.head.clauses[0]) {
+            (Clause::CreateVectorIndex(n), Clause::CreateVectorIndex(m)) => (n, m),
+            other => panic!("expected two CreateVectorIndex clauses, got {other:?}"),
+        };
+        assert_eq!(n.name.name, m.name.name);
+        assert_eq!(n.label.name, m.label.name);
+        assert_eq!(n.property.name, m.property.name);
+        assert_eq!(n.dim, m.dim);
+        assert_eq!(n.metric, m.metric);
+        assert_eq!((n.r, n.l_build, n.alpha), (m.r, m.l_build, m.alpha));
+        assert_eq!(n.quantization, m.quantization);
+        assert_eq!(n.if_not_exists, m.if_not_exists);
+        // The server-side DDL hook recognises the Neo4j spelling too.
+        assert!(neo.as_create_vector_index().is_some());
+    }
+
+    #[test]
+    fn create_vector_index_neo4j_form_variants() {
+        // IF NOT EXISTS sits in the same slot as natively, the option keys
+        // may be bare (unquoted) and given without the indexConfig wrapper,
+        // and the property reference may be parenthesized.
+        let q = ok(
+            "CREATE VECTOR INDEX doc_emb IF NOT EXISTS FOR (d:Doc) ON (d.emb) \
+             OPTIONS {vector.dimensions: 8, vector.similarity_function: 'euclidean'}",
+        );
+        let c = match &q.head.clauses[0] {
+            Clause::CreateVectorIndex(c) => c,
+            other => panic!("expected CreateVectorIndex, got {other:?}"),
+        };
+        assert!(c.if_not_exists);
+        assert_eq!(c.label.name, "Doc");
+        assert_eq!(c.property.name, "emb");
+        assert_eq!(c.dim, 8);
+        assert_eq!(c.metric, VectorMetric::Euclidean);
+    }
+
+    #[test]
+    fn create_vector_index_neo4j_unknown_option_errors_helpfully() {
+        let errs = parse(
+            "CREATE VECTOR INDEX ix FOR (d:Doc) ON d.emb \
+             OPTIONS {indexConfig: {`vector.wrong`: 1}}",
+        )
+        .expect_err("unknown option key must not parse");
+        assert_eq!(errs[0].code, ErrorCode::UnexpectedToken);
+        assert!(
+            errs[0].message.contains("vector.dimensions")
+                && errs[0].message.contains("vector.similarity_function"),
+            "error must name the supported keys, got: {}",
+            errs[0].message
+        );
+    }
+
+    #[test]
+    fn create_vector_index_neo4j_requires_dimension_and_metric() {
+        // The clause has no defaults for METRIC/DIMENSION, so an omitted (or
+        // incomplete) OPTIONS map errors with the required keys spelled out.
+        for src in [
+            "CREATE VECTOR INDEX ix FOR (d:Doc) ON d.emb",
+            "CREATE VECTOR INDEX ix FOR (d:Doc) ON d.emb \
+             OPTIONS {indexConfig: {`vector.dimensions`: 16}}",
+        ] {
+            let errs = parse(src).expect_err("incomplete vector DDL must not parse");
+            assert_eq!(errs[0].code, ErrorCode::UnexpectedToken, "{src}");
+            assert!(
+                errs[0].help.as_deref().unwrap_or("").contains("vector.dimensions"),
+                "help must list the required options, got: {:?}",
+                errs[0].help
+            );
+        }
+    }
+
+    #[test]
+    fn create_fulltext_index_neo4j_form_matches_native() {
+        // `FOR (d:Doc) ON EACH [d.title, d.body]` maps onto the identical
+        // clause the native `ON :Doc(title, body)` produces.
+        let native = ok("CREATE FULLTEXT INDEX body_ix ON :Doc(title, body)");
+        let neo = ok("CREATE FULLTEXT INDEX body_ix FOR (d:Doc) ON EACH [d.title, d.body]");
+        let (n, m) = match (&native.head.clauses[0], &neo.head.clauses[0]) {
+            (Clause::CreateFulltextIndex(n), Clause::CreateFulltextIndex(m)) => (n, m),
+            other => panic!("expected two CreateFulltextIndex clauses, got {other:?}"),
+        };
+        assert_eq!(n.name.name, m.name.name);
+        assert_eq!(n.label.name, m.label.name);
+        assert_eq!(
+            n.properties.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            m.properties.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        assert_eq!(n.if_not_exists, m.if_not_exists);
+        assert!(neo.as_create_fulltext_index().is_some());
+    }
+
+    #[test]
+    fn create_fulltext_index_neo4j_form_roundtrips_via_display() {
+        // Display renders the canonical native spelling; re-parsing it must
+        // yield the same two-property clause the ON EACH list produced.
+        let neo = ok(
+            "CREATE FULLTEXT INDEX body_ix IF NOT EXISTS \
+             FOR (d:Doc) ON EACH [d.title, d.body]",
+        );
+        let c = match &neo.head.clauses[0] {
+            Clause::CreateFulltextIndex(c) => c,
+            other => panic!("expected CreateFulltextIndex, got {other:?}"),
+        };
+        assert_eq!(
+            c.to_string(),
+            "CREATE FULLTEXT INDEX body_ix IF NOT EXISTS ON :Doc(title, body)"
+        );
+        let re = ok(&c.to_string());
+        match &re.head.clauses[0] {
+            Clause::CreateFulltextIndex(r) => {
+                assert_eq!(r.properties.len(), 2);
+                assert_eq!(r.properties[0].name, c.properties[0].name);
+                assert_eq!(r.properties[1].name, c.properties[1].name);
+                assert!(r.if_not_exists);
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]

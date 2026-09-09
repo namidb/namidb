@@ -186,7 +186,7 @@ pub struct Config {
     /// transaction. A runaway MERGE/DELETE is aborted cooperatively rather
     /// than pinning the single writer, and its pending batch is discarded so
     /// nothing partial is committed. `Duration::ZERO` disables it; the CLI
-    /// defaults it to `query_timeout`.
+    /// defaults it to 60s, independent of `query_timeout`.
     pub write_timeout: Duration,
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error

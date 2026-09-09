@@ -234,14 +234,17 @@ struct Cli {
     /// Wall-clock budget for a single write query: an HTTP / Bolt auto-commit
     /// statement, or each statement of a Bolt explicit transaction. A runaway
     /// MERGE/DELETE is aborted instead of pinning the single writer, and its
-    /// pending batch is discarded so nothing partial commits. Defaults to
-    /// `--query-timeout`; set to `0s` to allow writes to run unbounded.
+    /// pending batch is discarded so nothing partial commits. Writes get a
+    /// larger default than `--query-timeout` because a legitimate bulk-load
+    /// statement outlives any sane read; set to `0s` to allow writes to run
+    /// unbounded (recommended for one-off bulk loads, or chunk the writes).
     #[arg(
         long,
         env = "NAMIDB_WRITE_TIMEOUT",
+        default_value = "60s",
         value_parser = humantime::parse_duration,
     )]
-    write_timeout: Option<Duration>,
+    write_timeout: Duration,
 
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error
@@ -422,8 +425,7 @@ fn main() -> anyhow::Result<()> {
         bolt_max_message_bytes: cli.bolt_max_message_bytes,
         bolt_tx_timeout: cli.bolt_tx_timeout,
         query_timeout: cli.query_timeout,
-        // Writes inherit the read budget unless given their own; `0s` opts out.
-        write_timeout: cli.write_timeout.unwrap_or(cli.query_timeout),
+        write_timeout: cli.write_timeout,
         query_row_cap: cli.query_row_cap,
         compaction_l0_trigger: cli.compaction_l0_trigger,
         write_stall_l0: cli.write_stall_l0,
@@ -536,5 +538,35 @@ mod tests {
         std::env::set_var("NAMIDB_SWEEP_DELETE", "0");
         assert!(!Cli::try_parse_from(base).unwrap().sweep_delete);
         std::env::remove_var("NAMIDB_SWEEP_DELETE");
+    }
+
+    /// `--write-timeout` carries its own 60s default (fourth field report,
+    /// item 67b): it no longer inherits `--query-timeout`, so a bulk-load
+    /// write is not silently held to the 30s read budget. Serialized: clap
+    /// reads NAMIDB_WRITE_TIMEOUT on every try_parse_from.
+    #[test]
+    fn write_timeout_default_is_independent_of_query_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = ["namidb-server", "--store", "memory://t"];
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).unwrap()
+        };
+
+        let cli = parse(&[]);
+        assert_eq!(cli.query_timeout, Duration::from_secs(30));
+        assert_eq!(cli.write_timeout, Duration::from_secs(60));
+        // Raising the read budget no longer drags the write budget along.
+        let cli = parse(&["--query-timeout", "90s"]);
+        assert_eq!(cli.write_timeout, Duration::from_secs(60));
+        // An explicit flag overrides, and `0s` still means unbounded.
+        let cli = parse(&["--write-timeout", "5m"]);
+        assert_eq!(cli.write_timeout, Duration::from_secs(300));
+        assert_eq!(parse(&["--write-timeout", "0s"]).write_timeout, Duration::ZERO);
+        // The env-var form overrides the default too.
+        std::env::set_var("NAMIDB_WRITE_TIMEOUT", "2m");
+        assert_eq!(parse(&[]).write_timeout, Duration::from_secs(120));
+        std::env::remove_var("NAMIDB_WRITE_TIMEOUT");
     }
 }

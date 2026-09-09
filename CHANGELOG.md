@@ -80,6 +80,33 @@ crates.io release will establish and document that API explicitly.
   purpose: they are enforced by tuple scan on write and have no backing
   lookup structure to advertise.
 
+- The search DDL now accepts the Neo4j 5 spellings alongside the native
+  syntax, so tutorials and driver snippets paste in unchanged:
+  `CREATE VECTOR INDEX name FOR (n:Label) ON n.prop OPTIONS {indexConfig:
+  {vector.dimensions: 768, vector.similarity_function: 'cosine'}}`
+  (keys bare or backtick-quoted, with or without the `indexConfig`
+  wrapper) and `CREATE FULLTEXT INDEX name FOR (n:Label) ON EACH
+  [n.title, n.body]`. Both dialects parse to the identical clause, so
+  `IF NOT EXISTS`, `SHOW INDEXES`, and the drop statements behave the
+  same regardless of the spelling used. An unknown OPTIONS key errors
+  naming the supported ones; an OPTIONS map missing the dimension or
+  similarity function errors with both spelled out instead of guessing.
+- A build compiled without `vector-index`/`text-index` now rejects the
+  corresponding CREATE/DROP statements with a message naming the missing
+  build feature (and noting the official Docker image and release
+  binaries include it), instead of a misleading "must be the sole
+  statement" complaint on a statement that was already sole.
+
+
+**Changed**
+- `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) gains its own 60s default
+  instead of inheriting the 30s `--query-timeout`: a legitimate bulk-load
+  statement outlives any sane read budget, and since 2.5.0 the durability
+  tail is deadline-bounded on its own, so the write timeout no longer
+  needs to double as that safety net. For bulk loads, set
+  `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes; `0s` keeps
+  meaning disabled.
+
 ## [2.5.1] - 2026-08-30
 
 **Fixed**
