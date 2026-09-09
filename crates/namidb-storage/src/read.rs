@@ -737,6 +737,13 @@ pub struct Snapshot<'mt> {
     /// remain in the generation-pinned shared range cache. Both byte and entry
     /// ceilings prevent high query concurrency from multiplying metadata RAM.
     node_property_readers: Mutex<SnapshotByteCache<String, Arc<NodePropertyPageReader>>>,
+    /// Generation-pinned sidecar sources opened during this snapshot. Each
+    /// open costs one HEAD; a per-row lookup loop used to pay it on every
+    /// call (fourth field report, item 63 — the dominant term of the 14ms
+    /// non-unique point lookup). Pages stay in the shared range cache; this
+    /// holds only the tiny pinned handles.
+    pinned_sidecar_sources:
+        Mutex<SnapshotByteCache<String, crate::range_cache::PinnedObjectRangeSource>>,
     /// Read-your-own-writes overlay (RFC-026). A writer's staged-but-
     /// uncommitted batch, materialised as a second memtable and consulted
     /// alongside the committed `memtable`. The staged ops carry LSNs
@@ -832,6 +839,7 @@ impl<'mt> Snapshot<'mt> {
                 snapshot_local_cache_max_bytes(SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV),
                 SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_ENTRIES,
             )),
+            pinned_sidecar_sources: Mutex::new(SnapshotByteCache::new(64 * 1024, 64)),
             overlay: None,
         }
     }
@@ -2572,6 +2580,235 @@ impl<'mt> Snapshot<'mt> {
             .iter()
             .map(|value| confirmed.get(value).cloned().flatten())
             .collect())
+    }
+
+    /// Batched NON-unique twin of [`Self::batch_lookup_nodes_by_property`]:
+    /// resolve every value's FULL match set with one claimant pass, one
+    /// multi-value sidecar probe per SST, and one batched confirm — instead
+    /// of the per-row lookup loop that paid a fresh HEAD plus a sequential
+    /// page descent per value (fourth field report, item 63: 70x slower
+    /// than the unique arm on the same data). Same authoritative contract:
+    /// candidates are re-confirmed against the current view, so stale
+    /// postings never leak. Results per value are sorted by node id.
+    ///
+    /// `label` must be non-empty; the label-agnostic multi case already has
+    /// its own batched entry (`batch_lookup_nodes_by_property_any_label`).
+    pub async fn batch_lookup_nodes_by_property_multi(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Vec<NodeView>>> {
+        namidb_core::profile_scope!("Snapshot::batch_lookup_nodes_by_property_multi");
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(cache) = &self.property_index_cache {
+            cache.record_equality_lookup();
+        }
+
+        let mut candidates: BTreeMap<String, BTreeSet<NodeId>> = values
+            .iter()
+            .cloned()
+            .map(|value| (value, BTreeSet::new()))
+            .collect();
+
+        // RYOW snapshots: the writer-private postings map is authoritative
+        // per value (first probe scans the overlay once).
+        if self.transactional_property_index.is_some() {
+            for (value, ids_out) in &mut candidates {
+                if let Some(ids) = self
+                    .transactional_property_candidates(label, property, &Value::Str(value.clone()))
+                    .await?
+                {
+                    ids_out.extend(ids);
+                }
+            }
+            return self
+                .batch_confirm_multi_candidates(label, property, values, candidates)
+                .await;
+        }
+
+        let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        let have_node_ssts = !node_sst_idxs.is_empty();
+        let sst_idxs: Vec<usize> = node_sst_idxs
+            .into_iter()
+            .filter(|idx| node_sst_can_contain_label(&self.manifest.manifest, *idx, label))
+            .collect();
+        let sidecars: Option<Vec<_>> = sst_idxs
+            .iter()
+            .map(|idx| string_property_sidecar(&self.manifest.manifest.ssts[*idx], label, property))
+            .collect();
+
+        if have_node_ssts && sidecars.is_none() {
+            crate::route_telemetry::record_property(false);
+            let views = self.scan_label(label).await?;
+            return Ok(Self::group_multi_from_scan(property, values, views));
+        }
+        crate::route_telemetry::record_property(true);
+
+        let memtable_claimants = self.memtable_property_claimants(label, property)?;
+        for (value, ids_out) in &mut candidates {
+            let memtable_key =
+                crate::cache::encode_equality_property_value(&Value::Str(value.clone()))
+                    .expect("String values have an equality key");
+            if let Some(ids) = memtable_claimants.get(&memtable_key) {
+                ids_out.extend(ids.iter().copied());
+            }
+        }
+
+        for sidecar in sidecars.unwrap_or_default() {
+            match sidecar {
+                StringPropertySidecar::Unique(sidecar) => {
+                    // A legacy label-scoped unique map: at most one holder
+                    // per value from that generation — still a valid
+                    // candidate source (the property was unique when the
+                    // SST was written); newer duplicates live in newer
+                    // generations or the memtable.
+                    let absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        sidecar.path
+                    );
+                    let index = match self
+                        .probe_unique_property_sidecar(sidecar, &absolute, values)
+                        .await
+                    {
+                        Ok(index) => index,
+                        Err(error) if optional_accelerator_fallback(&error) => {
+                            tracing::warn!(
+                                path = %sidecar.path,
+                                error = %error,
+                                "unique property accelerator unavailable; falling back to one exact batch label scan"
+                            );
+                            crate::route_telemetry::record_property(false);
+                            let views = self.scan_label(label).await?;
+                            return Ok(Self::group_multi_from_scan(property, values, views));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    for (value, ids_out) in &mut candidates {
+                        if let Some(id) = index.get(value) {
+                            ids_out.insert(NodeId::from_uuid(Uuid::from_bytes(*id)));
+                        }
+                    }
+                }
+                StringPropertySidecar::Equality(sidecar) => {
+                    let absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        sidecar.path
+                    );
+                    let probes: Vec<String> = values
+                        .iter()
+                        .map(|value| {
+                            equality_sidecar_key(sidecar.key_encoding, &Value::Str(value.clone()))
+                                .expect("String sidecar compatibility checked during coverage")
+                        })
+                        .collect();
+                    let index = match self
+                        .probe_equality_property_sidecar(sidecar, &absolute, &probes)
+                        .await
+                    {
+                        Ok(index) => index,
+                        Err(error) if optional_accelerator_fallback(&error) => {
+                            tracing::warn!(
+                                path = %sidecar.path,
+                                error = %error,
+                                "equality property accelerator unavailable; falling back to one exact batch label scan"
+                            );
+                            crate::route_telemetry::record_property(false);
+                            let views = self.scan_label(label).await?;
+                            return Ok(Self::group_multi_from_scan(property, values, views));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    for (value, ids_out) in &mut candidates {
+                        let probe =
+                            equality_sidecar_key(sidecar.key_encoding, &Value::Str(value.clone()))
+                                .expect("String sidecar compatibility checked during coverage");
+                        if let Some(ids) = index.get(&probe) {
+                            ids_out.extend(
+                                ids.iter()
+                                    .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id))),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.batch_confirm_multi_candidates(label, property, values, candidates)
+            .await
+    }
+
+    /// Confirm-all twin of [`Self::batch_confirm_unique_candidates`]: keep
+    /// EVERY candidate whose current view still holds the value, sorted by
+    /// node id per value.
+    async fn batch_confirm_multi_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+        candidates: BTreeMap<String, BTreeSet<NodeId>>,
+    ) -> Result<Vec<Vec<NodeView>>> {
+        let ids: Vec<NodeId> = candidates
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let resolved = self.batch_lookup_nodes(label, &ids).await?;
+        let by_id: HashMap<NodeId, NodeView> = ids
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(id, view)| view.map(|view| (id, view)))
+            .collect();
+        let mut confirmed: HashMap<String, Vec<NodeView>> =
+            HashMap::with_capacity(candidates.len());
+        for (value, ids) in candidates {
+            let mut matches: Vec<NodeView> = ids
+                .into_iter()
+                .filter_map(|id| by_id.get(&id))
+                .filter(|view| {
+                    matches!(view.properties.get(property), Some(Value::Str(current)) if current == &value)
+                })
+                .cloned()
+                .collect();
+            matches.sort_by_key(|view| view.id);
+            confirmed.insert(value, matches);
+        }
+        Ok(values
+            .iter()
+            .map(|value| confirmed.get(value).cloned().unwrap_or_default())
+            .collect())
+    }
+
+    /// Scan-fallback grouping for the multi batch: one label scan, all
+    /// matches per value, sorted by node id.
+    fn group_multi_from_scan(
+        property: &str,
+        values: &[String],
+        views: Vec<NodeView>,
+    ) -> Vec<Vec<NodeView>> {
+        let mut by_value: HashMap<&str, Vec<NodeView>> = HashMap::new();
+        let wanted: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
+        for view in views {
+            let Some(Value::Str(current)) = view.properties.get(property) else {
+                continue;
+            };
+            if let Some(key) = wanted.get(current.as_str()) {
+                by_value.entry(key).or_default().push(view);
+            }
+        }
+        values
+            .iter()
+            .map(|value| {
+                let mut matches = by_value.remove(value.as_str()).unwrap_or_default();
+                matches.sort_by_key(|view| view.id);
+                matches
+            })
+            .collect()
     }
 
     fn batch_unique_from_scan(
@@ -6385,6 +6622,48 @@ impl<'mt> Snapshot<'mt> {
         self.edge_lookup_via_sst(edge_type, key, direction).await
     }
 
+    /// Topology-only partner list: CSR when attached, else a SLIM SST
+    /// fallback built on the identity-only partner merge — no property
+    /// hydration. Before this, a topology-only reverse expand into a
+    /// 53k-degree node with no CSR configured paid an O(deg) property
+    /// decode per probe (fourth field report, item 62); the walker's
+    /// plan-aware routing already guarantees Topology-mode consumers never
+    /// read `EdgeView.properties`, matching the CSR route's slim contract.
+    pub async fn edge_lookup_topology(
+        &self,
+        edge_type: &str,
+        key: NodeId,
+        direction: EdgeDirection,
+    ) -> Result<EdgeListView> {
+        if adjacency_enabled() {
+            if let Some(cache) = self.adjacency_cache.clone() {
+                return self
+                    .edge_lookup_via_csr(cache, edge_type, key, direction)
+                    .await;
+            }
+        }
+        let partners = self
+            .sorted_partners_via_sst(edge_type, key, direction)
+            .await?;
+        let edges = partners
+            .into_iter()
+            .map(|partner| {
+                let (src, dst) = match direction {
+                    EdgeDirection::Forward => (key, partner),
+                    EdgeDirection::Inverse => (partner, key),
+                };
+                EdgeView {
+                    edge_type: edge_type.to_string(),
+                    src,
+                    dst,
+                    properties: BTreeMap::new(),
+                    lsn: 0,
+                }
+            })
+            .collect();
+        Ok(EdgeListView { edges })
+    }
+
     async fn edge_lookup_via_sst(
         &self,
         edge_type: &str,
@@ -8541,6 +8820,27 @@ impl<'mt> Snapshot<'mt> {
         absolute: &str,
         expected_size: Option<u64>,
     ) -> Result<crate::range_cache::PinnedObjectRangeSource> {
+        if let Some(source) = self
+            .pinned_sidecar_sources
+            .lock()
+            .unwrap()
+            .get(&absolute.to_string())
+        {
+            // The integrity envelope re-applies on a hit: the cached HEAD's
+            // size must still match the caller's manifest expectation.
+            if let Some(expected) = expected_size {
+                if source.object_size() != expected {
+                    return Err(Error::Corrupted {
+                        path: absolute.to_string(),
+                        detail: format!(
+                            "sidecar object size {} differs from manifest size {expected}",
+                            source.object_size()
+                        ),
+                    });
+                }
+            }
+            return Ok(source);
+        }
         let path = Path::from(absolute);
         let meta = self.store.head(&path).await?;
         if meta.location != path {
@@ -8563,8 +8863,19 @@ impl<'mt> Snapshot<'mt> {
                 });
             }
         }
-        crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(self.store.clone(), meta)
-            .await
+        let source = crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(
+            self.store.clone(),
+            meta,
+        )
+        .await?;
+        self.pinned_sidecar_sources.lock().unwrap().insert(
+            absolute.to_string(),
+            source.clone(),
+            absolute
+                .len()
+                .saturating_add(SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES),
+        );
+        Ok(source)
     }
 
     /// Cache-aware fetch by absolute path. On hit, returns the cached

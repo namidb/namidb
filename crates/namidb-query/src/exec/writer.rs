@@ -919,18 +919,59 @@ fn execute_write_inner_mode<'a>(
                     return Ok(out);
                 }
 
+                // Same statement-level batching as the read walker's multi arm
+                // (item 63); the transactional overlay is handled inside the
+                // batched storage call.
+                let batched_multi: Option<Vec<Vec<namidb_storage::NodeView>>> =
+                    if *multi && !label.is_empty() {
+                        let string_values: Vec<String> = input_rows
+                            .iter()
+                            .filter_map(|row| match evaluate(value, row, params) {
+                                Ok(RuntimeValue::String(s)) => Some(s),
+                                _ => None,
+                            })
+                            .collect();
+                        if string_values.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                snap.batch_lookup_nodes_by_property_multi(
+                                    label,
+                                    property,
+                                    &string_values,
+                                )
+                                .await
+                                .map_err(ExecError::Storage)?,
+                            )
+                        }
+                    } else {
+                        None
+                    };
+                let mut batched_multi = batched_multi.map(|groups| groups.into_iter());
+
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
                     if *multi {
-                        for view in crate::exec::walker::lookup_nodes_by_property_via_scan(
-                            &snap,
-                            label,
-                            property,
-                            &lookup_val,
-                        )
-                        .await?
-                        {
+                        let views = match (&lookup_val, &mut batched_multi) {
+                            (RuntimeValue::String(_), Some(groups)) => {
+                                groups.next().ok_or_else(|| {
+                                    ExecError::Runtime(
+                                        "batched property lookup alignment was lost".into(),
+                                    )
+                                })?
+                            }
+                            _ => {
+                                crate::exec::walker::lookup_nodes_by_property_via_scan(
+                                    &snap,
+                                    label,
+                                    property,
+                                    &lookup_val,
+                                )
+                                .await?
+                            }
+                        };
+                        for view in views {
                             let mut new_row = row.clone();
                             new_row.set(
                                 alias.clone(),

@@ -618,20 +618,64 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     return Ok(out);
                 }
 
+                // Labeled non-unique String lookups batch the WHOLE input:
+                // one claimant pass + one multi-value probe per SST + one
+                // batched confirm, mirroring the unique arm (item 63 — the
+                // per-row loop was 70x slower on identical data). Non-String
+                // values keep the per-row exact route below.
+                let batched_multi: Option<Vec<Vec<namidb_storage::NodeView>>> =
+                    if *multi && !label.is_empty() {
+                        let string_values: Vec<String> = input_rows
+                            .iter()
+                            .filter_map(|row| match evaluate(value, row, params) {
+                                Ok(RuntimeValue::String(s)) => Some(s),
+                                _ => None,
+                            })
+                            .collect();
+                        if string_values.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                snapshot
+                                    .batch_lookup_nodes_by_property_multi(
+                                        label,
+                                        property,
+                                        &string_values,
+                                    )
+                                    .await
+                                    .map_err(ExecError::Storage)?,
+                            )
+                        }
+                    } else {
+                        None
+                    };
+                let mut batched_multi = batched_multi.map(|groups| groups.into_iter());
+
                 let mut out = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
                     if *multi {
                         // Non-unique indexed property: fan out one row per
                         // matching node.
-                        for view in lookup_nodes_by_property_via_scan(
-                            snapshot,
-                            label,
-                            property,
-                            &lookup_val,
-                        )
-                        .await?
-                        {
+                        let views = match (&lookup_val, &mut batched_multi) {
+                            (RuntimeValue::String(_), Some(groups)) => {
+                                groups.next().ok_or_else(|| {
+                                    ExecError::Runtime(
+                                        "batched property lookup alignment was lost".into(),
+                                    )
+                                })?
+                            }
+                            _ => {
+                                lookup_nodes_by_property_via_scan(
+                                    snapshot,
+                                    label,
+                                    property,
+                                    &lookup_val,
+                                )
+                                .await?
+                            }
+                        };
+                        for view in views {
                             let mut new_row = row.clone();
                             new_row.set(
                                 alias.clone(),
@@ -1523,6 +1567,17 @@ pub(crate) async fn execute_expand(
     }
 
     let mut out = Vec::new();
+    // Partner-list memo shared across ALL input rows of this operator
+    // invocation (item 62): a workload whose rows repeatedly bind the same
+    // high-degree tail used to re-fetch and re-materialise the full partner
+    // list per row — 159,804 rows x degree 53,473 never terminated. Edge
+    // types, direction, and read mode are constant per operator, so the
+    // tail alone keys it; Arc sharing keeps a memo hit O(1). Bounded by
+    // total memoized edges so a scan across millions of DISTINCT tails
+    // cannot hold the whole graph resident.
+    const NEIGHBOUR_MEMO_MAX_EDGES: usize = 1_000_000;
+    let mut neighbour_memo: HashMap<NodeId, Arc<Vec<EdgeView>>> = HashMap::new();
+    let mut neighbour_memo_edges: usize = 0;
     for row in rows {
         // Deadline + row-cap guards: a multi-seed (or variable-length)
         // expansion is the most expensive operator, so bound it at every
@@ -1693,14 +1748,14 @@ pub(crate) async fn execute_expand(
             // Without this, each (step, edge) pair issues its own
             // `lookup_node` SST decode — the dominant cost in cold IC09
             // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
-            let mut step_neighbours: Vec<(Step, Vec<EdgeView>)> =
+            let mut step_neighbours: Vec<(Step, Arc<Vec<EdgeView>>)> =
                 Vec::with_capacity(frontier.len());
             let mut unique_targets: Vec<NodeId> = Vec::new();
             let mut seen_targets: std::collections::HashSet<NodeId> =
                 std::collections::HashSet::new();
             for step in frontier.drain(..) {
-                let neighbours = if back_reference && max == 1 {
-                    match existing_target_id {
+                let neighbours: Arc<Vec<EdgeView>> = if back_reference && max == 1 {
+                    Arc::new(match existing_target_id {
                         Some(target) => {
                             exact_edges_between_any(
                                 snapshot,
@@ -1713,13 +1768,30 @@ pub(crate) async fn execute_expand(
                             .await?
                         }
                         None => Vec::new(),
-                    }
+                    })
+                } else if let Some(hit) = neighbour_memo.get(&step.tail) {
+                    Arc::clone(hit)
                 } else {
-                    neighbours_of_any(snapshot, &edge_types, direction, step.tail, edge_read_mode)
-                        .await?
+                    let fetched = Arc::new(
+                        neighbours_of_any(
+                            snapshot,
+                            &edge_types,
+                            direction,
+                            step.tail,
+                            edge_read_mode,
+                        )
+                        .await?,
+                    );
+                    if neighbour_memo_edges.saturating_add(fetched.len())
+                        <= NEIGHBOUR_MEMO_MAX_EDGES
+                    {
+                        neighbour_memo_edges += fetched.len();
+                        neighbour_memo.insert(step.tail, Arc::clone(&fetched));
+                    }
+                    fetched
                 };
                 if !back_reference {
-                    for edge in &neighbours {
+                    for edge in neighbours.iter() {
                         let tid = partner_id(edge, direction, step.tail);
                         if seen_targets.insert(tid) {
                             unique_targets.push(tid);
@@ -1741,7 +1813,7 @@ pub(crate) async fn execute_expand(
             )
             .await?;
             for (step, neighbours) in step_neighbours {
-                for edge in neighbours {
+                for edge in neighbours.iter() {
                     // Periodic in-loop guard: the (step × edge) space is the
                     // deg^hop blowup itself, so probe the budgets every few
                     // thousand edges rather than once per hop.
@@ -1752,7 +1824,7 @@ pub(crate) async fn execute_expand(
                             out.len() + hop_results.len() + next_frontier.len(),
                         )?;
                     }
-                    let target_id = partner_id(&edge, direction, step.tail);
+                    let target_id = partner_id(edge, direction, step.tail);
                     if prune_visits {
                         // Reached at an earlier level → any path through it now
                         // is longer than shortest (endpoint BFS: already
@@ -1848,7 +1920,7 @@ pub(crate) async fn execute_expand(
                             None => continue,
                         }
                     };
-                    let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge)));
+                    let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge.clone())));
                     let mut new_row = step.row.clone();
                     let mut new_rel_values = step.rel_values.clone();
                     if bind_rel_list {
@@ -6273,16 +6345,29 @@ async fn neighbours_of(
             }
         };
     }
+    // Topology mode: CSR when attached, else the SLIM identity fallback —
+    // never the property-hydrating SST path (item 62: an O(deg) property
+    // decode per probe on a 53k-degree node, for edges whose properties
+    // this mode is guaranteed never to read).
     match direction {
-        RelationshipDirection::Right => Ok(snapshot.out_edges(edge_type, node).await?.edges),
-        RelationshipDirection::Left => Ok(snapshot.in_edges(edge_type, node).await?.edges),
+        RelationshipDirection::Right => Ok(snapshot
+            .edge_lookup_topology(edge_type, node, EdgeDirection::Forward)
+            .await?
+            .edges),
+        RelationshipDirection::Left => Ok(snapshot
+            .edge_lookup_topology(edge_type, node, EdgeDirection::Inverse)
+            .await?
+            .edges),
         RelationshipDirection::Both => {
-            let mut out = snapshot.out_edges(edge_type, node).await?.edges;
-            // Drop self-loops from the in half — out_edges already yielded them
-            // (see the via_sst path above).
+            let mut out = snapshot
+                .edge_lookup_topology(edge_type, node, EdgeDirection::Forward)
+                .await?
+                .edges;
+            // Drop self-loops from the in half — the forward half already
+            // yielded them (see the via_sst path above).
             out.extend(
                 snapshot
-                    .in_edges(edge_type, node)
+                    .edge_lookup_topology(edge_type, node, EdgeDirection::Inverse)
                     .await?
                     .edges
                     .into_iter()

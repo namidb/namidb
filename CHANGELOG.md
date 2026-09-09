@@ -28,6 +28,26 @@ crates.io release will establish and document that API explicitly.
   interception (previously errored).
 
 **Fixed**
+- Non-unique `CREATE INDEX` point lookups were ~70x slower than unique
+  constraints on identical data (fourth field report: 14.1ms vs 0.2ms,
+  33min vs 47s for a 160k-fact load — and the load-time churn inflated
+  the store 8.4x). The labeled non-unique equality arm now batches the
+  WHOLE statement like the unique arm always did (one claimant pass, one
+  multi-value sidecar probe per SST, one batched confirm), and pinned
+  sidecar sources are cached per snapshot so repeated probes stop paying
+  a fresh HEAD each. Results are unchanged, including duplicate lookup
+  values and mixed-type UNWIND lists.
+- A topology-only reverse expansion into a high-degree node could run
+  for minutes (53k-degree: >300s): with no CSR cache configured, the
+  fallback hydrated O(degree) property rows per probe for edges whose
+  properties the query never reads, and the expand executor re-fetched
+  the full partner list for EVERY input row binding the same node
+  (159,804 rows x 53,473 degree never terminated). Topology mode now
+  serves from a slim identity merge (no property hydration), and the
+  expand operator memoizes partner lists across its input rows (bounded
+  at 1M memoized edges; Arc-shared, so a repeated tail is O(1)). The
+  boot log also explains `adjacency_cache_bytes=0` (the CSR tier is
+  opt-in via NAMIDB_ADJACENCY) instead of looking like a budget bug.
 - `SHOW INDEXES` returned `[]` on a database whose only declarations are
   unique constraints, so tooling could not discover the keys. A
   single-property unique constraint IS index-backed (one equality
