@@ -909,7 +909,7 @@ unreproduced: HTTP single-tenant listing verified live at 3M/5M).
 Recon-before-fix once more; verdicts: three CORRECTED on mechanism, the
 rest confirmed. Fix cycle targets 2.6.0.
 
-### 61. [CORRECTED — fix in progress] Process dies silently: exit 0, no log, restarts cluster in write bursts
+### 61. [CORRECTED — shipped in 2.6.0] Process dies silently: exit 0, no log, restarts cluster in write bursts
 
 The binary has NO self-exit path and NO exit-under-memory-pressure path
 (panic=abort → 134; kernel OOM → 137/OOMKilled). Exit 0 is reachable ONLY
@@ -928,7 +928,7 @@ permits) + awaiting the listener handle; rate-limited warns on pressure
 rejections; boot WARN when the governor is disabled under a finite
 cgroup limit.
 
-### 62. [CORRECTED — fix in progress] adjacency_cache_bytes=0; 53k-degree reverse expand doesn't finish in 300s
+### 62. [CORRECTED — shipped in 2.6.0] adjacency_cache_bytes=0; 53k-degree reverse expand doesn't finish in 300s
 
 The 0 is deliberate: adjacency is the only OPT-IN cache tier
 (NAMIDB_ADJACENCY, requests 0 bytes unless enabled) by object-native
@@ -942,7 +942,7 @@ log names the disabled tier + env var; per-operator-invocation partner
 memo in both expand paths; topology-mode skips property hydration in
 edge_lookup_via_sst.
 
-### 63. [CONFIRMED — fix in progress] CREATE INDEX point lookup 70x slower than unique constraint; 4.8GB vs 574MB store
+### 63. [CONFIRMED — shipped in 2.6.0] CREATE INDEX point lookup 70x slower than unique constraint; 4.8GB vs 574MB store
 
 The unique arm batches an entire statement into ONE storage call
 (claimant pass + one multi-value paged probe + one batch confirm); the
@@ -957,7 +957,7 @@ snapshot (kills the per-call HEAD); default-on 64MiB RAM range cache;
 batch the multi arm like the unique arm. Legacy-body default flip
 deferred (2.0.4 rollback contract); flush.rs doc contradiction fixed.
 
-### 64. [CONFIRMED — fix in progress] Nine parallel read aggregations kill the server; no admission queue
+### 64. [CONFIRMED — shipped in 2.6.0] Nine parallel read aggregations kill the server; no admission queue
 
 No bound on concurrent query execution exists in the default config: the
 memory governor defaults OFF, the scan gate (4) meters only plans
@@ -967,7 +967,7 @@ per-operator rows not bytes. Fix: --max-concurrent-queries semaphore
 bounded wait then retryable 503 (HTTP) / transient Bolt error; scan-gate
 waits raced against client cancellation while there.
 
-### 65. [CORRECTED — fix in progress] file:// on macOS bind mounts: Precondition failures
+### 65. [CORRECTED — shipped in 2.6.0] file:// on macOS bind mounts: Precondition failures
 
 Real, but the unstable field is the INODE, not the size (etag format is
 {inode:x}-{mtime:x}-{size:x}; the failing pair differs in field one —
@@ -987,7 +987,7 @@ Now dispatched in the ENGINE (one chokepoint serves every surface) from
 manifest-cheap observed_* snapshot data, with stable virtual node ids;
 propertyKeys unions the memtable delta.
 
-### 67. [minor gaps — fixes staged] Docker features, write-timeout, SHOW INDEXES
+### 67. [minor gaps — shipped in 2.6.0] Docker features, write-timeout, SHOW INDEXES
 
 (a) REFUTED as packaging: every 2.x tag's Dockerfile bakes
 vector-index,text-index (verified per tag), and CALL even lists

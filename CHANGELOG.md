@@ -27,7 +27,44 @@ crates.io release will establish and document that API explicitly.
   memtable data. The CLI also gained `SHOW CONSTRAINTS` / `SHOW INDEXES`
   interception (previously errored).
 
+**Added**
+- Server-side read admission (fourth field report, item 64): every read
+  acquires a process-wide concurrency permit
+  (`NAMIDB_MAX_CONCURRENT_QUERIES`, default `max(4, cores)`, `0`
+  disables) with a bounded queue wait
+  (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000) before executing;
+  waiting past the window returns a retryable 503 (Bolt: transient
+  error) naming the knob — nine parallel large aggregations used to
+  exhaust a container that handled them serialized, with nothing
+  bounding them. The scan gate stays nested inside; writes are
+  unaffected (they serialize on the writer); Bolt admission waits are
+  raced against client disconnect.
+
 **Fixed**
+- `file://` stores on macOS bind mounts (Docker Desktop's gRPC-FUSE) no
+  longer fail reads with `Request precondition failure`. The local
+  backend's ETag is stat-derived (`{inode:x}-{mtime:x}-{size:x}`) and
+  gRPC-FUSE churns the synthetic inode even for unmodified files, so the
+  `If-Match` pin on every SST range read rejected healthy data. Local
+  objects are create-only (written once under a fresh UUID name, never
+  modified), so `file://` reads now pin the immutable path instead of the
+  ETag — the shared range cache stays on, keyed per store instance.
+  `NAMIDB_LOCAL_ETAG_PIN=1` restores the previous ETag pin.
+- A dying server could exit 0 in near silence (fourth field report,
+  item 61). Shutdown is now attributed: the signal handler logs
+  SIGINT/SIGTERM at WARN with resident/max memory bytes and the
+  rejected-query count on the same line, so "shutdown under memory
+  pressure" is greppable. The shutdown channel closing without a real
+  signal — previously indistinguishable from a clean SIGTERM — now logs
+  at ERROR and exits nonzero, and a failed signal-handler registration
+  is logged once and never mistaken for a received signal. In-flight
+  Bolt sessions, which used to be abandoned the moment HTTP finished
+  draining, are drained behind a bounded permit barrier (25s, with the
+  abandoned count logged on timeout) before the process may return.
+  Memory-governor admission rejections, previously mute 503s/Bolt
+  failures, log at WARN rate-limited to one line per second, and a boot
+  with the governor disabled inside a container that has a finite
+  cgroup memory limit now warns to set `NAMIDB_MEMORY_MAX_BYTES=auto`.
 - Non-unique `CREATE INDEX` point lookups were ~70x slower than unique
   constraints on identical data (fourth field report: 14.1ms vs 0.2ms,
   33min vs 47s for a 160k-fact load — and the load-time churn inflated
@@ -55,6 +92,33 @@ crates.io release will establish and document that API explicitly.
   constraint's name. Composite unique constraints stay absent on
   purpose: they are enforced by tuple scan on write and have no backing
   lookup structure to advertise.
+
+- The search DDL now accepts the Neo4j 5 spellings alongside the native
+  syntax, so tutorials and driver snippets paste in unchanged:
+  `CREATE VECTOR INDEX name FOR (n:Label) ON n.prop OPTIONS {indexConfig:
+  {vector.dimensions: 768, vector.similarity_function: 'cosine'}}`
+  (keys bare or backtick-quoted, with or without the `indexConfig`
+  wrapper) and `CREATE FULLTEXT INDEX name FOR (n:Label) ON EACH
+  [n.title, n.body]`. Both dialects parse to the identical clause, so
+  `IF NOT EXISTS`, `SHOW INDEXES`, and the drop statements behave the
+  same regardless of the spelling used. An unknown OPTIONS key errors
+  naming the supported ones; an OPTIONS map missing the dimension or
+  similarity function errors with both spelled out instead of guessing.
+- A build compiled without `vector-index`/`text-index` now rejects the
+  corresponding CREATE/DROP statements with a message naming the missing
+  build feature (and noting the official Docker image and release
+  binaries include it), instead of a misleading "must be the sole
+  statement" complaint on a statement that was already sole.
+
+
+**Changed**
+- `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) gains its own 60s default
+  instead of inheriting the 30s `--query-timeout`: a legitimate bulk-load
+  statement outlives any sane read budget, and since 2.5.0 the durability
+  tail is deadline-bounded on its own, so the write timeout no longer
+  needs to double as that safety net. For bulk loads, set
+  `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes; `0s` keeps
+  meaning disabled.
 
 ## [2.5.1] - 2026-08-30
 

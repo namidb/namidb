@@ -181,6 +181,13 @@ pub struct MemoryGovernor {
     reclaim_state: Mutex<ReclaimState>,
     reclaim_events: AtomicU64,
     rejected_queries: AtomicU64,
+    /// Monotonic base for [`Self::last_rejection_warn_secs`].
+    created_at: Instant,
+    /// Whole seconds since `created_at`, offset by one so zero means "never",
+    /// of the last rejection WARN. Rate-limits pressure logging to one line
+    /// per second: enough to make sustained pressure greppable without
+    /// letting a retry storm own the log.
+    last_rejection_warn_secs: AtomicU64,
     /// Working-set headroom promised to authenticated Bolt requests that have
     /// passed RSS admission but have not finished decode/execution yet.
     reserved_headroom_bytes: AtomicUsize,
@@ -223,6 +230,8 @@ impl MemoryGovernor {
             reclaim_state: Mutex::new(ReclaimState::default()),
             reclaim_events: AtomicU64::new(0),
             rejected_queries: AtomicU64::new(0),
+            created_at: Instant::now(),
+            last_rejection_warn_secs: AtomicU64::new(0),
             reserved_headroom_bytes: AtomicUsize::new(0),
             admin_flush_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
@@ -252,10 +261,39 @@ impl MemoryGovernor {
         let resident = self.reclaim_off_worker(initial).await;
 
         if let Some(pressure) = Self::projected_pressure(resident, 0, self.max_bytes) {
-            self.rejected_queries.fetch_add(1, Ordering::Relaxed);
+            self.note_rejection(&pressure);
             return Err(pressure);
         }
         Ok(())
+    }
+
+    /// Count one refused admission and say so at WARN, at most once per
+    /// second. The governor's 503s carry no server-side log line of their
+    /// own, so a shutdown taken under sustained pressure used to be invisible
+    /// in default logs.
+    fn note_rejection(&self, pressure: &MemoryPressure) {
+        self.rejected_queries.fetch_add(1, Ordering::Relaxed);
+        if self.should_log_rejection() {
+            tracing::warn!(
+                resident_bytes = pressure.resident_bytes,
+                requested_headroom_bytes = pressure.requested_headroom_bytes,
+                max_bytes = pressure.max_bytes,
+                rejected_queries = self.rejected_queries.load(Ordering::Relaxed),
+                "memory pressure: rejecting new query admissions"
+            );
+        }
+    }
+
+    fn should_log_rejection(&self) -> bool {
+        // Offset by one so the very first rejection (elapsed < 1s) still
+        // logs; the compare-exchange elects one logger per one-second window.
+        let now_secs = self.created_at.elapsed().as_secs().saturating_add(1);
+        let last = self.last_rejection_warn_secs.load(Ordering::Relaxed);
+        now_secs > last
+            && self
+                .last_rejection_warn_secs
+                .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// Atomically reserve projected decode/runtime headroom after normal RSS
@@ -295,16 +333,17 @@ impl MemoryGovernor {
             if let Some(pressure) =
                 Self::projected_pressure(resident_bytes, projected_headroom, self.max_bytes)
             {
-                self.rejected_queries.fetch_add(1, Ordering::Relaxed);
+                self.note_rejection(&pressure);
                 return Err(pressure);
             }
             let next = reserved.checked_add(additional_bytes).ok_or_else(|| {
-                self.rejected_queries.fetch_add(1, Ordering::Relaxed);
-                MemoryPressure {
+                let pressure = MemoryPressure {
                     resident_bytes,
                     requested_headroom_bytes: usize::MAX,
                     max_bytes: self.max_bytes,
-                }
+                };
+                self.note_rejection(&pressure);
+                pressure
             })?;
             match self.reserved_headroom_bytes.compare_exchange_weak(
                 reserved,
@@ -878,6 +917,25 @@ mod tests {
         let governor = MemoryGovernor::new(1);
         let _ = governor.reclaim_if_needed();
         assert_eq!(governor.rejected_queries(), 0);
+    }
+
+    #[test]
+    fn rejection_warn_rate_limiter_logs_first_then_holds_within_a_window() {
+        let governor = MemoryGovernor::new(1);
+        assert!(
+            governor.should_log_rejection(),
+            "the first rejection must always log"
+        );
+        // A later window is only elected when now advances past the recorded
+        // second; force "recorded in the far future" to model the same-window
+        // case without depending on wall-clock granularity.
+        governor
+            .last_rejection_warn_secs
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(
+            !governor.should_log_rejection(),
+            "a rejection inside an already-logged window must stay quiet"
+        );
     }
 
     #[tokio::test]

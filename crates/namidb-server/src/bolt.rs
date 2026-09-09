@@ -975,7 +975,23 @@ impl ServerBackend {
             // Read path: borrow a short-lived `Snapshot` from the owned
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
-            let _scan_permit = crate::acquire_scan_permit(&plan).await;
+            let admission = tokio::select! {
+                admission = crate::acquire_read_admission(&plan) => admission,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
+            let Some(_admission) = admission else {
+                return RunObservation {
+                    kind: Some(QueryKind::Read),
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Storage(
+                        "too many concurrent queries; the read admission queue is full — \
+                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                            .into(),
+                    )),
+                };
+            };
             let snap = owned.borrow();
             let read = execute_with_limits(
                 &plan,
@@ -1207,7 +1223,23 @@ impl ServerBackend {
                     };
                 }
             };
-            let _scan_permit = crate::acquire_scan_permit(&plan).await;
+            let admission = tokio::select! {
+                admission = crate::acquire_read_admission(&plan) => admission,
+                _ = cancellation.cancelled() => {
+                    return disconnected_observation(started, Some(QueryKind::Read));
+                }
+            };
+            let Some(_admission) = admission else {
+                return RunObservation {
+                    kind: Some(QueryKind::Read),
+                    elapsed: started.elapsed(),
+                    result: Err(BackendError::Storage(
+                        "too many concurrent queries; the read admission queue is full — \
+                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                            .into(),
+                    )),
+                };
+            };
             let snap = tx.writer.overlay_snapshot();
             let read = execute_with_limits(
                 &plan,
@@ -2174,7 +2206,39 @@ async fn serve_tenancy(
             }
         });
     }
+    // Sessions accepted before the stop run on detached tasks; without a
+    // barrier here the process could exit mid-transaction the moment HTTP
+    // finished draining (fourth field report, item 61).
+    drain_sessions(&conn_limit, max_conns).await;
     Ok(())
+}
+
+/// Upper bound on waiting for in-flight Bolt sessions after the listener
+/// stops accepting. Long enough for a normal statement to finish under the
+/// default timeouts; short enough that one wedged session cannot pin process
+/// shutdown past a supervisor's grace period.
+const SESSION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Wait until every session task has released its connection permit, bounded
+/// by [`SESSION_DRAIN_TIMEOUT`]. Reacquiring the full permit count is the
+/// proof that all detached session tasks have exited, since each holds its
+/// permit for the whole connection lifetime.
+async fn drain_sessions(conn_limit: &Arc<tokio::sync::Semaphore>, max_conns: usize) {
+    let all_permits = u32::try_from(max_conns).unwrap_or(u32::MAX);
+    match tokio::time::timeout(SESSION_DRAIN_TIMEOUT, conn_limit.acquire_many(all_permits)).await {
+        Ok(Ok(_reacquired)) => info!("bolt sessions drained"),
+        // The connection semaphore is never closed; do not block shutdown on
+        // a would-be logic error here.
+        Ok(Err(_)) => {}
+        Err(_) => {
+            let abandoned = max_conns.saturating_sub(conn_limit.available_permits());
+            warn!(
+                abandoned_sessions = abandoned,
+                timeout_secs = SESSION_DRAIN_TIMEOUT.as_secs(),
+                "bolt session drain timed out; abandoning in-flight sessions"
+            );
+        }
+    }
 }
 
 /// Build and run one Bolt session over any byte stream — a plain `TcpStream`
@@ -2291,6 +2355,52 @@ mod tests {
             Some(std::time::Duration::from_millis(750))
         );
         assert!(bolt_partial_message_timeout(Some("later")).is_err());
+    }
+
+    /// The shutdown barrier that `serve_tenancy` runs after its accept loop
+    /// breaks: it must not return while a session task still holds its
+    /// connection permit. Paused time keeps the release deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_waits_until_sessions_release_their_permits() {
+        let max_conns = 4;
+        let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_conns));
+        let held = conn_limit.clone().try_acquire_owned().unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        {
+            let released = Arc::clone(&released);
+            tokio::spawn(async move {
+                // Well inside the drain bound: the barrier must wait for this
+                // release rather than race past the held permit.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                released.store(true, Ordering::SeqCst);
+                drop(held);
+            });
+        }
+        drain_sessions(&conn_limit, max_conns).await;
+        assert!(
+            released.load(Ordering::SeqCst),
+            "drain returned while a session still held its permit"
+        );
+        assert_eq!(
+            conn_limit.available_permits(),
+            max_conns,
+            "the barrier must give the reacquired permits back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_is_bounded_when_a_session_never_exits() {
+        let max_conns = 2;
+        let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_conns));
+        let _held = conn_limit.clone().try_acquire_owned().unwrap();
+        // Paused time: the 25s bound elapses deterministically instead of
+        // stalling the test for real.
+        drain_sessions(&conn_limit, max_conns).await;
+        assert_eq!(
+            conn_limit.available_permits(),
+            max_conns - 1,
+            "a timed-out drain must return the permits it did reacquire"
+        );
     }
 
     /// Blocks exactly one cold SST read so a cancellation test can stop a

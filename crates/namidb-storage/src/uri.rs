@@ -120,6 +120,10 @@ fn parse_memory(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), Uri
         name: rest.to_string(),
         reason: e.to_string(),
     })?;
+    // Deliberately NOT marked create-only for pinned reads (unlike file://):
+    // InMemory ETags are stable per-instance counters with no churn to
+    // tolerate, and overwriting a path is legal against this store, so the
+    // `If-Match` pin still carries weight here.
     Ok((
         Arc::new(InMemory::new()),
         NamespacePaths::new("", namespace),
@@ -168,10 +172,16 @@ fn parse_file(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriEr
         uri: uri.to_string(),
         source: anyhow::anyhow!("{e}"),
     })?;
-    Ok((
-        Arc::new(store) as Arc<dyn ObjectStore>,
-        NamespacePaths::new("", namespace),
-    ))
+    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    // NamiDB writes every local object exactly once under a fresh UUID name
+    // (tmp + atomic rename; `O_CREAT|O_EXCL` for pointers), so pinned reads
+    // may key by the immutable path. The alternative — `If-Match` on
+    // `LocalFileSystem`'s `{inode:x}-{mtime:x}-{size:x}` ETag — fails healthy
+    // reads on FUSE-backed bind mounts (macOS Docker Desktop gRPC-FUSE),
+    // which churn the synthetic inode under an unmodified file.
+    // `NAMIDB_LOCAL_ETAG_PIN=1` restores the ETag pin.
+    crate::range_cache::mark_store_paths_immutable(&store);
+    Ok((store, NamespacePaths::new("", namespace)))
 }
 
 /// Optional client tuning for the HTTP-backed stores (S3/GCS/Azure), from
@@ -471,6 +481,45 @@ mod tests {
         let uri = format!("file://{}?ns=acme", dir.path().display());
         let (_store, paths) = parse_uri(&uri).unwrap();
         assert_eq!(paths.namespace().as_str(), "acme");
+    }
+
+    /// A `file://` store is registered create-only at parse time, so pinned
+    /// reads use the immutable-path generation instead of `If-Match` on
+    /// `LocalFileSystem`'s `{inode,mtime,size}` ETag — which FUSE-backed
+    /// bind mounts churn for unmodified files.
+    #[tokio::test]
+    async fn file_store_pins_reads_by_immutable_path() {
+        use object_store::ObjectStoreExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}?ns=acme", dir.path().display());
+        let (store, _paths) = parse_uri(&uri).unwrap();
+        let location = object_store::path::Path::from(format!("sst/{}.sst", uuid::Uuid::now_v7()));
+        store
+            .put(
+                &location,
+                object_store::PutPayload::from_static(b"immutable-bytes"),
+            )
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        assert!(
+            meta.e_tag.is_some(),
+            "LocalFileSystem reports a stat-derived ETag; the pin must still ignore it"
+        );
+
+        let source =
+            crate::range_cache::PinnedObjectRangeSource::from_create_only_meta(store, meta)
+                .await
+                .unwrap();
+        assert_eq!(
+            source.generation(),
+            &crate::range_cache::PinnedObjectGeneration::ImmutablePath
+        );
+        assert_eq!(
+            source.read_range(0..15).await.unwrap(),
+            bytes::Bytes::from_static(b"immutable-bytes")
+        );
     }
 
     #[test]

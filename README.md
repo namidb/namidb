@@ -435,6 +435,15 @@ docker run --rm -p 8080:8080 -v namidb-data:/var/lib/namidb \
   namidb/namidb-server:2 --store "file:///var/lib/namidb?ns=prod"
 ```
 
+FUSE-backed bind mounts (macOS Docker Desktop's gRPC-FUSE, some network
+filesystems) are tolerated for `file://` stores: local objects are written
+exactly once under fresh UUID names, so reads pin the immutable path rather
+than sending `If-Match` on the stat-derived ETag — whose synthetic inode
+field such filesystems churn even for unmodified files, which used to fail
+reads with `Request precondition failure`. Set `NAMIDB_LOCAL_ETAG_PIN=1` to
+restore the ETag pin (e.g. if something other than NamiDB rewrites files
+under the store directory in place).
+
 For a full self-hosted stack (server + MinIO as the bucket) see [`docker-compose.yml`](docker-compose.yml). Or run it from source:
 
 ```bash
@@ -750,6 +759,8 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `--memtable-flush-bytes` (`NAMIDB_MEMTABLE_FLUSH_BYTES`) | 64 MiB | Flush as soon as a committed write crosses this — bounds the un-flushed working set by bytes, not just the flush interval. |
 | `--memtable-stall-bytes` (`NAMIDB_MEMTABLE_STALL_BYTES`) | 256 MiB | Soft write backpressure so a burst loader can't OOM the process between flushes. |
 | `--writer-lock-timeout` (`NAMIDB_WRITER_LOCK_TIMEOUT`) | 30s | Cap how long a foreground write/DDL waits for the writer; a stuck writer returns 503 fast instead of growing an unbounded queue. |
+| `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt); a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
+| `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) | 60s | Wall-clock budget for a single write statement — its own default, deliberately larger than the read budget. For a bulk load, set `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes into smaller statements. `0s` = unbounded. |
 
 A fenced or poisoned writer reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers — a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
 

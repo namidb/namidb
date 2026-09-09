@@ -186,7 +186,7 @@ pub struct Config {
     /// transaction. A runaway MERGE/DELETE is aborted cooperatively rather
     /// than pinning the single writer, and its pending batch is discarded so
     /// nothing partial is committed. `Duration::ZERO` disables it; the CLI
-    /// defaults it to `query_timeout`.
+    /// defaults it to 60s, independent of `query_timeout`.
     pub write_timeout: Duration,
     /// Maximum rows a single read-query operator may materialise. A query
     /// whose operator output would exceed this aborts with a row-cap error
@@ -994,6 +994,16 @@ pub async fn run_with_memory_max_bytes(
                  lower NAMIDB_CACHE_MAX_BYTES"
             );
         }
+    } else if let Some(limit) = memory::finite_cgroup_memory_limit_bytes() {
+        // The container has a hard memory ceiling but the admission rail is
+        // off, so the kernel OOM killer — not a 503 — is what happens at that
+        // limit. Say so at boot, while an operator is still watching.
+        warn!(
+            cgroup_memory_limit_bytes = limit,
+            "memory governor disabled under a finite cgroup memory limit; set \
+             NAMIDB_MEMORY_MAX_BYTES=auto to reject queries at 90% of the \
+             limit instead of risking an OOM kill"
+        );
     }
 
     // One shutdown signal is shared by HTTP, optional Bolt, and the resident
@@ -1001,10 +1011,23 @@ pub async fn run_with_memory_max_bytes(
     // watchdog before namespace recovery lets it reclaim reconstructible
     // state even when opening a large writer moves RSS without any request.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
+    {
+        // Attribute the shutdown in one greppable WARN with the memory gauges
+        // alongside: a SIGTERM from an operator otherwise looks identical to
+        // a supervisor killing a pressured pod (fourth field report, item 61).
+        let memory = Arc::clone(&memory);
+        tokio::spawn(async move {
+            let cause = wait_for_shutdown_signal().await;
+            warn!(
+                signal = cause.as_str(),
+                resident_bytes = memory.sample().unwrap_or_else(|| memory.resident_bytes()),
+                memory_max_bytes = memory.max_bytes(),
+                rejected_queries = memory.rejected_queries(),
+                "shutdown signal received, draining…"
+            );
+            let _ = shutdown_tx.send(true);
+        });
+    }
     if memory_max_bytes > 0 {
         // Dropping a Tokio JoinHandle deliberately detaches the task; the
         // shared shutdown receiver still terminates it cleanly.
@@ -1085,7 +1108,7 @@ pub async fn run_with_memory_max_bytes(
         // named by the Bolt `db` field (driver `session(database=...)`).
         // Before this, the flag combination silently never opened the Bolt
         // port and 2.2.x refused it at boot.
-        if let Some(bolt_addr) = config.bolt_listen {
+        let bolt_task = config.bolt_listen.map(|bolt_addr| {
             let bolt_shared = shared.clone();
             let bolt_auth = shared.auth.clone();
             let tx_timeout = config.bolt_tx_timeout;
@@ -1106,11 +1129,14 @@ pub async fn run_with_memory_max_bytes(
                 {
                     error!(error = %e, "multi-tenant bolt listener exited");
                 }
-            });
-        }
+            })
+        });
 
         info!(multi_tenant = true, "starting multi-tenant server");
-        return serve_http(app, config, tls_config, shutdown_rx).await;
+        let bolt_drain_rx = shutdown_rx.clone();
+        let served = serve_http(app, config, tls_config, shutdown_rx).await;
+        await_bolt_drain(bolt_task, &bolt_drain_rx).await;
+        return served;
     }
 
     let (store, paths) = namidb_storage::parse_uri(&config.store_uri)
@@ -1367,7 +1393,7 @@ pub async fn run_with_memory_max_bytes(
         _ => anyhow::bail!("set both --tls-cert and --tls-key to enable TLS, or neither"),
     };
 
-    if let Some(bolt_addr) = config.bolt_listen {
+    let bolt_task = config.bolt_listen.map(|bolt_addr| {
         let bolt_state = state.clone();
         let bolt_auth = state.auth();
         let tx_timeout = config.bolt_tx_timeout;
@@ -1388,14 +1414,23 @@ pub async fn run_with_memory_max_bytes(
             {
                 error!(error = %e, "bolt listener exited");
             }
-        });
-    }
+        })
+    });
 
     let app = build_router(state);
-    serve_http(app, config, tls_config, shutdown_rx).await
+    let bolt_drain_rx = shutdown_rx.clone();
+    let served = serve_http(app, config, tls_config, shutdown_rx).await;
+    await_bolt_drain(bolt_task, &bolt_drain_rx).await;
+    served
 }
 
 /// Serve an HTTP router with TLS and graceful shutdown.
+///
+/// Only a drain that a real signal started keeps exit code 0. `wait_for` on
+/// the shutdown watch also resolves when the sender is dropped without ever
+/// signalling — the signal task died — and that used to be indistinguishable
+/// from a clean SIGTERM: the server stopped, `main` returned `Ok(())`, and
+/// the process exited 0 with nothing in the log to explain the death.
 async fn serve_http(
     app: Router,
     config: Config,
@@ -1403,13 +1438,17 @@ async fn serve_http(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut http_shutdown = shutdown_rx;
+    let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     match tls_config {
         Some(server_config) => {
             let handle = axum_server::Handle::new();
             let drain = handle.clone();
+            let drain_signalled = Arc::clone(&signalled);
             tokio::spawn(async move {
-                let _ = http_shutdown.wait_for(|stop| *stop).await;
+                if http_shutdown.wait_for(|stop| *stop).await.is_ok() {
+                    drain_signalled.store(true, std::sync::atomic::Ordering::Release);
+                }
                 info!("shutdown signalled, draining HTTPS requests…");
                 drain.graceful_shutdown(Some(Duration::from_secs(10)));
             });
@@ -1423,24 +1462,78 @@ async fn serve_http(
         None => {
             let listener = TcpListener::bind(config.listen).await?;
             info!(addr = %config.listen, "namidb-server listening");
+            let drain_signalled = Arc::clone(&signalled);
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
-                    let _ = http_shutdown.wait_for(|stop| *stop).await;
+                    if http_shutdown.wait_for(|stop| *stop).await.is_ok() {
+                        drain_signalled.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     info!("shutdown signalled, draining HTTP requests…");
                 })
                 .await?;
         }
     }
+    if !signalled.load(std::sync::atomic::Ordering::Acquire) {
+        error!("shutdown channel closed without a signal — treating as failure");
+        anyhow::bail!("HTTP server stopped without a shutdown signal");
+    }
     Ok(())
+}
+
+/// After HTTP stops, hold the boot path open until the Bolt listener has run
+/// its bounded session drain (see `bolt::serve_tenancy`): sessions run on
+/// detached tasks, and returning from [`run`] while they are mid-transaction
+/// abandons them at process exit. The extra 5s over Bolt's 25s barrier covers
+/// listener teardown itself. A serve error with nothing signalled means the
+/// listener was never told to stop — waiting on it would only delay the
+/// failure exit.
+async fn await_bolt_drain(
+    task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) {
+    let Some(task) = task else { return };
+    if !*shutdown.borrow() && shutdown.has_changed().is_ok() {
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(30), task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => error!(%error, "bolt listener task failed during shutdown"),
+        Err(_) => warn!("bolt listener did not stop within 30s of HTTP shutdown; exiting anyway"),
+    }
+}
+
+/// Why the process is shutting down. Exit code 0 is only reachable through a
+/// graceful drain, and a drain is only legitimate after one of these signals;
+/// naming the cause keeps a "who stopped the server" investigation greppable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownCause {
+    Sigint,
+    Sigterm,
+}
+
+impl ShutdownCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            ShutdownCause::Sigint => "SIGINT",
+            ShutdownCause::Sigterm => "SIGTERM",
+        }
+    }
 }
 
 /// Resolve when the process is asked to stop: Ctrl-C (SIGINT) on every
 /// platform, plus SIGTERM on Unix — what `docker stop`, systemd and
 /// Kubernetes send. Without the SIGTERM arm the server ignored the orderly
 /// stop signal and was hard-killed once the grace period elapsed.
-async fn wait_for_shutdown_signal() {
+///
+/// A failed handler registration must never read as a received signal: that
+/// would turn an environment quirk at boot into a silent exit-0 shutdown.
+/// Each arm logs its failure once and pends, leaving the other source armed.
+async fn wait_for_shutdown_signal() -> ShutdownCause {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(%error, "SIGINT handler unavailable; Ctrl-C will not be observed");
+            std::future::pending::<()>().await;
+        }
     };
     #[cfg(unix)]
     let terminate = async {
@@ -1448,14 +1541,17 @@ async fn wait_for_shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(_) => std::future::pending::<()>().await,
+            Err(error) => {
+                error!(%error, "SIGTERM handler unavailable; SIGTERM will not be observed");
+                std::future::pending::<()>().await;
+            }
         }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        _ = ctrl_c => info!("SIGINT received, draining…"),
-        _ = terminate => info!("SIGTERM received, draining…"),
+        _ = ctrl_c => ShutdownCause::Sigint,
+        _ = terminate => ShutdownCause::Sigterm,
     }
 }
 
@@ -1770,6 +1866,90 @@ fn scan_gate() -> Option<&'static tokio::sync::Semaphore> {
 pub(crate) fn plan_contains_node_scan(plan: &namidb_query::LogicalPlan) -> bool {
     matches!(plan, namidb_query::LogicalPlan::NodeScan { .. })
         || plan.children().into_iter().any(plan_contains_node_scan)
+}
+
+/// Process-wide bound on CONCURRENT READ EXECUTION (fourth field report,
+/// item 64): nine parallel large aggregations exhausted a container that
+/// handled them fine serialized, and nothing bounded them — the memory
+/// governor defaults off, the scan gate meters only plans containing a
+/// `NodeScan` (lookup+expand aggregations pass free), and the row cap
+/// bounds rows, not concurrency. Every read acquires a permit here (the
+/// scan gate stays nested inside for its own O(label) reasons); waiting
+/// longer than the bounded window returns the retryable 503 so clients
+/// get server-side admission instead of each implementing a queue.
+///
+/// `NAMIDB_MAX_CONCURRENT_QUERIES` overrides the default of
+/// `max(4, available cores)`; `0` disables the gate.
+fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Option<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let default = std::thread::available_parallelism()
+            .map(|n| n.get().max(4))
+            .unwrap_or(4);
+        let permits = std::env::var("NAMIDB_MAX_CONCURRENT_QUERIES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(default);
+        (permits > 0).then(|| tokio::sync::Semaphore::new(permits))
+    })
+    .as_ref()
+}
+
+/// How long a read may queue for admission before the retryable 503
+/// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000). Bounded chiefly for
+/// Bolt, which has no outer request-timeout layer.
+fn read_admission_wait() -> Duration {
+    Duration::from_millis(
+        std::env::var("NAMIDB_QUERY_ADMISSION_WAIT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(5_000),
+    )
+}
+
+/// Guards a read holds for its whole execution: the admission permit and,
+/// when the plan scans, the nested scan permit.
+#[doc(hidden)]
+pub struct ReadAdmission {
+    _admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    _scan: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+/// Admit one read: bounded wait on the concurrency gate, then the scan
+/// gate when the plan needs it. `None` = the admission window elapsed —
+/// the caller returns the retryable too-many-queries rejection.
+#[doc(hidden)]
+pub async fn acquire_read_admission(plan: &namidb_query::LogicalPlan) -> Option<ReadAdmission> {
+    let admission = match read_admission_gate() {
+        None => None,
+        Some(gate) => match tokio::time::timeout(read_admission_wait(), gate.acquire()).await {
+            Ok(permit) => Some(permit.expect("read admission gate is never closed")),
+            Err(_) => return None,
+        },
+    };
+    let scan = acquire_scan_permit(plan).await;
+    Some(ReadAdmission {
+        _admission: admission,
+        _scan: scan,
+    })
+}
+
+/// Retryable 503 for a read that could not be admitted within the window.
+pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> ObservedQuery {
+    ObservedQuery {
+        kind: Some(QueryKind::Read),
+        ok: false,
+        elapsed: started.elapsed(),
+        response: (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "too many concurrent queries; the read admission queue is full — retry \
+                        (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
+                    .into(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 /// Acquire a scan permit when the plan needs one. Holding the returned
@@ -3573,7 +3753,9 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let _scan_permit = acquire_scan_permit(&plan).await;
+        let Some(_admission) = acquire_read_admission(&plan).await else {
+            return admission_exhausted_observation(started);
+        };
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,
@@ -4673,7 +4855,9 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let _scan_permit = acquire_scan_permit(&plan).await;
+        let Some(_admission) = acquire_read_admission(&plan).await else {
+            return admission_exhausted_observation(started);
+        };
         let snap = owned.borrow();
         let result = execute_with_limits(
             &plan,
@@ -5051,6 +5235,87 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn shutdown_cause_maps_each_signal_to_its_greppable_name() {
+        assert_eq!(ShutdownCause::Sigint.as_str(), "SIGINT");
+        assert_eq!(ShutdownCause::Sigterm.as_str(), "SIGTERM");
+    }
+
+    fn shutdown_test_config(ns: &str) -> Config {
+        Config {
+            store_uri: format!("memory://{ns}"),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            auth_token: None,
+            auth_tokens_file: None,
+            auth_tokens_reload_interval: Duration::ZERO,
+            no_auth: true,
+            backup_target_uri: None,
+            group_commit_window: Duration::ZERO,
+            #[cfg(feature = "jwt")]
+            jwt: None,
+            #[cfg(feature = "pdp")]
+            pdp_url: None,
+            flush_interval: Duration::ZERO,
+            compaction_interval: Duration::ZERO,
+            sweep_min_age: Duration::ZERO,
+            sweep_delete: false,
+            bolt_listen: None,
+            bolt_max_message_bytes: 64 << 20,
+            bolt_tx_timeout: Duration::ZERO,
+            query_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            query_row_cap: 0,
+            compaction_l0_trigger: 0,
+            write_stall_l0: 0,
+            write_stall_delay: Duration::ZERO,
+            memtable_flush_bytes: 0,
+            memtable_stall_bytes: 0,
+            writer_lock_timeout: Duration::from_secs(5),
+            tls_cert: None,
+            tls_key: None,
+            slow_query_threshold: Duration::ZERO,
+            multi_tenant: false,
+            default_namespace: ns.to_string(),
+            max_namespaces: 100,
+            namespace_idle_timeout: Duration::from_secs(3600),
+        }
+    }
+
+    /// The shutdown watch closing without ever signalling means the signal
+    /// task died. The server still stops — but exit code 0 would misreport
+    /// that as a clean drain, so `serve_http` must surface it as an error.
+    #[tokio::test]
+    async fn serve_http_fails_when_the_shutdown_channel_closes_without_a_signal() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+        let err = serve_http(
+            Router::new(),
+            shutdown_test_config("serve-http-closed-channel"),
+            None,
+            shutdown_rx,
+        )
+        .await
+        .expect_err("a channel closure is not a graceful shutdown");
+        assert!(
+            err.to_string().contains("without a shutdown signal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_http_keeps_the_clean_exit_path_for_a_signalled_drain() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        serve_http(
+            Router::new(),
+            shutdown_test_config("serve-http-signalled"),
+            None,
+            shutdown_rx,
+        )
+        .await
+        .expect("a signal-driven drain must keep exit code 0");
     }
 
     /// Item 56 end-to-end: a runaway write is listed with its statement and

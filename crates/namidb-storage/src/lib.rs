@@ -90,9 +90,9 @@ pub use parquet_loader::{
 pub use paths::NamespacePaths;
 pub use pin::{PinLease, RetentionPin, DEFAULT_PIN_TTL};
 pub use range_cache::{
-    shared_range_cache, ImmutableRangeCache, ImmutableRangeKey, PinnedObjectGeneration,
-    PinnedObjectRangeSource, RangeCacheConfig, RangeCacheError, RangeCacheStats,
-    DEFAULT_NVME_CACHE_BLOCK_BYTES, DEFAULT_NVME_CACHE_WRITE_BUFFER_BYTES,
+    mark_store_paths_immutable, shared_range_cache, ImmutableRangeCache, ImmutableRangeKey,
+    PinnedObjectGeneration, PinnedObjectRangeSource, RangeCacheConfig, RangeCacheError,
+    RangeCacheStats, DEFAULT_NVME_CACHE_BLOCK_BYTES, DEFAULT_NVME_CACHE_WRITE_BUFFER_BYTES,
     DEFAULT_RAM_PAGE_CACHE_MAX_BYTES, DEFAULT_RANGE_CACHE_MAX_ENTRY_BYTES,
     DEFAULT_RANGE_CACHE_PAGE_BYTES,
 };

@@ -356,8 +356,10 @@ impl VectorQuantization {
     }
 }
 
-/// `CREATE VECTOR INDEX <name> FOR (<alias>:<Label>) ON <alias>.<property>
-/// METRIC <m> DIMENSION <n> [WITH {r, l_build, alpha, quantization}]` (RFC-030).
+/// `CREATE VECTOR INDEX <name> ON :<Label>(<property>) METRIC <m>
+/// DIMENSION <n> [WITH {r, l_build, alpha, quantization}]` (RFC-030), or the
+/// Neo4j 5 spelling `… FOR (<var>:<Label>) ON <var>.<property> OPTIONS {…}`
+/// — both parse to this clause.
 ///
 /// A standalone schema command: the parser only emits it as the sole clause
 /// of a query, and the server executes it out-of-band (see
@@ -386,7 +388,9 @@ pub struct CreateVectorIndexClause {
     pub span: SourceSpan,
 }
 
-/// `CREATE FULLTEXT INDEX <name> ON :<Label>(<prop1>[, <prop2>, …])`.
+/// `CREATE FULLTEXT INDEX <name> ON :<Label>(<prop1>[, <prop2>, …])`, or the
+/// Neo4j 5 spelling `… FOR (<var>:<Label>) ON EACH [<var>.<prop1>, …]` —
+/// both parse to this clause.
 ///
 /// A standalone schema command for the persistent BM25 index: the parser only
 /// emits it as the sole clause of a query, and the server executes it
