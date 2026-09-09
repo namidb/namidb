@@ -31,6 +31,12 @@ const RECLAIM_PERCENT: usize = 90;
 const RESUME_PERCENT: usize = 80;
 const HARD_RECLAIM_COOLDOWN: Duration = Duration::from_secs(1);
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+/// How long an unbroken run of refused admissions has to last before it stops
+/// reading as a transient spike and starts being logged as an outage.
+const SUSTAINED_PRESSURE_SECS: u64 = 10;
+/// How many in-flight statements a pressure line names, and how much of each.
+const PRESSURE_HOLDERS_LOGGED: usize = 3;
+const PRESSURE_STATEMENT_CHARS: usize = 160;
 
 /// Parse an exact-byte process ceiling or resolve `auto` from the current
 /// container's finite cgroup memory limit.
@@ -188,6 +194,15 @@ pub struct MemoryGovernor {
     /// per second: enough to make sustained pressure greppable without
     /// letting a retry storm own the log.
     last_rejection_warn_secs: AtomicU64,
+    /// Start of the current unbroken run of rejections, in the same offset
+    /// seconds; zero means "not currently rejecting". A run that outlives
+    /// [`SUSTAINED_PRESSURE_SECS`] stops being a transient spike and starts
+    /// being an outage, and is logged as one.
+    rejection_streak_started_secs: AtomicU64,
+    /// In-flight statements, for naming the queries that are actually holding
+    /// the memory when an admission is refused. Set once at server start;
+    /// absent in embedded/unit contexts, which simply log without statements.
+    query_registry: std::sync::OnceLock<Arc<crate::metrics::QueryRegistry>>,
     /// Working-set headroom promised to authenticated Bolt requests that have
     /// passed RSS admission but have not finished decode/execution yet.
     reserved_headroom_bytes: AtomicUsize,
@@ -232,6 +247,8 @@ impl MemoryGovernor {
             rejected_queries: AtomicU64::new(0),
             created_at: Instant::now(),
             last_rejection_warn_secs: AtomicU64::new(0),
+            rejection_streak_started_secs: AtomicU64::new(0),
+            query_registry: std::sync::OnceLock::new(),
             reserved_headroom_bytes: AtomicUsize::new(0),
             admin_flush_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
@@ -264,24 +281,114 @@ impl MemoryGovernor {
             self.note_rejection(&pressure);
             return Err(pressure);
         }
+        self.clear_rejection_streak();
         Ok(())
     }
 
-    /// Count one refused admission and say so at WARN, at most once per
-    /// second. The governor's 503s carry no server-side log line of their
-    /// own, so a shutdown taken under sustained pressure used to be invisible
-    /// in default logs.
+    /// Publish the in-flight query registry so refusals can name the
+    /// statements holding the memory. Idempotent; the first caller wins.
+    pub fn attach_query_registry(&self, registry: Arc<crate::metrics::QueryRegistry>) {
+        let _ = self.query_registry.set(registry);
+    }
+
+    /// Count one refused admission and say so, at most once per second.
+    ///
+    /// Three things an operator needs and used to have to infer: the reason
+    /// and the numbers behind it, WHICH statements are holding the memory
+    /// (the refused query is usually innocent — it is the long-running ones
+    /// already inside that matter), and a severity that matches reality. A
+    /// brief spike is a warning; refusing continuously for
+    /// [`SUSTAINED_PRESSURE_SECS`] is an outage and logs at ERROR, so the
+    /// standard `grep -iE "error|fatal"` sweep that operators actually run
+    /// finds it. A silent 503 storm is how a memory-driven restart ends up
+    /// looking like a process that died for no reason.
     fn note_rejection(&self, pressure: &MemoryPressure) {
         self.rejected_queries.fetch_add(1, Ordering::Relaxed);
-        if self.should_log_rejection() {
+        let streak_secs = self.note_rejection_streak();
+        if !self.should_log_rejection() {
+            return;
+        }
+        let holders = self.pressure_holders();
+        let rejected_queries = self.rejected_queries.load(Ordering::Relaxed);
+        if streak_secs >= SUSTAINED_PRESSURE_SECS {
+            tracing::error!(
+                resident_bytes = pressure.resident_bytes,
+                requested_headroom_bytes = pressure.requested_headroom_bytes,
+                max_bytes = pressure.max_bytes,
+                rejected_queries,
+                sustained_secs = streak_secs,
+                in_flight = %holders,
+                "memory pressure: sustained rejection of new queries; the server \
+                 has been refusing work continuously and is at its configured \
+                 memory ceiling"
+            );
+        } else {
             tracing::warn!(
                 resident_bytes = pressure.resident_bytes,
                 requested_headroom_bytes = pressure.requested_headroom_bytes,
                 max_bytes = pressure.max_bytes,
-                rejected_queries = self.rejected_queries.load(Ordering::Relaxed),
+                rejected_queries,
+                in_flight = %holders,
                 "memory pressure: rejecting new query admissions"
             );
         }
+    }
+
+    /// Extend the current rejection run and return its length in seconds.
+    /// Claiming 0 -> now starts a run; a racing caller reads the winner's
+    /// start instead of resetting it, so a burst cannot keep the run at zero.
+    fn note_rejection_streak(&self) -> u64 {
+        let now = self.now_secs();
+        match self.rejection_streak_started_secs.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => 0,
+            Err(started) => now.saturating_sub(started),
+        }
+    }
+
+    /// End the current rejection run: the ceiling is admitting work again.
+    fn clear_rejection_streak(&self) {
+        self.rejection_streak_started_secs
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// The longest-running in-flight statements, which are the ones actually
+    /// occupying the memory being refused to someone else.
+    fn pressure_holders(&self) -> String {
+        let Some(registry) = self.query_registry.get() else {
+            return "unavailable".to_string();
+        };
+        let running = registry.list(None);
+        if running.is_empty() {
+            return "none".to_string();
+        }
+        let total = running.len();
+        let named: Vec<String> = running
+            .into_iter()
+            .take(PRESSURE_HOLDERS_LOGGED)
+            .map(|q| {
+                let mut statement = q.statement;
+                statement.truncate(PRESSURE_STATEMENT_CHARS);
+                format!("[{}ms {} {}]", q.elapsed_ms, q.protocol, statement)
+            })
+            .collect();
+        if total > named.len() {
+            format!(
+                "{} of {total} longest-running: {}",
+                named.len(),
+                named.join(" ")
+            )
+        } else {
+            format!("{total} running: {}", named.join(" "))
+        }
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.created_at.elapsed().as_secs().saturating_add(1)
     }
 
     fn should_log_rejection(&self) -> bool {
@@ -352,6 +459,7 @@ impl MemoryGovernor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.clear_rejection_streak();
                     return Ok(MemoryHeadroomReservation {
                         governor: Arc::clone(self),
                         bytes: additional_bytes,
@@ -1008,5 +1116,82 @@ mod tests {
         let _second = tokio::time::timeout(Duration::from_secs(1), governor.admin_flush_permit())
             .await
             .expect("finishing the detached trim must release the gate");
+    }
+
+    /// A refusal has to name the statements holding the memory. Without the
+    /// registry attached (embedded/unit contexts) it says so rather than
+    /// claiming nothing is running.
+    #[test]
+    fn pressure_holders_name_the_longest_running_statements() {
+        let governor = MemoryGovernor::new(1);
+        assert_eq!(governor.pressure_holders(), "unavailable");
+
+        let registry = Arc::new(crate::metrics::QueryRegistry::default());
+        governor.attach_query_registry(Arc::clone(&registry));
+        assert_eq!(governor.pressure_holders(), "none");
+
+        let _held = registry.register(
+            crate::metrics::Protocol::Http,
+            "tenant",
+            "MATCH (v:VENTA) RETURN count(v)",
+        );
+        let holders = governor.pressure_holders();
+        assert!(holders.contains("1 running"), "got {holders}");
+        assert!(holders.contains("MATCH (v:VENTA)"), "got {holders}");
+        assert!(holders.contains("http"), "got {holders}");
+    }
+
+    /// Only the first `PRESSURE_HOLDERS_LOGGED` statements are named, and the
+    /// line says how many it left out — a silent truncation would read as
+    /// "that is everything that was running".
+    #[test]
+    fn pressure_holders_report_what_they_omit() {
+        let governor = MemoryGovernor::new(1);
+        let registry = Arc::new(crate::metrics::QueryRegistry::default());
+        governor.attach_query_registry(Arc::clone(&registry));
+        let _held: Vec<_> = (0..PRESSURE_HOLDERS_LOGGED + 4)
+            .map(|i| {
+                registry.register(
+                    crate::metrics::Protocol::Bolt,
+                    "tenant",
+                    &format!("MATCH (n:L{i}) RETURN n"),
+                )
+            })
+            .collect();
+        let holders = governor.pressure_holders();
+        assert!(
+            holders.contains(&format!(
+                "{PRESSURE_HOLDERS_LOGGED} of {} longest-running",
+                PRESSURE_HOLDERS_LOGGED + 4
+            )),
+            "got {holders}"
+        );
+    }
+
+    /// The run starts at zero and grows; a successful admission ends it, so a
+    /// recovered server does not keep logging at ERROR.
+    #[test]
+    fn rejection_streak_starts_at_zero_and_clears_on_admission() {
+        let governor = MemoryGovernor::new(1);
+        assert_eq!(governor.note_rejection_streak(), 0, "a new run starts at 0");
+        // A second refusal within the same second is still the same run, and
+        // still measured from the run's start rather than restarting it.
+        assert_eq!(governor.note_rejection_streak(), 0);
+        assert_ne!(
+            governor
+                .rejection_streak_started_secs
+                .load(Ordering::Relaxed),
+            0,
+            "an active run must record its start"
+        );
+
+        governor.clear_rejection_streak();
+        assert_eq!(
+            governor
+                .rejection_streak_started_secs
+                .load(Ordering::Relaxed),
+            0,
+            "admitting work again must end the run"
+        );
     }
 }

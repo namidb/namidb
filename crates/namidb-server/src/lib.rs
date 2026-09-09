@@ -668,6 +668,11 @@ impl AppState {
 /// intentionally excluded from the auth check (a healthcheck probe or a
 /// Prometheus scraper carries no token).
 pub fn build_router(state: AppState) -> Router {
+    // The governor names the statements holding memory when it refuses an
+    // admission; this is the one place where the state is final.
+    state
+        .memory
+        .attach_query_registry(Arc::clone(state.metrics.queries()));
     let public = Router::new()
         .route("/v0/livez", get(livez))
         .route("/v0/health", get(health))
@@ -842,6 +847,9 @@ where
 /// - `/:namespace/v0/cypher` - execute Cypher queries
 /// - `/:namespace/v0/admin/flush` - manual flush
 pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
+    shared
+        .memory
+        .attach_query_registry(Arc::clone(shared.metrics.queries()));
     let public = Router::new()
         .route("/v0/version", get(version))
         .route("/v0/metrics", get(metrics_handler_multi));
@@ -3690,7 +3698,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 namidb_query::show_indexes_rows(manifest)
             }
         };
-        let (_columns, json_rows) = rows_to_json(&rows);
+        let json_rows = row_values(&rows);
         let columns = namidb_query::show_schema_columns();
         return ObservedQuery {
             kind: Some(QueryKind::Read),
@@ -3816,7 +3824,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         match result {
             Ok(outcome) => {
                 let summary = WriteSummary::from(&outcome);
-                let (columns, rows) = rows_to_json(&outcome.rows);
+                let (columns, rows) = rows_to_json(&plan, &outcome.rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Write),
                     ok: true,
@@ -3855,7 +3863,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
-                let (columns, rows) = rows_to_json(&rows);
+                let (columns, rows) = rows_to_json(&plan, &rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Read),
                     ok: true,
@@ -4929,7 +4937,7 @@ async fn run_cypher_multi(
                 namidb_query::show_indexes_rows(manifest)
             }
         };
-        let (_columns, json_rows) = rows_to_json(&rows);
+        let json_rows = row_values(&rows);
         return ObservedQuery {
             kind: Some(QueryKind::Read),
             ok: true,
@@ -5049,7 +5057,7 @@ async fn run_cypher_multi(
         match result {
             Ok(outcome) => {
                 let summary = WriteSummary::from(&outcome);
-                let (columns, rows) = rows_to_json(&outcome.rows);
+                let (columns, rows) = rows_to_json(&plan, &outcome.rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Write),
                     ok: true,
@@ -5086,7 +5094,7 @@ async fn run_cypher_multi(
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
-                let (columns, rows) = rows_to_json(&rows);
+                let (columns, rows) = rows_to_json(&plan, &rows);
                 ObservedQuery {
                     kind: Some(QueryKind::Read),
                     ok: true,
@@ -5305,22 +5313,23 @@ fn json_to_runtime(v: &serde_json::Value) -> Result<RuntimeValue, String> {
 }
 
 fn rows_to_json(
+    plan: &namidb_query::LogicalPlan,
     rows: &[namidb_query::Row],
 ) -> (Vec<String>, Vec<serde_json::Map<String, serde_json::Value>>) {
-    let columns: Vec<String> = rows
-        .first()
-        .map(|r| r.bindings.keys().cloned().collect())
-        .unwrap_or_default();
-    let json_rows: Vec<_> = rows
-        .iter()
+    (namidb_query::result_columns(plan, rows), row_values(rows))
+}
+
+/// Row bodies without a column list, for the `SHOW` surfaces that name their
+/// own canonical columns and never lower to a plan.
+fn row_values(rows: &[namidb_query::Row]) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    rows.iter()
         .map(|r| {
             r.bindings
                 .iter()
                 .map(|(k, v)| (k.clone(), runtime_to_json(v)))
                 .collect::<serde_json::Map<_, _>>()
         })
-        .collect();
-    (columns, json_rows)
+        .collect()
 }
 
 fn runtime_to_json(v: &RuntimeValue) -> serde_json::Value {
@@ -6444,6 +6453,61 @@ mod tests {
         assert_eq!(json["code"], "parse_error");
         assert_eq!(json["neo4j_code"], "Neo.ClientError.Statement.SyntaxError");
         assert_eq!(json["gql_status"], "42001");
+    }
+
+    /// The `columns` array is the positional contract: clients zip it with
+    /// row data, Bolt drivers index records by it, and Arrow/pandas carry it
+    /// into a dataframe. It used to be read off a row's `BTreeMap`, so it came
+    /// back sorted by name — `RETURN 3 AS c, 1 AS a, 2 AS b` reported
+    /// `[a, b, c]` and every positional reader silently took the wrong column.
+    #[tokio::test]
+    async fn result_columns_follow_the_return_clause() {
+        let app = fixture(None).await;
+
+        for (query, expected) in [
+            ("RETURN 3 AS c, 1 AS a, 2 AS b", vec!["c", "a", "b"]),
+            ("RETURN 1 AS zeta, 2 AS alpha", vec!["zeta", "alpha"]),
+            // Unaliased expressions take their generated names, still in
+            // clause order.
+            ("RETURN 2, 1", vec!["2", "1"]),
+        ] {
+            let resp = post_cypher(&app, None, query).await;
+            assert_eq!(resp.status(), StatusCode::OK, "query: {query}");
+            let body = body_json(resp).await;
+            let columns: Vec<String> = body["columns"]
+                .as_array()
+                .expect("columns array")
+                .iter()
+                .map(|c| c.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(columns, expected, "column order for: {query}");
+        }
+    }
+
+    /// Ordering and limiting sit above the projection, so the clause order has
+    /// to survive them — this is the shape a reporting query actually takes.
+    #[tokio::test]
+    async fn result_columns_survive_order_by_and_limit() {
+        let app = fixture(None).await;
+        let resp = post_cypher(
+            &app,
+            None,
+            "UNWIND [3, 1, 2] AS n RETURN n AS zulu, n * 2 AS alpha ORDER BY zulu DESC LIMIT 2",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let columns: Vec<String> = body["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(columns, vec!["zulu".to_string(), "alpha".to_string()]);
+        // And the ordering itself still applies.
+        let first = &body["rows"][0];
+        assert_eq!(first["zulu"], 3);
+        assert_eq!(first["alpha"], 6);
     }
 
     /// Router for namespace `ns` whose auth is loaded from `tokens_json` (the

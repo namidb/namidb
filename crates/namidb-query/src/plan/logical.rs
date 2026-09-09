@@ -665,6 +665,36 @@ pub struct ProjectionItem {
     pub alias: String,
 }
 
+/// The statement's output columns, in the order the `RETURN` clause wrote
+/// them.
+///
+/// A row is a `BTreeMap`, so reading the column list off a row yields
+/// LEXICOGRAPHIC order: `RETURN 3 AS c, 1 AS a, 2 AS b` reported `[a, b, c]`.
+/// Every client that indexes a result positionally — Bolt is positional by
+/// protocol, and Arrow/pandas conversion carries the order into a dataframe —
+/// silently read the wrong column. The plan is the only place the clause
+/// order survives, so take it from there.
+///
+/// Descends from the root only through nodes that cannot change the top-level
+/// binding set, and returns `None` for anything else (writes, bare
+/// `DiscardResult` statements), leaving the caller on its existing fallback.
+pub fn output_columns(plan: &LogicalPlan) -> Option<Vec<String>> {
+    match plan {
+        LogicalPlan::Project { items, .. } => {
+            Some(items.iter().map(|item| item.alias.clone()).collect())
+        }
+        // Ordering, deduplication and filtering rearrange or drop rows; none
+        // of them adds, removes or renames a column.
+        LogicalPlan::TopN { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Filter { input, .. } => output_columns(input),
+        // Both arms of a union project the same columns; the left one names
+        // them.
+        LogicalPlan::Union { left, .. } => output_columns(left),
+        _ => None,
+    }
+}
+
 /// One equi-join pair for [`LogicalPlan::HashJoin`].
 ///
 /// `build_side` is evaluated on each row of the build subtree to
@@ -1059,5 +1089,65 @@ mod tests {
             alias: "n".into(),
         };
         assert_eq!(item.alias, "n");
+    }
+
+    fn project_of(aliases: &[&str], input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Project {
+            input: Box::new(input),
+            items: aliases
+                .iter()
+                .map(|alias| ProjectionItem {
+                    expression: Expression {
+                        kind: ExpressionKind::Variable(Identifier::new(
+                            *alias,
+                            SourceSpan::point(0),
+                        )),
+                        span: SourceSpan::point(0),
+                    },
+                    alias: (*alias).to_string(),
+                })
+                .collect(),
+            distinct: false,
+            discard_input_bindings: true,
+        }
+    }
+
+    /// `RETURN 3 AS c, 1 AS a, 2 AS b` must report `[c, a, b]`. Reading the
+    /// list off a row's `BTreeMap` reported `[a, b, c]`, so every positional
+    /// client read the wrong column.
+    #[test]
+    fn output_columns_follow_the_return_clause_not_the_alphabet() {
+        let plan = project_of(&["c", "a", "b"], LogicalPlan::Empty);
+        assert_eq!(
+            output_columns(&plan),
+            Some(vec!["c".to_string(), "a".to_string(), "b".to_string()])
+        );
+    }
+
+    /// Ordering, deduplication and filtering sit above the projection without
+    /// touching the column set, so the clause order must survive them.
+    #[test]
+    fn output_columns_see_through_row_only_wrappers() {
+        let project = project_of(&["zeta", "alpha"], LogicalPlan::Empty);
+        let sorted = LogicalPlan::TopN {
+            input: Box::new(project),
+            keys: vec![],
+            skip: RowCount::Const(0),
+            limit: RowCount::Const(10),
+        };
+        let deduped = LogicalPlan::Distinct {
+            input: Box::new(sorted),
+        };
+        assert_eq!(
+            output_columns(&deduped),
+            Some(vec!["zeta".to_string(), "alpha".to_string()])
+        );
+    }
+
+    /// A plan with no projection (a bare write) has no clause order to report;
+    /// the caller keeps its row-derived fallback rather than inventing one.
+    #[test]
+    fn output_columns_are_absent_without_a_projection() {
+        assert_eq!(output_columns(&LogicalPlan::Empty), None);
     }
 }

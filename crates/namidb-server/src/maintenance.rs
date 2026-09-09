@@ -1063,7 +1063,8 @@ mod tests {
     /// 500 during a rolling restart.
     #[tokio::test]
     async fn admin_drain_stops_on_cancellation() {
-        let (store, paths) = namidb_storage::parse_uri("memory://maintenance-drain-cancel").unwrap();
+        let (store, paths) =
+            namidb_storage::parse_uri("memory://maintenance-drain-cancel").unwrap();
         let writer = WriterSession::open(store, paths).await.unwrap();
         let state = AppState::new(writer, None, "maintenance-drain-cancel".into());
         for i in 0..4 {

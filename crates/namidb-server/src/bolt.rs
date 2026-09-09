@@ -884,7 +884,7 @@ impl ServerBackend {
                 let acked = crate::bounded_group_ack(ack, self.state.write_deadline()).await;
                 let elapsed = started.elapsed();
                 let result = match acked {
-                    crate::GroupAck::Committed => Ok(write_run_outcome(outcome)),
+                    crate::GroupAck::Committed => Ok(write_run_outcome(&plan, outcome)),
                     crate::GroupAck::Shared(shared) => Err(map_exec_err_ref(shared.0.as_ref())),
                     crate::GroupAck::CoordinatorExited => Err(BackendError::Other(
                         "group commit coordinator exited".into(),
@@ -948,7 +948,7 @@ impl ServerBackend {
                     RunObservation {
                         kind: Some(QueryKind::Write),
                         elapsed,
-                        result: Ok(write_run_outcome(outcome)),
+                        result: Ok(write_run_outcome(&plan, outcome)),
                     }
                 }
                 Err(error) => {
@@ -1011,7 +1011,9 @@ impl ServerBackend {
             RunObservation {
                 kind: Some(QueryKind::Read),
                 elapsed,
-                result: rows.map(read_run_outcome).map_err(map_exec_err),
+                result: rows
+                    .map(|rows| read_run_outcome(&plan, rows))
+                    .map_err(map_exec_err),
             }
         }
     }
@@ -1175,7 +1177,7 @@ impl ServerBackend {
             let result = match staged {
                 Some(Ok(outcome)) => {
                     tx.staged = true;
-                    Ok(write_run_outcome(outcome))
+                    Ok(write_run_outcome(&plan, outcome))
                 }
                 Some(Err(e)) => {
                     // A failed statement aborts the transaction. Drop whatever
@@ -1259,7 +1261,9 @@ impl ServerBackend {
             RunObservation {
                 kind: Some(QueryKind::Read),
                 elapsed,
-                result: rows.map(read_run_outcome).map_err(map_exec_err),
+                result: rows
+                    .map(|rows| read_run_outcome(&plan, rows))
+                    .map_err(map_exec_err),
             }
         }
     }
@@ -1556,17 +1560,18 @@ fn classify_write(o: &namidb_query::WriteOutcome) -> StatementType {
     }
 }
 
-fn field_list(rows: &[namidb_query::Row]) -> Vec<String> {
-    rows.first()
-        .map(|r| r.bindings.keys().cloned().collect())
-        .unwrap_or_default()
+/// Bolt is positional: the driver zips `fields` with each record's values.
+/// The session emits values by field-name lookup, so ordering this list to
+/// match the `RETURN` clause reorders the values with it.
+fn field_list(plan: &namidb_query::LogicalPlan, rows: &[namidb_query::Row]) -> Vec<String> {
+    namidb_query::result_columns(plan, rows)
 }
 
 /// Build the Bolt `RunOutcome` for a write statement (auto-commit or staged
 /// in a transaction): the result rows plus the update counters.
-fn write_run_outcome(outcome: WriteOutcome) -> RunOutcome {
+fn write_run_outcome(plan: &namidb_query::LogicalPlan, outcome: WriteOutcome) -> RunOutcome {
     let stype = classify_write(&outcome);
-    let fields = field_list(&outcome.rows);
+    let fields = field_list(plan, &outcome.rows);
     let mut counters = std::collections::BTreeMap::new();
     counters.insert("nodes-created".into(), outcome.nodes_created as i64);
     counters.insert("nodes-deleted".into(), outcome.nodes_deleted as i64);
@@ -1582,8 +1587,8 @@ fn write_run_outcome(outcome: WriteOutcome) -> RunOutcome {
 }
 
 /// Build the Bolt `RunOutcome` for a read statement.
-fn read_run_outcome(rows: Vec<Row>) -> RunOutcome {
-    let fields = field_list(&rows);
+fn read_run_outcome(plan: &namidb_query::LogicalPlan, rows: Vec<Row>) -> RunOutcome {
+    let fields = field_list(plan, &rows);
     RunOutcome {
         fields,
         rows,
