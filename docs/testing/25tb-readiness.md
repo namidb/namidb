@@ -1555,3 +1555,63 @@ pruning will therefore help a lot for a property CORRELATED with insertion
 identity and very little for one that is not. The property-page path (2)
 does not have that limitation and is the better first target; verify
 against a real fixture before choosing.
+
+### 81. [OPEN — highest remaining value, fully scoped] Numeric equality never uses an index
+
+Same data, same cardinality, an index declared on both properties, 160,000
+nodes where each row carries the same key as a string and as an integer:
+
+| query | time | route |
+|---|---|---|
+| `MATCH (t:STR {txt: '12345'})` | **0.001 s** | index, posting lookup |
+| `MATCH (t:STR {num: 12345})` | **1.603 s** | full scan |
+
+**1600x, purely because the property is numeric.** EXPLAIN says so in
+plain text: *"numeric equality is not posting-indexed; only String/Bool
+are"*. `CREATE INDEX ... ON (n.numeric_prop)` is accepted and does
+nothing for equality.
+
+For a retail or clinical graph this is most of the schema — quantities,
+prices, amounts, numeric product codes, foreign keys. Note the reporter's
+own `cod_item` is a STRING (`'100565537'`), which is why their constraint
+lookups were fast; any numeric property they index gets nothing.
+
+**This is a performance gap only — the scan path is CORRECT.** Verified by
+a 102-combination filter-vs-expression sweep after the 2.6.12 coercion
+fix: every operator and type agrees. So this can be left open safely.
+
+**What it actually requires** — five coordinated places, each of which can
+silently drop rows if it disagrees with the others:
+
+1. *Harvester filter*, flush.rs (~1847) and compact.rs (~571): both hard
+   `matches!(p.data_type, Utf8 | LargeUtf8 | Bool)`. Compaction re-derives
+   sidecars from scratch, so a flush-only change vanishes at the first
+   merge.
+2. *Key encoding*, `encode_equality_property_value`: it ALREADY handles
+   I64/F64/Date/DateTime/Bytes with order-preserving encodings — but it
+   emits `i:{hex}` for an integer and `f:{hex}` for a float, so `5` and
+   `5.0` produce DIFFERENT keys while Cypher says they are equal. The
+   composite path already solved exactly this: TupleV1 canonicalises
+   numeric members to f64 and confirms with coercing equality (recorded
+   above under the composite-index work). The single-property index needs
+   the same canonicalisation. Collisions from i64 values beyond 2^53 are
+   safe *provided* the confirm step (3) actually filters.
+3. **THE TRAP** — `batch_confirm_multi_candidates` (read.rs ~2775) filters
+   candidates with
+   `matches!(view.properties.get(property), Some(Value::Str(current)) if current == &value)`.
+   It matches `Value::Str` and NOTHING ELSE. Widening the index without
+   widening this makes every numeric lookup confirm zero candidates and
+   return an empty result — silently. This is the single most dangerous
+   line in the change.
+4. *Planner route*, the rule behind the EXPLAIN note (plan/explain.rs
+   ~1061 and the matching decision in `optimize/unique_lookup.rs`).
+5. *Back-compat*, which is unusually easy here: existing sidecars contain
+   NO numeric keys at all, so widening ADDS keys without changing any
+   existing one. `EqualityIndexDescriptor.key_encoding` already exists for
+   versioning if a canonical numeric encoding needs its own tag.
+
+**Acceptance before this ships**: the equivalence harness pointed at
+indexed-vs-unindexed results for numeric equality across Int/Float
+spellings, integral floats, values beyond 2^53, negatives, and a
+string-vs-number pair that must NOT match — plus the same after flush AND
+after compaction, since (1) means the two writers must agree.
