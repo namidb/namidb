@@ -1111,73 +1111,51 @@ flag (`--http-request-timeout`, `0s` disables) whose default is derived
 to clear the largest configured query/write budget, with a boot warning
 when an explicit value would truncate them.
 
-### 75. [OPEN — measured, design ready] `LIMIT` does not bound an expansion's work
+### 75. [FIXED in 2.6.10] `LIMIT` now bounds an expansion's work
 
-Re-measured on 2.6.9, degree 160,000, ~1 KB targets,
-`MATCH (h:HUB)-[:TIENE]->(t:FAT)`:
+Was: a pushed-down cap was checked only at the SEED boundary, so the hop
+loop collected every partner, `prepare_expand_targets` hydrated all of
+them, and truncation happened above the operator. `LIMIT 1` cost what
+counting every row cost.
 
-| query | time |
-|---|---|
-| `RETURN count(*)` (target unreferenced -> membership sidecar) | **0.65 s** |
-| `RETURN count(t)` (hydrates) | 2.18 s |
-| `RETURN t.idx LIMIT 25` | 2.01 s |
-| `RETURN t.idx LIMIT 1` | **2.04 s** |
+Fixed by hydrating in consecutive WINDOWS: run the per-edge loop over
+exactly one window, take another only if the cap is still unmet. Measured
+at degree 160,000, ~1 KB targets:
 
-`LIMIT 1` costs what the full scan costs. The cap is checked only at the
-SEED boundary — the contract being that every consumed seed contributes
-its COMPLETE edge set — so the hop loop collects every partner into
-`unique_targets`, `prepare_expand_targets` hydrates all of them, and the
-truncation happens above the operator.
+| query | before | after |
+|---|---|---|
+| `RETURN t.idx LIMIT 1` | 2.04 s | **0.32 s** |
+| `RETURN t.idx LIMIT 25` | 2.01 s | **0.31 s** |
+| `RETURN t.idx LIMIT 1000` | ~2.0 s | 0.34 s |
+| `LIMIT 200000` (beyond the total) | 2.28 s | 2.28 s |
+| `RETURN count(t)` (uncapped) | 2.23 s | 2.23 s |
 
-Split: hydration ~1.4 s (**~70%**), adjacency read plus membership
-~0.65 s (**~30%**). Bounding hydration takes `LIMIT 25` to roughly 0.7 s.
-The remaining 30% needs the limit inside `out_edges`, which has no limit
-parameter — that is the storage half, and it is where the hierarchical
-adjacency work from finding #3 actually earns its keep.
+**Why a window and not a truncation.** The per-edge loop rejects edges on
+many paths (label mismatch, membership, the trail rule, visited pruning, an
+absent node), so hydrating "the first N endpoints" returns FEWER rows than
+requested whenever one is rejected — a wrong answer, not a slow one.
+Windows are consecutive and re-entered until the cap is met, so the result
+stays an order-preserving prefix of the uncapped one.
 
-**Why a plain truncation is WRONG.** The per-edge loop has eight
-`continue` paths (label mismatch, membership, trail rule, visited-set
-pruning, node absent). Taking the first N edges UNDERFILLS whenever any
-edge is rejected — fewer rows than the user asked for, a wrong answer
-rather than a slow one, and the fourth such bug class this codebase has
-produced this week.
+Guarded to `cap.is_some() && max == 1 && !back_reference && shortest ==
+None && !endpoint_bfs`. At `max == 1` a window is provably independent:
+one round, nothing carries into a next hop, and `next_frontier` is never
+pushed. The other three modes carry pruning state (`visited`,
+`visited_at_hop`, `level_seen`) whose meaning depends on observing a whole
+level.
 
-**The design, ready to execute.** A wave loop: hydrate a bounded chunk,
-run the per-edge loop over exactly that chunk, take another chunk only if
-the cap is not yet met. Order is preserved because chunks are consecutive.
+Oracle: `exec_limit_pushdown::cap_never_underfills_when_most_edges_are_rejected`
+— a hub where only every fourth neighbour carries the queried label, so
+`LIMIT 25` must walk ~100 edges and discard 75. Verified live too, on a hub
+with 30,000 rejected neighbours among 40,000: every limit from 1 to beyond
+the total returns exactly `min(limit, total)` rows and matches the uncapped
+prefix.
 
-- Guard, computed once beside `endpoint_bfs`:
-  `cap.is_some() && max == 1 && !back_reference && shortest == ShortestMode::None && !endpoint_bfs`.
-  Each clause earns its place: `max == 1` means the frontier holds exactly
-  one `Step` per seed and the hop loop runs once, so a wave is literally a
-  chunk of one `Arc<Vec<EdgeView>>`; the other three switch on the
-  loop-carried pruning state below.
-- Loop-carried state, and where each must live. With that guard:
-  `level_seen`, `visited` and `visited_at_hop` are all dead (they need
-  `prune_visits` / `hop_keyed_prune`, which need shortest or endpoint_bfs);
-  `next_frontier` is never pushed (`hop < max` is false at `max == 1`);
-  `guard_tick` is a counter and hoists above the wave loop; `matched_any`
-  must persist ACROSS waves. `unique_targets` / `seen_targets` are
-  per-wave. Getting one of these wrong is a silent wrong answer, which is
-  why they are enumerated here rather than rediscovered.
-- Phase 1 (the adjacency read into `step_neighbours`) stays OUTSIDE the
-  wave loop — it is the 30% that no executor change can avoid.
-- Cursor `(step_index, edge_index)` advances across waves; stop when the
-  cursor exhausts or `out.len() + hop_results.len() >= cap`.
-- Initial chunk `max(cap * 4, 512)`, doubling. Sizing is a starting point,
-  not a measured optimum — tune against the 160k-degree fixture.
-- Oracle: `LIMIT n` must return exactly `min(n, total)` rows. Build the
-  underfill case deliberately — a hub whose neighbours are half a
-  non-matching label, `LIMIT 25`, assert exactly 25.
-
-**Deliberately not done in the 2026-09-10 session.** This restructures
-~250 lines of the per-edge loop so it can run over a range. That function
-was modified four times that day, twice to correct the previous change,
-and the payoff here is 3x on one query shape rather than a correctness
-fix. Shipping it as the seventh release of a long day is how a third
-regression gets introduced. The measurement and the design above are the
-part worth having; the edit should be made deliberately, with the
-equivalence suite and the underfill oracle in place first.
+**Residual, unchanged:** the adjacency read itself (~0.3 s of the 0.32 s)
+is Phase 1, outside the window loop. `out_edges(edge_type, src)` has no
+limit parameter and materialises the whole partner list, so no executor
+change can avoid it. That is the storage half, and it is where the
+hierarchical adjacency work from finding #3 would earn its keep.
 
 ### 76. [OPEN — measured, correct by design] An unlabelled unreferenced target cannot use the membership path
 

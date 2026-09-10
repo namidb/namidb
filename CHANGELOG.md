@@ -15,6 +15,35 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.10] - 2026-09-10
+
+### Performance
+
+- **`LIMIT` now bounds an expansion's work instead of costing the full
+  traversal.** A pushed-down limit was checked only at the seed boundary, so
+  the hop loop collected every partner and hydrated all of them before the
+  truncation happened above the operator: at degree 160,000 with ~1 KB
+  targets, `LIMIT 1` cost 2.04 s — the same as counting all 160,000 rows.
+  Endpoints are now hydrated in consecutive windows, the per-edge loop runs
+  over exactly one window, and another window is taken only if the limit is
+  still unmet. `LIMIT 1` is 0.32 s and `LIMIT 25` is 0.31 s, a 6.5x
+  improvement; a limit larger than the available rows costs what it always
+  did.
+
+  The window cannot simply truncate the endpoint list: the per-edge loop
+  rejects edges on many paths (label mismatch, membership, the trail rule,
+  visited pruning, an absent node), so hydrating "the first N" would return
+  FEWER rows than requested. Windows are consecutive and re-entered until
+  the limit is met, so the result stays an order-preserving prefix of the
+  uncapped one. Restricted to single-hop, non-back-reference expansions
+  outside shortest-path and endpoint-BFS modes, whose pruning state depends
+  on observing a whole level.
+
+  Verified live on a hub with 30,000 rejected neighbours among 40,000: every
+  limit from 1 to beyond the total returns exactly `min(limit, total)` rows
+  and matches the uncapped prefix.
+
+
 ## [2.6.9] - 2026-09-10
 
 ### Fixed
@@ -3294,7 +3323,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.9...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.10...HEAD
+[2.6.10]: https://github.com/namidb/namidb/compare/v2.6.9...v2.6.10
 [2.6.9]: https://github.com/namidb/namidb/compare/v2.6.8...v2.6.9
 [2.6.8]: https://github.com/namidb/namidb/compare/v2.6.7...v2.6.8
 [2.6.7]: https://github.com/namidb/namidb/compare/v2.6.6...v2.6.7

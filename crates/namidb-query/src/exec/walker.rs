@@ -1750,9 +1750,6 @@ pub(crate) async fn execute_expand(
             // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
             let mut step_neighbours: Vec<(Step, Arc<Vec<EdgeView>>)> =
                 Vec::with_capacity(frontier.len());
-            let mut unique_targets: Vec<NodeId> = Vec::new();
-            let mut seen_targets: std::collections::HashSet<NodeId> =
-                std::collections::HashSet::new();
             for step in frontier.drain(..) {
                 let neighbours: Arc<Vec<EdgeView>> = if back_reference && max == 1 {
                     Arc::new(match existing_target_id {
@@ -1790,310 +1787,392 @@ pub(crate) async fn execute_expand(
                     }
                     fetched
                 };
+                step_neighbours.push((step, neighbours));
+            }
+            // Phase 2, in WAVES when a pushed-down LIMIT is in play.
+            //
+            // Hydrating every endpoint before emitting anything makes
+            // `LIMIT 1` cost what the whole traversal costs: at degree
+            // 160k that is ~2.0s where the adjacency read alone is 0.65s.
+            // But the cap CANNOT simply truncate the endpoint list: the
+            // per-edge loop below rejects edges on a dozen paths (label
+            // mismatch, membership, the trail rule, visited pruning, an
+            // absent node), so hydrating "the first N" and stopping
+            // UNDERFILLS whenever one is rejected — fewer rows than asked
+            // for, a wrong answer rather than a slow one.
+            //
+            // So: hydrate a window, run the per-edge loop over exactly that
+            // window, and take another window only if the cap is still
+            // unmet. Windows are consecutive, so `out` stays an
+            // order-preserving prefix of the uncapped result. The window
+            // doubles, bounding the number of hydration round-trips at
+            // log(degree) while keeping the first one small.
+            //
+            // Restricted to the shape where a window is provably
+            // independent: `max == 1` (one round, so nothing carries into a
+            // next hop), no back-reference, no shortest-path mode and no
+            // endpoint BFS (all three carry pruning state whose meaning
+            // depends on seeing a whole level).
+            let total_edges: usize = step_neighbours.iter().map(|(_, n)| n.len()).sum();
+            let wave_hydration = cap.is_some()
+                && max == 1
+                && !back_reference
+                && shortest == crate::plan::ShortestMode::None
+                && !endpoint_bfs;
+            let mut wave_start = 0usize;
+            let mut wave_size = if wave_hydration {
+                cap.map_or(total_edges, |c| c.saturating_mul(4).max(512))
+            } else {
+                total_edges
+            };
+            while wave_start < total_edges || wave_start == 0 {
+                let wave_end = wave_start.saturating_add(wave_size).min(total_edges);
+                // Collect the endpoints of THIS window only.
+                let mut unique_targets: Vec<NodeId> = Vec::new();
+                let mut seen_targets: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
                 if !back_reference {
-                    for edge in neighbours.iter() {
-                        let tid = partner_id(edge, direction, step.tail);
-                        if seen_targets.insert(tid) {
-                            unique_targets.push(tid);
+                    let mut edge_index = 0usize;
+                    for (step, ns) in step_neighbours.iter() {
+                        for edge in ns.iter() {
+                            let i = edge_index;
+                            edge_index += 1;
+                            if i < wave_start {
+                                continue;
+                            }
+                            if i >= wave_end {
+                                break;
+                            }
+                            let tid = partner_id(edge, direction, step.tail);
+                            if seen_targets.insert(tid) {
+                                unique_targets.push(tid);
+                            }
+                        }
+                        if edge_index >= wave_end {
+                            break;
                         }
                     }
                 }
-                step_neighbours.push((step, neighbours));
-            }
-            // Phase 2: either prove endpoint labels through the compact
-            // `(LabelId,NodeId)` sidecar (identity-only target), or prewarm
-            // the ordinary point cache once for the whole hop. This keeps
-            // work proportional to touched endpoints and avoids hydrating
-            // large vectors solely to evaluate `(:Label)`.
-            let target_membership = prepare_expand_targets(
-                snapshot,
-                target_labels,
-                &unique_targets,
-                skip_target_materialize,
-                true,
-                max > 1,
-            )
-            .await?;
-            for (step, neighbours) in step_neighbours {
-                for edge in neighbours.iter() {
-                    // Periodic in-loop guard: the (step × edge) space is the
-                    // deg^hop blowup itself, so probe the budgets every few
-                    // thousand edges rather than once per hop.
-                    guard_tick = guard_tick.wrapping_add(1);
-                    if guard_tick % 4096 == 0 {
-                        crate::exec::limits::check_deadline()?;
-                        crate::exec::limits::check_row_cap(
-                            out.len() + hop_results.len() + next_frontier.len(),
-                        )?;
-                    }
-                    let target_id = partner_id(edge, direction, step.tail);
-                    if prune_visits {
-                        // Reached at an earlier level → any path through it now
-                        // is longer than shortest (endpoint BFS: already
-                        // expanded and emitted at its first level); skip both
-                        // as a result and as a frontier extension.
-                        if visited.contains(&target_id) {
+                // Either prove endpoint labels through the compact
+                // `(LabelId,NodeId)` sidecar (identity-only target), or
+                // prewarm the ordinary point cache for this window. This
+                // keeps work proportional to touched endpoints and avoids
+                // hydrating large vectors solely to evaluate `(:Label)`.
+                let target_membership = prepare_expand_targets(
+                    snapshot,
+                    target_labels,
+                    &unique_targets,
+                    skip_target_materialize,
+                    true,
+                    max > 1,
+                )
+                .await?;
+                // Flattened so a window is a plain slice of the (step, edge)
+                // sequence. `shortest == First` breaking out of this loop is
+                // what the per-step break did before: once a hit is found in
+                // that mode the whole BFS for this seed stops.
+                let mut edge_index = 0usize;
+                'wave_edges: for (step, ns) in step_neighbours.iter() {
+                    for edge in ns.iter() {
+                        let i = edge_index;
+                        edge_index += 1;
+                        if i < wave_start {
                             continue;
                         }
-                        // One walk per node per level suffices for `First` and
-                        // for the endpoint BFS; `All` keeps every same-level
-                        // arrival (each is a distinct shortest path).
-                        if (shortest == crate::plan::ShortestMode::First || endpoint_bfs)
-                            && !level_seen.insert(target_id)
-                        {
-                            continue;
+                        if i >= wave_end {
+                            break 'wave_edges;
                         }
-                    }
-                    // Cypher relationship uniqueness (trail semantics): a
-                    // relationship may appear at most once per matched path.
-                    // Skip an edge already traversed on this path so a
-                    // variable-length pattern cannot walk the same edge back
-                    // (e.g. `-[:R*2..2]-` over a single edge → a-r-b-r-a). Only
-                    // enforced for multi-hop expansions; a single hop can never
-                    // repeat a relationship. The identity is the STORED edge
-                    // `(edge_type, src, dst)`, so a Both-direction traversal of
-                    // the same edge in either orientation collapses to one key.
-                    let edge_key = if max > 1 {
-                        Some((edge.edge_type.clone(), edge.src, edge.dst))
-                    } else {
-                        None
-                    };
-                    if let Some(k) = &edge_key {
-                        if step.rels.contains(k) {
-                            continue;
+                        // Periodic in-loop guard: the (step × edge) space is the
+                        // deg^hop blowup itself, so probe the budgets every few
+                        // thousand edges rather than once per hop.
+                        guard_tick = guard_tick.wrapping_add(1);
+                        if guard_tick % 4096 == 0 {
+                            crate::exec::limits::check_deadline()?;
+                            crate::exec::limits::check_row_cap(
+                                out.len() + hop_results.len() + next_frontier.len(),
+                            )?;
                         }
-                    }
-                    // (node, hop) dedup AFTER the trail check, so a walk the
-                    // trail rule rejects cannot consume the slot a valid
-                    // alternative arrival needed.
-                    if hop_keyed_prune && !visited_at_hop.insert((target_id, hop)) {
-                        continue;
-                    }
-                    // Back-reference fast path: skip the lookup_node
-                    // (the binding's NodeView is already on the row).
-                    // For non-back-reference, fetch the view so we
-                    // can populate / label-filter.
-                    // The far-end label(s) constrain which reached nodes are
-                    // RESULTS — not which may be traversed THROUGH. For a
-                    // multi-hop (`*`) expansion we therefore traverse every
-                    // existing neighbour and let `target_is_result` gate the hit.
-                    // Pruning the frontier on a label mismatch (the pre-fix bug)
-                    // made `(s)-[:R*1..n]->(a:Label)` return empty whenever the
-                    // intermediate nodes were not themselves `Label`.
-                    let mut target_is_result = true;
-                    let target_view_opt = if back_reference {
-                        None
-                    } else if skip_target_materialize {
-                        if !match &target_membership {
-                            ExpandTargets::Membership(membership) => {
-                                membership.get(&target_id).copied().unwrap_or(false)
+                        let target_id = partner_id(edge, direction, step.tail);
+                        if prune_visits {
+                            // Reached at an earlier level → any path through it now
+                            // is longer than shortest (endpoint BFS: already
+                            // expanded and emitted at its first level); skip both
+                            // as a result and as a frontier extension.
+                            if visited.contains(&target_id) {
+                                continue;
                             }
-                            _ => false,
-                        } {
-                            continue;
-                        }
-                        None
-                    } else if let ExpandTargets::Views(views) = &target_membership {
-                        // The hop's own materialisation answers directly, so a
-                        // large fan-out no longer depends on cache retention.
-                        // The batch resolves by id across every descriptor, so
-                        // it describes nodes of ANY label — which is what lets
-                        // a multi-hop traversal use it too.
-                        match views.get(&target_id) {
-                            Some(v) => {
-                                if target_labels.iter().all(|l| v.labels.contains(l)) {
-                                    Some(v.clone())
-                                } else if max > 1 {
-                                    // Multi-hop: the far-end label decides
-                                    // whether this node is a RESULT, never
-                                    // whether it may be traversed. Pruning the
-                                    // frontier on a mismatch is what made
-                                    // `(s)-[:R*1..n]->(a:L)` return empty when
-                                    // the intermediates were not themselves L.
-                                    target_is_result = false;
-                                    Some(v.clone())
-                                } else {
-                                    continue;
-                                }
-                            }
-                            // Absent from the batch is NOT absent from the
-                            // graph: fall back to the authoritative point
-                            // reader so a batch that under-reports can never
-                            // drop a real row.
-                            None => match scan_node_for_id(snapshot, target_id).await? {
-                                Some(v) => {
-                                    let matches =
-                                        target_labels.iter().all(|l| v.labels.contains(l));
-                                    if !matches && max == 1 {
-                                        continue;
-                                    }
-                                    target_is_result = matches;
-                                    Some(v)
-                                }
-                                None => continue,
-                            },
-                        }
-                    } else if let Some(label) = target_labels.first() {
-                        if max > 1 {
-                            // Multi-hop: traverse through any existing node; the
-                            // far-end label gates only whether it is a result.
-                            match scan_node_for_id(snapshot, target_id).await? {
-                                Some(v) => {
-                                    target_is_result =
-                                        target_labels.iter().all(|l| v.labels.contains(l));
-                                    Some(v)
-                                }
-                                None => continue,
-                            }
-                        } else {
-                            // Single hop: the target IS the result, so a label
-                            // mismatch excludes the edge (no traversal beyond it).
-                            // Conjunctive multi-label: must carry EVERY label.
-                            match snapshot.lookup_node(label, target_id).await? {
-                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
-                                    Some(v)
-                                }
-                                _ => continue,
+                            // One walk per node per level suffices for `First` and
+                            // for the endpoint BFS; `All` keeps every same-level
+                            // arrival (each is a distinct shortest path).
+                            if (shortest == crate::plan::ShortestMode::First || endpoint_bfs)
+                                && !level_seen.insert(target_id)
+                            {
+                                continue;
                             }
                         }
-                    } else {
-                        match scan_node_for_id(snapshot, target_id).await? {
-                            Some(v) => Some(v),
-                            None => continue,
-                        }
-                    };
-                    let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge.clone())));
-                    let mut new_row = step.row.clone();
-                    let mut new_rel_values = step.rel_values.clone();
-                    if bind_rel_list {
-                        if rel_alias.is_some() {
-                            new_rel_values.push(rel_value.clone());
-                        }
-                    } else if let Some(name) = rel_alias {
-                        // A fixed single relationship (`[r:KNOWS]`, no `*`)
-                        // binds the scalar relationship.
-                        new_row.set(name, rel_value.clone());
-                    }
-                    // For shortestPath trail materialisation we need a
-                    // target NodeValue regardless of `skip_target_materialize`.
-                    // Compute it once below and reuse for both the row binding
-                    // and the trail.
-                    let target_node_value: Option<NodeValue> =
-                        if let Some(view) = target_view_opt.as_ref() {
-                            Some(NodeValue::from(view.clone()))
-                        } else if back_reference {
-                            if materialise_trail && Some(target_id) != existing_target_id {
-                                // The trail must carry the node actually
-                                // reached at THIS hop. The pre-bound value is
-                                // only correct at the final target; reusing
-                                // it for intermediates made `nodes(p)` repeat
-                                // the endpoint (["n0", "n2", "n2"]).
-                                scan_node_for_id(snapshot, target_id)
-                                    .await?
-                                    .map(NodeValue::from)
-                            } else {
-                                // Back-reference uses the pre-bound NodeView
-                                // from the existing target_alias on the row.
-                                match row.get(target_alias) {
-                                    Some(RuntimeValue::Node(n)) => Some(n.as_ref().clone()),
-                                    _ => None,
-                                }
-                            }
-                        } else if skip_target_materialize {
-                            Some(NodeValue {
-                                id: target_id,
-                                labels: target_labels.iter().map(|l| l.to_string()).collect(),
-                                properties: std::collections::BTreeMap::new(),
-                            })
+                        // Cypher relationship uniqueness (trail semantics): a
+                        // relationship may appear at most once per matched path.
+                        // Skip an edge already traversed on this path so a
+                        // variable-length pattern cannot walk the same edge back
+                        // (e.g. `-[:R*2..2]-` over a single edge → a-r-b-r-a). Only
+                        // enforced for multi-hop expansions; a single hop can never
+                        // repeat a relationship. The identity is the STORED edge
+                        // `(edge_type, src, dst)`, so a Both-direction traversal of
+                        // the same edge in either orientation collapses to one key.
+                        let edge_key = if max > 1 {
+                            Some((edge.edge_type.clone(), edge.src, edge.dst))
                         } else {
                             None
                         };
-
-                    if let Some(view) = target_view_opt {
-                        new_row.set(
-                            target_alias.to_string(),
-                            RuntimeValue::Node(Box::new(NodeValue::from(view))),
-                        );
-                    } else if skip_target_materialize && !back_reference {
-                        // id-only stub: enough for the next Expand to read
-                        // `.id`; `label` is preserved so RuntimeValue::Node
-                        // still type-checks for downstream Expand source reads.
-                        if let Some(nv) = &target_node_value {
-                            new_row.set(
-                                target_alias.to_string(),
-                                RuntimeValue::Node(Box::new(nv.clone())),
-                            );
+                        if let Some(k) = &edge_key {
+                            if step.rels.contains(k) {
+                                continue;
+                            }
                         }
-                    }
-                    // Back-reference: the binding stays at the
-                    // original existing target; new_row already
-                    // carries it from row.clone() above.
-                    let mut new_trail = step.trail.clone();
-                    if materialise_trail {
-                        new_trail.push(rel_value);
-                        if let Some(nv) = target_node_value {
-                            new_trail.push(RuntimeValue::Node(Box::new(nv)));
-                        } else {
-                            new_trail.push(RuntimeValue::Null);
+                        // (node, hop) dedup AFTER the trail check, so a walk the
+                        // trail rule rejects cannot consume the slot a valid
+                        // alternative arrival needed.
+                        if hop_keyed_prune && !visited_at_hop.insert((target_id, hop)) {
+                            continue;
                         }
-                    }
-                    let mut new_rels = step.rels.clone();
-                    if let Some(k) = &edge_key {
-                        new_rels.push(k.clone());
-                    }
-                    // The frontier feeds the NEXT round, so on the last hop
-                    // every entry is dead on arrival — and each one costs a
-                    // DEEP clone of the row (every binding, whole node values
-                    // included), its trail and its relationship list, per
-                    // matched edge. This was fixed for `max == 1` after a
-                    // 53k-degree hub turned it into hundreds of MB of pure
-                    // waste (sixth field report); `hop == max` is the same
-                    // waste for exactly the same reason, and a `*1..2` over a
-                    // 300x300 fan-out spent longer building the doomed
-                    // frontier than answering the query.
-                    if hop < max {
-                        next_frontier.push(Step {
-                            tail: target_id,
-                            row: new_row.clone(),
-                            trail: new_trail.clone(),
-                            rels: new_rels,
-                            rel_values: new_rel_values.clone(),
-                        });
-                    }
-                    if hop >= min.max(1) {
-                        let keeps = bound_target_matches_labels
-                            && target_is_result
-                            && match existing_target_id {
-                                Some(existing) => target_id == existing,
-                                None => true,
-                            };
-                        if keeps {
-                            let mut hit_row = new_row;
-                            if bind_rel_list {
-                                if let Some(name) = rel_alias {
-                                    hit_row.set(
-                                        name.to_string(),
-                                        RuntimeValue::List(new_rel_values.clone()),
-                                    );
+                        // Back-reference fast path: skip the lookup_node
+                        // (the binding's NodeView is already on the row).
+                        // For non-back-reference, fetch the view so we
+                        // can populate / label-filter.
+                        // The far-end label(s) constrain which reached nodes are
+                        // RESULTS — not which may be traversed THROUGH. For a
+                        // multi-hop (`*`) expansion we therefore traverse every
+                        // existing neighbour and let `target_is_result` gate the hit.
+                        // Pruning the frontier on a label mismatch (the pre-fix bug)
+                        // made `(s)-[:R*1..n]->(a:Label)` return empty whenever the
+                        // intermediate nodes were not themselves `Label`.
+                        let mut target_is_result = true;
+                        let target_view_opt = if back_reference {
+                            None
+                        } else if skip_target_materialize {
+                            if !match &target_membership {
+                                ExpandTargets::Membership(membership) => {
+                                    membership.get(&target_id).copied().unwrap_or(false)
+                                }
+                                _ => false,
+                            } {
+                                continue;
+                            }
+                            None
+                        } else if let ExpandTargets::Views(views) = &target_membership {
+                            // The hop's own materialisation answers directly, so a
+                            // large fan-out no longer depends on cache retention.
+                            // The batch resolves by id across every descriptor, so
+                            // it describes nodes of ANY label — which is what lets
+                            // a multi-hop traversal use it too.
+                            match views.get(&target_id) {
+                                Some(v) => {
+                                    if target_labels.iter().all(|l| v.labels.contains(l)) {
+                                        Some(v.clone())
+                                    } else if max > 1 {
+                                        // Multi-hop: the far-end label decides
+                                        // whether this node is a RESULT, never
+                                        // whether it may be traversed. Pruning the
+                                        // frontier on a mismatch is what made
+                                        // `(s)-[:R*1..n]->(a:L)` return empty when
+                                        // the intermediates were not themselves L.
+                                        target_is_result = false;
+                                        Some(v.clone())
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                // Absent from the batch is NOT absent from the
+                                // graph: fall back to the authoritative point
+                                // reader so a batch that under-reports can never
+                                // drop a real row.
+                                None => match scan_node_for_id(snapshot, target_id).await? {
+                                    Some(v) => {
+                                        let matches =
+                                            target_labels.iter().all(|l| v.labels.contains(l));
+                                        if !matches && max == 1 {
+                                            continue;
+                                        }
+                                        target_is_result = matches;
+                                        Some(v)
+                                    }
+                                    None => continue,
+                                },
+                            }
+                        } else if let Some(label) = target_labels.first() {
+                            if max > 1 {
+                                // Multi-hop: traverse through any existing node; the
+                                // far-end label gates only whether it is a result.
+                                match scan_node_for_id(snapshot, target_id).await? {
+                                    Some(v) => {
+                                        target_is_result =
+                                            target_labels.iter().all(|l| v.labels.contains(l));
+                                        Some(v)
+                                    }
+                                    None => continue,
+                                }
+                            } else {
+                                // Single hop: the target IS the result, so a label
+                                // mismatch excludes the edge (no traversal beyond it).
+                                // Conjunctive multi-label: must carry EVERY label.
+                                match snapshot.lookup_node(label, target_id).await? {
+                                    Some(v)
+                                        if target_labels.iter().all(|l| v.labels.contains(l)) =>
+                                    {
+                                        Some(v)
+                                    }
+                                    _ => continue,
                                 }
                             }
-                            if let Some(name) = path_binding {
-                                hit_row.set(name.to_string(), RuntimeValue::Path(new_trail));
+                        } else {
+                            match scan_node_for_id(snapshot, target_id).await? {
+                                Some(v) => Some(v),
+                                None => continue,
                             }
-                            hop_results.push(hit_row);
-                            matched_any = true;
-                            // shortestPath: at most one row per
-                            // (source, target). Stop the whole BFS
-                            // for this seed row.
-                            if shortest == crate::plan::ShortestMode::First {
-                                break;
+                        };
+                        let rel_value = RuntimeValue::Rel(Box::new(RelValue::from(edge.clone())));
+                        let mut new_row = step.row.clone();
+                        let mut new_rel_values = step.rel_values.clone();
+                        if bind_rel_list {
+                            if rel_alias.is_some() {
+                                new_rel_values.push(rel_value.clone());
+                            }
+                        } else if let Some(name) = rel_alias {
+                            // A fixed single relationship (`[r:KNOWS]`, no `*`)
+                            // binds the scalar relationship.
+                            new_row.set(name, rel_value.clone());
+                        }
+                        // For shortestPath trail materialisation we need a
+                        // target NodeValue regardless of `skip_target_materialize`.
+                        // Compute it once below and reuse for both the row binding
+                        // and the trail.
+                        let target_node_value: Option<NodeValue> =
+                            if let Some(view) = target_view_opt.as_ref() {
+                                Some(NodeValue::from(view.clone()))
+                            } else if back_reference {
+                                if materialise_trail && Some(target_id) != existing_target_id {
+                                    // The trail must carry the node actually
+                                    // reached at THIS hop. The pre-bound value is
+                                    // only correct at the final target; reusing
+                                    // it for intermediates made `nodes(p)` repeat
+                                    // the endpoint (["n0", "n2", "n2"]).
+                                    scan_node_for_id(snapshot, target_id)
+                                        .await?
+                                        .map(NodeValue::from)
+                                } else {
+                                    // Back-reference uses the pre-bound NodeView
+                                    // from the existing target_alias on the row.
+                                    match row.get(target_alias) {
+                                        Some(RuntimeValue::Node(n)) => Some(n.as_ref().clone()),
+                                        _ => None,
+                                    }
+                                }
+                            } else if skip_target_materialize {
+                                Some(NodeValue {
+                                    id: target_id,
+                                    labels: target_labels.iter().map(|l| l.to_string()).collect(),
+                                    properties: std::collections::BTreeMap::new(),
+                                })
+                            } else {
+                                None
+                            };
+
+                        if let Some(view) = target_view_opt {
+                            new_row.set(
+                                target_alias.to_string(),
+                                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            );
+                        } else if skip_target_materialize && !back_reference {
+                            // id-only stub: enough for the next Expand to read
+                            // `.id`; `label` is preserved so RuntimeValue::Node
+                            // still type-checks for downstream Expand source reads.
+                            if let Some(nv) = &target_node_value {
+                                new_row.set(
+                                    target_alias.to_string(),
+                                    RuntimeValue::Node(Box::new(nv.clone())),
+                                );
+                            }
+                        }
+                        // Back-reference: the binding stays at the
+                        // original existing target; new_row already
+                        // carries it from row.clone() above.
+                        let mut new_trail = step.trail.clone();
+                        if materialise_trail {
+                            new_trail.push(rel_value);
+                            if let Some(nv) = target_node_value {
+                                new_trail.push(RuntimeValue::Node(Box::new(nv)));
+                            } else {
+                                new_trail.push(RuntimeValue::Null);
+                            }
+                        }
+                        let mut new_rels = step.rels.clone();
+                        if let Some(k) = &edge_key {
+                            new_rels.push(k.clone());
+                        }
+                        // The frontier feeds the NEXT round, so on the last hop
+                        // every entry is dead on arrival — and each one costs a
+                        // DEEP clone of the row (every binding, whole node values
+                        // included), its trail and its relationship list, per
+                        // matched edge. This was fixed for `max == 1` after a
+                        // 53k-degree hub turned it into hundreds of MB of pure
+                        // waste (sixth field report); `hop == max` is the same
+                        // waste for exactly the same reason, and a `*1..2` over a
+                        // 300x300 fan-out spent longer building the doomed
+                        // frontier than answering the query.
+                        if hop < max {
+                            next_frontier.push(Step {
+                                tail: target_id,
+                                row: new_row.clone(),
+                                trail: new_trail.clone(),
+                                rels: new_rels,
+                                rel_values: new_rel_values.clone(),
+                            });
+                        }
+                        if hop >= min.max(1) {
+                            let keeps = bound_target_matches_labels
+                                && target_is_result
+                                && match existing_target_id {
+                                    Some(existing) => target_id == existing,
+                                    None => true,
+                                };
+                            if keeps {
+                                let mut hit_row = new_row;
+                                if bind_rel_list {
+                                    if let Some(name) = rel_alias {
+                                        hit_row.set(
+                                            name.to_string(),
+                                            RuntimeValue::List(new_rel_values.clone()),
+                                        );
+                                    }
+                                }
+                                if let Some(name) = path_binding {
+                                    hit_row.set(name.to_string(), RuntimeValue::Path(new_trail));
+                                }
+                                hop_results.push(hit_row);
+                                matched_any = true;
+                                // shortestPath: at most one row per
+                                // (source, target). Stop the whole BFS
+                                // for this seed row.
+                                if shortest == crate::plan::ShortestMode::First {
+                                    break 'wave_edges;
+                                }
                             }
                         }
                     }
+                }
+                wave_start = wave_end;
+                if !wave_hydration || wave_start >= total_edges {
+                    break;
                 }
                 if shortest == crate::plan::ShortestMode::First && matched_any {
                     break;
                 }
+                if let Some(c) = cap {
+                    if out.len() + hop_results.len() >= c {
+                        break;
+                    }
+                }
+                wave_size = wave_size.saturating_mul(2);
             }
             // shortestPath: hit found this hop → don't extend the
             // frontier into hop+1.
