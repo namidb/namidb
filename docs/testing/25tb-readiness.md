@@ -1111,6 +1111,90 @@ flag (`--http-request-timeout`, `0s` disables) whose default is derived
 to clear the largest configured query/write budget, with a boot warning
 when an explicit value would truncate them.
 
+## Self-audit by measurement (2026-09-10) — items 73-74
+
+Found by sweeping query shapes that SHOULD cost the same and comparing,
+not by reading code. The 2.6.2 cliff fix had been verified only on the
+shape the reporter sent.
+
+### 73. [CONFIRMED — fixed in 2.6.4] An unlabelled expand target read one node per edge
+
+The 2.6.2 fan-out fix (`ExpandTargets::Views`) was gated on the target
+carrying a label, so `(a)-[:R]->(x)` and `(a)-[:R]->()` kept the old
+per-edge point-read path. Measured on a 197k-degree hub with ~1 KB
+targets, all three spellings returning the same 197,000 rows:
+
+| pattern | 2.6.3 | 2.6.4 |
+|---|---|---|
+| `-[:TIENE]->(t:FAT)` | 3.47 s | 3.09 s |
+| `-[:TIENE]->(t)` | timed out at 300 s | 2.93 s |
+| `-[:TIENE]->()` | timed out at 300 s | 2.76 s |
+
+The gate rested on a misreading: `batch_lookup_nodes` iterates
+`manifest.index.node_descriptors()` and uses its `label` argument only to
+namespace cache keys, so an empty label is a complete id-primary batch.
+The old code called the batch, discarded the result, and did the per-edge
+reads anyway. Only `max == 1` still gates it (a var-length traversal must
+walk THROUGH nodes the batch does not describe). A batch MISS now falls
+back to the point reader rather than skipping the edge — the old arm
+collapsed "absent from batch" and "wrong label" into one `continue`.
+
+**Process note:** nothing in the suite expanded a hub through an
+unlabelled target, so the release that fixed the labelled twin left this
+untouched. A sweep of 12 expand shapes at degree 120k now shows them
+uniform (~1.7 s); before the fix two of them did not complete.
+
+### 74. [OPEN — prerequisite now met] A bare-node reference forces full hydration
+
+Re-measured on the 2.6.10 build at degree 160,000, ~1 KB targets:
+
+| query | time |
+|---|---|
+| `RETURN count(*)` (target unreferenced) | **0.64 s** |
+| `RETURN count(t)` | 2.20 s |
+| `RETURN count(id(t))` | 2.19 s |
+| `RETURN count(DISTINCT t)` | 2.13 s |
+| `RETURN sum(t.idx)` | 2.25 s |
+
+`count(id(t))` — where the caller has literally written that only the id
+is needed — costs the same as full hydration. 3.4x of pure waste.
+`should_skip_target_materialize` requires
+`!routing.referenced_aliases.contains(target_alias)`, and
+`collect_plan_references` treats `Count { arg: Some(e) }` exactly like
+`Sum`/`Avg`, so any mention of the alias forces every column.
+
+**The prerequisite is now met.** Widening the id-only stub was blocked on
+the reference collector being trustworthy, and it was not: two forms read
+a host binding without registering it, and both were silent wrong answers
+(quantifiers / list comprehensions over a target property, and a `*0..n`
+source losing its extra labels — both fixed in 2.6.8). The collector is
+now EXHAUSTIVE — no `_` arm, so the compiler forces a decision for every
+`ExpressionKind` — and the only forms that deliberately register nothing
+are the genuinely closed pattern forms (`Exists`, `ExistsSubquery`,
+`PatternComprehension`) plus `Literal` / `Parameter` / `Star`, none of
+which read a host binding.
+
+**What remains is the whitelist, and it must stay narrow.** The stub binds
+EMPTY properties, so mis-classifying one form returns nulls for real
+values. Two tiers with different burdens of proof:
+
+- `id(x)` as the sole mention: provably safe with no further reasoning —
+  `id()` reads the id, and the stub carries the correct id.
+- bare `count(x)` / `count(DISTINCT x)`: needs the argument that node
+  dedup is by an id-only fingerprint (it is — a BTreeSet over id
+  fingerprints since the first release, confirmed under item 68). Worth
+  having, since `count(x)` is the common spelling, but it rests on an
+  aggregate-internals invariant that deserves its own pinning test first.
+
+Anything else mentioning the alias stays on the full path. Not a
+blacklist: a new expression form must be added to the whitelist
+deliberately, never inherit the fast path by omission.
+
+Add a family to `exec_rewrite_equivalence.rs` at the same time, and
+remember that file's trap: a family must reference the target ONLY through
+the construct under test, or the stub is never built and the family passes
+with the fix reverted.
+
 ### 75. [FIXED in 2.6.10] `LIMIT` now bounds an expansion's work
 
 Was: a pushed-down cap was checked only at the SEED boundary, so the hop
@@ -1176,7 +1260,20 @@ row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
 having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
 full hydration for nothing.
 
-### 77. [OPEN — measured] Labelled variable-length burns CPU with no extra I/O
+### 77. [FIXED in 2.6.7] Labelled variable-length burned CPU with no extra I/O
+
+**Root cause found and fixed:** `batch_lookup_nodes` sweeps by id but
+FILTERS its output by the label it is given, and every hop of a
+variable-length pattern shares the pattern's FINAL target label — so
+intermediate hops resolved nothing and each edge fell through to
+`lookup_node_by_id`, the one node read with no cache tier. The expand
+batch now asks for no label and re-proves labels per edge.
+`-[:A|B*2..2]->(x:LEAF)` went 5.3s -> 0.21s and `->(x:MID)` from
+exceeding the deadline to 0.16s, matching the explicit chain (0.13s).
+The investigation below is kept because its REFUTED hypotheses are what
+narrowed the search.
+
+#### Original entry (hypotheses refuted by measurement)
 
 2.6.6 is a strict improvement, but a large residual remains and one shape
 still does not complete. Same fixture and store on both images (200x200,
@@ -1228,7 +1325,20 @@ volume and is the sharpest available lead.
 
 Not a regression: every one of these timed out on 2.6.5.
 
-### 78. [OPEN — conformance question, NOT fixed] A repeated type in an alternation duplicates rows
+### 78. [FIXED in 2.6.9] A repeated type in an alternation duplicated rows
+
+Resolved as a defect, not a semantic choice. What settled it: the test
+asserting the doubling is NAMED
+`expand_alternation_single_type_matches_legacy_path` and its docstring is
+about SINGLETON parity, yet it queries `[:KNOWS|:KNOWS]` — a repeated
+type — and asserts the doubling. The assertion described behaviour instead
+of deriving it, and contradicted RFC-024's own definition ("one row per
+matching PATH, not one row per tuple"; a path is a sequence of actual
+edges). The type list is now deduplicated at lowering. Verified across
+eight shapes; genuine alternation, parallel-edge multiplicity and
+flat/WCOJ parity unchanged.
+
+#### Original entry
 
 `MATCH (a:P)-[:E|E]->(b:Q)` returns every matching row TWICE; `-[:E]->`
 returns it once. The executor unions one partner list per listed type
