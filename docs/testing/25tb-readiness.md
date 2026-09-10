@@ -1531,13 +1531,30 @@ in this codebase this week. It wants the equivalence harness pointed at it
 shapes, types, nulls and absent properties) and an adversarial review —
 not the tail of an eleven-release day.
 
-One caveat for whoever picks it up: nodes are stored **id-primary**, so a
-property like `idx` is scattered across row groups in UUID order and every
-row group's `[min,max]` may span nearly the whole value range. Row-group
-pruning will therefore help a lot for a property CORRELATED with insertion
-identity and very little for one that is not. The property-page path (2)
-does not have that limitation and is the better first target; verify
-against a real fixture before choosing.
+**A caveat I got WRONG the first time, corrected here.** I originally wrote
+that nodes are id-primary so a property is "scattered across row groups in
+UUID order" and pruning could not help. That reasoning is false: `NodeId`
+is `Uuid::now_v7()` — TIME-ordered — so id order tracks insertion order,
+and a property written in a correlated order (a sale date, an incrementing
+code) lands in narrow per-row-group ranges. Pruning would help such a
+property a great deal.
+
+What is true is the measurement, and it survived a much better fixture:
+with `NAMIDB_NODE_SST_ROW_GROUP_ROWS=4096` (≈39 row groups instead of the
+2 the 128Ki default gives at 160k rows), an `idx` written in ascending
+order, and the property declared as an index so it is a physical column,
+the times are still flat — 0.331 s for a predicate matching nothing,
+0.321 s for one matching 9 rows, 0.330 s for one matching half. Nothing is
+pruned, and the reason is the one verified in the source above: the
+predicate never reaches Parquet.
+
+**Two notes for whoever picks this up.** First, the default row group is
+128Ki rows, so any fixture under ~500k rows has too few row groups to show
+pruning at all — set `NAMIDB_NODE_SST_ROW_GROUP_ROWS` when testing this.
+Second, the whole-node branch (`RETURN t`, which DOES pass `predicates`)
+is also insensitive to selectivity — 1.315 s at zero rows against 1.389 s
+at nine — so something blocks pruning there too and it was not determined.
+Establish that before assuming the projected branch is the only gap.
 
 ### 81. [OPEN — highest remaining value, fully scoped] Numeric equality never uses an index
 
