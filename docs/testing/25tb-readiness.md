@@ -1110,3 +1110,43 @@ TimeoutLayer, whose only knob was an undocumented env var. Now a real
 flag (`--http-request-timeout`, `0s` disables) whose default is derived
 to clear the largest configured query/write budget, with a boot warning
 when an explicit value would truncate them.
+
+### 75. [OPEN — measured] `LIMIT` does not bound an expansion's work
+
+Measured on 2.6.6, ~1 KB targets, `MATCH (h:HUB)-[:TIENE]->(t:FAT)`:
+
+| degree | `RETURN t.idx LIMIT 25` | `RETURN count(t)` | ratio |
+|---|---|---|---|
+| 10,000 | 0.44 s | 0.44 s | 1.00 |
+| 40,000 | 0.59 s | 0.63 s | 0.94 |
+| 160,000 | 2.42 s | 2.55 s | 0.95 |
+
+`LIMIT 25` costs the same as consuming the whole adjacency, and grows
+linearly with degree. `execute_expand` checks its pushed-down cap only at
+the SEED boundary (the contract is that every consumed seed contributes
+its COMPLETE edge set); the hop loop collects every partner into
+`unique_targets` before any cap applies, `prepare_expand_targets`
+hydrates all of them, and the truncation to 25 happens above the operator.
+
+**Two independent costs, and only one is cheap to fix.** From the shape
+breakdown at degree 120k: `count(*)` (target unreferenced, membership
+only) is 0.46 s while `count(t)` (hydrating) is 1.87 s. So hydration is
+~75% and the adjacency read ~25%.
+
+1. *Executor.* Bounding the hydration set would recover the ~75%. It
+   cannot be a plain truncation of `unique_targets`: the per-edge loop
+   has eight `continue` paths (label mismatch, membership, trail rule,
+   visited-set pruning), so taking the first N edges UNDERFILLS whenever
+   any edge is rejected — fewer rows than asked for, which is a wrong
+   answer rather than a slow one. It needs a wave loop: hydrate a bounded
+   chunk, run the per-edge loop over exactly that chunk, and take another
+   chunk only if the cap is not yet met. Order is preserved because the
+   chunks are consecutive.
+2. *Storage.* The remaining ~25% needs the limit to reach the edge read
+   itself. `out_edges(edge_type, src) -> EdgeListView` has no limit
+   parameter and materialises the whole partner list, so no executor-side
+   change can avoid it. This is the part that genuinely wants the
+   hierarchical adjacency work from finding #3.
+
+Doing (1) alone turns 2.42 s into roughly 0.6 s at degree 160k — worth
+having, but state it as ~4x rather than implying the cliff is gone.
