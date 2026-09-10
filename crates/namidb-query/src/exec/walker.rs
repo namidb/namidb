@@ -6698,9 +6698,94 @@ fn should_skip_target_materialize(
     !back_reference
         && path_binding.is_none()
         && !target_labels.is_empty()
-        && !routing.referenced_aliases.contains(target_alias)
+        && (!routing.referenced_aliases.contains(target_alias)
+            || routing.identity_only_aliases.contains(target_alias))
         && !routing.zero_hop_sources.contains(target_alias)
         && length.as_ref().is_none_or(|length| length.max == 1)
+}
+
+/// Aliases whose every reference reads only the node's identity.
+///
+/// The id-only stub binds EMPTY properties and only the labels its own
+/// Expand asked for, so an alias may take it either by being unreferenced or
+/// by being referenced ONLY in positions that read nothing else. This is a
+/// WHITELIST, deliberately shallow: a form must be added to it on purpose and
+/// can never inherit the fast path by omission, and an identity-only form
+/// NESTED inside a larger expression counts as a full-value reference.
+/// Over-collecting into `full` is the safe direction — it costs a hydration,
+/// where under-collecting returns nulls for real values.
+///
+/// The three admitted forms, and why each reads only the id:
+/// * `count(x)` — counts non-null occurrences; a stub is non-null exactly
+///   where the node is.
+/// * `count(DISTINCT x)` — dedups on `fingerprint_value`, whose node arm is
+///   `N{id};` (walker.rs, `fingerprint_into`): id alone, no properties, no
+///   labels.
+/// * `count(id(x))` — `id()` reads the id, which the stub carries correctly.
+fn collect_identity_only_aliases(
+    plan: &LogicalPlan,
+    all_refs: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    // `full` is the ordinary reference walk with identity-only counts
+    // suppressed; `identity` is just those counts. An alias qualifies only if
+    // it appears in the second and never in the first.
+    let mut full: BTreeSet<String> = BTreeSet::new();
+    collect_plan_references(plan, &mut full, true, true);
+    let mut identity: BTreeSet<String> = BTreeSet::new();
+    collect_identity_count_args(plan, &mut identity);
+    // Referenced, seen at least once in an identity-only position, and never
+    // anywhere else.
+    identity
+        .into_iter()
+        .filter(|a| all_refs.contains(a) && !full.contains(a))
+        .collect()
+}
+
+/// The bare alias an identity-only aggregate argument reads, if it is one.
+fn identity_only_count_arg(expr: &Expression) -> Option<String> {
+    use crate::parser::ExpressionKind;
+    match &expr.kind {
+        ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
+        // `id(<variable>)` and nothing else — any other function, or any
+        // argument that is not a bare variable, is a full-value reference.
+        ExpressionKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => {
+            // Unqualified `id(...)` only: a namespaced call is a different
+            // function and must not inherit the fast path.
+            let is_id = name.segments.len() == 1
+                && name.segments[0].name.eq_ignore_ascii_case("id")
+                && args.len() == 1
+                && !*distinct;
+            if !is_id {
+                return None;
+            }
+            match &args[0].kind {
+                ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The aliases read by identity-only aggregate arguments.
+fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    use crate::plan::logical::AggregateExpr;
+    if let LogicalPlan::Aggregate { aggregations, .. } = plan {
+        for (_alias, agg) in aggregations {
+            if let AggregateExpr::Count { arg: Some(e), .. } = agg {
+                if let Some(alias) = identity_only_count_arg(e) {
+                    out.insert(alias);
+                }
+            }
+        }
+    }
+    for child in plan.children() {
+        collect_identity_count_args(child, out);
+    }
 }
 
 /// Collect the source alias of every `*0..n` Expand in the plan.
@@ -9742,6 +9827,10 @@ pub(crate) struct PlanRouting {
     /// consumed downstream. This intentionally excludes a bare `DELETE r`:
     /// deleting a relationship only needs its `(type, src, dst)` identity.
     value_referenced_aliases: BTreeSet<String>,
+    /// Aliases every one of whose references reads only the node's
+    /// IDENTITY, never a property, a label or the whole value. Such a target
+    /// can be bound as an id-only stub even though it IS referenced.
+    identity_only_aliases: BTreeSet<String>,
     /// Aliases a later Expand consumes as the SOURCE of a zero-length
     /// variable-length pattern (`*0..n`). Such an Expand decides whether the
     /// source itself is a result by reading the labels off the ROW, and an
@@ -9767,7 +9856,9 @@ impl PlanRouting {
         collect_plan_value_referenced_variables(plan, &mut value_refs);
         let mut zero_hop_sources: BTreeSet<String> = BTreeSet::new();
         collect_zero_hop_expand_sources(plan, &mut zero_hop_sources);
+        let identity_only_aliases = collect_identity_only_aliases(plan, &refs);
         Self {
+            identity_only_aliases,
             referenced_aliases: refs,
             value_referenced_aliases: value_refs,
             zero_hop_sources,
@@ -10025,20 +10116,21 @@ fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
 }
 
 fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    collect_plan_references(plan, out, true);
+    collect_plan_references(plan, out, true, false);
 }
 
 /// Same plan walk as [`collect_plan_referenced_variables`], except a bare
 /// `DELETE <alias>` is treated as an identity-only use. Every other expression
 /// remains conservative and requires the full value.
 fn collect_plan_value_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    collect_plan_references(plan, out, false);
+    collect_plan_references(plan, out, false, false);
 }
 
 fn collect_plan_references(
     plan: &LogicalPlan,
     out: &mut BTreeSet<String>,
     delete_needs_full_value: bool,
+    skip_identity_counts: bool,
 ) {
     use crate::plan::logical::{AggregateExpr, CreateElement, RemoveOp};
 
@@ -10066,6 +10158,12 @@ fn collect_plan_references(
             }
             for (_alias, agg) in aggregations {
                 match agg {
+                    // `count(x)` / `count(DISTINCT x)` / `count(id(x))` read
+                    // only the node's IDENTITY, so under `skip_identity_counts`
+                    // they contribute no VALUE reference. Split out of the
+                    // shared arm below, which does read values.
+                    AggregateExpr::Count { arg: Some(e), .. }
+                        if skip_identity_counts && identity_only_count_arg(e).is_some() => {}
                     AggregateExpr::Count { arg: Some(e), .. }
                     | AggregateExpr::Sum { arg: e, .. }
                     | AggregateExpr::Avg { arg: e, .. }
@@ -10204,7 +10302,7 @@ fn collect_plan_references(
     }
 
     for child in plan.children() {
-        collect_plan_references(child, out, delete_needs_full_value);
+        collect_plan_references(child, out, delete_needs_full_value, skip_identity_counts);
     }
 }
 
@@ -10577,5 +10675,50 @@ mod tests {
     fn sum_mixed_promotes_to_float() {
         let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Float(2.5)]).unwrap();
         assert_eq!(v, RuntimeValue::Float(3.5));
+    }
+}
+
+#[cfg(test)]
+mod identity_only_tests {
+    use super::*;
+    use crate::plan::lower;
+
+    fn routing_for(q: &str) -> PlanRouting {
+        let parsed = crate::parser::parse(q).unwrap();
+        let plan = lower(&parsed).unwrap();
+        PlanRouting::analyze(&plan)
+    }
+
+    #[test]
+    fn identity_only_classification() {
+        for (q, alias, expect) in [
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN count(b) AS c", "b", true),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN count(id(b)) AS c",
+                "b",
+                true,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN count(DISTINCT b) AS c",
+                "b",
+                true,
+            ),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN count(b.n) AS c", "b", false),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN count(b) AS c, max(b.n) AS m",
+                "b",
+                false,
+            ),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN b.n AS n", "b", false),
+        ] {
+            let r = routing_for(q);
+            assert_eq!(
+                r.identity_only_aliases.contains(alias),
+                expect,
+                "`{alias}` in `{q}`: identity_only={:?} referenced={:?}",
+                r.identity_only_aliases,
+                r.referenced_aliases
+            );
+        }
     }
 }

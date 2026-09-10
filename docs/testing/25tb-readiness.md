@@ -1144,56 +1144,43 @@ unlabelled target, so the release that fixed the labelled twin left this
 untouched. A sweep of 12 expand shapes at degree 120k now shows them
 uniform (~1.7 s); before the fix two of them did not complete.
 
-### 74. [OPEN — prerequisite now met] A bare-node reference forces full hydration
+### 74. [FIXED in 2.6.11] A bare-node reference forced full hydration
 
-Re-measured on the 2.6.10 build at degree 160,000, ~1 KB targets:
+Measured at degree 160,000, ~1 KB targets:
 
-| query | time |
-|---|---|
-| `RETURN count(*)` (target unreferenced) | **0.64 s** |
-| `RETURN count(t)` | 2.20 s |
-| `RETURN count(id(t))` | 2.19 s |
-| `RETURN count(DISTINCT t)` | 2.13 s |
-| `RETURN sum(t.idx)` | 2.25 s |
+| query | before | after |
+|---|---|---|
+| `RETURN count(*)` (unreferenced, the floor) | 0.54 s | 0.55 s |
+| `RETURN count(t)` | 2.24 s | **0.55 s** |
+| `RETURN count(id(t))` | 2.23 s | **0.61 s** |
+| `RETURN count(DISTINCT t)` | 2.24 s | **0.64 s** |
+| `RETURN count(t.idx)` | 2.26 s | 2.11 s (correctly NOT optimised) |
+| `RETURN count(t), max(t.idx)` | — | 2.36 s (correctly NOT optimised) |
 
-`count(id(t))` — where the caller has literally written that only the id
-is needed — costs the same as full hydration. 3.4x of pure waste.
-`should_skip_target_materialize` requires
-`!routing.referenced_aliases.contains(target_alias)`, and
-`collect_plan_references` treats `Count { arg: Some(e) }` exactly like
-`Sum`/`Avg`, so any mention of the alias forces every column.
+`PlanRouting` gained `identity_only_aliases`: aliases referenced ONLY in
+positions that read the node id. `should_skip_target_materialize` admits
+those to the id-only stub alongside genuinely unreferenced ones.
 
-**The prerequisite is now met.** Widening the id-only stub was blocked on
-the reference collector being trustworthy, and it was not: two forms read
-a host binding without registering it, and both were silent wrong answers
-(quantifiers / list comprehensions over a target property, and a `*0..n`
-source losing its extra labels — both fixed in 2.6.8). The collector is
-now EXHAUSTIVE — no `_` arm, so the compiler forces a decision for every
-`ExpressionKind` — and the only forms that deliberately register nothing
-are the genuinely closed pattern forms (`Exists`, `ExistsSubquery`,
-`PatternComprehension`) plus `Literal` / `Parameter` / `Star`, none of
-which read a host binding.
+Sound because each admitted form provably reads only the id: `count(x)`
+counts non-null occurrences (a stub is non-null exactly where the node is);
+`count(DISTINCT x)` dedups on `fingerprint_value`, whose node arm is
+`N{id};` — verified at walker.rs, id alone, no properties, no labels; and
+`id(x)` reads the id, which the stub carries correctly.
 
-**What remains is the whitelist, and it must stay narrow.** The stub binds
-EMPTY properties, so mis-classifying one form returns nulls for real
-values. Two tiers with different burdens of proof:
+**A WHITELIST, never a blacklist.** Nested identity forms, counts over a
+property, and any alias also read for a value elsewhere in the statement
+all keep the full path. A new expression form must be added deliberately.
 
-- `id(x)` as the sole mention: provably safe with no further reasoning —
-  `id()` reads the id, and the stub carries the correct id.
-- bare `count(x)` / `count(DISTINCT x)`: needs the argument that node
-  dedup is by an id-only fingerprint (it is — a BTreeSet over id
-  fingerprints since the first release, confirmed under item 68). Worth
-  having, since `count(x)` is the common spelling, but it rests on an
-  aggregate-internals invariant that deserves its own pinning test first.
-
-Anything else mentioning the alias stays on the full path. Not a
-blacklist: a new expression form must be added to the whitelist
-deliberately, never inherit the fast path by omission.
-
-Add a family to `exec_rewrite_equivalence.rs` at the same time, and
-remember that file's trap: a family must reference the target ONLY through
-the construct under test, or the stub is never built and the family passes
-with the fix reverted.
+**Two process notes worth keeping.** First, the implementation initially
+passed every test while being completely INERT — `count(t)` stayed at
+2.24 s. `collect_plan_references` recurses into children itself, so calling
+it per-node walked the whole subtree and collected the alias from the
+aggregate anyway. Caught only by measuring after the tests went green;
+fixed by threading a `skip_identity_counts` flag through the single
+existing traversal instead of adding a second one. Second, the equivalence
+families for this must include the MIXED case (`count(t)` and `max(t.n)`
+in one statement): that is the shape where a mis-classification returns a
+correct count beside a null maximum — a half-right row, the worst kind.
 
 ### 75. [FIXED in 2.6.10] `LIMIT` now bounds an expansion's work
 
@@ -1241,24 +1228,49 @@ limit parameter and materialises the whole partner list, so no executor
 change can avoid it. That is the storage half, and it is where the
 hierarchical adjacency work from finding #3 would earn its keep.
 
-### 76. [OPEN — measured, correct by design] An unlabelled unreferenced target cannot use the membership path
+### 76. [OPEN — design ready] An unlabelled unreferenced target cannot use the membership path
 
 At degree 160,000, `count(*)` over `(t:FAT)` takes 0.63 s but over `()`
-takes 2.24 s — **3.5x** — although neither references the target. The
-label-membership sidecar proves "carries label L"; with no label there is
-nothing to prove, and `try_batch_nodes_have_labels` returns `None` with
+takes 2.24 s — **3.5x** — although neither references the target.
+`try_batch_nodes_have_labels` returns `None` for an empty label list, with
 the reason stated in place: *"Membership in zero labels does not prove
 that the endpoint itself exists; retain the authoritative node point
 path."* So the expansion falls back to full hydration purely to establish
 that each endpoint exists.
 
-**Unlike items 73/74 this is not a mistaken gate.** Those rested on a
-false belief about `batch_lookup_nodes` being label-scoped; this rests on
-a true constraint. Closing it needs a new storage capability — an
-existence-only batch that decodes the key column rather than the whole
-row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
-having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
-full hydration for nothing.
+**The constraint is real; existence cannot be skipped.** A dangling edge
+would otherwise produce a phantom row. Dangling edges can no longer be
+CREATED through Cypher — a bare `DELETE` of a connected node is refused
+(and since 2.6.10 refused as a 409, not a 500) — but they can exist in
+data written by earlier versions, and the embedded `tombstone_node` API
+carries no incident-edge check. Skipping the proof would silently add rows
+on exactly those stores.
+
+**Two implementable designs, in preference order.**
+
+1. *An existence-only batch* (`batch_nodes_exist(ids) -> Vec<bool>`).
+   The row decode is what costs: measured elsewhere in this document, a
+   900-byte string column costs the same as an 8-byte integer column
+   (0.433 s vs 0.466 s at 160k), so the expense is per-ROW
+   materialisation, not bytes. Reading only the key column to test
+   presence avoids essentially all of it. This is the clean answer, and it
+   is a new storage method in the hot read path — it needs the
+   equivalence harness pointed at it (unlabelled vs labelled counts on a
+   store containing a deliberately dangling edge, written through the
+   embedded API).
+
+2. *Probe the label sidecar for ANY label.* Membership is keyed
+   `(label_id, node_id)` and `per_label_counts` names the labels present
+   in each SST, so existence is a probe per label, ORed. A node cannot
+   have zero labels — `CREATE (n {p: 1})` without a label is rejected with
+   a 400, verified live — so "appears under some label" is equivalent to
+   "exists". Bound it: probe when the SST carries few labels (≤ 4, say)
+   and fall back to hydration otherwise, or a wide-schema store turns one
+   read into fifty.
+
+Design (1) is preferred: it is O(1) per node regardless of schema width,
+and it does not depend on the every-node-has-a-label invariant holding for
+data written by any future writer.
 
 ### 77. [FIXED in 2.6.7] Labelled variable-length burned CPU with no extra I/O
 
@@ -1495,13 +1507,38 @@ aggregation pushdown". It is, in order of value:
 2. Then consider vectorised aggregation over the decoded Arrow column, to
    remove the per-row materialisation that item 79 measured.
 
-**Why this was not wired tonight.** Wiring a filter is the "rows go
-missing" risk class: a page- or row-group-level decision that disagrees
-with the row-level evaluation drops rows silently, which is the failure
-mode that produced five bugs in this codebase this week. It needs the
-equivalence harness pointed at it (filtered scan vs unfiltered-then-filter
-for a matrix of predicate shapes, types, nulls and absent properties) and
-an adversarial review — not the tail of an eight-release day.
+**The `&[]` is not an oversight — and knowing why is the whole handoff.**
+That branch reads properties from the `.npp` sidecar addressed by a
+RUNNING ROW ORDINAL:
+
+    let mut next_ordinal = 0_u64;                      // read.rs:5754
+    ...
+    next_ordinal = next_ordinal.checked_add(batch.num_rows() as u64)
+    ...
+    if next_ordinal != desc.row_count {                // read.rs:5812
+        return Err(Error::invariant("node property/Parquet row-count mismatch"));
+    }
+
+The ordinal must stay aligned with the sidecar, so the branch requires
+seeing EVERY row group — and it self-checks that it did. Handing Parquet
+the predicates would make it skip row groups, the ordinal would fall
+short, and that invariant would fire. So the current code is correct and
+defensive, not careless.
+
+**What wiring it therefore requires**: advancing `next_ordinal` by the row
+count of each SKIPPED row group (available in the footer metadata that
+this branch already fetches and caches), so the sidecar stays addressable.
+The existing invariant check is the safety net for getting it wrong — it
+turns a silent row loss into a hard error, which is why it should be kept
+and not relaxed.
+
+**Why this was not wired tonight.** Even with the accounting understood, a
+page- or row-group-level decision that disagrees with the row-level
+evaluation drops rows, which is the failure mode that produced five bugs
+in this codebase this week. It wants the equivalence harness pointed at it
+(filtered scan vs unfiltered-then-filter across a matrix of predicate
+shapes, types, nulls and absent properties) and an adversarial review —
+not the tail of an eleven-release day.
 
 One caveat for whoever picks it up: nodes are stored **id-primary**, so a
 property like `idx` is scattered across row groups in UUID order and every
