@@ -226,6 +226,18 @@ fn scalar_cmp(a: &StatScalar, b: &StatScalar) -> Option<Ordering> {
         (Int64(x), Int64(y)) => Some(x.cmp(y)),
         (Float32(x), Float32(y)) => Some(float_cmp_f32(*x, *y)),
         (Float64(x), Float64(y)) => Some(float_cmp_f64(*x, *y)),
+        // Mixed Int/Float, matching `value_cmp` above and the executor. A
+        // missing arm here is SAFE (the caller resolves `None` to
+        // `MaybePresent`, so it never prunes wrongly) but it means a mixed
+        // predicate skips no row groups at all.
+        (Int32(x), Float32(y)) => Some(float_cmp_f64(*x as f64, *y as f64)),
+        (Int32(x), Float64(y)) => Some(float_cmp_f64(*x as f64, *y)),
+        (Int64(x), Float32(y)) => Some(float_cmp_f64(*x as f64, *y as f64)),
+        (Int64(x), Float64(y)) => Some(float_cmp_f64(*x as f64, *y)),
+        (Float32(x), Int32(y)) => Some(float_cmp_f64(*x as f64, *y as f64)),
+        (Float32(x), Int64(y)) => Some(float_cmp_f64(*x as f64, *y as f64)),
+        (Float64(x), Int32(y)) => Some(float_cmp_f64(*x, *y as f64)),
+        (Float64(x), Int64(y)) => Some(float_cmp_f64(*x, *y as f64)),
         (Utf8(x), Utf8(y)) => Some(x.cmp(y)),
         (LargeUtf8(x), LargeUtf8(y)) => Some(x.cmp(y)),
         (Binary(x), Binary(y)) => Some(x.cmp(y)),
@@ -313,6 +325,19 @@ fn value_cmp(v: &Value, s: &StatScalar) -> Option<Ordering> {
         // determinism (writer canonicalises NaN during HLL hashing).
         (V::F64(a), S::Float32(b)) => Some(float_cmp_f64(*a, *b as f64)),
         (V::F64(a), S::Float64(b)) => Some(float_cmp_f64(*a, *b)),
+        // Cypher compares numbers ACROSS Int and Float: `5 = 5.0` is true,
+        // and the executor does exactly this — `is_equal` uses
+        // `(x as f64) == y` and `compare` uses `(x as f64).partial_cmp(y)`
+        // (exec/expr.rs). Without these arms a mixed comparison fell to
+        // `_ => None`, which every caller resolves as `false`, so
+        // `WHERE n.price > 0` over a float column returned NO ROWS while
+        // `RETURN n.price > 0` returned true — the same comparison
+        // disagreeing with itself depending on whether it was a filter or
+        // an expression.
+        (V::I64(a), S::Float32(b)) => Some(float_cmp_f64(*a as f64, *b as f64)),
+        (V::I64(a), S::Float64(b)) => Some(float_cmp_f64(*a as f64, *b)),
+        (V::F64(a), S::Int32(b)) => Some(float_cmp_f64(*a, *b as f64)),
+        (V::F64(a), S::Int64(b)) => Some(float_cmp_f64(*a, *b as f64)),
         (V::Str(a), S::Utf8(b)) => Some(a.as_str().cmp(b.as_str())),
         (V::Str(a), S::LargeUtf8(b)) => Some(a.as_str().cmp(b.as_str())),
         (V::Bytes(a), S::Binary(b)) => Some(a.as_slice().cmp(b.as_slice())),
@@ -790,5 +815,125 @@ mod tests {
         assert_eq!(p1.column(), "age");
         assert_eq!(p2.column(), "name");
         assert_eq!(p3.column(), "age");
+    }
+}
+
+#[cfg(test)]
+mod numeric_coercion_tests {
+    use super::*;
+    use namidb_core::value::Value;
+
+    /// A scan-side predicate must compare numbers the way the executor does:
+    /// `is_equal` uses `(x as f64) == y` and `compare` uses
+    /// `(x as f64).partial_cmp(y)` (namidb-query exec/expr.rs).
+    ///
+    /// Without cross-numeric arms every mixed comparison fell to `None`,
+    /// which the caller resolves to `false`, so `WHERE n.price > 0` over a
+    /// float column returned NO ROWS while `RETURN n.price > 0` returned
+    /// true — the same comparison disagreeing with itself.
+    #[test]
+    fn mixed_int_float_predicates_match_executor_semantics() {
+        let eq = |target: StatScalar| ScanPredicate::Eq {
+            column: "p".into(),
+            value: target,
+        };
+        let gt = |target: StatScalar| ScanPredicate::Gt {
+            column: "p".into(),
+            value: target,
+        };
+        let lt = |target: StatScalar| ScanPredicate::Lt {
+            column: "p".into(),
+            value: target,
+        };
+
+        // An integer-valued property against float predicates.
+        assert!(eval_against_value(
+            &eq(StatScalar::Float64(5.0)),
+            Some(&Value::I64(5))
+        ));
+        assert!(!eval_against_value(
+            &eq(StatScalar::Float64(5.5)),
+            Some(&Value::I64(5))
+        ));
+        assert!(eval_against_value(
+            &gt(StatScalar::Float64(4.5)),
+            Some(&Value::I64(5))
+        ));
+        assert!(eval_against_value(
+            &lt(StatScalar::Float64(5.5)),
+            Some(&Value::I64(5))
+        ));
+
+        // A float-valued property against integer predicates — the shape
+        // that silently emptied `WHERE amount > 0` over a money column.
+        assert!(eval_against_value(
+            &gt(StatScalar::Int64(0)),
+            Some(&Value::F64(12.5))
+        ));
+        assert!(eval_against_value(
+            &lt(StatScalar::Int64(13)),
+            Some(&Value::F64(12.5))
+        ));
+        assert!(!eval_against_value(
+            &gt(StatScalar::Int64(13)),
+            Some(&Value::F64(12.5))
+        ));
+        assert!(eval_against_value(
+            &eq(StatScalar::Int64(5)),
+            Some(&Value::F64(5.0))
+        ));
+        assert!(!eval_against_value(
+            &eq(StatScalar::Int64(5)),
+            Some(&Value::F64(5.5))
+        ));
+
+        // Same-type comparisons are unchanged.
+        assert!(eval_against_value(
+            &eq(StatScalar::Int64(5)),
+            Some(&Value::I64(5))
+        ));
+        assert!(eval_against_value(
+            &eq(StatScalar::Float64(5.5)),
+            Some(&Value::F64(5.5))
+        ));
+        // A genuinely incomparable pair still declines.
+        assert!(!eval_against_value(
+            &eq(StatScalar::Utf8("5".into())),
+            Some(&Value::I64(5))
+        ));
+    }
+
+    /// Row-group pruning must never exclude a group a mixed predicate could
+    /// match. `None` was already safe (`MaybePresent`); now the comparison
+    /// succeeds, so it can also prune correctly.
+    #[test]
+    fn mixed_row_group_bounds_prune_correctly_and_never_over_prune() {
+        let stats = PropertyColumnStats {
+            name: "p".into(),
+            null_count: 0,
+            min: Some(StatScalar::Int64(10)),
+            max: Some(StatScalar::Int64(20)),
+            ndv_estimate: None,
+        };
+        let eq = |v: StatScalar| ScanPredicate::Eq {
+            column: "p".into(),
+            value: v,
+        };
+        // Inside the integer range, expressed as a float: must be kept.
+        assert_eq!(
+            eval_row_group(&eq(StatScalar::Float64(15.0)), &stats),
+            RowGroupVerdict::MaybePresent
+        );
+        // On the boundary: kept.
+        assert_eq!(
+            eval_row_group(&eq(StatScalar::Float64(10.0)), &stats),
+            RowGroupVerdict::MaybePresent
+        );
+        // Outside: now provably absent, where before it was conservatively
+        // kept.
+        assert_eq!(
+            eval_row_group(&eq(StatScalar::Float64(25.0)), &stats),
+            RowGroupVerdict::Absent
+        );
     }
 }
