@@ -1438,3 +1438,75 @@ If an exact-answer fast path is ever wanted, it needs a per-label
 "stats are exact" bit that flush clears on any tombstone and compaction
 sets when it recomputes from survivors. That does not exist today, and
 inventing it is a manifest format change.
+
+### 80. [OPEN — root cause found] Filtered scans prune nothing: the predicate never reaches storage
+
+Measured at 160,000 nodes, one label, one projected column. The times do
+not depend on selectivity at all:
+
+| query | rows returned | time |
+|---|---|---|
+| `WHERE t.idx > 999999` (outside every value in the store) | **0** | 0.377 s |
+| `WHERE t.idx < -5` (outside, low side) | **0** | 0.468 s |
+| `WHERE t.idx = 12345` | 1 | 0.375 s |
+| `WHERE t.idx > 159990` | 9 | 0.412 s |
+| `WHERE t.idx > 80000` | 79,999 | 0.417 s |
+| no filter (manifest fast path) | 160,000 | **0.001 s** |
+
+A predicate that provably matches nothing costs the same as one matching
+half the store. Nothing is being skipped.
+
+**Root cause, and it is not a missing feature — it is two implemented
+features that are not wired.**
+
+1. *Parquet row-group pruning.* `EnabledStatistics::Chunk` is configured
+   (sst/nodes.rs:1515) so per-row-group column statistics ARE written, and
+   `eval_row_group` + `PropertyColumnStats` (sst/predicates.rs:93) decide
+   Absent/MaybePresent from them. But the branch that serves a PROJECTED
+   scan — the common shape, and the one EXPLAIN shows here
+   (`projection=[idx] predicates=[t.idx > 159990]`) — builds a
+   `LimitedNodeBatchContext` carrying `predicates` and then opens the
+   stream with `node_scan_limited_async(..., &[], Some(&[]), ...)`
+   (read.rs:5735-5741): empty predicates, empty projection. Four of the
+   five call sites in read.rs pass `&[]`; only one passes `predicates`.
+2. *Property-page predicate filtering.* `NodePropertyPageReader::filter_node_ids`
+   (property_pages.rs:2088) and the whole `NodePropertyPredicate` IR
+   (property_pages.rs:255) are implemented and unit-tested — and **dead in
+   production**: the only callers are at property_pages.rs:3518 and 3541,
+   both inside the `#[cfg(test)]` module that begins at line 3372, and
+   `NodePropertyPredicate::` is never constructed anywhere outside its own
+   file.
+
+So a filtered projected scan reads and materialises every row and
+evaluates the predicate row-by-row.
+
+**Also measured: the cost is per-ROW, not per-byte.** `count(t.pad)` over
+a 900-byte string column costs 0.433 s against `count(t.idx)` over an
+8-byte integer column at 0.466 s — indistinguishable. Two columns cost
+0.676 s against one at 0.466 s. That is a fixed per-row overhead
+(materialisation into `Row` / `RuntimeValue`) dominating, which is why
+scalar aggregates (item 79) sit at ~0.47 s regardless of the column.
+
+**What this means for finding #8.** The remaining work is not "build
+aggregation pushdown". It is, in order of value:
+1. Wire ONE of the two existing predicate paths into the projected-scan
+   branch. This makes every selective filter selective, not just
+   aggregates.
+2. Then consider vectorised aggregation over the decoded Arrow column, to
+   remove the per-row materialisation that item 79 measured.
+
+**Why this was not wired tonight.** Wiring a filter is the "rows go
+missing" risk class: a page- or row-group-level decision that disagrees
+with the row-level evaluation drops rows silently, which is the failure
+mode that produced five bugs in this codebase this week. It needs the
+equivalence harness pointed at it (filtered scan vs unfiltered-then-filter
+for a matrix of predicate shapes, types, nulls and absent properties) and
+an adversarial review — not the tail of an eight-release day.
+
+One caveat for whoever picks it up: nodes are stored **id-primary**, so a
+property like `idx` is scattered across row groups in UUID order and every
+row group's `[min,max]` may span nearly the whole value range. Row-group
+pruning will therefore help a lot for a property CORRELATED with insertion
+identity and very little for one that is not. The property-page path (2)
+does not have that limitation and is the better first target; verify
+against a real fixture before choosing.
