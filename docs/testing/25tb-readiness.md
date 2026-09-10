@@ -1228,57 +1228,40 @@ limit parameter and materialises the whole partner list, so no executor
 change can avoid it. That is the storage half, and it is where the
 hierarchical adjacency work from finding #3 would earn its keep.
 
-### 76. [OPEN — design ready] An unlabelled unreferenced target cannot use the membership path
+### 76. [FIXED in 2.6.13] An unlabelled unreferenced target could not use the membership path
 
-At degree 160,000, `count(*)` over `(t:FAT)` takes 0.63 s but over `()`
-takes 2.24 s — **3.5x** — although neither references the target.
-`try_batch_nodes_have_labels` returns `None` for an empty label list, with
-the reason stated in place: *"Membership in zero labels does not prove
-that the endpoint itself exists; retain the authoritative node point
-path."* So the expansion falls back to full hydration purely to establish
-that each endpoint exists.
+At degree 160,000, `count(*)` over `(t:FAT)` took 0.63 s but over `()`
+took 2.23 s — 3.5x — although neither referenced the target. The
+membership sidecar proves "carries label L"; an unlabelled target has no
+label to prove, so the expansion hydrated every endpoint purely to
+establish that it existed.
 
-**The constraint is real; existence cannot be skipped.** A dangling edge
-would otherwise produce a phantom row. Dangling edges can no longer be
-CREATED through Cypher — a bare `DELETE` of a connected node is refused
-(and since 2.6.10 refused as a 409, not a 500) — but they can exist in
-data written by earlier versions, and the embedded `tombstone_node` API
-carries no incident-edge check. Skipping the proof would silently add rows
-on exactly those stores.
+| query | before | after |
+|---|---|---|
+| `-[:TIENE]->(t:FAT) RETURN count(*)` | 0.63 s | 0.63 s |
+| `-[:TIENE]->() RETURN count(*)` | **2.23 s** | **0.53 s** |
+| `-[:TIENE]->(t) RETURN count(*)` | **2.17 s** | **0.57 s** |
 
-**Two implementable designs, in preference order.**
+`Snapshot::try_batch_nodes_exist` ORs `batch_label_contains_from_source`
+across the labels each descriptor actually holds, where
+`try_batch_nodes_have_labels` ANDs across the labels the query asked for.
+A node can never carry zero labels — `CREATE (n {p: 1})` without one is
+rejected with a 400, verified live — so "appears under some label" is
+equivalent to "exists".
 
-1. *An existence-only batch* (`batch_nodes_exist(ids) -> Vec<bool>`).
-   The row decode is what costs: measured elsewhere in this document, a
-   900-byte string column costs the same as an 8-byte integer column
-   (0.433 s vs 0.466 s at 160k), so the expense is per-ROW
-   materialisation, not bytes. Reading only the key column to test
-   presence avoids essentially all of it. This is the clean answer, and it
-   is a new storage method in the hot read path — it needs the
-   equivalence harness pointed at it (unlabelled vs labelled counts on a
-   store containing a deliberately dangling edge, written through the
-   embedded API).
+**Fails closed everywhere.** A descriptor with no label index, a
+non-`PagedV1` format, an unreadable sidecar, a descriptor carrying more
+than `EXISTENCE_PROBE_MAX_LABELS` (8) labels, or an id no descriptor
+claims all return `None` and the caller hydrates. A descriptor skipped by
+mistake is a MISSING ROW, not a slow one.
 
-2. *Probe the label sidecar for ANY label.* Concretely: mirror
-   `try_batch_nodes_have_labels` (read.rs:3636) but OR instead of AND —
-   for each node descriptor, iterate `index.per_label_counts` and call
-   `crate::sst::paged_index::batch_label_contains_from_source` once per
-   label id, exactly as the existing path does for its single label. A
-   node exists if any label of any descriptor contains it. The `None`
-   fallbacks that path already has (non-`PagedV1` format, empty
-   `per_label_counts`, a sidecar that fails to open) must stay
-   fail-CLOSED: if any descriptor could not be probed, return `None` and
-   let the caller hydrate, because a missed descriptor is a missing row,
-   not a slow one. A node cannot
-   have zero labels — `CREATE (n {p: 1})` without a label is rejected with
-   a 400, verified live — so "appears under some label" is equivalent to
-   "exists". Bound it: probe when the SST carries few labels (≤ 4, say)
-   and fall back to hydration otherwise, or a wide-schema store turns one
-   read into fifty.
+The proof cannot be skipped: a dangling edge would become a phantom row.
+Cypher can no longer create one, but older data and the embedded
+`tombstone_node` API can still hold them.
 
-Design (1) is preferred: it is O(1) per node regardless of schema width,
-and it does not depend on the every-node-has-a-label invariant holding for
-data written by any future writer.
+Pinned by `exec_supernode::unlabelled_targets_are_proven_to_exist_and_track_deletes`,
+which asserts every spelling agrees with hydration both before and after
+deleting a third of the targets.
 
 ### 77. [FIXED in 2.6.7] Labelled variable-length burned CPU with no extra I/O
 

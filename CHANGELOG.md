@@ -15,6 +15,31 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.13] - 2026-09-10
+
+### Performance
+
+- **An expansion whose target carries no label no longer decodes a full row
+  per endpoint.** The label-membership sidecar proves "carries label L", and
+  an unlabelled target has no label to prove — so `MATCH (a)-[:R]->()` fell
+  back to hydrating every endpoint purely to establish that it existed. At
+  degree 160,000 with ~1 KB targets, `count(*)` over `()` took 2.23 s
+  against 0.55 s for the labelled spelling; it now takes 0.53 s.
+
+  Existence is proven by `try_batch_nodes_exist`, which ORs across the
+  labels each descriptor actually holds — a node can never carry zero
+  labels, since `CREATE (n {p: 1})` without one is rejected. It fails
+  CLOSED: any descriptor that cannot be probed, a wide-schema descriptor
+  past an 8-label bound, or an id no descriptor claims all fall back to
+  hydration, because a descriptor skipped by mistake is a missing row
+  rather than a slow one.
+
+  The proof cannot be skipped: a dangling edge would become a phantom row.
+  Cypher can no longer create one — a bare `DELETE` of a connected node is
+  refused — but older data and the embedded `tombstone_node` API can still
+  hold them.
+
+
 ## [2.6.12] - 2026-09-10
 
 ### Fixed
@@ -3383,7 +3408,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.12...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.13...HEAD
+[2.6.13]: https://github.com/namidb/namidb/compare/v2.6.12...v2.6.13
 [2.6.12]: https://github.com/namidb/namidb/compare/v2.6.11...v2.6.12
 [2.6.11]: https://github.com/namidb/namidb/compare/v2.6.10...v2.6.11
 [2.6.10]: https://github.com/namidb/namidb/compare/v2.6.9...v2.6.10

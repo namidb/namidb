@@ -3633,6 +3633,164 @@ impl<'mt> Snapshot<'mt> {
     /// `batch_label_contains_from_source`, so a high-degree graph expansion
     /// does not issue one header/footer read or hydrate one embedding per
     /// relationship endpoint.
+    /// Past this many labels in one descriptor, an existence proof costs
+    /// more probes than the row read it is avoiding.
+    const EXISTENCE_PROBE_MAX_LABELS: usize = 8;
+
+    /// Prove that each id names a LIVE node, without decoding its row.
+    ///
+    /// An expansion whose target carries no label still has to establish
+    /// that the endpoint exists — a dangling edge would otherwise produce a
+    /// phantom row, and while Cypher no longer lets one be created (a bare
+    /// `DELETE` of a connected node is refused), older data and the embedded
+    /// `tombstone_node` API can still contain them. Today that proof costs a
+    /// full row hydration: at degree 160,000, `count(*)` over `()` takes
+    /// 2.2s against 0.55s over `(t:Label)`, which uses the membership
+    /// sidecar.
+    ///
+    /// A node can never carry zero labels — `CREATE (n {p: 1})` without one
+    /// is rejected — so "appears in the label sidecar under SOME label" is
+    /// equivalent to "exists". This ORs across the labels each descriptor
+    /// actually holds, where [`Self::try_batch_nodes_have_labels`] ANDs
+    /// across the labels the query asked for.
+    ///
+    /// Returns `None` — fail CLOSED, let the caller hydrate — whenever any
+    /// descriptor cannot be probed. A descriptor skipped by mistake is a
+    /// missing row, not a slow one.
+    pub async fn try_batch_nodes_exist(&self, ids: &[NodeId]) -> Result<Option<Vec<bool>>> {
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(descriptors) = self.disjoint_node_descriptors() else {
+            if let Some(cache) = &self.cache {
+                cache.record_label_membership_fallback();
+            }
+            return Ok(None);
+        };
+
+        let mut probes_by_descriptor: BTreeMap<usize, Vec<(usize, [u8; 16])>> = BTreeMap::new();
+        for (position, id) in ids.iter().enumerate() {
+            let id_bytes = *id.as_bytes();
+            let candidate = descriptors.partition_point(|descriptor_index| {
+                self.manifest.manifest.ssts[*descriptor_index].max_key < id_bytes
+            });
+            // No descriptor claims this id. `disjoint_node_descriptors`
+            // already refused when the memtable holds any node, so this is
+            // genuinely absent — but answer it by hydrating rather than by
+            // inference: a wrong `false` here is a MISSING row.
+            let Some(&descriptor_index) = descriptors.get(candidate) else {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            };
+            let descriptor = &self.manifest.manifest.ssts[descriptor_index];
+            if descriptor.min_key <= id_bytes && id_bytes <= descriptor.max_key {
+                probes_by_descriptor
+                    .entry(descriptor_index)
+                    .or_default()
+                    .push((position, id_bytes));
+            } else {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            }
+        }
+
+        let mut output = vec![false; ids.len()];
+        for (descriptor_index, probes) in probes_by_descriptor {
+            let descriptor = &self.manifest.manifest.ssts[descriptor_index];
+            let Some(index) = &descriptor.label_index else {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            };
+            if index.format != PropertyIndexFormat::PagedV1
+                || index.per_label_counts.is_empty()
+                || self
+                    .validated_node_descriptor_live_count(descriptor)
+                    .is_none()
+            {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            }
+            // A wide-schema descriptor would turn one read into one probe per
+            // label; past that point hydrating is the cheaper answer.
+            if index.per_label_counts.len() > Self::EXISTENCE_PROBE_MAX_LABELS {
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_fallback();
+                }
+                return Ok(None);
+            }
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
+            let source = match self
+                .pinned_sidecar_source(&absolute, Some(index.size_bytes))
+                .await
+            {
+                Ok(source) => source,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    if let Some(cache) = &self.cache {
+                        cache.record_label_membership_fallback();
+                    }
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let probe_ids = probes.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+            let mut descriptor_matches = vec![false; probes.len()];
+            for (label_id, count) in &index.per_label_counts {
+                if *count == 0 {
+                    continue;
+                }
+                let (matches, stats) =
+                    match crate::sst::paged_index::batch_label_contains_from_source(
+                        &source,
+                        *label_id,
+                        &probe_ids,
+                        *descriptor.id.as_bytes(),
+                        &index.per_label_counts,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) if optional_accelerator_fallback(&error) => {
+                            if let Some(cache) = &self.cache {
+                                cache.record_label_membership_fallback();
+                            }
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if let Some(cache) = &self.cache {
+                    cache.record_label_membership_probe(probe_ids.len(), stats);
+                }
+                if matches.len() != probes.len() || stats.index_entries != index.posting_count {
+                    if let Some(cache) = &self.cache {
+                        cache.record_label_membership_fallback();
+                    }
+                    return Ok(None);
+                }
+                for (combined, one_label) in descriptor_matches.iter_mut().zip(matches) {
+                    *combined |= one_label;
+                }
+                if descriptor_matches.iter().all(|matched| *matched) {
+                    break;
+                }
+            }
+            for ((position, _), matched) in probes.into_iter().zip(descriptor_matches) {
+                output[position] = matched;
+            }
+        }
+        if let Some(cache) = &self.cache {
+            cache.record_label_membership_fast_path();
+        }
+        Ok(Some(output))
+    }
+
     pub async fn try_batch_nodes_have_labels(
         &self,
         labels: &[String],
