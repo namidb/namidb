@@ -1811,6 +1811,7 @@ pub(crate) async fn execute_expand(
                 &unique_targets,
                 skip_target_materialize,
                 true,
+                max > 1,
             )
             .await?;
             for (step, neighbours) in step_neighbours {
@@ -6517,6 +6518,7 @@ async fn prepare_expand_targets(
     unique_targets: &[NodeId],
     skip_target_materialize: bool,
     views_usable: bool,
+    multi_hop: bool,
 ) -> Result<ExpandTargets, ExecError> {
     if unique_targets.is_empty() {
         return Ok(if skip_target_materialize {
@@ -6557,12 +6559,34 @@ async fn prepare_expand_targets(
         ));
     }
 
-    // `batch_lookup_nodes` resolves by id across every node descriptor; the
-    // label only namespaces its cache keys, so an EMPTY label is a complete
-    // id-primary batch, not a miss. Only a SINGLE-HOP expansion may consume
-    // it directly: a variable-length traversal must be able to walk THROUGH
-    // nodes this batch does not describe.
-    let label = target_labels.first().map_or("", String::as_str);
+    // `batch_lookup_nodes` sweeps by id across every node descriptor, but it
+    // FILTERS its output by the label it is given (read.rs: `.filter(|v|
+    // label.is_empty() || v.labels.contains(label))`) — an empty label is the
+    // only way to ask for "whatever is there".
+    //
+    // That distinction is the whole cost of a multi-hop traversal. Every hop
+    // shares the pattern's FINAL target label, so asking for it at an
+    // INTERMEDIATE hop drops every endpoint: the batch comes back all-None,
+    // the Views map is empty, and each traversed edge falls through to
+    // `scan_node_for_id` — `lookup_node_by_id`, the one node read with no
+    // cache tier, which re-decodes a whole Parquet row group per call. It
+    // never warms up, and it costs more the fatter the neighbouring rows are.
+    //
+    // A multi-hop expansion therefore asks for no label at all. Nothing is
+    // lost: the consumer re-proves the label per edge against the view it
+    // gets, which is also what decides result-vs-traversal at `max > 1`.
+    // ALWAYS ask for no label, single hop or not. The consumer re-proves the
+    // label per edge against the view it receives, so the batch's own filter
+    // adds nothing — and it costs a great deal: a neighbour of a different
+    // label is dropped from the batch, and an absent id then falls through to
+    // `scan_node_for_id`, one uncached point read PER EDGE. On a 40k-degree
+    // hub whose neighbours are half `:VERDE` and half `:ROJO`,
+    // `-[:N]->(t:VERDE) RETURN count(t)` spent longer than the 120s deadline
+    // paying that toll for every `:ROJO` neighbour. With no label the batch
+    // returns every endpoint, a miss means genuinely absent, and the fallback
+    // becomes the rare path it was written to be.
+    let label = "";
+    let _ = multi_hop;
     if !views_usable || unique_targets.len() > expand_target_view_budget() {
         let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
         return Ok(ExpandTargets::Cold);
@@ -8724,6 +8748,7 @@ async fn execute_expand_factor(
                 &unique_targets,
                 skip_target_materialize,
                 true,
+                max > 1,
             )
             .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {

@@ -207,3 +207,78 @@ async fn unlabelled_and_anonymous_hub_targets_match_the_labelled_form() {
         }
     }
 }
+
+/// A hub whose neighbours carry DIFFERENT labels, with the target label
+/// referenced downstream.
+///
+/// `batch_lookup_nodes` sweeps by id but FILTERS its output by the label it
+/// is given, so asking for `:Green` drops every `:Red` neighbour from the
+/// batch. Those ids are then absent from the Views map, and the miss branch
+/// falls through to `scan_node_for_id` — one uncached point read PER EDGE.
+/// On a 40k-degree hub split evenly between two labels, this took
+/// `-[:KNOWS]->(t:Green) RETURN count(t)` past a 120s deadline where 2.6.3
+/// answered in 0.22s. The expand batch therefore asks for NO label and
+/// re-proves the label itself, per edge, against the view it gets.
+///
+/// The timing cannot be asserted here (an in-memory store makes the point
+/// read cheap), but nothing in the suite expanded a hub whose neighbours had
+/// mixed labels at all, which is why the regression shipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_label_neighbours_resolve_without_per_edge_reads() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("exec-mixed-labels").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+    let hub = NodeId::new();
+    writer.upsert_node("Person", hub, &person("hub")).unwrap();
+    // Half the neighbours carry the label the query asks for, half do not.
+    for ordinal in 0..FANIN {
+        let green = NodeId::new();
+        writer
+            .upsert_node("Green", green, &person(&format!("green-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, green, &edge()).unwrap();
+        let red = NodeId::new();
+        writer
+            .upsert_node("Red", red, &person(&format!("red-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, red, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    // Referencing the target forces the materialising path (an unreferenced
+    // target takes the cheap membership sidecar and would not exercise this).
+    let green = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) RETURN count(t) AS c",
+    )
+    .await;
+    assert_eq!(
+        green, FANIN as i64,
+        "every :Green neighbour must be counted"
+    );
+
+    let red = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Red) RETURN count(t) AS c",
+    )
+    .await;
+    assert_eq!(red, FANIN as i64);
+
+    // A label no neighbour carries must return zero, not the whole fan-out.
+    let absent = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Absent) RETURN count(t) AS c",
+    )
+    .await;
+    assert_eq!(absent, 0);
+
+    // Unlabelled sees both halves.
+    let all = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t) RETURN count(t) AS c",
+    )
+    .await;
+    assert_eq!(all, (FANIN * 2) as i64);
+}
