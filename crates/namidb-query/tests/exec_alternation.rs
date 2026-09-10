@@ -310,10 +310,22 @@ async fn expand_alternation_single_type_matches_legacy_path() {
 
     let single_rows = execute(&p_single, &snap, &Params::new()).await.unwrap();
     let alt_rows = execute(&p_alt, &snap, &Params::new()).await.unwrap();
-    // `[:KNOWS|:KNOWS]` should produce TWO rows per edge (one per listed
-    // type) — that's the per-path semantic the executor follows.
+    // A type alternation is a SET. RFC-024 defines the output as "one row per
+    // matching PATH, not one row per tuple", and a path is a sequence of
+    // actual edges — writing the same type twice does not create a second
+    // edge. `[:KNOWS|:KNOWS]` therefore describes exactly the edges `[:KNOWS]`
+    // does and must return exactly its rows.
+    //
+    // This previously asserted FOUR rows, "one per listed type". That was
+    // describing the behaviour, not deriving it: the assertion contradicted
+    // this test's own name and docstring, both of which are about singleton
+    // parity with the pre-RFC path.
     assert_eq!(single_rows.len(), 2);
-    assert_eq!(alt_rows.len(), 4, "two types × two edges = four rows");
+    assert_eq!(
+        alt_rows.len(),
+        2,
+        "a repeated type describes the same edge set, so the same rows"
+    );
 }
 
 // ─────────────────────── MultiwayJoin alternation ───────────────────────

@@ -15,6 +15,24 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.9] - 2026-09-10
+
+### Fixed
+
+- **A relationship type written twice in an alternation no longer doubles
+  every row.** `-[:E|E]->` returned each matching row once per listed type;
+  `-[:A|B|A]->` returned the `:A` rows twice. A type alternation is a SET —
+  RFC-024 defines the output as "one row per matching PATH, not one row per
+  tuple", and a path is a sequence of actual edges, so writing a type twice
+  cannot create a second edge. Both executors union one partner list per
+  listed type, so the list is now deduplicated at lowering, preserving
+  first-seen order. Genuine alternation, parallel-edge multiplicity and
+  flat/WCOJ parity are unchanged.
+
+  The likely way to hit this was never hand-written Cypher but a query
+  builder joining a type list that was not itself deduplicated.
+
+
 ## [2.6.8] - 2026-09-10
 
 ### Fixed
@@ -3276,7 +3294,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.8...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.9...HEAD
+[2.6.9]: https://github.com/namidb/namidb/compare/v2.6.8...v2.6.9
 [2.6.8]: https://github.com/namidb/namidb/compare/v2.6.7...v2.6.8
 [2.6.7]: https://github.com/namidb/namidb/compare/v2.6.6...v2.6.7
 [2.6.6]: https://github.com/namidb/namidb/compare/v2.6.5...v2.6.6

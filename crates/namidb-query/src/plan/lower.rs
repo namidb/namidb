@@ -1300,9 +1300,24 @@ fn lower_rel_node(
                  // `[:A|:B|:C]` lowers to a non-empty Vec; `[]` (untyped) lowers to
                  // None. The executor unions the partner lists across listed types
                  // (RFC-024 §"Open questions" Q1).
+                 // An alternation is a SET of types — RFC-024 defines the output as "one
+                 // row per matching PATH, not one row per tuple", and a path is a sequence
+                 // of actual edges. Both executors union one partner list per LISTED type,
+                 // so a type written twice (`[:E|E]`) traversed the same edge twice and
+                 // doubled every row. Deduplicate here, preserving first-seen order, so the
+                 // flat and WCOJ paths both see a set.
     let edge_type: Option<Vec<String>> = match rel.types.as_slice() {
         [] => None,
-        types => Some(types.iter().map(|t| t.name.clone()).collect()),
+        types => {
+            let mut seen = std::collections::BTreeSet::new();
+            Some(
+                types
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .filter(|name| seen.insert(name.clone()))
+                    .collect(),
+            )
+        }
     };
     let rel_alias = rel.binding.as_ref().map(|b| b.name.clone());
     if let Some(name) = &rel_alias {
