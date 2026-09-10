@@ -303,6 +303,20 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // A type alternation is a SET: writing the same type twice describes the
+    // same edges, so it must return the same rows. It used to return each row
+    // once per listed type.
+    assert_equivalent(
+        &w,
+        "repeated type in an alternation",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN b.n AS n",
+            "MATCH (a:P)-[:E|E]->(b:Q) RETURN b.n AS n",
+            "MATCH (a:P)-[:E|E|E]->(b:Q) RETURN b.n AS n",
+        ],
+    )
+    .await;
+
     assert_equivalent(
         &w,
         "conjunctive multi-label vs labels() predicate",
