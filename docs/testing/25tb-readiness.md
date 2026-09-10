@@ -1173,3 +1173,30 @@ existence-only batch that decodes the key column rather than the whole
 row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
 having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
 full hydration for nothing.
+
+### 77. [OPEN — measured] Variable-length still costs far more than the equivalent explicit chain
+
+2.6.6 took `-[:A|B*2..2]->` from "exceeds a 120 s deadline" to "works",
+but a large residual remains. Measured WARM on the published 2.6.6 image,
+200x200 fan-out (40,000 paths), same answer from both:
+
+| query | time |
+|---|---|
+| `(r:ROOT)-[:A]->(m:MID)-[:B]->(l:LEAF)` | **0.27 s** |
+| `(r:ROOT)-[:A\|B*2..2]->(l:LEAF)` | **9.36 s** |
+
+**35x for the same logical query.** Note the number is store-dependent:
+on a store containing only this fixture the same shape measured 1.73 s at
+90,000 paths, so it is roughly 12x worse per path once other node SSTs
+exist. That points at `batch_lookup_nodes` sweeping row groups in EVERY
+node descriptor — node ids are UUIDs spread across the key range, so the
+`[min_key, max_key]` prefilter admits essentially every SST (the comment
+at read.rs says as much). The explicit chain issues the same batch, so
+the batch alone does not explain the gap; the var-length path additionally
+pays, per matched edge, an `edge_type.clone()` for the trail key, a
+`step.rels.clone()`, and a `new_rel_values.clone()` because
+`bind_rel_list` is true for any starred pattern.
+
+Not diagnosed further. Recorded so the 2.6.6 note is not read as "var-length
+is now as fast as the explicit form" — it is not, it is merely no longer
+unusable.
