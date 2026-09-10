@@ -1810,7 +1810,7 @@ pub(crate) async fn execute_expand(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
-                max == 1 && !target_labels.is_empty(),
+                max == 1,
             )
             .await?;
             for (step, neighbours) in step_neighbours {
@@ -1893,14 +1893,27 @@ pub(crate) async fn execute_expand(
                         }
                         None
                     } else if let ExpandTargets::Views(views) = &target_membership {
-                        // Single-hop labelled expansion: the hop's own
-                        // materialisation answers directly, so a large
+                        // Single-hop expansion, labelled or not: the hop's
+                        // own materialisation answers directly, so a large
                         // fan-out no longer depends on cache retention.
                         match views.get(&target_id) {
-                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
-                                Some(v.clone())
+                            Some(v) => {
+                                if target_labels.iter().all(|l| v.labels.contains(l)) {
+                                    Some(v.clone())
+                                } else {
+                                    continue;
+                                }
                             }
-                            _ => continue,
+                            // Absent from the batch is NOT absent from the
+                            // graph: fall back to the authoritative point
+                            // reader so a batch that under-reports can never
+                            // drop a real row.
+                            None => match scan_node_for_id(snapshot, target_id).await? {
+                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                    Some(v)
+                                }
+                                _ => continue,
+                            },
                         }
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
@@ -6522,10 +6535,12 @@ async fn prepare_expand_targets(
         ));
     }
 
+    // `batch_lookup_nodes` resolves by id across every node descriptor; the
+    // label only namespaces its cache keys, so an EMPTY label is a complete
+    // id-primary batch, not a miss. Only a SINGLE-HOP expansion may consume
+    // it directly: a variable-length traversal must be able to walk THROUGH
+    // nodes this batch does not describe.
     let label = target_labels.first().map_or("", String::as_str);
-    // Only a SINGLE-HOP labelled expansion may consume the batch directly:
-    // the batch is label-scoped, while a variable-length traversal must be
-    // able to walk THROUGH nodes carrying other labels.
     if !views_usable || unique_targets.len() > expand_target_view_budget() {
         let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
         return Ok(ExpandTargets::Cold);
@@ -8686,7 +8701,7 @@ async fn execute_expand_factor(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
-                max == 1 && !target_labels.is_empty(),
+                max == 1,
             )
             .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
@@ -8731,14 +8746,27 @@ async fn execute_expand_factor(
                         }
                         None
                     } else if let ExpandTargets::Views(views) = &target_membership {
-                        // Single-hop labelled expansion: the hop's own
-                        // materialisation answers directly, so a large
+                        // Single-hop expansion, labelled or not: the hop's
+                        // own materialisation answers directly, so a large
                         // fan-out no longer depends on cache retention.
                         match views.get(&target_id) {
-                            Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
-                                Some(v.clone())
+                            Some(v) => {
+                                if target_labels.iter().all(|l| v.labels.contains(l)) {
+                                    Some(v.clone())
+                                } else {
+                                    continue;
+                                }
                             }
-                            _ => continue,
+                            // Absent from the batch is NOT absent from the
+                            // graph: fall back to the authoritative point
+                            // reader so a batch that under-reports can never
+                            // drop a real row.
+                            None => match scan_node_for_id(snapshot, target_id).await? {
+                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                    Some(v)
+                                }
+                                _ => continue,
+                            },
                         }
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
