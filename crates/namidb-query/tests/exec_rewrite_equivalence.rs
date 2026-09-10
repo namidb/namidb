@@ -109,6 +109,30 @@ async fn fixture() -> WriterSession {
     )
     .unwrap();
 
+    // Numeric properties of BOTH families, so a filter mixing Int and Float
+    // has something to be wrong about. `amount` is a float and `units` an
+    // integer — how money and quantities are actually stored.
+    let n1 = NodeId::new();
+    w.upsert_node(
+        "NUM",
+        n1,
+        &node(vec![
+            ("amount", CoreValue::F64(12.5)),
+            ("units", CoreValue::I64(3)),
+        ]),
+    )
+    .unwrap();
+    let n2 = NodeId::new();
+    w.upsert_node(
+        "NUM",
+        n2,
+        &node(vec![
+            ("amount", CoreValue::F64(0.0)),
+            ("units", CoreValue::I64(0)),
+        ]),
+    )
+    .unwrap();
+
     let r1 = NodeId::new();
     let r2 = NodeId::new();
     w.upsert_node("R", r1, &node(vec![("n", s("r1"))])).unwrap();
@@ -169,9 +193,10 @@ async fn assert_equivalent(writer: &WriterSession, name: &str, family: &[&str]) 
         let got = multiset(&rows);
         match &baseline {
             None => baseline = Some(((*query).to_string(), got)),
-            Some((first, expected)) => assert_eq!(
-                &got, expected,
-                "\n{name}: these must agree but do not.\n  A: {first}\n  B: {query}\n"
+            Some((first, expected)) => assert!(
+                &got == expected,
+                "\n{name}: these must agree but do not.\n  \
+                 {first}\n    -> {expected:?}\n  {query}\n    -> {got:?}\n"
             ),
         }
     }
@@ -363,6 +388,52 @@ async fn meaning_preserving_rewrites_agree() {
         &[
             "MATCH (a:P)-[:E]->(b:Q) RETURN count(b.n) AS c",
             "MATCH (a:P)-[:E]->(b:Q) WHERE b.n IS NOT NULL RETURN count(*) AS c",
+        ],
+    )
+    .await;
+
+    // A comparison must not depend on whether the literal is spelled as an
+    // integer or a float, nor on whether it lands in a FILTER or an
+    // EXPRESSION. `WHERE n.amount > 0` over a float column silently returned
+    // nothing while `RETURN n.amount > 0` returned true.
+    assert_equivalent(
+        &w,
+        "float property vs integer and float literals",
+        &[
+            "MATCH (n:NUM) WHERE n.amount > 0 RETURN count(*) AS c",
+            "MATCH (n:NUM) WHERE n.amount > 0.0 RETURN count(*) AS c",
+        ],
+    )
+    .await;
+
+    assert_equivalent(
+        &w,
+        "integer property vs float and integer literals",
+        &[
+            "MATCH (n:NUM) WHERE n.units >= 1 RETURN count(*) AS c",
+            "MATCH (n:NUM) WHERE n.units >= 1.0 RETURN count(*) AS c",
+        ],
+    )
+    .await;
+
+    assert_equivalent(
+        &w,
+        "equality across numeric families",
+        &[
+            "MATCH (n:NUM) WHERE n.units = 3 RETURN count(*) AS c",
+            "MATCH (n:NUM) WHERE n.units = 3.0 RETURN count(*) AS c",
+        ],
+    )
+    .await;
+
+    // The filter/expression split: the same comparison as a WHERE and as a
+    // projected boolean must agree on which rows satisfy it.
+    assert_equivalent(
+        &w,
+        "the same comparison as a filter and as an expression",
+        &[
+            "MATCH (n:NUM) WHERE n.amount > 0 RETURN count(*) AS c",
+            "MATCH (n:NUM) WITH n, (n.amount > 0) AS keep WHERE keep RETURN count(*) AS c",
         ],
     )
     .await;
