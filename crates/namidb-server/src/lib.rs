@@ -6430,6 +6430,46 @@ mod tests {
     /// NDB-03: resource exhaustion carries its own taxonomy — a client must
     /// be able to tell "too expensive" from "malformed" without string
     /// matching, on both the `code` and the Neo4j/GQL-shaped fields.
+    /// Deleting a connected node without DETACH is the CALLER's statement
+    /// being wrong, so it must classify as a client error.
+    ///
+    /// It was raised as `ExecError::Runtime`, which falls to the unclassified
+    /// arm: HTTP 500 + `Neo.DatabaseError`. Drivers and retry middleware read
+    /// that as a transient server fault and retry a permanently-failing
+    /// statement, and it counts against server error budgets. Neo4j returns
+    /// `Neo.ClientError.Schema.ConstraintValidationFailed` for exactly this
+    /// case, which is what `ExecError::Constraint` already maps to.
+    #[tokio::test]
+    async fn delete_with_relationships_is_a_client_error_not_a_server_fault() {
+        let response = exec_failure_response(
+            "write execution failed",
+            &namidb_query::exec::ExecError::Constraint(
+                "cannot DELETE a node that still has relationships (found REL); \
+                 use DETACH DELETE to remove the node and its relationships"
+                    .into(),
+            ),
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "a caller mistake must not be reported as 5xx"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "constraint");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.ClientError.Schema.ConstraintValidationFailed"
+        );
+        assert_eq!(json["gql_status"], "23000");
+        // The remedy must survive into the wire message.
+        assert!(
+            json["error"].as_str().unwrap().contains("DETACH DELETE"),
+            "the error must still name the fix: {}",
+            json["error"]
+        );
+    }
+
     #[tokio::test]
     async fn timeout_response_exposes_taxonomy_fields() {
         let response = exec_failure_response(

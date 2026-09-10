@@ -1111,73 +1111,135 @@ flag (`--http-request-timeout`, `0s` disables) whose default is derived
 to clear the largest configured query/write budget, with a boot warning
 when an explicit value would truncate them.
 
-### 75. [OPEN — measured, design ready] `LIMIT` does not bound an expansion's work
+## Self-audit by measurement (2026-09-10) — items 73-74
 
-Re-measured on 2.6.9, degree 160,000, ~1 KB targets,
-`MATCH (h:HUB)-[:TIENE]->(t:FAT)`:
+Found by sweeping query shapes that SHOULD cost the same and comparing,
+not by reading code. The 2.6.2 cliff fix had been verified only on the
+shape the reporter sent.
+
+### 73. [CONFIRMED — fixed in 2.6.4] An unlabelled expand target read one node per edge
+
+The 2.6.2 fan-out fix (`ExpandTargets::Views`) was gated on the target
+carrying a label, so `(a)-[:R]->(x)` and `(a)-[:R]->()` kept the old
+per-edge point-read path. Measured on a 197k-degree hub with ~1 KB
+targets, all three spellings returning the same 197,000 rows:
+
+| pattern | 2.6.3 | 2.6.4 |
+|---|---|---|
+| `-[:TIENE]->(t:FAT)` | 3.47 s | 3.09 s |
+| `-[:TIENE]->(t)` | timed out at 300 s | 2.93 s |
+| `-[:TIENE]->()` | timed out at 300 s | 2.76 s |
+
+The gate rested on a misreading: `batch_lookup_nodes` iterates
+`manifest.index.node_descriptors()` and uses its `label` argument only to
+namespace cache keys, so an empty label is a complete id-primary batch.
+The old code called the batch, discarded the result, and did the per-edge
+reads anyway. Only `max == 1` still gates it (a var-length traversal must
+walk THROUGH nodes the batch does not describe). A batch MISS now falls
+back to the point reader rather than skipping the edge — the old arm
+collapsed "absent from batch" and "wrong label" into one `continue`.
+
+**Process note:** nothing in the suite expanded a hub through an
+unlabelled target, so the release that fixed the labelled twin left this
+untouched. A sweep of 12 expand shapes at degree 120k now shows them
+uniform (~1.7 s); before the fix two of them did not complete.
+
+### 74. [OPEN — prerequisite now met] A bare-node reference forces full hydration
+
+Re-measured on the 2.6.10 build at degree 160,000, ~1 KB targets:
 
 | query | time |
 |---|---|
-| `RETURN count(*)` (target unreferenced -> membership sidecar) | **0.65 s** |
-| `RETURN count(t)` (hydrates) | 2.18 s |
-| `RETURN t.idx LIMIT 25` | 2.01 s |
-| `RETURN t.idx LIMIT 1` | **2.04 s** |
+| `RETURN count(*)` (target unreferenced) | **0.64 s** |
+| `RETURN count(t)` | 2.20 s |
+| `RETURN count(id(t))` | 2.19 s |
+| `RETURN count(DISTINCT t)` | 2.13 s |
+| `RETURN sum(t.idx)` | 2.25 s |
 
-`LIMIT 1` costs what the full scan costs. The cap is checked only at the
-SEED boundary — the contract being that every consumed seed contributes
-its COMPLETE edge set — so the hop loop collects every partner into
-`unique_targets`, `prepare_expand_targets` hydrates all of them, and the
-truncation happens above the operator.
+`count(id(t))` — where the caller has literally written that only the id
+is needed — costs the same as full hydration. 3.4x of pure waste.
+`should_skip_target_materialize` requires
+`!routing.referenced_aliases.contains(target_alias)`, and
+`collect_plan_references` treats `Count { arg: Some(e) }` exactly like
+`Sum`/`Avg`, so any mention of the alias forces every column.
 
-Split: hydration ~1.4 s (**~70%**), adjacency read plus membership
-~0.65 s (**~30%**). Bounding hydration takes `LIMIT 25` to roughly 0.7 s.
-The remaining 30% needs the limit inside `out_edges`, which has no limit
-parameter — that is the storage half, and it is where the hierarchical
-adjacency work from finding #3 actually earns its keep.
+**The prerequisite is now met.** Widening the id-only stub was blocked on
+the reference collector being trustworthy, and it was not: two forms read
+a host binding without registering it, and both were silent wrong answers
+(quantifiers / list comprehensions over a target property, and a `*0..n`
+source losing its extra labels — both fixed in 2.6.8). The collector is
+now EXHAUSTIVE — no `_` arm, so the compiler forces a decision for every
+`ExpressionKind` — and the only forms that deliberately register nothing
+are the genuinely closed pattern forms (`Exists`, `ExistsSubquery`,
+`PatternComprehension`) plus `Literal` / `Parameter` / `Star`, none of
+which read a host binding.
 
-**Why a plain truncation is WRONG.** The per-edge loop has eight
-`continue` paths (label mismatch, membership, trail rule, visited-set
-pruning, node absent). Taking the first N edges UNDERFILLS whenever any
-edge is rejected — fewer rows than the user asked for, a wrong answer
-rather than a slow one, and the fourth such bug class this codebase has
-produced this week.
+**What remains is the whitelist, and it must stay narrow.** The stub binds
+EMPTY properties, so mis-classifying one form returns nulls for real
+values. Two tiers with different burdens of proof:
 
-**The design, ready to execute.** A wave loop: hydrate a bounded chunk,
-run the per-edge loop over exactly that chunk, take another chunk only if
-the cap is not yet met. Order is preserved because chunks are consecutive.
+- `id(x)` as the sole mention: provably safe with no further reasoning —
+  `id()` reads the id, and the stub carries the correct id.
+- bare `count(x)` / `count(DISTINCT x)`: needs the argument that node
+  dedup is by an id-only fingerprint (it is — a BTreeSet over id
+  fingerprints since the first release, confirmed under item 68). Worth
+  having, since `count(x)` is the common spelling, but it rests on an
+  aggregate-internals invariant that deserves its own pinning test first.
 
-- Guard, computed once beside `endpoint_bfs`:
-  `cap.is_some() && max == 1 && !back_reference && shortest == ShortestMode::None && !endpoint_bfs`.
-  Each clause earns its place: `max == 1` means the frontier holds exactly
-  one `Step` per seed and the hop loop runs once, so a wave is literally a
-  chunk of one `Arc<Vec<EdgeView>>`; the other three switch on the
-  loop-carried pruning state below.
-- Loop-carried state, and where each must live. With that guard:
-  `level_seen`, `visited` and `visited_at_hop` are all dead (they need
-  `prune_visits` / `hop_keyed_prune`, which need shortest or endpoint_bfs);
-  `next_frontier` is never pushed (`hop < max` is false at `max == 1`);
-  `guard_tick` is a counter and hoists above the wave loop; `matched_any`
-  must persist ACROSS waves. `unique_targets` / `seen_targets` are
-  per-wave. Getting one of these wrong is a silent wrong answer, which is
-  why they are enumerated here rather than rediscovered.
-- Phase 1 (the adjacency read into `step_neighbours`) stays OUTSIDE the
-  wave loop — it is the 30% that no executor change can avoid.
-- Cursor `(step_index, edge_index)` advances across waves; stop when the
-  cursor exhausts or `out.len() + hop_results.len() >= cap`.
-- Initial chunk `max(cap * 4, 512)`, doubling. Sizing is a starting point,
-  not a measured optimum — tune against the 160k-degree fixture.
-- Oracle: `LIMIT n` must return exactly `min(n, total)` rows. Build the
-  underfill case deliberately — a hub whose neighbours are half a
-  non-matching label, `LIMIT 25`, assert exactly 25.
+Anything else mentioning the alias stays on the full path. Not a
+blacklist: a new expression form must be added to the whitelist
+deliberately, never inherit the fast path by omission.
 
-**Deliberately not done in the 2026-09-10 session.** This restructures
-~250 lines of the per-edge loop so it can run over a range. That function
-was modified four times that day, twice to correct the previous change,
-and the payoff here is 3x on one query shape rather than a correctness
-fix. Shipping it as the seventh release of a long day is how a third
-regression gets introduced. The measurement and the design above are the
-part worth having; the edit should be made deliberately, with the
-equivalence suite and the underfill oracle in place first.
+Add a family to `exec_rewrite_equivalence.rs` at the same time, and
+remember that file's trap: a family must reference the target ONLY through
+the construct under test, or the stub is never built and the family passes
+with the fix reverted.
+
+### 75. [FIXED in 2.6.10] `LIMIT` now bounds an expansion's work
+
+Was: a pushed-down cap was checked only at the SEED boundary, so the hop
+loop collected every partner, `prepare_expand_targets` hydrated all of
+them, and truncation happened above the operator. `LIMIT 1` cost what
+counting every row cost.
+
+Fixed by hydrating in consecutive WINDOWS: run the per-edge loop over
+exactly one window, take another only if the cap is still unmet. Measured
+at degree 160,000, ~1 KB targets:
+
+| query | before | after |
+|---|---|---|
+| `RETURN t.idx LIMIT 1` | 2.04 s | **0.32 s** |
+| `RETURN t.idx LIMIT 25` | 2.01 s | **0.31 s** |
+| `RETURN t.idx LIMIT 1000` | ~2.0 s | 0.34 s |
+| `LIMIT 200000` (beyond the total) | 2.28 s | 2.28 s |
+| `RETURN count(t)` (uncapped) | 2.23 s | 2.23 s |
+
+**Why a window and not a truncation.** The per-edge loop rejects edges on
+many paths (label mismatch, membership, the trail rule, visited pruning, an
+absent node), so hydrating "the first N endpoints" returns FEWER rows than
+requested whenever one is rejected — a wrong answer, not a slow one.
+Windows are consecutive and re-entered until the cap is met, so the result
+stays an order-preserving prefix of the uncapped one.
+
+Guarded to `cap.is_some() && max == 1 && !back_reference && shortest ==
+None && !endpoint_bfs`. At `max == 1` a window is provably independent:
+one round, nothing carries into a next hop, and `next_frontier` is never
+pushed. The other three modes carry pruning state (`visited`,
+`visited_at_hop`, `level_seen`) whose meaning depends on observing a whole
+level.
+
+Oracle: `exec_limit_pushdown::cap_never_underfills_when_most_edges_are_rejected`
+— a hub where only every fourth neighbour carries the queried label, so
+`LIMIT 25` must walk ~100 edges and discard 75. Verified live too, on a hub
+with 30,000 rejected neighbours among 40,000: every limit from 1 to beyond
+the total returns exactly `min(limit, total)` rows and matches the uncapped
+prefix.
+
+**Residual, unchanged:** the adjacency read itself (~0.3 s of the 0.32 s)
+is Phase 1, outside the window loop. `out_edges(edge_type, src)` has no
+limit parameter and materialises the whole partner list, so no executor
+change can avoid it. That is the storage half, and it is where the
+hierarchical adjacency work from finding #3 would earn its keep.
 
 ### 76. [OPEN — measured, correct by design] An unlabelled unreferenced target cannot use the membership path
 
@@ -1198,7 +1260,20 @@ row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
 having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
 full hydration for nothing.
 
-### 77. [OPEN — measured] Labelled variable-length burns CPU with no extra I/O
+### 77. [FIXED in 2.6.7] Labelled variable-length burned CPU with no extra I/O
+
+**Root cause found and fixed:** `batch_lookup_nodes` sweeps by id but
+FILTERS its output by the label it is given, and every hop of a
+variable-length pattern shares the pattern's FINAL target label — so
+intermediate hops resolved nothing and each edge fell through to
+`lookup_node_by_id`, the one node read with no cache tier. The expand
+batch now asks for no label and re-proves labels per edge.
+`-[:A|B*2..2]->(x:LEAF)` went 5.3s -> 0.21s and `->(x:MID)` from
+exceeding the deadline to 0.16s, matching the explicit chain (0.13s).
+The investigation below is kept because its REFUTED hypotheses are what
+narrowed the search.
+
+#### Original entry (hypotheses refuted by measurement)
 
 2.6.6 is a strict improvement, but a large residual remains and one shape
 still does not complete. Same fixture and store on both images (200x200,
@@ -1250,7 +1325,20 @@ volume and is the sharpest available lead.
 
 Not a regression: every one of these timed out on 2.6.5.
 
-### 78. [OPEN — conformance question, NOT fixed] A repeated type in an alternation duplicates rows
+### 78. [FIXED in 2.6.9] A repeated type in an alternation duplicated rows
+
+Resolved as a defect, not a semantic choice. What settled it: the test
+asserting the doubling is NAMED
+`expand_alternation_single_type_matches_legacy_path` and its docstring is
+about SINGLETON parity, yet it queries `[:KNOWS|:KNOWS]` — a repeated
+type — and asserts the doubling. The assertion described behaviour instead
+of deriving it, and contradicted RFC-024's own definition ("one row per
+matching PATH, not one row per tuple"; a path is a sequence of actual
+edges). The type list is now deduplicated at lowering. Verified across
+eight shapes; genuine alternation, parallel-edge multiplicity and
+flat/WCOJ parity unchanged.
+
+#### Original entry
 
 `MATCH (a:P)-[:E|E]->(b:Q)` returns every matching row TWICE; `-[:E]->`
 returns it once. The executor unions one partner list per listed type
@@ -1288,3 +1376,137 @@ WHERE, MATCH-WHERE vs WITH-WHERE, quantifier vs `IN`, `count(*)` vs
 worth keeping: comparing RESULTS across equivalent rewrites is what the
 suite does not do, and four wrong-answer bugs surfaced in this codebase
 today.
+
+### 79. [DESIGN CORRECTION for finding #8] Manifest min/max are BOUNDS, not exact values — do not answer MIN()/MAX() from them
+
+The proposed first increment for finding #8 was "answer `MIN(n.p)` /
+`MAX(n.p)` / `count(n.p)` from manifest stats, as a direct extension of the
+`count(*)` fast path". **That is unsound as stated**, and would ship a
+silent wrong answer.
+
+Current state, measured at 160,000 nodes:
+
+| query | time | path |
+|---|---|---|
+| `MATCH (t:FAT) RETURN count(*)` | **0.00 s** | manifest fast path (already exists) |
+| `MATCH (t:FAT) RETURN count(t)` | **0.00 s** | manifest fast path |
+| `RETURN min(t.idx)` | 0.47 s | full projected column scan |
+| `RETURN max(t.idx)` | 0.47 s | full projected column scan |
+| `RETURN count(t.idx)` | 0.46 s | full projected column scan |
+| `RETURN sum(t.idx)` | 0.47 s | full projected column scan |
+
+And the good news the earlier recon got right: `PerLabelPropertyStat`
+(manifest.rs:409) ALREADY carries `min`, `max`, `null_count` and an HLL
+`ndv_estimate`. No format change, no writer change — it looked like a
+reader-only increment.
+
+**Why it is unsound.** The chain, all read from the source:
+
+1. `PerLabelStatsCollector::observe` is fed only `MemOp::Upsert` rows —
+   tombstones are skipped (flush.rs:1294-1296). Correct in itself.
+2. Stats are per-SST rows in the manifest.
+3. The read side folds them with a plain `merge_min`/`merge_max` across
+   every SST (`cost/stats.rs:415-428`), with no tombstone awareness.
+4. So deleting the row that holds the maximum writes a tombstone into a
+   NEW SST while the OLD SST keeps its stat row — and the merged maximum
+   still reports the deleted value.
+5. Only compaction fixes it, because compaction recomputes the stats from
+   the surviving rows (compact.rs:3088).
+
+Between a delete and the compaction that merges its SST away — which can
+be a long time, and is exactly the window a bulk-load-then-query workload
+lives in — `MAX()` answered from stats returns a value that is no longer
+in the graph. Silently. The same holds for a property UPDATE that lowers
+the maximum, and `null_count` has the same staleness for `count(prop)`.
+
+There is a second hazard even without deletes: `min_scalar` / `max_scalar`
+(sst/nodes.rs:1912-1926) order via `scalar_lt`, which compares ACROSS
+`StatScalar` variants. A property holding both `Int64` and `Utf8` values
+therefore gets a min/max under an ordering that is not Cypher's
+comparison semantics.
+
+**The sound design is pruning, not answering.** A bound is enough to SKIP
+work: to find the maximum, visit only the row groups whose recorded max is
+greater than the best value found so far, and read the actual rows from
+those. The answer always comes from real rows, so staleness costs a
+wasted read rather than a wrong result — and the existing row-group
+machinery (`ScanPredicate`, `eval_row_group`, `node_scan_plan` in
+sst/nodes.rs:735-869) is the right place to hang it. That is a bigger
+change than the one proposed, and it is the honest version of it.
+
+If an exact-answer fast path is ever wanted, it needs a per-label
+"stats are exact" bit that flush clears on any tombstone and compaction
+sets when it recomputes from survivors. That does not exist today, and
+inventing it is a manifest format change.
+
+### 80. [OPEN — root cause found] Filtered scans prune nothing: the predicate never reaches storage
+
+Measured at 160,000 nodes, one label, one projected column. The times do
+not depend on selectivity at all:
+
+| query | rows returned | time |
+|---|---|---|
+| `WHERE t.idx > 999999` (outside every value in the store) | **0** | 0.377 s |
+| `WHERE t.idx < -5` (outside, low side) | **0** | 0.468 s |
+| `WHERE t.idx = 12345` | 1 | 0.375 s |
+| `WHERE t.idx > 159990` | 9 | 0.412 s |
+| `WHERE t.idx > 80000` | 79,999 | 0.417 s |
+| no filter (manifest fast path) | 160,000 | **0.001 s** |
+
+A predicate that provably matches nothing costs the same as one matching
+half the store. Nothing is being skipped.
+
+**Root cause, and it is not a missing feature — it is two implemented
+features that are not wired.**
+
+1. *Parquet row-group pruning.* `EnabledStatistics::Chunk` is configured
+   (sst/nodes.rs:1515) so per-row-group column statistics ARE written, and
+   `eval_row_group` + `PropertyColumnStats` (sst/predicates.rs:93) decide
+   Absent/MaybePresent from them. But the branch that serves a PROJECTED
+   scan — the common shape, and the one EXPLAIN shows here
+   (`projection=[idx] predicates=[t.idx > 159990]`) — builds a
+   `LimitedNodeBatchContext` carrying `predicates` and then opens the
+   stream with `node_scan_limited_async(..., &[], Some(&[]), ...)`
+   (read.rs:5735-5741): empty predicates, empty projection. Four of the
+   five call sites in read.rs pass `&[]`; only one passes `predicates`.
+2. *Property-page predicate filtering.* `NodePropertyPageReader::filter_node_ids`
+   (property_pages.rs:2088) and the whole `NodePropertyPredicate` IR
+   (property_pages.rs:255) are implemented and unit-tested — and **dead in
+   production**: the only callers are at property_pages.rs:3518 and 3541,
+   both inside the `#[cfg(test)]` module that begins at line 3372, and
+   `NodePropertyPredicate::` is never constructed anywhere outside its own
+   file.
+
+So a filtered projected scan reads and materialises every row and
+evaluates the predicate row-by-row.
+
+**Also measured: the cost is per-ROW, not per-byte.** `count(t.pad)` over
+a 900-byte string column costs 0.433 s against `count(t.idx)` over an
+8-byte integer column at 0.466 s — indistinguishable. Two columns cost
+0.676 s against one at 0.466 s. That is a fixed per-row overhead
+(materialisation into `Row` / `RuntimeValue`) dominating, which is why
+scalar aggregates (item 79) sit at ~0.47 s regardless of the column.
+
+**What this means for finding #8.** The remaining work is not "build
+aggregation pushdown". It is, in order of value:
+1. Wire ONE of the two existing predicate paths into the projected-scan
+   branch. This makes every selective filter selective, not just
+   aggregates.
+2. Then consider vectorised aggregation over the decoded Arrow column, to
+   remove the per-row materialisation that item 79 measured.
+
+**Why this was not wired tonight.** Wiring a filter is the "rows go
+missing" risk class: a page- or row-group-level decision that disagrees
+with the row-level evaluation drops rows silently, which is the failure
+mode that produced five bugs in this codebase this week. It needs the
+equivalence harness pointed at it (filtered scan vs unfiltered-then-filter
+for a matrix of predicate shapes, types, nulls and absent properties) and
+an adversarial review — not the tail of an eight-release day.
+
+One caveat for whoever picks it up: nodes are stored **id-primary**, so a
+property like `idx` is scattered across row groups in UUID order and every
+row group's `[min,max]` may span nearly the whole value range. Row-group
+pruning will therefore help a lot for a property CORRELATED with insertion
+identity and very little for one that is not. The property-page path (2)
+does not have that limitation and is the better first target; verify
+against a real fixture before choosing.

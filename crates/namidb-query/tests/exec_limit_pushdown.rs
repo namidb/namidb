@@ -285,3 +285,98 @@ async fn param_limit_not_provided_errors() {
         "expected a missing-parameter error, got: {err}"
     );
 }
+
+/// A capped expansion must return exactly `min(limit, total)` rows even when
+/// most edges are REJECTED inside the per-edge loop.
+///
+/// This is the oracle for bounding an expansion's hydration. The per-edge
+/// loop has many `continue` paths — label mismatch, membership, the trail
+/// rule, visited-set pruning, an absent node — so any scheme that hydrates
+/// "the first N endpoints" and stops UNDERFILLS whenever an endpoint is
+/// rejected: fewer rows than the user asked for, which is a wrong answer,
+/// not a slow one.
+///
+/// The fixture makes rejection the common case: one hub with 400 neighbours
+/// of which only every fourth carries the queried label, so satisfying
+/// `LIMIT 25` requires walking ~100 edges and discarding 75 of them.
+#[tokio::test]
+async fn cap_never_underfills_when_most_edges_are_rejected() {
+    let mut writer = WriterSession::open(store(), paths("cap-underfill"))
+        .await
+        .unwrap();
+    let hub = NodeId::new();
+    writer
+        .upsert_node("Hub", hub, &node_with("hid", 0))
+        .unwrap();
+
+    // 400 neighbours; every 4th is a :Wanted, the rest are :Other.
+    const NEIGHBOURS: i64 = 400;
+    let mut wanted_total = 0i64;
+    for i in 0..NEIGHBOURS {
+        let id = NodeId::new();
+        if i % 4 == 0 {
+            writer
+                .upsert_node("Wanted", id, &node_with("v", i))
+                .unwrap();
+            wanted_total += 1;
+        } else {
+            writer.upsert_node("Other", id, &node_with("v", i)).unwrap();
+        }
+        writer.upsert_edge("NEAR", hub, id, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let rows_for = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let q = parse(&query).unwrap();
+            let plan = lower(&q).unwrap();
+            execute_flat_path(&plan, snapshot, &Params::new())
+                .await
+                .unwrap()
+        }
+    };
+
+    let baseline = rows_for("MATCH (h:Hub)-[:NEAR]->(t:Wanted) RETURN t.v AS v".to_string()).await;
+    assert_eq!(
+        baseline.len() as i64,
+        wanted_total,
+        "fixture sanity: every :Wanted neighbour matches"
+    );
+
+    // Every limit from under to over the available rows must be exact, and
+    // must be an order-preserving PREFIX of the uncapped result.
+    let full: Vec<i64> = baseline
+        .iter()
+        .map(|r| match r.get("v") {
+            Some(RuntimeValue::Integer(v)) => *v,
+            other => panic!("unexpected row shape: {other:?}"),
+        })
+        .collect();
+    for limit in [1usize, 2, 25, 99, 100, 101, 400] {
+        let rows = rows_for(format!(
+            "MATCH (h:Hub)-[:NEAR]->(t:Wanted) RETURN t.v AS v LIMIT {limit}"
+        ))
+        .await;
+        let expected = limit.min(full.len());
+        assert_eq!(
+            rows.len(),
+            expected,
+            "LIMIT {limit} must return exactly min(limit, {}) rows",
+            full.len()
+        );
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|r| match r.get("v") {
+                Some(RuntimeValue::Integer(v)) => *v,
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            full[..expected].to_vec(),
+            "LIMIT {limit} must be an order-preserving prefix of the uncapped result"
+        );
+    }
+}
