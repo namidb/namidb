@@ -1080,7 +1080,6 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     should_skip_target_materialize(
                         routing,
                         target_alias,
-                        target_labels,
                         path_binding.as_deref(),
                         length,
                         *back_reference,
@@ -1240,7 +1239,6 @@ fn execute_capped<'a>(
                     should_skip_target_materialize(
                         routing,
                         target_alias,
-                        target_labels,
                         path_binding.as_deref(),
                         length,
                         *back_reference,
@@ -1430,7 +1428,7 @@ async fn try_execute_endpoint_distinct_project(
         None,
         snapshot,
         routing.edge_read_mode(rel_alias.as_deref(), None),
-        should_skip_target_materialize(routing, target_alias, target_labels, None, resolved, false),
+        should_skip_target_materialize(routing, target_alias, None, resolved, false),
         cap,
         true,
     )
@@ -6607,6 +6605,31 @@ async fn prepare_expand_targets(
         });
     }
     if skip_target_materialize {
+        // No labels to prove: prove EXISTENCE instead. A dangling edge must
+        // not become a phantom row, and while Cypher can no longer create one
+        // (a bare DELETE of a connected node is refused), older data and the
+        // embedded `tombstone_node` API can still hold them.
+        if target_labels.is_empty() {
+            if let Some(present) = snapshot.try_batch_nodes_exist(unique_targets).await? {
+                if present.len() != unique_targets.len() {
+                    return Err(ExecError::Runtime(
+                        "batched endpoint existence returned a misaligned result".into(),
+                    ));
+                }
+                return Ok(ExpandTargets::Membership(
+                    unique_targets.iter().copied().zip(present).collect(),
+                ));
+            }
+            // Fail-closed: hydrate and let the per-edge loop decide.
+            let views = snapshot.batch_lookup_nodes("", unique_targets).await?;
+            return Ok(ExpandTargets::Membership(
+                unique_targets
+                    .iter()
+                    .copied()
+                    .zip(views.into_iter().map(|view| view.is_some()))
+                    .collect(),
+            ));
+        }
         let matches = match snapshot
             .try_batch_nodes_have_labels(target_labels, unique_targets)
             .await?
@@ -6684,20 +6707,26 @@ async fn prepare_expand_targets(
 /// Decide whether an Expand target may be represented by an id-only stub.
 ///
 /// The decision never trusts `EdgeTypeDef` endpoint declarations. It is
-/// enabled only for an unconsumed, labelled, single-hop target, and
-/// [`prepare_expand_targets`] still proves every candidate against the
-/// immutable label-membership sidecar or the authoritative point reader.
+/// enabled for an unconsumed (or identity-only) single-hop target, labelled
+/// or not, and [`prepare_expand_targets`] still proves every candidate —
+/// against the label-membership sidecar when there is a label, against the
+/// existence sidecar when there is not, and against the authoritative point
+/// reader whenever either declines.
 fn should_skip_target_materialize(
     routing: &PlanRouting,
     target_alias: &str,
-    target_labels: &[String],
     path_binding: Option<&str>,
     length: Option<crate::parser::RelationshipLength>,
     back_reference: bool,
 ) -> bool {
     !back_reference
         && path_binding.is_none()
-        && !target_labels.is_empty()
+        // An UNLABELLED target may take the stub too: `prepare_expand_targets`
+        // proves existence through `try_batch_nodes_exist` instead of through
+        // label membership, and falls back to hydration when it cannot.
+        // Without this, `MATCH (a)-[:R]->() RETURN count(*)` paid a full row
+        // decode per endpoint purely to establish that the endpoint is there —
+        // 2.2s against 0.55s for the labelled spelling at degree 160k.
         && (!routing.referenced_aliases.contains(target_alias)
             || routing.identity_only_aliases.contains(target_alias))
         && !routing.zero_hop_sources.contains(target_alias)
@@ -8234,7 +8263,6 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     should_skip_target_materialize(
                         routing,
                         target_alias,
-                        target_labels,
                         path_binding.as_deref(),
                         length,
                         *back_reference,
@@ -10583,7 +10611,7 @@ mod tests {
             "DELETE r must use a source-keyed identity lookup, never a whole-type CSR rebuild"
         );
         assert!(
-            should_skip_target_materialize(&routing, "t", &["Target".into()], None, None, false,),
+            should_skip_target_materialize(&routing, "t", None, None, false),
             "an unconsumed labelled endpoint should use batched membership instead of hydration"
         );
 
@@ -10592,7 +10620,7 @@ mod tests {
              RETURN t",
         );
         assert!(
-            !should_skip_target_materialize(&consumed, "t", &["Target".into()], None, None, false,),
+            !should_skip_target_materialize(&consumed, "t", None, None, false),
             "returning the target requires its full property value"
         );
     }

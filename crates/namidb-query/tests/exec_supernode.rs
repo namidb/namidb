@@ -282,3 +282,82 @@ async fn mixed_label_neighbours_resolve_without_per_edge_reads() {
     .await;
     assert_eq!(all, (FANIN * 2) as i64);
 }
+
+/// An UNLABELLED expansion target must be proven to exist, and deleting a
+/// target must remove its row.
+///
+/// An unlabelled target used to pay a full row decode per endpoint purely to
+/// establish that the endpoint was there — the label-membership sidecar
+/// proves "carries label L" and there is no label to prove. It is now proven
+/// through `try_batch_nodes_exist`, which ORs across the labels each
+/// descriptor actually holds (a node can never carry zero labels). At degree
+/// 160,000 that took `count(*)` over `()` from 2.2s to 0.53s.
+///
+/// The correctness half is what this pins: the existence proof must agree
+/// with hydration, before AND after a delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlabelled_targets_are_proven_to_exist_and_track_deletes() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("exec-existence").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+    let hub = NodeId::new();
+    writer.upsert_node("Person", hub, &person("hub")).unwrap();
+    let mut spokes = Vec::new();
+    for ordinal in 0..FANIN {
+        let spoke = NodeId::new();
+        writer
+            .upsert_node("Person", spoke, &person(&format!("spoke-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, spoke, &edge()).unwrap();
+        spokes.push(spoke);
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    // Every spelling must agree, and agree with hydration.
+    let anonymous = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->() RETURN count(*) AS c",
+    )
+    .await;
+    let unlabelled = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t) RETURN count(*) AS c",
+    )
+    .await;
+    let hydrated = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t) RETURN count(t.name) AS c",
+    )
+    .await;
+    assert_eq!(anonymous, FANIN as i64);
+    assert_eq!(unlabelled, anonymous);
+    assert_eq!(
+        hydrated, anonymous,
+        "the existence proof must agree with hydration"
+    );
+
+    // Delete a third of the targets, then re-check every spelling.
+    let removed = FANIN / 3;
+    for spoke in spokes.iter().take(removed) {
+        writer.tombstone_edge("KNOWS", hub, *spoke).unwrap();
+        writer.tombstone_node("Person", *spoke).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    let expected = (FANIN - removed) as i64;
+    for query in [
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->() RETURN count(*) AS c",
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t) RETURN count(*) AS c",
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t) RETURN count(t.name) AS c",
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Person) RETURN count(*) AS c",
+    ] {
+        assert_eq!(
+            count_value(&writer, query).await,
+            expected,
+            "after deleting {removed} targets: {query}"
+        );
+    }
+}
