@@ -1507,13 +1507,38 @@ aggregation pushdown". It is, in order of value:
 2. Then consider vectorised aggregation over the decoded Arrow column, to
    remove the per-row materialisation that item 79 measured.
 
-**Why this was not wired tonight.** Wiring a filter is the "rows go
-missing" risk class: a page- or row-group-level decision that disagrees
-with the row-level evaluation drops rows silently, which is the failure
-mode that produced five bugs in this codebase this week. It needs the
-equivalence harness pointed at it (filtered scan vs unfiltered-then-filter
-for a matrix of predicate shapes, types, nulls and absent properties) and
-an adversarial review — not the tail of an eight-release day.
+**The `&[]` is not an oversight — and knowing why is the whole handoff.**
+That branch reads properties from the `.npp` sidecar addressed by a
+RUNNING ROW ORDINAL:
+
+    let mut next_ordinal = 0_u64;                      // read.rs:5754
+    ...
+    next_ordinal = next_ordinal.checked_add(batch.num_rows() as u64)
+    ...
+    if next_ordinal != desc.row_count {                // read.rs:5812
+        return Err(Error::invariant("node property/Parquet row-count mismatch"));
+    }
+
+The ordinal must stay aligned with the sidecar, so the branch requires
+seeing EVERY row group — and it self-checks that it did. Handing Parquet
+the predicates would make it skip row groups, the ordinal would fall
+short, and that invariant would fire. So the current code is correct and
+defensive, not careless.
+
+**What wiring it therefore requires**: advancing `next_ordinal` by the row
+count of each SKIPPED row group (available in the footer metadata that
+this branch already fetches and caches), so the sidecar stays addressable.
+The existing invariant check is the safety net for getting it wrong — it
+turns a silent row loss into a hard error, which is why it should be kept
+and not relaxed.
+
+**Why this was not wired tonight.** Even with the accounting understood, a
+page- or row-group-level decision that disagrees with the row-level
+evaluation drops rows, which is the failure mode that produced five bugs
+in this codebase this week. It wants the equivalence harness pointed at it
+(filtered scan vs unfiltered-then-filter across a matrix of predicate
+shapes, types, nulls and absent properties) and an adversarial review —
+not the tail of an eleven-release day.
 
 One caveat for whoever picks it up: nodes are stored **id-primary**, so a
 property like `idx` is scattered across row groups in UUID order and every
