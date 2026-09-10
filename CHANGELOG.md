@@ -15,6 +15,29 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.7] - 2026-09-10
+
+### Fixed
+
+- **An expansion whose neighbours carry mixed labels no longer does one
+  uncached node read per edge.** This reverts a regression introduced in
+  2.6.4. `batch_lookup_nodes` sweeps by id but FILTERS its output by the
+  label it is given, so a batch asking for `:Green` drops every `:Red`
+  neighbour; those ids are then absent from the materialisation map and the
+  miss branch added in 2.6.4 falls through to `lookup_node_by_id`, the one
+  node read with no cache tier. On a 40k-degree hub split evenly between two
+  labels, `-[:N]->(t:Green) RETURN count(t)` went past a 120s deadline where
+  2.6.3 answered in 0.22 s; it now takes 0.24 s. The expand batch asks for no
+  label and re-proves the label itself, per edge, against the view it gets.
+- The same filter was the whole cost of a variable-length traversal, since
+  every hop shared the pattern's FINAL target label and therefore resolved
+  nothing at intermediate hops. Measured on a 200x200 fan-out, 40,000 paths:
+  `-[:A|B*2..2]->(x:LEAF)` 5.3 s to **0.21 s**, `-[:A|B*1..2]->(x:LEAF)`
+  6.0 s to 0.22 s, and `-[:A|B*2..2]->(x:MID)` — a label matching nothing at
+  the final hop — from exceeding the deadline to 0.16 s. Variable-length now
+  matches the explicitly-spelled chain (0.13 s) rather than trailing it.
+
+
 ## [2.6.6] - 2026-09-10
 
 ### Fixed
@@ -3230,7 +3253,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.6...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.7...HEAD
+[2.6.7]: https://github.com/namidb/namidb/compare/v2.6.6...v2.6.7
 [2.6.6]: https://github.com/namidb/namidb/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/namidb/namidb/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/namidb/namidb/compare/v2.6.3...v2.6.4
