@@ -15,6 +15,22 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.5] - 2026-09-10
+
+### Fixed
+
+- **A pattern with an anonymous intermediate node returned wrong rows.**
+  `MATCH (a)-[:X]->()-[:Y]->(b)` re-anchored its second hop on the last
+  NAMED binding instead of the anonymous node, so it planned and executed
+  as `MATCH (a)-[:X]->() , (a)-[:Y]->(b)` — the one-hop neighbours crossed
+  with themselves. The answers looked plausible, which is what made this
+  dangerous: on a fixture where the correct result is `[Carol, Dave]` the
+  engine returned `[Bob, Bob, Carol, Carol]`, and when the two hops used
+  different relationship types it silently returned nothing at all. The
+  chain now advances on the alias the hop actually bound, anonymous or
+  not. This affects every release that supported multi-hop patterns.
+
+
 ## [2.6.4] - 2026-09-10
 
 ### Fixed
@@ -3192,7 +3208,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.4...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.5...HEAD
+[2.6.5]: https://github.com/namidb/namidb/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/namidb/namidb/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/namidb/namidb/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/namidb/namidb/compare/v2.6.1...v2.6.2

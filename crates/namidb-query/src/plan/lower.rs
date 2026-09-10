@@ -1134,8 +1134,7 @@ fn lower_pattern_element(
     // shape and would otherwise reject those operators.
     let mut current_source = elem.head.binding.as_ref().map(|b| b.name.clone());
     for (rel, target) in &elem.chain {
-        let target_alias_for_next = target.binding.as_ref().map(|b| b.name.clone());
-        plan = lower_rel_node(
+        let (next_plan, bound_target) = lower_rel_node(
             plan,
             current_source.as_deref(),
             &elem.head,
@@ -1145,11 +1144,15 @@ fn lower_pattern_element(
             shortest,
             ctx,
         )?;
-        // After this rel, the target becomes the source for the next.
-        // Anonymous targets are named inside lower_rel_node; we don't
-        // need to track them here because variable-length chains
-        // terminate at named bindings in v0 LDBC queries.
-        current_source = target_alias_for_next.or(current_source);
+        plan = next_plan;
+        // After this rel the target becomes the source for the next hop —
+        // including when it is ANONYMOUS. `lower_rel_node` generates the
+        // binding for `()`, so only it knows the name; keeping the previous
+        // named binding here re-anchored the next hop on the wrong node and
+        // silently returned the wrong rows (`(a)-[:X]->()-[:Y]->(b)` became
+        // `(a)-[:Y]->(b)`). The old code assumed chains terminate at named
+        // bindings, which is not true of a very ordinary pattern.
+        current_source = Some(bound_target);
     }
     Ok(plan)
 }
@@ -1284,11 +1287,11 @@ fn lower_rel_node(
     optional: bool,
     shortest: ShortestMode,
     ctx: &mut LowerCtx,
-) -> Result<LogicalPlan, LowerError> {
+) -> Result<(LogicalPlan, String), LowerError> {
     // Prefer the explicit source (passed by `lower_pattern_element`,
     // which tracks the chain head + each target as the next source).
     // Fall back to inspecting the plan shape only if the chain didn't
-    // name a head — e.g. anonymous mid-chain nodes left as fallback.
+    // name a head.
     let source = match explicit_source {
         Some(name) if ctx.bindings.contains(name) => name.to_string(),
         _ => previous_source(&input)?,
@@ -1387,7 +1390,7 @@ fn lower_rel_node(
             };
         }
     }
-    Ok(plan)
+    Ok((plan, target_alias))
 }
 
 fn previous_source(plan: &LogicalPlan) -> Result<String, LowerError> {
@@ -2922,6 +2925,53 @@ mod tests {
             },
             _ => panic!(),
         }
+    }
+
+    /// `(a)-[:X]->()-[:Y]->(b)`: the SECOND hop must source from the
+    /// anonymous middle node, not from the last NAMED binding.
+    ///
+    /// The chain tracked `current_source` from explicit bindings only and
+    /// left it unchanged for an anonymous target, so the next hop
+    /// re-anchored on the previous named node: `(r)-[:A]->()-[:B]->(l)`
+    /// planned as `Expand(r -A-> __anon0)` then `Expand(r -B-> l)`, which
+    /// is the query `(r)-[:B]->(l)` — a silently WRONG answer (0 rows on a
+    /// graph with 15 matches), not a slow one.
+    #[test]
+    fn anonymous_middle_node_is_the_next_hops_source() {
+        let p = lp("MATCH (r:Root)-[:A]->()-[:B]->(l:Leaf) RETURN l");
+        // Walk down to the two Expands, skipping Filter/Project wrappers.
+        fn find_expands(plan: &LogicalPlan, out: &mut Vec<(String, String)>) {
+            if let LogicalPlan::Expand {
+                source,
+                target_alias,
+                input,
+                ..
+            } = plan
+            {
+                out.push((source.clone(), target_alias.clone()));
+                find_expands(input, out);
+                return;
+            }
+            for child in plan.children() {
+                find_expands(child, out);
+            }
+        }
+        let mut expands = Vec::new();
+        find_expands(&p, &mut expands);
+        assert_eq!(expands.len(), 2, "expected two hops, got {expands:?}");
+        // Outermost first: the (?, l) hop, then the (r, anon) hop.
+        let (outer_source, outer_target) = &expands[0];
+        let (inner_source, inner_target) = &expands[1];
+        assert_eq!(outer_target, "l");
+        assert_eq!(inner_source, "r");
+        assert_ne!(
+            outer_source, "r",
+            "the second hop must not re-anchor on the head; that is the bug"
+        );
+        assert_eq!(
+            outer_source, inner_target,
+            "the second hop must source from the anonymous node the first hop bound"
+        );
     }
 
     #[test]

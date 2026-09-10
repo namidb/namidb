@@ -2834,3 +2834,77 @@ async fn var_length_alias_binds_the_relationship_list() {
         zero_rows[0].get("rs")
     );
 }
+
+/// `(a)-[:X]->()-[:Y]->(b)` must traverse THROUGH the anonymous middle node.
+///
+/// The chain tracked its next source from explicit bindings only, so an
+/// anonymous target left it pointing at the previous NAMED node and the
+/// following hop re-anchored there: `(a)-[:KNOWS]->()-[:KNOWS]->(c)` planned
+/// as `(a)-[:KNOWS]->(c)`. That is a silently WRONG answer, not a slow one —
+/// it returns the one-hop neighbours, or nothing at all when the two hops use
+/// different relationship types.
+///
+/// Runs through the full optimizer, as the server does.
+#[tokio::test]
+async fn anonymous_middle_node_traverses_two_hops() {
+    let mut writer = WriterSession::open(store(), paths("exec-anon-middle"))
+        .await
+        .unwrap();
+    let ids = build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+
+    // Alice -> {Bob, Carol}; Bob -> Carol; Carol -> Dave.
+    // So Alice's two-hop set through an anonymous middle is {Carol, Dave}.
+    let named = parse(
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(m:Person)-[:KNOWS]->(c:Person) \
+         RETURN c.name AS name",
+    )
+    .unwrap();
+    let anon = parse(
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->()-[:KNOWS]->(c:Person) \
+         RETURN c.name AS name",
+    )
+    .unwrap();
+
+    let mut expected: Vec<String> = collect_names(
+        &execute(
+            &optimize(lower(&named).unwrap(), &catalog),
+            &snapshot,
+            &Params::new(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut got: Vec<String> = collect_names(
+        &execute(
+            &optimize(lower(&anon).unwrap(), &catalog),
+            &snapshot,
+            &Params::new(),
+        )
+        .await
+        .unwrap(),
+    );
+    expected.sort();
+    got.sort();
+
+    assert_eq!(
+        expected,
+        vec!["Carol".to_string(), "Dave".to_string()],
+        "fixture sanity: Alice's two-hop set"
+    );
+    assert_eq!(
+        got, expected,
+        "an anonymous middle node must not change which rows match"
+    );
+    let _ = ids;
+}
+
+fn collect_names(rows: &[namidb_query::Row]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|r| match r.bindings.get("name") {
+            Some(RuntimeValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
