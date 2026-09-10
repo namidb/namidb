@@ -1266,3 +1266,65 @@ WHERE, MATCH-WHERE vs WITH-WHERE, quantifier vs `IN`, `count(*)` vs
 worth keeping: comparing RESULTS across equivalent rewrites is what the
 suite does not do, and four wrong-answer bugs surfaced in this codebase
 today.
+
+### 79. [DESIGN CORRECTION for finding #8] Manifest min/max are BOUNDS, not exact values — do not answer MIN()/MAX() from them
+
+The proposed first increment for finding #8 was "answer `MIN(n.p)` /
+`MAX(n.p)` / `count(n.p)` from manifest stats, as a direct extension of the
+`count(*)` fast path". **That is unsound as stated**, and would ship a
+silent wrong answer.
+
+Current state, measured at 160,000 nodes:
+
+| query | time | path |
+|---|---|---|
+| `MATCH (t:FAT) RETURN count(*)` | **0.00 s** | manifest fast path (already exists) |
+| `MATCH (t:FAT) RETURN count(t)` | **0.00 s** | manifest fast path |
+| `RETURN min(t.idx)` | 0.47 s | full projected column scan |
+| `RETURN max(t.idx)` | 0.47 s | full projected column scan |
+| `RETURN count(t.idx)` | 0.46 s | full projected column scan |
+| `RETURN sum(t.idx)` | 0.47 s | full projected column scan |
+
+And the good news the earlier recon got right: `PerLabelPropertyStat`
+(manifest.rs:409) ALREADY carries `min`, `max`, `null_count` and an HLL
+`ndv_estimate`. No format change, no writer change — it looked like a
+reader-only increment.
+
+**Why it is unsound.** The chain, all read from the source:
+
+1. `PerLabelStatsCollector::observe` is fed only `MemOp::Upsert` rows —
+   tombstones are skipped (flush.rs:1294-1296). Correct in itself.
+2. Stats are per-SST rows in the manifest.
+3. The read side folds them with a plain `merge_min`/`merge_max` across
+   every SST (`cost/stats.rs:415-428`), with no tombstone awareness.
+4. So deleting the row that holds the maximum writes a tombstone into a
+   NEW SST while the OLD SST keeps its stat row — and the merged maximum
+   still reports the deleted value.
+5. Only compaction fixes it, because compaction recomputes the stats from
+   the surviving rows (compact.rs:3088).
+
+Between a delete and the compaction that merges its SST away — which can
+be a long time, and is exactly the window a bulk-load-then-query workload
+lives in — `MAX()` answered from stats returns a value that is no longer
+in the graph. Silently. The same holds for a property UPDATE that lowers
+the maximum, and `null_count` has the same staleness for `count(prop)`.
+
+There is a second hazard even without deletes: `min_scalar` / `max_scalar`
+(sst/nodes.rs:1912-1926) order via `scalar_lt`, which compares ACROSS
+`StatScalar` variants. A property holding both `Int64` and `Utf8` values
+therefore gets a min/max under an ordering that is not Cypher's
+comparison semantics.
+
+**The sound design is pruning, not answering.** A bound is enough to SKIP
+work: to find the maximum, visit only the row groups whose recorded max is
+greater than the best value found so far, and read the actual rows from
+those. The answer always comes from real rows, so staleness costs a
+wasted read rather than a wrong result — and the existing row-group
+machinery (`ScanPredicate`, `eval_row_group`, `node_scan_plan` in
+sst/nodes.rs:735-869) is the right place to hang it. That is a bigger
+change than the one proposed, and it is the honest version of it.
+
+If an exact-answer fast path is ever wanted, it needs a per-label
+"stats are exact" bit that flush clears on any tombstone and compaction
+sets when it recomputes from survivors. That does not exist today, and
+inventing it is a manifest format change.
