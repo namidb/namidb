@@ -1174,29 +1174,54 @@ row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
 having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
 full hydration for nothing.
 
-### 77. [OPEN — measured] Variable-length still costs far more than the equivalent explicit chain
+### 77. [OPEN — measured] Labelled variable-length burns CPU with no extra I/O
 
-2.6.6 took `-[:A|B*2..2]->` from "exceeds a 120 s deadline" to "works",
-but a large residual remains. Measured WARM on the published 2.6.6 image,
-200x200 fan-out (40,000 paths), same answer from both:
+2.6.6 is a strict improvement, but a large residual remains and one shape
+still does not complete. Same fixture and store on both images (200x200,
+40,000 paths, plus an unrelated 60k-degree hub of ~1 KB nodes built in the
+same session), warm:
 
-| query | time |
-|---|---|
-| `(r:ROOT)-[:A]->(m:MID)-[:B]->(l:LEAF)` | **0.27 s** |
-| `(r:ROOT)-[:A\|B*2..2]->(l:LEAF)` | **9.36 s** |
+| query | 2.6.5 | 2.6.6 |
+|---|---|---|
+| `(r:ROOT)-[:A]->(m:MID)-[:B]->(l:LEAF)` (explicit) | 0.20 s | 0.20 s |
+| `-[:A\|B*2..2]->(x)` — no target label | timed out at 120 s | **0.25 s** |
+| `-[:A\|B*2..2]->(x:LEAF)` | timed out at 120 s | **5.3 s** |
+| `-[:A\|B*2..2]->(x:MID)` — label matches nothing at the last hop | timed out at 120 s | **still times out** |
 
-**35x for the same logical query.** Note the number is store-dependent:
-on a store containing only this fixture the same shape measured 1.73 s at
-90,000 paths, so it is roughly 12x worse per path once other node SSTs
-exist. That points at `batch_lookup_nodes` sweeping row groups in EVERY
-node descriptor — node ids are UUIDs spread across the key range, so the
-`[min_key, max_key]` prefilter admits essentially every SST (the comment
-at read.rs says as much). The explicit chain issues the same batch, so
-the batch alone does not explain the gap; the var-length path additionally
-pays, per matched edge, an `edge_type.clone()` for the trail key, a
-`step.rels.clone()`, and a `new_rel_values.clone()` because
-`bind_rel_list` is true for any starred pattern.
+Two things follow, and the second is the interesting one.
 
-Not diagnosed further. Recorded so the 2.6.6 note is not read as "var-length
-is now as fast as the explicit form" — it is not, it is merely no longer
-unusable.
+**(a) The residual is entirely about the TARGET LABEL, and it is pure CPU.**
+Unlabelled 0.25 s vs labelled 5.3 s is 21x for the same traversal, the
+same answer and the SAME plan shape (EXPLAIN renders them identically;
+only `target_labels` inside the operator differs). Metric deltas across
+the two runs are equal — `namidb_range_cache_lookups_total{outcome="memory_hit"}
++= 916` in both — so no additional object-store or range-cache work is
+being done. Whatever the cost is, it is CPU inside the operator, gated on
+the label list being non-empty.
+
+Hypotheses REFUTED by measurement (recorded so they are not re-tried):
+- Store composition. Adding 60,000 unrelated FAT nodes to a clean store
+  moved varlen from 0.52 s to 0.58 s; adding 60,000 unrelated edges of
+  another type moved it to 0.63 s. Neither explains 5.3 s.
+- Alternation. On a clean store `[:C*2..2]` (single type) measured 0.59 s
+  against `[:A|B*2..2]` at 0.55 s — no difference.
+- Hydration. `count(*)` (target unreferenced) costs 5.37 s against
+  `count(l)` at 5.70 s, so materialising the endpoints is ~0.33 s of it.
+- `bound_target_matches_labels`: computed once per SEED row (walker.rs
+  1610), not per edge.
+
+What DID reproduce it: building the unrelated hub INTERLEAVED with the
+chain in one session rather than in a separate flushed phase. Same node
+and edge counts either way, so this is an SST/row-group layout effect
+interacting with the label — but the mechanism was not identified from
+outside the process, and guessing further is what the refuted list above
+is for. Needs an in-process profile (`crates/namidb-query/src/profile.rs`
+has a `ProfileCollector` that is NOT exposed over HTTP — exposing it is
+probably the cheapest next step).
+
+**(b) `-[*2..2]->(x:LABEL)` where LABEL matches nothing at the final hop
+still does not complete.** It produces zero rows and takes longer than the
+variant that produces 40,000. That asymmetry is not explained by result
+volume and is the sharpest available lead.
+
+Not a regression: every one of these timed out on 2.6.5.
