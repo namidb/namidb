@@ -1259,9 +1259,17 @@ on exactly those stores.
    store containing a deliberately dangling edge, written through the
    embedded API).
 
-2. *Probe the label sidecar for ANY label.* Membership is keyed
-   `(label_id, node_id)` and `per_label_counts` names the labels present
-   in each SST, so existence is a probe per label, ORed. A node cannot
+2. *Probe the label sidecar for ANY label.* Concretely: mirror
+   `try_batch_nodes_have_labels` (read.rs:3636) but OR instead of AND —
+   for each node descriptor, iterate `index.per_label_counts` and call
+   `crate::sst::paged_index::batch_label_contains_from_source` once per
+   label id, exactly as the existing path does for its single label. A
+   node exists if any label of any descriptor contains it. The `None`
+   fallbacks that path already has (non-`PagedV1` format, empty
+   `per_label_counts`, a sidecar that fails to open) must stay
+   fail-CLOSED: if any descriptor could not be probed, return `None` and
+   let the caller hydrate, because a missed descriptor is a missing row,
+   not a slow one. A node cannot
    have zero labels — `CREATE (n {p: 1})` without a label is rejected with
    a 400, verified live — so "appears under some label" is equivalent to
    "exists". Bound it: probe when the SST carries few labels (≤ 4, say)
