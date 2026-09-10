@@ -190,10 +190,9 @@ async fn unlabelled_and_anonymous_hub_targets_match_the_labelled_form() {
     // The unlabelled binding must still carry real property values, so the
     // batch cannot be answering with id-only stubs.
     let snapshot = writer.snapshot();
-    let parsed = parse(
-        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(x) RETURN x.name AS n ORDER BY n LIMIT 3",
-    )
-    .unwrap();
+    let parsed =
+        parse("MATCH (h:Person {name: 'hub'})-[:KNOWS]->(x) RETURN x.name AS n ORDER BY n LIMIT 3")
+            .unwrap();
     let plan = lower(&parsed).unwrap();
     let rows = namidb_query::execute(&plan, &snapshot, &Params::new())
         .await
@@ -208,4 +207,3 @@ async fn unlabelled_and_anonymous_hub_targets_match_the_labelled_form() {
         }
     }
 }
-

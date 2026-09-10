@@ -15,6 +15,25 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-09-10
+
+### Fixed
+
+- **An expand whose target carries no label no longer reads one node per
+  edge.** The 2.6.2 fan-out fix let a single hop consume its own prewarmed
+  batch instead of re-reading each endpoint through the shared node cache,
+  but it was gated on the target being labelled — so `(a)-[:R]->(x)` and
+  `(a)-[:R]->()`, among the most common patterns in Cypher, kept the old
+  per-edge path. On a 197k-degree hub the unlabelled and anonymous forms
+  timed out at 300s where the labelled form took 3.5s; all three now cost
+  about 2.8s and return the same rows. `batch_lookup_nodes` resolves ids
+  across every node descriptor and uses its label argument only to
+  namespace cache keys, so an empty label is a complete id-primary batch.
+- A batch miss during expansion now falls back to the authoritative point
+  reader instead of skipping the edge, so a batch that under-reports can
+  no longer drop rows silently.
+
+
 ## [2.6.3] - 2026-09-09
 
 ### Added
@@ -3173,7 +3192,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.3...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.4...HEAD
+[2.6.4]: https://github.com/namidb/namidb/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/namidb/namidb/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/namidb/namidb/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/namidb/namidb/compare/v2.6.0...v2.6.1
