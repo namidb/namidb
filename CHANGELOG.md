@@ -15,6 +15,34 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.12] - 2026-09-10
+
+### Fixed
+
+- **A `WHERE` comparing an integer property to a float literal — or a float
+  property to an integer literal — silently returned NO ROWS.**
+  `WHERE n.amount > 0` over a float column matched nothing, while
+  `RETURN n.amount > 0` on the same row returned true: the same comparison
+  disagreeing with itself depending on whether it was a filter or an
+  expression. Affected `=`, `<`, `<=`, `>`, `>=` and `IN`, on both the
+  memtable and the flushed-SST paths.
+
+  Cypher compares numbers across Int and Float, and the executor already
+  did (`is_equal` uses `(x as f64) == y`, `compare` uses
+  `(x as f64).partial_cmp(y)`). The scan-side evaluator had no cross-numeric
+  arms, so every mixed comparison fell through to "incomparable", which
+  every caller resolves as `false`. It now mirrors the executor exactly.
+
+  This also showed up as a route divergence: the same predicate matched
+  through a composite index (which canonicalises numeric members to f64)
+  and did not match through the single-property path, so adding an
+  unrelated `AND` conjunct changed the answer.
+
+  Row-group pruning shared the gap but was already fail-safe there — an
+  incomparable pair resolved to `MaybePresent`, so it never over-pruned. It
+  now compares, so a mixed predicate can also skip row groups.
+
+
 ## [2.6.11] - 2026-09-10
 
 ### Performance
@@ -3355,7 +3383,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.11...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.12...HEAD
+[2.6.12]: https://github.com/namidb/namidb/compare/v2.6.11...v2.6.12
 [2.6.11]: https://github.com/namidb/namidb/compare/v2.6.10...v2.6.11
 [2.6.10]: https://github.com/namidb/namidb/compare/v2.6.9...v2.6.10
 [2.6.9]: https://github.com/namidb/namidb/compare/v2.6.8...v2.6.9
