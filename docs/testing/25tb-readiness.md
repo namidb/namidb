@@ -1225,3 +1225,42 @@ variant that produces 40,000. That asymmetry is not explained by result
 volume and is the sharpest available lead.
 
 Not a regression: every one of these timed out on 2.6.5.
+
+### 78. [OPEN — conformance question, NOT fixed] A repeated type in an alternation duplicates rows
+
+`MATCH (a:P)-[:E|E]->(b:Q)` returns every matching row TWICE; `-[:E]->`
+returns it once. The executor unions one partner list per listed type
+(`neighbours_of_any`, walker.rs) and a type written twice is traversed
+twice.
+
+**I did not change this, deliberately.**
+`exec_alternation.rs:314-316` asserts the current behaviour on purpose:
+
+    // `[:KNOWS|:KNOWS]` should produce TWO rows per edge (one per listed
+    // type) — that's the per-path semantic the executor follows.
+    assert_eq!(alt_rows.len(), 4, "two types × two edges = four rows");
+
+My reading is that this is wrong: in openCypher a type alternation is a
+PREDICATE on one relationship (`type(r) IN {A, B}`), not a cross product
+over the listed types, so one edge is one path and should yield one row —
+which is what Neo4j does. Deduplicating the type list at lowering
+(`lower_rel_node`, one filter over `rel.types`) fixes it and breaks only
+that assertion.
+
+But it IS a deliberate, documented decision, the input is degenerate
+(nobody hand-writes `[:E|E]`), and changing it is a semantic change to
+shipped behaviour rather than a defect fix. It needs an owner's call, not
+a late-session unilateral one. Worth noting the realistic way to hit it:
+a query builder mapping a type list that is not itself deduplicated.
+
+Found by a differential harness that runs families of query rewrites that
+must return identical results and compares them
+(scratchpad `equiv.py`). Twelve of thirteen families agreed — including
+labelled-vs-`labels()`, explicit-chain-vs-`*2..2`,
+anonymous-vs-named intermediate, direction reversal, inline-property vs
+WHERE, MATCH-WHERE vs WITH-WHERE, quantifier vs `IN`, `count(*)` vs
+`size(collect())`, DISTINCT vs grouping, OPTIONAL-when-all-match,
+`*1..1` vs a single hop, and conjunctive multi-label. That harness is
+worth keeping: comparing RESULTS across equivalent rewrites is what the
+suite does not do, and four wrong-answer bugs surfaced in this codebase
+today.

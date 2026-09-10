@@ -15,6 +15,29 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.8] - 2026-09-10
+
+### Fixed
+
+- **`any()` / `all()` / `none()` / `single()` and list comprehensions over a
+  target's property returned nothing.** The reference collector grouped
+  quantifiers and list comprehensions with the closed pattern forms
+  (`Exists`, `PatternComprehension`), whose binding reads genuinely happen
+  inside their own sub-plan. A quantifier is not one of those — it is a plain
+  list operation over a host binding. So `WHERE any(x IN t.tags WHERE x =
+  'a')` never registered `t`, the expansion bound it as an id-only stub with
+  no properties, `t.tags` read as null, and the predicate matched NOTHING. A
+  silently empty result, not an error. `size(t.tags)` and `t.name` were
+  unaffected, which is why this went unnoticed.
+- **A `*0..n` pattern lost rows when its source carried more labels than the
+  pattern named.** The zero-hop arm decides whether the source is itself a
+  result by reading the labels off the row, and an id-only stub carries only
+  the labels the previous expansion asked for. A node labelled `:T:U` bound
+  by `->(t:T)` therefore failed `-[:S*0..2]->(u:U)` at zero hops and vanished
+  from the result. An alias consumed as a zero-hop source is now excluded
+  from the stub optimisation.
+
+
 ## [2.6.7] - 2026-09-10
 
 ### Fixed
@@ -3253,7 +3276,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.7...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.8...HEAD
+[2.6.8]: https://github.com/namidb/namidb/compare/v2.6.7...v2.6.8
 [2.6.7]: https://github.com/namidb/namidb/compare/v2.6.6...v2.6.7
 [2.6.6]: https://github.com/namidb/namidb/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/namidb/namidb/compare/v2.6.4...v2.6.5
