@@ -1144,56 +1144,43 @@ unlabelled target, so the release that fixed the labelled twin left this
 untouched. A sweep of 12 expand shapes at degree 120k now shows them
 uniform (~1.7 s); before the fix two of them did not complete.
 
-### 74. [OPEN — prerequisite now met] A bare-node reference forces full hydration
+### 74. [FIXED in 2.6.11] A bare-node reference forced full hydration
 
-Re-measured on the 2.6.10 build at degree 160,000, ~1 KB targets:
+Measured at degree 160,000, ~1 KB targets:
 
-| query | time |
-|---|---|
-| `RETURN count(*)` (target unreferenced) | **0.64 s** |
-| `RETURN count(t)` | 2.20 s |
-| `RETURN count(id(t))` | 2.19 s |
-| `RETURN count(DISTINCT t)` | 2.13 s |
-| `RETURN sum(t.idx)` | 2.25 s |
+| query | before | after |
+|---|---|---|
+| `RETURN count(*)` (unreferenced, the floor) | 0.54 s | 0.55 s |
+| `RETURN count(t)` | 2.24 s | **0.55 s** |
+| `RETURN count(id(t))` | 2.23 s | **0.61 s** |
+| `RETURN count(DISTINCT t)` | 2.24 s | **0.64 s** |
+| `RETURN count(t.idx)` | 2.26 s | 2.11 s (correctly NOT optimised) |
+| `RETURN count(t), max(t.idx)` | — | 2.36 s (correctly NOT optimised) |
 
-`count(id(t))` — where the caller has literally written that only the id
-is needed — costs the same as full hydration. 3.4x of pure waste.
-`should_skip_target_materialize` requires
-`!routing.referenced_aliases.contains(target_alias)`, and
-`collect_plan_references` treats `Count { arg: Some(e) }` exactly like
-`Sum`/`Avg`, so any mention of the alias forces every column.
+`PlanRouting` gained `identity_only_aliases`: aliases referenced ONLY in
+positions that read the node id. `should_skip_target_materialize` admits
+those to the id-only stub alongside genuinely unreferenced ones.
 
-**The prerequisite is now met.** Widening the id-only stub was blocked on
-the reference collector being trustworthy, and it was not: two forms read
-a host binding without registering it, and both were silent wrong answers
-(quantifiers / list comprehensions over a target property, and a `*0..n`
-source losing its extra labels — both fixed in 2.6.8). The collector is
-now EXHAUSTIVE — no `_` arm, so the compiler forces a decision for every
-`ExpressionKind` — and the only forms that deliberately register nothing
-are the genuinely closed pattern forms (`Exists`, `ExistsSubquery`,
-`PatternComprehension`) plus `Literal` / `Parameter` / `Star`, none of
-which read a host binding.
+Sound because each admitted form provably reads only the id: `count(x)`
+counts non-null occurrences (a stub is non-null exactly where the node is);
+`count(DISTINCT x)` dedups on `fingerprint_value`, whose node arm is
+`N{id};` — verified at walker.rs, id alone, no properties, no labels; and
+`id(x)` reads the id, which the stub carries correctly.
 
-**What remains is the whitelist, and it must stay narrow.** The stub binds
-EMPTY properties, so mis-classifying one form returns nulls for real
-values. Two tiers with different burdens of proof:
+**A WHITELIST, never a blacklist.** Nested identity forms, counts over a
+property, and any alias also read for a value elsewhere in the statement
+all keep the full path. A new expression form must be added deliberately.
 
-- `id(x)` as the sole mention: provably safe with no further reasoning —
-  `id()` reads the id, and the stub carries the correct id.
-- bare `count(x)` / `count(DISTINCT x)`: needs the argument that node
-  dedup is by an id-only fingerprint (it is — a BTreeSet over id
-  fingerprints since the first release, confirmed under item 68). Worth
-  having, since `count(x)` is the common spelling, but it rests on an
-  aggregate-internals invariant that deserves its own pinning test first.
-
-Anything else mentioning the alias stays on the full path. Not a
-blacklist: a new expression form must be added to the whitelist
-deliberately, never inherit the fast path by omission.
-
-Add a family to `exec_rewrite_equivalence.rs` at the same time, and
-remember that file's trap: a family must reference the target ONLY through
-the construct under test, or the stub is never built and the family passes
-with the fix reverted.
+**Two process notes worth keeping.** First, the implementation initially
+passed every test while being completely INERT — `count(t)` stayed at
+2.24 s. `collect_plan_references` recurses into children itself, so calling
+it per-node walked the whole subtree and collected the alias from the
+aggregate anyway. Caught only by measuring after the tests went green;
+fixed by threading a `skip_identity_counts` flag through the single
+existing traversal instead of adding a second one. Second, the equivalence
+families for this must include the MIXED case (`count(t)` and `max(t.n)`
+in one statement): that is the shape where a mis-classification returns a
+correct count beside a null maximum — a half-right row, the worst kind.
 
 ### 75. [FIXED in 2.6.10] `LIMIT` now bounds an expansion's work
 

@@ -317,6 +317,56 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // The identity-only whitelist: an alias referenced ONLY through
+    // `count(x)` / `count(DISTINCT x)` / `count(id(x))` may be bound as an
+    // id-only stub. These must all agree with the unreferenced spelling.
+    assert_equivalent(
+        &w,
+        "identity-only counts agree with count(*)",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(*) AS c",
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(b) AS c",
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(id(b)) AS c",
+        ],
+    )
+    .await;
+
+    assert_equivalent(
+        &w,
+        "identity-only DISTINCT agrees across spellings",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(DISTINCT b) AS c",
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(DISTINCT id(b)) AS c",
+        ],
+    )
+    .await;
+
+    // THE DANGEROUS CASE. `b` is counted AND read for a property in the same
+    // statement, so it must NOT be classified identity-only. If it were, the
+    // stub's empty properties would make `max(b.n)` null while the count
+    // stayed right — a half-correct row, which is the worst kind.
+    assert_equivalent(
+        &w,
+        "an alias both counted and value-read stays hydrated",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(b) AS c, max(b.n) AS m",
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(*) AS c, max(b.n) AS m",
+        ],
+    )
+    .await;
+
+    // `count(b.n)` counts a PROPERTY, not the node: the argument is not a
+    // bare variable, so it must take the full path.
+    assert_equivalent(
+        &w,
+        "count over a property is not an identity reference",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN count(b.n) AS c",
+            "MATCH (a:P)-[:E]->(b:Q) WHERE b.n IS NOT NULL RETURN count(*) AS c",
+        ],
+    )
+    .await;
+
     assert_equivalent(
         &w,
         "conjunctive multi-label vs labels() predicate",

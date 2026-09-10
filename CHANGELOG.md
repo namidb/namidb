@@ -15,6 +15,26 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.11] - 2026-09-10
+
+### Performance
+
+- **An expansion target referenced only for its identity is no longer fully
+  hydrated.** `count(t)`, `count(DISTINCT t)` and `count(id(t))` read nothing
+  but the node id, yet any mention of the alias forced every column to be
+  materialised. At degree 160,000 with ~1 KB targets they cost 2.2 s against
+  0.55 s for the same query with the target unreferenced; they now cost
+  0.55-0.64 s, a 3.5-4x improvement.
+
+  The admitted forms are a WHITELIST, deliberately shallow: `count(x)` counts
+  non-null occurrences, `count(DISTINCT x)` dedups on a fingerprint whose node
+  arm is the id alone, and `id(x)` reads the id. An identity-only form nested
+  inside a larger expression, a count over a property, or an alias that is
+  ALSO read for a value anywhere in the statement all keep the full path — a
+  new expression form must be added to the whitelist deliberately and can
+  never inherit the fast path by omission.
+
+
 ## [2.6.10] - 2026-09-10
 
 ### Fixed
@@ -3335,7 +3355,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.10...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.11...HEAD
+[2.6.11]: https://github.com/namidb/namidb/compare/v2.6.10...v2.6.11
 [2.6.10]: https://github.com/namidb/namidb/compare/v2.6.9...v2.6.10
 [2.6.9]: https://github.com/namidb/namidb/compare/v2.6.8...v2.6.9
 [2.6.8]: https://github.com/namidb/namidb/compare/v2.6.7...v2.6.8
