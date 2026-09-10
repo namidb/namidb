@@ -1228,24 +1228,49 @@ limit parameter and materialises the whole partner list, so no executor
 change can avoid it. That is the storage half, and it is where the
 hierarchical adjacency work from finding #3 would earn its keep.
 
-### 76. [OPEN — measured, correct by design] An unlabelled unreferenced target cannot use the membership path
+### 76. [OPEN — design ready] An unlabelled unreferenced target cannot use the membership path
 
 At degree 160,000, `count(*)` over `(t:FAT)` takes 0.63 s but over `()`
-takes 2.24 s — **3.5x** — although neither references the target. The
-label-membership sidecar proves "carries label L"; with no label there is
-nothing to prove, and `try_batch_nodes_have_labels` returns `None` with
+takes 2.24 s — **3.5x** — although neither references the target.
+`try_batch_nodes_have_labels` returns `None` for an empty label list, with
 the reason stated in place: *"Membership in zero labels does not prove
 that the endpoint itself exists; retain the authoritative node point
 path."* So the expansion falls back to full hydration purely to establish
 that each endpoint exists.
 
-**Unlike items 73/74 this is not a mistaken gate.** Those rested on a
-false belief about `batch_lookup_nodes` being label-scoped; this rests on
-a true constraint. Closing it needs a new storage capability — an
-existence-only batch that decodes the key column rather than the whole
-row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
-having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
-full hydration for nothing.
+**The constraint is real; existence cannot be skipped.** A dangling edge
+would otherwise produce a phantom row. Dangling edges can no longer be
+CREATED through Cypher — a bare `DELETE` of a connected node is refused
+(and since 2.6.10 refused as a 409, not a 500) — but they can exist in
+data written by earlier versions, and the embedded `tombstone_node` API
+carries no incident-edge check. Skipping the proof would silently add rows
+on exactly those stores.
+
+**Two implementable designs, in preference order.**
+
+1. *An existence-only batch* (`batch_nodes_exist(ids) -> Vec<bool>`).
+   The row decode is what costs: measured elsewhere in this document, a
+   900-byte string column costs the same as an 8-byte integer column
+   (0.433 s vs 0.466 s at 160k), so the expense is per-ROW
+   materialisation, not bytes. Reading only the key column to test
+   presence avoids essentially all of it. This is the clean answer, and it
+   is a new storage method in the hot read path — it needs the
+   equivalence harness pointed at it (unlabelled vs labelled counts on a
+   store containing a deliberately dangling edge, written through the
+   embedded API).
+
+2. *Probe the label sidecar for ANY label.* Membership is keyed
+   `(label_id, node_id)` and `per_label_counts` names the labels present
+   in each SST, so existence is a probe per label, ORed. A node cannot
+   have zero labels — `CREATE (n {p: 1})` without a label is rejected with
+   a 400, verified live — so "appears under some label" is equivalent to
+   "exists". Bound it: probe when the SST carries few labels (≤ 4, say)
+   and fall back to hydration otherwise, or a wide-schema store turns one
+   read into fifty.
+
+Design (1) is preferred: it is O(1) per node regardless of schema width,
+and it does not depend on the every-node-has-a-label invariant holding for
+data written by any future writer.
 
 ### 77. [FIXED in 2.6.7] Labelled variable-length burned CPU with no extra I/O
 
