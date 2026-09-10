@@ -131,3 +131,79 @@ async fn traversals_cross_a_flushed_supernode_exactly() {
     .await;
     assert_eq!(total, (FANOUT + FANIN + 1) as i64);
 }
+
+/// A hub expansion whose target carries NO label must cost the same as a
+/// labelled one and return the same rows.
+///
+/// The 2.6.2 fan-out fix let a single hop consume its own prewarmed batch
+/// instead of re-reading each endpoint through the shared FIFO node cache,
+/// but it was gated on the target being labelled. An unlabelled or anonymous
+/// target — `(a)-[:R]->()`, one of the most common patterns in Cypher — fell
+/// back to one authoritative point read PER EDGE. Measured on a 197k-degree
+/// hub: 3.5s labelled versus a 300s timeout unlabelled, for the same answer.
+/// The batch resolves by id across every node descriptor, so an empty label
+/// is a complete id-primary batch rather than a miss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlabelled_and_anonymous_hub_targets_match_the_labelled_form() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("exec-unlabelled").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+    let hub = NodeId::new();
+    writer.upsert_node("Person", hub, &person("hub")).unwrap();
+    for ordinal in 0..FANOUT {
+        let spoke = NodeId::new();
+        writer
+            .upsert_node("Person", spoke, &person(&format!("out-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, spoke, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    // All three spellings describe the same set of edges.
+    let labelled = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(x:Person) RETURN count(*) AS c",
+    )
+    .await;
+    let unlabelled = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(x) RETURN count(*) AS c",
+    )
+    .await;
+    let anonymous = count_value(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->() RETURN count(*) AS c",
+    )
+    .await;
+    assert_eq!(labelled, FANOUT as i64);
+    assert_eq!(
+        unlabelled, labelled,
+        "an unlabelled target must not change the result"
+    );
+    assert_eq!(
+        anonymous, labelled,
+        "an anonymous target must not change the result"
+    );
+
+    // The unlabelled binding must still carry real property values, so the
+    // batch cannot be answering with id-only stubs.
+    let snapshot = writer.snapshot();
+    let parsed =
+        parse("MATCH (h:Person {name: 'hub'})-[:KNOWS]->(x) RETURN x.name AS n ORDER BY n LIMIT 3")
+            .unwrap();
+    let plan = lower(&parsed).unwrap();
+    let rows = namidb_query::execute(&plan, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        match row.bindings.get("n") {
+            Some(RuntimeValue::String(name)) => {
+                assert!(name.starts_with("out-"), "unexpected spoke name {name}")
+            }
+            other => panic!("unlabelled target lost its properties: {other:?}"),
+        }
+    }
+}
