@@ -442,3 +442,219 @@ async fn declared_edge_endpoint_does_not_replace_live_label_validation() {
         "the declared dst_label is not proof that a raw edge's live target carries it"
     );
 }
+
+/// `any()` / `all()` over a TARGET's list property must materialise that
+/// target.
+///
+/// `collect_referenced_variables` grouped `Quantifier` and
+/// `ListComprehension` with the closed pattern forms (`Exists`,
+/// `PatternComprehension`), whose binding reads really do happen inside their
+/// own sub-plan. A quantifier is not one of those: it is a plain list
+/// operation over a host binding. So `WHERE any(x IN t.tags WHERE x = 'a')`
+/// never registered `t`, the Expand bound it as an id-only stub with no
+/// properties, `t.tags` read as null, and the predicate matched NOTHING —
+/// a silently empty result, not an error.
+#[tokio::test]
+async fn quantifier_over_a_target_list_property_materialises_the_target() {
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    std::env::set_var("NAMIDB_NODE_CACHE", "1");
+    let mut writer = WriterSession::open(store(), paths("quantifier-routing"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(LabelDef {
+            name: "Tgt".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        })
+        .unwrap()
+        .label(LabelDef {
+            name: "Src".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, false).unwrap()],
+        })
+        .unwrap()
+        .edge_type(EdgeTypeDef {
+            name: "REL".into(),
+            src_label: "Src".into(),
+            dst_label: "Tgt".into(),
+            properties: vec![],
+        })
+        .unwrap()
+        .build();
+
+    let src = NodeId::new();
+    let mut src_props: BTreeMap<String, CoreValue> = BTreeMap::new();
+    src_props.insert("name".into(), CoreValue::Str("s".into()));
+    writer
+        .upsert_node(
+            "Src",
+            src,
+            &NodeWriteRecord {
+                properties: src_props,
+                schema_version: 0,
+                labels: vec![],
+            },
+        )
+        .unwrap();
+    for (name, tags) in [("t1", vec!["a", "b"]), ("t2", vec!["c"])] {
+        let id = NodeId::new();
+        let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+        props.insert("name".into(), CoreValue::Str(name.into()));
+        props.insert(
+            "tags".into(),
+            CoreValue::List(tags.into_iter().map(|t| CoreValue::Str(t.into())).collect()),
+        );
+        writer
+            .upsert_node(
+                "Tgt",
+                id,
+                &NodeWriteRecord {
+                    properties: props,
+                    schema_version: 0,
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+        writer
+            .upsert_edge("REL", src, id, &EdgeWriteRecord::default())
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let count = |q: &'static str| {
+        let snapshot = &snapshot;
+        async move {
+            let parsed = parse(q).unwrap();
+            let plan = lower(&parsed).unwrap();
+            let rows = execute(&plan, snapshot, &Params::new()).await.unwrap();
+            match rows[0].bindings.values().next() {
+                Some(RuntimeValue::Integer(n)) => *n,
+                other => panic!("expected an integer count, got {other:?}"),
+            }
+        }
+    };
+
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) WHERE any(x IN t.tags WHERE x = 'a') RETURN count(*) AS c").await,
+        1,
+        "any() over the target's list property must see the real list"
+    );
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) WHERE all(x IN t.tags WHERE x <> 'z') RETURN count(*) AS c").await,
+        2,
+        "all() over the target's list property must see the real list"
+    );
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) WHERE none(x IN t.tags WHERE x = 'a') RETURN count(*) AS c").await,
+        1
+    );
+    // A list comprehension reads the host binding the same way.
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) WHERE size([x IN t.tags WHERE x <> 'b']) = 1 RETURN count(*) AS c").await,
+        2
+    );
+    // Controls: shapes that already worked must not change.
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) WHERE t.name = 't1' RETURN count(*) AS c").await,
+        1
+    );
+    assert_eq!(
+        count("MATCH (s:Src)-[:REL]->(t:Tgt) RETURN count(*) AS c").await,
+        2
+    );
+}
+
+/// A `*0..n` pattern must see its SOURCE's real label set.
+///
+/// The zero-hop arm decides whether the source itself is a result by reading
+/// the labels off the row (`source_has_target_labels`). An unreferenced
+/// Expand target is bound as an id-only stub whose `labels` field holds only
+/// the labels THAT Expand asked for — not the node's real set. So a node
+/// labelled `:TT:UU`, bound by `->(t:TT)`, failed `-[:S*0..2]->(u:UU)` at
+/// zero hops and the row vanished. An alias consumed as a zero-hop source is
+/// now excluded from the stub optimisation.
+#[tokio::test]
+async fn zero_hop_source_sees_its_full_label_set() {
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    std::env::set_var("NAMIDB_NODE_CACHE", "1");
+    let mut writer = WriterSession::open(store(), paths("zero-hop-labels"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(person_label())
+        .unwrap()
+        .edge_type(works_with_edge())
+        .unwrap()
+        .build();
+
+    // `both` carries TWO labels; `far` is one hop beyond it.
+    let a = NodeId::new();
+    let both = NodeId::new();
+    let far = NodeId::new();
+    writer.upsert_node("Person", a, &person("a")).unwrap();
+    writer
+        .upsert_node_with_labels(["TT".to_string(), "UU".to_string()], both, &person("both"))
+        .unwrap();
+    writer
+        .upsert_node_with_labels(["UU".to_string()], far, &person("far"))
+        .unwrap();
+    writer
+        .upsert_edge("WORKS_WITH", a, both, &weighted_edge(1.0))
+        .unwrap();
+    writer
+        .upsert_edge("WORKS_WITH", both, far, &weighted_edge(1.0))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let names = |q: &'static str| {
+        let snapshot = &snapshot;
+        async move {
+            let parsed = parse(q).unwrap();
+            let plan = lower(&parsed).unwrap();
+            let rows = execute(&plan, snapshot, &Params::new()).await.unwrap();
+            let mut out: Vec<String> = rows
+                .iter()
+                .filter_map(|r| match r.bindings.get("n") {
+                    Some(RuntimeValue::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+
+    // Zero hops alone: `both` IS a :UU, so it must match itself.
+    assert_eq!(
+        names(
+            "MATCH (a:Person {name: 'a'})-[:WORKS_WITH]->(t:TT)-[:WORKS_WITH*0..0]->(u:UU) \
+             RETURN u.name AS n"
+        )
+        .await,
+        vec!["both".to_string()],
+        "a zero-length hop must recognise the source's own labels"
+    );
+
+    // Zero-or-more: both the source itself and the node one hop beyond.
+    assert_eq!(
+        names(
+            "MATCH (a:Person {name: 'a'})-[:WORKS_WITH]->(t:TT)-[:WORKS_WITH*0..2]->(u:UU) \
+             RETURN u.name AS n"
+        )
+        .await,
+        vec!["both".to_string(), "far".to_string()]
+    );
+
+    // Control: min == 1 excludes the source, and always did.
+    assert_eq!(
+        names(
+            "MATCH (a:Person {name: 'a'})-[:WORKS_WITH]->(t:TT)-[:WORKS_WITH*1..2]->(u:UU) \
+             RETURN u.name AS n"
+        )
+        .await,
+        vec!["far".to_string()]
+    );
+}

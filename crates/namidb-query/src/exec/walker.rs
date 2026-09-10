@@ -6620,7 +6620,20 @@ fn should_skip_target_materialize(
         && path_binding.is_none()
         && !target_labels.is_empty()
         && !routing.referenced_aliases.contains(target_alias)
+        && !routing.zero_hop_sources.contains(target_alias)
         && length.as_ref().is_none_or(|length| length.max == 1)
+}
+
+/// Collect the source alias of every `*0..n` Expand in the plan.
+fn collect_zero_hop_expand_sources(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    if let LogicalPlan::Expand { source, length, .. } = plan {
+        if length.as_ref().is_some_and(|l| l.min == 0) {
+            out.insert(source.clone());
+        }
+    }
+    for child in plan.children() {
+        collect_zero_hop_expand_sources(child, out);
+    }
 }
 
 /// Resolve a node when the logical operator carries no label constraint.
@@ -9588,13 +9601,34 @@ fn collect_referenced_variables(expr: &Expression, out: &mut BTreeSet<String>) {
             collect_referenced_variables(&r.list, out);
             collect_referenced_variables(&r.expression, out);
         }
+        // `any`/`all`/`none`/`single` and a list comprehension are plain list
+        // operations over a HOST binding, evaluated by the expression engine —
+        // not closed pattern forms. Grouping them with `Exists` meant
+        // `WHERE any(x IN t.tags WHERE x = 'a')` never registered `t`, so the
+        // Expand bound it as an id-only stub with no properties, `t.tags` read
+        // as null, and the predicate silently matched nothing.
+        //
+        // The local element variable shadows any same-named host binding, so
+        // collecting it over-collects — the safe direction for a thin row, and
+        // the same trade `reduce()` above already makes.
+        ExpressionKind::Quantifier(q) => {
+            collect_referenced_variables(&q.list, out);
+            collect_referenced_variables(&q.predicate, out);
+        }
+        ExpressionKind::ListComprehension(lc) => {
+            collect_referenced_variables(&lc.list, out);
+            if let Some(p) = &lc.predicate {
+                collect_referenced_variables(p, out);
+            }
+            if let Some(p) = &lc.projection {
+                collect_referenced_variables(p, out);
+            }
+        }
         // Closed pattern forms — the binding reads they perform live
         // inside their own sub-plan, not in the host expression.
         ExpressionKind::Exists(_)
         | ExpressionKind::ExistsSubquery(_)
-        | ExpressionKind::ListComprehension(_)
         | ExpressionKind::PatternComprehension(_)
-        | ExpressionKind::Quantifier(_)
         | ExpressionKind::Literal(_)
         | ExpressionKind::Parameter(_)
         | ExpressionKind::Star => {}
@@ -9629,6 +9663,14 @@ pub(crate) struct PlanRouting {
     /// consumed downstream. This intentionally excludes a bare `DELETE r`:
     /// deleting a relationship only needs its `(type, src, dst)` identity.
     value_referenced_aliases: BTreeSet<String>,
+    /// Aliases a later Expand consumes as the SOURCE of a zero-length
+    /// variable-length pattern (`*0..n`). Such an Expand decides whether the
+    /// source itself is a result by reading the labels off the ROW, and an
+    /// id-only stub carries only the labels its own Expand asked for — not
+    /// the node's real set. A node labelled `:T:U` bound by `->(t:T)` would
+    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops and silently lose the
+    /// row. These aliases must be materialised.
+    zero_hop_sources: BTreeSet<String>,
     /// A node-mutating write invalidates the committed property cache at
     /// commit. Correlated indexed reads in such a statement must therefore
     /// use the writer-private transactional postings map so a sequence of
@@ -9644,9 +9686,12 @@ impl PlanRouting {
         collect_plan_referenced_variables(plan, &mut refs);
         let mut value_refs: BTreeSet<String> = BTreeSet::new();
         collect_plan_value_referenced_variables(plan, &mut value_refs);
+        let mut zero_hop_sources: BTreeSet<String> = BTreeSet::new();
+        collect_zero_hop_expand_sources(plan, &mut zero_hop_sources);
         Self {
             referenced_aliases: refs,
             value_referenced_aliases: value_refs,
+            zero_hop_sources,
             transactional_property_reads: plan_requires_transactional_property_reads(plan),
         }
     }
