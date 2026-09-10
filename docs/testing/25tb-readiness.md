@@ -1128,25 +1128,48 @@ its COMPLETE edge set); the hop loop collects every partner into
 `unique_targets` before any cap applies, `prepare_expand_targets`
 hydrates all of them, and the truncation to 25 happens above the operator.
 
-**Two independent costs, and only one is cheap to fix.** From the shape
-breakdown at degree 120k: `count(*)` (target unreferenced, membership
-only) is 0.46 s while `count(t)` (hydrating) is 1.87 s. So hydration is
-~75% and the adjacency read ~25%.
+**Where the time actually goes.** Isolated at degree 160,000 — note that
+all four shapes must be compared on ONE dataset, since the cheap
+membership path needs a LABELLED target and comparing across fixtures
+gives a misleading split:
 
-1. *Executor.* Bounding the hydration set would recover the ~75%. It
-   cannot be a plain truncation of `unique_targets`: the per-edge loop
-   has eight `continue` paths (label mismatch, membership, trail rule,
-   visited-set pruning), so taking the first N edges UNDERFILLS whenever
-   any edge is rejected — fewer rows than asked for, which is a wrong
-   answer rather than a slow one. It needs a wave loop: hydrate a bounded
-   chunk, run the per-edge loop over exactly that chunk, and take another
-   chunk only if the cap is not yet met. Order is preserved because the
-   chunks are consecutive.
-2. *Storage.* The remaining ~25% needs the limit to reach the edge read
-   itself. `out_edges(edge_type, src) -> EdgeListView` has no limit
-   parameter and materialises the whole partner list, so no executor-side
-   change can avoid it. This is the part that genuinely wants the
-   hierarchical adjacency work from finding #3.
+| shape | time | path |
+|---|---|---|
+| `(t:FAT)` + `count(*)` | **0.63 s** | adjacency read + label-membership sidecar |
+| `(t:FAT)` + `count(t)` | 2.37 s | + full hydration |
+| `()` + `count(*)` | 2.24 s | unlabelled: no membership path available |
 
-Doing (1) alone turns 2.42 s into roughly 0.6 s at degree 160k — worth
-having, but state it as ~4x rather than implying the cliff is gone.
+So hydration is ~1.74 s of 2.37 s (**~73%**) and the adjacency read plus
+membership is ~0.63 s (**~27%**).
+
+1. *Executor — recovers the ~73%.* Bounding the hydration set cannot be a
+   plain truncation of `unique_targets`: the per-edge loop has eight
+   `continue` paths (label mismatch, membership, trail rule, visited-set
+   pruning), so taking the first N edges UNDERFILLS whenever any edge is
+   rejected — fewer rows than asked for, a wrong answer rather than a slow
+   one. It needs a wave loop: hydrate a bounded chunk, run the per-edge
+   loop over exactly that chunk, take another chunk only if the cap is not
+   yet met. Order is preserved because the chunks are consecutive.
+2. *Storage — the remaining ~27%.* `out_edges(edge_type, src) ->
+   EdgeListView` has no limit parameter and materialises the whole partner
+   list, so no executor-side change can avoid it. This is the part that
+   genuinely wants the hierarchical adjacency work from finding #3.
+
+### 76. [OPEN — measured, correct by design] An unlabelled unreferenced target cannot use the membership path
+
+At degree 160,000, `count(*)` over `(t:FAT)` takes 0.63 s but over `()`
+takes 2.24 s — **3.5x** — although neither references the target. The
+label-membership sidecar proves "carries label L"; with no label there is
+nothing to prove, and `try_batch_nodes_have_labels` returns `None` with
+the reason stated in place: *"Membership in zero labels does not prove
+that the endpoint itself exists; retain the authoritative node point
+path."* So the expansion falls back to full hydration purely to establish
+that each endpoint exists.
+
+**Unlike items 73/74 this is not a mistaken gate.** Those rested on a
+false belief about `batch_lookup_nodes` being label-scoped; this rests on
+a true constraint. Closing it needs a new storage capability — an
+existence-only batch that decodes the key column rather than the whole
+row (`batch_nodes_exist(ids)`) — not the removal of a condition. Worth
+having: `MATCH (a)-[:R]->() RETURN count(*)` is a common shape and pays
+full hydration for nothing.
