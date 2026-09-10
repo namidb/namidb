@@ -3176,7 +3176,15 @@ async fn apply_delete(
                     // without DETACH is an error, never a silent commit of
                     // dangling edges — which reads would then resurrect as
                     // half-broken traversal results.
-                    return Err(ExecError::Runtime(format!(
+                    // A Constraint, not a Runtime error: this is the
+                    // caller's statement being wrong, and it classifies as
+                    // 409 + `Neo.ClientError.Schema.ConstraintValidationFailed`
+                    // — exactly what Neo4j returns here. As a Runtime error it
+                    // surfaced as HTTP 500 + `Neo.DatabaseError`, so drivers
+                    // and retry middleware treated a permanent user mistake as
+                    // a transient server fault and retried it forever, and it
+                    // counted against server error budgets.
+                    return Err(ExecError::Constraint(format!(
                         "cannot DELETE a node that still has relationships \
                          (found {edge_type}); use DETACH DELETE to remove the \
                          node and its relationships"

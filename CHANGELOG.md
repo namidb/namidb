@@ -17,6 +17,18 @@ crates.io release will establish and document that API explicitly.
 
 ## [2.6.10] - 2026-09-10
 
+### Fixed
+
+- **Deleting a connected node without `DETACH` now returns 409, not 500.** The
+  error was raised as a runtime fault, so it fell to the unclassified arm and
+  surfaced as `HTTP 500` with `Neo.DatabaseError` — a permanent caller mistake
+  reported as a transient server fault. Retry middleware retried it forever,
+  and it counted against server error budgets. It is now a constraint
+  violation: `409 Conflict`,
+  `Neo.ClientError.Schema.ConstraintValidationFailed`, `gql_status 23000` —
+  exactly Neo4j's classification for this case. The message, which already
+  named the remedy, is unchanged.
+
 ### Performance
 
 - **`LIMIT` now bounds an expansion's work instead of costing the full
