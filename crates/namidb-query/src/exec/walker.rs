@@ -1810,7 +1810,7 @@ pub(crate) async fn execute_expand(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
-                max == 1,
+                true,
             )
             .await?;
             for (step, neighbours) in step_neighbours {
@@ -1893,12 +1893,23 @@ pub(crate) async fn execute_expand(
                         }
                         None
                     } else if let ExpandTargets::Views(views) = &target_membership {
-                        // Single-hop expansion, labelled or not: the hop's
-                        // own materialisation answers directly, so a large
-                        // fan-out no longer depends on cache retention.
+                        // The hop's own materialisation answers directly, so a
+                        // large fan-out no longer depends on cache retention.
+                        // The batch resolves by id across every descriptor, so
+                        // it describes nodes of ANY label — which is what lets
+                        // a multi-hop traversal use it too.
                         match views.get(&target_id) {
                             Some(v) => {
                                 if target_labels.iter().all(|l| v.labels.contains(l)) {
+                                    Some(v.clone())
+                                } else if max > 1 {
+                                    // Multi-hop: the far-end label decides
+                                    // whether this node is a RESULT, never
+                                    // whether it may be traversed. Pruning the
+                                    // frontier on a mismatch is what made
+                                    // `(s)-[:R*1..n]->(a:L)` return empty when
+                                    // the intermediates were not themselves L.
+                                    target_is_result = false;
                                     Some(v.clone())
                                 } else {
                                     continue;
@@ -1909,10 +1920,16 @@ pub(crate) async fn execute_expand(
                             // reader so a batch that under-reports can never
                             // drop a real row.
                             None => match scan_node_for_id(snapshot, target_id).await? {
-                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v) => {
+                                    let matches =
+                                        target_labels.iter().all(|l| v.labels.contains(l));
+                                    if !matches && max == 1 {
+                                        continue;
+                                    }
+                                    target_is_result = matches;
                                     Some(v)
                                 }
-                                _ => continue,
+                                None => continue,
                             },
                         }
                     } else if let Some(label) = target_labels.first() {
@@ -2023,12 +2040,17 @@ pub(crate) async fn execute_expand(
                     if let Some(k) = &edge_key {
                         new_rels.push(k.clone());
                     }
-                    // A single-hop expansion never runs another round, so the
-                    // frontier entry is dead on arrival — and it costs a DEEP
-                    // clone of the row (every binding, whole node values
-                    // included) per matched edge. At a 53k-degree hub that was
-                    // hundreds of MB of pure waste (sixth field report).
-                    if max > 1 {
+                    // The frontier feeds the NEXT round, so on the last hop
+                    // every entry is dead on arrival — and each one costs a
+                    // DEEP clone of the row (every binding, whole node values
+                    // included), its trail and its relationship list, per
+                    // matched edge. This was fixed for `max == 1` after a
+                    // 53k-degree hub turned it into hundreds of MB of pure
+                    // waste (sixth field report); `hop == max` is the same
+                    // waste for exactly the same reason, and a `*1..2` over a
+                    // 300x300 fan-out spent longer building the doomed
+                    // frontier than answering the query.
+                    if hop < max {
                         next_frontier.push(Step {
                             tail: target_id,
                             row: new_row.clone(),
@@ -8701,7 +8723,7 @@ async fn execute_expand_factor(
                 target_labels,
                 &unique_targets,
                 skip_target_materialize,
-                max == 1,
+                true,
             )
             .await?;
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
@@ -8746,12 +8768,23 @@ async fn execute_expand_factor(
                         }
                         None
                     } else if let ExpandTargets::Views(views) = &target_membership {
-                        // Single-hop expansion, labelled or not: the hop's
-                        // own materialisation answers directly, so a large
-                        // fan-out no longer depends on cache retention.
+                        // The hop's own materialisation answers directly, so a
+                        // large fan-out no longer depends on cache retention.
+                        // The batch resolves by id across every descriptor, so
+                        // it describes nodes of ANY label — which is what lets
+                        // a multi-hop traversal use it too.
                         match views.get(&target_id) {
                             Some(v) => {
                                 if target_labels.iter().all(|l| v.labels.contains(l)) {
+                                    Some(v.clone())
+                                } else if max > 1 {
+                                    // Multi-hop: the far-end label decides
+                                    // whether this node is a RESULT, never
+                                    // whether it may be traversed. Pruning the
+                                    // frontier on a mismatch is what made
+                                    // `(s)-[:R*1..n]->(a:L)` return empty when
+                                    // the intermediates were not themselves L.
+                                    target_is_result = false;
                                     Some(v.clone())
                                 } else {
                                     continue;
@@ -8762,10 +8795,16 @@ async fn execute_expand_factor(
                             // reader so a batch that under-reports can never
                             // drop a real row.
                             None => match scan_node_for_id(snapshot, target_id).await? {
-                                Some(v) if target_labels.iter().all(|l| v.labels.contains(l)) => {
+                                Some(v) => {
+                                    let matches =
+                                        target_labels.iter().all(|l| v.labels.contains(l));
+                                    if !matches && max == 1 {
+                                        continue;
+                                    }
+                                    target_is_result = matches;
                                     Some(v)
                                 }
-                                _ => continue,
+                                None => continue,
                             },
                         }
                     } else if let Some(label) = target_labels.first() {

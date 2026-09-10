@@ -15,6 +15,28 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.6] - 2026-09-10
+
+### Fixed
+
+- **Variable-length traversals of two hops or more no longer read one node
+  per edge.** The batched endpoint materialisation was restricted to single
+  hops, so every multi-hop traversal fell back to an authoritative point read
+  per edge. On a 300x300 fan-out (90,000 paths), `-[:A|B*2..2]->` and
+  `-[:A|B*1..2]->` both exceeded a 120s deadline; they now take 1.7s and
+  0.4s, matching the explicitly-spelled two-hop form. The batch resolves by
+  id across every node descriptor, so it describes nodes of any label — the
+  property that made the single-hop restriction unnecessary. The far-end
+  label still gates only whether a node is a RESULT, never whether it may be
+  traversed.
+- An expansion no longer builds a frontier on its final hop. The frontier
+  feeds the next round, so on the last hop every entry is discarded
+  immediately — after a deep clone of the row, its trail and its
+  relationship list, per matched edge. This was already avoided for
+  single-hop expansions; it is the same waste for the same reason at
+  `hop == max`.
+
+
 ## [2.6.5] - 2026-09-10
 
 ### Fixed
@@ -3208,7 +3230,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.5...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.6...HEAD
+[2.6.6]: https://github.com/namidb/namidb/compare/v2.6.5...v2.6.6
 [2.6.5]: https://github.com/namidb/namidb/compare/v2.6.4...v2.6.5
 [2.6.4]: https://github.com/namidb/namidb/compare/v2.6.3...v2.6.4
 [2.6.3]: https://github.com/namidb/namidb/compare/v2.6.2...v2.6.3
