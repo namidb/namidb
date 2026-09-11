@@ -354,12 +354,39 @@ pub(crate) struct DrainSummary {
     /// landed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Passes abandoned because a background compactor installed first. Not
+    /// an error: the work was done by the other pass, and this drain
+    /// re-prepared against the manifest it left. Reported because a drain
+    /// that spends most of its passes losing races is a signal in itself.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub races_lost: usize,
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Bound on passes for one drain request, so a pathological churn rate
 /// cannot pin the writer forever. Each pass merges at least one bucket, so
 /// this is generous for any real L0 depth.
 const MAX_DRAIN_PASSES: usize = 128;
+
+/// Consecutive passes this drain may lose to a background compactor before
+/// giving up and reporting.
+///
+/// The drain does NOT go through [`CompactionScheduler::admit`] — it runs
+/// its passes directly — so a worker started by something else (a
+/// `CREATE INDEX` schedules one for its own backfill) can install between
+/// this drain's prepare and its install. The prepared plan then names an
+/// input the winner already merged away, and storage abandons it with a
+/// `Precondition`, which `run_compaction_pass` already labels `Stale`: the
+/// work happened, just not by this pass. Re-preparing against the manifest
+/// the winner left is the correct response.
+///
+/// Bounded, and deliberately far below `MAX_DRAIN_PASSES`: each retry pays
+/// a full prepare, so a drain that cannot win in this many consecutive
+/// attempts should report rather than burn the writer.
+const MAX_CONSECUTIVE_RACES_LOST: usize = 8;
 
 /// Drain L0 by running compaction passes back to back until nothing is left
 /// to merge. This is the "catch up before you serve" step after a bulk
@@ -377,6 +404,7 @@ pub(crate) async fn drain_compaction(
     cancel: Option<&watch::Receiver<bool>>,
 ) -> namidb_storage::Result<DrainSummary> {
     let mut summary = DrainSummary::default();
+    let mut consecutive_races_lost = 0_usize;
     for pass in 0..MAX_DRAIN_PASSES {
         // Same exclusion the scheduler takes around every pass. Without it a
         // concurrent orphan sweep can delete an object this pass is about to
@@ -412,6 +440,7 @@ pub(crate) async fn drain_compaction(
                 summary.source_ssts_removed += outcome.source_ssts_removed;
                 summary.new_ssts_written += outcome.new_ssts_written;
                 summary.manifest_version = outcome.committed.manifest.version;
+                consecutive_races_lost = 0;
             }
             Ok(CompactionPass::Noop | CompactionPass::Cancelled) => {
                 // Read the depth back rather than trusting the last applied
@@ -420,6 +449,19 @@ pub(crate) async fn drain_compaction(
                 // while files are already stacking up again.
                 summary.observe_idle(writer).await;
                 return Ok(summary);
+            }
+            // Losing the install race is not a failure of the drain — the
+            // merge it prepared was performed by whoever won, and the right
+            // response is to re-prepare against the manifest they left.
+            // Answering 500 here made `POST /v0/admin/compact` fail outright
+            // whenever a `CREATE INDEX` had just scheduled its own backfill
+            // pass, which is precisely when an operator reaches for it.
+            Err(namidb_storage::Error::Precondition(_))
+                if consecutive_races_lost < MAX_CONSECUTIVE_RACES_LOST =>
+            {
+                consecutive_races_lost += 1;
+                summary.races_lost += 1;
+                continue;
             }
             // A pass can lose the manifest install race to a concurrent
             // writer. Whatever earlier passes committed is durable and real,

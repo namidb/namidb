@@ -1442,176 +1442,283 @@ If an exact-answer fast path is ever wanted, it needs a per-label
 sets when it recomputes from survivors. That does not exist today, and
 inventing it is a manifest format change.
 
-### 80. [OPEN — root cause found] Filtered scans prune nothing: the predicate never reaches storage
+### 80. [PARTLY FIXED in 2.6.14 — equality; ranges are a missing capability, not a wiring bug] Filtered scans prune nothing
 
-Measured at 160,000 nodes, one label, one projected column. The times do
-not depend on selectivity at all:
+Re-measured on 2.6.14, same 160,000-node fixture, `idx` declared as an
+index, one projected column:
 
-| query | rows returned | time |
-|---|---|---|
-| `WHERE t.idx > 999999` (outside every value in the store) | **0** | 0.377 s |
-| `WHERE t.idx < -5` (outside, low side) | **0** | 0.468 s |
-| `WHERE t.idx = 12345` | 1 | 0.375 s |
-| `WHERE t.idx > 159990` | 9 | 0.412 s |
-| `WHERE t.idx > 80000` | 79,999 | 0.417 s |
-| no filter (manifest fast path) | 160,000 | **0.001 s** |
+| query | rows | 2.6.13 | 2.6.14 | route |
+|---|---|---|---|---|
+| `WHERE t.idx = 12345` | 1 | 0.375 s | **0.000078 s** | index |
+| `{idx: 12345}` | 1 | — | **0.000060 s** | index |
+| `WHERE t.idx > 999999` (matches nothing) | 0 | 0.377 s | 0.311 s | scan |
+| `WHERE t.idx < -5` (matches nothing) | 0 | 0.468 s | 0.399 s | scan |
+| `WHERE t.idx > 159990` | 9 | 0.412 s | 0.292 s | scan |
+| `WHERE t.idx > 80000` | 79,999 | 0.417 s | 0.340 s | scan |
+| no filter (manifest fast path) | 160,000 | 0.001 s | 0.000030 s | — |
 
-A predicate that provably matches nothing costs the same as one matching
-half the store. Nothing is being skipped.
+**Equality is fixed** — by item 81, not by anything done here. What remains
+is RANGE predicates, and they are still completely insensitive to
+selectivity: a predicate matching nothing costs the same as one matching
+half the store.
 
-**Root cause, and it is not a missing feature — it is two implemented
-features that are not wired.**
+**THE DIAGNOSIS IN THE TWO PREVIOUS VERSIONS OF THIS ENTRY WAS WRONG, TWICE.**
+Both said this was a wiring problem — "two implemented features that are not
+wired". It is not. Recorded in full, because the wrong version would have
+sent someone to do work that cannot help:
 
-1. *Parquet row-group pruning.* `EnabledStatistics::Chunk` is configured
-   (sst/nodes.rs:1515) so per-row-group column statistics ARE written, and
-   `eval_row_group` + `PropertyColumnStats` (sst/predicates.rs:93) decide
-   Absent/MaybePresent from them. But the branch that serves a PROJECTED
-   scan — the common shape, and the one EXPLAIN shows here
-   (`projection=[idx] predicates=[t.idx > 159990]`) — builds a
-   `LimitedNodeBatchContext` carrying `predicates` and then opens the
-   stream with `node_scan_limited_async(..., &[], Some(&[]), ...)`
-   (read.rs:5735-5741): empty predicates, empty projection. Four of the
-   five call sites in read.rs pass `&[]`; only one passes `predicates`.
-2. *Property-page predicate filtering.* `NodePropertyPageReader::filter_node_ids`
-   (property_pages.rs:2088) and the whole `NodePropertyPredicate` IR
-   (property_pages.rs:255) are implemented and unit-tested — and **dead in
-   production**: the only callers are at property_pages.rs:3518 and 3541,
-   both inside the `#[cfg(test)]` module that begins at line 3372, and
-   `NodePropertyPredicate::` is never constructed anywhere outside its own
-   file.
+1. *"Wire the predicates into the projected-scan branch."* There is nothing
+   to wire them into. A node SST is written with an **empty LabelDef** and
+   therefore has **no `prop_*` columns at all** — flush.rs states it
+   outright: *"one identity-partitioned SST spanning every label, built with
+   an empty LabelDef (fixed layout — no prop_* columns; every property rides
+   in `__overflow_json`)"*. `node_arrow_schema` of an empty LabelDef is six
+   engine columns and nothing else, and
+   `scan_with_predicates_and_projection_async` rejects any file that does
+   not match it exactly. So there are no per-row-group property statistics
+   for `eval_row_group` to read: `node_scan_plan` resolves no column,
+   `PropertyColumnStats::empty` has `min`/`max` of `None`, and every arm of
+   `eval_row_group` answers `MaybePresent` when the bound is absent. Passing
+   the predicates through would prune exactly zero row groups.
 
-So a filtered projected scan reads and materialises every row and
-evaluates the predicate row-by-row.
+   (The `eval_row_group` / `synthesize_property_stats` machinery is not dead
+   code — it serves LEGACY label-scoped SSTs, whose `scope` names a single
+   label and whose LabelDef therefore does carry properties. The current
+   writer no longer produces those.)
 
-**Also measured: the cost is per-ROW, not per-byte.** `count(t.pad)` over
-a 900-byte string column costs 0.433 s against `count(t.idx)` over an
-8-byte integer column at 0.466 s — indistinguishable. Two columns cost
-0.676 s against one at 0.466 s. That is a fixed per-row overhead
-(materialisation into `Row` / `RuntimeValue`) dominating, which is why
-scalar aggregates (item 79) sit at ~0.47 s regardless of the column.
+2. *"Wire `NodePropertyPageReader::filter_node_ids`."* Its predicate IR is
+   `EqString`, `InString`, `EqBool`, `InBool`, and an explicit
+   `Unsupported` — **no range predicates of any kind**. It could not serve a
+   single one of the slow queries above, and for the equality shapes it does
+   support, the equality posting sidecar already does the job better.
 
-**What this means for finding #8.** The remaining work is not "build
-aggregation pushdown". It is, in order of value:
-1. Wire ONE of the two existing predicate paths into the projected-scan
-   branch. This makes every selective filter selective, not just
-   aggregates.
-2. Then consider vectorised aggregation over the decoded Arrow column, to
-   remove the per-row materialisation that item 79 measured.
+   The `.npp` pages also carry no per-property `min`/`max`: their page
+   metadata is size limits (`max_value_bytes`, `max_page_decoded_bytes`, …),
+   not value statistics.
 
-**The `&[]` is not an oversight — and knowing why is the whole handoff.**
-That branch reads properties from the `.npp` sidecar addressed by a
-RUNNING ROW ORDINAL:
+**An earlier same-day correction in this entry was also wrong** — it said
+the blocker was `label_def_for_node_sst` returning an empty property list
+for id-primary SSTs, and proposed resolving the predicate column against the
+manifest schema instead. That empty LabelDef is a faithful description of
+the file layout, not an oversight: resolving a column name that has no
+Parquet column would find nothing.
 
-    let mut next_ordinal = 0_u64;                      // read.rs:5754
-    ...
-    next_ordinal = next_ordinal.checked_add(batch.num_rows() as u64)
-    ...
-    if next_ordinal != desc.row_count {                // read.rs:5812
-        return Err(Error::invariant("node property/Parquet row-count mismatch"));
-    }
+**So this is a MISSING CAPABILITY.** Node properties have no value
+statistics anywhere in the current format — not in Parquet, not in the
+property pages. No layer can answer "this page cannot contain a value
+> 999999", so every range predicate reads every row.
 
-The ordinal must stay aligned with the sidecar, so the branch requires
-seeing EVERY row group — and it self-checks that it did. Handing Parquet
-the predicates would make it skip row groups, the ordinal would fall
-short, and that invariant would fire. So the current code is correct and
-defensive, not careless.
+**The path that does exist, and why 2.6.14 opened it.** The equality
+sidecar is a range-readable B+tree keyed by the encoded scalar, and
+`ordered_node_ids_by_string_property` already positions by value within it
+for `ORDER BY <string prop> LIMIT k`. Item 81's numeric key was made
+ORDER-PRESERVING for exactly this reason: `sortable_f64_bits` maps an f64
+onto a u64 whose unsigned order is the number's order, so the same B+tree
+can be positioned at `> x` for numbers too. Raw IEEE-754 bits would have
+sorted negatives backwards — which costs an equality probe nothing, and
+would have foreclosed every ordered read over those postings without anyone
+noticing until the format was already in the wild.
 
-**What wiring it therefore requires**: advancing `next_ordinal` by the row
-count of each SKIPPED row group (available in the footer metadata that
-this branch already fetches and caches), so the sidecar stays addressable.
-The existing invariant check is the safety net for getting it wrong — it
-turns a silent row loss into a hard error, which is why it should be kept
-and not relaxed.
+Order of work, corrected:
+1. An ordered/range numeric read over the equality sidecar — the twin of
+   `ordered_node_ids_by_string_property`, using the order-preserving key.
+   This serves `WHERE n.amount > x` on an INDEXED property, which is the
+   case operators actually declare an index for.
+2. Only then consider value statistics in the property pages, for ranges on
+   UNINDEXED properties. That is a storage-format change and wants its own
+   design.
+3. Separately, and still true from the original entry: the cost is per-ROW,
+   not per-byte — `count(t.pad)` over a 900-byte string column costs the
+   same as `count(t.idx)` over an 8-byte integer, and two columns cost more
+   than one. That is `Row`/`RuntimeValue` materialisation dominating, and it
+   is what caps every scalar aggregate at ~0.3 s regardless of the column.
+   Vectorised aggregation over the decoded Arrow column is the fix, and it
+   is independent of everything above.
 
-**Why this was not wired tonight.** Even with the accounting understood, a
-page- or row-group-level decision that disagrees with the row-level
-evaluation drops rows, which is the failure mode that produced five bugs
-in this codebase this week. It wants the equivalence harness pointed at it
-(filtered scan vs unfiltered-then-filter across a matrix of predicate
-shapes, types, nulls and absent properties) and an adversarial review —
-not the tail of an eleven-release day.
+**A note for whoever picks this up**: the default row group is 128Ki rows,
+so any fixture under ~500k rows has too few row groups to show row-group
+pruning at all. That mattered for the original (wrong) framing; it does not
+change the conclusion, since the layout carries no property statistics at
+any row-group count.
 
-**A caveat I got WRONG the first time, corrected here.** I originally wrote
-that nodes are id-primary so a property is "scattered across row groups in
-UUID order" and pruning could not help. That reasoning is false: `NodeId`
-is `Uuid::now_v7()` — TIME-ordered — so id order tracks insertion order,
-and a property written in a correlated order (a sale date, an incrementing
-code) lands in narrow per-row-group ranges. Pruning would help such a
-property a great deal.
-
-What is true is the measurement, and it survived a much better fixture:
-with `NAMIDB_NODE_SST_ROW_GROUP_ROWS=4096` (≈39 row groups instead of the
-2 the 128Ki default gives at 160k rows), an `idx` written in ascending
-order, and the property declared as an index so it is a physical column,
-the times are still flat — 0.331 s for a predicate matching nothing,
-0.321 s for one matching 9 rows, 0.330 s for one matching half. Nothing is
-pruned, and the reason is the one verified in the source above: the
-predicate never reaches Parquet.
-
-**Two notes for whoever picks this up.** First, the default row group is
-128Ki rows, so any fixture under ~500k rows has too few row groups to show
-pruning at all — set `NAMIDB_NODE_SST_ROW_GROUP_ROWS` when testing this.
-Second, the whole-node branch (`RETURN t`, which DOES pass `predicates`)
-is also insensitive to selectivity — 1.315 s at zero rows against 1.389 s
-at nine — so something blocks pruning there too and it was not determined.
-Establish that before assuming the projected branch is the only gap.
-
-### 81. [OPEN — highest remaining value, fully scoped] Numeric equality never uses an index
+### 81. [FIXED in 2.6.14] Numeric equality never uses an index
 
 Same data, same cardinality, an index declared on both properties, 160,000
 nodes where each row carries the same key as a string and as an integer:
 
-| query | time | route |
+| query | before | after |
 |---|---|---|
-| `MATCH (t:STR {txt: '12345'})` | **0.001 s** | index, posting lookup |
-| `MATCH (t:STR {num: 12345})` | **1.603 s** | full scan |
+| `MATCH (t:STR {txt: '12345'})` | 0.001 s | 0.000107 s |
+| `MATCH (t:STR {num: 12345})` | **1.603 s** | **0.000080 s** |
 
-**1600x, purely because the property is numeric.** EXPLAIN says so in
+**1600x, purely because the property was numeric.** EXPLAIN said so in
 plain text: *"numeric equality is not posting-indexed; only String/Bool
-are"*. `CREATE INDEX ... ON (n.numeric_prop)` is accepted and does
-nothing for equality.
+are"*. `CREATE INDEX ... ON (n.numeric_prop)` was accepted and did nothing
+for equality.
 
-For a retail or clinical graph this is most of the schema — quantities,
-prices, amounts, numeric product codes, foreign keys. Note the reporter's
-own `cod_item` is a STRING (`'100565537'`), which is why their constraint
-lookups were fast; any numeric property they index gets nothing.
+For a retail or clinical graph that is most of the schema — quantities,
+prices, amounts, numeric product codes, foreign keys. The reporter's own
+`cod_item` is a STRING (`'100565537'`), which is why their constraint
+lookups were fast; any numeric property they indexed got nothing.
 
-**This is a performance gap only — the scan path is CORRECT.** Verified by
-a 102-combination filter-vs-expression sweep after the 2.6.12 coercion
-fix: every operator and type agrees. So this can be left open safely.
+Numeric equality is now served by the same posting sidecars a string key
+uses. Measured in-process against the route it used to be forced onto, on
+160k rows: **525 ms scan vs 80 us index, 6561x** (the ignored measurement
+test `numeric_equality_is_not_orders_of_magnitude_slower_than_string`).
+It is now marginally FASTER than its string twin, because the canonical
+numeric key is a fixed 16 hex characters while a string key is raw and
+variable-length.
 
-**What it actually requires** — five coordinated places, each of which can
-silently drop rows if it disagrees with the others:
+**How it works.** One canonical key per numeric value: both `I64(5)` and
+`F64(5.0)` encode to `n:{f64 bits}`, because Cypher says they are equal
+and two values that compare equal MUST share a posting or the index route
+drops rows the scan returns. Above 2^53 that key is lossy and distinct
+integers collide — a deliberate FALSE POSITIVE, removed at confirm time by
+`cypher_scalar_equal`, the same function TupleV1 already used for
+composite members.
 
-1. *Harvester filter*, flush.rs (~1847) and compact.rs (~571): both hard
-   `matches!(p.data_type, Utf8 | LargeUtf8 | Bool)`. Compaction re-derives
-   sidecars from scratch, so a flush-only change vanishes at the first
-   merge.
-2. *Key encoding*, `encode_equality_property_value`: it ALREADY handles
-   I64/F64/Date/DateTime/Bytes with order-preserving encodings — but it
-   emits `i:{hex}` for an integer and `f:{hex}` for a float, so `5` and
-   `5.0` produce DIFFERENT keys while Cypher says they are equal. The
-   composite path already solved exactly this: TupleV1 canonicalises
-   numeric members to f64 and confirms with coercing equality (recorded
-   above under the composite-index work). The single-property index needs
-   the same canonicalisation. Collisions from i64 values beyond 2^53 are
-   safe *provided* the confirm step (3) actually filters.
-3. **THE TRAP** — `batch_confirm_multi_candidates` (read.rs ~2775) filters
-   candidates with
-   `matches!(view.properties.get(property), Some(Value::Str(current)) if current == &value)`.
-   It matches `Value::Str` and NOTHING ELSE. Widening the index without
-   widening this makes every numeric lookup confirm zero candidates and
-   return an empty result — silently. This is the single most dangerous
-   line in the change.
-4. *Planner route*, the rule behind the EXPLAIN note (plan/explain.rs
-   ~1061 and the matching decision in `optimize/unique_lookup.rs`).
-5. *Back-compat*, which is unusually easy here: existing sidecars contain
-   NO numeric keys at all, so widening ADDS keys without changing any
-   existing one. `EqualityIndexDescriptor.key_encoding` already exists for
-   versioning if a canonical numeric encoding needs its own tag.
+**What the scoped plan got right, and what it got wrong.** Worth recording,
+because four of the five scoped places turned out to be somewhere else:
 
-**Acceptance before this ships**: the equivalence harness pointed at
-indexed-vs-unindexed results for numeric equality across Int/Float
-spellings, integral floats, values beyond 2^53, negatives, and a
-string-vs-number pair that must NOT match — plus the same after flush AND
-after compaction, since (1) means the two writers must agree.
+1. *Harvester filter* — correct, and both writers did have to change
+   together. They share ONE collector (`EqualitySidecarCollector`, imported
+   by compact.rs from flush.rs), so a single edit covered both. The
+   declaration gate widened to Int32/Int64/Float32/Float64; the runtime
+   harvest for those properties widened to I64/F64 **on top of** the
+   String/Bool baseline, which stays because such a property can still hold
+   a legacy string that a string probe must not miss.
+2. *Key encoding* — correct. Canonicalised as described above.
+3. **THE TRAP was real but in the wrong place.** The `Value::Str`-only
+   filter in `batch_confirm_multi_candidates` sits on the string-typed
+   BATCH API, which numerics never reach. The confirm that actually
+   mattered was `view.properties.get(property) == Some(value)` in
+   `indexed_node_ids_by_property_value_inner` — a TYPED `==`, which would
+   have filed `5` and `5.0` together under the canonical key and then
+   thrown one of them away. It is now `cypher_scalar_equal`.
+4. *Planner route* — **there was no planner gate.** The optimizer already
+   emitted `NodeByPropertyValue` for numeric literals; `unique_lookup.rs`
+   never excluded them. The EXPLAIN note was simply describing a decision
+   made three layers down, and was replaced with real coverage reporting.
+5. *Back-compat* — **`key_encoding` was the wrong versioning hook.** It is
+   an externally-tagged enum, so a rolled-back reader meeting an unknown
+   variant fails to deserialise the WHOLE manifest and cannot open the
+   namespace. Coverage is a new `#[serde(default)] numeric_complete` field
+   instead: serde ignores an unknown field, the widened sidecar is a strict
+   superset, and a pre-numeric reader keeps probing its string keys exactly
+   as completely as before. Asserted in `manifest_rollback_204`.
+
+**The place the scope missed entirely** — and the actual reason nothing
+reached storage: `non_numeric_index_value` in exec/walker.rs dropped every
+non-string probe before the index path was attempted, so neither route
+counter even moved. Now `indexable_probe_value`, which admits numbers
+(NaN excepted: it equals nothing in Cypher and has no canonical key).
+
+**A second missed interaction, closed by measurement of the code rather
+than by the plan.** `ordered_node_ids_by_string_property` walks the same
+sidecar in KEY order for `ORDER BY <string prop> LIMIT k`. Tagged numeric
+keys filed into a sidecar it reads would sort among raw strings. They
+cannot be: the declaration gate scopes numeric harvesting to
+numeric-declared properties, and that iterator admits only Utf8/LargeUtf8
+ones. `union_indexed_props` already resolved a property declared numeric
+on one label and text on another IN FAVOUR of text — written for another
+reason, but exactly the right tie-break here, and now documented as
+load-bearing with a test
+(`a_string_declaration_downgrades_a_same_named_numeric_index`). The cost
+is a numeric index quietly downgraded to the scan whenever another label
+declares the same property name as a string; `numeric_complete` reports
+that honestly, so EXPLAIN shows the scan fallback instead of claiming an
+index that is not there.
+
+**Migration.** Existing SSTs carry no numeric keys and report
+`numeric_complete: false`, so numeric equality on them keeps the scan
+route — correct, at exactly today's cost. The DDL-backfill arm in
+`node_descriptor_needs_non_record_migration` now also demands numeric
+coverage for a numeric-declared indexed property, so the next compaction
+pass rewrites those buckets and the postings materialise on pre-existing
+data. EXPLAIN reports the interim state as
+`numeric postings {covered}/{total} SSTs`.
+
+**Acceptance**: `crates/namidb-query/tests/numeric_equality_index.rs` —
+13 indexed-vs-unindexed spellings that must return identical multisets
+(Int/Float spellings, integral floats, fractional floats, negatives,
+`-0.0` vs `0.0`, a string-vs-number pair that must NOT match, NULL, `IN`,
+and the two i64 beyond 2^53 that share a key), run at memtable, after
+flush, AND after compaction — plus a plan-shape assertion that the query
+anchors on `NodeByPropertyValue` with no `NodeScan`, and a route-counter
+assertion that the lookup is served natively. Result parity alone would
+have passed with the fix reverted; the scan is already correct.
+
+**Follow-up, deliberately not taken here.** Numerics take one posting
+lookup per distinct value instead of joining the batched string path: the
+batch entry points (`batch_lookup_nodes_by_property*`) are `&[String]`-
+typed, and their confirm/group helpers filter on `Value::Str` in ten
+places in read.rs. A correlated `UNWIND $keys ... MATCH (n {num: key})`
+over N distinct numeric keys therefore costs N posting probes rather than
+one batch — vastly better than N full scans, but not yet at string parity.
+Making that change means widening the string-typed API surface and all ten
+confirm sites at once; it is a larger blast radius than this item needed,
+and the accounting is asserted explicitly in
+`global_correlated_match_batches_direct_set_and_delete_with_rollback`.
+
+**The search-LSM prefilter is deliberately untouched.** Its native-filter
+property list feeds the catalog signature, so widening it retires every
+vector/text generation for rebuild. Its numeric exclusion is locked by
+`vector_prefilter_never_narrows_cross_typed_numeric_equality` and should
+be lifted with that subsystem.
+
+### 82. [FIXED in 2.6.14] `POST /v0/admin/compact` returned 500 after a `CREATE INDEX`
+
+Found while wiring the item 81 migration path into the EXPLAIN surface
+test — which is to say, found by trying to USE the migration the release
+notes describe. The admin drain answered a DDL-triggered compaction with
+
+    500 {"error":"compaction failed: precondition failed: abandoning
+         prepared compaction: Nodes input <uuid> is missing or ambiguous"}
+
+Reproduction: seed rows -> `POST /v0/admin/flush` -> `CREATE INDEX ... FOR
+(p:Label) ON (p.prop)` -> `POST /v0/admin/compact`. That is exactly the
+sequence an operator runs — "I declared the index, now materialize it".
+
+**Pre-existing, and not item 81's doing.** It reproduces with the numeric
+rewrite trigger disabled. What the DDL adds is `needs_compaction() == true`
+via the item-38 backfill arm, so the DDL rewrite path runs at all.
+
+**Root cause: a lost install race reported as a failure.** `CREATE INDEX`
+schedules its OWN backfill pass (lib.rs:3361, the item-38 trigger). The
+admin drain does not go through `CompactionScheduler::admit` — it calls
+`run_compaction_pass` directly — and `compaction_guard()` is a READ guard,
+held by both, which excludes the orphan janitor and not another compactor.
+So the two run concurrently, the DDL worker installs first, and the drain's
+prepared plan names an input the winner already merged away.
+`run_compaction_pass` already labels that `CompactionStatus::Stale` — "a
+competing compaction won the install race" — and then returned it as an
+error, which `drain_compaction` turned into a 500 whenever it happened on
+the FIRST pass (`summary.passes` counts only `Applied`).
+
+**Fix.** Losing the race is not a failure of the drain: the merge it
+prepared was performed by whoever won. It now re-prepares against the
+manifest they left, bounded by `MAX_CONSECUTIVE_RACES_LOST = 8` because
+each retry pays a full prepare, and reports `races_lost` in the drain
+summary so a drain that spends its passes losing races stays visible.
+
+The error messages in `verify_node_rewrite_inputs` now name the basis
+version, the manifest version, and the number of Nodes SSTs, and separate
+"no longer present" (a lost race, benign) from "changed between prepare and
+install" and from a genuinely duplicated id, which is an invariant
+violation rather than a precondition. The original "missing or ambiguous"
+conflated three different problems and cost a long diagnosis; with the new
+message the cause read directly off the failure: *basis v5 … no longer in
+manifest v6*.
+
+Pinned by `admin_compact_survives_the_ddl_backfill_pass_it_races`
+(crates/namidb-server/tests/ddl_index_backfill.rs), verified non-inert by
+reverting the retry and watching it fail. The EXPLAIN surface test now also
+drives the whole migration over HTTP: DDL -> `numeric postings 0/N` ->
+admin compact -> `→ index`.
+
+**Not changed, and worth stating.** The deeper fix is to make the admin
+drain participate in scheduler admission so it cannot run beside a
+background worker at all. That touches the admission state machine
+(leases, coalescing, pending follow-ups) and is a larger change than this
+defect needs; the retry is correct regardless, since an external writer can
+always win a race the drain does not control.

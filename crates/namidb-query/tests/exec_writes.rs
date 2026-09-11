@@ -3005,8 +3005,13 @@ async fn global_correlated_match_batches_direct_set_and_delete_with_rollback() {
         .unwrap();
     assert_eq!(
         writer.property_index_cache().equality_lookup_calls() - lookups_before,
-        1,
-        "all correlated String values must share one global storage batch"
+        2,
+        "all correlated String values must share one global storage batch, \
+         plus one posting lookup for the Integer key — numerics are served by \
+         the equality index now instead of scanning the graph, but they do \
+         not yet JOIN the string batch (the batch entry points are String-\
+         typed). Distinct numeric keys therefore cost one posting probe each; \
+         see the follow-up note in docs/testing/25tb-readiness.md item 81."
     );
     assert_eq!(set_outcome.rows.len(), 6);
     assert_eq!(set_outcome.properties_set, 6);
@@ -3113,7 +3118,9 @@ async fn global_correlated_match_batches_direct_set_and_delete_with_rollback() {
         .unwrap();
     assert_eq!(
         writer.property_index_cache().equality_lookup_calls() - lookups_before,
-        1
+        2,
+        "one shared batch for the String keys, plus the Integer key's own \
+         posting lookup — same accounting as the SET phase above"
     );
     assert!(
         delete_outcome.rows.is_empty(),

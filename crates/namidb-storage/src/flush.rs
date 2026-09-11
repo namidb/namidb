@@ -633,20 +633,39 @@ pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
                     .and_modify(|current| {
                         // The synthetic definition is global: declarations
                         // with the same property name may legitimately use
-                        // different types on different labels.  Its type is
+                        // different types on different labels. Its type is
                         // only a capability marker for the equality
-                        // harvester/planner, so never let an arbitrary
-                        // lexically-first unsupported declaration (for
-                        // example Int64) hide a later String/Bool index.
-                        let current_supported = matches!(
+                        // harvester/planner.
+                        //
+                        // A String/Bool declaration WINS over a numeric one,
+                        // and that tie-break is load-bearing in both
+                        // directions:
+                        //
+                        // - It stops an arbitrary lexically-first declaration
+                        //   from hiding a later String/Bool index, which is
+                        //   why the rule was written.
+                        // - It also keeps tagged numeric keys OUT of any
+                        //   sidecar that `ordered_node_ids_by_string_property`
+                        //   can walk. That iterator reads keys in order for
+                        //   `ORDER BY <string prop> LIMIT k` and admits any
+                        //   label declaring the property Utf8; a numeric key
+                        //   filed alongside would sort among raw strings.
+                        //
+                        // The cost is a numeric index quietly downgraded to
+                        // the scan route whenever another label declares the
+                        // same property name as a string — conservative on
+                        // purpose. `numeric_complete` reports it honestly, so
+                        // EXPLAIN shows the scan fallback rather than
+                        // claiming an index that is not there.
+                        let current_is_text = matches!(
                             current.data_type,
                             DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
                         );
-                        let candidate_supported = matches!(
+                        let candidate_is_text = matches!(
                             p.data_type,
                             DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
                         );
-                        if !current_supported && candidate_supported {
+                        if !current_is_text && candidate_is_text {
                             *current = candidate.clone();
                         }
                     })
@@ -1820,10 +1839,52 @@ pub(crate) fn prepare_equality_property_sidecars(
     collector.finish(paths, level, sst_id, label)
 }
 
+/// Declared types that get a single-property equality posting sidecar.
+///
+/// The one gate shared by the flush collector, the compaction rewrite
+/// trigger, and the reader's route decision. They MUST agree: a type the
+/// trigger demands but the collector declines would rewrite every bucket on
+/// every compaction forever.
+pub(crate) fn equality_indexable(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
+    ) || numeric_data_type(data_type)
+}
+
+/// Declared types whose values Cypher compares numerically. Date/Timestamp
+/// are deliberately excluded: they are ordered, but `date = 5` is not a
+/// Cypher equality, so folding them into the numeric key would buy nothing
+/// and widen the confirm contract.
+pub(crate) fn numeric_data_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+    )
+}
+
+/// One property this collector files postings for, and whether its
+/// declaration makes numeric probes serviceable.
+#[derive(Debug)]
+pub(crate) struct HarvestedProperty {
+    name: String,
+    /// The declared type is numeric, so numeric runtime values are harvested
+    /// too and the descriptor may advertise `numeric_complete`.
+    ///
+    /// Scoped to the DECLARATION on purpose. Widening the harvest for a
+    /// String-declared property would file tagged numeric keys into the same
+    /// sidecar that `ordered_node_ids_by_string_property` walks in key order
+    /// for `ORDER BY <string prop> LIMIT k`, where they would sort among raw
+    /// string keys. Numeric-declared properties are never read by that
+    /// iterator (it requires Utf8/LargeUtf8), so the two stay disjoint.
+    numeric: bool,
+}
+
 /// One property's harvested `value → [id, ...]` postings, in def order.
 ///
 /// Once a property is declared with a ScalarV1-compatible type, the collector
-/// harvests every actually encodable String/Bool runtime value. This is
+/// harvests every actually encodable runtime value it can be PROBED for —
+/// String/Bool always, and numbers as well for a numeric declaration. This is
 /// deliberate even for a legacy label-scoped SST: the raw storage API can
 /// contain rows that predate or disagree with the later schema declaration,
 /// and an authoritative negative-answer index must cover those rows too.
@@ -1831,23 +1892,20 @@ pub(crate) fn prepare_equality_property_sidecars(
 /// posting-list analogue of [`UniqueSidecarCollector`].
 #[derive(Debug)]
 pub(crate) struct EqualitySidecarCollector {
-    properties: Vec<String>,
+    properties: Vec<HarvestedProperty>,
     sorter: crate::sst::external_pairs::ExternalPairSorter,
 }
 
 impl EqualitySidecarCollector {
     pub(crate) fn new(label_def: &LabelDef) -> Result<Self> {
-        let properties: Vec<String> = label_def
+        let properties: Vec<HarvestedProperty> = label_def
             .properties
             .iter()
-            .filter(|p| {
-                p.indexed
-                    && matches!(
-                        p.data_type,
-                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
-                    )
+            .filter(|p| p.indexed && equality_indexable(&p.data_type))
+            .map(|p| HarvestedProperty {
+                name: p.name.clone(),
+                numeric: numeric_data_type(&p.data_type),
             })
-            .map(|p| p.name.clone())
             .collect();
         u32::try_from(properties.len())
             .map_err(|_| Error::invariant("equality property count exceeds u32"))?;
@@ -1858,17 +1916,26 @@ impl EqualitySidecarCollector {
     }
 
     pub(crate) fn observe(&mut self, id: [u8; 16], rec: &NodeWriteRecord) -> Result<()> {
-        for (ordinal, name) in self.properties.iter().enumerate() {
-            let value = rec.properties.get(name);
+        for (ordinal, property) in self.properties.iter().enumerate() {
+            let value = rec.properties.get(&property.name);
             // The declaration only decides whether this property has a
-            // ScalarV1 sidecar. Coverage follows the stored value: both
-            // supported runtime types must be harvested so a schema change,
-            // heterogeneous label, or legacy mismatched row cannot become an
-            // authoritative false miss.
+            // ScalarV1 sidecar. Coverage follows the stored value: every
+            // runtime type this sidecar can be PROBED for must be harvested,
+            // so a schema change, heterogeneous label, or legacy mismatched
+            // row cannot become an authoritative false miss.
+            //
+            // A numeric-declared property is probed for numbers as well, so
+            // it harvests numbers on top of the String/Bool baseline — the
+            // baseline stays because such a property can still hold a legacy
+            // string, and a String probe against it must not miss.
             let compatible = matches!(
                 value,
                 Some(namidb_core::Value::Str(_) | namidb_core::Value::Bool(_))
-            );
+            ) || (property.numeric
+                && matches!(
+                    value,
+                    Some(namidb_core::Value::I64(_) | namidb_core::Value::F64(_))
+                ));
             if let Some(key) = compatible
                 .then_some(value)
                 .flatten()
@@ -1939,13 +2006,14 @@ impl EqualitySidecarCollector {
 
         let mut descriptors = Vec::new();
         let mut bodies = Vec::new();
-        for (((name, builder), legacy), distinct_values) in self
+        for (((property, builder), legacy), distinct_values) in self
             .properties
             .into_iter()
             .zip(builders)
             .zip(legacy)
             .zip(distinct_counts)
         {
+            let HarvestedProperty { name, numeric } = property;
             // One key too wide to page must not cost the property its index:
             // keep the legacy body and mark the accelerator unsupported, which
             // is the same contract the pre-paged writer offered.
@@ -1983,6 +2051,7 @@ impl EqualitySidecarCollector {
                     distinct_values,
                     key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
                     mixed_type_complete: true,
+                    numeric_complete: numeric,
                     format: crate::manifest::PropertyIndexFormat::BincodeV0,
                     paged: upload
                         .as_ref()
@@ -2012,6 +2081,7 @@ impl EqualitySidecarCollector {
                     distinct_values,
                     key_encoding: crate::manifest::EqualityKeyEncoding::ScalarV1,
                     mixed_type_complete: true,
+                    numeric_complete: numeric,
                     format: crate::manifest::PropertyIndexFormat::PagedV1,
                     paged: None,
                     paged_build_unsupported: false,
@@ -3221,6 +3291,70 @@ pub mod builder {
 mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    #[test]
+    fn a_string_declaration_downgrades_a_same_named_numeric_index() {
+        use namidb_core::{DataType, LabelDef, PropertyDef, SchemaBuilder};
+
+        // `code` is numeric on one label and text on another. The union must
+        // resolve to the TEXT declaration, so no tagged numeric key is ever
+        // filed into a sidecar that the ordered-string iterator may walk for
+        // `ORDER BY code LIMIT k` on the text label.
+        let schema = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Venta".into(),
+                properties: vec![PropertyDef::new("code", DataType::Int64, false)
+                    .unwrap()
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .label(LabelDef {
+                name: "Producto".into(),
+                properties: vec![PropertyDef::new("code", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .build();
+
+        let union = super::union_indexed_props(&schema);
+        let code = union
+            .properties
+            .iter()
+            .find(|p| p.name == "code")
+            .expect("the union must carry the property");
+        assert_eq!(
+            code.data_type,
+            DataType::Utf8,
+            "a text declaration must win the tie-break"
+        );
+        assert!(
+            !super::numeric_data_type(&code.data_type),
+            "so the collector files no numeric key, and `numeric_complete` \
+             stays false — numeric equality keeps the scan route it had, \
+             which is correct if slow"
+        );
+
+        // With no conflicting text declaration the numeric index stands.
+        let numeric_only = SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Venta".into(),
+                properties: vec![PropertyDef::new("code", DataType::Int64, false)
+                    .unwrap()
+                    .with_indexed(true)],
+            })
+            .unwrap()
+            .build();
+        let union = super::union_indexed_props(&numeric_only);
+        assert!(super::numeric_data_type(
+            &union
+                .properties
+                .iter()
+                .find(|p| p.name == "code")
+                .unwrap()
+                .data_type
+        ));
+    }
 
     use namidb_core::{EdgeTypeDef, LabelDef, NamespaceId, NodeId, PropertyDef, SchemaBuilder};
     use object_store::memory::InMemory;

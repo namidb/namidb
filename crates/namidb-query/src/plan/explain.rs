@@ -1062,29 +1062,35 @@ pub fn collect_route_notes(
                 &value.kind,
                 ExpressionKind::Literal(Literal::Integer(_) | Literal::Float(_))
             );
-            let note = if numeric {
+            // A numeric equality is served by the same posting sidecars, but
+            // only those that harvested numbers count toward its coverage:
+            // an SST written before numeric equality was indexable still
+            // serves String probes while leaving this one on the scan, until
+            // a compaction pass backfills it.
+            let (covered, total) = if numeric {
+                snapshot.numeric_property_index_coverage(label, property)
+            } else {
+                snapshot.property_index_coverage(label, property)
+            };
+            let note = if total == 0 {
+                format!("# route: {shown}.{property} → memtable ({kind} lookup; no SSTs in scope)")
+            } else if covered == total {
                 format!(
-                    "# route: {shown}.{property} → scan \
-                     (numeric equality is not posting-indexed; only String/Bool are)"
+                    "# route: {shown}.{property} → index \
+                     ({kind} lookup; posting sidecars {covered}/{total} SSTs)"
+                )
+            } else if numeric {
+                format!(
+                    "# route: {shown}.{property} → SCAN FALLBACK \
+                     (numeric postings {covered}/{total} SSTs; \
+                     a compaction pass materializes the rest)"
                 )
             } else {
-                let (covered, total) = snapshot.property_index_coverage(label, property);
-                if total == 0 {
-                    format!(
-                        "# route: {shown}.{property} → memtable ({kind} lookup; no SSTs in scope)"
-                    )
-                } else if covered == total {
-                    format!(
-                        "# route: {shown}.{property} → index \
-                         ({kind} lookup; posting sidecars {covered}/{total} SSTs)"
-                    )
-                } else {
-                    format!(
-                        "# route: {shown}.{property} → SCAN FALLBACK \
-                         (posting sidecars {covered}/{total} SSTs; \
-                         a compaction pass materializes the rest)"
-                    )
-                }
+                format!(
+                    "# route: {shown}.{property} → SCAN FALLBACK \
+                     (posting sidecars {covered}/{total} SSTs; \
+                     a compaction pass materializes the rest)"
+                )
             };
             out.push(note);
         }

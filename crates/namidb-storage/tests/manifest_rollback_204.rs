@@ -159,6 +159,14 @@ fn manifest_205_round_trips_through_the_204_wire_prefix() {
         distinct_values: 2,
         key_encoding: EqualityKeyEncoding::ScalarV1,
         mixed_type_complete: true,
+        // Set on purpose: a sidecar that also harvested numbers must stay
+        // readable by a rolled-back 2.0.4 decoder, which knows nothing about
+        // the field. This is the reason numeric coverage is a NEW FIELD and
+        // not a new `EqualityKeyEncoding` variant — an unknown enum variant
+        // would fail the decode of the WHOLE manifest and strand the
+        // namespace, while an unknown field is ignored and the widened
+        // sidecar reads as the String/Bool index it has always been.
+        numeric_complete: true,
         format: PropertyIndexFormat::BincodeV0,
         paged: Some(PagedPropertyIndexDescriptor {
             path: "sst/level1/nodes-articles-vigente.pidx".into(),
@@ -329,6 +337,23 @@ fn manifest_205_round_trips_through_the_204_wire_prefix() {
         .is_none());
     assert!(legacy_json["ssts"][0]["equality_property_indices"][0]
         .get("key_encoding")
+        .is_none());
+    // A rolled-back reader drops numeric coverage entirely, exactly as it
+    // drops `key_encoding` and `mixed_type_complete`, and keeps probing the
+    // sidecar as the raw string posting map it has always understood. The
+    // widened body is a strict SUPERSET: its string keys are untouched, the
+    // extra tagged numeric keys are ones a 2.0.4 probe never forms, and
+    // numeric equality simply stays on the scan route it used there anyway.
+    //
+    // This is the whole reason numeric coverage is a new FIELD and not a new
+    // `EqualityKeyEncoding` variant: serde ignores an unknown field, but an
+    // unknown enum variant fails the decode of the entire manifest and would
+    // strand the namespace on rollback.
+    assert!(legacy_json["ssts"][0]["equality_property_indices"][0]
+        .get("numeric_complete")
+        .is_none());
+    assert!(legacy_json["ssts"][0]["equality_property_indices"][0]
+        .get("mixed_type_complete")
         .is_none());
 }
 

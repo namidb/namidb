@@ -164,8 +164,16 @@ async fn explain_renders_the_plan_and_its_physical_route_without_executing() {
         "index route note expected after flush: {body}"
     );
 
-    // A numeric equality is not posting-indexed — the footer says so
-    // instead of letting the operator name imply index speed.
+    // A numeric equality IS posting-indexed, but only on sidecars that
+    // harvested numbers, and these SSTs were flushed before the index
+    // existed. The footer must report whichever route is real at this
+    // moment, and never let the operator name imply index speed on its own.
+    //
+    // Deliberately NOT asserting one specific route here: the DDL schedules
+    // its own backfill pass, so by the time this EXPLAIN runs the postings
+    // may or may not be materialised, and which one wins is a timing detail
+    // (it differs between Linux and macOS runners). What must hold either
+    // way is that the note states the route it is REALLY taking.
     let (status, body) = cypher(
         &base,
         "CREATE INDEX persona_seq IF NOT EXISTS FOR (p:Person) ON (p.seq)",
@@ -175,9 +183,36 @@ async fn explain_renders_the_plan_and_its_physical_route_without_executing() {
     let (status, body) = cypher(&base, "EXPLAIN MATCH (p:Person {seq: 7}) RETURN p").await;
     assert_eq!(status, 200, "{body}");
     if body.contains("NodeByPropertyValue") {
+        let backfilled = body.contains("→ index");
+        let not_yet = body.contains("SCAN FALLBACK") && body.contains("numeric postings");
         assert!(
-            body.contains("numeric equality is not posting-indexed"),
-            "numeric route caveat expected: {body}"
+            backfilled || not_yet,
+            "a numeric equality must report either the index it can use or \
+             the numeric postings it is still missing: {body}"
+        );
+        assert!(
+            !body.contains("numeric equality is not posting-indexed"),
+            "the pre-2.6.14 caveat must be gone: {body}"
+        );
+    }
+
+    // …and a compaction pass backfills those postings, which is the whole
+    // migration path. The same EXPLAIN must then say index.
+    let compact = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/compact"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let compact_status = compact.status().as_u16();
+    let compact_body = compact.text().await.unwrap();
+    assert_eq!(compact_status, 200, "compact said: {compact_body}");
+    let (status, body) = cypher(&base, "EXPLAIN MATCH (p:Person {seq: 7}) RETURN p").await;
+    assert_eq!(status, 200, "{body}");
+    if body.contains("NodeByPropertyValue") {
+        assert!(
+            body.contains("→ index"),
+            "numeric postings must be servable after a compaction pass: {body}"
         );
     }
 

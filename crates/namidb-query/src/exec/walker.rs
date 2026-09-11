@@ -7624,11 +7624,12 @@ pub(crate) async fn lookup_node_by_property_via_scan(
             .map_err(ExecError::from);
     }
 
-    // Scalar-v1 equality sidecars also cover the non-numeric scalar types.
-    // Numeric probes stay on the exact fallback for now because Cypher treats
-    // I64(1) and F64(1.0) as equal while the physical index deliberately keeps
-    // them distinct.
-    if let Some(core) = non_numeric_index_value(value) {
+    // Scalar-v1 equality sidecars cover the other scalar types, numerics
+    // included: `I64(1)` and `F64(1.0)` are one Cypher value and encode to
+    // one canonical key, and storage declines the route wherever it cannot
+    // honour that (a sidecar predating numeric harvesting, or the
+    // transactional overlay, which keys them apart).
+    if let Some(core) = indexable_probe_value(value) {
         if let Some(ids) = snapshot
             .indexed_node_ids_by_property_value(label, property, &core)
             .await
@@ -7700,7 +7701,7 @@ pub(crate) async fn lookup_nodes_by_property_via_scan(
             .await
             .map_err(ExecError::from);
     }
-    if let Some(core) = non_numeric_index_value(value) {
+    if let Some(core) = indexable_probe_value(value) {
         if let Some(ids) = snapshot
             .indexed_node_ids_by_property_value(label, property, &core)
             .await
@@ -7757,7 +7758,7 @@ async fn lookup_nodes_by_property_via_scan_limited(
     }
     let core = match value {
         RuntimeValue::String(value) => Some(namidb_core::Value::Str(value.clone())),
-        other => non_numeric_index_value(other),
+        other => indexable_probe_value(other),
     };
     if let Some(core) = core {
         if let Some(ids) = snapshot
@@ -7870,8 +7871,9 @@ pub(crate) async fn lookup_nodes_by_property_tuple_via_scan(
 }
 
 /// Scalar runtime value -> storable core value for a tuple member probe.
-/// Unlike [`non_numeric_index_value`], numerics ARE included — TupleV1
-/// canonicalizes them to match Cypher's coercing equality.
+/// Unlike [`indexable_probe_value`], a String is included: a tuple key is
+/// self-delimiting, so a String member cannot alias a tagged one, and the
+/// single-property path has a dedicated String entry point already.
 fn tuple_member_core_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
     match value {
         RuntimeValue::Bool(value) => Some(namidb_core::Value::Bool(*value)),
@@ -7885,9 +7887,21 @@ fn tuple_member_core_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
     }
 }
 
-fn non_numeric_index_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
+/// The non-String probe values storage can answer from an equality posting
+/// index. Anything returning `None` here is left to the label scan.
+///
+/// Numbers belong here: a numeric-declared property files one canonical key
+/// per numeric value, so `{amount: 12345}` is served by the same posting
+/// lookup a String key gets instead of scanning the label. A sidecar that
+/// predates numeric harvesting reports its own incompleteness
+/// (`numeric_complete`) and storage falls back to the scan on its own.
+fn indexable_probe_value(value: &RuntimeValue) -> Option<namidb_core::Value> {
     match value {
         RuntimeValue::Bool(value) => Some(namidb_core::Value::Bool(*value)),
+        RuntimeValue::Integer(value) => Some(namidb_core::Value::I64(*value)),
+        // NaN equals nothing in Cypher, and has no canonical key. Leave it to
+        // the scan rather than encode it into a posting it cannot match.
+        RuntimeValue::Float(value) if !value.is_nan() => Some(namidb_core::Value::F64(*value)),
         RuntimeValue::Date(value) => Some(namidb_core::Value::Date(*value)),
         RuntimeValue::DateTime(value) => Some(namidb_core::Value::DateTime(*value)),
         RuntimeValue::Bytes(value) => Some(namidb_core::Value::Bytes(value.clone())),

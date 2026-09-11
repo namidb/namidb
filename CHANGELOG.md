@@ -15,6 +15,71 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.14] - 2026-09-11
+
+### Performance
+
+- **`CREATE INDEX` on a numeric property now accelerates equality.** It was
+  accepted and did nothing: `MATCH (t {num: 12345})` scanned the whole label
+  while the identical `MATCH (t {txt: '12345'})` served from the posting
+  index. On 160,000 rows carrying the same key both ways, with an index
+  declared on both, that was 1.603 s against 0.001 s — **1600x, purely
+  because the property was numeric**. EXPLAIN said so in plain text:
+  *"numeric equality is not posting-indexed; only String/Bool are"*. For a
+  retail or clinical schema — quantities, prices, amounts, numeric product
+  codes, foreign keys — that is most of the schema.
+
+  Numeric equality is now served by the same sidecars a string key uses.
+  Measured in-process against the route it used to take, on 160k rows:
+  525 ms scan against 80 us index.
+
+  `5` and `5.0` are one Cypher value, so both encode to one canonical key
+  and share a posting. Above 2^53 that key is lossy and distinct integers
+  can collide; every candidate is re-confirmed with Cypher equality before
+  it reaches a result, so the collision costs a wasted candidate and never a
+  wrong row.
+
+  The key is also order-preserving, so the range-readable sidecar it lives
+  in can later be positioned by value for `WHERE n.amount > x`. Raw IEEE-754
+  bits sort negatives backwards, which an equality probe never notices —
+  and which would have foreclosed every ordered read over those postings
+  once the format was in the wild.
+
+### Fixed
+
+- **`POST /v0/admin/compact` returned 500 right after a `CREATE INDEX`** —
+  which is exactly when an operator reaches for it, to materialize the index
+  the DDL just declared.
+
+  `CREATE INDEX` schedules its own backfill pass. The admin drain runs its
+  passes outside the scheduler's admission, so the two ran concurrently, the
+  DDL pass won the manifest install, and the drain's prepared plan named an
+  input the winner had already merged away. Storage abandons such a plan
+  with a precondition the compactor already labels "a competing compaction
+  won the install race" — the drain reported it as a hard error whenever it
+  happened on the first pass.
+
+  Losing that race is not a failure: the merge was performed by whoever won.
+  The drain now re-prepares against the manifest they left, bounded, and
+  reports `races_lost` in its summary. The abandon messages also name the
+  basis and manifest versions now, and distinguish a lost race from an input
+  that changed and from a duplicated id.
+
+### Compatibility
+
+- Numeric coverage is recorded per sidecar in a new optional manifest field.
+  Existing SSTs report no numeric coverage and keep the scan route until a
+  compaction pass backfills their postings, which the DDL-backfill trigger
+  now schedules; EXPLAIN reports the interim state as
+  `numeric postings {covered}/{total} SSTs`. A rolled-back reader ignores
+  the field and probes the widened sidecar exactly as completely as before.
+- A property declared numeric on one label and textual on another keeps the
+  scan route for numeric equality, so ordered string reads over the same
+  sidecar stay correct.
+- Numeric equality inside a write transaction also keeps the scan route: the
+  transactional overlay distinguishes `5` from `5.0`, and a scan there sees
+  the same uncommitted writes.
+
 ## [2.6.13] - 2026-09-10
 
 ### Performance
@@ -3408,7 +3473,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.13...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.14...HEAD
+[2.6.14]: https://github.com/namidb/namidb/compare/v2.6.13...v2.6.14
 [2.6.13]: https://github.com/namidb/namidb/compare/v2.6.12...v2.6.13
 [2.6.12]: https://github.com/namidb/namidb/compare/v2.6.11...v2.6.12
 [2.6.11]: https://github.com/namidb/namidb/compare/v2.6.10...v2.6.11
