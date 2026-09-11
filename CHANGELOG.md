@@ -15,6 +15,31 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.18] - 2026-09-11
+
+### Fixed
+
+- **A numeric range over a label that has not been flushed yet was served by
+  the index and hydrated row by row, at twice the cost of the scan.** On
+  60,000 memtable-resident rows, `WHERE v.idx > 30000` (matching half) took
+  130.7 ms against the scan's 69.0 ms. It now declines and costs 66.8 ms.
+  Selective windows are unaffected: 6.0 ms against 42.2 ms for nine rows.
+
+  The route decides whether a window is selective enough by comparing it to
+  the label's live row count, which it summed from SST descriptors. Before
+  the first flush there are none, so the sum was zero — and zero was read as
+  "no information, allow it" rather than "no information, be careful". That
+  is not a rare state: it is every store between a bulk load and its first
+  flush, which is exactly when the first query tends to arrive.
+
+  The memtable's own size now bounds the route. Scanning a memtable is
+  cheaper than scanning SSTs — it is already decoded and in memory — so the
+  bar for using an index there is higher, not lower.
+
+- `NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES=0` now disables the range route
+  instead of aborting the process (2.6.17 shipped this; recorded here
+  because the release notes for it were incomplete).
+
 ## [2.6.17] - 2026-09-11
 
 ### Fixed
@@ -3564,7 +3589,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.17...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.18...HEAD
+[2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
 [2.6.17]: https://github.com/namidb/namidb/compare/v2.6.16...v2.6.17
 [2.6.16]: https://github.com/namidb/namidb/compare/v2.6.15...v2.6.16
 [2.6.15]: https://github.com/namidb/namidb/compare/v2.6.14...v2.6.15
