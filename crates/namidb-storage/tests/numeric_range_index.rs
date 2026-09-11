@@ -280,6 +280,50 @@ async fn an_unselective_range_declines_rather_than_paying_twice() {
     assert!(!expected.is_empty(), "the window must not be empty");
 }
 
+/// The hole the flushed-corpus cap test did not cover: BEFORE any flush
+/// there are no SST descriptors, so a budget derived only from them has no
+/// information at all.
+///
+/// That is not a rare state — it is every store between a bulk load and its
+/// first flush, which is exactly when someone runs their first query. A
+/// window covering half a memtable-resident label was being served and
+/// hydrated row by row, at twice the cost of the scan it was meant to beat
+/// (measured: 130.7 ms against 69.0 ms on 60,000 rows).
+#[tokio::test]
+async fn a_wide_window_over_a_memtable_resident_label_declines_too() {
+    let writer = corpus("range-memtable", false, false).await;
+    let snapshot = writer.snapshot();
+
+    // Half the label, with no SSTs in existence.
+    assert!(
+        snapshot.manifest().manifest.ssts.is_empty(),
+        "this test is only meaningful before a flush"
+    );
+    let wide = vec![gt(ROWS / 2)];
+    assert!(
+        snapshot
+            .indexed_node_ids_by_numeric_range("T", "idx", &wide, usize::MAX)
+            .await
+            .unwrap()
+            .is_none(),
+        "a window over half a memtable-resident label must decline, whatever \
+         cap the caller offers: scanning a memtable is cheap, and hydrating \
+         every candidate the postings named is not"
+    );
+
+    // A narrow one is still served, and still agrees.
+    let narrow = vec![gt(ROWS - 10)];
+    let expected = by_scan(&writer, &narrow).await;
+    let mut got = snapshot
+        .indexed_node_ids_by_numeric_range("T", "idx", &narrow, usize::MAX)
+        .await
+        .unwrap()
+        .expect("a narrow window must still be served from the memtable");
+    got.sort_unstable();
+    assert_eq!(got, expected);
+    assert!(!expected.is_empty());
+}
+
 #[tokio::test]
 async fn shapes_this_route_must_refuse() {
     let writer = corpus("range-refuse", true, true).await;

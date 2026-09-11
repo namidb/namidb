@@ -1444,7 +1444,26 @@ impl<'mt> Snapshot<'mt> {
         }
 
         // The committed/staged memtable delta, which no sidecar covers yet.
+        // The committed/staged memtable delta, which no sidecar covers yet.
+        //
+        // Its own size is part of the selectivity question, not just a source
+        // of ids. Before any flush there are NO SST descriptors to estimate
+        // the label from, and a caller-supplied cap derived only from
+        // descriptors is then meaningless — which is how a window covering
+        // half a memtable-resident label got served and hydrated row by row,
+        // at twice the cost of the scan it was supposed to beat.
         let memtable = self.memtable_property_claimants(label, property)?;
+        let memtable_rows: usize = memtable.values().map(|ids| ids.len()).sum();
+        let budget = max_candidates.min(
+            memtable_rows
+                .checked_div(MEMTABLE_RANGE_FRACTION)
+                .unwrap_or(max_candidates)
+                .max(MIN_RANGE_CANDIDATES),
+        );
+        if candidates.len() > budget {
+            crate::route_telemetry::record_property(false);
+            return Ok(None);
+        }
         for (key, ids) in memtable.iter() {
             if key.as_str() < start_key.as_str() || key.as_str() > end_key.as_str() {
                 continue;
@@ -1452,7 +1471,7 @@ impl<'mt> Snapshot<'mt> {
             for id in ids {
                 candidates.push(*id);
             }
-            if candidates.len() > max_candidates {
+            if candidates.len() > budget {
                 crate::route_telemetry::record_property(false);
                 return Ok(None);
             }
@@ -10065,6 +10084,20 @@ fn equality_sidecar_key(
         },
     }
 }
+
+/// Share of a memtable-resident label a numeric range may match and still be
+/// worth an index lookup.
+///
+/// Scanning a memtable is cheap — it is already decoded and in memory — so
+/// the bar is higher there than for SSTs. A window over this share is served
+/// by the scan, which reads each row once instead of hydrating every
+/// candidate the postings named.
+const MEMTABLE_RANGE_FRACTION: usize = 8;
+
+/// Floor under every derived candidate budget, so a tiny label (or a tiny
+/// memtable) does not make the route decline windows it would answer in
+/// microseconds.
+const MIN_RANGE_CANDIDATES: usize = 256;
 
 /// Leaf pages the numeric range walk may read before deciding the window is
 /// not selective enough to be worth an index lookup.
