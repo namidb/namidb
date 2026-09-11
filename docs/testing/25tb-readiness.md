@@ -1442,155 +1442,104 @@ If an exact-answer fast path is ever wanted, it needs a per-label
 sets when it recomputes from survivors. That does not exist today, and
 inventing it is a manifest format change.
 
-### 80. [OPEN — root cause found] Filtered scans prune nothing: the predicate never reaches storage
+### 80. [PARTLY FIXED in 2.6.14 — equality; ranges are a missing capability, not a wiring bug] Filtered scans prune nothing
 
-Measured at 160,000 nodes, one label, one projected column. The times do
-not depend on selectivity at all:
+Re-measured on 2.6.14, same 160,000-node fixture, `idx` declared as an
+index, one projected column:
 
-| query | rows returned | time |
-|---|---|---|
-| `WHERE t.idx > 999999` (outside every value in the store) | **0** | 0.377 s |
-| `WHERE t.idx < -5` (outside, low side) | **0** | 0.468 s |
-| `WHERE t.idx = 12345` | 1 | 0.375 s |
-| `WHERE t.idx > 159990` | 9 | 0.412 s |
-| `WHERE t.idx > 80000` | 79,999 | 0.417 s |
-| no filter (manifest fast path) | 160,000 | **0.001 s** |
+| query | rows | 2.6.13 | 2.6.14 | route |
+|---|---|---|---|---|
+| `WHERE t.idx = 12345` | 1 | 0.375 s | **0.000078 s** | index |
+| `{idx: 12345}` | 1 | — | **0.000060 s** | index |
+| `WHERE t.idx > 999999` (matches nothing) | 0 | 0.377 s | 0.311 s | scan |
+| `WHERE t.idx < -5` (matches nothing) | 0 | 0.468 s | 0.399 s | scan |
+| `WHERE t.idx > 159990` | 9 | 0.412 s | 0.292 s | scan |
+| `WHERE t.idx > 80000` | 79,999 | 0.417 s | 0.340 s | scan |
+| no filter (manifest fast path) | 160,000 | 0.001 s | 0.000030 s | — |
 
-A predicate that provably matches nothing costs the same as one matching
-half the store. Nothing is being skipped.
+**Equality is fixed** — by item 81, not by anything done here. What remains
+is RANGE predicates, and they are still completely insensitive to
+selectivity: a predicate matching nothing costs the same as one matching
+half the store.
 
-**Root cause, and it is not a missing feature — it is two implemented
-features that are not wired.**
+**THE DIAGNOSIS IN THE TWO PREVIOUS VERSIONS OF THIS ENTRY WAS WRONG, TWICE.**
+Both said this was a wiring problem — "two implemented features that are not
+wired". It is not. Recorded in full, because the wrong version would have
+sent someone to do work that cannot help:
 
-1. *Parquet row-group pruning.* `EnabledStatistics::Chunk` is configured
-   (sst/nodes.rs:1515) so per-row-group column statistics ARE written, and
-   `eval_row_group` + `PropertyColumnStats` (sst/predicates.rs:93) decide
-   Absent/MaybePresent from them. But the branch that serves a PROJECTED
-   scan — the common shape, and the one EXPLAIN shows here
-   (`projection=[idx] predicates=[t.idx > 159990]`) — builds a
-   `LimitedNodeBatchContext` carrying `predicates` and then opens the
-   stream with `node_scan_limited_async(..., &[], Some(&[]), ...)`
-   (read.rs:5735-5741): empty predicates, empty projection. Four of the
-   five call sites in read.rs pass `&[]`; only one passes `predicates`.
-2. *Property-page predicate filtering.* `NodePropertyPageReader::filter_node_ids`
-   (property_pages.rs:2088) and the whole `NodePropertyPredicate` IR
-   (property_pages.rs:255) are implemented and unit-tested — and **dead in
-   production**: the only callers are at property_pages.rs:3518 and 3541,
-   both inside the `#[cfg(test)]` module that begins at line 3372, and
-   `NodePropertyPredicate::` is never constructed anywhere outside its own
-   file.
+1. *"Wire the predicates into the projected-scan branch."* There is nothing
+   to wire them into. A node SST is written with an **empty LabelDef** and
+   therefore has **no `prop_*` columns at all** — flush.rs states it
+   outright: *"one identity-partitioned SST spanning every label, built with
+   an empty LabelDef (fixed layout — no prop_* columns; every property rides
+   in `__overflow_json`)"*. `node_arrow_schema` of an empty LabelDef is six
+   engine columns and nothing else, and
+   `scan_with_predicates_and_projection_async` rejects any file that does
+   not match it exactly. So there are no per-row-group property statistics
+   for `eval_row_group` to read: `node_scan_plan` resolves no column,
+   `PropertyColumnStats::empty` has `min`/`max` of `None`, and every arm of
+   `eval_row_group` answers `MaybePresent` when the bound is absent. Passing
+   the predicates through would prune exactly zero row groups.
 
-So a filtered projected scan reads and materialises every row and
-evaluates the predicate row-by-row.
+   (The `eval_row_group` / `synthesize_property_stats` machinery is not dead
+   code — it serves LEGACY label-scoped SSTs, whose `scope` names a single
+   label and whose LabelDef therefore does carry properties. The current
+   writer no longer produces those.)
 
-**Also measured: the cost is per-ROW, not per-byte.** `count(t.pad)` over
-a 900-byte string column costs 0.433 s against `count(t.idx)` over an
-8-byte integer column at 0.466 s — indistinguishable. Two columns cost
-0.676 s against one at 0.466 s. That is a fixed per-row overhead
-(materialisation into `Row` / `RuntimeValue`) dominating, which is why
-scalar aggregates (item 79) sit at ~0.47 s regardless of the column.
+2. *"Wire `NodePropertyPageReader::filter_node_ids`."* Its predicate IR is
+   `EqString`, `InString`, `EqBool`, `InBool`, and an explicit
+   `Unsupported` — **no range predicates of any kind**. It could not serve a
+   single one of the slow queries above, and for the equality shapes it does
+   support, the equality posting sidecar already does the job better.
 
-**What this means for finding #8.** The remaining work is not "build
-aggregation pushdown". It is, in order of value:
-1. Wire ONE of the two existing predicate paths into the projected-scan
-   branch. This makes every selective filter selective, not just
-   aggregates.
-2. Then consider vectorised aggregation over the decoded Arrow column, to
-   remove the per-row materialisation that item 79 measured.
+   The `.npp` pages also carry no per-property `min`/`max`: their page
+   metadata is size limits (`max_value_bytes`, `max_page_decoded_bytes`, …),
+   not value statistics.
 
-**The `&[]` is not an oversight — and knowing why is the whole handoff.**
-That branch reads properties from the `.npp` sidecar addressed by a
-RUNNING ROW ORDINAL:
+**An earlier same-day correction in this entry was also wrong** — it said
+the blocker was `label_def_for_node_sst` returning an empty property list
+for id-primary SSTs, and proposed resolving the predicate column against the
+manifest schema instead. That empty LabelDef is a faithful description of
+the file layout, not an oversight: resolving a column name that has no
+Parquet column would find nothing.
 
-    let mut next_ordinal = 0_u64;                      // read.rs:5754
-    ...
-    next_ordinal = next_ordinal.checked_add(batch.num_rows() as u64)
-    ...
-    if next_ordinal != desc.row_count {                // read.rs:5812
-        return Err(Error::invariant("node property/Parquet row-count mismatch"));
-    }
+**So this is a MISSING CAPABILITY.** Node properties have no value
+statistics anywhere in the current format — not in Parquet, not in the
+property pages. No layer can answer "this page cannot contain a value
+> 999999", so every range predicate reads every row.
 
-The ordinal must stay aligned with the sidecar, so the branch requires
-seeing EVERY row group — and it self-checks that it did. Handing Parquet
-the predicates would make it skip row groups, the ordinal would fall
-short, and that invariant would fire. So the current code is correct and
-defensive, not careless.
+**The path that does exist, and why 2.6.14 opened it.** The equality
+sidecar is a range-readable B+tree keyed by the encoded scalar, and
+`ordered_node_ids_by_string_property` already positions by value within it
+for `ORDER BY <string prop> LIMIT k`. Item 81's numeric key was made
+ORDER-PRESERVING for exactly this reason: `sortable_f64_bits` maps an f64
+onto a u64 whose unsigned order is the number's order, so the same B+tree
+can be positioned at `> x` for numbers too. Raw IEEE-754 bits would have
+sorted negatives backwards — which costs an equality probe nothing, and
+would have foreclosed every ordered read over those postings without anyone
+noticing until the format was already in the wild.
 
-**What wiring it therefore requires**: advancing `next_ordinal` by the row
-count of each SKIPPED row group (available in the footer metadata that
-this branch already fetches and caches), so the sidecar stays addressable.
-The existing invariant check is the safety net for getting it wrong — it
-turns a silent row loss into a hard error, which is why it should be kept
-and not relaxed.
+Order of work, corrected:
+1. An ordered/range numeric read over the equality sidecar — the twin of
+   `ordered_node_ids_by_string_property`, using the order-preserving key.
+   This serves `WHERE n.amount > x` on an INDEXED property, which is the
+   case operators actually declare an index for.
+2. Only then consider value statistics in the property pages, for ranges on
+   UNINDEXED properties. That is a storage-format change and wants its own
+   design.
+3. Separately, and still true from the original entry: the cost is per-ROW,
+   not per-byte — `count(t.pad)` over a 900-byte string column costs the
+   same as `count(t.idx)` over an 8-byte integer, and two columns cost more
+   than one. That is `Row`/`RuntimeValue` materialisation dominating, and it
+   is what caps every scalar aggregate at ~0.3 s regardless of the column.
+   Vectorised aggregation over the decoded Arrow column is the fix, and it
+   is independent of everything above.
 
-**Why this was not wired tonight.** Even with the accounting understood, a
-page- or row-group-level decision that disagrees with the row-level
-evaluation drops rows, which is the failure mode that produced five bugs
-in this codebase this week. It wants the equivalence harness pointed at it
-(filtered scan vs unfiltered-then-filter across a matrix of predicate
-shapes, types, nulls and absent properties) and an adversarial review —
-not the tail of an eleven-release day.
-
-**A caveat I got WRONG the first time, corrected here.** I originally wrote
-that nodes are id-primary so a property is "scattered across row groups in
-UUID order" and pruning could not help. That reasoning is false: `NodeId`
-is `Uuid::now_v7()` — TIME-ordered — so id order tracks insertion order,
-and a property written in a correlated order (a sale date, an incrementing
-code) lands in narrow per-row-group ranges. Pruning would help such a
-property a great deal.
-
-What is true is the measurement, and it survived a much better fixture:
-with `NAMIDB_NODE_SST_ROW_GROUP_ROWS=4096` (≈39 row groups instead of the
-2 the 128Ki default gives at 160k rows), an `idx` written in ascending
-order, and the property declared as an index so it is a physical column,
-the times are still flat — 0.331 s for a predicate matching nothing,
-0.321 s for one matching 9 rows, 0.330 s for one matching half. Nothing is
-pruned, and the reason is the one verified in the source above: the
-predicate never reaches Parquet.
-
-**Two notes for whoever picks this up.** First, the default row group is
-128Ki rows, so any fixture under ~500k rows has too few row groups to show
-pruning at all — set `NAMIDB_NODE_SST_ROW_GROUP_ROWS` when testing this.
-Second, the whole-node branch (`RETURN t`, which DOES pass `predicates`)
-is also insensitive to selectivity — 1.315 s at zero rows against 1.389 s
-at nine.
-
-**That second question is now ANSWERED (2026-09-11), and it means the
-projected branch is not the only gap — nor even the first one to fix.**
-`node_scan_plan` (sst/nodes.rs:749) resolves each predicate's column by
-looking it up in the `LabelDef` it is handed:
-
-    let prop = label.properties.iter().find(|p| p.name == col);
-    ...
-    None => PropertyColumnStats::empty(col),
-
-and that `LabelDef` comes from `label_def_for_node_sst` (read.rs:4494),
-which for an **id-primary SST — `scope == ""`, the modern layout — returns
-a LabelDef with an EMPTY property list**. So no predicate column is ever
-resolved to a Parquet column, every row group is evaluated against
-`PropertyColumnStats::empty`, and `eval_row_group` answers `MaybePresent`
-for every predicate shape because its `min`/`max` are both `None`
-(predicates.rs:93 onward — every arm falls through to `MaybePresent` when
-the bound is absent).
-
-**Row-group pruning is therefore dead on every id-primary SST, on BOTH
-branches**, regardless of the `&[]` in the projected branch. Passing the
-predicates through without fixing the LabelDef would change nothing.
-
-The fix is to resolve the predicate column against the manifest schema
-rather than a single label's definition — but conservatively: a property
-name declared with DIFFERENT types on different labels must NOT be
-resolved, because synthesizing stats under the wrong type could produce a
-WRONG `Absent` verdict, which is a dropped row rather than a slow query.
-`union_indexed_props` (flush.rs:623) is the existing precedent for
-building that union, and item 81 has just made its type tie-break
-load-bearing for a related reason.
-
-Order of work, revised:
-1. Resolve the predicate column on id-primary SSTs (both branches benefit;
-   the whole-node branch needs nothing else).
-2. Then the projected branch's ordinal accounting, as described above.
-3. Then vectorised aggregation over the decoded Arrow column.
+**A note for whoever picks this up**: the default row group is 128Ki rows,
+so any fixture under ~500k rows has too few row groups to show row-group
+pruning at all. That mattered for the original (wrong) framing; it does not
+change the conclusion, since the layout carries no property statistics at
+any row-group count.
 
 ### 81. [FIXED in 2.6.14] Numeric equality never uses an index
 

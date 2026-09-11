@@ -39,6 +39,12 @@ crates.io release will establish and document that API explicitly.
   it reaches a result, so the collision costs a wasted candidate and never a
   wrong row.
 
+  The key is also order-preserving, so the range-readable sidecar it lives
+  in can later be positioned by value for `WHERE n.amount > x`. Raw IEEE-754
+  bits sort negatives backwards, which an equality probe never notices —
+  and which would have foreclosed every ordered read over those postings
+  once the format was in the wild.
+
 ### Fixed
 
 - **`POST /v0/admin/compact` returned 500 right after a `CREATE INDEX`** —

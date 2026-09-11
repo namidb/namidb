@@ -137,6 +137,24 @@ pub type EqualityPropertySidecar = BTreeMap<String, Vec<[u8; 16]>>;
 /// tagged Bool `true`. Equality and ordered readers always hydrate and confirm
 /// candidates against the current typed value, so the collision only adds a
 /// conservative candidate; it cannot produce a false result.
+/// Map an f64 onto a u64 whose UNSIGNED order is the number's order.
+///
+/// IEEE-754 bits are almost sortable already: positives ascend, but negatives
+/// descend (the sign bit dominates and the magnitude runs backwards). Flipping
+/// every bit of a negative reverses it into place, and setting the sign bit on
+/// a positive lifts it above every negative.
+///
+/// `-0.0` must be normalised to `0.0` by the caller; NaN has no position in
+/// this order and is not encodable at all.
+fn sortable_f64_bits(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & (1 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+}
+
 pub fn encode_equality_property_value(value: &Value) -> Option<String> {
     let mut out = String::new();
     match value {
@@ -153,14 +171,19 @@ pub fn encode_equality_property_value(value: &Value) -> Option<String> {
         // share a posting. That is a conservative FALSE POSITIVE, not a wrong
         // answer: every candidate is re-confirmed against the current typed
         // value with [`cypher_scalar_equal`] before it reaches a result.
+        //
+        // The key is also ORDER-PRESERVING (see [`sortable_f64_bits`]), so the
+        // range-readable sidecar can be positioned by value. Raw `to_bits()`
+        // would sort negatives backwards, which costs nothing for an equality
+        // probe and forecloses every ordered read over the same postings.
         Value::I64(v) => {
             use std::fmt::Write as _;
-            write!(&mut out, "n:{:016x}", (*v as f64).to_bits()).ok()?;
+            write!(&mut out, "n:{:016x}", sortable_f64_bits(*v as f64)).ok()?;
         }
         Value::F64(v) if !v.is_nan() => {
             let normalized = if *v == 0.0 { 0.0 } else { *v };
             use std::fmt::Write as _;
-            write!(&mut out, "n:{:016x}", normalized.to_bits()).ok()?;
+            write!(&mut out, "n:{:016x}", sortable_f64_bits(normalized)).ok()?;
         }
         Value::Bytes(bytes) => {
             use std::fmt::Write as _;
@@ -2952,6 +2975,58 @@ mod tests {
         assert!(
             !cypher_scalar_equal(&low, &high),
             "the confirm step MUST separate what the key merged"
+        );
+    }
+
+    #[test]
+    fn numeric_equality_keys_sort_in_numeric_order() {
+        // The sidecar is a range-readable B+tree over these keys. An equality
+        // probe would not care, but an ordered read over the same postings
+        // (the natural home for `WHERE n.amount > x`) needs the key order to
+        // BE the numeric order — and raw IEEE-754 bits sort negatives
+        // backwards. Locked here because changing the encoding after numeric
+        // postings exist in the wild is a format migration.
+        let ascending = [
+            Value::F64(f64::NEG_INFINITY),
+            // -1e300 is far more negative than i64::MIN (-9.2e18).
+            Value::F64(-1e300),
+            Value::I64(i64::MIN),
+            Value::I64(-9_007_199_254_740_993),
+            Value::I64(-42),
+            Value::F64(-1.5),
+            Value::F64(-f64::MIN_POSITIVE),
+            Value::F64(-0.0),
+            Value::I64(0),
+            Value::F64(f64::MIN_POSITIVE),
+            Value::F64(0.5),
+            Value::I64(1),
+            Value::I64(42),
+            Value::I64(i64::MAX),
+            // …and 1e300 is far larger than i64::MAX (9.2e18).
+            Value::F64(1e300),
+            Value::F64(f64::INFINITY),
+        ];
+        let keys: Vec<String> = ascending
+            .iter()
+            .map(|value| {
+                encode_equality_property_value(value)
+                    .unwrap_or_else(|| panic!("{value:?} must be encodable"))
+            })
+            .collect();
+        for window in keys.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "numeric keys must ascend with the numbers: {:?} then {:?}",
+                window[0],
+                window[1]
+            );
+        }
+        // `-0.0` folds onto `0`, and `i64::MIN`/`-9007199254740993` round to
+        // f64 neighbours, so the sequence is non-strict by construction —
+        // but nothing may go BACKWARDS, and the distinct ends must differ.
+        assert!(
+            keys.first() < keys.last(),
+            "the order must be total, not collapsed"
         );
     }
 
