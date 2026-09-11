@@ -1553,8 +1553,44 @@ predicate never reaches Parquet.
 pruning at all — set `NAMIDB_NODE_SST_ROW_GROUP_ROWS` when testing this.
 Second, the whole-node branch (`RETURN t`, which DOES pass `predicates`)
 is also insensitive to selectivity — 1.315 s at zero rows against 1.389 s
-at nine — so something blocks pruning there too and it was not determined.
-Establish that before assuming the projected branch is the only gap.
+at nine.
+
+**That second question is now ANSWERED (2026-09-11), and it means the
+projected branch is not the only gap — nor even the first one to fix.**
+`node_scan_plan` (sst/nodes.rs:749) resolves each predicate's column by
+looking it up in the `LabelDef` it is handed:
+
+    let prop = label.properties.iter().find(|p| p.name == col);
+    ...
+    None => PropertyColumnStats::empty(col),
+
+and that `LabelDef` comes from `label_def_for_node_sst` (read.rs:4494),
+which for an **id-primary SST — `scope == ""`, the modern layout — returns
+a LabelDef with an EMPTY property list**. So no predicate column is ever
+resolved to a Parquet column, every row group is evaluated against
+`PropertyColumnStats::empty`, and `eval_row_group` answers `MaybePresent`
+for every predicate shape because its `min`/`max` are both `None`
+(predicates.rs:93 onward — every arm falls through to `MaybePresent` when
+the bound is absent).
+
+**Row-group pruning is therefore dead on every id-primary SST, on BOTH
+branches**, regardless of the `&[]` in the projected branch. Passing the
+predicates through without fixing the LabelDef would change nothing.
+
+The fix is to resolve the predicate column against the manifest schema
+rather than a single label's definition — but conservatively: a property
+name declared with DIFFERENT types on different labels must NOT be
+resolved, because synthesizing stats under the wrong type could produce a
+WRONG `Absent` verdict, which is a dropped row rather than a slow query.
+`union_indexed_props` (flush.rs:623) is the existing precedent for
+building that union, and item 81 has just made its type tie-break
+load-bearing for a related reason.
+
+Order of work, revised:
+1. Resolve the predicate column on id-primary SSTs (both branches benefit;
+   the whole-node branch needs nothing else).
+2. Then the projected branch's ordinal accounting, as described above.
+3. Then vectorised aggregation over the decoded Arrow column.
 
 ### 81. [FIXED in 2.6.14] Numeric equality never uses an index
 
