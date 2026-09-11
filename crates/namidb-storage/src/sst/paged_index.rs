@@ -2823,6 +2823,19 @@ async fn equality_range_with_source(
         page_id = next;
     }
 
+    // The window overflowed its bound, so the caller is going to discard this
+    // page and scan. Fetching the posting bodies now would be pure waste —
+    // and on a high-cardinality property that is one external read PER KEY,
+    // which made an unselective range measurably SLOWER than the scan it
+    // falls back to. Stop at the leaf walk, which is already paid for.
+    if more_in_range {
+        return Ok(EqualityRangePage {
+            postings: BTreeMap::new(),
+            stats,
+            more_in_range: true,
+        });
+    }
+
     let external: Vec<(usize, Range<u64>)> = selected
         .iter()
         .enumerate()
@@ -4008,8 +4021,31 @@ mod tests {
         )
         .await
         .unwrap();
+        // An overflowing window returns NO postings and says so. The caller
+        // is going to discard the page and scan, so fetching the posting
+        // bodies would be pure waste — one external read per key on a
+        // high-cardinality property, which made an unselective range slower
+        // than the scan it falls back to.
         assert!(capped.more_in_range, "a capped range must say so");
-        assert!(capped.postings.values().map(Vec::len).sum::<usize>() <= 7);
+        assert!(
+            capped.postings.is_empty(),
+            "an overflowing window must not pay for bodies it will not return"
+        );
+        let full = equality_range(
+            Arc::clone(&store),
+            path.clone(),
+            b"v-00004000",
+            b"v-00004009",
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(
+            capped.stats.bytes_read < full.stats.bytes_read,
+            "declining must cost LESS than serving: {} vs {}",
+            capped.stats.bytes_read,
+            full.stats.bytes_read
+        );
 
         // Bounds outside every key, both sides, and an inverted range.
         let above = equality_range(Arc::clone(&store), path.clone(), b"w", b"z", usize::MAX)
