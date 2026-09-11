@@ -17,7 +17,7 @@
 use namidb_storage::sst::predicates::ScanPredicate;
 use namidb_storage::sst::stats::StatScalar;
 
-use crate::parser::ast::{BinaryOp, Expression, ExpressionKind, Literal};
+use crate::parser::ast::{BinaryOp, Expression, ExpressionKind, Literal, UnaryOp};
 
 /// Split `pending` into (a) conjuncts that translate to `ScanPredicate`
 /// against `alias` and (b) the residual that must remain as a Filter.
@@ -79,12 +79,16 @@ fn try_binary_to_predicate(
     alias: &str,
 ) -> Option<ScanPredicate> {
     // Try (Property OP Literal). Then try mirror (Literal OP Property).
-    if let (Some(column), Some(lit)) = (property_column_for_alias(left, alias), literal_of(right)) {
-        let value = literal_to_stat_scalar(lit)?;
+    if let (Some(column), Some(value)) = (
+        property_column_for_alias(left, alias),
+        scalar_bound_of(right),
+    ) {
         return predicate_for_binary(op, column, value, /*literal_on_right=*/ true);
     }
-    if let (Some(column), Some(lit)) = (property_column_for_alias(right, alias), literal_of(left)) {
-        let value = literal_to_stat_scalar(lit)?;
+    if let (Some(column), Some(value)) = (
+        property_column_for_alias(right, alias),
+        scalar_bound_of(left),
+    ) {
         return predicate_for_binary(op, column, value, /*literal_on_right=*/ false);
     }
     None
@@ -145,6 +149,28 @@ fn literal_of(expr: &Expression) -> Option<&Literal> {
         ExpressionKind::Literal(lit) => Some(lit),
         _ => None,
     }
+}
+
+/// A literal bound, folding a unary minus over a numeric literal.
+///
+/// `WHERE n.idx < -5` parses the sign as a unary operator, not as part of the
+/// literal, so a bare [`literal_of`] sees no literal at all and the whole
+/// predicate stays a residual filter. Every negative bound — a temperature, a
+/// delta, a debit — was therefore invisible to pushdown.
+fn scalar_bound_of(expr: &Expression) -> Option<StatScalar> {
+    if let ExpressionKind::Unary { op, expr: operand } = &expr.kind {
+        if *op == UnaryOp::Neg {
+            return match literal_of(operand)? {
+                // `-i64::MIN` has no i64: leave it to the residual filter
+                // rather than wrapping into a positive bound.
+                Literal::Integer(n) => n.checked_neg().map(StatScalar::Int64),
+                Literal::Float(f) => Some(StatScalar::Float64(-*f)),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    literal_to_stat_scalar(literal_of(expr)?)
 }
 
 /// Pluck a list of literals out of `[1, 2, 3]`-style expressions for

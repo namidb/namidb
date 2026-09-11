@@ -2665,6 +2665,224 @@ pub fn decode_all_equality(body: &Bytes) -> Result<BTreeMap<String, Vec<[u8; 16]
     Ok(out)
 }
 
+/// One bounded window of an equality sidecar's postings, in key order.
+#[derive(Debug, Default)]
+pub struct EqualityRangePage {
+    /// Postings whose key lies within the requested bounds.
+    pub postings: BTreeMap<String, Vec<[u8; 16]>>,
+    pub stats: PagedProbeStats,
+    /// A key inside the bounds was left unread because `max_postings` was
+    /// reached. The caller must widen or fall back; treating this page as the
+    /// complete answer would drop rows.
+    pub more_in_range: bool,
+}
+
+/// Postings whose keys lie in `[start, end]`, in key order, bounded by
+/// `max_postings` NodeIds.
+///
+/// The ordered twin of [`probe_equality`]: instead of descending once per
+/// exact key, it descends once to the leaf holding `start` and then walks the
+/// chained leaf level forward. That is what makes a range predicate over an
+/// indexed property cost the matching keys rather than the whole label — and
+/// it is only sound because the scalar key encoding is ORDER-PRESERVING
+/// (`cache::encode_equality_property_value`), so key order IS value order.
+///
+/// Bounds are INCLUSIVE and compared as raw bytes. A caller wanting a strict
+/// `>` encodes the boundary value and drops it at confirm time; the returned
+/// NodeIds are candidates in every case, because a posting can be stale and
+/// the numeric key is deliberately lossy above 2^53.
+///
+/// Keys outside the caller's type — a raw String sharing the key space with
+/// the tagged scalars — can fall inside the byte range. They are conservative
+/// extra candidates, exactly as they are for an exact probe, and the caller's
+/// confirm step removes them.
+pub async fn equality_range_from_source(
+    source: &PinnedObjectRangeSource,
+    start: &[u8],
+    end: &[u8],
+    max_postings: usize,
+) -> Result<EqualityRangePage> {
+    equality_range_with_source(source, start, end, max_postings).await
+}
+
+/// Store-addressed [`equality_range_from_source`]. Test-only, mirroring
+/// [`equality_prefix`]: production callers read through a pinned generation.
+#[cfg(test)]
+pub async fn equality_range(
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    start: &[u8],
+    end: &[u8],
+    max_postings: usize,
+) -> Result<EqualityRangePage> {
+    let source = LegacyObjectRangeSource { store, path };
+    equality_range_with_source(&source, start, end, max_postings).await
+}
+
+async fn equality_range_with_source(
+    source: &dyn PagedRangeSource,
+    start: &[u8],
+    end: &[u8],
+    max_postings: usize,
+) -> Result<EqualityRangePage> {
+    type SelectedPosting = (Vec<u8>, u64, usize, usize, Option<u32>);
+
+    crate::cancel::check()?;
+    let header_bytes = source.read_range(0..HEADER_SIZE as u64).await?;
+    let header = Header::decode(&header_bytes, PagedIndexKind::Equality)?;
+    header.require_authoritative_integrity()?;
+    let mut stats = PagedProbeStats {
+        index_entries: header.entry_count,
+        bytes_read: header_bytes.len(),
+        ..Default::default()
+    };
+    if max_postings == 0 || start > end {
+        return Ok(EqualityRangePage {
+            stats,
+            ..Default::default()
+        });
+    }
+
+    // Descend to the leaf that would hold `start`. An internal entry's key is
+    // the MAXIMUM key in its subtree, so the first child whose max is >= start
+    // is the one to enter; falling back to the last child keeps a start beyond
+    // every key on the rightmost path, where the forward walk finds nothing.
+    let mut page_id = header.root_page;
+    loop {
+        crate::cancel::check()?;
+        if page_id >= header.page_count {
+            return Err(Error::invariant(
+                "equality range child points outside page region",
+            ));
+        }
+        let page = source.read_range(page_range(page_id)).await?;
+        stats.pages_read += 1;
+        stats.bytes_read = stats.bytes_read.saturating_add(page.len());
+        if page.len() != PAGE_SIZE {
+            return Err(Error::invariant(format!(
+                "short paged-index page {page_id}"
+            )));
+        }
+        match page[0] {
+            PAGE_LEAF => break,
+            PAGE_INTERNAL => {
+                let children = parse_internal(&page, header.format)?;
+                page_id = children
+                    .iter()
+                    .find(|(max, _)| start <= max.as_slice())
+                    .or_else(|| children.last())
+                    .map(|(_, child)| *child)
+                    .ok_or_else(|| Error::invariant("empty paged-index internal page"))?;
+            }
+            other => {
+                return Err(Error::invariant(format!(
+                    "invalid paged-index page kind {other}"
+                )));
+            }
+        }
+    }
+
+    let mut selected: Vec<SelectedPosting> = Vec::new();
+    let mut postings = 0usize;
+    let mut more_in_range = false;
+    'leaves: while page_id != NO_PAGE {
+        crate::cancel::check()?;
+        let page = source.read_range(page_range(page_id)).await?;
+        stats.pages_read += 1;
+        stats.bytes_read += page.len();
+        let next = read_u32(&page, 8)?;
+        let entries = parse_leaf(&page, PagedIndexKind::Equality, header.format)?;
+        stats.leaf_entries_examined += entries.len();
+        for entry in entries {
+            if entry.key.as_slice() < start {
+                continue;
+            }
+            if entry.key.as_slice() > end {
+                break 'leaves;
+            }
+            if postings >= max_postings {
+                more_in_range = true;
+                break 'leaves;
+            }
+            let LeafValue::External(offset, len, checksum) = entry.value else {
+                return Err(Error::invariant("equality range found inline value"));
+            };
+            if len as usize % 16 != 0 {
+                return Err(Error::invariant("unaligned equality range posting"));
+            }
+            let full_ids = len as usize / 16;
+            let take_ids = full_ids.min(max_postings.saturating_sub(postings));
+            stats.matched_value_bytes = stats.matched_value_bytes.saturating_add(len as u64);
+            // A partially-read posting is itself "more in range": the caller
+            // has not seen every NodeId for this key either.
+            more_in_range |= take_ids < full_ids;
+            stats.values_truncated |= take_ids < full_ids;
+            selected.push((entry.key, offset, len as usize, take_ids * 16, checksum));
+            postings += take_ids;
+        }
+        page_id = next;
+    }
+
+    let external: Vec<(usize, Range<u64>)> = selected
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, offset, _, read_len, _))| {
+            if *read_len == 0 {
+                return None;
+            }
+            Some(
+                external_value_range(header.values_offset, *offset, *read_len)
+                    .map(|range| (index, range)),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ranges: Vec<Range<u64>> = external.iter().map(|(_, range)| range.clone()).collect();
+    let values = source.read_ranges(&ranges).await?;
+    if values.len() != ranges.len() {
+        return Err(Error::invariant(format!(
+            "paged equality range source returned {} values for {} ranges",
+            values.len(),
+            ranges.len()
+        )));
+    }
+    stats.bytes_read += values.iter().map(Bytes::len).sum::<usize>();
+    let mut fetched: BTreeMap<usize, Bytes> = external
+        .into_iter()
+        .zip(values)
+        .map(|((index, _), value)| (index, value))
+        .collect();
+    let mut postings_out = BTreeMap::new();
+    for (index, (key, _, full_len, _, checksum)) in selected.into_iter().enumerate() {
+        let value = fetched.remove(&index).unwrap_or_default();
+        // Only a COMPLETE value can be checked against its CRC; a truncated
+        // one is reported through `more_in_range` instead, exactly as the
+        // ordered prefix reports it through `values_truncated`.
+        if value.len() == full_len
+            && checksum.is_some_and(|expected| crc32fast::hash(&value) != expected)
+        {
+            return Err(Error::invariant(
+                "equality range external-value checksum mismatch",
+            ));
+        }
+        let mut ids = Vec::with_capacity(value.len() / 16);
+        for chunk in value.chunks_exact(16) {
+            let mut id = [0; 16];
+            id.copy_from_slice(chunk);
+            ids.push(id);
+        }
+        postings_out.insert(
+            String::from_utf8(key)
+                .map_err(|e| Error::invariant(format!("equality range key utf8: {e}")))?,
+            ids,
+        );
+    }
+    Ok(EqualityRangePage {
+        postings: postings_out,
+        stats,
+        more_in_range,
+    })
+}
+
 /// Read the smallest equality keys until at least `min_postings` NodeIds have
 /// been returned. Leaf `next` links make `ORDER BY ... SKIP/LIMIT` proportional
 /// to its requested prefix instead of total distinct keys.
@@ -3709,6 +3927,103 @@ mod tests {
         }
         assert!(stats.leaf_entries_examined < ids.len() / 2);
         assert!(stats.bytes_read < body.len() / 2);
+    }
+
+    #[tokio::test]
+    async fn equality_range_agrees_with_the_ordered_prefix_and_reads_only_its_window() {
+        // 10k distinct keys, five ids each. The range read must return exactly
+        // the keys in its window — no more, no fewer — and must not read the
+        // whole index to do it.
+        let index: BTreeMap<String, Vec<[u8; 16]>> = (0..10_000u128)
+            .map(|n| {
+                (
+                    format!("v-{n:08}"),
+                    (0..5).map(|m| id(n * 10 + m)).collect(),
+                )
+            })
+            .collect();
+        let body = build_equality(&index).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("eq.pidx");
+        store
+            .put(&path, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+
+        // A narrow window in the middle: keys v-00004000 ..= v-00004009.
+        let page = equality_range(
+            Arc::clone(&store),
+            path.clone(),
+            b"v-00004000",
+            b"v-00004009",
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let got: Vec<&String> = page.postings.keys().collect();
+        let want: Vec<String> = (4_000..=4_009u128).map(|n| format!("v-{n:08}")).collect();
+        assert_eq!(got, want.iter().collect::<Vec<_>>());
+        for (n, key) in (4_000..=4_009u128).zip(&want) {
+            assert_eq!(
+                page.postings[key],
+                (0..5).map(|m| id(n * 10 + m)).collect::<Vec<_>>()
+            );
+        }
+        assert!(!page.more_in_range);
+        // Positioning by key must cost a search path plus the window, not the
+        // corpus. The ordered prefix would have had to walk 4,000 keys first.
+        assert!(
+            page.stats.bytes_read < body.len() / 20,
+            "a windowed range read {} bytes of a {}-byte index",
+            page.stats.bytes_read,
+            body.len()
+        );
+
+        // A range covering everything must equal the ordered prefix over
+        // everything: the two leaf walks may not drift apart.
+        let all = equality_range(
+            Arc::clone(&store),
+            path.clone(),
+            b"",
+            b"v-zzzzzzzz",
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let (prefix, _) = equality_prefix(Arc::clone(&store), path.clone(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(all.postings, prefix);
+        assert_eq!(all.postings.len(), index.len());
+        assert!(!all.more_in_range);
+
+        // The cap must REPORT that it stopped, or the caller would treat a
+        // partial window as the complete answer and drop rows.
+        let capped = equality_range(
+            Arc::clone(&store),
+            path.clone(),
+            b"v-00004000",
+            b"v-00004009",
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(capped.more_in_range, "a capped range must say so");
+        assert!(capped.postings.values().map(Vec::len).sum::<usize>() <= 7);
+
+        // Bounds outside every key, both sides, and an inverted range.
+        let above = equality_range(Arc::clone(&store), path.clone(), b"w", b"z", usize::MAX)
+            .await
+            .unwrap();
+        assert!(above.postings.is_empty() && !above.more_in_range);
+        let below = equality_range(Arc::clone(&store), path.clone(), b"a", b"b", usize::MAX)
+            .await
+            .unwrap();
+        assert!(below.postings.is_empty() && !below.more_in_range);
+        let inverted = equality_range(store, path, b"v-00005000", b"v-00004000", usize::MAX)
+            .await
+            .unwrap();
+        assert!(inverted.postings.is_empty() && !inverted.more_in_range);
     }
 
     #[tokio::test]

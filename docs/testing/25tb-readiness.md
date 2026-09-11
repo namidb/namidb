@@ -1442,98 +1442,101 @@ If an exact-answer fast path is ever wanted, it needs a per-label
 sets when it recomputes from survivors. That does not exist today, and
 inventing it is a manifest format change.
 
-### 80. [PARTLY FIXED in 2.6.14 — equality; ranges are a missing capability, not a wiring bug] Filtered scans prune nothing
+### 80. [FIXED for indexed properties in 2.6.15; unindexed ranges remain a missing capability] Filtered scans prune nothing
 
-Re-measured on 2.6.14, same 160,000-node fixture, `idx` declared as an
-index, one projected column:
+Measured on the same 160,000-node fixture, `idx` declared as an index, one
+projected column:
 
-| query | rows | 2.6.13 | 2.6.14 | route |
+| query | rows | 2.6.13 | 2.6.15 | route |
 |---|---|---|---|---|
 | `WHERE t.idx = 12345` | 1 | 0.375 s | **0.000078 s** | index |
-| `{idx: 12345}` | 1 | — | **0.000060 s** | index |
-| `WHERE t.idx > 999999` (matches nothing) | 0 | 0.377 s | 0.311 s | scan |
-| `WHERE t.idx < -5` (matches nothing) | 0 | 0.468 s | 0.399 s | scan |
-| `WHERE t.idx > 159990` | 9 | 0.412 s | 0.292 s | scan |
-| `WHERE t.idx > 80000` | 79,999 | 0.417 s | 0.340 s | scan |
+| `WHERE t.idx > 999999` (matches nothing) | 0 | 0.377 s | **0.000068 s** | index |
+| `WHERE t.idx < -5` (matches nothing) | 0 | 0.468 s | **0.000053 s** | index |
+| `WHERE t.idx > 159990` | 9 | 0.412 s | **0.000109 s** | index |
+| `WHERE t.idx > 1000 AND t.idx < 1100` | 99 | ~0.4 s | **0.000527 s** | index |
+| `WHERE t.idx > 80000` | 79,999 | 0.417 s | 0.398 s | scan, declined |
 | no filter (manifest fast path) | 160,000 | 0.001 s | 0.000030 s | — |
 
-**Equality is fixed** — by item 81, not by anything done here. What remains
-is RANGE predicates, and they are still completely insensitive to
-selectivity: a predicate matching nothing costs the same as one matching
-half the store.
+Equality was closed by item 81. Ranges are closed here, for an INDEXED
+property: 2,700x to 7,500x on the selective shapes, and a deliberate
+decline once the window stops being selective.
 
-**THE DIAGNOSIS IN THE TWO PREVIOUS VERSIONS OF THIS ENTRY WAS WRONG, TWICE.**
-Both said this was a wiring problem — "two implemented features that are not
-wired". It is not. Recorded in full, because the wrong version would have
-sent someone to do work that cannot help:
+**Why this was possible without the storage-format change the previous
+version of this entry called for.** The equality sidecar is a
+range-readable B+tree, and item 81 made the numeric key order-preserving —
+so a key window IS a value window. `equality_range_from_source` descends
+once to the leaf holding the lower bound and walks the chained leaf level
+forward; a ten-key window over a 10k-key index reads under 5% of the body.
+No new plan node and no optimizer rule: the optimizer already pushes these
+predicates onto `NodeScan`, so the route sits in front of the scan and
+changes how the same predicate is satisfied, not what the plan is.
+
+**The candidate set is deliberately a SUPERSET**, for three reasons, each
+removed by confirming every candidate with `eval_against_value` — the same
+evaluator the scan uses, so the two routes cannot disagree about what the
+predicate means:
+
+* the numeric key is lossy above 2^53, so distinct integers share a key;
+* a posting can name a node whose current version no longer matches;
+* a raw String key can fall inside the numeric byte window.
+
+A subset would be a silent wrong answer. A superset is a wasted candidate.
+Verified non-inert by removing the confirm step and watching `> 1990`
+disagree with the scan immediately.
+
+**The cap is relative to the label, and that matters in both directions.**
+The index route reads postings AND hydrates candidates; the scan reads each
+row once. A fixed cap is wrong twice over: on a small label it lets the
+route read most of the corpus the slow way, and on a 10M-row label it
+declines windows the index would win by two orders of magnitude. The
+manifest already carries live per-label counts, so the estimate costs no
+I/O. The first draft used a fixed 65,536 and made the declining case SLOWER
+than before (0.475 s against a 0.340 s baseline) purely from postings read
+and thrown away.
+
+**A pushdown gap found on the way, and fixed.** `WHERE n.idx < -5` was not
+reaching storage as a predicate at all: Cypher parses the sign as a unary
+operator, and the pushdown's literal extractor accepted only literals. Every
+negative bound — a temperature, a delta, a debit — was invisible. Folding a
+unary minus over a numeric literal fixes it (with `checked_neg`, so
+`-i64::MIN` stays a residual filter rather than wrapping into a positive
+bound). That gap predates this work and also affected the legacy
+label-scoped row-group pruning path.
+
+**What remains, and it is genuinely a missing capability.** A range on an
+UNINDEXED property still reads every row, and nothing short of a format
+change fixes it. Recorded because two earlier versions of this entry
+prescribed work that cannot help:
 
 1. *"Wire the predicates into the projected-scan branch."* There is nothing
-   to wire them into. A node SST is written with an **empty LabelDef** and
-   therefore has **no `prop_*` columns at all** — flush.rs states it
-   outright: *"one identity-partitioned SST spanning every label, built with
-   an empty LabelDef (fixed layout — no prop_* columns; every property rides
-   in `__overflow_json`)"*. `node_arrow_schema` of an empty LabelDef is six
-   engine columns and nothing else, and
-   `scan_with_predicates_and_projection_async` rejects any file that does
-   not match it exactly. So there are no per-row-group property statistics
-   for `eval_row_group` to read: `node_scan_plan` resolves no column,
+   to wire them into. Node SSTs are written with an empty LabelDef and have
+   **no `prop_*` columns at all** — flush.rs says so outright: *"fixed
+   layout — no prop_* columns; every property rides in `__overflow_json`"*.
+   With no property column there are no per-row-group property statistics,
    `PropertyColumnStats::empty` has `min`/`max` of `None`, and every arm of
-   `eval_row_group` answers `MaybePresent` when the bound is absent. Passing
-   the predicates through would prune exactly zero row groups.
-
-   (The `eval_row_group` / `synthesize_property_stats` machinery is not dead
-   code — it serves LEGACY label-scoped SSTs, whose `scope` names a single
-   label and whose LabelDef therefore does carry properties. The current
-   writer no longer produces those.)
-
+   `eval_row_group` answers `MaybePresent`. (That machinery is not dead —
+   it serves LEGACY label-scoped SSTs, which the current writer no longer
+   produces.)
 2. *"Wire `NodePropertyPageReader::filter_node_ids`."* Its predicate IR is
-   `EqString`, `InString`, `EqBool`, `InBool`, and an explicit
-   `Unsupported` — **no range predicates of any kind**. It could not serve a
-   single one of the slow queries above, and for the equality shapes it does
-   support, the equality posting sidecar already does the job better.
+   `EqString`, `InString`, `EqBool`, `InBool` and an explicit `Unsupported`
+   — no range forms. The `.npp` pages carry size limits, not value
+   statistics.
 
-   The `.npp` pages also carry no per-property `min`/`max`: their page
-   metadata is size limits (`max_value_bytes`, `max_page_decoded_bytes`, …),
-   not value statistics.
+An earlier same-day correction was also wrong: it blamed
+`label_def_for_node_sst` returning an empty property list, and proposed
+resolving the predicate column against the manifest schema. That empty
+LabelDef faithfully describes the file layout; resolving a column name with
+no Parquet column would find nothing.
 
-**An earlier same-day correction in this entry was also wrong** — it said
-the blocker was `label_def_for_node_sst` returning an empty property list
-for id-primary SSTs, and proposed resolving the predicate column against the
-manifest schema instead. That empty LabelDef is a faithful description of
-the file layout, not an oversight: resolving a column name that has no
-Parquet column would find nothing.
-
-**So this is a MISSING CAPABILITY.** Node properties have no value
-statistics anywhere in the current format — not in Parquet, not in the
-property pages. No layer can answer "this page cannot contain a value
-> 999999", so every range predicate reads every row.
-
-**The path that does exist, and why 2.6.14 opened it.** The equality
-sidecar is a range-readable B+tree keyed by the encoded scalar, and
-`ordered_node_ids_by_string_property` already positions by value within it
-for `ORDER BY <string prop> LIMIT k`. Item 81's numeric key was made
-ORDER-PRESERVING for exactly this reason: `sortable_f64_bits` maps an f64
-onto a u64 whose unsigned order is the number's order, so the same B+tree
-can be positioned at `> x` for numbers too. Raw IEEE-754 bits would have
-sorted negatives backwards — which costs an equality probe nothing, and
-would have foreclosed every ordered read over those postings without anyone
-noticing until the format was already in the wild.
-
-Order of work, corrected:
-1. An ordered/range numeric read over the equality sidecar — the twin of
-   `ordered_node_ids_by_string_property`, using the order-preserving key.
-   This serves `WHERE n.amount > x` on an INDEXED property, which is the
-   case operators actually declare an index for.
-2. Only then consider value statistics in the property pages, for ranges on
-   UNINDEXED properties. That is a storage-format change and wants its own
-   design.
-3. Separately, and still true from the original entry: the cost is per-ROW,
-   not per-byte — `count(t.pad)` over a 900-byte string column costs the
-   same as `count(t.idx)` over an 8-byte integer, and two columns cost more
-   than one. That is `Row`/`RuntimeValue` materialisation dominating, and it
-   is what caps every scalar aggregate at ~0.3 s regardless of the column.
-   Vectorised aggregation over the decoded Arrow column is the fix, and it
-   is independent of everything above.
+Order of work from here:
+1. Value statistics in the property pages, for ranges on unindexed
+   properties. A storage-format change, wanting its own design.
+2. Independently, and still true from the original entry: the cost is
+   per-ROW, not per-byte. `count(t.pad)` over a 900-byte string column costs
+   the same as `count(t.idx)` over an 8-byte integer, and two columns cost
+   more than one. That is `Row`/`RuntimeValue` materialisation dominating,
+   and it caps every scalar aggregate at ~0.3 s regardless of the column.
+   Vectorised aggregation over the decoded Arrow column is the fix.
 
 **A note for whoever picks this up**: the default row group is 128Ki rows,
 so any fixture under ~500k rows has too few row groups to show row-group
