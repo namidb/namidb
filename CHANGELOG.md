@@ -15,6 +15,24 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.16] - 2026-09-11
+
+### Fixed
+
+- **An indexed numeric range matching a large share of its label became
+  slower than the plain scan it falls back to.** Found verifying 2.6.15
+  against the published wheel: on 60,000 rows, `WHERE v.idx > 30000`
+  (matching half) took 137 ms through the indexed property against 68 ms
+  through an unindexed twin holding identical values. Selective ranges were
+  unaffected and remain ~10x faster.
+
+  The range reader stops its leaf walk as soon as the window exceeds what
+  the caller will accept — but it then fetched the posting bodies for
+  everything it had already selected, which the caller discards. On a
+  high-cardinality property that is one external read PER KEY. It now
+  returns as soon as it knows the window overflowed, so declining costs the
+  leaf walk it had already paid for and nothing more.
+
 ## [2.6.15] - 2026-09-11
 
 ### Performance
@@ -3521,7 +3539,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.15...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.16...HEAD
+[2.6.16]: https://github.com/namidb/namidb/compare/v2.6.15...v2.6.16
 [2.6.15]: https://github.com/namidb/namidb/compare/v2.6.14...v2.6.15
 [2.6.14]: https://github.com/namidb/namidb/compare/v2.6.13...v2.6.14
 [2.6.13]: https://github.com/namidb/namidb/compare/v2.6.12...v2.6.13
