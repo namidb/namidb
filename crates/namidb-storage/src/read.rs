@@ -1296,6 +1296,192 @@ impl<'mt> Snapshot<'mt> {
         )
     }
 
+    /// Live node ids satisfying a conjunction of RANGE predicates on one
+    /// indexed numeric property, served from the equality sidecar instead of
+    /// scanning the label.
+    ///
+    /// `Some(ids)` is authoritative and already confirmed. `None` means the
+    /// caller must run its exact scan — the property is not indexed, a
+    /// sidecar in scope has no numeric coverage or no range-readable body,
+    /// the predicates are not all numeric bounds on this property, a write
+    /// transaction is open, or the matching window is larger than
+    /// `max_candidates` and the scan is the better route anyway.
+    ///
+    /// Candidates are confirmed with [`crate::sst::eval_against_value`] — the
+    /// SAME evaluator the scan uses — so the two routes cannot disagree about
+    /// what the predicate means. That matters more than usual here: the key
+    /// is lossy above 2^53, a posting can be stale, and a raw String key can
+    /// fall inside the numeric byte window. All three are conservative extra
+    /// candidates that the confirm step removes.
+    pub async fn indexed_node_ids_by_numeric_range(
+        &self,
+        label: &str,
+        property: &str,
+        predicates: &[crate::sst::ScanPredicate],
+        max_candidates: usize,
+    ) -> Result<Option<Vec<NodeId>>> {
+        namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_numeric_range");
+        if predicates.is_empty() || max_candidates == 0 {
+            return Ok(None);
+        }
+        // The transactional overlay keys its candidates with
+        // `unique_index::key_part`, which has no ordering across types and no
+        // range support at all. A scan there sees the same staged writes.
+        if self.transactional_property_index.is_some() {
+            return Ok(None);
+        }
+        let Some((start_key, end_key)) = numeric_range_key_bounds(property, predicates) else {
+            return Ok(None);
+        };
+        if start_key > end_key {
+            return Ok(Some(Vec::new()));
+        }
+
+        let indexed = if label.is_empty() {
+            self.manifest.manifest.schema.labels.values().any(|def| {
+                def.properties
+                    .iter()
+                    .find(|p| p.name == property)
+                    .is_some_and(|p| p.indexed || p.unique)
+            })
+        } else {
+            self.manifest
+                .manifest
+                .schema
+                .label(label)
+                .and_then(|def| def.properties.iter().find(|p| p.name == property))
+                .is_some_and(|p| p.indexed || p.unique)
+        };
+        if !indexed {
+            return Ok(None);
+        }
+
+        let all_node_ssts: Vec<usize> = self.manifest.index.node_descriptors();
+        let sst_idxs: Vec<usize> = all_node_ssts
+            .into_iter()
+            .filter(|idx| {
+                label.is_empty() || node_sst_can_contain_label(&self.manifest.manifest, *idx, label)
+            })
+            .collect();
+
+        let mut candidates: Vec<NodeId> = Vec::new();
+        for idx in &sst_idxs {
+            let Some(descriptor) = self.manifest.manifest.ssts[*idx]
+                .equality_property_indices
+                .iter()
+                .find(|desc| {
+                    desc.property == property && desc.mixed_type_complete && desc.numeric_complete
+                })
+            else {
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            };
+            let Some(paged) = &descriptor.paged else {
+                // A legacy-only body cannot be positioned by key without
+                // decoding the whole object, which is the cost this route
+                // exists to avoid.
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            };
+            let paged_absolute =
+                format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
+            let source = match self
+                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .await
+            {
+                Ok(source) => source,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    crate::route_telemetry::record_property(false);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let remaining = max_candidates.saturating_sub(candidates.len());
+            let page = match crate::sst::paged_index::equality_range_from_source(
+                &source,
+                start_key.as_bytes(),
+                end_key.as_bytes(),
+                remaining.saturating_add(1),
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    crate::route_telemetry::record_property(false);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if page.stats.index_entries != descriptor.distinct_values {
+                tracing::warn!(
+                    path = %paged.path,
+                    expected_entries = descriptor.distinct_values,
+                    actual_entries = page.stats.index_entries,
+                    "paged equality accelerator is stale/partial; declining the range route"
+                );
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            }
+            if let Some(cache) = &self.property_index_cache {
+                cache.record_equality_index_bytes_read(page.stats.bytes_read);
+            }
+            if page.more_in_range {
+                // Too wide to be worth an index: the scan reads the same rows
+                // once, without also paying the posting reads.
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            }
+            for ids in page.postings.into_values() {
+                for id in ids {
+                    candidates.push(NodeId::from_uuid(Uuid::from_bytes(id)));
+                }
+            }
+            if candidates.len() > max_candidates {
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            }
+        }
+
+        // The committed/staged memtable delta, which no sidecar covers yet.
+        let memtable = self.memtable_property_claimants(label, property)?;
+        for (key, ids) in memtable.iter() {
+            if key.as_str() < start_key.as_str() || key.as_str() > end_key.as_str() {
+                continue;
+            }
+            for id in ids {
+                candidates.push(*id);
+            }
+            if candidates.len() > max_candidates {
+                crate::route_telemetry::record_property(false);
+                return Ok(None);
+            }
+        }
+
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut confirmed = Vec::with_capacity(candidates.len());
+        const CONFIRM_BATCH: usize = 256;
+        for batch in candidates.chunks(CONFIRM_BATCH) {
+            if let Some(cache) = &self.property_index_cache {
+                cache.record_equality_confirmation_candidates(batch.len());
+            }
+            let views = self.batch_lookup_nodes(label, batch).await?;
+            for (id, view) in batch.iter().zip(views) {
+                let Some(view) = view else { continue };
+                let value = view.properties.get(property);
+                if predicates
+                    .iter()
+                    .all(|predicate| crate::sst::eval_against_value(predicate, value))
+                {
+                    confirmed.push(*id);
+                }
+            }
+        }
+        crate::route_telemetry::record_property(true);
+        Ok(Some(confirmed))
+    }
+
     /// Return the live node ids matching EVERY member of a declared
     /// composite equality index.
     ///
@@ -5858,6 +6044,19 @@ impl<'mt> Snapshot<'mt> {
             return Ok(Vec::new());
         }
 
+        // A bare `LIMIT` over a selective range still benefits: the scan has
+        // to walk until it has found `limit` matches, which for a rare value
+        // is the whole label. The route returns the confirmed set in id order
+        // — the same order the scan produces — so truncating here picks the
+        // same rows the scan would have.
+        if let Some(mut rows) = self
+            .try_scan_numeric_range_index(label, predicates, projection)
+            .await?
+        {
+            rows.truncate(limit);
+            return Ok(rows);
+        }
+
         // Predicate columns are semantically required even when a direct
         // storage caller supplies a narrower output projection. The optimizer
         // already includes them, but widening here keeps this API exact on its
@@ -6113,12 +6312,136 @@ impl<'mt> Snapshot<'mt> {
     /// filter optional here ensures both routes perform exactly one
     /// memtable+SST reconciliation and cannot drift in predicate/projection
     /// semantics.
+    /// Widest matching window the numeric range index will serve before
+    /// handing the query back to the scan.
+    ///
+    /// The index route reads the postings AND hydrates every candidate; the
+    /// scan reads each row once. So the index wins only while the window is
+    /// SMALL RELATIVE TO THE LABEL, and the cap is what enforces that.
+    ///
+    /// Relative on purpose. A fixed cap is wrong in both directions: on a
+    /// small label it lets the route read most of the corpus through the
+    /// slower path, and on a 10M-row label it declines windows the index
+    /// would have won by two orders of magnitude. The manifest already
+    /// carries live per-label counts, so the estimate costs no I/O.
+    ///
+    /// The cap also bounds the WASTED work of a decline: exceeding it stops
+    /// the leaf walk, so an unselective range pays a bounded posting read
+    /// before falling back, not a full one.
+    ///
+    /// `NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES` overrides the absolute ceiling.
+    fn numeric_range_candidate_cap(&self, label: &str) -> usize {
+        const DEFAULT_CEILING: usize = 65_536;
+        /// A window under an eighth of the label is worth an index lookup;
+        /// beyond that the scan reads the same rows once and wins.
+        const LABEL_FRACTION: u64 = 8;
+
+        let ceiling = std::env::var("NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CEILING);
+
+        let mut live: u64 = 0;
+        for idx in self.manifest.index.node_descriptors() {
+            let desc = &self.manifest.manifest.ssts[idx];
+            if !desc.scope.is_empty() {
+                if desc.scope == label || label.is_empty() {
+                    live = live.saturating_add(desc.row_count);
+                }
+                continue;
+            }
+            let Some(index) = &desc.label_index else {
+                // No per-label counts to estimate from; the whole SST is an
+                // upper bound, which keeps the cap conservative rather than
+                // accidentally tiny.
+                live = live.saturating_add(desc.row_count);
+                continue;
+            };
+            if label.is_empty() || index.per_label_counts.is_empty() {
+                live = live.saturating_add(desc.row_count);
+                continue;
+            }
+            if let Some(label_id) = self.manifest.manifest.label_dict.id(label) {
+                live = live.saturating_add(
+                    index
+                        .per_label_counts
+                        .iter()
+                        .filter(|(id, _)| *id == label_id.get())
+                        .map(|(_, count)| *count)
+                        .sum::<u64>(),
+                );
+            }
+        }
+        if live == 0 {
+            return ceiling;
+        }
+        usize::try_from(live / LABEL_FRACTION)
+            .unwrap_or(ceiling)
+            .clamp(1, ceiling)
+    }
+
+    /// Serve a label scan from the numeric range index when every predicate
+    /// is a bound on one indexed numeric property and the matching window is
+    /// small enough to be worth it.
+    ///
+    /// `None` means "not applicable" and the caller runs its ordinary scan.
+    /// This sits in front of the scan rather than in the planner because the
+    /// optimizer has already pushed these predicates down: the plan does not
+    /// change, only the way the same predicate is satisfied.
+    async fn try_scan_numeric_range_index(
+        &self,
+        label: Option<&str>,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+    ) -> Result<Option<Vec<NodeView>>> {
+        if predicates.is_empty() {
+            return Ok(None);
+        }
+        let property = predicates[0].column();
+        if predicates
+            .iter()
+            .any(|predicate| predicate.column() != property)
+        {
+            return Ok(None);
+        }
+        let label = label.unwrap_or("");
+        let Some(ids) = self
+            .indexed_node_ids_by_numeric_range(
+                label,
+                property,
+                predicates,
+                self.numeric_range_candidate_cap(label),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Already confirmed against the predicate and sorted by id, which is
+        // the order the scan returns rows in.
+        let views = self.batch_lookup_nodes(label, &ids).await?;
+        let mut rows: Vec<NodeView> = views.into_iter().flatten().collect();
+        if let Some(requested) = projection {
+            let keep: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+            for row in &mut rows {
+                row.properties
+                    .retain(|name, _| keep.contains(name.as_str()));
+            }
+        }
+        Ok(Some(rows))
+    }
+
     async fn scan_nodes_with_optional_label(
         &self,
         label: Option<&str>,
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
+        if let Some(rows) = self
+            .try_scan_numeric_range_index(label, predicates, projection)
+            .await?
+        {
+            return Ok(rows);
+        }
         let dict = &self.manifest.manifest.label_dict;
         // Row-group predicate pruning happens before the LSM winner is known.
         // It is therefore sound only when the manifest proves that every
@@ -9734,6 +10057,64 @@ fn equality_sidecar_key(
             _ => None,
         },
     }
+}
+
+/// Byte bounds over the ScalarV1 key space for a conjunction of numeric
+/// predicates on `property`, or `None` when this route does not apply.
+///
+/// Bounds are always INCLUSIVE at the key level even for a strict `<` / `>`:
+/// the numeric key is lossy above 2^53, so the boundary key can be shared by
+/// values that do and do not satisfy the predicate. Including it and letting
+/// the confirm step decide is the only safe direction — excluding it could
+/// drop a row.
+///
+/// The window is clamped to the numeric key space (`n:` + 16 hex), which
+/// keeps the leaf walk off the raw-String keys that share the sidecar.
+fn numeric_range_key_bounds(
+    property: &str,
+    predicates: &[crate::sst::ScanPredicate],
+) -> Option<(String, String)> {
+    use crate::sst::{ScanPredicate as P, StatScalar as S};
+
+    const NUMERIC_LOW: &str = "n:0000000000000000";
+    const NUMERIC_HIGH: &str = "n:ffffffffffffffff";
+
+    fn numeric_value(scalar: &S) -> Option<Value> {
+        match scalar {
+            S::Int32(v) => Some(Value::I64(i64::from(*v))),
+            S::Int64(v) => Some(Value::I64(*v)),
+            S::Float32(v) if !v.is_nan() => Some(Value::F64(f64::from(*v))),
+            S::Float64(v) if !v.is_nan() => Some(Value::F64(*v)),
+            _ => None,
+        }
+    }
+
+    let mut low = NUMERIC_LOW.to_string();
+    let mut high = NUMERIC_HIGH.to_string();
+    let mut bounded = false;
+    for predicate in predicates {
+        if predicate.column() != property {
+            return None;
+        }
+        let (scalar, is_lower, is_upper) = match predicate {
+            P::Gt { value, .. } | P::GtEq { value, .. } => (value, true, false),
+            P::Lt { value, .. } | P::LtEq { value, .. } => (value, false, true),
+            P::Eq { value, .. } => (value, true, true),
+            // IN could be served as a multi-probe, IS NULL / IS NOT NULL not
+            // at all from a sidecar that files no key for an absent value.
+            P::In { .. } | P::IsNull { .. } | P::IsNotNull { .. } => return None,
+        };
+        let key = crate::cache::encode_equality_property_value(&numeric_value(scalar)?)?;
+        if is_lower && key > low {
+            low = key.clone();
+        }
+        if is_upper && key < high {
+            high = key;
+        }
+        bounded = true;
+    }
+    // An unbounded window is the whole label: the scan is the better route.
+    bounded.then_some((low, high))
 }
 
 /// A probe value Cypher compares numerically, and which therefore requires

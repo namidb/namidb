@@ -15,6 +15,54 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.15] - 2026-09-11
+
+### Performance
+
+- **A range predicate on an indexed numeric property is now served by the
+  index instead of reading every row.** `WHERE n.amount > 1000`,
+  `WHERE n.fecha >= ... AND n.fecha < ...`, `WHERE n.stock < 5` — the shapes
+  a retail or clinical schema is built on — were completely insensitive to
+  selectivity: on 160,000 rows, a predicate matching NOTHING cost 0.311 s and
+  one matching half cost 0.340 s.
+
+  | query | before | after |
+  |---|---|---|
+  | `WHERE t.idx > 999999` (0 rows) | 0.311 s | 0.000068 s |
+  | `WHERE t.idx < -5` (0 rows) | 0.399 s | 0.000053 s |
+  | `WHERE t.idx > 159990` (9 rows) | 0.292 s | 0.000109 s |
+  | `WHERE t.idx > 1000 AND t.idx < 1100` (99 rows) | ~0.4 s | 0.000527 s |
+  | `WHERE t.idx > 80000` (79,999 rows) | 0.340 s | scan, declined |
+
+  The equality sidecar is a range-readable B+tree and its numeric key is
+  order-preserving, so a key window is a value window: the reader descends
+  once to the lower bound and walks the leaf level forward, reading the
+  matching keys rather than the corpus.
+
+  Candidates are confirmed with the same evaluator the scan uses, so the two
+  routes cannot disagree — necessary, because the candidate set is
+  deliberately a superset (the key is lossy above 2^53, a posting can name a
+  stale version, and a raw string key can fall inside the numeric window).
+
+  The route declines, and the scan runs as before, whenever it cannot be
+  authoritative or cannot win: an unindexed property, a sidecar without
+  numeric coverage, an open write transaction, or a window too wide relative
+  to the label. That threshold scales with the label's live row count, which
+  the manifest already carries.
+
+  A range on an UNINDEXED property is unchanged and still reads every row.
+  Node SSTs carry no per-property columns and the property pages carry no
+  value statistics, so there is nothing to prune on; closing that is a
+  storage-format change.
+
+### Fixed
+
+- **A negative literal bound never reached storage as a predicate.**
+  `WHERE n.amount < -5` parses the sign as a unary operator, and predicate
+  pushdown accepted only bare literals, so every negative bound — a
+  temperature, a delta, a debit — was left entirely to the residual filter.
+  `-i64::MIN` still is, rather than wrapping into a positive bound.
+
 ## [2.6.14] - 2026-09-11
 
 ### Performance
@@ -3473,7 +3521,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.14...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.15...HEAD
+[2.6.15]: https://github.com/namidb/namidb/compare/v2.6.14...v2.6.15
 [2.6.14]: https://github.com/namidb/namidb/compare/v2.6.13...v2.6.14
 [2.6.13]: https://github.com/namidb/namidb/compare/v2.6.12...v2.6.13
 [2.6.12]: https://github.com/namidb/namidb/compare/v2.6.11...v2.6.12
