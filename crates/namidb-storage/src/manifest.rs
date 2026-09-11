@@ -485,6 +485,19 @@ pub struct EqualityIndexDescriptor {
     /// negative-answer index.
     #[serde(default)]
     pub mixed_type_complete: bool,
+    /// The collector also harvested every NUMERIC runtime value for this
+    /// property, so an Integer/Float probe may be answered from the posting
+    /// list instead of scanning the label.
+    ///
+    /// A NEW FIELD rather than a new [`EqualityKeyEncoding`] variant, and
+    /// deliberately so: `key_encoding` is an externally-tagged enum, so a
+    /// rolled-back reader meeting an unknown variant fails to deserialise the
+    /// WHOLE manifest and cannot open the namespace. An unknown *field* is
+    /// ignored. A widened sidecar is a strict superset — a pre-numeric reader
+    /// probes only its String/Bool keys, which are exactly as complete as
+    /// before, and leaves numeric equality on the scan route it already used.
+    #[serde(default)]
+    pub numeric_complete: bool,
     /// Physical encoding of the immutable posting map.
     #[serde(default)]
     pub format: PropertyIndexFormat,
@@ -3358,6 +3371,7 @@ mod tests {
             distinct_values: 2,
             key_encoding: EqualityKeyEncoding::ScalarV1,
             mixed_type_complete: true,
+            numeric_complete: false,
             format: PropertyIndexFormat::PagedV1,
             paged: None,
             paged_build_unsupported: false,

@@ -1595,6 +1595,20 @@ impl<'mt> Snapshot<'mt> {
             cache.record_equality_lookup();
         }
 
+        // The transactional overlay keys off `unique_index::key_part`, whose
+        // `I64` and `F64` are DISTINCT variants — it does not canonicalise
+        // numerics the way the posting key does. Probing `{n: 5.0}` there
+        // would miss every row storing `I64(5)` and return an authoritative
+        // empty result. Decline the index inside a write transaction and let
+        // the caller scan: the scan sees the same overlay, so it is correct,
+        // and it is exactly the cost numeric equality paid everywhere before.
+        // (Canonicalising `key_part` would also change unique-constraint
+        // conflict semantics, which is a separate decision.)
+        if probe_is_numeric(value) && self.transactional_property_index.is_some() {
+            crate::route_telemetry::record_property(false);
+            return Ok(IndexedPropertyLookup::Unavailable);
+        }
+
         let mut cursors: Vec<EqualityNodePostingCursor> = Vec::new();
         let mut advertised_source_entries: Option<usize> = None;
         let mut truncated_source_without_cursor = false;
@@ -1626,6 +1640,12 @@ impl<'mt> Snapshot<'mt> {
                         .equality_property_indices
                         .iter()
                         .find(|desc| desc.property == property && desc.mixed_type_complete)
+                        // A numeric probe needs a sidecar that actually
+                        // harvested numbers. On one written before numeric
+                        // equality was indexable the flag defaults to false,
+                        // so the whole lookup reports Unavailable and the
+                        // caller scans — correct, and exactly today's cost.
+                        .filter(|desc| !probe_is_numeric(value) || desc.numeric_complete)
                         .filter(|desc| equality_sidecar_key(desc.key_encoding, value).is_some())
                         .map(|desc| (*idx, desc))
                 })
@@ -1743,10 +1763,17 @@ impl<'mt> Snapshot<'mt> {
             }
             let views = self.batch_lookup_nodes(label, &batch).await?;
             for (id, view) in batch.into_iter().zip(views) {
-                if view
-                    .as_ref()
-                    .is_some_and(|view| view.properties.get(property) == Some(value))
-                {
+                // Cypher equality, not `==`. The canonical numeric key makes
+                // `I64(5)` and `F64(5.0)` share a posting BECAUSE they are the
+                // same Cypher value, so a typed `==` here would file them
+                // together and then throw one of them away. It is also what
+                // separates the false positives that key is lossy enough to
+                // admit: two i64 above 2^53 that round to the same f64.
+                if view.as_ref().is_some_and(|view| {
+                    view.properties
+                        .get(property)
+                        .is_some_and(|current| crate::cache::cypher_scalar_equal(current, value))
+                }) {
                     confirmed.push(id);
                     if confirmed.len() == target {
                         break;
@@ -2051,6 +2078,36 @@ impl<'mt> Snapshot<'mt> {
             .filter(|i| {
                 string_property_sidecar(&self.manifest.manifest.ssts[**i], label, property)
                     .is_some()
+            })
+            .count();
+        (covered, in_scope.len())
+    }
+
+    /// Numeric twin of [`Self::property_index_coverage`]: how many in-scope
+    /// node SSTs advertise a sidecar that actually harvested numbers, and can
+    /// therefore serve an Integer/Float equality instead of scanning.
+    ///
+    /// Lower than the String coverage exactly while older SSTs are still
+    /// waiting for the compaction that backfills their numeric postings.
+    pub fn numeric_property_index_coverage(&self, label: &str, property: &str) -> (usize, usize) {
+        let in_scope: Vec<usize> = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .filter(|i| node_sst_can_contain_label(&self.manifest.manifest, *i, label))
+            .collect();
+        let covered = in_scope
+            .iter()
+            .filter(|i| {
+                self.manifest.manifest.ssts[**i]
+                    .equality_property_indices
+                    .iter()
+                    .any(|sidecar| {
+                        sidecar.property == property
+                            && sidecar.mixed_type_complete
+                            && sidecar.numeric_complete
+                    })
             })
             .count();
         (covered, in_scope.len())
@@ -9666,10 +9723,24 @@ fn equality_sidecar_key(
             _ => None,
         },
         crate::manifest::EqualityKeyEncoding::ScalarV1 => match value {
-            Value::Str(_) | Value::Bool(_) => crate::cache::encode_equality_property_value(value),
+            // Numerics are encodable under the same ScalarV1 key space (one
+            // canonical `n:` key for Integer and Float alike), but whether a
+            // GIVEN sidecar actually filed them is a per-descriptor fact:
+            // see `EqualityIndexDescriptor::numeric_complete`, checked by the
+            // caller. Encoding compatibility and coverage are separate gates.
+            Value::Str(_) | Value::Bool(_) | Value::I64(_) | Value::F64(_) => {
+                crate::cache::encode_equality_property_value(value)
+            }
             _ => None,
         },
     }
+}
+
+/// A probe value Cypher compares numerically, and which therefore requires
+/// the sidecar to advertise `numeric_complete` before its negative answer can
+/// be trusted.
+fn probe_is_numeric(value: &Value) -> bool {
+    matches!(value, Value::I64(_) | Value::F64(_))
 }
 
 /// Ids resolved per inner batch pass. Large enough that the batched
@@ -16694,6 +16765,7 @@ mod tests {
                 distinct_values: 1,
                 key_encoding: crate::manifest::EqualityKeyEncoding::StringV0,
                 mixed_type_complete: true,
+                numeric_complete: false,
                 format: crate::manifest::PropertyIndexFormat::BincodeV0,
                 paged: None,
                 paged_build_unsupported: false,

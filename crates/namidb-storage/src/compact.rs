@@ -99,7 +99,7 @@ use tracing::{debug, instrument};
 use uuid::Uuid;
 use xxhash_rust::xxh3::Xxh3;
 
-use namidb_core::{DataType, EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
+use namidb_core::{EdgeTypeDef, LabelDef, LabelDictionary, Schema, Value};
 
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
@@ -561,17 +561,23 @@ fn node_descriptor_needs_non_record_migration(
     required: &LabelDef,
     composite: &[namidb_core::schema::IndexDef],
 ) -> bool {
-    let required_equality: Vec<&str> = required
+    // `(name, numeric)`: a numeric-declared property additionally demands a
+    // sidecar that advertises numeric coverage, so SSTs written before
+    // numeric equality was indexable are rewritten once and their postings
+    // backfilled — the same DDL-backfill arm item 38 added for the
+    // String/Bool case.
+    let required_equality: Vec<(&str, bool)> = required
         .properties
         .iter()
         .filter(|property| {
-            property.indexed
-                && matches!(
-                    property.data_type,
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Bool
-                )
+            property.indexed && crate::flush::equality_indexable(&property.data_type)
         })
-        .map(|property| property.name.as_str())
+        .map(|property| {
+            (
+                property.name.as_str(),
+                crate::flush::numeric_data_type(&property.data_type),
+            )
+        })
         .collect();
     desc.unique_property_indices.iter().any(|index| {
         index.format != crate::manifest::PropertyIndexFormat::PagedV1
@@ -581,10 +587,11 @@ fn node_descriptor_needs_non_record_migration(
         index.format != crate::manifest::PropertyIndexFormat::PagedV1
             && index.paged.is_none()
             && !index.paged_build_unsupported
-    }) || required_equality.iter().any(|property| {
+    }) || required_equality.iter().any(|(property, numeric)| {
         !desc.equality_property_indices.iter().any(|index| {
             index.property == *property
                 && index.mixed_type_complete
+                && (!numeric || index.numeric_complete)
                 && (index.format == crate::manifest::PropertyIndexFormat::PagedV1
                     || index.paged.is_some()
                     || index.paged_build_unsupported)
@@ -3991,10 +3998,19 @@ impl VectorMemberCollector {
             .into_iter()
             .flat_map(|label| &label.properties)
             .filter(|property| {
+                // Deliberately NOT widened to numerics alongside the equality
+                // sidecars. This is the search-LSM native-filter catalog: its
+                // property list feeds the catalog signature, so changing it
+                // retires every vector/text generation for rebuild. The
+                // prefilter's own numeric exclusion is locked by
+                // `vector_prefilter_never_narrows_cross_typed_numeric_equality`
+                // and should be lifted with that subsystem, not with this one.
                 (property.indexed || property.unique)
                     && matches!(
                         property.data_type,
-                        DataType::Bool | DataType::Utf8 | DataType::LargeUtf8
+                        namidb_core::DataType::Bool
+                            | namidb_core::DataType::Utf8
+                            | namidb_core::DataType::LargeUtf8
                     )
             })
             .map(|property| property.name.clone())

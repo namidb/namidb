@@ -142,14 +142,25 @@ pub fn encode_equality_property_value(value: &Value) -> Option<String> {
     match value {
         Value::Str(s) => out.push_str(s),
         Value::Bool(v) => out.push_str(if *v { "b:1" } else { "b:0" }),
+        // Numerics share ONE canonical key. Cypher equality coerces across
+        // Integer and Float (`5 = 5.0` is TRUE, mirrored from the executor's
+        // `is_equal`), so two values that compare equal MUST encode
+        // identically or the index route silently drops rows the scan route
+        // returns. This matches what TupleV1 already does for composite
+        // members; see [`encode_equality_tuple_key`].
+        //
+        // `i64 -> f64` loses precision above 2^53, so distinct integers can
+        // share a posting. That is a conservative FALSE POSITIVE, not a wrong
+        // answer: every candidate is re-confirmed against the current typed
+        // value with [`cypher_scalar_equal`] before it reaches a result.
         Value::I64(v) => {
             use std::fmt::Write as _;
-            write!(&mut out, "i:{:016x}", (*v as u64) ^ (1_u64 << 63)).ok()?;
+            write!(&mut out, "n:{:016x}", (*v as f64).to_bits()).ok()?;
         }
         Value::F64(v) if !v.is_nan() => {
             let normalized = if *v == 0.0 { 0.0 } else { *v };
             use std::fmt::Write as _;
-            write!(&mut out, "f:{:016x}", normalized.to_bits()).ok()?;
+            write!(&mut out, "n:{:016x}", normalized.to_bits()).ok()?;
         }
         Value::Bytes(bytes) => {
             use std::fmt::Write as _;
@@ -2898,6 +2909,50 @@ mod tests {
         );
         assert!(encode_equality_property_value(&Value::Null).is_none());
         assert!(encode_equality_property_value(&Value::F64(f64::NAN)).is_none());
+    }
+
+    #[test]
+    fn numeric_equality_keys_are_canonical_across_integer_and_float() {
+        // Cypher says `5 = 5.0`, so the index must file them together or the
+        // posting route drops rows the scan route returns.
+        assert_eq!(
+            encode_equality_property_value(&Value::I64(5)),
+            encode_equality_property_value(&Value::F64(5.0)),
+            "an integer and an equal float must share one posting"
+        );
+        assert_eq!(
+            encode_equality_property_value(&Value::I64(-7)),
+            encode_equality_property_value(&Value::F64(-7.0))
+        );
+        assert_eq!(
+            encode_equality_property_value(&Value::I64(0)),
+            encode_equality_property_value(&Value::F64(-0.0)),
+            "-0.0 folds into 0.0, which equals the integer zero"
+        );
+        assert_ne!(
+            encode_equality_property_value(&Value::I64(5)),
+            encode_equality_property_value(&Value::F64(5.5))
+        );
+        assert_ne!(
+            encode_equality_property_value(&Value::I64(5)),
+            encode_equality_property_value(&Value::Str("5".into())),
+            "a string never equals a number in Cypher"
+        );
+
+        // Above 2^53 the canonical key is LOSSY on purpose: distinct integers
+        // may share a posting. That is a conservative false positive, and
+        // `cypher_scalar_equal` is what removes it at confirm time.
+        let low = Value::I64(9_007_199_254_740_992); // 2^53
+        let high = Value::I64(9_007_199_254_740_993); // 2^53 + 1
+        assert_eq!(
+            encode_equality_property_value(&low),
+            encode_equality_property_value(&high),
+            "the lossy key is expected to collide here"
+        );
+        assert!(
+            !cypher_scalar_equal(&low, &high),
+            "the confirm step MUST separate what the key merged"
+        );
     }
 
     fn tight_cache(bytes: usize) -> SstCache {
