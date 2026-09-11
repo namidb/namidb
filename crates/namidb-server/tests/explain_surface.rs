@@ -164,8 +164,10 @@ async fn explain_renders_the_plan_and_its_physical_route_without_executing() {
         "index route note expected after flush: {body}"
     );
 
-    // A numeric equality is not posting-indexed — the footer says so
-    // instead of letting the operator name imply index speed.
+    // A numeric equality IS posting-indexed, but only on sidecars that
+    // harvested numbers. These SSTs were flushed before the index existed,
+    // so the footer must report the scan it is really taking rather than
+    // letting the operator name imply index speed.
     let (status, body) = cypher(
         &base,
         "CREATE INDEX persona_seq IF NOT EXISTS FOR (p:Person) ON (p.seq)",
@@ -176,8 +178,29 @@ async fn explain_renders_the_plan_and_its_physical_route_without_executing() {
     assert_eq!(status, 200, "{body}");
     if body.contains("NodeByPropertyValue") {
         assert!(
-            body.contains("numeric equality is not posting-indexed"),
-            "numeric route caveat expected: {body}"
+            body.contains("SCAN FALLBACK") && body.contains("numeric postings"),
+            "a numeric equality over pre-index SSTs must report the scan it \
+             is really taking: {body}"
+        );
+    }
+
+    // …and a compaction pass backfills those postings, which is the whole
+    // migration path. The same EXPLAIN must then say index.
+    let compact = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/compact"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let compact_status = compact.status().as_u16();
+    let compact_body = compact.text().await.unwrap();
+    assert_eq!(compact_status, 200, "compact said: {compact_body}");
+    let (status, body) = cypher(&base, "EXPLAIN MATCH (p:Person {seq: 7}) RETURN p").await;
+    assert_eq!(status, 200, "{body}");
+    if body.contains("NodeByPropertyValue") {
+        assert!(
+            body.contains("→ index"),
+            "numeric postings must be servable after a compaction pass: {body}"
         );
     }
 

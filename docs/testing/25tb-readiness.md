@@ -1716,3 +1716,60 @@ property list feeds the catalog signature, so widening it retires every
 vector/text generation for rebuild. Its numeric exclusion is locked by
 `vector_prefilter_never_narrows_cross_typed_numeric_equality` and should
 be lifted with that subsystem.
+
+### 82. [FIXED in 2.6.14] `POST /v0/admin/compact` returned 500 after a `CREATE INDEX`
+
+Found while wiring the item 81 migration path into the EXPLAIN surface
+test — which is to say, found by trying to USE the migration the release
+notes describe. The admin drain answered a DDL-triggered compaction with
+
+    500 {"error":"compaction failed: precondition failed: abandoning
+         prepared compaction: Nodes input <uuid> is missing or ambiguous"}
+
+Reproduction: seed rows -> `POST /v0/admin/flush` -> `CREATE INDEX ... FOR
+(p:Label) ON (p.prop)` -> `POST /v0/admin/compact`. That is exactly the
+sequence an operator runs — "I declared the index, now materialize it".
+
+**Pre-existing, and not item 81's doing.** It reproduces with the numeric
+rewrite trigger disabled. What the DDL adds is `needs_compaction() == true`
+via the item-38 backfill arm, so the DDL rewrite path runs at all.
+
+**Root cause: a lost install race reported as a failure.** `CREATE INDEX`
+schedules its OWN backfill pass (lib.rs:3361, the item-38 trigger). The
+admin drain does not go through `CompactionScheduler::admit` — it calls
+`run_compaction_pass` directly — and `compaction_guard()` is a READ guard,
+held by both, which excludes the orphan janitor and not another compactor.
+So the two run concurrently, the DDL worker installs first, and the drain's
+prepared plan names an input the winner already merged away.
+`run_compaction_pass` already labels that `CompactionStatus::Stale` — "a
+competing compaction won the install race" — and then returned it as an
+error, which `drain_compaction` turned into a 500 whenever it happened on
+the FIRST pass (`summary.passes` counts only `Applied`).
+
+**Fix.** Losing the race is not a failure of the drain: the merge it
+prepared was performed by whoever won. It now re-prepares against the
+manifest they left, bounded by `MAX_CONSECUTIVE_RACES_LOST = 8` because
+each retry pays a full prepare, and reports `races_lost` in the drain
+summary so a drain that spends its passes losing races stays visible.
+
+The error messages in `verify_node_rewrite_inputs` now name the basis
+version, the manifest version, and the number of Nodes SSTs, and separate
+"no longer present" (a lost race, benign) from "changed between prepare and
+install" and from a genuinely duplicated id, which is an invariant
+violation rather than a precondition. The original "missing or ambiguous"
+conflated three different problems and cost a long diagnosis; with the new
+message the cause read directly off the failure: *basis v5 … no longer in
+manifest v6*.
+
+Pinned by `admin_compact_survives_the_ddl_backfill_pass_it_races`
+(crates/namidb-server/tests/ddl_index_backfill.rs), verified non-inert by
+reverting the retry and watching it fail. The EXPLAIN surface test now also
+drives the whole migration over HTTP: DDL -> `numeric postings 0/N` ->
+admin compact -> `→ index`.
+
+**Not changed, and worth stating.** The deeper fix is to make the admin
+drain participate in scheduler admission so it cannot run beside a
+background worker at all. That touches the admission state machine
+(leases, coalescing, pending follow-ups) and is a larger change than this
+defect needs; the retry is correct regardless, since an external writer can
+always win a race the drain does not control.

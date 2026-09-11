@@ -1823,9 +1823,17 @@ struct RebasedBarrier {
     body: Bytes,
 }
 
+/// Confirm every prepared Nodes rewrite still describes the manifest it is
+/// about to be folded into.
+///
+/// The failure messages name the manifest versions and say WHICH way the
+/// check failed. A bare "missing or ambiguous" cost a long diagnosis once:
+/// a lost install race, a stale basis, and a genuinely duplicated id are
+/// three different problems, and only one of them is benign.
 fn verify_node_rewrite_inputs(
     manifest: &crate::manifest::Manifest,
     rewrites: &[PreparedNodeRewrite],
+    base_version: u64,
 ) -> Result<()> {
     let mut claimed = HashSet::new();
     for rewrite in rewrites {
@@ -1844,18 +1852,33 @@ fn verify_node_rewrite_inputs(
                 .ssts
                 .iter()
                 .filter(|descriptor| descriptor.id == input.id);
+            let nodes_now = manifest
+                .ssts
+                .iter()
+                .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+                .count();
             match (matches.next(), matches.next()) {
                 (Some(current), None) if current == input => {}
                 (Some(_), None) => {
                     return Err(Error::precondition(format!(
-                        "abandoning prepared compaction: Nodes input {} changed after prepare",
-                        input.id
+                        "abandoning prepared compaction (basis v{base_version}): Nodes input {} \
+                         changed between prepare and install in manifest v{} \
+                         ({nodes_now} Nodes SSTs present)",
+                        input.id, manifest.version
+                    )));
+                }
+                (None, _) => {
+                    return Err(Error::precondition(format!(
+                        "abandoning prepared compaction (basis v{base_version}): Nodes input {} \
+                         is no longer in manifest v{} ({nodes_now} Nodes SSTs present); \
+                         another compaction won the install race",
+                        input.id, manifest.version
                     )));
                 }
                 _ => {
-                    return Err(Error::precondition(format!(
-                        "abandoning prepared compaction: Nodes input {} is missing or ambiguous",
-                        input.id
+                    return Err(Error::invariant(format!(
+                        "manifest v{} lists Nodes SST {} more than once",
+                        manifest.version, input.id
                     )));
                 }
             }
@@ -2294,7 +2317,11 @@ pub async fn install_prepared(
                 prepared.base_version
             ))
         })?;
-        verify_node_rewrite_inputs(&current.manifest, &prepared.node_rewrites)?;
+        verify_node_rewrite_inputs(
+            &current.manifest,
+            &prepared.node_rewrites,
+            prepared.base_version,
+        )?;
         // States this very prepare REPLACES (the authoritative rebuild path —
         // e.g. a freshly recreated index still Building with partial
         // coverage) are retired below, not rebased: validating their partial
@@ -5220,7 +5247,8 @@ mod tests {
             .unwrap()
             .max_lsn += 1;
         assert!(
-            verify_node_rewrite_inputs(&conflicting_manifest, std::slice::from_ref(&plan)).is_err()
+            verify_node_rewrite_inputs(&conflicting_manifest, std::slice::from_ref(&plan), 0)
+                .is_err()
         );
     }
 

@@ -208,3 +208,77 @@ async fn create_index_on_loaded_data_materializes_without_periodic_compaction() 
         "an applied ddl-triggered compaction must be counted; got: {applied:?}"
     );
 }
+
+/// Item 82: `POST /v0/admin/compact` right after a `CREATE INDEX` answered
+/// 500, which is exactly when an operator reaches for it — "I declared the
+/// index, now materialize it".
+///
+/// The DDL schedules its own backfill pass. The admin drain does NOT go
+/// through the scheduler's admission, so it runs alongside that pass and can
+/// lose the manifest install race; storage abandons the prepared plan with a
+/// `Precondition` ("another compaction won the install race"), and the drain
+/// reported that as a hard error whenever it happened on its FIRST pass.
+/// Losing the race means the merge was performed by the winner, so the drain
+/// now re-prepares against the manifest they left.
+#[tokio::test]
+async fn admin_compact_survives_the_ddl_backfill_pass_it_races() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_uri = format!("file://{}?ns=ddl-race", dir.path().display());
+    let base = boot(store_uri).await;
+
+    for chunk in 0..3 {
+        let parts: Vec<String> = (0..100)
+            .map(|i| {
+                let n = chunk * 100 + i;
+                format!("(:Person {{cedula: 'ced-{n:04}', seq: {n}}})")
+            })
+            .collect();
+        let (status, body) = cypher(&base, &format!("CREATE {}", parts.join(", "))).await;
+        assert_eq!(status, 200, "seed chunk: {body}");
+    }
+    let flush = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/flush"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+
+    // The DDL leaves a backfill pass in flight behind it.
+    let (status, body) = cypher(
+        &base,
+        "CREATE INDEX persona_seq IF NOT EXISTS FOR (p:Person) ON (p.seq)",
+    )
+    .await;
+    assert_eq!(status, 200, "index DDL: {body}");
+
+    // Straight into the drain, with no pause: this is the shape that failed.
+    let compact = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/compact"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = compact.status().as_u16();
+    let body = compact.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "draining right after a CREATE INDEX must not fail: {body}"
+    );
+
+    // And the drain reports a real account of what it saw, including any
+    // races it lost, rather than an opaque success.
+    let summary: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        summary.get("l0_after").is_some() && summary.get("manifest_version").is_some(),
+        "the drain must report its observed state: {body}"
+    );
+
+    // The index still answers correctly afterwards.
+    let (status, body) = cypher(&base, "MATCH (p:Person {seq: 123}) RETURN p.cedula AS c").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("ced-0123"),
+        "indexed lookup must match: {body}"
+    );
+}

@@ -39,6 +39,26 @@ crates.io release will establish and document that API explicitly.
   it reaches a result, so the collision costs a wasted candidate and never a
   wrong row.
 
+### Fixed
+
+- **`POST /v0/admin/compact` returned 500 right after a `CREATE INDEX`** —
+  which is exactly when an operator reaches for it, to materialize the index
+  the DDL just declared.
+
+  `CREATE INDEX` schedules its own backfill pass. The admin drain runs its
+  passes outside the scheduler's admission, so the two ran concurrently, the
+  DDL pass won the manifest install, and the drain's prepared plan named an
+  input the winner had already merged away. Storage abandons such a plan
+  with a precondition the compactor already labels "a competing compaction
+  won the install race" — the drain reported it as a hard error whenever it
+  happened on the first pass.
+
+  Losing that race is not a failure: the merge was performed by whoever won.
+  The drain now re-prepares against the manifest they left, bounded, and
+  reports `races_lost` in its summary. The abandon messages also name the
+  basis and manifest versions now, and distinguish a lost race from an input
+  that changed and from a duplicated id.
+
 ### Compatibility
 
 - Numeric coverage is recorded per sidecar in a new optional manifest field.

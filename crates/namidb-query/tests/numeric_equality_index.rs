@@ -280,6 +280,17 @@ async fn assert_all_agree(writer: &WriterSession, stage: &str) {
 /// The lookup must be served by the posting index, not by an O(label) scan
 /// that happens to return the same rows.
 async fn assert_native_route(writer: &WriterSession, stage: &str) {
+    // Exact, and immune to the other test in this binary moving the
+    // process-wide counters: every in-scope SST must advertise numeric
+    // coverage, or the lookup could not have been served natively.
+    let (covered, total) = writer
+        .snapshot()
+        .numeric_property_index_coverage("T", "num");
+    assert!(
+        total > 0 && covered == total,
+        "[{stage}] every in-scope SST must carry numeric postings, got {covered}/{total}"
+    );
+
     let before = route_telemetry::snapshot();
     let five = run(writer, "MATCH (t:T {num: 5}) RETURN t.txt AS txt").await;
     let after = route_telemetry::snapshot();
@@ -388,4 +399,69 @@ async fn numeric_equality_matches_the_scan_and_uses_the_index() {
     writer.compact_l0(&committed).await.unwrap();
     assert_all_agree(&writer, "compacted").await;
     assert_native_route(&writer, "compacted").await;
+}
+
+/// The MIGRATION path: rows already flushed before the index was declared.
+///
+/// The documented promise is that a compaction pass backfills their numeric
+/// postings. Until it runs, the sidecar must report its own incompleteness
+/// and the lookup must keep the scan — correct, just slow. This is a
+/// different order from the main test, where the index predates the flush,
+/// and it is the order a real deployment hits.
+#[tokio::test]
+async fn a_compaction_pass_backfills_numeric_postings_onto_existing_ssts() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("numeric-eq-backfill").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    for ordinal in 0..400_i64 {
+        writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &thing(ordinal, ordinal as f64 + 0.5, &ordinal.to_string()),
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    // Flush FIRST: these SSTs carry no numeric postings.
+    let pre_ddl = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(pre_ddl).await.unwrap();
+
+    // Now declare the index on already-flushed data.
+    writer.create_property_index("T", "num").await.unwrap();
+    let committed = writer.snapshot().manifest().manifest.schema.clone();
+
+    // Coverage, not the route counters: those are process-wide, and the
+    // other test in this binary runs concurrently and moves them. This
+    // reads the manifest this snapshot actually sees, so it is exact.
+    let coverage = |writer: &WriterSession| {
+        let snapshot = writer.snapshot();
+        snapshot.numeric_property_index_coverage("T", "num")
+    };
+
+    let (covered, total) = coverage(&writer);
+    assert!(
+        total > 0 && covered == 0,
+        "an SST written before the index cannot serve numeric equality yet, \
+         but reported {covered}/{total}"
+    );
+    let pre = run(&writer, "MATCH (t:T {num: 5}) RETURN t.txt AS txt").await;
+    assert_eq!(
+        pre,
+        vec!["txt=5".to_string()],
+        "the scan must still be right"
+    );
+
+    // The backfill pass.
+    writer.compact_l0(&committed).await.unwrap();
+
+    let (covered, total) = coverage(&writer);
+    assert!(
+        total > 0 && covered == total,
+        "a compaction pass must materialize the numeric postings, but \
+         coverage is {covered}/{total}"
+    );
+    let post = run(&writer, "MATCH (t:T {num: 5}) RETURN t.txt AS txt").await;
+    assert_eq!(post, pre, "the backfilled route must agree with the scan");
 }
