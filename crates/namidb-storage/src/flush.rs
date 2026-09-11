@@ -1839,15 +1839,6 @@ pub(crate) fn prepare_equality_property_sidecars(
     collector.finish(paths, level, sst_id, label)
 }
 
-/// One property's harvested `value → [id, ...]` postings, in def order.
-///
-/// Once a property is declared with a ScalarV1-compatible type, the collector
-/// harvests every actually encodable String/Bool runtime value. This is
-/// deliberate even for a legacy label-scoped SST: the raw storage API can
-/// contain rows that predate or disagree with the later schema declaration,
-/// and an authoritative negative-answer index must cover those rows too.
-/// Streaming harvester behind [`prepare_equality_property_sidecars`]; the
-/// posting-list analogue of [`UniqueSidecarCollector`].
 /// Declared types that get a single-property equality posting sidecar.
 ///
 /// The one gate shared by the flush collector, the compaction rewrite
@@ -1889,6 +1880,16 @@ pub(crate) struct HarvestedProperty {
     numeric: bool,
 }
 
+/// One property's harvested `value → [id, ...]` postings, in def order.
+///
+/// Once a property is declared with a ScalarV1-compatible type, the collector
+/// harvests every actually encodable runtime value it can be PROBED for —
+/// String/Bool always, and numbers as well for a numeric declaration. This is
+/// deliberate even for a legacy label-scoped SST: the raw storage API can
+/// contain rows that predate or disagree with the later schema declaration,
+/// and an authoritative negative-answer index must cover those rows too.
+/// Streaming harvester behind [`prepare_equality_property_sidecars`]; the
+/// posting-list analogue of [`UniqueSidecarCollector`].
 #[derive(Debug)]
 pub(crate) struct EqualitySidecarCollector {
     properties: Vec<HarvestedProperty>,
