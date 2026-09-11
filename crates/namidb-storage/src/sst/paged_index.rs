@@ -2701,8 +2701,9 @@ pub async fn equality_range_from_source(
     start: &[u8],
     end: &[u8],
     max_postings: usize,
+    max_leaf_pages: usize,
 ) -> Result<EqualityRangePage> {
-    equality_range_with_source(source, start, end, max_postings).await
+    equality_range_with_source(source, start, end, max_postings, max_leaf_pages).await
 }
 
 /// Store-addressed [`equality_range_from_source`]. Test-only, mirroring
@@ -2716,7 +2717,7 @@ pub async fn equality_range(
     max_postings: usize,
 ) -> Result<EqualityRangePage> {
     let source = LegacyObjectRangeSource { store, path };
-    equality_range_with_source(&source, start, end, max_postings).await
+    equality_range_with_source(&source, start, end, max_postings, usize::MAX).await
 }
 
 async fn equality_range_with_source(
@@ -2724,6 +2725,7 @@ async fn equality_range_with_source(
     start: &[u8],
     end: &[u8],
     max_postings: usize,
+    max_leaf_pages: usize,
 ) -> Result<EqualityRangePage> {
     type SelectedPosting = (Vec<u8>, u64, usize, usize, Option<u32>);
 
@@ -2736,7 +2738,7 @@ async fn equality_range_with_source(
         bytes_read: header_bytes.len(),
         ..Default::default()
     };
-    if max_postings == 0 || start > end {
+    if max_postings == 0 || max_leaf_pages == 0 || start > end {
         return Ok(EqualityRangePage {
             stats,
             ..Default::default()
@@ -2785,9 +2787,22 @@ async fn equality_range_with_source(
     let mut selected: Vec<SelectedPosting> = Vec::new();
     let mut postings = 0usize;
     let mut more_in_range = false;
+    let mut leaf_pages = 0usize;
     'leaves: while page_id != NO_PAGE {
         crate::cancel::check()?;
+        // Two bounds, because the route has two costs. `max_postings` bounds
+        // the HYDRATION the caller will do; `max_leaf_pages` bounds the I/O
+        // this walk does, which is one sequential ranged read per page and is
+        // what actually makes an unselective window expensive. A low-
+        // cardinality property trips the first; a high-cardinality one trips
+        // the second long before it. Either way the answer is the same: this
+        // window is not selective, hand it back to the scan.
+        if leaf_pages >= max_leaf_pages {
+            more_in_range = true;
+            break 'leaves;
+        }
         let page = source.read_range(page_range(page_id)).await?;
+        leaf_pages += 1;
         stats.pages_read += 1;
         stats.bytes_read += page.len();
         let next = read_u32(&page, 8)?;
@@ -4045,6 +4060,38 @@ mod tests {
             "declining must cost LESS than serving: {} vs {}",
             capped.stats.bytes_read,
             full.stats.bytes_read
+        );
+
+        // The I/O bound: a window spanning many leaf pages must stop after
+        // the pages it was allowed, and say so. This is the bound that
+        // actually decides whether declining is cheap — the posting cap
+        // bounds the caller's hydration, this bounds the walk itself, and a
+        // high-cardinality property trips this one long before the other.
+        let one_page = equality_range_with_source(
+            &LegacyObjectRangeSource {
+                store: Arc::clone(&store),
+                path: path.clone(),
+            },
+            b"",
+            b"v-zzzzzzzz",
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            one_page.more_in_range,
+            "a window past its page budget must say so"
+        );
+        assert!(
+            one_page.postings.is_empty(),
+            "and must not pay for bodies it will not return"
+        );
+        assert!(
+            one_page.stats.bytes_read < all.stats.bytes_read / 50,
+            "declining early must be far cheaper than serving: {} vs {}",
+            one_page.stats.bytes_read,
+            all.stats.bytes_read
         );
 
         // Bounds outside every key, both sides, and an inverted range.

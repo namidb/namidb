@@ -15,6 +15,31 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.17] - 2026-09-11
+
+### Fixed
+
+- **An indexed numeric range matching a large share of its label was still
+  slower than the scan it falls back to.** 2.6.16 removed one half of the
+  waste; this removes the half that actually dominated. On 60,000 rows,
+  `WHERE v.idx > 30000` (matching half) went from 147 ms to 133 ms against
+  an unindexed twin's 146 ms — from twice the scan's cost to slightly under
+  it. Selective ranges are unchanged and remain 480x-1700x faster.
+
+  The route bounded how many POSTINGS it would collect before declining,
+  which bounds what the caller hydrates. But the cost of deciding to decline
+  is the leaf walk itself — one sequential ranged read per page — and on a
+  high-cardinality property a window matching half the label spans dozens of
+  pages. The walk is now bounded in pages as well, so declining costs a
+  fixed handful of reads whatever the window contains. A selective window
+  touches one or two pages and is unaffected.
+
+- `NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES=0` now disables the range route
+  instead of aborting the process. The label-relative cap clamped into an
+  empty range, which panics — and release builds abort on panic, so a
+  configuration value could take the server down at startup of the first
+  range query.
+
 ## [2.6.16] - 2026-09-11
 
 ### Fixed
@@ -3539,7 +3564,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.16...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.17...HEAD
+[2.6.17]: https://github.com/namidb/namidb/compare/v2.6.16...v2.6.17
 [2.6.16]: https://github.com/namidb/namidb/compare/v2.6.15...v2.6.16
 [2.6.15]: https://github.com/namidb/namidb/compare/v2.6.14...v2.6.15
 [2.6.14]: https://github.com/namidb/namidb/compare/v2.6.13...v2.6.14
