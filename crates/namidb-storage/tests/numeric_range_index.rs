@@ -242,8 +242,9 @@ async fn an_unselective_range_declines_rather_than_paying_twice() {
     let writer = corpus("range-cap", true, true).await;
     let snapshot = writer.snapshot();
 
-    // Matching (almost) the whole label: reading every posting AND hydrating
-    // every row costs strictly more than the scan that reads each row once.
+    // Matching (almost) the whole label. Reading every posting AND hydrating
+    // every row costs strictly more than the scan that reads each row once,
+    // so this must decline — and it must decline on EITHER bound.
     let wide = vec![gt(-1_000_000)];
     assert!(
         snapshot
@@ -251,20 +252,32 @@ async fn an_unselective_range_declines_rather_than_paying_twice() {
             .await
             .unwrap()
             .is_none(),
-        "a window wider than the cap must decline"
+        "a window over the posting cap must decline"
+    );
+    assert!(
+        snapshot
+            .indexed_node_ids_by_numeric_range("T", "idx", &wide, 1 << 20)
+            .await
+            .unwrap()
+            .is_none(),
+        "and still decline with a generous posting cap, because the walk \
+         itself spans more leaf pages than the route will read — that page \
+         bound is what makes declining cheap, and it is independent of how \
+         many ids the caller was willing to take"
     );
 
-    // The same window with a cap above the corpus is servable, and still has
-    // to agree with the scan.
-    let expected = by_scan(&writer, &wide).await;
-    let got = snapshot
-        .indexed_node_ids_by_numeric_range("T", "idx", &wide, 1 << 20)
+    // A window inside BOTH bounds serves, and still has to agree with the
+    // scan.
+    let narrow = vec![gt(1_900), lt(1_990)];
+    let expected = by_scan(&writer, &narrow).await;
+    let mut got = snapshot
+        .indexed_node_ids_by_numeric_range("T", "idx", &narrow, 1 << 20)
         .await
         .unwrap()
-        .expect("a generous cap must serve");
-    let mut got = got;
+        .expect("a window inside both bounds must serve");
     got.sort_unstable();
     assert_eq!(got, expected);
+    assert!(!expected.is_empty(), "the window must not be empty");
 }
 
 #[tokio::test]

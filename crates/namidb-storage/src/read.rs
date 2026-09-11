@@ -1402,6 +1402,7 @@ impl<'mt> Snapshot<'mt> {
                 start_key.as_bytes(),
                 end_key.as_bytes(),
                 remaining.saturating_add(1),
+                NUMERIC_RANGE_MAX_LEAF_PAGES,
             )
             .await
             {
@@ -6339,7 +6340,13 @@ impl<'mt> Snapshot<'mt> {
         let ceiling = std::env::var("NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
+            // `0` disables the route rather than panicking in `clamp(1, 0)`,
+            // which in a release build (panic = "abort") would take the
+            // process down from a config value.
             .unwrap_or(DEFAULT_CEILING);
+        if ceiling == 0 {
+            return 0;
+        }
 
         let mut live: u64 = 0;
         for idx in self.manifest.index.node_descriptors() {
@@ -10058,6 +10065,18 @@ fn equality_sidecar_key(
         },
     }
 }
+
+/// Leaf pages the numeric range walk may read before deciding the window is
+/// not selective enough to be worth an index lookup.
+///
+/// The posting cap bounds what the CALLER will hydrate; this bounds what the
+/// WALK itself costs, which is one sequential ranged read per page. Measured
+/// on a 60,000-row corpus, a window matching half the label walked ~60 pages
+/// and made the indexed query 147 ms against the scan's 74 ms — the route
+/// declined correctly and still lost, because deciding to decline was the
+/// expensive part. A selective window touches one or two pages, so this is
+/// generous for every case the route is meant to serve.
+const NUMERIC_RANGE_MAX_LEAF_PAGES: usize = 8;
 
 /// Byte bounds over the ScalarV1 key space for a conjunction of numeric
 /// predicates on `property`, or `None` when this route does not apply.
