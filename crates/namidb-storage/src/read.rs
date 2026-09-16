@@ -1364,6 +1364,20 @@ impl<'mt> Snapshot<'mt> {
             })
             .collect();
 
+        // The budget is decided BEFORE any I/O, from the population this
+        // snapshot can account for, so the SST walk and the memtable union
+        // are bounded by the same number instead of two that can disagree.
+        let memtable = self.memtable_property_claimants(label, property)?;
+        let memtable_rows: usize = memtable.values().map(|ids| ids.len()).sum();
+        let population = self
+            .live_row_estimate(label)
+            .saturating_add(memtable_rows as u64);
+        let derived = usize::try_from(population / RANGE_POPULATION_FRACTION)
+            .unwrap_or(usize::MAX)
+            .max(MIN_RANGE_CANDIDATES);
+        let budget = max_candidates.min(derived);
+        let max_leaf_pages = numeric_range_max_leaf_pages(budget);
+
         let mut candidates: Vec<NodeId> = Vec::new();
         for idx in &sst_idxs {
             let Some(descriptor) = self.manifest.manifest.ssts[*idx]
@@ -1376,17 +1390,32 @@ impl<'mt> Snapshot<'mt> {
                 crate::route_telemetry::record_property(false);
                 return Ok(None);
             };
-            let Some(paged) = &descriptor.paged else {
-                // A legacy-only body cannot be positioned by key without
-                // decoding the whole object, which is the cost this route
-                // exists to avoid.
-                crate::route_telemetry::record_property(false);
-                return Ok(None);
+            // Where the range-readable body lives depends on whether the
+            // operator still emits the legacy mirror. With it enabled the
+            // paged index is a SIDECAR of the descriptor; with it disabled —
+            // the documented default, and the one the container ships — the
+            // descriptor's own `path` IS the paged body and `paged` is None.
+            // Reading only the sidecar made this route decline on the first
+            // SST in exactly the configuration everyone runs. The equality
+            // route has always handled both; see
+            // `probe_equality_property_sidecar`.
+            let (paged_path, paged_size) = match (&descriptor.paged, descriptor.format) {
+                (Some(paged), _) => (paged.path.as_str(), paged.size_bytes),
+                (None, PropertyIndexFormat::PagedV1) => {
+                    (descriptor.path.as_str(), descriptor.size_bytes)
+                }
+                (None, PropertyIndexFormat::BincodeV0) => {
+                    // A legacy-only body cannot be positioned by key without
+                    // decoding the whole object, which is the cost this route
+                    // exists to avoid.
+                    crate::route_telemetry::record_property(false);
+                    return Ok(None);
+                }
             };
             let paged_absolute =
-                format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged.path);
+                format!("{}/{}", self.paths.namespace_prefix().as_ref(), paged_path);
             let source = match self
-                .pinned_sidecar_source(&paged_absolute, Some(paged.size_bytes))
+                .pinned_sidecar_source(&paged_absolute, Some(paged_size))
                 .await
             {
                 Ok(source) => source,
@@ -1396,13 +1425,13 @@ impl<'mt> Snapshot<'mt> {
                 }
                 Err(error) => return Err(error),
             };
-            let remaining = max_candidates.saturating_sub(candidates.len());
+            let remaining = budget.saturating_sub(candidates.len());
             let page = match crate::sst::paged_index::equality_range_from_source(
                 &source,
                 start_key.as_bytes(),
                 end_key.as_bytes(),
                 remaining.saturating_add(1),
-                NUMERIC_RANGE_MAX_LEAF_PAGES,
+                max_leaf_pages,
             )
             .await
             {
@@ -1415,7 +1444,7 @@ impl<'mt> Snapshot<'mt> {
             };
             if page.stats.index_entries != descriptor.distinct_values {
                 tracing::warn!(
-                    path = %paged.path,
+                    path = %paged_path,
                     expected_entries = descriptor.distinct_values,
                     actual_entries = page.stats.index_entries,
                     "paged equality accelerator is stale/partial; declining the range route"
@@ -1437,7 +1466,7 @@ impl<'mt> Snapshot<'mt> {
                     candidates.push(NodeId::from_uuid(Uuid::from_bytes(id)));
                 }
             }
-            if candidates.len() > max_candidates {
+            if candidates.len() > budget {
                 crate::route_telemetry::record_property(false);
                 return Ok(None);
             }
@@ -1445,21 +1474,11 @@ impl<'mt> Snapshot<'mt> {
 
         // The committed/staged memtable delta, which no sidecar covers yet.
         // The committed/staged memtable delta, which no sidecar covers yet.
-        //
-        // Its own size is part of the selectivity question, not just a source
-        // of ids. Before any flush there are NO SST descriptors to estimate
-        // the label from, and a caller-supplied cap derived only from
-        // descriptors is then meaningless — which is how a window covering
-        // half a memtable-resident label got served and hydrated row by row,
-        // at twice the cost of the scan it was supposed to beat.
-        let memtable = self.memtable_property_claimants(label, property)?;
-        let memtable_rows: usize = memtable.values().map(|ids| ids.len()).sum();
-        let budget = max_candidates.min(
-            memtable_rows
-                .checked_div(MEMTABLE_RANGE_FRACTION)
-                .unwrap_or(max_candidates)
-                .max(MIN_RANGE_CANDIDATES),
-        );
+        // Its rows are already part of the population the budget above was
+        // derived from — before any flush they are the WHOLE population, and
+        // sizing the route against SST descriptors alone is what let a window
+        // covering half a memtable-resident label be served and hydrated row
+        // by row, at twice the cost of the scan it was supposed to beat.
         if candidates.len() > budget {
             crate::route_telemetry::record_property(false);
             return Ok(None);
@@ -6328,34 +6347,20 @@ impl<'mt> Snapshot<'mt> {
         Ok(out)
     }
 
-    /// Shared implementation for typed and typeless scans. Keeping the label
-    /// filter optional here ensures both routes perform exactly one
-    /// memtable+SST reconciliation and cannot drift in predicate/projection
-    /// semantics.
-    /// Widest matching window the numeric range index will serve before
-    /// handing the query back to the scan.
+    /// Absolute ceiling on candidates the numeric range route will collect,
+    /// whatever the label's size suggests.
     ///
-    /// The index route reads the postings AND hydrates every candidate; the
-    /// scan reads each row once. So the index wins only while the window is
-    /// SMALL RELATIVE TO THE LABEL, and the cap is what enforces that.
+    /// This is a safety bound, not the selectivity decision — that lives in
+    /// `indexed_node_ids_by_numeric_range`, which measures the window against
+    /// the population it can actually see (SSTs plus memtable). Keeping the
+    /// two apart is deliberate: the ceiling is about bounding peak work, and
+    /// conflating it with selectivity is what let an empty memtable cap the
+    /// whole route at its floor.
     ///
-    /// Relative on purpose. A fixed cap is wrong in both directions: on a
-    /// small label it lets the route read most of the corpus through the
-    /// slower path, and on a 10M-row label it declines windows the index
-    /// would have won by two orders of magnitude. The manifest already
-    /// carries live per-label counts, so the estimate costs no I/O.
-    ///
-    /// The cap also bounds the WASTED work of a decline: exceeding it stops
-    /// the leaf walk, so an unselective range pays a bounded posting read
-    /// before falling back, not a full one.
-    ///
-    /// `NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES` overrides the absolute ceiling.
-    fn numeric_range_candidate_cap(&self, label: &str) -> usize {
+    /// `NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES` overrides it; `0` disables the
+    /// route.
+    fn numeric_range_candidate_cap(&self) -> usize {
         const DEFAULT_CEILING: usize = 65_536;
-        /// A window under an eighth of the label is worth an index lookup;
-        /// beyond that the scan reads the same rows once and wins.
-        const LABEL_FRACTION: u64 = 8;
-
         let ceiling = std::env::var("NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -6367,6 +6372,17 @@ impl<'mt> Snapshot<'mt> {
             return 0;
         }
 
+        ceiling
+    }
+
+    /// Live rows of `label` the MANIFEST can account for, with no I/O.
+    ///
+    /// A lower bound, and knowingly so: it says nothing about the memtable,
+    /// which before the first flush is the entire store. Callers that use it
+    /// for a selectivity decision must add what they can see of the memtable
+    /// themselves — treating this alone as the population is how a route
+    /// came to be sized against zero.
+    fn live_row_estimate(&self, label: &str) -> u64 {
         let mut live: u64 = 0;
         for idx in self.manifest.index.node_descriptors() {
             let desc = &self.manifest.manifest.ssts[idx];
@@ -6378,8 +6394,8 @@ impl<'mt> Snapshot<'mt> {
             }
             let Some(index) = &desc.label_index else {
                 // No per-label counts to estimate from; the whole SST is an
-                // upper bound, which keeps the cap conservative rather than
-                // accidentally tiny.
+                // upper bound, which keeps the estimate conservative rather
+                // than accidentally tiny.
                 live = live.saturating_add(desc.row_count);
                 continue;
             };
@@ -6398,12 +6414,7 @@ impl<'mt> Snapshot<'mt> {
                 );
             }
         }
-        if live == 0 {
-            return ceiling;
-        }
-        usize::try_from(live / LABEL_FRACTION)
-            .unwrap_or(ceiling)
-            .clamp(1, ceiling)
+        live
     }
 
     /// Serve a label scan from the numeric range index when every predicate
@@ -6436,7 +6447,7 @@ impl<'mt> Snapshot<'mt> {
                 label,
                 property,
                 predicates,
-                self.numeric_range_candidate_cap(label),
+                self.numeric_range_candidate_cap(),
             )
             .await?
         else {
@@ -10085,31 +10096,43 @@ fn equality_sidecar_key(
     }
 }
 
-/// Share of a memtable-resident label a numeric range may match and still be
-/// worth an index lookup.
+/// Share of a label a numeric range may match and still be worth an index
+/// lookup, measured against everything the snapshot can see — SSTs and
+/// memtable together.
 ///
-/// Scanning a memtable is cheap — it is already decoded and in memory — so
-/// the bar is higher there than for SSTs. A window over this share is served
-/// by the scan, which reads each row once instead of hydrating every
-/// candidate the postings named.
-const MEMTABLE_RANGE_FRACTION: usize = 8;
+/// The index route reads postings AND hydrates every candidate; the scan
+/// reads each row once. So the index wins only while the window is small
+/// relative to the population, and this is the line.
+const RANGE_POPULATION_FRACTION: u64 = 8;
 
 /// Floor under every derived candidate budget, so a tiny label (or a tiny
 /// memtable) does not make the route decline windows it would answer in
 /// microseconds.
 const MIN_RANGE_CANDIDATES: usize = 256;
 
-/// Leaf pages the numeric range walk may read before deciding the window is
-/// not selective enough to be worth an index lookup.
+/// Leaf pages the numeric range walk may read, derived from the candidate
+/// budget so the two bounds cannot contradict each other.
 ///
-/// The posting cap bounds what the CALLER will hydrate; this bounds what the
-/// WALK itself costs, which is one sequential ranged read per page. Measured
-/// on a 60,000-row corpus, a window matching half the label walked ~60 pages
-/// and made the indexed query 147 ms against the scan's 74 ms — the route
-/// declined correctly and still lost, because deciding to decline was the
-/// expensive part. A selective window touches one or two pages, so this is
-/// generous for every case the route is meant to serve.
-const NUMERIC_RANGE_MAX_LEAF_PAGES: usize = 8;
+/// They measure different costs — the budget bounds what the CALLER will
+/// hydrate, the page bound bounds what the WALK itself costs, one sequential
+/// ranged read per page — but a fixed page bound silently becomes the binding
+/// one. At eight pages the route could only ever serve about a thousand
+/// distinct keys, whatever the budget said, so a 1,000-row window over a
+/// 100,000-row label was handed to the scan despite being 37x faster through
+/// the index.
+///
+/// In the worst case for the walk each key holds one id, so the pages needed
+/// are the budget divided by the keys a leaf holds. The floor keeps a tiny
+/// label servable; the ceiling keeps the DECLINE cheap, which is the case
+/// that gains nothing and so can afford nothing.
+fn numeric_range_max_leaf_pages(budget: usize) -> usize {
+    /// Conservative: a real leaf holds more, so this over-estimates the pages
+    /// a budget needs rather than cutting the walk short.
+    const KEYS_PER_LEAF_PAGE: usize = 128;
+    const MIN_PAGES: usize = 8;
+    const MAX_PAGES: usize = 128;
+    (budget / KEYS_PER_LEAF_PAGE).clamp(MIN_PAGES, MAX_PAGES)
+}
 
 /// Byte bounds over the ScalarV1 key space for a conjunction of numeric
 /// predicates on `property`, or `None` when this route does not apply.
