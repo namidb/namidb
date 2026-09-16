@@ -15,6 +15,38 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [2.6.19] - 2026-09-16
+
+### Fixed
+
+- **The numeric range index did nothing in the configuration NamiDB ships.**
+  With `NAMIDB_LEGACY_PROPERTY_INDEX_MAX_BYTES=0` — the documented default
+  and the one the container sets — a flush writes the paged body as the
+  descriptor's own path and leaves the optional `paged` sidecar field empty.
+  The range route read only that field, so it declined on the first SST for
+  every numeric range query. Everything 2.6.15 through 2.6.18 added was
+  inert for any operator following the README; ranges kept scanning exactly
+  as before.
+
+  The equality route never had the hole, and the range route now resolves
+  the body the same way it does.
+
+- **An empty memtable capped the range route at 256 candidates.** The budget
+  divided the memtable's row count by a non-zero constant, so the "no
+  memtable information" branch was unreachable and a settled store — where
+  the memtable holds nothing — always derived zero, floored to 256. A
+  1,000-row window over a 100,000-row label was handed to the scan despite
+  being 31x faster through the index.
+
+  Selectivity is now measured against everything the snapshot can account
+  for, SSTs and memtable together, and the leaf-page bound is derived from
+  that same budget instead of being a fixed number that silently became the
+  binding one.
+
+  Measured on a 100,000-row label: 100 rows 0.56 ms against 166 ms, 1,000
+  rows 4.9 ms against 152 ms, 5,000 rows 32 ms against 162 ms. Windows past
+  the budget decline to the scan at parity.
+
 ## [2.6.18] - 2026-09-11
 
 ### Fixed
@@ -3589,7 +3621,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.18...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.19...HEAD
+[2.6.19]: https://github.com/namidb/namidb/compare/v2.6.18...v2.6.19
 [2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
 [2.6.17]: https://github.com/namidb/namidb/compare/v2.6.16...v2.6.17
 [2.6.16]: https://github.com/namidb/namidb/compare/v2.6.15...v2.6.16
