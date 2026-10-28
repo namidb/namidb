@@ -79,7 +79,8 @@ impl Client {
     /// `spool_dir` is where compaction writes its scratch files. It defaults
     /// to `NAMIDB_SPOOL_DIR`, then to `<root>/.namidb-spool` for `file://`
     /// URIs. `auto_sweep_min_age_secs` reclaims objects an applied compaction
-    /// retired once they are that old (`None` disables), and `flush()`
+    /// retired once they were written that long ago (`None` disables; it is
+    /// no grace period for a reader in another process), and `flush()`
     /// compacts once a bucket reaches `compaction_l0_trigger` L0 SSTs (`0`
     /// disables).
     #[new]
@@ -361,6 +362,20 @@ impl Client {
             report.manifest_snapshots_reclaimed,
         )?;
         d.set_item("manifest_bytes_freed", report.manifest_bytes_freed)?;
+        d.set_item("pointer_files_reclaimed", report.pointer_files_reclaimed)?;
+        d.set_item("pointer_bytes_freed", report.pointer_bytes_freed)?;
+        d.set_item(
+            "memtable_snapshots_reclaimed",
+            report.memtable_snapshots_reclaimed,
+        )?;
+        d.set_item(
+            "memtable_snapshot_bytes_freed",
+            report.memtable_snapshot_bytes_freed,
+        )?;
+        d.set_item("expired_pins_reclaimed", report.expired_pins_reclaimed)?;
+        d.set_item("pins_honoured", report.pins_honoured)?;
+        // A pin lease that landed mid-sweep deletes nothing; run it again.
+        d.set_item("aborted_by_pin", report.aborted_by_pin)?;
         Ok(d.into())
     }
 
@@ -750,10 +765,13 @@ impl Client {
                 .unwrap_or_default();
             let mut nodes: Vec<(NodeId, Vec<String>, BTreeMap<String, Value>)> =
                 Vec::with_capacity(count);
+            // Rows repeating an id fold into one node, so the unique checks
+            // below see only each id's final value.
+            let mut slot: std::collections::HashMap<NodeId, usize> =
+                std::collections::HashMap::new();
             if merge {
                 // Read-modify-write against the RYOW overlay, so nodes staged
-                // by earlier calls count too. Rows repeating an id fold into
-                // one node here instead of re-reading the overlay per row.
+                // by earlier calls count too.
                 let snap = guard.overlay_snapshot().with_cache(cache);
                 // One batched read warms the decoded row groups, so the
                 // per-id lookups below (label-agnostic, to union labels)
@@ -764,8 +782,6 @@ impl Client {
                 snap.batch_lookup_nodes(&label, &distinct)
                     .await
                     .map_err(map_storage_err)?;
-                let mut slot: std::collections::HashMap<NodeId, usize> =
-                    std::collections::HashMap::new();
                 for (id, props) in parsed {
                     let i = match slot.get(&id) {
                         Some(&i) => i,
@@ -793,11 +809,16 @@ impl Client {
                     }
                 }
             } else {
-                nodes.extend(
-                    parsed
-                        .into_iter()
-                        .map(|(id, props)| (id, vec![label.clone()], props)),
-                );
+                // Replace semantics: the last row for an id wins.
+                for (id, props) in parsed {
+                    match slot.get(&id) {
+                        Some(&i) => nodes[i].2 = props,
+                        None => {
+                            slot.insert(id, nodes.len());
+                            nodes.push((id, vec![label.clone()], props));
+                        }
+                    }
+                }
             }
             let mut seen: std::collections::HashMap<(String, String), NodeId> =
                 std::collections::HashMap::new();
@@ -923,7 +944,10 @@ async fn run_compaction_inner(
 /// no prepared compaction output is waiting to be installed and no flush or
 /// commit sits between its object PUT and the manifest CAS. Embedded reads also
 /// run entirely under the writer guard, so no in-process reader holds an older
-/// version. Readers in other processes are covered by pin leases and `min_age`.
+/// version. Readers in other processes are covered only by pin leases: `min_age`
+/// counts from an object's write, not from when it stopped being referenced.
+/// The writer guard stays held for the whole pass because a flush or commit
+/// may sit between its PUT and its CAS for longer than a short `min_age`.
 async fn sweep_locked(
     guard: &WriterSession,
     manifest_store: &ManifestStore,
@@ -1680,10 +1704,12 @@ fn build_node_views_table(
             if !all_names.contains(key) {
                 return Some((key.clone(), key));
             }
+            // Compared as parsed ids: a legacy row may spell its UUID in
+            // upper case, braced or without hyphens.
             let echoes_id = key == "id"
                 && views.iter().all(|v| match v.properties.get(key) {
                     None => true,
-                    Some(Value::Str(s)) => *s == v.id.to_string(),
+                    Some(Value::Str(s)) => s.parse::<NodeId>().is_ok_and(|id| id == v.id),
                     Some(_) => false,
                 });
             (!echoes_id).then(|| (format!("property.{key}"), key))

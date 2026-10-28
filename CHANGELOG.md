@@ -24,7 +24,8 @@ crates.io release will establish and document that API explicitly.
   value removes the key, and the label is added to the node's labels. Rows
   that repeat an id in one call merge in order. The old replace behaviour
   lives on as the new `put_nodes`, which skips the read and is the faster
-  choice for a first load.
+  choice for a first load. In `put_nodes` the last row for an id wins, and
+  unique constraints are checked against each id's final value only.
 
 - **Python bulk rows take the node id from `_id`.** That matches `n._id` in
   Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
@@ -38,8 +39,11 @@ crates.io release will establish and document that API explicitly.
   L0 files and flushed WAL segments stayed on disk for good. `flush()` now
   runs a compaction pass once a bucket holds `compaction_l0_trigger` L0 SSTs
   (default 8, `0` turns it off), and every applied pass is followed by a
-  sweep of objects older than `auto_sweep_min_age_secs` (default 60, `None`
-  turns it off).
+  sweep of objects written more than `auto_sweep_min_age_secs` ago (default
+  60, `None` turns it off). The age counts from when a file was written, so
+  it does not protect a reader in another process that loaded the manifest
+  before the pass. Turn the auto sweep off while another process reads the
+  graph.
 
 - **Compaction scratch for a `file://` Python client goes under
   `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
@@ -56,14 +60,16 @@ crates.io release will establish and document that API explicitly.
 - **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
   with the legacy `id` key keeps `id` as a property, which clashed with the
   metadata `id` column and made `table["id"]` raise. A property that only
-  repeats the node id is dropped from the table, and any other property
+  repeats the node id (in any UUID spelling, upper case included) is
+  dropped from the table, and any other property
   named like a metadata column comes back as `property.<key>`.
 
 ### Added
 
 - **`Client.sweep(min_age_secs=60, dry_run=False)`** in the Python client
   deletes objects no manifest version references any more and reports what
-  it removed.
+  it removed. `aborted_by_pin` in the report is true when a pin lease landed
+  mid-sweep and nothing was deleted, so the sweep should be run again.
 
 ### Fixed
 

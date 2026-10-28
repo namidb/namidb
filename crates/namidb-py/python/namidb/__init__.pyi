@@ -39,6 +39,14 @@ class _SweepReport(TypedDict):
     wal_bytes_freed: int
     manifest_snapshots_reclaimed: int
     manifest_bytes_freed: int
+    pointer_files_reclaimed: int
+    pointer_bytes_freed: int
+    memtable_snapshots_reclaimed: int
+    memtable_snapshot_bytes_freed: int
+    expired_pins_reclaimed: int
+    pins_honoured: int
+    # True when a pin lease landed mid-sweep: nothing was deleted, run it again.
+    aborted_by_pin: bool
 
 
 class QueryResult:
@@ -103,7 +111,9 @@ class Client:
         """`spool_dir` holds compaction scratch files; it defaults to
         `NAMIDB_SPOOL_DIR`, then `<root>/.namidb-spool` for `file://`
         URIs. An applied compaction sweeps retired objects older than
-        `auto_sweep_min_age_secs` (`None` disables). `flush()` compacts
+        `auto_sweep_min_age_secs` (`None` disables; the age counts from
+        the write, so turn it off while another process reads the
+        graph). `flush()` compacts
         once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
         disables)."""
 

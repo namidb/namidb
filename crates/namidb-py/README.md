@@ -249,9 +249,14 @@ it inline:
   turn it off and call `compact()` yourself.
 - A compaction that applies is followed by a sweep that deletes what it
   retired: the merged-away L0 files, WAL segments that flushes already
-  folded into SSTs, old manifest versions. Only objects older than
-  `auto_sweep_min_age_secs` (default 60) go, so a reader in another
-  process gets a grace period. `None` turns the auto sweep off.
+  folded into SSTs, old manifest versions. Only objects written more than
+  `auto_sweep_min_age_secs` ago (default 60) go. That age counts from when
+  the file was written, not from when it stopped being used, so it is no
+  grace period for a reader in another process: a server, the CLI or a
+  read-only client that loaded the manifest before the pass can find its
+  files gone. If another process reads the graph while this client
+  writes, pass `None` to turn the auto sweep off and call `sweep()` when
+  the readers are done.
 - `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
   demand and returns counts of what it removed (or would remove). The
   auto sweep runs right after the pass, so that pass's own leftovers are
