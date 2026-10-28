@@ -6222,6 +6222,7 @@ impl<'mt> Snapshot<'mt> {
                             let batch = batch.map_err(|error| {
                                 Error::invariant(format!("projected Parquet limited read: {error}"))
                             })?;
+                            crate::cancel::check()?;
                             decoded_rows = decoded_rows.saturating_add(batch.num_rows());
                             let Some(candidates) = self
                                 .project_node_property_batch(
@@ -11363,6 +11364,19 @@ mod tests {
         // Under a deadline already in the past, the same scan aborts.
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let result = crate::cancel::with_deadline(Some(past), snap.scan_label("Person")).await;
+        assert!(
+            matches!(result, Err(Error::Timeout)),
+            "expected Error::Timeout, got {result:?}"
+        );
+
+        // The projected prefix scan streams the property sidecar batch by
+        // batch and probes the deadline there too.
+        let projection = ["name".to_string()];
+        let result = crate::cancel::with_deadline(
+            Some(past),
+            snap.scan_all_nodes_with_predicates_and_projection_limited(&[], Some(&projection), 10),
+        )
+        .await;
         assert!(
             matches!(result, Err(Error::Timeout)),
             "expected Error::Timeout, got {result:?}"
